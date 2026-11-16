@@ -57,13 +57,43 @@ libc = "0.2.191"
 unused_workspace_dependencies = "allow"
 
 [workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+# GPUI APIs use `Context<Self>` without the `'_` lifetime throughout.
+elided_lifetimes_in_paths = "allow"
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+let_underscore_drop = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
 
 [workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that add noise without a matching project invariant.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Production control paths handle failure explicitly (AGENTS.md).
 unwrap_used = "warn"
 expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+exit = "warn"
+mem_forget = "warn"
+unused_result_ok = "warn"
+let_underscore_must_use = "warn"
+# Keep `unsafe` small and documented.
 undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+# Every suppression states its reason and is checked for staleness.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 
 [profile.release]
 lto = "thin"

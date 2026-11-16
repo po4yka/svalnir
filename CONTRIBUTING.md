@@ -100,6 +100,39 @@ Use the warning policy configured for the pinned toolchain. The Clippy command a
 
 Select relevant targets and feature combinations from the manifests. Inspect unfamiliar tests and build scripts before running them. A broad test command must not become an implicit helper installation, real cleanup operation, or permission change. Run workspace-wide checks when shared changes or a required gate justify the extra coverage.
 
+### Static checks
+
+`scripts/check.sh` runs the repository static checks. CI runs the same script. With no argument, the script runs all steps. To run some steps only, give their names:
+
+```sh
+scripts/check.sh
+scripts/check.sh fmt clippy
+```
+
+| Step | Tool | Configuration |
+| --- | --- | --- |
+| `fmt` | rustfmt | `rustfmt.toml` |
+| `clippy` | Clippy, warnings are errors | `[workspace.lints]` in `Cargo.toml`, `clippy.toml` |
+| `test` | `cargo test --workspace` | Crate manifests |
+| `doc` | rustdoc, warnings are errors | `[workspace.lints.rustdoc]` in `Cargo.toml` |
+| `deny` | cargo-deny: advisories, licenses, bans, sources | `deny.toml` |
+| `typos` | typos | `typos.toml` |
+| `links` | lychee, offline: relative links and heading anchors in Markdown | `lychee.toml` |
+| `workflows` | actionlint and zizmor | `.github/workflows/` |
+| `shell` | ShellCheck | Shell scripts |
+
+The Rust steps need macOS, the pinned toolchain, and Xcode with the Metal toolchain, because the GPUI build compiles Metal shaders. If `xcrun -sdk macosx metal -v` fails, install the Metal toolchain with `xcodebuild -downloadComponent MetalToolchain`. The other steps need these tools. `.github/workflows/ci.yml` pins their versions; Dependabot does not update them, so keep this list and the workflow the same:
+
+```sh
+cargo install --locked cargo-deny@0.21.0 typos-cli@1.52.2 lychee@0.24.2 zizmor@1.32.0
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+brew install shellcheck  # CI uses ShellCheck 0.11.0
+```
+
+Each crate sets `[lints] workspace = true`. The workspace lints include Clippy `pedantic` and restriction lints for `unwrap`, `expect`, `panic`, undocumented `unsafe`, and suppressions without a reason. To suppress a lint, use `#[expect(lint, reason = "...")]` on the smallest item. Do not use `#[allow]`. Test functions and `#[cfg(test)]` modules can use `unwrap`, `expect`, `panic`, and `dbg!`. Helper functions outside them cannot.
+
+The license allow list in `deny.toml` contains only licenses that are compatible with distribution under GPL-3.0-only. Before you add a license to the list, make sure that it is compatible. The dependency policy runs on Linux in CI and checks the macOS dependency graph.
+
 ## Make a focused change
 
 1. **Define the result.** State the behavior being added or corrected and the contract that governs it.

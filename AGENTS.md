@@ -49,6 +49,8 @@ cargo clippy -p PACKAGE --all-targets --locked -- -D warnings
 
 Replace `PACKAGE` with the actual affected package. These are a command menu, not a mandatory sequence for every edit. Use `--locked`; update the lockfile intentionally when changing dependencies. Broaden checks for shared interfaces, required project gates, or a concrete unresolved risk.
 
+`scripts/check.sh [STEP...]` runs the static checks that CI runs: formatting, Clippy, tests, rustdoc, cargo-deny, typos, Markdown links, workflow lint, and ShellCheck. `CONTRIBUTING.md#static-checks` lists the steps, their configuration, and the required tools. Fix a lint at its cause. If a suppression is necessary, use `#[expect(lint, reason = "...")]` on the smallest item.
+
 macOS-native compilation and integration require a suitable macOS toolchain. On another host, run applicable portable checks and report the native checks that remain unverified. Do not represent a portable test pass as validation of a macOS helper or GPUI build.
 
 ## Architecture boundaries

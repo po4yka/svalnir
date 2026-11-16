@@ -1,0 +1,5 @@
+# Repository link check: relative links and heading anchors only.
+# External URLs are not fetched, so the check is deterministic and offline.
+offline = true
+include_fragments = "full"
+no_progress = true

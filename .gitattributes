@@ -1,0 +1,3 @@
+# Imported agent skills stay identical to the pinned upstream bytes; see
+# THIRD_PARTY_NOTICES.md. Do not convert their line endings.
+.claude/skills/** -text

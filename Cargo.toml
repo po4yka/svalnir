@@ -28,6 +28,11 @@ clap_complete = "4.6.11"
 
 # GUI. gpui-kit re-exports the GPUI snapshot that it pins (`gpui_kit::gpui`).
 # Keep the requirement exact: a GPUI snapshot can change the API.
+# The default features are `component` (the styled components) and `assets`
+# (the Lucide component icons). gpui-component has no feature that removes its
+# Markdown, LSP-type, file-watch, or i18n dependencies, so the GUI graph has
+# about 510 crates. The graph for macOS has no HTTP client or TLS crate. The
+# release `svalnir-gui` binary, which shows one label, is 16.6 MB (2026-11-16).
 gpui-kit = "=0.10.0"
 
 # Serialization and configuration

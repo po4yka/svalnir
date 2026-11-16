@@ -38,6 +38,30 @@ A tinted fill for a pill or a danger button is the tone at 15% over its surface,
 
 The primary button is silver, not `brand`: a vertical gradient from `#ababab` to `#ffffff` in the dark theme and from `#e6e6e6` to `#ffffff` in the light theme, with `#111111` text. The secondary button is a gradient from `#1d1d1d` to `#262626` in the dark theme and from `#e2e2e2` to `#ececec` in the light theme.
 
+### Theme mapping
+
+The tokens of this document are the source. The application sets them on the `gpui-kit` theme (`ThemeColor` and `Theme`) at startup and when the system appearance changes, so that a `gpui-kit` component shows Svalnir colors with no override at the call site. The names in the right column are fields of the `gpui-kit` theme.
+
+| Svalnir token | `gpui-kit` theme field |
+| --- | --- |
+| `background` | `background`, `title_bar` |
+| `surface` | `sidebar`, `group_box`, `secondary`, `tab_bar` |
+| `surface-inset` | `list`, `table`, `input` |
+| `surface-raised` | `popover`, `tab_active`, `list_active` |
+| `inset-tint` | `muted` |
+| `foreground` | `foreground`, `popover_foreground` |
+| `muted-foreground` | `muted_foreground` |
+| `border` | `border`, `table_row_border`, `sidebar_border` |
+| `brand` | `ring`, `selection`, `link`, `info`, `progress_bar` |
+| `positive` | `success` |
+| `negative` | `danger` |
+| `warning` | `warning` |
+| Silver primary button | `button_primary` and its hover, active, and foreground fields; the gradient is a Svalnir style on the button |
+| Sans, Mono | `font_family`, `mono_font_family` |
+| Motion constants of §6 | `motion` (`MotionTokens`) |
+
+`primary` in the `gpui-kit` theme is not `brand`: set `primary` to the silver button color, because `gpui-kit` uses it for the default emphasis of a control. Set `shadow` to off and keep `focus_ring` on. The radii of this document do not fit the two theme radii (`radius`, `radius_lg`); set the radius on each surface. The field names are from `gpui-kit` 0.10.0. No code applies this mapping yet.
+
 ### Categorical palette
 
 Use this order for series and storage categories. The dark values are given; select light values that have a contrast of 3:1 or more against `surface-inset`.
@@ -116,6 +140,32 @@ Each control has full keyboard behavior.
 | Skeleton, loader, empty state | See §8 for which one a data state uses |
 | Key hint | Shows the macOS key symbols |
 | Data table | Sortable columns, row selection, mono data cells aligned right |
+
+### Component mapping
+
+Use the `gpui_kit::component` module in the right column for a control. Write a custom element only where the column says so, and build it on `gpui_kit::base` behavior where that exists.
+
+| Control | `gpui-kit` component |
+| --- | --- |
+| Action button | `button`: `primary`, default (`secondary`), `ghost` (`quiet`), `danger` |
+| Segmented control | `tab`, segmented variant |
+| Status pill and tag | `tag`, `badge` |
+| Progress bar | `progress`. The segmented bar and the stripes are custom |
+| Rolling number | Custom element |
+| Switch, checkbox, radio group | `switch`, `checkbox`, `radio` |
+| Text, search, select, range slider | `input`, `select`, `combobox`, `slider` |
+| Tabs, disclosure | `tab`, `collapsible`, `accordion` |
+| Tooltip | `tooltip` |
+| Action menu, popover | `menu`, `popover` |
+| Dialog and sheet | `dialog`, `sheet` |
+| Toast stack | `notification` |
+| Skeleton, loader, empty state | `skeleton`, `spinner`, `empty` |
+| Key hint | `kbd` |
+| Data table | `table`; `virtual_list` for a long list |
+| Shell, panel, inset (§3) | Custom containers; `group_box` is not the three-layer frame |
+| Window frame | `title_bar`, `sidebar`, `status_bar` |
+
+The cell and tick components of §5 are custom elements. The rate graph and the step timeline can use `chart` or `plot` where the marks agree with §5. The mapping is not checked against a built view.
 
 Action classes map to button variants as follows.
 
@@ -265,7 +315,7 @@ A provenance line in overline style can close a card: the source, the sample tim
 - State uses a minimum of two signals: tone with an icon, or tone with text.
 - Body text has a contrast of 4.5:1 or more. Marks and large values have 3:1 or more. Check both themes.
 - Honor the macOS settings Reduce Motion, Increase Contrast, and Reduce Transparency. With Increase Contrast on, surfaces get a 1 px `border` outline.
-- Icons are filled glyphs at 16 px in rows and 18 px in an icon tile. Line glyphs such as the check, the cross, and arrows use a bold weight.
+- Icons come from Lucide, the icon set that `gpui-kit` bundles. They are outline glyphs at 16 px in rows and 18 px in an icon tile. Take an application icon from the same set; do not mix a second icon set into a view.
 - The window is resizable. The grid changes from three columns to two and then to one. A card does not go below 320 px.
 - The menu bar item shows the inline capacity grid, the memory pressure state as a pill, and the pause control. It has no animation other than a state change.
 
@@ -280,8 +330,10 @@ These decisions were accepted on 2026-11-16.
 | Storage categories and their colors | Take the categories from the resource model; assign palette colors in a fixed order |
 | Default storage layout | Cell band in Overview; tiles in Storage |
 | Glow on filled cells | None in the first release |
+| Component base | `gpui-kit`; see "Theme mapping" in §2 and "Component mapping" in §4 |
+| Icon set | Lucide (ISC License), through `gpui_kit::assets` |
 
-The icon set is not selected. Include the license text of the bundled fonts with the application.
+The component base and the icon set were accepted after that date, with the change to `gpui-kit`. Include the license text of the bundled fonts and of the icon set with the application.
 
 ## 11. Screen map
 

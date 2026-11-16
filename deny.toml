@@ -14,7 +14,9 @@ ignore = []
 
 [licenses]
 # Each license must be compatible with distribution under GPL-3.0-only.
-# Keep this list the same as `accepted` in about.toml.
+# Keep this list the same as `accepted` in about.toml, except ISC: about.toml
+# adds it for the Lucide icons inside gpui-kit-assets, and that crate declares
+# Apache-2.0 only, so cargo-deny does not encounter ISC.
 allow = [
     "0BSD",
     "Apache-2.0",

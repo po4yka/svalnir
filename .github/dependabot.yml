@@ -9,6 +9,10 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # Move gpui-kit by hand, together with its skills; see "Agent skills" in
+      # AGENTS.md. `scripts/check.sh pins` fails when the two differ.
+      - dependency-name: "gpui-kit"
 
   - package-ecosystem: github-actions
     directory: /

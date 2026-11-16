@@ -50,7 +50,7 @@ cargo clippy -p PACKAGE --all-targets --locked -- -D warnings
 
 Replace `PACKAGE` with the actual affected package. These are a command menu, not a mandatory sequence for every edit. Use `--locked`; update the lockfile intentionally when changing dependencies. Broaden checks for shared interfaces, required project gates, or a concrete unresolved risk.
 
-`scripts/check.sh [STEP...]` runs the static checks that CI runs: formatting, Clippy, tests, rustdoc, cargo-deny, typos, Markdown links, workflow lint, and ShellCheck. `CONTRIBUTING.md#static-checks` lists the steps, their configuration, and the required tools. Fix a lint at its cause. If a suppression is necessary, use `#[expect(lint, reason = "...")]` on the smallest item.
+`scripts/check.sh [STEP...]` runs the static checks that CI runs: formatting, Clippy, tests, rustdoc, cargo-deny, typos, Markdown links, workflow lint, ShellCheck, and the skill pins. `CONTRIBUTING.md#static-checks` lists the steps, their configuration, and the required tools. Fix a lint at its cause. If a suppression is necessary, use `#[expect(lint, reason = "...")]` on the smallest item.
 
 macOS-native compilation and integration require a suitable macOS toolchain. On another host, run applicable portable checks and report the native checks that remain unverified. Do not represent a portable test pass as validation of a macOS helper or GPUI build.
 
@@ -78,7 +78,7 @@ Keep rendering dependencies out of the headless agent and native APIs behind foc
 - Bound queues, scans, retained samples, and background work. Support cancellation and avoid blocking GPUI's event thread.
 - The GUI depends on `gpui-kit`, which re-exports the GPUI snapshot that it pins. Import GPUI items from `gpui_kit`; do not add a direct `gpui` dependency. Use a `gpui_kit::component` component before you write a new one.
 - Check the pinned GPUI API before using examples from another revision. Preserve keyboard navigation, accessible labels, and loading/error/unavailable states.
-- Build views from the tokens, surfaces, and components in `DESIGN.md`. Where `DESIGN.md` and the `gpui-kit-design-guides` skill disagree, `DESIGN.md` applies. Record a new token, component, or motion pattern there in the same change. An animated value ends at the value the agent measured.
+- Build views from the tokens, surfaces, and components in `DESIGN.md`. Where `DESIGN.md` and the `gpui-kit-design-guides` skill disagree, `DESIGN.md` applies. Where the Coding Guides of the `gpui-kit` skill disagree with this file or `CONTRIBUTING.md`, this file and `CONTRIBUTING.md` apply. Record a new token, component, or motion pattern there in the same change. An animated value ends at the value the agent measured.
 - Keep machine-readable stdout free of diagnostics and progress decoration. Version serialized contracts and validate configuration before activating it.
 - Preserve the local/offline core. Add dependencies, network behavior, and permission requirements only where the requested feature needs them.
 

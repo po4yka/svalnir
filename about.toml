@@ -1,6 +1,7 @@
 # cargo-about configuration. scripts/package.sh uses it to generate
 # THIRD_PARTY_LICENSES.txt for the release artifacts.
-# Keep `accepted` the same as the license allow list in deny.toml.
+# Keep `accepted` the same as the license allow list in deny.toml, plus ISC for
+# the clarification below.
 
 accepted = [
     "0BSD",
@@ -11,6 +12,7 @@ accepted = [
     "BSL-1.0",
     "CC0-1.0",
     "GPL-3.0-only",
+    "ISC",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
@@ -22,3 +24,13 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 # Svalnir's own crates are covered by LICENSE.
 private = { ignore = true }
+
+# gpui-kit-assets embeds Lucide icons, which use the ISC License. The crate
+# manifest declares Apache-2.0 only.
+[gpui-kit-assets.clarify]
+license = "Apache-2.0 AND ISC"
+
+[[gpui-kit-assets.clarify.files]]
+path = "LICENSE-LUCIDE"
+license = "ISC"
+checksum = "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"

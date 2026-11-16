@@ -121,6 +121,9 @@ scripts/check.sh fmt clippy
 | `links` | lychee, offline: relative links and heading anchors in Markdown | `lychee.toml` |
 | `workflows` | actionlint and zizmor | `.github/workflows/` |
 | `shell` | ShellCheck | Shell scripts |
+| `pins` | Shell: the `gpui-kit` skills are at the tag of the `gpui-kit` dependency, and `.agents/skills/` has one link for each skill | `Cargo.toml`, `.claude/skills/` |
+
+The `typos` and `links` steps do not check `.claude/skills/`. Those files are imported and stay identical to their upstream revision; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 The Rust steps need macOS, the pinned toolchain, and Xcode with the Metal toolchain, because the GPUI build compiles Metal shaders. If `xcrun -sdk macosx metal -v` fails, install the Metal toolchain with `xcodebuild -downloadComponent MetalToolchain`. The other steps need these tools. `.github/workflows/ci.yml` pins their versions; Dependabot does not update them, so keep this list and the workflow the same:
 

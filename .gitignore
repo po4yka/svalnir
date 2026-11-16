@@ -1,0 +1,98 @@
+# Rust / Cargo build output
+# Cargo.lock is committed on purpose (see README: "Commit a tested toolchain
+# definition and Cargo.lock").
+/target/
+**/*.rs.bk
+*.pdb
+
+# Profiling and coverage output
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+flamegraph.svg
+perf.data*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode / Apple tooling (GPUI build, app bundling, signing)
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.dSYM/
+*.dSYM.zip
+
+# Packaging and notarization artifacts
+/dist/
+*.dmg
+*.pkg
+*.app.zip
+*.notarization.zip
+
+# Signing material — never commit
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+AuthKey_*.p8
+
+# Local state from development runs (SQLite, journals, logs)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and IDEs
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.zed/
+
+# AI coding agents: ignore per-user and runtime files only.
+# Shared project instructions and config stay committable:
+# CLAUDE.md, AGENTS.md, .claude/settings.json, .claude/{agents,commands,skills}/,
+# .codex/config.toml, opencode.json, .opencode/{agent,command,plugin}/.
+
+# Claude Code
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+
+# Codex
+.codex/*
+!.codex/config.toml
+AGENTS.override.md
+
+# OpenCode
+.opencode/node_modules/
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# Orchestration plugin state (oh-my-claudecode, oh-my-opencode)
+.omc/
+.omo/
+
+# Local reference notes (not part of the repository)
+/PROJECT_REFERENCES.md

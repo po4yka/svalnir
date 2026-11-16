@@ -39,6 +39,7 @@ Start with the affected implementation and the documents that define its behavio
 | [Resource model](docs/RESOURCE_MODEL.md) | Units, identity, scope, freshness, availability, and aggregation |
 | [Interfaces](docs/INTERFACES.md) | CLI, configuration, JSON/NDJSON, IPC, and GPUI parity |
 | [Validation plan](docs/VALIDATION.md) | Relevant test families, evidence records, and release gates |
+| [Design](DESIGN.md) | GPUI views: tokens, surfaces, components, data visualization, and motion |
 
 The specifications own their respective contracts; this guide explains how to contribute changes to them. The "Design specifications" table in the README lists which specification owns which contract. If two documents disagree, the owning specification states the intended behavior; correct the other document in the same change. If implementation and documentation disagree materially, identify the intended behavior and update the affected contract with the implementation. Do not quietly redefine an action or authorization rule in a client, adapter, or test.
 

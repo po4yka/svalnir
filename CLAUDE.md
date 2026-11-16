@@ -23,7 +23,7 @@ Start from the "Design specifications" table in `README.md` to find the document
 1. Change the owning specification first. Then search for the same term in the other documents and align each occurrence in the same change:
 
    ```sh
-   rg -n 'TERM' README.md AGENTS.md CONTRIBUTING.md docs/
+   rg -n 'TERM' README.md AGENTS.md CONTRIBUTING.md DESIGN.md docs/
    ```
 
 2. Keep the stable identifiers unchanged: threats `T-01` to `T-15`, validation families `VAL-01` to `VAL-16`, release gates `G-01` to `G-09`, rule IDs, action-class names, and operation-state names. To retire one, keep its number reserved.
@@ -35,6 +35,12 @@ Start from the "Design specifications" table in `README.md` to find the document
    - Each code fence is closed, and each Mermaid block has valid syntax.
    - Each section-number cross-reference points to the intended section.
    - The search in step 1 shows no occurrence that contradicts the owning specification.
+
+## GUI work
+
+Read the sections of `DESIGN.md` that cover the view before a change to `crates/svalnir-gui`.
+
+To check a view, run the application and take a screenshot in the two themes and with Reduce Motion on. A successful build does not show that a view agrees with `DESIGN.md`.
 
 ## Subagents
 

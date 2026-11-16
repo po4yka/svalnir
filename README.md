@@ -47,6 +47,7 @@ Each document owns one contract. Where a specification is more specific than thi
 | [Cleanup rules](docs/CLEANUP_RULES.md) | Rule declaration, eligibility, the proposed registry, and promotion |
 | [Interfaces](docs/INTERFACES.md) | CLI, JSON/NDJSON output, exit status, local IPC, and GPUI parity |
 | [Validation plan](docs/VALIDATION.md) | Validation families, release gates, and evidence records |
+| [Design](DESIGN.md) | Visual language of the GPUI client: tokens, surfaces, components, data visualization, and motion |
 
 [CONTRIBUTING.md](CONTRIBUTING.md) gives the contribution workflow. [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) give instructions for automated contributors.
 
@@ -535,6 +536,8 @@ The initial interface should provide:
 - **Diagnostics:** permissions for the actual running components, service state, and unsupported capabilities.
 
 A menu bar item provides compact status and pause/resume. Notifications explain meaningful state changes without repeatedly alerting on the same sustained condition.
+
+[DESIGN.md](DESIGN.md) specifies the visual language, the components, and the motion of these screens.
 
 Disk and memory visualizations must preserve units, unknown values, and measurement definitions. A treemap represents a selected size metric, not a promise that every displayed byte can be reclaimed. Keyboard navigation, accessible labels, readable focus states, and restrained background rendering are part of the interface requirements.
 

@@ -27,6 +27,7 @@ The checkout contains the design documents and a skeleton Cargo workspace: five 
 | `docs/ARCHITECTURE.md`, `docs/THREAT_MODEL.md` | Component boundaries and trust boundaries |
 | `docs/POLICY_SPEC.md`, `docs/ACTION_CONTRACTS.md`, `docs/CLEANUP_RULES.md` | Automation and action semantics |
 | `docs/RESOURCE_MODEL.md`, `docs/INTERFACES.md` | Metrics, configuration, CLI, and IPC contracts |
+| `DESIGN.md` | Visual language of the GPUI client: tokens, surfaces, components, data visualization, and motion |
 | `CONTRIBUTING.md`, `docs/VALIDATION.md` | Development commands, validation families, and release gates |
 
 These documents are design specifications, not prerequisites for each task and not evidence of implemented behavior. Each specification owns its contract; the "Design specifications" table in `README.md` lists the owners. If two documents disagree, follow the owning specification and correct the other document in the same change. If documentation and code materially disagree, establish the intended behavior and update the affected contract with the implementation.
@@ -76,6 +77,7 @@ Keep rendering dependencies out of the headless agent and native APIs behind foc
 - Keep `unsafe` and FFI small, with documented ownership, lifetime, thread, and pointer invariants. Release native resources reliably.
 - Bound queues, scans, retained samples, and background work. Support cancellation and avoid blocking GPUI's event thread.
 - Check the pinned GPUI API before using examples from another revision. Preserve keyboard navigation, accessible labels, and loading/error/unavailable states.
+- Build views from the tokens, surfaces, and components in `DESIGN.md`. Record a new token, component, or motion pattern there in the same change. An animated value ends at the value the agent measured.
 - Keep machine-readable stdout free of diagnostics and progress decoration. Version serialized contracts and validate configuration before activating it.
 - Preserve the local/offline core. Add dependencies, network behavior, and permission requirements only where the requested feature needs them.
 

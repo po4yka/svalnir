@@ -400,7 +400,7 @@ An agent restart, configuration reload, or reconnect does not reset an incident 
 
 ## 14. GPUI parity and presentation
 
-GPUI consumes the same authenticated services and typed outcomes as the CLI. It may cache view state but cannot own a different policy engine, grant interpretation, or mutation implementation.
+GPUI consumes the same authenticated services and typed outcomes as the CLI. It may cache view state but cannot own a different policy engine, grant interpretation, or mutation implementation. [DESIGN.md](../DESIGN.md) specifies the visual language that applies these requirements.
 
 The application must:
 

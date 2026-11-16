@@ -6,10 +6,11 @@ Svalnir is designed to keep a Mac usable when storage, memory, and background wo
 
 The background agent watches available disk capacity, system memory pressure, swap activity, and application resource usage. Under an explicitly enabled policy, it can automatically evict approved regenerable files, terminate applications that exceed their memory budgets, and force quit eligible applications during sustained critical memory pressure.
 
-**Project status: design and implementation specification.** This README describes the intended product and its proposed interfaces. It does not claim that an implementation, downloadable release, package, or benchmark already exists. Commands, configuration keys, crate boundaries, and milestones below are a coordinated starting specification and may evolve during implementation.
+**Project status: design specification with a skeleton workspace.** This README describes the intended product and its proposed interfaces. The repository contains a Cargo workspace with five placeholder crates that implement no product behavior. This README does not claim that a working implementation, downloadable release, package, or benchmark already exists. Commands, configuration keys, crate boundaries, and milestones below are a coordinated starting specification and may evolve during implementation.
 
 ## Contents
 
+- [Design specifications](#design-specifications)
 - [Product goals](#product-goals)
 - [Planned capabilities](#planned-capabilities)
 - [How protection works](#how-protection-works)
@@ -31,6 +32,23 @@ The background agent watches available disk capacity, system memory pressure, sw
 - [Development and validation](#development-and-validation)
 - [Roadmap and release criteria](#roadmap-and-release-criteria)
 - [License](#license)
+
+## Design specifications
+
+Each document owns one contract. Where a specification is more specific than this README, the specification takes precedence. All of them describe required behavior, not an implementation.
+
+| Document | Owns |
+| --- | --- |
+| [Architecture](docs/ARCHITECTURE.md) | Components, coordination, persistence, and cross-component invariants |
+| [Threat model](docs/THREAT_MODEL.md) | Trust boundaries, threats, required controls, and residual risks |
+| [Resource model](docs/RESOURCE_MODEL.md) | Metric definitions, units, identities, freshness, and aggregation |
+| [Policy specification](docs/POLICY_SPEC.md) | Configuration validation, triggers, incidents, budgets, and recovery |
+| [Action contracts](docs/ACTION_CONTRACTS.md) | Plans, admission, execution states, outcomes, and crash recovery |
+| [Cleanup rules](docs/CLEANUP_RULES.md) | Rule declaration, eligibility, the proposed registry, and promotion |
+| [Interfaces](docs/INTERFACES.md) | CLI, JSON/NDJSON output, exit status, local IPC, and GPUI parity |
+| [Validation plan](docs/VALIDATION.md) | Validation families, release gates, and evidence records |
+
+[CONTRIBUTING.md](CONTRIBUTING.md) gives the contribution workflow. [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) give instructions for automated contributors.
 
 ## Product goals
 
@@ -102,6 +120,8 @@ The controller distinguishes **normal**, **warning**, **acting**, **recovering**
 
 A warning can prepare candidates and notify the user. An action requires a fresh measurement, an applicable enabled policy, an eligible target, and remaining action budget. Recovery requires a stable interval before normal background work resumes.
 
+These five states are a summary for presentation. The [policy specification](docs/POLICY_SPEC.md) defines the incident states, qualification windows, and budgets.
+
 ## Disk analysis and accounting
 
 ### Understand where space goes
@@ -134,6 +154,8 @@ The baseline filesystem sample uses the appropriate `statfs` fields, including `
 For APFS volumes that share a container, Svalnir must not add each volume's available capacity as if it were independent storage. Volume quotas, reserves, and the system's Data/VM relationship also matter when explaining why disk availability and swap activity interact. See [APFS space management][apfs-volumes] and [Apple's volume layout][apfs-layout].
 
 A live before/after change includes other applications' activity. The UI should say “available capacity increased by…” rather than attributing every changed byte to Svalnir.
+
+The [resource model](docs/RESOURCE_MODEL.md) defines each measurement, its source, and its unit.
 
 ## Automatic disk protection
 
@@ -170,7 +192,7 @@ An automatic cleanup adapter must identify specific regenerable data and prove t
 
 Being inside a directory named `Caches`, having an old timestamp, or belonging to a developer tool is insufficient proof. Access time alone is not a reliable activity test.
 
-A rule records its ID and version, approved roots, supported application/tool versions, owner identity, minimum age, lock and activity checks, exclusions, deletion method, expected rebuild cost, possible network requirements, and action budgets. Ambiguous ownership or unsupported layouts produce a skip.
+A rule records its ID and version, approved roots, supported application/tool versions, owner identity, minimum age, lock and activity checks, exclusions, deletion method, expected rebuild cost, possible network requirements, and action budgets. Ambiguous ownership or unsupported layouts produce a skip. The [cleanup rules](docs/CLEANUP_RULES.md) document defines the rule declaration, the proposed registry, and the evidence that a rule needs before it can act automatically.
 
 ### Trash and permanent eviction
 
@@ -182,7 +204,7 @@ These modes have separate authorization and presentation. A permanent eviction r
 
 Before each batch, the executor rechecks target identity, volume, rule version, scope, permissions, activity, and policy authorization. Filesystem operations should use directory-relative handles and no-follow protections where available. A path check followed by an unrelated recursive delete is insufficient protection against concurrent path replacement.
 
-After each batch, the agent samples capacity again. Open files and retained snapshot blocks may prevent an immediate increase even after a successful unlink; [unlink semantics][unlink] explain one such case. Low benefit triggers backoff or another already-authorized candidate. It never expands the policy to personal files.
+After each batch, the agent samples capacity again. Open files and retained snapshot blocks may prevent an immediate increase even after a successful unlink; [unlink semantics][unlink] explain one such case. Low benefit triggers backoff or another already-authorized candidate. It never expands the policy to personal files. The [action contracts](docs/ACTION_CONTRACTS.md) define admission, execution states, and outcomes for each action class.
 
 ## RAM and swap monitoring
 
@@ -298,8 +320,6 @@ The CLI will use **`clap` with its derive API**, plus `clap_complete` for shell 
 
 ### Proposed command surface
 
-These commands describe the intended interface; they are not installation instructions for a released binary.
-
 | Command | Purpose |
 | --- | --- |
 | `svalnir status` | Summarize disk, memory, agent, and policy state |
@@ -314,15 +334,16 @@ These commands describe the intended interface; they are not installation instru
 | `svalnir processes top` | Rank applications or processes by a selected metric |
 | `svalnir processes show --target ID` | Explain a target and its policy eligibility |
 | `svalnir processes stop --target ID` | Request termination of a verified target |
+| `svalnir operations show/wait/cancel` | Query an admitted operation, wait for its result, or stop its later steps |
 | `svalnir agent install/status/pause/resume/uninstall` | Manage Svalnir's own background service |
-| `svalnir policy list/show/enable/disable/simulate` | Inspect and manage standing policies |
-| `svalnir config validate` | Validate schema, thresholds, scopes, and rule references |
+| `svalnir policy list/show/enable/disable/simulate/rearm` | Inspect and manage standing policies and incident allowance |
+| `svalnir config validate/show/apply` | Validate a proposal, show effective values, and activate a revision |
 | `svalnir history` | Inspect actions and observed outcomes |
 | `svalnir doctor` | Diagnose permissions, service identity, APIs, and degraded state |
 | `svalnir completions SHELL` | Generate shell completions |
 | `svalnir license` | Display the GPLv3 license and applicable notices |
 
-Future namespaces may include `apps`, `services`, `run`, `volumes`, and `power`. They are not prerequisites for the core guards.
+Future namespaces may include `apps`, `services`, `run`, `volumes`, and `power`. They are not prerequisites for the core guards. The [interfaces](docs/INTERFACES.md) document defines the common options, output encoding, exit status, and the local protocol.
 
 ### Inspect and clean
 
@@ -348,6 +369,8 @@ svalnir monitor --format ndjson
 ```
 
 `SCAN_ID`, `PLAN_ID`, and target IDs are placeholders for identifiers returned by Svalnir. Plans bind to targets, policy/rule revisions, selected action modes, and an expiry. Applying a plan consumes it; retries inspect the recorded operation instead of blindly repeating deletion.
+
+The manual cleanup modes are `trash` (move selected entries to Trash), `permanent` (permanently delete selected entries), and `evict` (permanently remove candidates of one reviewed rule). Each mode needs its own authorization.
 
 Read-only commands do not authorize cleanup. A plan can be created and examined without mutation. Interactive apply shows its scope; noninteractive apply requires `--yes` or an applicable standing authorization. `--yes` does not override exclusions, failed identity checks, or a stale plan.
 
@@ -402,7 +425,7 @@ Manual commands use the same identity validation and hard protections as automat
 - Partial scans preserve successful results while identifying unreadable or stale areas.
 - Stream cancellation disconnects the client; it does not implicitly uninstall the agent or cancel an unrelated background operation.
 
-Proposed exit codes are `0` for success, `1` for an operation failure, `2` for invalid arguments/configuration, `3` for missing capability or authorization, `4` for partial results, `5` for stale/conflicting state, and `130` for user interruption. A policy simulation can succeed while reporting that all candidates were skipped.
+Proposed exit codes are `0` for success, `1` for an operation failure, `2` for invalid arguments/configuration, `3` for missing capability or authorization, `4` for partial results or a partial or incomplete operation, `5` for stale/conflicting state or an unknown outcome, and `130` for user interruption. A policy simulation can succeed while reporting that all candidates were skipped. A status query exits with `0` when the query succeeds, even if the operation that it reports failed. [INTERFACES.md](docs/INTERFACES.md) has the full exit-status contract.
 
 ## Configuration and policies
 
@@ -412,9 +435,9 @@ The intended default user configuration path is:
 ~/Library/Application Support/Svalnir/config.toml
 ```
 
-Machine-level helper configuration is separate, administrator-owned, and cannot be broadened through an untrusted per-user file. The CLI can select another user configuration with `--config PATH`.
+Machine-level helper configuration is separate, administrator-owned, and cannot be broadened through an untrusted per-user file. The CLI can select another configuration file as a proposal with `--config PATH` for validation and simulation. That option does not activate the file; `svalnir config apply` activates a validated revision.
 
-The following is an **illustrative proposed schema**, not a shipped default. Storage thresholds suit neither every disk nor every workload. The example application identity must be replaced with a real, verified target.
+The following is an **illustrative proposed schema**, not a shipped default. Storage thresholds suit neither every disk nor every workload. The example application identity must be replaced with a real, verified target. The [policy specification](docs/POLICY_SPEC.md) has the complete example with the explicit limits, timing fields, and validation rules.
 
 ```toml
 schema_version = 1
@@ -529,7 +552,7 @@ GPUI is actively developed and documents breaking changes before 1.0. The implem
 | `svalnir-cli` | Argument parsing, rendering, structured output, and calls into the shared application services |
 | `svalnir-gui` | GPUI views, interaction, notifications, and client state |
 
-The proposed workspace uses these five crates under `crates/`. macOS-specific bindings initially live behind internal platform modules; they can become a separate crate when the boundary is useful. Optional system extensions remain separate deployable components.
+The workspace contains these five crates under `crates/`. Each crate is currently a placeholder; the table gives its intended responsibility. macOS-specific bindings initially live behind internal platform modules; they can become a separate crate when the boundary is useful. Optional system extensions remain separate deployable components.
 
 ```mermaid
 flowchart TD
@@ -544,7 +567,7 @@ flowchart TD
     Collectors --> System
 ```
 
-A single coordinator owns conflicting mutations. A second CLI or GUI cannot start an overlapping cleanup behind its back. Short critical sections protect scheduling state; a graceful-exit timeout must not block telemetry collection.
+A single coordinator owns conflicting mutations. A second CLI or GUI cannot start an overlapping cleanup behind its back. Short critical sections protect scheduling state; a graceful-exit timeout must not block telemetry collection. The [architecture](docs/ARCHITECTURE.md) document defines the components, coordination, and persistence in detail.
 
 Read-only scans can run without the persistent agent when permissions allow. Mutation commands go through the operation coordinator, starting a transient user coordinator if necessary. A transient coordinator does not silently enable persistent automation.
 
@@ -561,7 +584,7 @@ Read-only scans can run without the persistent agent when permissions allow. Mut
 | Native integration | Focused `objc2` framework bindings, `dispatch2`, and audited libc/Mach interfaces |
 | Background scheduling | macOS `launchd`; Rust async/background workers where appropriate |
 
-These are architectural recommendations, not a lockfile. Exact versions, minimum Rust version, feature flags, and unsafe-code boundaries are established when the workspace is created. Background runtimes and GPUI's executor need a deliberate bridge; the GUI must not bring rendering dependencies into the headless agent.
+This table gives the architectural choices. The root `Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` are the source of truth for the exact dependency versions, feature flags, Rust edition, and pinned toolchain. The lint configuration is in `Cargo.toml` and `clippy.toml`. Background runtimes and GPUI's executor need a deliberate bridge; the GUI must not bring rendering dependencies into the headless agent.
 
 ### Local API and authority
 
@@ -569,7 +592,7 @@ The API exposes typed observations, plan IDs, target IDs, policy revisions, and 
 
 Privileged and Full Disk Access-bearing endpoints must authenticate the calling application and validate each request. A user-private socket and matching UID are useful boundaries but do not alone identify a signed Svalnir client. XPC code-signing requirements can contribute to that design; availability must be checked against the supported OS range. See [XPC peer requirements][xpc-peer].
 
-Policy and plan validation are enforced again across the privilege boundary. Request IDs, expiry, and replay handling prevent a consumed authorization from becoming an unlimited capability.
+Policy and plan validation are enforced again across the privilege boundary. Request IDs, expiry, and replay handling prevent a consumed authorization from becoming an unlimited capability. The [threat model](docs/THREAT_MODEL.md) lists the threats, the required controls, and the risks that remain.
 
 ## Permissions and privileged operations
 
@@ -647,13 +670,13 @@ History and logs have hard size limits. Metrics may be sampled less frequently o
 
 ### Journal irreversible actions
 
-Filesystem deletion requires a durable intent record before the irreversible step. The record identifies the target, action mode, authorization, and expected operation state. An operation then transitions through execution, verification, and completion or partial failure.
+Each filesystem mutation, including a move to Trash, requires a durable intent record before the step. The record identifies the target, action mode, authorization, and expected operation state. An operation then transitions through execution, verification, and completion or partial failure.
 
 A small emergency logging reserve can reduce the likelihood of failure when storage is exhausted. It is not a guarantee: copy-on-write behavior, metadata requirements, and database errors still matter. In particular, the design must handle SQLite's `SQLITE_FULL` explicitly. See [SQLite result codes][sqlite-full].
 
-If durable intent cannot be recorded, the filesystem executor does not start another permanent deletion.
+If durable intent cannot be recorded, the filesystem executor does not start another mutation.
 
-Memory intervention has an independent policy choice. By default, it also requires a durable record. If `allow_volatile_journal_on_critical` is explicitly enabled, a previously authorized critical-pressure termination may proceed with a bounded in-memory record when persistent logging fails. This exception applies only to the critical-pressure path, not ordinary application-budget enforcement or filesystem cleanup. The UI reports the incomplete durable history, and the agent attempts to persist the record after recovery. A crash can lose that volatile record.
+Memory intervention has an independent policy choice. By default, it also requires a durable record. If `allow_volatile_journal_on_critical` is explicitly enabled, a previously authorized critical-pressure termination may proceed with a bounded in-memory record when persistent logging fails. This exception applies only to the automatic critical-pressure path, not ordinary application-budget enforcement, manual process control, or filesystem cleanup. The UI reports the incomplete durable history, and the agent attempts to persist the record after recovery. A crash can lose that volatile record.
 
 ### Recover from interruption
 
@@ -710,22 +733,21 @@ There are currently no release downloads, Homebrew formulae, published Svalnir c
 
 ## Development and validation
 
-### Intended development workflow
+### Development workflow
 
-Development requires a macOS machine, a compatible Rust toolchain, and the Apple development tools required by the chosen GPUI revision. The GUI's documented setup includes Xcode and its macOS components; a command-line-tools-only installation should not be assumed sufficient. See [GPUI's macOS requirements][gpui-readme].
+Development requires a macOS machine, the Rust toolchain pinned in `rust-toolchain.toml`, and the Apple development tools required by the chosen GPUI revision. The GUI's documented setup includes Xcode and its macOS components; a command-line-tools-only installation should not be assumed sufficient. See [GPUI's macOS requirements][gpui-readme].
 
-After the proposed workspace has been created, the expected workflow is:
+The workspace checks are:
 
 ```sh
-# These commands become applicable after the crates and toolchain are added.
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p svalnir-core
-cargo run -p svalnir-cli --bin svalnir -- scan "$HOME"
-cargo build -p svalnir-gui
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo run -p svalnir-cli --bin svalnir --locked -- --help
+cargo build -p svalnir-gui --locked
 ```
 
-Commit a tested toolchain definition and `Cargo.lock`. Keep privileged APIs behind small reviewed interfaces, document unsafe invariants, and avoid passing unchecked strings across process or privilege boundaries.
+The `svalnir` binary currently parses arguments only; the subcommands in this README are not implemented. Use `--locked`, and change `Cargo.lock` only as an intended dependency update. Keep privileged APIs behind small reviewed interfaces, document unsafe invariants, and avoid passing unchecked strings across process or privilege boundaries.
 
 ### Validation strategy
 
@@ -751,7 +773,9 @@ The essential scenarios include:
 
 Native integration tests require explicit, disposable fixtures and supported macOS versions. Privileged tests should use isolated test machines or equivalent controlled environments. Ordinary development tests must never need to force quit unrelated applications.
 
-Performance gates should measure idle CPU, resident/footprint overhead, scan throughput, peak scan memory, disk I/O, wake impact, database growth, and intervention latency. Acceptance budgets are set and published after representative measurements; this README contains no claimed benchmarks.
+Performance gates should measure idle CPU, resident/footprint overhead, scan throughput, peak scan memory, disk I/O, wake impact, database growth, and intervention latency. Acceptance budgets are set and published after representative measurements.
+
+The [validation plan](docs/VALIDATION.md) defines the validation families (`VAL-01` to `VAL-16`), the release gates (`G-01` to `G-09`), and the evidence record. All gates are unverified until that evidence exists.
 
 ### Contributions
 
@@ -759,7 +783,7 @@ Changes to cleanup rules should include provenance for the file layout, eligibil
 
 A new integration should explain which supported operation it uses and how it behaves when unavailable. Adding a powerful action without a bounded policy and observable result is incomplete.
 
-Contributions to Svalnir are intended to use the project's GPLv3 license. The repository should add contribution and security-reporting instructions when real maintainer contact and repository locations are available.
+Contributions to Svalnir are intended to use the project's GPLv3 license. [CONTRIBUTING.md](CONTRIBUTING.md) gives the contribution workflow and the interim security-reporting guidance. The repository does not yet publish a maintainer security contact.
 
 ## Roadmap and release criteria
 
@@ -789,6 +813,7 @@ Release acceptance requires:
 - Crash recovery and low-space journal failure follow documented behavior.
 - Validation covers the supported hardware and macOS matrix.
 - Distribution includes the license and required source/notice materials.
+- All nine release gates in the [validation plan](docs/VALIDATION.md) pass for the declared release scope.
 
 ### Milestone 4 — Deeper integrations
 
@@ -844,6 +869,3 @@ See [LICENSE](LICENSE) for the complete license text, or read the [GNU GPLv3][gp
 [network-extension]: https://developer.apple.com/documentation/technotes/tn3134-network-extension-provider-deployment
 [sqlite-full]: https://www.sqlite.org/rescode.html#full
 [gpl3]: https://www.gnu.org/licenses/gpl-3.0.en.html
-
-
-

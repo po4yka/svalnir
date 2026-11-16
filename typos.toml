@@ -1,2 +1,3 @@
 [files]
-extend-exclude = ["Cargo.lock"]
+# .claude/skills/ holds imported agent skills; see THIRD_PARTY_NOTICES.md.
+extend-exclude = ["Cargo.lock", ".claude/skills/"]

@@ -3,3 +3,5 @@
 offline = true
 include_fragments = "full"
 no_progress = true
+# .claude/skills/ holds imported agent skills; see THIRD_PARTY_NOTICES.md.
+exclude_path = ['\.claude/skills/']

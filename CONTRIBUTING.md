@@ -312,7 +312,7 @@ Svalnir's own code uses `GPL-3.0-only`; the complete license is in [LICENSE](LIC
 
 For new dependencies, explain the concrete need, selected version/revision and features, native/build requirements, maintenance considerations, and effect on binary size, runtime resource use, permissions, or networking where relevant. Preserve the local/offline core. Update manifests and the lockfile together, and review transitive changes rather than treating a successful build as a license or security audit.
 
-Record upstream repositories, exact revisions, source paths, applicable licenses, notices, modifications, and where material is used in a tracked notice file. No such file exists yet, because the repository contains no imported material; add `THIRD_PARTY_NOTICES.md` at the repository root with the first import. A repository's root license does not replace file-level or asset provenance.
+Record upstream repositories, exact revisions, source paths, applicable licenses, notices, modifications, and where material is used in the tracked notice file, [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). A repository's root license does not replace file-level or asset provenance.
 
 `PROJECT_REFERENCES.md` is a maintainer's local research note on design influences. It is excluded by `.gitignore` and can be absent from a checkout. Do not use it as a provenance or notice record, and keep product inspirations out of the product README.
 

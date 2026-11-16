@@ -30,9 +30,9 @@ require() {
     fi
 }
 
-# Print tracked and untracked, not ignored files that match a pattern, NUL-separated.
+# Print tracked and untracked, not ignored files that match the pathspecs, NUL-separated.
 repo_files() {
-    git ls-files -z --cached --others --exclude-standard -- "$1"
+    git ls-files -z --cached --others --exclude-standard -- "$@"
 }
 
 run_step() {
@@ -59,7 +59,7 @@ run_step() {
         ;;
     links)
         require lychee
-        repo_files '*.md' | xargs -0 -r lychee --config lychee.toml --
+        repo_files '*.md' ':(exclude).claude/skills' | xargs -0 -r lychee --config lychee.toml --
         ;;
     workflows)
         require actionlint

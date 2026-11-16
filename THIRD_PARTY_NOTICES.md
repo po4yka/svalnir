@@ -48,3 +48,29 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+## gpui-kit skills
+
+| Item | Value |
+| --- | --- |
+| Upstream repository | <https://github.com/longbridge/gpui-kit> |
+| Revision | Tag `v0.10.0`, commit `f697c3133d55c64fa8a5b67926147fb3dadd276d` |
+| Upstream paths | `skills/gpui-kit/`, `skills/gpui-kit-design-guides/` |
+| Location in this repository | `.claude/skills/gpui-kit/`, `.claude/skills/gpui-kit-design-guides/`, and a symbolic link to each in `.agents/skills/` |
+| License | Apache-2.0. Copyright 2024 - 2026 Longbridge. The text is in [LICENSES/gpui-kit-Apache-2.0.txt](LICENSES/gpui-kit-Apache-2.0.txt). |
+| Use | Reference sheets that a coding agent loads during development. They are not part of a Svalnir binary or release artifact. |
+| Modifications | `gh skill install` added source-tracking metadata to the frontmatter of each `SKILL.md`. No other change. |
+
+The `gpui-kit` crate is a Cargo dependency, not imported source. `THIRD_PARTY_LICENSES.txt` covers it.
+
+## Zed skills
+
+| Item | Value |
+| --- | --- |
+| Upstream repository | <https://github.com/zed-industries/zed> |
+| Revision | Commit `7b5cc722a13192533a01c88800c75b22f5b1d5e6` |
+| Upstream paths | `.agents/skills/gpui-test/`, `.agents/skills/gpui-bench/` |
+| Location in this repository | `.claude/skills/gpui-test/`, `.claude/skills/gpui-bench/`, and a symbolic link to each in `.agents/skills/` |
+| License | GPL-3.0-or-later. The Zed README states that the source is "licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked"; these files have no Apache-2.0 mark. The GPL version 3 text is in [LICENSE](LICENSE). |
+| Use | Reference sheets that a coding agent loads during development. They are not part of a Svalnir binary or release artifact. |
+| Modifications | `gh skill install` added source-tracking metadata to the frontmatter of each `SKILL.md` on 2026-11-16. No other change. |

@@ -579,7 +579,7 @@ Read-only scans can run without the persistent agent when permissions allow. Mut
 | Concern | Choice |
 | --- | --- |
 | CLI | `clap` derive and `clap_complete` |
-| GUI | `gpui` and its matching platform integration |
+| GUI | `gpui-kit`: the GPUI snapshot that it pins, its component library, and the matching platform integration |
 | Serialization/configuration | `serde`, `serde_json`, and TOML |
 | Local state | SQLite through `rusqlite`, with bounded retention and explicit migrations |
 | Diagnostics | `tracing`, typed errors with `thiserror`, optional user-facing diagnostics with `miette` |

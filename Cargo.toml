@@ -26,8 +26,9 @@ svalnir-core = { path = "crates/svalnir-core" }
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
 
-# GUI
-gpui = "0.2.2"
+# GUI. gpui-kit re-exports the GPUI snapshot that it pins (`gpui_kit::gpui`).
+# Keep the requirement exact: a GPUI snapshot can change the API.
+gpui-kit = "=0.10.0"
 
 # Serialization and configuration
 serde = { version = "1.0.229", features = ["derive"] }

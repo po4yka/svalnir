@@ -13,7 +13,7 @@ name = "svalnir-gui"
 path = "src/main.rs"
 
 [dependencies]
-gpui.workspace = true
+gpui-kit.workspace = true
 tracing.workspace = true
 
 [lints]

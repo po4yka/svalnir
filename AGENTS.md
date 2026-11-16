@@ -76,19 +76,28 @@ Keep rendering dependencies out of the headless agent and native APIs behind foc
 - Use typed identities, units, errors, and operation states at component boundaries. Handle external failures explicitly; keep production control paths free of unchecked `unwrap` and `expect`.
 - Keep `unsafe` and FFI small, with documented ownership, lifetime, thread, and pointer invariants. Release native resources reliably.
 - Bound queues, scans, retained samples, and background work. Support cancellation and avoid blocking GPUI's event thread.
+- The GUI depends on `gpui-kit`, which re-exports the GPUI snapshot that it pins. Import GPUI items from `gpui_kit`; do not add a direct `gpui` dependency. Use a `gpui_kit::component` component before you write a new one.
 - Check the pinned GPUI API before using examples from another revision. Preserve keyboard navigation, accessible labels, and loading/error/unavailable states.
-- Build views from the tokens, surfaces, and components in `DESIGN.md`. Record a new token, component, or motion pattern there in the same change. An animated value ends at the value the agent measured.
+- Build views from the tokens, surfaces, and components in `DESIGN.md`. Where `DESIGN.md` and the `gpui-kit-design-guides` skill disagree, `DESIGN.md` applies. Record a new token, component, or motion pattern there in the same change. An animated value ends at the value the agent measured.
 - Keep machine-readable stdout free of diagnostics and progress decoration. Version serialized contracts and validate configuration before activating it.
 - Preserve the local/offline core. Add dependencies, network behavior, and permission requirements only where the requested feature needs them.
 
-## Rust skills
+## Agent skills
 
-`.claude/skills/` holds 27 skills from `po4yka/rust-skills`, pinned to the tag `v0.5.0`. Each entry in `.agents/skills/` is a symbolic link to the same skill, for Codex and the other agents that read that directory. Do not edit these files.
+`.claude/skills/` holds imported skills, each pinned to one upstream revision. Each entry in `.agents/skills/` is a symbolic link to the same skill, for Codex and the other agents that read that directory. Do not edit these files.
 
-To move to a newer tag, install each skill again with the new tag, then update `THIRD_PARTY_NOTICES.md`. For a new skill, also add its link.
+| Source | Revision | Skills |
+| --- | --- | --- |
+| `po4yka/rust-skills` | Tag `v0.5.0` | 27 Rust skills |
+| `longbridge/gpui-kit` | Tag `v0.10.0`, the same as the `gpui-kit` dependency | `gpui-kit`, `gpui-kit-design-guides` |
+| `zed-industries/zed` | Commit `7b5cc722a131` | `gpui-test`, `gpui-bench` |
+
+The Zed skills refer to the Zed repository layout and to the GPUI revision of that commit. Check each command and API against the pinned `gpui-kit` before you use it.
+
+To move a skill to a newer revision, install it again, then update `THIRD_PARTY_NOTICES.md`. Move the `gpui-kit` skills together with the `gpui-kit` dependency. For a new skill, also add its link. For a Zed skill, the path is `.agents/skills/NAME`, and the command needs `--allow-hidden-dirs`.
 
 ```sh
-gh skill install po4yka/rust-skills skills/NAME --pin TAG --agent claude-code --scope project --force
+gh skill install OWNER/REPO skills/NAME --pin REVISION --agent claude-code --scope project --force
 ln -s ../../.claude/skills/NAME .agents/skills/NAME
 ```
 

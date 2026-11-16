@@ -14,6 +14,7 @@ ignore = []
 
 [licenses]
 # Each license must be compatible with distribution under GPL-3.0-only.
+# Keep this list the same as `accepted` in about.toml.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

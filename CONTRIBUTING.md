@@ -134,6 +134,29 @@ Each crate sets `[lints] workspace = true`. The workspace lints include Clippy `
 
 The license allow list in `deny.toml` contains only licenses that are compatible with distribution under GPL-3.0-only. Before you add a license to the list, make sure that it is compatible. The dependency policy runs on Linux in CI and checks the macOS dependency graph.
 
+### CI and releases
+
+`.github/workflows/ci.yml` runs on each push to `main`, on each pull request, and on demand. The release workflow also calls it. It runs `scripts/check.sh` in three jobs: the Rust steps on macOS, the dependency policy on Linux, and the text, link, and workflow lint on Linux.
+
+`.github/workflows/release.yml` makes release artifacts:
+
+1. Set the workspace version in `Cargo.toml` to `MAJOR.MINOR.PATCH` and merge the change to `main`. Pre-release versions such as `0.1.0-rc.1` are not supported, because `CFBundleVersion` accepts integers only.
+2. Push one tag `v` followed by that version, for example `v0.1.0`. GitHub does not start workflows when you push more than three tags at the same time.
+3. A first job stops the workflow if the tag does not match the version or if the tagged commit is not in `main`. Then the workflow runs the CI checks.
+4. `scripts/package.sh` runs on macOS. It builds the release binaries for `aarch64-apple-darwin` with macOS 13.0 as the deployment target. It makes a binaries archive, a `Svalnir.app` zip with the bundle identifier `dev.po4yka.svalnir`, and `SHA256SUMS`. Both artifacts contain `LICENSE` and `THIRD_PARTY_LICENSES.txt`, which cargo-about generates from `about.toml` and `packaging/about.hbs`.
+5. A separate job attests the build provenance of the archive and the zip. `SHA256SUMS` is not attested. The build job has no token that can sign attestations, because it runs the build scripts of dependencies.
+6. The last job creates a draft GitHub Release. A tag `v0.*` makes a prerelease. If a release or a draft for the tag exists, the job stops.
+7. Examine the draft and publish it by hand.
+
+A manual run of the release workflow builds test artifacts and keeps them as workflow artifacts for 14 days. It does not attest them and does not create a release, also when you select a tag. To make equivalent artifacts locally, run `scripts/package.sh`; they go to `dist/`. The script needs jq and cargo-about:
+
+```sh
+cargo install --locked --features cli cargo-about@0.9.3
+brew install jq  # macOS 15 and later include jq
+```
+
+The artifacts are not signed with a Developer ID and are not notarized. The app bundle has an ad-hoc signature only, so Gatekeeper blocks it after a download. Developer ID signing, notarization, and the release gates in [VALIDATION.md](docs/VALIDATION.md) remain open for a supported release.
+
 ## Make a focused change
 
 1. **Define the result.** State the behavior being added or corrected and the contract that governs it.

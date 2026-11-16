@@ -1,0 +1,185 @@
+name: Release
+
+# A version tag (vX.Y.Z) on a commit in main runs the CI checks, builds the
+# macOS artifacts, attests their build provenance, and creates a draft GitHub
+# Release. A maintainer reviews the draft and publishes it by hand.
+#
+# A manual run (workflow_dispatch) builds test artifacts only. It does not
+# attest them and does not create a release, also when a tag is selected.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+# Keep this group different from the group in ci.yml. ci.yml runs as a called
+# workflow here, and the same group in caller and callee causes a deadlock.
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  verify-tag:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Compare the tag with the workspace version and main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" != "push" ] || [ "$REF_TYPE" != "tag" ]; then
+            echo "Manual run: no tag to verify."
+            exit 0
+          fi
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Workspace version '$version' is not MAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          if [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::Tag '$REF_NAME' does not match the workspace version 'v$version'."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag '$REF_NAME' points to a commit that is not in main."
+            exit 1
+          fi
+
+  checks:
+    name: CI checks
+    needs: verify-tag
+    # GitHub documents the ./ form for a reusable workflow in the same repository.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
+  build:
+    name: Build macOS artifacts
+    needs: checks
+    runs-on: macos-latest
+    timeout-minutes: 60
+    # This job runs dependency build scripts. It gets no token that can sign
+    # attestations or write to the repository.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install the Metal toolchain for GPUI shaders
+        run: xcrun -sdk macosx metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-about@0.9.3
+      - name: Build and package
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            scripts/package.sh "$REF_NAME"
+          else
+            scripts/package.sh
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dist
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Attest build provenance
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # Mint the OIDC token that signs the provenance attestation.
+      attestations: write # Store the attestation in the repository.
+      artifact-metadata: write # Record the attested artifacts as storage records.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  publish:
+    name: Create draft release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # Create the draft release and upload its assets.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The release list includes drafts. Stop if a release for this tag
+          # exists, so that a re-run does not make a second draft.
+          if gh api "repos/$GH_REPO/releases" --paginate --jq '.[].tag_name' | grep -Fxq -- "$TAG"; then
+            echo "::error::A release for '$TAG' exists. Delete the draft or finish it by hand."
+            exit 1
+          fi
+          prerelease=()
+          case "$TAG" in v0.*) prerelease=(--prerelease) ;; esac
+          cat >"$RUNNER_TEMP/notes.md" <<'NOTES'
+          > [!WARNING]
+          > Development build for Apple Silicon. The artifacts are not signed with a
+          > Developer ID and are not notarized. The release gates in docs/VALIDATION.md
+          > are not verified for this build.
+
+          To verify a download:
+
+          ```sh
+          shasum -a 256 --check SHA256SUMS
+          gh attestation verify FILE --repo @REPO@ \
+            --source-ref refs/tags/@TAG@ \
+            --signer-workflow @REPO@/.github/workflows/release.yml
+          ```
+          NOTES
+          sed -i -e "s|@REPO@|$GH_REPO|g" -e "s|@TAG@|$TAG|g" "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/* \
+            --draft --verify-tag "${prerelease[@]}" \
+            --title "Svalnir $TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --generate-notes

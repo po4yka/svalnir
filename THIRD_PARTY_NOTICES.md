@@ -9,7 +9,7 @@ This file records the material that the repository imports from other projects, 
 | Upstream repository | <https://github.com/po4yka/rust-skills> |
 | Revision | Tag `v0.5.0`, commit `0d0b9462c8f51532253af6e20458d934b24c8bf7` |
 | Upstream paths | `skills/<name>/` for each of the 27 skills below |
-| Location in this repository | `.claude/skills/<name>/` |
+| Location in this repository | `.claude/skills/<name>/`. Each `.agents/skills/<name>` is a symbolic link to that directory. |
 | License | BSD-3-Clause |
 | Use | Reference sheets that a coding agent loads during development. They are not part of a Svalnir binary or release artifact. |
 | Modifications | `gh skill install` added source-tracking metadata (`github-repo`, `github-ref`, `github-pinned`, `github-path`, `github-tree-sha`) to the frontmatter of each `SKILL.md`. No other change. |

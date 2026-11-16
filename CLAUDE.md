@@ -42,14 +42,6 @@ Read the sections of `DESIGN.md` that cover the view before a change to `crates/
 
 To check a view, run the application and take a screenshot in the two themes and with Reduce Motion on. A successful build does not show that a view agrees with `DESIGN.md`.
 
-## Rust skills
-
-`.claude/skills/` holds 27 skills from `po4yka/rust-skills`, pinned to the tag `v0.5.0`. Do not edit these files. To move to a newer tag, install each skill again with the new tag, then update `THIRD_PARTY_NOTICES.md`:
-
-```sh
-gh skill install po4yka/rust-skills skills/NAME --pin TAG --agent claude-code --scope project --force
-```
-
 ## Subagents
 
 Use one writer for the documents. They cross-reference each other, so parallel edits to different files produce contradictions. Read-only search and review can run in parallel.

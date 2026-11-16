@@ -81,6 +81,17 @@ Keep rendering dependencies out of the headless agent and native APIs behind foc
 - Keep machine-readable stdout free of diagnostics and progress decoration. Version serialized contracts and validate configuration before activating it.
 - Preserve the local/offline core. Add dependencies, network behavior, and permission requirements only where the requested feature needs them.
 
+## Rust skills
+
+`.claude/skills/` holds 27 skills from `po4yka/rust-skills`, pinned to the tag `v0.5.0`. Each entry in `.agents/skills/` is a symbolic link to the same skill, for Codex and the other agents that read that directory. Do not edit these files.
+
+To move to a newer tag, install each skill again with the new tag, then update `THIRD_PARTY_NOTICES.md`. For a new skill, also add its link.
+
+```sh
+gh skill install po4yka/rust-skills skills/NAME --pin TAG --agent claude-code --scope project --force
+ln -s ../../.claude/skills/NAME .agents/skills/NAME
+```
+
 ## Resource and action invariants
 
 - Distinguish logical size, allocated size, estimated reclaimable bytes, Trash transfers, and observed capacity change. Account for shared APFS storage without double-counting available capacity.

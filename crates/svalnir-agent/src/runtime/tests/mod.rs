@@ -1,0 +1,1316 @@
+//! Tests of the runtime with injected collectors.
+//!
+//! Each test has its own temporary directory with the journal, an
+//! approved root, a home directory, and a Trash directory. A file is
+//! removed or moved only below that directory. A process is signaled only
+//! when the test started it: the planned identity is the PID and the start
+//! time of that child, and a guard kills and collects the child at the end
+//! of the test. No test registers a service, and no test reads or writes
+//! the state directory, the home directory, or the Trash of the user.
+
+#![cfg(target_os = "macos")]
+use std::fs;
+use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::process::ExitStatusExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use svalnir_core::action::{
+    ActionClass, ClientRole, Escalation, ExecutorRole, FileBinding, FileObjectType, Journal,
+    OperationState, PLAN_SCHEMA_VERSION, Plan, PlanApproval, PlanContent, PlanLimits, PlanTarget,
+    PlannedStep, Principal, TargetBinding, Trigger, Validity, WorkCharge,
+};
+use svalnir_core::authority::AuthorityBinding;
+use svalnir_core::file::{DeviceNumber, FileObjectEvidence, LosslessPath};
+use svalnir_core::grant::AuthorityState;
+use svalnir_core::id::{
+    AdapterId, ApplicationInstanceId, ExecutorEpochId, LeaseId, MountId, OperationId, PlanId,
+    PolicyRevisionId, RequestId, RootId, StepId, TargetId, VolumeId,
+};
+use svalnir_core::observation::Observation;
+use svalnir_core::policy::{ApplicationCandidate, ContinuityGeneration, EvaluationClock, PolicyId};
+use svalnir_core::process::{
+    AttributionMethod, ExecutableIdentity, Pid, ProcessAssociation, ProcessIdentity,
+};
+use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
+use svalnir_core::rule::RuleRegistry;
+use svalnir_core::state::PressureState;
+use svalnir_core::time::{MonotonicNanos, WallTime};
+use tempfile::TempDir;
+
+use super::{
+    AgentClock, AgentStatus, CandidateSource, Collector, Driver, DriverParts, DriverSettings,
+    DriverStart, LifecycleRecord, Notifier, RunState, Sample, SelfFootprint, ServiceSettings,
+    ShutdownReport, StopHandle, journal_path, run,
+};
+use crate::controller::tests::support::{
+    CandidateSpec, GIBIBYTE, MOUNT, ROOT_ID, Registry, SECOND, VOLUME, application, boot, capacity,
+    clock_domain, config, config_text, enabled, memory, prepared, pressure, proposed_registry,
+    rule, user, validated_registry, volume, wall,
+};
+use crate::controller::{
+    BlockedReason, CandidateSet, ControllerState, Guard, GuardPhase, Notification, Observations,
+    PreparationMode, Summary,
+};
+use crate::coordinator::{
+    CoordinatorConfig, IdSource, Idle, Measurements, Phase, SystemProbe, TimeReading,
+};
+use crate::executor::fs::{
+    ApprovedRoot, ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig, TrashBackend,
+    TrashReply, TrashRequest,
+};
+use crate::executor::process::{
+    DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, StepClock,
+};
+use crate::journal::{
+    AgentRecord, JournalOptions, OperationJournal, QueuedRequest, RequestBody, RequestCompletion,
+    RequestStatus,
+};
+use crate::platform::process::{DarwinProcessSource, ProcessSource, QueryFailure, generation_id};
+
+/// The time of a fixed clock at the start of a test.
+const START: u64 = 1_000 * SECOND;
+/// The time between two samples of a test.
+const SAMPLE: u64 = 5 * SECOND;
+
+const CHILD_VARIABLE: &str = "SVALNIR_TEST_RUNTIME_CHILD";
+const CHILD_TEST: &str = "runtime::tests::child_entry";
+const CHILD_LIFE: Duration = Duration::from_secs(60);
+
+/// The body of a child process. Without the variable, which only the
+/// tests of this file set, it does nothing.
+#[test]
+#[ignore = "the entry of a child process that the tests of this file start"]
+fn child_entry() {
+    if std::env::var_os(CHILD_VARIABLE).is_none() {
+        return;
+    }
+    // The child ends when its life ends or when the test process that
+    // started it does not exist.
+    let parent: u32 = std::os::unix::process::parent_id();
+    let end: Instant = Instant::now() + CHILD_LIFE;
+    while Instant::now() < end && std::os::unix::process::parent_id() == parent {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A child process that is killed and collected when the value is
+/// dropped.
+struct ChildGuard(Child);
+
+impl ChildGuard {
+    fn pid(&self) -> Pid {
+        Pid::new(i32::try_from(self.0.id()).unwrap()).unwrap()
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // `Child::kill` addresses only the child of this value.
+        if let Err(error) = self.0.kill() {
+            eprintln!("the child was not killed: {error}");
+        }
+        if let Err(error) = self.0.wait() {
+            eprintln!("the child was not collected: {error}");
+        }
+    }
+}
+
+fn child_command(program: &Path) -> Command {
+    let mut command: Command = Command::new(program);
+    command
+        .env(CHILD_VARIABLE, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Starts a child. With `ignores_term`, the shell sets the disposition of
+/// `SIGTERM` and replaces itself with the test binary, which inherits it.
+fn spawn_child(ignores_term: bool) -> ChildGuard {
+    let program = std::env::current_exe().unwrap();
+    let arguments = ["--ignored", "--exact", CHILD_TEST];
+    if !ignores_term {
+        return ChildGuard(child_command(&program).args(arguments).spawn().unwrap());
+    }
+    let child: Child = child_command(Path::new("/bin/sh"))
+        .args(["-c", "trap '' TERM; exec \"$0\" \"$@\""])
+        .arg(&program)
+        .args(arguments)
+        .spawn()
+        .unwrap();
+    let guard = ChildGuard(child);
+    let source = DarwinProcessSource::new();
+    let limit: Instant = Instant::now() + Duration::from_secs(10);
+    loop {
+        let replaced: bool = source
+            .executable_path(guard.pid())
+            .is_ok_and(|path| !path.as_bytes().starts_with(b"/bin/"));
+        if replaced {
+            return guard;
+        }
+        assert!(Instant::now() < limit, "the shell did not start the child");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The identity of a live child as a plan has it.
+fn child_identity(process: Pid) -> ProcessIdentity {
+    let source = DarwinProcessSource::new();
+    let info = source.process_info(process).unwrap();
+    let path = source.executable_path(process).unwrap();
+    let file = source.file_evidence(&path).ok();
+    ProcessIdentity {
+        generation_id: generation_id(process, info.start_time).unwrap(),
+        pid: process,
+        start_time: info.start_time,
+        uid: info.effective_uid,
+        boot_id: boot(),
+        executable: Some(ExecutableIdentity {
+            path,
+            file,
+            code_signature: None,
+        }),
+        association: ProcessAssociation::ManagedJob {
+            instance_id: ApplicationInstanceId::new("instance-child").unwrap(),
+            label: "com.example.test-child".to_owned(),
+            attribution: AttributionMethod::LaunchdJob,
+        },
+    }
+}
+
+/// The clock of a test: a base time and an offset that the test moves.
+/// With the host as the base, a process state that the executor reads is
+/// at the same time as the clock.
+#[derive(Debug, Clone)]
+struct TestClock {
+    host: bool,
+    offset: Arc<AtomicU64>,
+    discontinuities: Arc<AtomicU64>,
+}
+
+impl TestClock {
+    fn fixed() -> Self {
+        Self {
+            host: false,
+            offset: Arc::new(AtomicU64::new(0)),
+            discontinuities: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn host() -> Self {
+        Self {
+            host: true,
+            ..Self::fixed()
+        }
+    }
+
+    fn now(&self) -> u64 {
+        let base: u64 = if self.host {
+            DarwinProcessSource::new().monotonic_now().unwrap().get()
+        } else {
+            START
+        };
+        base + self.offset.load(Ordering::SeqCst)
+    }
+
+    fn advance(&self, nanoseconds: u64) {
+        self.offset.fetch_add(nanoseconds, Ordering::SeqCst);
+    }
+
+    fn reading(&self) -> TimeReading {
+        let now: u64 = self.now();
+        let generation: u64 = self.discontinuities.load(Ordering::SeqCst);
+        TimeReading {
+            clock: EvaluationClock {
+                now: MonotonicNanos::new(now),
+                clock_domain: clock_domain(),
+                boot_id: boot(),
+                continuity: ContinuityGeneration::new(generation),
+                last_discontinuity: None,
+            },
+            wall: wall(now),
+        }
+    }
+}
+
+impl AgentClock for TestClock {
+    fn now(&self) -> Option<TimeReading> {
+        Some(self.reading())
+    }
+
+    fn mark_discontinuity(&self) {
+        self.discontinuities.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl StepClock for TestClock {
+    fn monotonic_now(&self) -> Result<MonotonicNanos, QueryFailure> {
+        Ok(MonotonicNanos::new(self.now()))
+    }
+
+    fn wall_now(&self) -> Option<WallTime> {
+        Some(wall(self.now()))
+    }
+}
+
+/// Moves the clock of a test to the wake time of the coordinator.
+struct TestIdle(TestClock);
+
+impl Idle for TestIdle {
+    fn idle(&mut self, wake_at: Option<MonotonicNanos>) {
+        let now: u64 = self.0.now();
+        match wake_at {
+            Some(wake_at) if wake_at.get() > now => self.0.advance(wake_at.get() - now),
+            _ => self.0.advance(SECOND / 10),
+        }
+        // A process state needs a short real time to change.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The measurements of a test: the available capacity is larger for each
+/// file that is not below the root, and the pressure is a value that the
+/// test sets.
+#[derive(Debug, Clone)]
+struct TestMeasurements {
+    clock: TestClock,
+    root: PathBuf,
+    pressure: Arc<Mutex<PressureState>>,
+}
+
+impl Measurements for TestMeasurements {
+    fn capacity(&mut self, _volume: &VolumeId) -> Observation<Bytes> {
+        let files: u64 = fs::read_dir(&self.root).map_or(0, |entries| entries.count() as u64);
+        capacity(
+            Some((20_u64.saturating_sub(files)) * GIBIBYTE),
+            self.clock.now(),
+        )
+    }
+
+    fn memory_pressure(&mut self) -> Observation<PressureState> {
+        pressure(
+            Some(self.pressure.lock().unwrap().clone()),
+            self.clock.now(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct TestIds(String, u64);
+
+impl IdSource for TestIds {
+    fn operation_id(&mut self) -> Option<OperationId> {
+        self.1 += 1;
+        OperationId::new(format!("{}-operation-{}", self.0, self.1)).ok()
+    }
+
+    fn lease_id(&mut self) -> Option<LeaseId> {
+        self.1 += 1;
+        LeaseId::new(format!("{}-lease-{}", self.0, self.1)).ok()
+    }
+}
+
+fn object_of(path: &Path) -> FileObjectEvidence {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    FileObjectEvidence {
+        device: DeviceNumber::new(i32::try_from(metadata.dev()).unwrap()),
+        inode: metadata.ino().into(),
+    }
+}
+
+/// A Trash backend that moves an entry to the Trash directory of the
+/// fixture. It refuses each path outside the temporary directory.
+#[derive(Debug)]
+struct TempTrash(PathBuf);
+
+impl TrashBackend for TempTrash {
+    fn move_to_trash(&self, request: &TrashRequest<'_>) -> TrashReply {
+        let source: PathBuf = request.path.to_path_buf();
+        assert!(source.starts_with(self.0.parent().unwrap()));
+        let item: PathBuf = self.0.join(source.file_name().unwrap());
+        fs::rename(&source, &item).unwrap();
+        TrashReply::Moved {
+            item_object: Some(object_of(&item)),
+            item: Some(LosslessPath::from_path(&item).unwrap()),
+        }
+    }
+}
+
+/// The candidates of a test: each regular file below the root of the
+/// fixture, as a candidate of the test rule.
+#[derive(Debug)]
+struct TempCandidates {
+    registry: Registry,
+    root: PathBuf,
+    modes: Arc<Mutex<Vec<PreparationMode>>>,
+}
+
+impl CandidateSource for TempCandidates {
+    fn prepare(
+        &mut self,
+        _volumes: &[VolumeId],
+        mode: PreparationMode,
+        time: &TimeReading,
+    ) -> Option<CandidateSet> {
+        self.modes.lock().unwrap().push(mode);
+        let rule = self.registry.rules().first().copied()?.clone();
+        let mut names: Vec<String> = fs::read_dir(&self.root)
+            .ok()?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        Some(CandidateSet {
+            prepared_at: time.clock.now,
+            complete: true,
+            candidates: names
+                .iter()
+                .map(|name| {
+                    let spec = CandidateSpec {
+                        name: name.clone(),
+                        root_path: LosslessPath::from_path(&self.root).unwrap(),
+                        object: object_of(&self.root.join(name)),
+                        object_type: FileObjectType::RegularFile,
+                        work_bytes: 1_000,
+                    };
+                    prepared(&rule, &spec)
+                })
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Notes(Arc<Mutex<Vec<Notification>>>);
+
+impl Notifier for Notes {
+    fn notify(&mut self, notification: &Notification) {
+        self.0.lock().unwrap().push(notification.clone());
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Footprint(Arc<AtomicU64>);
+
+impl SelfFootprint for Footprint {
+    fn footprint(&mut self) -> Option<Bytes> {
+        Some(Bytes::new(self.0.load(Ordering::SeqCst)))
+    }
+}
+
+/// Everything that a test holds beside the driver.
+struct Bench {
+    _temp: TempDir,
+    state: PathBuf,
+    root: PathBuf,
+    trash: PathBuf,
+    home: PathBuf,
+    clock: TestClock,
+    registry: Registry,
+    text: String,
+    pressure: Arc<Mutex<PressureState>>,
+    modes: Arc<Mutex<Vec<PreparationMode>>>,
+    notes: Notes,
+    footprint: Arc<AtomicU64>,
+    lifetimes: u32,
+}
+
+impl Bench {
+    fn new(clock: TestClock, registry: Registry) -> Self {
+        let temp: TempDir = tempfile::tempdir().unwrap();
+        // The temporary directory of macOS is below the symbolic link
+        // `/var`. An approved root has no symbolic link in its path.
+        let base: PathBuf = fs::canonicalize(temp.path()).unwrap();
+        let directories = ["state", "root", "trash", "home"].map(|name| base.join(name));
+        for directory in &directories {
+            fs::create_dir(directory).unwrap();
+        }
+        let [state, root, trash, home] = directories;
+        Self {
+            _temp: temp,
+            state,
+            root,
+            trash,
+            home,
+            clock,
+            registry,
+            text: config_text(&[]),
+            pressure: Arc::new(Mutex::new(PressureState::Normal)),
+            modes: Arc::new(Mutex::new(Vec::new())),
+            notes: Notes::default(),
+            footprint: Arc::new(AtomicU64::new(10 * 1024 * 1024)),
+            lifetimes: 0,
+        }
+    }
+
+    fn journal(&self) -> OperationJournal {
+        // The tests do not need the full synchronization of the device.
+        let options = JournalOptions {
+            full_fsync: false,
+            ..JournalOptions::default()
+        };
+        OperationJournal::open(&journal_path(&self.state), &options).unwrap()
+    }
+
+    /// Writes the authority record as an activation and two enable
+    /// commands of a client do: the two guards are active.
+    fn seed_authority(&self) -> AuthorityState {
+        let state: AuthorityState = enabled(&self.text, &self.registry);
+        self.write_authority(&state);
+        state
+    }
+
+    fn write_authority(&self, state: &AuthorityState) {
+        let mut journal = self.journal();
+        if let Some(active) = &state.active {
+            journal
+                .record_policy_revision(&active.revision, Some(&self.text))
+                .unwrap();
+        }
+        journal
+            .put_agent_record(AgentRecord::Authority, state, None, wall(self.clock.now()))
+            .unwrap();
+    }
+
+    fn roots(&self) -> ApprovedRoots {
+        ApprovedRoots::new(vec![ApprovedRoot {
+            root_id: RootId::new(ROOT_ID).unwrap(),
+            path: LosslessPath::from_path(&self.root).unwrap(),
+            object: object_of(&self.root),
+            volume_id: VolumeId::new(VOLUME).unwrap(),
+            mount_id: MountId::new(MOUNT).unwrap(),
+        }])
+        .unwrap()
+    }
+
+    fn settings(&self) -> DriverSettings {
+        DriverSettings {
+            principal: user(),
+            home_directory: Some(LosslessPath::from_path(&self.home).unwrap()),
+            proposal: config(&[]),
+            coordinator: CoordinatorConfig {
+                filesystem_adapter: AdapterId::new("svalnir.filesystem").unwrap(),
+                process_adapter: AdapterId::new("macos.process").unwrap(),
+                batch_targets: 2,
+                poll_interval: Nanoseconds::new(SECOND),
+                volatile_capacity: 8,
+            },
+            journal: JournalOptions {
+                full_fsync: false,
+                ..JournalOptions::default()
+            },
+            status_interval: Nanoseconds::new(30 * SECOND),
+            maintenance_interval: Nanoseconds::new(3_600 * SECOND),
+            self_budget: Bytes::new(64 * 1024 * 1024),
+            shutdown_bound: Nanoseconds::new(3 * SECOND),
+            coordinator_units: 8,
+            sample_stale_after: Nanoseconds::new(180 * SECOND),
+        }
+    }
+
+    fn parts(&self, epoch: &ExecutorEpochId) -> DriverParts {
+        let roots: ApprovedRoots = self.roots();
+        let filesystem = FsExecutor::new(
+            &FsExecutorConfig {
+                home_directory: LosslessPath::from_path(&self.home).unwrap(),
+                limits: ExecutorLimits::default(),
+            },
+            Box::new(TempTrash(self.trash.clone())),
+        )
+        .unwrap();
+        DriverParts {
+            clock: Arc::new(self.clock.clone()),
+            registry: Box::new(self.registry.clone()),
+            measurements: Box::new(TestMeasurements {
+                clock: self.clock.clone(),
+                root: self.root.clone(),
+                pressure: Arc::clone(&self.pressure),
+            }),
+            ids: Box::new(TestIds(epoch.as_str().to_owned(), 0)),
+            filesystem: Box::new(filesystem),
+            roots: roots.clone(),
+            application: Box::new(ProcessExecutor::new(
+                DarwinProcessSource::new(),
+                DarwinProcessControl,
+                self.clock.clone(),
+                ExecutorContext {
+                    boot_id: boot(),
+                    clock_domain: clock_domain(),
+                    executor_epoch: epoch.clone(),
+                },
+                ExecutorConfig::default(),
+            )),
+            probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
+            candidates: Box::new(TempCandidates {
+                registry: self.registry.clone(),
+                root: self.root.clone(),
+                modes: Arc::clone(&self.modes),
+            }),
+            notifier: Box::new(self.notes.clone()),
+            footprint: Box::new(Footprint(Arc::clone(&self.footprint))),
+            store: None,
+            capabilities: None,
+        }
+    }
+
+    /// Starts a new executor lifetime on the journal of the bench.
+    fn try_start(&mut self) -> DriverStart {
+        self.lifetimes += 1;
+        let epoch = ExecutorEpochId::new(format!("epoch_{}", self.lifetimes)).unwrap();
+        Driver::start(
+            &self.state,
+            epoch.clone(),
+            self.settings(),
+            self.parts(&epoch),
+        )
+        .unwrap()
+    }
+
+    fn start(&mut self) -> Box<Driver> {
+        match self.try_start() {
+            DriverStart::Running(driver) => driver,
+            DriverStart::Busy => panic!("a different coordinator holds the lock"),
+        }
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        let path: PathBuf = self.root.join(name);
+        fs::write(&path, b"regenerable content").unwrap();
+        path
+    }
+
+    /// A sample at the time of the clock.
+    fn sample(
+        &self,
+        available: u64,
+        state: PressureState,
+        applications: Vec<ApplicationCandidate>,
+    ) -> Sample {
+        let at: u64 = self.clock.now();
+        *self.pressure.lock().unwrap() = state.clone();
+        Sample {
+            observations: Observations {
+                volumes: vec![volume(Some(available), at)],
+                memory: memory(Some(state), at, applications),
+                candidates: None,
+            },
+            woke: false,
+            // The test process is not a member of a target of a test.
+            control_plane: Some(Vec::new()),
+            degraded: Vec::new(),
+        }
+    }
+
+    fn status(&self) -> AgentStatus {
+        self.journal()
+            .agent_record::<AgentStatus>(AgentRecord::Status)
+            .unwrap()
+            .unwrap()
+            .record
+    }
+
+    fn lifecycle(&self) -> LifecycleRecord {
+        self.journal()
+            .agent_record::<LifecycleRecord>(AgentRecord::Lifecycle)
+            .unwrap()
+            .unwrap()
+            .record
+    }
+
+    fn controller_record(&self) -> ControllerState {
+        self.journal()
+            .agent_record::<ControllerState>(AgentRecord::Controller)
+            .unwrap()
+            .unwrap()
+            .record
+    }
+}
+
+fn blocked(driver: &Driver, guard: Guard) -> Vec<BlockedReason> {
+    driver
+        .controller_status()
+        .unwrap()
+        .guards
+        .iter()
+        .find(|status| status.guard == guard)
+        .unwrap()
+        .blocked
+        .clone()
+}
+
+fn phase(driver: &Driver, guard: Guard) -> GuardPhase {
+    driver
+        .controller_status()
+        .unwrap()
+        .guards
+        .iter()
+        .find(|status| status.guard == guard)
+        .unwrap()
+        .phase
+}
+
+#[test]
+fn with_no_authority_record_the_agent_only_observes_and_reports_it() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.file("a");
+    let mut driver = bench.start();
+    assert_eq!(bench.status().state, RunState::Starting);
+    for _ in 0..12 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    // The trigger qualified, and nothing was removed.
+    assert!(bench.root.join("a").exists());
+    assert_eq!(
+        blocked(&driver, Guard::Disk),
+        vec![BlockedReason::ObservationOnly]
+    );
+    let status: AgentStatus = bench.status();
+    assert_eq!(status.state, RunState::Running);
+    assert_eq!(status.policy.revision, None);
+    assert_eq!(status.policy.problem, None);
+    let controller = status.controller.unwrap();
+    assert!(controller.observation_only);
+    assert_eq!(controller.summary, Summary::Warning);
+    assert_eq!(bench.modes.lock().unwrap().len(), 0);
+
+    // An authority record whose source text is not the text of its
+    // revision is not usable: the agent still only observes.
+    let state: AuthorityState = enabled(&bench.text, &bench.registry);
+    let mut journal = bench.journal();
+    journal
+        .record_policy_revision(
+            &state.active.as_ref().unwrap().revision,
+            Some("schema_version = 1\n"),
+        )
+        .unwrap();
+    journal
+        .put_agent_record(
+            AgentRecord::Authority,
+            &state,
+            None,
+            wall(bench.clock.now()),
+        )
+        .unwrap();
+    for _ in 0..4 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert!(bench.root.join("a").exists());
+    assert_eq!(
+        bench.status().policy.problem.as_deref(),
+        Some("policy_revision_source_not_usable")
+    );
+    assert_eq!(
+        blocked(&driver, Guard::Disk),
+        vec![BlockedReason::ObservationOnly]
+    );
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
+}
+
+#[test]
+fn an_automatic_eviction_removes_the_candidates_of_the_test_rule_and_recovers() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    let first: PathBuf = bench.file("a");
+    let second: PathBuf = bench.file("b");
+    let mut driver = bench.start();
+
+    // The capacity is below the reclaim threshold for the sustain time.
+    let mut ticks: u32 = 0;
+    while (first.exists() || second.exists()) && ticks < 40 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+        ticks += 1;
+    }
+    assert!(!first.exists() && !second.exists(), "after {ticks} ticks");
+    // The window of 30 seconds qualified before the first removal.
+    assert!(ticks >= 7, "{ticks}");
+    // The emergency used the known candidates. No discovery started.
+    let modes: Vec<PreparationMode> = bench.modes.lock().unwrap().clone();
+    assert_ne!(modes.len(), 0);
+    assert!(modes.iter().all(|mode| *mode == PreparationMode::KnownOnly));
+    // Nothing was moved to the Trash of the fixture: an eviction is a
+    // removal.
+    assert_eq!(fs::read_dir(&bench.trash).unwrap().count(), 0);
+
+    // The result is in the state of the controller and in the journal.
+    driver.tick(Some(bench.sample(
+        5 * GIBIBYTE,
+        PressureState::Normal,
+        Vec::new(),
+    )));
+    let state: &ControllerState = driver.controller_state();
+    assert!(state.outstanding.is_none());
+    let incident = &state.policy.disk.incidents[0];
+    assert_eq!(incident.usage.consumed_bytes.get(), 2_000);
+    assert_eq!(incident.usage.consumed_items.get(), 2);
+    assert_eq!(incident.usage.reserved_bytes.get(), 0);
+    let finished: Vec<Notification> = bench
+        .notes
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|note| matches!(note, Notification::Finished { .. }))
+        .cloned()
+        .collect();
+    assert!(
+        matches!(
+            finished.as_slice(),
+            [Notification::Finished { guard: Guard::Disk, state, low_benefit: false, .. }]
+                if state == "Completed"
+        ),
+        "{finished:?}"
+    );
+    let journal = bench.journal();
+    assert_eq!(journal.unsettled_operation_count().unwrap(), 0);
+    let recorded: ControllerState = bench.controller_record();
+    assert_eq!(
+        recorded.policy.disk.incidents[0].usage.consumed_items.get(),
+        2
+    );
+    assert!(!recorded.clean_stop);
+    let status: AgentStatus = bench.status();
+    assert_eq!(
+        status.policy.revision,
+        Some(PolicyRevisionId::new("policy_1").unwrap())
+    );
+    assert_eq!(status.executor_epoch.as_str(), "epoch_1");
+    assert!(!status.limits.over_budget);
+
+    // The capacity is at the recovery target, and the incident closes
+    // after the stable time.
+    for _ in 0..16 {
+        driver.tick(Some(bench.sample(
+            30 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(driver.controller_state().disk_incidents.len(), 0);
+    assert_eq!(phase(&driver, Guard::Disk), GuardPhase::Normal);
+
+    let report: ShutdownReport = driver.shutdown(&mut TestIdle(bench.clock.clone()));
+    assert!(report.clean);
+    assert!(bench.lifecycle().stopped_cleanly);
+    assert!(bench.controller_record().clean_stop);
+    assert_eq!(bench.status().state, RunState::Stopped);
+    // The registration is released: a new lifetime has no reconciliation.
+    let next = bench.start();
+    assert_eq!(bench.lifecycle().unclean_stops, 0);
+    drop(next);
+}
+
+#[test]
+fn a_rule_in_the_proposed_state_removes_nothing_and_the_status_says_why() {
+    let mut bench = Bench::new(TestClock::fixed(), proposed_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("a");
+    let mut driver = bench.start();
+    for _ in 0..20 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert!(file.exists());
+    assert_eq!(
+        blocked(&driver, Guard::Disk),
+        vec![BlockedReason::RuleNotValidated {
+            rule: "test.cache".to_owned()
+        }]
+    );
+    assert_eq!(bench.modes.lock().unwrap().len(), 0);
+    assert_eq!(bench.journal().unsettled_operation_count().unwrap(), 0);
+    let controller = bench.status().controller.unwrap();
+    assert_eq!(controller.summary, Summary::Warning);
+}
+
+#[test]
+fn the_agent_over_its_own_budget_reduces_its_optional_work() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    let mut driver = bench.start();
+    // A warning state with no pressure: the candidates are prepared with
+    // a discovery.
+    for _ in 0..3 {
+        driver.tick(Some(bench.sample(
+            15 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(
+        bench.modes.lock().unwrap().as_slice(),
+        [PreparationMode::Refresh]
+    );
+    // The footprint is above the budget: no further discovery starts.
+    bench.footprint.store(512 * 1024 * 1024, Ordering::SeqCst);
+    bench.clock.advance(1_200 * SECOND);
+    for _ in 0..3 {
+        driver.tick(Some(bench.sample(
+            15 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(bench.modes.lock().unwrap().len(), 1);
+    let status: AgentStatus = bench.status();
+    assert!(status.limits.over_budget);
+    assert!(status.limits.optional_work_reduced);
+    assert_eq!(status.limits.footprint_bytes, Some(512 * 1024 * 1024));
+}
+
+#[test]
+fn a_wake_starts_each_window_again() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("a");
+    let mut driver = bench.start();
+    for _ in 0..5 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(phase(&driver, Guard::Disk), GuardPhase::Qualifying);
+    // The host slept: the window of before the sleep does not continue.
+    let mut woke: Sample = bench.sample(5 * GIBIBYTE, PressureState::Normal, Vec::new());
+    woke.woke = true;
+    driver.tick(Some(woke));
+    bench.clock.advance(SAMPLE);
+    for _ in 0..3 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert!(file.exists());
+    assert_eq!(phase(&driver, Guard::Disk), GuardPhase::Qualifying);
+    assert_eq!(bench.clock.discontinuities.load(Ordering::SeqCst), 1);
+}
+
+/// The memory samples of a child test: critical pressure with the child
+/// as the one eligible job.
+fn child_sample(bench: &Bench, member: &ProcessIdentity) -> Sample {
+    let at: u64 = bench.clock.now();
+    bench.sample(
+        100 * GIBIBYTE,
+        PressureState::Critical,
+        vec![application(
+            "members-child",
+            vec![member.clone()],
+            3 * GIBIBYTE,
+            at,
+        )],
+    )
+}
+
+/// Ticks with critical samples until the controller has a plan in
+/// progress with an admitted operation.
+fn run_to_operation(bench: &Bench, driver: &mut Driver, member: &ProcessIdentity) -> OperationId {
+    for _ in 0..40 {
+        driver.tick(Some(child_sample(bench, member)));
+        if let Some(operation_id) = driver
+            .controller_state()
+            .outstanding
+            .as_ref()
+            .and_then(|outstanding| outstanding.operation_id.clone())
+        {
+            return operation_id;
+        }
+        bench.clock.advance(SAMPLE);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "no operation was admitted: {:?}",
+        driver.controller_status()
+    );
+}
+
+#[test]
+fn an_automatic_stop_ends_a_child_of_the_test_and_charges_one_slot() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    bench.seed_authority();
+    let mut child = spawn_child(false);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let mut driver = bench.start();
+
+    let operation_id: OperationId = run_to_operation(&bench, &mut driver, &member);
+    // The graceful request ends the child. The exit is observed, and
+    // then the operation is finished.
+    let limit: Instant = Instant::now() + Duration::from_secs(20);
+    while driver.controller_state().outstanding.is_some() {
+        assert!(Instant::now() < limit, "the operation did not finish");
+        bench.clock.advance(SECOND);
+        std::thread::sleep(Duration::from_millis(20));
+        *bench.pressure.lock().unwrap() = PressureState::Normal;
+        driver.tick(None);
+    }
+    let status = child.0.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+
+    let view = driver.operation(&operation_id).unwrap();
+    assert_eq!(view.phase, Phase::Finished);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    let incident = driver.controller_state().policy.memory.incident.unwrap();
+    assert_eq!((incident.consumed_slots, incident.reserved_slots), (1, 0));
+    assert!(bench.notes.0.lock().unwrap().iter().any(|note| matches!(
+        note,
+        Notification::Finished { guard: Guard::Memory, state, .. } if state == "Completed"
+    )));
+    assert_eq!(bench.journal().unsettled_operation_count().unwrap(), 0);
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
+}
+
+#[test]
+fn a_stop_during_a_grace_period_sends_no_force_step_and_is_clean() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    bench.seed_authority();
+    let mut child = spawn_child(true);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let mut driver = bench.start();
+
+    let operation_id: OperationId = run_to_operation(&bench, &mut driver, &member);
+    // The graceful request is submitted, and the child ignores it. The
+    // operation waits for the grace period of 10 seconds.
+    for _ in 0..3 {
+        bench.clock.advance(SECOND);
+        driver.tick(None);
+    }
+    assert!(driver.controller_state().outstanding.is_some());
+    assert!(child.is_running());
+    let view = driver.operation(&operation_id).unwrap();
+    let graceful = view
+        .operation
+        .steps()
+        .iter()
+        .find(|step| step.action_class() == &ActionClass::RequestApplicationExit)
+        .unwrap();
+    assert!(graceful.progress().dispatch().is_possibly_submitted());
+    assert_ne!(view.phase, Phase::Finished);
+
+    // The stop request arrives in the grace period.
+    let report: ShutdownReport = driver.shutdown(&mut TestIdle(bench.clock.clone()));
+    assert!(report.clean);
+    // No force step was dispatched: the child is alive.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(child.is_running());
+
+    let journal = bench.journal();
+    let operation = journal.operation(&operation_id).unwrap().unwrap();
+    assert!(operation.state().is_settled());
+    assert_ne!(operation.state(), &OperationState::Completed);
+    let force = operation
+        .steps()
+        .iter()
+        .find(|step| step.action_class() == &ActionClass::ForceApplicationExit)
+        .unwrap();
+    assert!(!force.progress().dispatch().is_possibly_submitted());
+    // The checkpoint: the slot of the submitted request stays charged.
+    let recorded: ControllerState = bench.controller_record();
+    assert!(recorded.clean_stop);
+    assert!(recorded.outstanding.is_none());
+    assert_eq!(recorded.policy.memory.incident.unwrap().consumed_slots, 1);
+    assert!(bench.lifecycle().stopped_cleanly);
+}
+
+#[test]
+fn a_start_after_a_crash_reconciles_and_does_not_act_again() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    bench.seed_authority();
+    let mut child = spawn_child(true);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let mut driver = bench.start();
+    let operation_id: OperationId = run_to_operation(&bench, &mut driver, &member);
+    bench.clock.advance(SECOND);
+    driver.tick(None);
+    // The crash: the process ends with the graceful request submitted and
+    // no record of a stop.
+    drop(driver);
+    assert!(child.is_running());
+
+    let mut driver = bench.start();
+    // The operation of the lifetime before this one was reconciled before
+    // anything else. It is settled or its effect is not known, and it is
+    // never dispatched again.
+    let journal = bench.journal();
+    let operation = journal.operation(&operation_id).unwrap().unwrap();
+    assert_eq!(operation.executor_epoch().as_str(), "epoch_1");
+    assert_ne!(operation.state(), &OperationState::Admitted);
+    assert_ne!(operation.state(), &OperationState::Completed);
+    let lifecycle: LifecycleRecord = bench.lifecycle();
+    assert_eq!(lifecycle.unclean_stops, 1);
+    assert!(!lifecycle.stopped_cleanly);
+
+    // The incident of before the crash is not established, and the plan
+    // that was in progress stays charged.
+    let state: &ControllerState = driver.controller_state();
+    assert!(state.outstanding.is_none());
+    let record = state.memory_incident.clone().unwrap();
+    assert!(!record.established);
+    assert!(record.unknown_outcome);
+    assert_eq!(state.policy.memory.incident.unwrap().consumed_slots, 1);
+
+    // The pressure continues. The restart backoff is in effect at the
+    // start; the windows of the new lifetime qualify after it, and then
+    // the incident that is not established inhibits the guard.
+    driver.tick(Some(child_sample(&bench, &member)));
+    assert!(bench.status().restart_backoff);
+    bench.clock.advance(SAMPLE);
+    let mut reasons: Vec<BlockedReason> = Vec::new();
+    for _ in 0..12 {
+        driver.tick(Some(child_sample(&bench, &member)));
+        for reason in blocked(&driver, Guard::Memory) {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(reasons, vec![BlockedReason::IncidentStateNotEstablished]);
+    assert!(driver.controller_state().outstanding.is_none());
+    let status: AgentStatus = bench.status();
+    assert_eq!(status.unclean_stops, 1);
+    assert_eq!(status.executor_epoch.as_str(), "epoch_2");
+    // The child got no second request and no force step.
+    assert!(child.is_running());
+    let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
+    let force = operation
+        .steps()
+        .iter()
+        .find(|step| step.action_class() == &ActionClass::ForceApplicationExit)
+        .unwrap();
+    assert!(!force.progress().dispatch().is_possibly_submitted());
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
+    // A clean stop resets the count of the restart backoff.
+    drop(bench.start());
+    assert_eq!(bench.lifecycle().unclean_stops, 0);
+}
+
+#[test]
+fn a_second_agent_on_the_same_journal_is_busy_and_changes_nothing() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    let driver = bench.start();
+    assert!(matches!(bench.try_start(), DriverStart::Busy));
+    assert_eq!(bench.status().executor_epoch.as_str(), "epoch_1");
+    drop(driver);
+}
+
+/// A collector that gives quiet samples at the time of the clock.
+struct QuietCollector {
+    clock: TestClock,
+    collections: Arc<AtomicU64>,
+}
+
+impl Collector for QuietCollector {
+    fn collect(&mut self) -> Sample {
+        self.collections.fetch_add(1, Ordering::SeqCst);
+        let at: u64 = self.clock.now();
+        Sample {
+            observations: Observations {
+                volumes: vec![volume(Some(100 * GIBIBYTE), at)],
+                memory: memory(Some(PressureState::Normal), at, Vec::new()),
+                candidates: None,
+            },
+            woke: false,
+            control_plane: Some(Vec::new()),
+            degraded: Vec::new(),
+        }
+    }
+}
+
+/// A manual Trash plan of a client for the entry `name` below the root.
+fn trash_plan(bench: &Bench, name: &str) -> Plan {
+    let now: u64 = bench.clock.now();
+    let target_id = TargetId::new("client-target").unwrap();
+    Plan::seal(PlanContent {
+        schema_version: PLAN_SCHEMA_VERSION,
+        plan_id: PlanId::new("client-plan").unwrap(),
+        principal: Principal {
+            uid: user(),
+            session: None,
+            role: ClientRole::Cli,
+        },
+        trigger: Trigger::manual(),
+        authority: AuthorityBinding {
+            policy_revision: PolicyRevisionId::new("policy_1").unwrap(),
+            action_grants: Vec::new(),
+            privilege_grant: None,
+        },
+        executor: ExecutorRole::User,
+        targets: vec![PlanTarget {
+            target_id: target_id.clone(),
+            binding: TargetBinding::File(FileBinding {
+                root_id: RootId::new(ROOT_ID).unwrap(),
+                relative_entry: LosslessPath::from_bytes(name.as_bytes()).unwrap(),
+                volume_id: VolumeId::new(VOLUME).unwrap(),
+                mount_id: MountId::new(MOUNT).unwrap(),
+                object_type: FileObjectType::RegularFile,
+                owner: user(),
+                object: Some(object_of(&bench.root.join(name))),
+                rule: None,
+                charge: WorkCharge::new(Bytes::new(10), EntryCount::new(1)),
+            }),
+        }],
+        steps: vec![PlannedStep {
+            step_id: StepId::new("client-step").unwrap(),
+            action_class: ActionClass::MoveToTrash,
+            target_id,
+        }],
+        limits: PlanLimits {
+            work: Some(WorkCharge::new(Bytes::new(10), EntryCount::new(1))),
+            execution_deadline: Nanoseconds::new(60 * SECOND),
+            grace: None,
+            verification_window: Nanoseconds::new(5 * SECOND),
+            escalation: Escalation::None,
+        },
+        validity: Validity {
+            clock_domain: clock_domain(),
+            boot_id: boot(),
+            created_at: MonotonicNanos::new(now),
+            expires_at: MonotonicNanos::new(now + 120 * SECOND),
+            created_wall: wall(now),
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_client_request_through_the_queue_is_served_while_the_loop_runs() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("client-file");
+    let driver = bench.start();
+    let stop: StopHandle = StopHandle::new();
+    let collections: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let collector = Box::new(QuietCollector {
+        clock: bench.clock.clone(),
+        collections: Arc::clone(&collections),
+    });
+    // The sender is the pressure event source of the test.
+    let (events, receiver) = std::sync::mpsc::sync_channel::<()>(4);
+    let settings = ServiceSettings {
+        // Longer than the test, so that only a pressure event starts a
+        // second collection.
+        sample_interval: Duration::from_secs(120),
+        pressure_sample_interval: Duration::from_millis(100),
+        idle_interval: Duration::from_millis(50),
+    };
+    let service_stop: StopHandle = stop.clone();
+    let clock: Arc<dyn AgentClock> = Arc::new(bench.clock.clone());
+    let service = std::thread::spawn(move || {
+        run(driver, collector, receiver, settings, &service_stop, clock)
+    });
+
+    // The client: a second connection writes the plan and the request.
+    let plan: Plan = trash_plan(&bench, "client-file");
+    let mut client = bench.journal();
+    client.record_plan(&plan).unwrap();
+    let request_id = RequestId::new("request-1").unwrap();
+    client
+        .enqueue_request(&QueuedRequest {
+            request_id: request_id.clone(),
+            principal: plan.principal.clone(),
+            body: RequestBody::Apply {
+                approval: PlanApproval {
+                    plan_id: plan.plan_id.clone(),
+                    digest: plan.digest().clone(),
+                },
+            },
+            enqueued_at: wall(bench.clock.now()),
+        })
+        .unwrap();
+    let limit: Instant = Instant::now() + Duration::from_secs(20);
+    let operation_id: OperationId = loop {
+        if let Some(RequestStatus::Completed { completion }) =
+            client.request_status(&request_id).unwrap()
+        {
+            match completion {
+                RequestCompletion::Operation { operation_id } => break operation_id,
+                other => panic!("the request was not admitted: {other:?}"),
+            }
+        }
+        assert!(Instant::now() < limit, "the request was not served");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    loop {
+        let settled: bool = client
+            .operation(&operation_id)
+            .unwrap()
+            .is_some_and(|operation| operation.state().is_settled());
+        if settled {
+            break;
+        }
+        assert!(Instant::now() < limit, "the operation did not settle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!file.exists());
+    assert!(bench.trash.join("client-file").exists());
+
+    // A pressure event starts a collection before the sample interval.
+    let before: u64 = collections.load(Ordering::SeqCst);
+    events.send(()).unwrap();
+    let limit: Instant = Instant::now() + Duration::from_secs(5);
+    while collections.load(Ordering::SeqCst) == before {
+        assert!(Instant::now() < limit, "the event started no collection");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The loop wrote the status while it served the request.
+    let status: AgentStatus = bench.status();
+    assert_eq!(status.state, RunState::Running);
+    assert_eq!(status.controller.unwrap().summary, Summary::Normal);
+
+    stop.request_stop();
+    let report: ShutdownReport = service.join().unwrap();
+    assert!(report.clean);
+    assert_eq!(bench.status().state, RunState::Stopped);
+    assert!(bench.lifecycle().stopped_cleanly);
+    // The lock is free: a client can start a transient coordinator.
+    drop(bench.start());
+}
+
+#[test]
+fn the_disk_guard_policy_of_the_fixture_names_the_test_rule() {
+    // The fixture and the registry agree, so a test of a refusal shows
+    // the lifecycle state and not a missing rule.
+    let registry = proposed_registry();
+    let state: AuthorityState = enabled(&config_text(&[]), &registry);
+    let active = state.active.as_ref().unwrap();
+    assert!(
+        active
+            .scope
+            .rules(PolicyId::DiskGuard)
+            .contains(&rule(svalnir_core::rule::LifecycleState::Proposed).reference)
+    );
+}

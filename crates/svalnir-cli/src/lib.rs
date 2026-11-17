@@ -17,6 +17,11 @@ pub mod cli;
 mod commands;
 pub mod output;
 
+// The read-only commands of Milestone 1 will run in this process through the
+// agent library.
+// TODO(npochaev): remove this line when a command uses the crate.
+use svalnir_agent as _;
+
 #[cfg(test)]
 mod tests;
 
@@ -33,7 +38,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    run_with_request_id(arguments, RequestId::generate(), stdout, stderr)
+    run_with_request_id(arguments, output::generate_request_id(), stdout, stderr)
 }
 
 fn run_with_request_id<I, T>(

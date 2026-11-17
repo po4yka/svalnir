@@ -50,26 +50,15 @@ impl From<ExitStatus> for ExitCode {
     }
 }
 
-/// Correlation identity of one invocation.
-///
-/// The value is opaque. It is not a plan, operation, or step identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct RequestId(String);
+pub use svalnir_core::id::RequestId;
 
-impl RequestId {
-    /// Makes an identity from the wall clock and the process ID.
-    pub fn generate() -> Self {
-        let nanoseconds: u128 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        Self(format!("request_{nanoseconds:x}_{:x}", std::process::id()))
-    }
-
-    /// Uses the given text as the identity.
-    pub fn from_text(text: impl Into<String>) -> Self {
-        Self(text.into())
-    }
+/// Makes the correlation identity of one invocation from the wall clock and
+/// the process ID.
+pub fn generate_request_id() -> RequestId {
+    let nanoseconds: u128 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    RequestId::from_client_parts(nanoseconds, std::process::id())
 }
 
 /// Variant of a JSON response.

@@ -65,6 +65,10 @@ Monotonic timestamps are comparable only under the specified clock domain and bo
 
 Enumeration values in this document's examples use the spellings of their source specifications: state and effect names from ACTION_CONTRACTS, decision reasons from POLICY_SPEC, and availability reasons from RESOURCE_MODEL. Those specifications mark the spellings as conceptual. The published schema must fix one serialized spelling for each enumeration before the interface is declared stable.
 
+An opaque ID has 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. A wall-clock timestamp has the `Z` offset and a fraction of zero, three, six, or nine digits, whichever is the smallest exact one; a decoder accepts a fraction of one to nine digits and rejects another offset and a leap second.
+
+Identity evidence uses these encodings. A process ID, a user ID, and a device number are JSON integers. A process start time is microseconds since the Unix epoch as a canonical base-10 string, and an inode number is a canonical base-10 string. A filesystem path in a response is a tagged object: `{"encoding": "utf8", "value": "..."}` for a path that is valid UTF-8, and `{"encoding": "hex", "value": "..."}` with lowercase hexadecimal bytes for another path. A decoder rejects an empty path, a NUL byte, an unknown encoding, and `hex` for bytes that are valid UTF-8.
+
 An opaque target ID resolves to server-held identity evidence. It is not permission to inspect or modify that entity. A client cannot replace the owner, start time, mount generation, or rule scope in an apply request.
 
 For discovery requests that accept a filesystem path, use a tagged UTF-8 path or an explicitly supported byte-preserving encoding. Reject NUL, malformed encoding, and ambiguous competing path representations. Keep an escaped display label separate. Relative CLI paths are resolved against the invocation directory before submission; the agent must not interpret them relative to its own working directory. Execution still revalidates the resolved identity and approved scope.

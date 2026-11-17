@@ -122,6 +122,8 @@ Coverage is independent of availability. A scan can successfully report a partia
 
 A failed current query produces an unavailable observation. An older successful observation can remain in history with its original timestamp. Clients may label it “last observed,” but must not substitute it into current admission without satisfying freshness.
 
+The initial registered `unit` spellings are `byte`, `page`, `entry`, `nanosecond`, `percent`, and `state`. The initial scope `kind` spellings are `host`, `volume`, `capacity_domain`, `process`, and `application`. A decoder keeps an unknown `unit`, `kind`, `coverage`, `reason`, scope `kind`, or state value as an explicit unrecognized value with its received text. A decoder rejects an observation whose `availability` is not `available` or `unavailable`, whose `value` and `reason` do not agree with its `availability`, or whose sample finishes before it starts.
+
 Unknown units, states, metric definitions, or incompatible revisions cannot be coerced to known meanings. A client that cannot interpret a new pressure state renders it as unsupported or unknown, never normal.
 
 ## 5. Time, freshness, and snapshots

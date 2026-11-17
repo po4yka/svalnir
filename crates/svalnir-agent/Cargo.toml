@@ -8,13 +8,33 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+name = "svalnir_agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "svalnir-agent"
 path = "src/main.rs"
 
+# The Milestone 1 modules use these dependencies. A session that fills one
+# module directory adds no dependency here. No rendering crate is permitted
+# in this graph.
 [dependencies]
+libc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+svalnir-core.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
 
 [lints]
 workspace = true

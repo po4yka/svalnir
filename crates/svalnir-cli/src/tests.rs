@@ -16,7 +16,7 @@ fn svalnir(arguments: &[&str]) -> Outcome {
     let mut stderr: Vec<u8> = Vec::new();
     let status = run_with_request_id(
         std::iter::once("svalnir").chain(arguments.iter().copied()),
-        RequestId::from_text("request_test"),
+        RequestId::new("request_test").unwrap(),
         &mut stdout,
         &mut stderr,
     );
@@ -271,7 +271,7 @@ fn closed_pipe_is_quiet_and_keeps_the_success_status() {
     let mut stderr: Vec<u8> = Vec::new();
     let status = run_with_request_id(
         ["svalnir", "license"],
-        RequestId::from_text("request_test"),
+        RequestId::new("request_test").unwrap(),
         &mut ClosedPipe,
         &mut stderr,
     );

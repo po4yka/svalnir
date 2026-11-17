@@ -1,6 +1,6 @@
 # Contributing to Svalnir
 
-**Current stage:** design specification with a skeleton workspace. This checkout contains the documentation and a Cargo workspace with five placeholder crates. It contains no product behavior and no validated release. Keep this section and the development instructions current as implementation lands.
+**Current stage:** design specification with a skeleton workspace. This checkout contains the documentation and a Cargo workspace with five crates. The CLI parses the proposed command surface. The checkout contains no monitoring, cleanup, or process-control behavior and no validated release. Keep this section and the development instructions current as implementation lands.
 
 Automatic eviction of approved regenerable data and policy-authorized application termination, including force quit, are first-release requirements. Contributions should implement those capabilities through the existing policy and action contracts. An observation-only build is a useful development milestone; it does not satisfy the complete first-release scope.
 
@@ -69,7 +69,7 @@ Explain any difference between the reproducer and the original environment. A sm
 
 Inspect the working-tree state, applicable directory instructions, manifests, toolchain files, and development scripts before choosing commands. Use a topic branch or an isolated worktree when it helps preserve concurrent work. Keep unrelated local changes intact.
 
-The workspace has a root `Cargo.toml`, `Cargo.lock`, a toolchain pinned in `rust-toolchain.toml`, lint settings in `Cargo.toml` and `clippy.toml`, and five crates under `crates/`. The crates are placeholders: the `svalnir` binary parses arguments only, and no collector, policy, action, or IPC code exists. Do not assume that a command or feature from the specifications is runnable until its code exists.
+The workspace has a root `Cargo.toml`, `Cargo.lock`, a toolchain pinned in `rust-toolchain.toml`, lint settings in `Cargo.toml` and `clippy.toml`, and five crates under `crates/`. The `svalnir` binary parses the command surface and implements `completions` and `license`; each other subcommand reports `not_implemented` with exit status `3`. No collector, policy, action, or IPC code exists. Do not assume that a command or feature from the specifications is runnable until its code exists.
 
 When you change the toolchain, the Rust edition, or a dependency, update the manifests and `Cargo.lock` together and document changed build or test entry points in the same change. Introduce checked-in scripts when they remove meaningful repetition; keep commands discoverable without adding an unnecessary orchestration layer.
 

@@ -93,8 +93,8 @@ Optional future namespaces do not appear as functional commands until their adap
 
 ### Common options
 
-- `--format text|json|ndjson`: text by default; JSON for snapshots/results; NDJSON only for streaming commands.
-- `--config PATH`: choose a proposal for supported configuration/simulation operations. It never silently activates that file or changes what a status query calls effective.
+- `--format text|json|ndjson`: text by default; JSON for snapshots/results; NDJSON only for streaming commands. `completions` accepts only text.
+- `--config PATH`: choose a proposal for supported configuration/simulation operations (`config validate`, `config apply`, and `policy simulate`). It never silently activates that file or changes what a status query calls effective.
 - `--timeout DURATION`: bound client waiting/transport behavior; not a cancellation guarantee for admitted work.
 - `--yes`: permit a plan-bound noninteractive approval where supported; not an override for stale state or exclusions.
 - `--no-wait`: return an admitted operation reference instead of waiting for completion, where supported.
@@ -108,7 +108,7 @@ Every admitted scan has a scan ID and bounded scope. `--save` retains its catalo
 
 A cleanup selection preset such as `--profile developer` filters candidates. It is separate from the Observe/Balanced/Aggressive operating templates and cannot enable rules or grant authority.
 
-The proposed manual cleanup modes are `trash`, `permanent`, and `evict`, mapping respectively to `MoveToTrash`, `DeleteSelectedFiles`, and rule-based `EvictRegenerableData`. The evict mode requires an exact supported rule selection. The policy's `automatic_mode = "permanent"` remains a separate configuration field.
+The proposed manual cleanup modes are `trash`, `permanent`, and `evict`, mapping respectively to `MoveToTrash`, `DeleteSelectedFiles`, and rule-based `EvictRegenerableData`. The evict mode requires an exact supported rule selection, given as `--rule RULE_ID`. The policy's `automatic_mode = "permanent"` remains a separate configuration field.
 
 ## 5. Manual approval and standing authorization
 
@@ -162,7 +162,7 @@ svalnir agent resume
 
 Activation compares the expected revision. An interactive enable flow can fetch and present the current proposal before binding its request; a noninteractive mutation must bind the reviewed revision explicitly. A conflict requires renewed evaluation, not a silent overwrite.
 
-A rearm request identifies the incident and current budget generation and records the newly authorized generation. It does not erase history, bypass cooldowns, or resolve an unknown prior effect.
+A rearm request identifies the incident and current budget generation (`policy rearm POLICY --incident INCIDENT_ID --generation GENERATION`) and records the newly authorized generation. It does not erase history, bypass cooldowns, or resolve an unknown prior effect.
 
 ## 7. JSON response envelope
 

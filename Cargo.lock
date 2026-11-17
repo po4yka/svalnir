@@ -890,6 +890,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2042,7 +2051,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2945,7 +2954,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6133,11 +6142,18 @@ name = "svalnir-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "clap_complete",
+ "serde",
+ "serde_json",
+ "svalnir-core",
 ]
 
 [[package]]
 name = "svalnir-core"
 version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "svalnir-gui"

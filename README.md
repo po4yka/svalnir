@@ -6,7 +6,7 @@ Svalnir is designed to keep a Mac usable when storage, memory, and background wo
 
 The background agent watches available disk capacity, system memory pressure, swap activity, and application resource usage. Under an explicitly enabled policy, it can automatically evict approved regenerable files, terminate applications that exceed their memory budgets, and force quit eligible applications during sustained critical memory pressure.
 
-**Project status: design specification with a skeleton workspace.** This README describes the intended product and its proposed interfaces. The repository contains a Cargo workspace with five placeholder crates that implement no product behavior. This README does not claim that a working implementation, downloadable release, package, or benchmark already exists. Commands, configuration keys, crate boundaries, and milestones below are a coordinated starting specification and may evolve during implementation.
+**Project status: design specification with a skeleton workspace.** This README describes the intended product and its proposed interfaces. The repository contains a Cargo workspace with five crates. The `svalnir` CLI parses the proposed command surface; no crate implements monitoring, cleanup, or process control. This README does not claim that a working implementation, downloadable release, package, or benchmark already exists. Commands, configuration keys, crate boundaries, and milestones below are a coordinated starting specification and may evolve during implementation.
 
 ## Contents
 
@@ -555,7 +555,7 @@ GPUI is actively developed and documents breaking changes before 1.0. The implem
 | `svalnir-cli` | Argument parsing, rendering, structured output, and calls into the shared application services |
 | `svalnir-gui` | GPUI views, interaction, notifications, and client state |
 
-The workspace contains these five crates under `crates/`. Each crate is currently a placeholder; the table gives its intended responsibility. macOS-specific bindings initially live behind internal platform modules; they can become a separate crate when the boundary is useful. Optional system extensions remain separate deployable components.
+The workspace contains these five crates under `crates/`. Only the CLI argument and output contract is implemented; the table gives the intended responsibility of each crate. macOS-specific bindings initially live behind internal platform modules; they can become a separate crate when the boundary is useful. Optional system extensions remain separate deployable components.
 
 ```mermaid
 flowchart TD
@@ -750,7 +750,7 @@ cargo run -p svalnir-cli --bin svalnir --locked -- --help
 cargo build -p svalnir-gui --locked
 ```
 
-The `svalnir` binary currently parses arguments only; the subcommands in this README are not implemented. Use `--locked`, and change `Cargo.lock` only as an intended dependency update. Keep privileged APIs behind small reviewed interfaces, document unsafe invariants, and avoid passing unchecked strings across process or privilege boundaries.
+The `svalnir` binary parses the command surface of this README and implements `completions` and `license`. Each other subcommand reports `not_implemented` with exit status `3` and changes nothing. Use `--locked`, and change `Cargo.lock` only as an intended dependency update. Keep privileged APIs behind small reviewed interfaces, document unsafe invariants, and avoid passing unchecked strings across process or privilege boundaries.
 
 ### Validation strategy
 

@@ -1,26 +1,10 @@
-//! Svalnir command-line client.
-//!
-//! Parses arguments, renders output, and sends requests to the shared
-//! application services. It has no independent destructive execution path.
+//! Entry point of the `svalnir` binary. The library crate has the behavior.
 
-use clap::Parser;
+use std::io;
+use std::process::ExitCode;
 
-/// Local macOS resource manager.
-#[derive(Debug, Parser)]
-#[command(name = "svalnir", version, about)]
-struct Cli {}
-
-fn main() {
-    let _cli: Cli = Cli::parse();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Cli;
-    use clap::CommandFactory;
-
-    #[test]
-    fn command_definition_is_valid() {
-        Cli::command().debug_assert();
-    }
+fn main() -> ExitCode {
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    svalnir_cli::run(std::env::args_os(), &mut stdout, &mut stderr).into()
 }

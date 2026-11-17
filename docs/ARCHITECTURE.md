@@ -26,7 +26,7 @@ These invariants govern new integrations as well as the initial disk and memory 
 
 ## 2. Components and dependency direction
 
-The Cargo workspace contains five crates under `crates/`. Their manifests exist and each crate is a placeholder; the table gives the intended responsibilities, which are not yet implemented.
+The Cargo workspace contains five crates under `crates/`. `svalnir-cli` implements the argument and output contract of [INTERFACES.md](INTERFACES.md), and the other crates are placeholders; the table gives the intended responsibilities, which are not yet implemented.
 
 | Component | Responsibilities | Must not own |
 | --- | --- | --- |

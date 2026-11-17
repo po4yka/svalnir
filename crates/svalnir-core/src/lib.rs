@@ -4,3 +4,5 @@
 //! This crate has no rendering, launchd, deletion, or signaling side effects.
 
 #![forbid(unsafe_code)]
+
+pub mod duration;

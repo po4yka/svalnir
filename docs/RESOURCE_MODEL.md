@@ -264,7 +264,7 @@ Membership requires positive application/job evidence. An association records it
 
 An exited member is not simply a zero reading. Verify its exit and update the membership snapshot; an inaccessible member remains missing. Partial coverage cannot silently satisfy or clear a complete-application budget predicate. A membership change invalidates the corresponding qualifying window while preserving incident usage and cooldown history.
 
-Foreground state, owner, protected status, and application liveness are independent evidence. Unknown foreground identity is not background. Ordinary collection avoids raw arguments, environment variables, file contents, and unnecessary cross-user inventory.
+Foreground state, owner, protected status, and application liveness are independent evidence. Unknown foreground identity is not background. The list of running applications and the active state of each entry are current only when the main run loop of the collecting process ran after the previous read. A collector with no such evidence reports each foreground state as unknown and marks the snapshot as possibly stale. Ordinary collection avoids raw arguments, environment variables, file contents, and unnecessary cross-user inventory.
 
 ## 12. Swap and optional CPU context
 

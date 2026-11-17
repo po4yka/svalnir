@@ -15,8 +15,12 @@
 //!
 //! The list of running applications can be older than the collection:
 //! `NSWorkspace` refreshes it, and the active state of each entry, only when
-//! the main run loop of the process runs. A collector in a process with no
-//! main run loop reads the list of its first call. An entry gives a
+//! the main run loop of the process runs. The macOS source lets the main run
+//! loop run before each list after the first one
+//! ([`turn_main_run_loop`](crate::platform::run_loop::turn_main_run_loop)).
+//! A collector on a thread that is not the main thread, in a process whose
+//! main thread does not run its run loop, reads the list of its first call.
+//! An entry gives a
 //! membership only when its executable path is the path of the recorded
 //! process, so a new process that got the PID of an application that quit
 //! does not get the membership. The source says whether the list is known to

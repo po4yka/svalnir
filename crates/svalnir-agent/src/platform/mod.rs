@@ -9,5 +9,6 @@
 
 pub mod memory;
 pub mod process;
+pub mod run_loop;
 pub mod sleep;
 pub mod volume;

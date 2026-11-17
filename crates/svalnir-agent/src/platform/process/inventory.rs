@@ -15,8 +15,12 @@
 //!
 //! The list of running applications can be older than the collection:
 //! `NSWorkspace` refreshes it, and the active state of each entry, only when
-//! the main run loop of the process runs. A collector in a process with no
-//! main run loop reads the list of its first call. An entry gives a
+//! the main run loop of the process runs. The macOS source lets the main run
+//! loop run before each list after the first one
+//! ([`turn_main_run_loop`](crate::platform::run_loop::turn_main_run_loop)).
+//! A collector on a thread that is not the main thread, in a process whose
+//! main thread does not run its run loop, reads the list of its first call.
+//! An entry gives a
 //! membership only when its executable path is the path of the recorded
 //! process, so a new process that got the PID of an application that quit
 //! does not get the membership. The source says whether the list is known to
@@ -41,8 +45,10 @@ use svalnir_core::process::{
     AttributionMethod, ExecutableIdentity, Pid, ProcessAssociation, ProcessIdentity,
     ProcessStartTime, Uid, VerifiedMembership,
 };
-use svalnir_core::quantity::{Bytes, CounterValue};
+use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds};
 use svalnir_core::time::{MonotonicNanos, WallTime};
+
+use crate::platform::sleep::{bracketed_sleep_reading, sleep_reading};
 use thiserror::Error;
 
 use super::source::{
@@ -226,6 +232,10 @@ pub struct ProcessSnapshot {
     pub finished_monotonic_ns: MonotonicNanos,
     /// The wall-clock time of the collection, for display.
     pub captured_at: WallTime,
+    /// The cumulative sleep time of the host during the collection. It has
+    /// no value when the host slept during the collection. A CPU use between two snapshots with different sleep times has a sleep
+    /// in its interval.
+    pub sleep_time: Reading<Nanoseconds>,
     /// The recorded processes, in PID order.
     pub records: Vec<ProcessRecord>,
     /// The processes that were found and not recorded.
@@ -343,6 +353,9 @@ impl<S: ProcessSource> ProcessCollector<S> {
     pub fn collect(&self) -> Result<ProcessSnapshot, CollectError> {
         let started: MonotonicNanos = self.now()?;
         let captured_at: WallTime = self.source.wall_now().map_err(CollectError::Clock)?;
+        // The sleep time is read here and again after the last process, so a
+        // sleep during the collection gives no sleep time.
+        let sleep_before: Reading<Nanoseconds> = sleep_reading(self.source.sleep_time());
         let timebase: Result<Timebase, QueryFailure> = self.source.timebase();
         let mut pids: Vec<Pid> = self.source.list_pids().map_err(CollectError::ProcessList)?;
         pids.sort_unstable();
@@ -394,12 +407,15 @@ impl<S: ProcessSource> ProcessCollector<S> {
             records.push(self.record(entry, association, foreground, captured_at, timebase)?);
         }
 
+        let sleep_time: Reading<Nanoseconds> =
+            bracketed_sleep_reading(&sleep_before, sleep_reading(self.source.sleep_time()));
         Ok(ProcessSnapshot {
             boot_id: self.context.boot_id.clone(),
             clock_domain: self.clock_domain.clone(),
             started_monotonic_ns: started,
             finished_monotonic_ns: self.now()?,
             captured_at,
+            sleep_time,
             records,
             omissions,
             launch_services_unavailable: applications.err().map(QueryFailure::reason),

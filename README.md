@@ -239,7 +239,7 @@ For each accessible process, Svalnir should expose:
 
 Physical footprint and RSS are different quantities. Footprint can account for dirty, compressed, and swapped memory, and relevant GPU allocations; it is not a synonym for currently resident RAM. Application totals are estimates when shared resources or incomplete attribution prevent exact accounting. See [Apple's memory analysis session][memory-footprint] and [Metal memory guidance][metal-memory].
 
-The Rust `sysinfo` crate is useful for inventory and general process metrics, but its memory values must not be renamed to macOS physical footprint. Native APIs supply the additional semantics where supported. Missing or restricted metrics appear as **unavailable**, **stale**, or **unknown**, never as a fabricated zero. See [sysinfo process documentation][sysinfo-process].
+Native macOS collectors supply the process inventory and the memory metrics. A resident-size value must not be renamed to macOS physical footprint. Missing or restricted metrics appear as **unavailable**, **stale**, or **unknown**, never as a fabricated zero.
 
 ### What swap management means
 
@@ -582,9 +582,8 @@ Read-only scans can run without the persistent agent when permissions allow. Mut
 | GUI | `gpui-kit`: the GPUI snapshot that it pins, its component library, and the matching platform integration |
 | Serialization/configuration | `serde`, `serde_json`, and TOML |
 | Local state | SQLite through `rusqlite`, with bounded retention and explicit migrations |
-| Diagnostics | `tracing`, typed errors with `thiserror`, optional user-facing diagnostics with `miette` |
-| General inventory | `sysinfo`, augmented by native macOS collectors |
-| Native integration | Focused `objc2` framework bindings, `dispatch2`, and audited libc/Mach interfaces |
+| Diagnostics | `tracing` and typed errors with `thiserror` |
+| Inventory and native integration | Native macOS collectors: focused `objc2` framework bindings, `dispatch2`, and audited libc/Mach interfaces |
 | Background scheduling | macOS `launchd`; Rust async/background workers where appropriate |
 
 This table gives the architectural choices. The root `Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` are the source of truth for the exact dependency versions, feature flags, Rust edition, and pinned toolchain. The lint configuration is in `Cargo.toml` and `clippy.toml`. Background runtimes and GPUI's executor need a deliberate bridge; the GUI must not bring rendering dependencies into the headless agent.
@@ -843,7 +842,6 @@ See [LICENSE](LICENSE) for the complete license text, or read the [GNU GPLv3][gp
 [sysctl]: https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/sysctl.h
 [memory-footprint]: https://developer.apple.com/videos/play/wwdc2022/10106/
 [metal-memory]: https://developer.apple.com/documentation/xcode/analyzing-the-memory-usage-of-your-metal-app
-[sysinfo-process]: https://docs.rs/sysinfo/latest/sysinfo/struct.Process.html
 [app-terminate]: https://developer.apple.com/documentation/appkit/nsrunningapplication/terminate()
 [app-force-terminate]: https://developer.apple.com/documentation/appkit/nsrunningapplication/forceterminate()
 [app-terminated]: https://developer.apple.com/documentation/appkit/nsrunningapplication/isterminated

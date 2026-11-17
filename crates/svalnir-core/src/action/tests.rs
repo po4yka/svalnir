@@ -3,15 +3,16 @@
 use serde_json::{Value, json};
 
 use super::{
-    ActionClass, ActionError, ActionStage, ApplicationBinding, Attribution, CapacityEffect, Check,
-    Checked, ClientRole, Correlation, DispatchState, Durability, EffectEvidence, EnvelopeContent,
-    EnvelopeError, ErrorCode, ErrorFamily, Escalation, EvidenceBinding, ExecutorRole, FileBinding,
-    FileObjectType, LeaseResource, NativeResult, Operation, OperationError, OperationState,
-    OutcomeError, PLAN_SCHEMA_VERSION, Plan, PlanApproval, PlanContent, PlanError, PlanLimits,
-    PlanState, PlanTarget, PlannedStep, Principal, RecordingMode, RequestEnvelope, Reservation,
-    ResourceEffect, ResourceLease, StepLimits, StepState, StopReason, TargetBinding, TargetEffect,
-    TargetResult, TargetResultRecord, TransitionError, Trigger, TriggerClass, Validity, WorkCharge,
-    aggregate, aggregate_step,
+    ActionClass, ActionError, ActionStage, ApplicationBinding, Attribution, CandidateBindingError,
+    CapacityEffect, Check, Checked, ClientRole, Correlation, DispatchState, Durability,
+    EffectEvidence, EnvelopeContent, EnvelopeError, ErrorCode, ErrorFamily, Escalation,
+    EvidenceBinding, ExecutorRole, FileBinding, FileObjectType, LeaseResource, NativeResult,
+    Operation, OperationError, OperationState, OutcomeError, PLAN_SCHEMA_VERSION, Plan,
+    PlanApproval, PlanContent, PlanError, PlanLimits, PlanState, PlanTarget, PlannedStep,
+    Principal, RecordingMode, RequestEnvelope, Reservation, ResourceEffect, ResourceLease,
+    StepLimits, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
+    TargetResultRecord, TransitionError, Trigger, TriggerClass, Validity, WorkCharge, aggregate,
+    aggregate_step,
 };
 use crate::authority::{ActionGrantRef, AuthorityBinding, Generation, PrivilegeGrantRef};
 use crate::digest::ContentDigest;
@@ -23,7 +24,10 @@ use crate::id::{
     StepId, TargetId, VolumeId,
 };
 use crate::observation::Observation;
-use crate::policy::{ContinuityGeneration, EvaluationClock};
+use crate::policy::{
+    ApplicationCandidate, ContinuityGeneration, ControlPlaneProcess, EvaluationClock,
+    ForegroundStatus, ProtectionContext, ProtectionFact,
+};
 use crate::process::{
     AttributionMethod, Pid, ProcessAssociation, ProcessIdentity, ProcessStartTime, Uid,
 };
@@ -928,6 +932,84 @@ fn a_plan_expires_at_its_expiry_and_in_another_clock_context() {
         ..clock(1_500)
     };
     assert!(plan.is_expired(&other_domain));
+}
+
+#[test]
+fn an_application_binding_is_the_membership_snapshot_of_the_policy_candidate() {
+    let candidate =
+        |hard_protection: ProtectionFact, processes: Vec<ProcessIdentity>| ApplicationCandidate {
+            processes,
+            membership_snapshot: MembershipSnapshotId::new("members_1").unwrap(),
+            foreground: ForegroundStatus::Background,
+            footprint: capacity_observation("volume_1", &json!("1")),
+            hard_protection,
+        };
+    let members = || vec![member("proc_1", 4242), member("proc_2", 4243)];
+    let binding =
+        ApplicationBinding::from_candidate(&candidate(ProtectionFact::NotProtected, members()));
+    assert_eq!(binding, Ok(application_binding()));
+    // A hard protection, or an unknown one, gives no target. A manual
+    // request does not remove it.
+    assert_eq!(
+        ApplicationBinding::from_candidate(&candidate(ProtectionFact::Protected, members())),
+        Err(CandidateBindingError::Protected)
+    );
+    assert_eq!(
+        ApplicationBinding::from_candidate(&candidate(ProtectionFact::Unknown, members())),
+        Err(CandidateBindingError::ProtectionUnknown)
+    );
+    // The members have positive evidence for one instance.
+    let unattributed = ProcessIdentity {
+        association: ProcessAssociation::Unattributed,
+        ..member("proc_3", 5000)
+    };
+    let other_instance = ProcessIdentity {
+        association: ProcessAssociation::Application {
+            instance_id: ApplicationInstanceId::new("app_2").unwrap(),
+            bundle_identifier: "com.example.Example".to_owned(),
+            attribution: AttributionMethod::LaunchServices,
+        },
+        ..member("proc_3", 5000)
+    };
+    for processes in [
+        Vec::new(),
+        vec![member("proc_1", 4242), unattributed],
+        vec![member("proc_1", 4242), other_instance],
+    ] {
+        assert_eq!(
+            ApplicationBinding::from_candidate(&candidate(ProtectionFact::NotProtected, processes)),
+            Err(CandidateBindingError::Membership)
+        );
+    }
+
+    // The binding gives its members to the catalog of hard protections.
+    let binding = application_binding();
+    let context = |control_plane| ProtectionContext {
+        principal: Uid::new(501),
+        control_plane,
+    };
+    // The fixture members have no executable evidence, so the catalog
+    // cannot classify them.
+    assert_eq!(
+        binding.hard_protection(&context(Some(&[]))),
+        ProtectionFact::Unknown
+    );
+    let other_user = ProtectionContext {
+        principal: Uid::new(502),
+        control_plane: Some(&[]),
+    };
+    assert_eq!(
+        binding.hard_protection(&other_user),
+        ProtectionFact::Protected
+    );
+    let own = [ControlPlaneProcess {
+        pid: Pid::new(4242).unwrap(),
+        start_time: ProcessStartTime::from_timeval(1_794_830_400, 0).unwrap(),
+    }];
+    assert_eq!(
+        binding.hard_protection(&context(Some(&own))),
+        ProtectionFact::Protected
+    );
 }
 
 // Target results.

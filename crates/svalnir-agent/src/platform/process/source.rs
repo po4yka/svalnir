@@ -8,6 +8,7 @@
 use svalnir_core::file::{FileObjectEvidence, LosslessPath};
 use svalnir_core::observation::UnavailableReason;
 use svalnir_core::process::{Pid, ProcessStartTime, Uid};
+use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use thiserror::Error;
 
@@ -222,6 +223,13 @@ pub trait ProcessSource {
     ///
     /// Returns a [`QueryFailure`] when the clock gives no value.
     fn monotonic_now(&self) -> Result<MonotonicNanos, QueryFailure>;
+
+    /// The cumulative time that the host slept in the current boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the host gives no sleep time.
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason>;
 
     /// The wall-clock time.
     ///

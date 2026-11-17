@@ -17,10 +17,12 @@ use svalnir_core::observation::{
     Coverage, MetricId, MetricKind, Observation, Reading, Sample, Scope, ScopeKind, Source,
     UnavailableReason, Unit,
 };
+use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use thiserror::Error;
 
 use super::native;
+use crate::platform::sleep;
 
 /// The revision of the adapters in this module and in the volume module.
 /// Increase it when the definition or the source of a metric changes.
@@ -62,13 +64,25 @@ pub trait Clock: fmt::Debug + Send + Sync {
     /// Returns [`ClockError::WallTimeOutOfRange`] when the time is not
     /// representable.
     fn wall_now(&self) -> Result<WallTime, ClockError>;
+
+    /// The cumulative time that the host slept in the current boot.
+    ///
+    /// Two samples with different sleep times have a sleep between them (see
+    /// [`sleep_between`](crate::platform::sleep::sleep_between)).
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the clock gives no sleep time.
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason>;
 }
 
 /// The clock of the host.
 ///
 /// On macOS the monotonic time is `clock_gettime(CLOCK_MONOTONIC_RAW)`. This
 /// clock is the same for each process of one boot and continues while the
-/// host sleeps, so a sleep shows as a long interval between two samples.
+/// host sleeps, so a sleep shows as a long interval between two samples. The
+/// sleep time is that clock minus `clock_gettime(CLOCK_UPTIME_RAW)`, which
+/// stops while the host sleeps.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -93,6 +107,10 @@ impl Clock for SystemClock {
 
     fn wall_now(&self) -> Result<WallTime, ClockError> {
         WallTime::try_from(SystemTime::now()).map_err(|_| ClockError::WallTimeOutOfRange)
+    }
+
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+        sleep::native_sleep_time()
     }
 }
 
@@ -272,6 +290,11 @@ impl CollectionContext {
         &self.clock
     }
 
+    /// The sleep time of the host at this call, for a rate interval.
+    pub fn sleep_time(&self) -> Reading<Nanoseconds> {
+        sleep::sleep_reading(self.clock.sleep_time())
+    }
+
     /// The scope of a host metric.
     pub fn host_scope(&self) -> Scope {
         Scope {
@@ -369,17 +392,19 @@ pub(crate) mod testing {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use svalnir_core::id::{BootId, ClockDomainId, CollectorEpochId, IdentityId, WorkerId};
-    use svalnir_core::observation::Sample;
+    use svalnir_core::observation::{Sample, UnavailableReason};
+    use svalnir_core::quantity::Nanoseconds;
     use svalnir_core::time::{MonotonicNanos, WallTime};
 
     use super::{Clock, ClockError, CollectionContext, ContextIdentity};
 
     /// A clock that a test moves. Each read of the monotonic time also adds
-    /// `step` nanoseconds.
+    /// `step` nanoseconds. The sleep time is zero until a test sets it.
     #[derive(Debug)]
     pub(crate) struct ManualClock {
         now: AtomicU64,
         step: u64,
+        slept: AtomicU64,
     }
 
     impl ManualClock {
@@ -387,7 +412,13 @@ pub(crate) mod testing {
             Self {
                 now: AtomicU64::new(now),
                 step,
+                slept: AtomicU64::new(0),
             }
+        }
+
+        /// Sets the cumulative sleep time of the host.
+        pub(crate) fn set_slept(&self, slept: u64) {
+            self.slept.store(slept, Ordering::SeqCst);
         }
 
         pub(crate) fn set(&self, now: u64) {
@@ -404,6 +435,10 @@ pub(crate) mod testing {
 
         fn wall_now(&self) -> Result<WallTime, ClockError> {
             Ok(WallTime::UNIX_EPOCH)
+        }
+
+        fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+            Ok(Nanoseconds::new(self.slept.load(Ordering::SeqCst)))
         }
     }
 

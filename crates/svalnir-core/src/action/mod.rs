@@ -56,10 +56,10 @@ pub use outcome::{
     aggregate_step,
 };
 pub use plan::{
-    ApplicationBinding, ClientRole, Escalation, ExecutorRole, FileBinding, FileObjectType,
-    MAX_APPLICATION_MEMBERS, MAX_PLAN_TARGETS, PLAN_SCHEMA_VERSION, Plan, PlanApproval,
-    PlanContent, PlanError, PlanLimits, PlanTarget, PlannedStep, Principal, TargetBinding, Trigger,
-    Validity,
+    ApplicationBinding, CandidateBindingError, ClientRole, Escalation, ExecutorRole, FileBinding,
+    FileObjectType, MAX_APPLICATION_MEMBERS, MAX_PLAN_TARGETS, PLAN_SCHEMA_VERSION, Plan,
+    PlanApproval, PlanContent, PlanError, PlanLimits, PlanTarget, PlannedStep, Principal,
+    TargetBinding, Trigger, Validity,
 };
 pub use state::{
     DispatchState, Durability, OperationState, PlanState, StepProgress, StepState, TransitionError,

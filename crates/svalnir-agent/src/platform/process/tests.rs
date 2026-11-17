@@ -716,7 +716,64 @@ fn cpu_at(generation_id: &ProcessGenerationId, at: u64, cpu_ns: u64) -> CpuSampl
         clock_domain: clock(),
         at: MonotonicNanos::new(at),
         cpu_time: Reading::Available(CounterValue::new(cpu_ns)),
+        sleep_time: Reading::Available(Nanoseconds::ZERO),
     }
+}
+
+#[test]
+fn cpu_use_rejects_an_interval_with_a_sleep() {
+    let process: ProcessGenerationId = generation(7, 7);
+    let earlier: CpuSample = cpu_at(&process, 1_000, 100);
+    let mut later: CpuSample = cpu_at(&process, 2_000, 400);
+
+    // The host slept for one second between the samples.
+    later.sleep_time = Reading::Available(Nanoseconds::new(1_000_000_000));
+    let slept: DerivedUnavailable = cpu_usage(&earlier, &later).unwrap_err();
+    assert_eq!(slept, DerivedUnavailable::SleepInInterval);
+    assert_eq!(slept.reason(), UnavailableReason::ClockDiscontinuity);
+
+    // A sleep time that decreased is not consistent.
+    assert_eq!(
+        cpu_usage(&later, &cpu_at(&process, 3_000, 500)),
+        Err(DerivedUnavailable::SleepTimeDecreased)
+    );
+
+    // A sleep time with no value is not evidence of an interval with no
+    // sleep.
+    later.sleep_time = Reading::Unavailable(UnavailableReason::Unsupported);
+    assert_eq!(
+        cpu_usage(&earlier, &later),
+        Err(DerivedUnavailable::SampleUnavailable(
+            UnavailableReason::Unsupported
+        ))
+    );
+}
+
+#[test]
+fn a_sleep_between_snapshots_gives_no_cpu_use_and_keeps_the_growth() {
+    let mut busy = usage(30 * MIB, MIB);
+    busy.user_time_mach = 24_000;
+    let before: FakeSource =
+        FakeSource::new().with_process(info(100, 50), "/bin/a", usage(10 * MIB, MIB));
+    let mut after: FakeSource = FakeSource::new().with_process(info(100, 50), "/bin/a", busy);
+    after.clock.set(9_000_000);
+    after.slept = Ok(Nanoseconds::new(5_000_000_000));
+    let before: ProcessSnapshot = snapshot(before);
+    let after: ProcessSnapshot = snapshot(after);
+    assert_eq!(
+        after.sleep_time,
+        Reading::Available(Nanoseconds::new(5_000_000_000))
+    );
+
+    let derived: DerivedMetrics = derive_between(&before, &after);
+    let id: &ProcessGenerationId = &record(&after, 100).identity.generation_id;
+    assert_eq!(
+        derived.cpu.get(id),
+        Some(&Err(DerivedUnavailable::SleepInInterval))
+    );
+    // The footprint growth is a gauge difference.
+    let growth = derived.growth.get(id).unwrap().as_ref().unwrap();
+    assert_eq!(growth.delta, ByteDelta::new(i128::from(20 * MIB)).unwrap());
 }
 
 #[test]
@@ -762,6 +819,32 @@ fn cpu_use_rejects_samples_that_are_not_comparable() {
     assert_eq!(
         cpu_usage(&earlier, &other_clock),
         Err(DerivedUnavailable::ClockDomainMismatch)
+    );
+}
+
+#[test]
+fn a_sleep_during_a_collection_gives_no_sleep_time_and_no_cpu_use() {
+    let before: ProcessSnapshot =
+        snapshot(FakeSource::new().with_process(info(100, 50), "/bin/a", usage(MIB, MIB)));
+    // The host sleeps after the first sleep-time read of the later
+    // collection, so the read at the start agrees with the earlier snapshot.
+    let mut later: FakeSource =
+        FakeSource::new().with_process(info(100, 50), "/bin/a", usage(MIB, MIB));
+    later.clock.set(9_000_000);
+    later.slept_later = Some(Nanoseconds::new(5_000_000_000));
+    let after: ProcessSnapshot = snapshot(later);
+    assert_eq!(
+        after.sleep_time,
+        Reading::Unavailable(UnavailableReason::ClockDiscontinuity)
+    );
+
+    let derived: DerivedMetrics = derive_between(&before, &after);
+    let id: &ProcessGenerationId = &record(&after, 100).identity.generation_id;
+    assert_eq!(
+        derived.cpu.get(id),
+        Some(&Err(DerivedUnavailable::SampleUnavailable(
+            UnavailableReason::ClockDiscontinuity
+        )))
     );
 }
 

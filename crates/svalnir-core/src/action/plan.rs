@@ -31,7 +31,9 @@ use crate::id::{
     ApplicationInstanceId, BootId, ClockDomainId, DecisionId, IncidentId, MembershipSnapshotId,
     MountId, PlanId, RootId, SessionId, StepId, TargetId, VolumeId,
 };
-use crate::policy::EvaluationClock;
+use crate::policy::{
+    ApplicationCandidate, EvaluationClock, ProtectionContext, ProtectionFact, hard_protection,
+};
 use crate::process::{ProcessIdentity, Uid, VerifiedMembership};
 use crate::quantity::Nanoseconds;
 use crate::rule::RuleRef;
@@ -208,6 +210,74 @@ pub struct ApplicationBinding {
     /// The members. Each one has positive membership evidence for the
     /// instance.
     pub members: Vec<ProcessIdentity>,
+}
+
+/// The reason an application candidate cannot be the target of a plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CandidateBindingError {
+    /// The candidate has a hard protection. No profile, policy, grant, or
+    /// manual request removes it.
+    #[error("the application has a hard protection")]
+    Protected,
+    /// The hard protection of the candidate is not known.
+    #[error("the hard protection of the application is not known")]
+    ProtectionUnknown,
+    /// The candidate has no process, or a process has no positive
+    /// membership evidence for one instance.
+    #[error("the processes are not the verified members of one instance")]
+    Membership,
+}
+
+impl ApplicationBinding {
+    /// Makes the binding of the membership snapshot that the memory policy
+    /// evaluated. The policy candidate and the plan target are then the
+    /// same processes and the same membership identity.
+    ///
+    /// The hard protection is the one of the catalog
+    /// ([`hard_protection`]), as the candidate recorded it. Evaluate it
+    /// again with [`ApplicationBinding::hard_protection`] at each later
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CandidateBindingError`] when the hard protection of the
+    /// candidate is not `NotProtected`, when the candidate has no process,
+    /// or when a process has no verified membership of the same instance.
+    pub fn from_candidate(candidate: &ApplicationCandidate) -> Result<Self, CandidateBindingError> {
+        match candidate.hard_protection {
+            ProtectionFact::NotProtected => {}
+            ProtectionFact::Protected => return Err(CandidateBindingError::Protected),
+            ProtectionFact::Unknown => return Err(CandidateBindingError::ProtectionUnknown),
+        }
+        let mut instance: Option<&ApplicationInstanceId> = None;
+        for process in &candidate.processes {
+            let Some(
+                VerifiedMembership::Application { instance_id, .. }
+                | VerifiedMembership::ManagedJob { instance_id, .. },
+            ) = process.association.verified_membership()
+            else {
+                return Err(CandidateBindingError::Membership);
+            };
+            if instance.is_some_and(|first| first != instance_id) {
+                return Err(CandidateBindingError::Membership);
+            }
+            instance = Some(instance_id);
+        }
+        let instance_id: ApplicationInstanceId =
+            instance.ok_or(CandidateBindingError::Membership)?.clone();
+        Ok(Self {
+            instance_id,
+            membership: candidate.membership_snapshot.clone(),
+            members: candidate.processes.clone(),
+        })
+    }
+
+    /// The hard protection of the members, from the catalog of the policy
+    /// module. Only `NotProtected` permits a step, for a manual plan and
+    /// for an automatic plan.
+    pub fn hard_protection(&self, context: &ProtectionContext<'_>) -> ProtectionFact {
+        hard_protection(&self.members, context)
+    }
 }
 
 /// The verified identity that a target is bound to.

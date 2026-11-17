@@ -202,7 +202,24 @@ Stop before the next unit if the deadline, policy, activity evidence, namespace 
 
 An application plan freezes the verified application instance and members to which its selected backend applies. Descendants, similarly named executables, shared services, and process groups are not automatically included.
 
-Hard protected identities include essential system processes and Svalnir's control plane. The initial process-control surface excludes other-user, root, and system targets. Automatic foreground protection is evaluated at each automatic termination boundary. Manual requests enforce their own exact authorization and applicable global/manual protections; `memory_guard.allow_force_quit` neither grants nor independently prohibits manual force quit.
+Hard protected identities include essential system processes and Svalnir's control plane. The initial process-control surface excludes other-user, root, and system targets.
+
+The catalog of hard protections gives one fact for each application or job instance: protected, not protected, or unknown. An instance is protected when one of its members agrees with one of these rules:
+
+| Rule | A member is protected when |
+| --- | --- |
+| Owner | Its owner is not the principal of the evaluation, or is root |
+| `launchd` | Its process ID is 1 |
+| Control plane | It is the evaluating Svalnir process or one of its ancestors. An ancestor is identified by its process ID together with its start time |
+| Session application | Its bundle identifier is one of `com.apple.finder`, `com.apple.dock`, `com.apple.loginwindow`, `com.apple.systemuiserver`, `com.apple.controlcenter`, `com.apple.notificationcenterui`, `com.apple.WindowManager`, `com.apple.Spotlight`, `com.apple.SecurityAgent`, and `com.apple.coreservices.uiagent`. The comparison ignores ASCII case |
+| Svalnir component | Its bundle identifier is `dev.svalnir` or starts with `dev.svalnir.`, or its executable has the file name `svalnir`, `svalnir-agent`, `svalnir-privileged`, or `svalnir-gui`. The comparison ignores ASCII case |
+| System executable | Its executable is below `/System/`, `/usr/`, `/bin/`, `/sbin/`, or `/Library/Apple/`, and not below `/usr/local/`. The comparison ignores ASCII case |
+
+A rule can only add a protection. A name, a path, or a bundle identifier never selects a target. A bundle identifier protects also when the membership of the process is not verified.
+
+The application target of a plan is the membership snapshot that the policy candidate has: the same processes and the same membership identity. A candidate whose fact is protected or unknown gives no target, for a manual plan and for an automatic plan. The check of a plan and of a request envelope also rejects a member of another user; that check repeats the owner rule and does not replace the catalog, which needs the control plane of the evaluating process. The executor asks the catalog again for the members of the target at each later boundary. The catalog has application and job instances only. The hard protection of a file candidate is a fact that its cleanup rule establishes ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 6).
+
+With no protected member, the fact is unknown when the instance has no member, a member has no executable evidence, an executable path is relative or has an empty, `.`, or `..` component, or the control plane is not known. An evaluation skips an instance of unknown protection. No profile, policy, or grant changes the catalog; a user protection in the configuration is a separate exclusion. Automatic foreground protection is evaluated at each automatic termination boundary. Manual requests enforce their own exact authorization and applicable global/manual protections; `memory_guard.allow_force_quit` neither grants nor independently prohibits manual force quit.
 
 The normal sequence is:
 

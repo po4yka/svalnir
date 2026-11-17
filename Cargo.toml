@@ -52,10 +52,9 @@ rusqlite = { version = "0.43.0", features = ["bundled"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0.21"
-miette = "7.6.0"
 
-# Inventory and native integration
-sysinfo = "0.40.3"
+# Native integration
+block2 = "0.6.2"
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-app-kit = "0.3.2"
@@ -64,11 +63,6 @@ libc = "0.2.191"
 
 # Tests only: disposable directories for the journal and the executors.
 tempfile = "3.27.0"
-
-[workspace.lints.cargo]
-# The selections above are pinned ahead of use while the crates are skeletons.
-# TODO(npochaev): remove this allowance when each entry has a consuming crate.
-unused_workspace_dependencies = "allow"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }

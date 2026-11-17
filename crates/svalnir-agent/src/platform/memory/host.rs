@@ -8,11 +8,12 @@
 use svalnir_core::observation::{
     MetricId, MetricKind, Observation, Reading, Sample, UnavailableReason, Unit, metric,
 };
-use svalnir_core::quantity::{Bytes, CounterValue, PageCount};
+use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds, PageCount};
 
 use super::context::{CollectError, CollectionContext, MetricSpec, Provenance, reading_from};
 use super::native;
 use super::raw::{RawSwapUsage, RawVmStatistics, RawVmStatisticsRevision1};
+use crate::platform::sleep::bracketed_sleep_reading;
 
 /// The native API of the physical-memory query.
 pub const PHYSICAL_NATIVE_API: &str = "sysctlbyname";
@@ -80,6 +81,9 @@ pub struct VmStatistics {
     pub page_size: Reading<Bytes>,
     /// The acquisition of the statistics and of the page size.
     pub sample: Sample,
+    /// The cumulative sleep time of the host at this sample. A rate between
+    /// two samples with different sleep times has a sleep in its interval.
+    pub sleep_time: Reading<Nanoseconds>,
     /// `memory.vm.free_pages`.
     pub free: Observation<PageCount>,
     /// `memory.vm.active_pages`.
@@ -247,6 +251,9 @@ impl VmFields<'_> {
 
 /// Makes the VM observations from a raw sample and a raw page size.
 ///
+/// The function also reads the sleep time of the host from the clock of
+/// `context`, as evidence for a rate interval.
+///
 /// A page size of zero is not valid. A field of revision 1 of the native
 /// structure is `unsupported` when the kernel returned only revision 0.
 pub fn vm_statistics(
@@ -272,6 +279,7 @@ pub fn vm_statistics(
         revision_1,
     };
     VmStatistics {
+        sleep_time: context.sleep_time(),
         free: fields.base_gauge(metric::MEMORY_VM_FREE_PAGES, "free_count", |raw| {
             raw.free_count.into()
         }),
@@ -349,11 +357,17 @@ pub fn vm_statistics(
 ///
 /// Returns a [`CollectError`] when the clock gives no acquisition window.
 pub fn collect_vm_statistics(context: &CollectionContext) -> Result<VmStatistics, CollectError> {
+    // The sleep time is read before and after the counters, so a sleep
+    // during the acquisition does not give a sleep time that agrees with the
+    // next sample.
+    let sleep_before: Reading<Nanoseconds> = context.sleep_time();
     let acquisition = context.begin()?;
     let page_size: Result<u64, UnavailableReason> = native::vm_page_size();
     let raw: Result<RawVmStatistics, UnavailableReason> = native::vm_statistics();
     let sample: Sample = context.finish(acquisition)?;
-    Ok(vm_statistics(context, raw, page_size, &sample))
+    let mut statistics: VmStatistics = vm_statistics(context, raw, page_size, &sample);
+    statistics.sleep_time = bracketed_sleep_reading(&sleep_before, statistics.sleep_time);
+    Ok(statistics)
 }
 
 /// The swap space of the host from one `vm.swapusage` read.

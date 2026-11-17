@@ -33,9 +33,13 @@ use std::time::SystemTime;
 static FIRST_APPLICATION_LIST: AtomicBool = AtomicBool::new(true);
 
 use objc2::rc::autoreleasepool;
+
+use crate::platform::run_loop;
 use objc2_app_kit::NSWorkspace;
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
+use svalnir_core::observation::UnavailableReason;
 use svalnir_core::process::{Pid, ProcessStartTime, Uid};
+use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
@@ -405,12 +409,9 @@ impl ProcessSource for DarwinProcessSource {
 
     fn application_list_current(&self) -> bool {
         // The first call in the process reads a fresh list. After it, the
-        // list is refreshed only when the main run loop runs, and this source
-        // has no evidence of that, so a later list is not known to be
-        // current.
-        // TODO(npochaev): report a later list as current when the host process
-        // runs the main run loop.
-        FIRST_APPLICATION_LIST.swap(false, Ordering::Relaxed)
+        // list is refreshed only when the main run loop runs, so a later
+        // list is current only when the run loop ran for this call.
+        FIRST_APPLICATION_LIST.swap(false, Ordering::Relaxed) || run_loop::turn_main_run_loop()
     }
 
     fn running_applications(&self) -> Result<Vec<RunningApplication>, QueryFailure> {
@@ -423,6 +424,10 @@ impl ProcessSource for DarwinProcessSource {
 
     fn monotonic_now(&self) -> Result<MonotonicNanos, QueryFailure> {
         monotonic_now()
+    }
+
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+        crate::platform::sleep::native_sleep_time()
     }
 
     fn wall_now(&self) -> Result<WallTime, QueryFailure> {

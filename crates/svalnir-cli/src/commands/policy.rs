@@ -5,28 +5,24 @@
 //! the proposal against one new snapshot from the collectors of this process
 //! with the pure functions of `svalnir_core::policy`.
 
-use std::collections::BTreeMap;
-
 use serde::Serialize;
 use svalnir_agent::capability::{ProbeSubject, WorkerRole};
 use svalnir_agent::platform::memory;
-use svalnir_agent::platform::process::{ForegroundState, ProcessRecord, ProcessSnapshot};
+use svalnir_agent::platform::process::{
+    ProcessSnapshot, application_candidates, control_plane_of_this_process, instance_count,
+};
 use svalnir_agent::platform::volume;
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
-use svalnir_core::id::{ApplicationInstanceId, CollectorEpochId, MembershipSnapshotId, SampleId};
-use svalnir_core::observation::{
-    Coverage, MetricKind, Observation, Reading, Sample, Scope, Source, Unit, metric,
-};
+use svalnir_core::id::{CollectorEpochId, SampleId};
+use svalnir_core::observation::{Coverage, Sample};
 use svalnir_core::policy::{
-    self, ApplicationCandidate, AssumedGrants, ContinuityGeneration, CorroboratingEvidence,
-    DiskSnapshot, EvaluationClock, EvaluationContext, ForegroundStatus, GrantBasis,
-    InventoryEvidence, MemorySnapshot, PolicyDescription, PolicyId, PolicyListEntry, PolicyState,
-    ProtectionFact, RevisionLabel, RevisionSource, SimulationInput, SimulationReport,
-    VolumeEvidence,
+    self, AssumedGrants, ContinuityGeneration, CorroboratingEvidence, DiskSnapshot,
+    EvaluationClock, EvaluationContext, GrantBasis, InventoryEvidence, MemorySnapshot,
+    PolicyDescription, PolicyId, PolicyListEntry, PolicyState, ProtectionContext, RevisionLabel,
+    RevisionSource, SimulationInput, SimulationReport, VolumeEvidence,
 };
-use svalnir_core::process::{Uid, VerifiedMembership};
-use svalnir_core::quantity::Bytes;
+use svalnir_core::process::Uid;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::config::{self as proposal, Proposal, SourceView, proposal_text};
@@ -43,7 +39,7 @@ const STARTUP_DATA_SELECTOR: &str = "startup-data";
 const NOT_ACTIVE_NOTE: &str = "These policies are a proposal. No policy is active in this build, and this command recorded no grant.";
 
 /// The statement of `policy simulate` about its inputs.
-const SIMULATION_NOTE: &str = "This is a simulation of a proposal that is not active. The grants are the recorded state of this build: none. The snapshot has no cleanup candidate, because this build has no rule registry. The product protection of each application is unknown, because this build has no protection catalog, so no application is eligible. One snapshot starts a qualification window and cannot complete it.";
+const SIMULATION_NOTE: &str = "This is a simulation of a proposal that is not active. The grants are the recorded state of this build: none. The snapshot has no cleanup candidate, because this build has no rule registry. The product protection of each application comes from the catalog of hard protections; this process and its ancestors are protected. One snapshot starts a qualification window and cannot complete it.";
 
 const fn policy_id(name: PolicyName) -> PolicyId {
     match name {
@@ -206,161 +202,6 @@ pub(crate) fn simulate_with(
     })
 }
 
-/// A 64-bit FNV-1a hash of the member identities, for the identity of a
-/// membership snapshot. A different member set gives a different identity.
-fn membership_fingerprint(members: &[&ProcessRecord]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for member in members {
-        for byte in member
-            .identity
-            .generation_id
-            .as_str()
-            .bytes()
-            .chain(std::iter::once(0))
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
-}
-
-/// The sum of the member footprints as one observation of the membership
-/// snapshot. The observation has no value when a member has none: a sum
-/// with a missing member is not the footprint of the application.
-fn attributed_footprint(
-    members: &[&ProcessRecord],
-    membership: &MembershipSnapshotId,
-    captured_at: WallTime,
-) -> Option<Observation<Bytes>> {
-    let first: &ProcessRecord = members.first()?;
-    let first_sample: &Sample = first.metrics.sample();
-    let mut reading: Reading<Bytes> = Reading::Available(Bytes::ZERO);
-    let mut started: MonotonicNanos = first_sample.started_monotonic_ns;
-    let mut finished: MonotonicNanos = first_sample.finished_monotonic_ns;
-    for member in members {
-        let footprint: &Observation<Bytes> = &member.metrics.footprint;
-        started = started.min(footprint.sample.started_monotonic_ns);
-        finished = finished.max(footprint.sample.finished_monotonic_ns);
-        reading = match (reading, footprint.value(), &footprint.reading) {
-            (Reading::Available(total), Some(bytes), _) => total.checked_add(*bytes).map_or(
-                Reading::Unavailable(svalnir_core::observation::UnavailableReason::Overflow),
-                Reading::Available,
-            ),
-            (Reading::Available(_), None, Reading::Unavailable(reason)) => {
-                Reading::Unavailable(reason.clone())
-            }
-            (Reading::Available(_), None, _) => {
-                Reading::Unavailable(svalnir_core::observation::UnavailableReason::InconsistentData)
-            }
-            (unavailable, _, _) => unavailable,
-        };
-    }
-    let coverage: Coverage = if reading.is_available() {
-        Coverage::Complete
-    } else {
-        Coverage::Partial
-    };
-    Some(Observation {
-        metric_id: metric::APPLICATION_ATTRIBUTED_FOOTPRINT_BYTES,
-        scope: Scope::application(membership.clone()),
-        reading,
-        unit: Unit::Byte,
-        kind: MetricKind::Gauge,
-        coverage,
-        source: Source {
-            native_field: "sum(ri_phys_footprint) of the membership snapshot".to_owned(),
-            ..first.metrics.footprint.source.clone()
-        },
-        sample: Sample {
-            sample_id: SampleId::new(format!("as-{}-{}", started.get(), first.identity.pid.get()))
-                .ok()?,
-            started_monotonic_ns: started,
-            finished_monotonic_ns: finished,
-            captured_at,
-            ..first_sample.clone()
-        },
-    })
-}
-
-/// The application and job instances of a process snapshot as candidates of
-/// a memory-guard evaluation.
-///
-/// Only a verified membership makes a process a member. A process with no
-/// verified membership is in no candidate.
-// TODO(npochaev): move this function to the agent when the agent makes
-// membership snapshots and has the protection catalog.
-pub(crate) fn application_candidates(snapshot: &ProcessSnapshot) -> Vec<ApplicationCandidate> {
-    let mut instances: BTreeMap<&ApplicationInstanceId, Vec<&ProcessRecord>> = BTreeMap::new();
-    for record in &snapshot.records {
-        if let Some(
-            VerifiedMembership::Application { instance_id, .. }
-            | VerifiedMembership::ManagedJob { instance_id, .. },
-        ) = record.identity.association.verified_membership()
-        {
-            instances.entry(instance_id).or_default().push(record);
-        }
-    }
-    instances
-        .into_iter()
-        .filter_map(|(instance_id, members)| {
-            // The identity has the instance, the member count, and a hash of
-            // the members, so a membership change makes a new identity.
-            let instance: &str = instance_id.as_str();
-            let instance: &str = instance.get(..80).unwrap_or(instance);
-            let membership = MembershipSnapshotId::new(format!(
-                "ms-{instance}-{}-{:016x}",
-                members.len(),
-                membership_fingerprint(&members)
-            ))
-            .ok()?;
-            let foreground: ForegroundStatus = if members
-                .iter()
-                .any(|member| member.foreground == ForegroundState::Foreground)
-            {
-                ForegroundStatus::Foreground
-            } else if members
-                .iter()
-                .all(|member| member.foreground == ForegroundState::Background)
-            {
-                ForegroundStatus::Background
-            } else {
-                ForegroundStatus::Unknown
-            };
-            Some(ApplicationCandidate {
-                footprint: attributed_footprint(&members, &membership, snapshot.captured_at)?,
-                processes: members
-                    .iter()
-                    .map(|member| member.identity.clone())
-                    .collect(),
-                membership_snapshot: membership,
-                foreground,
-                // This build has no protection catalog. `Unknown` makes the
-                // evaluation skip the candidate.
-                hard_protection: ProtectionFact::Unknown,
-            })
-        })
-        .collect()
-}
-
-/// The number of application and job instances with a verified member.
-fn instance_count(snapshot: &ProcessSnapshot) -> usize {
-    snapshot
-        .records
-        .iter()
-        .filter_map(
-            |record| match record.identity.association.verified_membership() {
-                Some(
-                    VerifiedMembership::Application { instance_id, .. }
-                    | VerifiedMembership::ManagedJob { instance_id, .. },
-                ) => Some(instance_id),
-                None => None,
-            },
-        )
-        .collect::<std::collections::BTreeSet<&ApplicationInstanceId>>()
-        .len()
-}
-
 /// The evidence that the process inventory is complete.
 pub(crate) fn inventory_evidence(
     snapshot: &ProcessSnapshot,
@@ -409,6 +250,38 @@ fn collect_processes(_host: &Host) -> Result<ProcessSnapshot, String> {
     Err("the process inventory has a collector for macOS only".to_owned())
 }
 
+/// Adds the application candidates and the inventory evidence of a process
+/// snapshot to the inputs of a memory-guard simulation.
+fn add_applications(
+    processes: &ProcessSnapshot,
+    principal: Uid,
+    collector_epoch: &CollectorEpochId,
+    memory_snapshot: &mut MemorySnapshot,
+    summary: &mut InputSummary,
+) {
+    // This process and its ancestors are the control plane of the
+    // simulation.
+    let control_plane = control_plane_of_this_process(processes);
+    memory_snapshot.applications = application_candidates(
+        processes,
+        &ProtectionContext {
+            principal,
+            control_plane: control_plane.as_deref(),
+        },
+    );
+    memory_snapshot.inventory = inventory_evidence(processes, collector_epoch);
+    memory_snapshot.application_list_may_be_stale = processes.application_list_may_be_stale;
+    summary.applications = memory_snapshot.applications.len();
+    summary.applications_not_evaluated =
+        instance_count(processes).saturating_sub(memory_snapshot.applications.len());
+    // An instance with no candidate is not absent.
+    if summary.applications_not_evaluated > 0
+        && let Some(inventory) = &mut memory_snapshot.inventory
+    {
+        inventory.coverage = Coverage::Partial;
+    }
+}
+
 /// Reads one snapshot of the host for a simulation of `policy`.
 fn collect_inputs(
     host: &Host,
@@ -417,6 +290,7 @@ fn collect_inputs(
     environment: &Environment,
 ) -> Result<SimulationInputs, ErrorBody> {
     let context = host.context();
+    let principal: Uid = ProbeSubject::current(WorkerRole::Cli).effective_uid;
     let mut disk = DiskSnapshot {
         rule_allowances: Vec::new(),
         volumes: Vec::new(),
@@ -463,22 +337,13 @@ fn collect_inputs(
             ];
             memory_snapshot.pressure = Some(host_memory.pressure);
             match collect_processes(host) {
-                Ok(processes) => {
-                    memory_snapshot.applications = application_candidates(&processes);
-                    memory_snapshot.inventory =
-                        inventory_evidence(&processes, &context.identity().collector_epoch);
-                    memory_snapshot.application_list_may_be_stale =
-                        processes.application_list_may_be_stale;
-                    summary.applications = memory_snapshot.applications.len();
-                    summary.applications_not_evaluated = instance_count(&processes)
-                        .saturating_sub(memory_snapshot.applications.len());
-                    // An instance with no candidate is not absent.
-                    if summary.applications_not_evaluated > 0
-                        && let Some(inventory) = &mut memory_snapshot.inventory
-                    {
-                        inventory.coverage = Coverage::Partial;
-                    }
-                }
+                Ok(processes) => add_applications(
+                    &processes,
+                    principal,
+                    &context.identity().collector_epoch,
+                    &mut memory_snapshot,
+                    &mut summary,
+                ),
                 Err(reason) => summary.process_inventory_unavailable = Some(reason),
             }
         }
@@ -506,7 +371,7 @@ fn collect_inputs(
             last_discontinuity: None,
         },
         snapshot_time,
-        principal: ProbeSubject::current(WorkerRole::Cli).effective_uid,
+        principal,
         home: environment
             .home
             .as_deref()
@@ -566,8 +431,8 @@ mod tests {
     use svalnir_core::id::CollectorEpochId;
     use svalnir_core::observation::{Coverage, Reading, UnavailableReason};
     use svalnir_core::policy::{
-        ContinuityGeneration, DiskSnapshot, EvaluationClock, ForegroundStatus, MemorySnapshot,
-        PolicyId, VolumeEvidence,
+        ContinuityGeneration, ControlPlaneProcess, DiskSnapshot, EvaluationClock, MemorySnapshot,
+        PolicyId, ProtectionContext, VolumeEvidence,
     };
     use svalnir_core::process::Uid;
     use svalnir_core::quantity::Bytes;
@@ -719,54 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn application_candidates_have_only_verified_members() {
-        let snapshot = process_snapshot();
-        let candidates = application_candidates(&snapshot);
-        // The editor and its helper are one instance. The third process has
-        // no verified membership.
-        assert_eq!(candidates.len(), 1);
-        let candidate = &candidates[0];
-        assert_eq!(candidate.processes.len(), 2);
-        assert_eq!(candidate.foreground, ForegroundStatus::Foreground);
-        assert_eq!(
-            candidate.footprint.value(),
-            Some(&Bytes::new(4 * 1024 * 1024 * 1024))
-        );
-        assert_eq!(candidate.footprint.coverage, Coverage::Complete);
-        assert_eq!(
-            candidate.footprint.metric_id.as_str(),
-            "application.attributed_footprint_bytes"
-        );
-        assert!(
-            candidate
-                .membership_snapshot
-                .as_str()
-                .starts_with("ms-app-200-")
-        );
-
-        // A different member set has a different identity.
-        let mut smaller = snapshot.clone();
-        smaller.records.remove(1);
-        let other = application_candidates(&smaller);
-        assert_ne!(other[0].membership_snapshot, candidate.membership_snapshot);
-    }
-
-    #[test]
-    fn a_member_with_no_footprint_makes_the_sum_unavailable() {
-        let mut snapshot = process_snapshot();
-        snapshot.records[1].metrics.footprint.reading =
-            Reading::Unavailable(UnavailableReason::PermissionDenied);
-        let candidates = application_candidates(&snapshot);
-        assert_eq!(candidates[0].footprint.value(), None);
-        assert_eq!(
-            candidates[0].footprint.reason(),
-            Some(&UnavailableReason::PermissionDenied)
-        );
-        assert_eq!(candidates[0].footprint.coverage, Coverage::Partial);
-    }
-
-    #[test]
-    fn a_memory_simulation_skips_each_application_of_unknown_protection() {
+    fn a_memory_simulation_gets_the_protection_of_each_application_from_the_catalog() {
         let validation = parse_and_validate(
             "schema_version = 1\n[agent]\nprofile = \"balanced\"\n[memory_guard]\nenabled = true\neligible_groups = [\"background-user-applications\"]\n",
         );
@@ -774,15 +592,41 @@ mod tests {
         let snapshot = process_snapshot();
         let host_memory = memory_snapshot();
         let epoch = CollectorEpochId::new("epoch_test").unwrap();
-        let memory = MemorySnapshot {
+        let memory_with = |control_plane: Option<&[ControlPlaneProcess]>| MemorySnapshot {
             pressure: Some(host_memory.pressure.clone()),
             corroborating: vec![
                 svalnir_core::policy::CorroboratingEvidence::from_observation(&host_memory.vm.free),
             ],
-            applications: application_candidates(&snapshot),
+            applications: application_candidates(
+                &snapshot,
+                &ProtectionContext {
+                    principal: Uid::new(501),
+                    control_plane,
+                },
+            ),
             inventory: inventory_evidence(&snapshot, &epoch),
             application_list_may_be_stale: snapshot.application_list_may_be_stale,
         };
+        let no_disk = || DiskSnapshot {
+            rule_allowances: Vec::new(),
+            volumes: Vec::new(),
+            candidates: Vec::new(),
+        };
+
+        // With no known control plane, the protection is unknown and the
+        // application is skipped.
+        let unknown = simulate_with(
+            source(),
+            config,
+            PolicyId::MemoryGuard,
+            inputs(no_disk(), memory_with(None)),
+        )
+        .unwrap();
+        let unknown = serde_json::to_value(&unknown).unwrap();
+        let skipped = unknown["simulation"]["candidates"][0].to_string();
+        assert!(skipped.contains("protection_unknown"), "{skipped}");
+
+        let memory = memory_with(Some(&[]));
         assert_eq!(
             memory.inventory.as_ref().unwrap().coverage,
             Coverage::Complete
@@ -798,14 +642,7 @@ mod tests {
             source(),
             config,
             PolicyId::MemoryGuard,
-            inputs(
-                DiskSnapshot {
-                    rule_allowances: Vec::new(),
-                    volumes: Vec::new(),
-                    candidates: Vec::new(),
-                },
-                memory,
-            ),
+            inputs(no_disk(), memory),
         )
         .unwrap();
         let json = serde_json::to_value(&view).unwrap();
@@ -813,6 +650,11 @@ mod tests {
         let candidates = json["simulation"]["candidates"].as_array().unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0]["kind"], "application");
+        // The catalog gives a protection, so the application is evaluated.
+        // It is the foreground application, which the default protects.
+        let evaluated = candidates[0].to_string();
+        assert!(!evaluated.contains("protection_unknown"), "{evaluated}");
+        assert!(!evaluated.contains("product_protection"), "{evaluated}");
         assert_ne!(candidates[0]["decision"], "eligible");
         assert_eq!(
             json["simulation"]["first_actions"][0]["admissible_now"],

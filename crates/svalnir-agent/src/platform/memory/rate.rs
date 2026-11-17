@@ -14,6 +14,7 @@ use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds};
 use thiserror::Error;
 
 use super::host::VmStatistics;
+use crate::platform::sleep::{SleepBoundary, sleep_between};
 
 const NANOSECONDS_PER_SECOND: f64 = 1_000_000_000.0;
 
@@ -93,6 +94,27 @@ pub enum RateUnavailable {
     /// The runtime page size of one sample is not known.
     #[error("the page size of a sample is unavailable: {}", .0.as_str())]
     PageSizeUnavailable(UnavailableReason),
+    /// The host slept between the two samples.
+    #[error("the host slept in the interval")]
+    SleepInInterval,
+    /// The sleep time of the host decreased between the two samples.
+    #[error("the sleep time of the host decreased between the samples")]
+    SleepTimeDecreased,
+    /// The sleep time of one sample is not known, so there is no evidence
+    /// that the host did not sleep.
+    #[error("the sleep time of a sample is unavailable: {}", .0.as_str())]
+    SleepTimeUnavailable(UnavailableReason),
+}
+
+impl From<SleepBoundary> for RateUnavailable {
+    fn from(boundary: SleepBoundary) -> Self {
+        match boundary {
+            SleepBoundary::Slept => Self::SleepInInterval,
+            SleepBoundary::Decreased => Self::SleepTimeDecreased,
+            SleepBoundary::Unavailable(reason) => Self::SleepTimeUnavailable(reason),
+            SleepBoundary::Unrecognized => Self::InputUnrecognized,
+        }
+    }
 }
 
 impl RateUnavailable {
@@ -101,17 +123,21 @@ impl RateUnavailable {
         match self {
             // A new collector lifetime has no baseline measurement.
             Self::FirstSample | Self::CollectorRestarted => UnavailableReason::NotInitialized,
-            Self::InputUnavailable(reason) | Self::PageSizeUnavailable(reason) => reason.clone(),
+            Self::InputUnavailable(reason)
+            | Self::PageSizeUnavailable(reason)
+            | Self::SleepTimeUnavailable(reason) => reason.clone(),
             Self::InputUnrecognized
             | Self::DefinitionMismatch
             | Self::CounterReset
-            | Self::PageSizeChanged => UnavailableReason::InconsistentData,
+            | Self::PageSizeChanged
+            | Self::SleepTimeDecreased => UnavailableReason::InconsistentData,
             // The counters of the later sample are possibly not new values.
             Self::IntervalTooShort => UnavailableReason::NotCollected,
             Self::BootChanged
             | Self::ClockDomainChanged
             | Self::NotOrdered
-            | Self::IntervalTooLong => UnavailableReason::ClockDiscontinuity,
+            | Self::IntervalTooLong
+            | Self::SleepInInterval => UnavailableReason::ClockDiscontinuity,
         }
     }
 }
@@ -121,10 +147,11 @@ impl RateUnavailable {
 /// There is no default maximum: the caller states the longest interval that is
 /// one continuous observation. [`RateLimits::DEFAULT_MIN_INTERVAL`] is the
 /// default minimum. The monotonic clock of the host continues during
-/// sleep, so a sleep that is longer than the limit shows as a gap. This code
-/// does not detect a sleep or a wake that is shorter than the limit.
-// TODO(npochaev): reject an interval that has a wake event when the agent
-// has a power-state source.
+/// sleep, so a sleep that is longer than the limit shows as a gap. The limits
+/// do not show a sleep that is shorter: [`swap_activity`] rejects such an
+/// interval from the sleep times of the two samples. A caller of
+/// [`counter_rate`] makes that check with
+/// [`sleep_between`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimits {
     /// The longest permitted interval. A longer interval is a gap: the host
@@ -176,6 +203,10 @@ fn counter_value(observation: &Observation<CounterValue>) -> Result<CounterValue
 /// that are not distinct and ordered, an interval shorter than the minimum
 /// or longer than the maximum, or
 /// a counter that decreased.
+///
+/// An observation has no sleep time, so this function does not reject an
+/// interval with a sleep that is shorter than the maximum. The caller makes
+/// that check with [`sleep_between`].
 pub fn counter_rate(
     earlier: Option<&Observation<CounterValue>>,
     later: &Observation<CounterValue>,
@@ -290,7 +321,8 @@ fn stable_page_size(
 ///
 /// The rates use the explicit swap counters. The page-in and page-out
 /// counters are different activity and are not used. `earlier` is `None` for
-/// the first sample.
+/// the first sample. An interval in which the host slept gives no rate: the
+/// sleep times of the two samples must agree.
 pub fn swap_activity(
     earlier: Option<&VmStatistics>,
     later: &VmStatistics,
@@ -305,6 +337,7 @@ pub fn swap_activity(
     let page_rate = |earlier_counter: &Observation<CounterValue>,
                      later_counter: &Observation<CounterValue>| {
         let rate: CounterRate = counter_rate(Some(earlier_counter), later_counter, limits)?;
+        sleep_between(&earlier.sleep_time, &later.sleep_time)?;
         let page_size: Bytes = stable_page_size(earlier, later)?;
         Ok(PageRate { rate, page_size })
     };
@@ -498,6 +531,58 @@ mod tests {
         assert_eq!(
             RateUnavailable::CollectorRestarted.reason(),
             UnavailableReason::NotInitialized
+        );
+    }
+
+    #[test]
+    fn a_sleep_in_the_interval_gives_no_rate() {
+        let (context, clock) = testing::context();
+        clock.set_slept(40 * SECOND);
+        let earlier = vm_at(&context, 10 * SECOND, 1_000, 5_000);
+        // The host slept for three seconds. The interval is shorter than the
+        // limit, so only the sleep time shows the sleep.
+        clock.set_slept(43 * SECOND);
+        let later = vm_at(&context, 15 * SECOND, 1_300, 5_100);
+        let activity = swap_activity(Some(&earlier), &later, LIMITS);
+        assert_eq!(activity.swapins, Err(RateUnavailable::SleepInInterval));
+        assert_eq!(activity.swapouts, Err(RateUnavailable::SleepInInterval));
+        assert_eq!(
+            RateUnavailable::SleepInInterval.reason(),
+            UnavailableReason::ClockDiscontinuity
+        );
+
+        // A sleep time that decreased is not consistent.
+        clock.set_slept(39 * SECOND);
+        let decreased = vm_at(&context, 16 * SECOND, 1_300, 5_100);
+        assert_eq!(
+            swap_activity(Some(&earlier), &decreased, LIMITS).swapins,
+            Err(RateUnavailable::SleepTimeDecreased)
+        );
+
+        // The next interval, with no sleep, gives a rate again.
+        clock.set_slept(43 * SECOND);
+        let next = vm_at(&context, 17 * SECOND, 1_400, 5_100);
+        let swapins = swap_activity(Some(&later), &next, LIMITS).swapins.unwrap();
+        assert_eq!(swapins.rate.increase, 100);
+    }
+
+    #[test]
+    fn a_sample_with_no_sleep_time_gives_no_rate() {
+        let (context, _clock) = testing::context();
+        let earlier = vm_at(&context, 10 * SECOND, 1_000, 5_000);
+        let mut later = vm_at(&context, 12 * SECOND, 1_300, 5_000);
+        later.sleep_time =
+            svalnir_core::observation::Reading::Unavailable(UnavailableReason::Unsupported);
+        let activity = swap_activity(Some(&earlier), &later, LIMITS);
+        assert_eq!(
+            activity.swapins,
+            Err(RateUnavailable::SleepTimeUnavailable(
+                UnavailableReason::Unsupported
+            ))
+        );
+        assert_eq!(
+            activity.swapins.unwrap_err().reason(),
+            UnavailableReason::Unsupported
         );
     }
 

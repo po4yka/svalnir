@@ -50,6 +50,11 @@ fn an_ordinary_application_of_the_user_is_not_protected() {
         hard_protection(&[with_path("/usr/local/bin/tool")], &context(&[])),
         ProtectionFact::NotProtected
     );
+    // A directory whose name only starts with `local` is below `/usr/`.
+    assert_eq!(
+        hard_protection(&[with_path("/usr/localx/bin/tool")], &context(&[])),
+        ProtectionFact::Protected
+    );
 }
 
 #[test]
@@ -87,6 +92,9 @@ fn launchd_and_a_system_executable_are_protected() {
         "/bin/zsh",
         "/sbin/launchd",
         "/Library/Apple/usr/libexec/oah/runtime",
+        // The default volume format ignores case.
+        "/system/Library/CoreServices/Dock.app/Contents/MacOS/Dock",
+        "/USR/bin/true",
     ] {
         assert_eq!(
             hard_protection(&[with_path(path)], &context(&[])),
@@ -120,6 +128,7 @@ fn a_session_application_and_each_svalnir_component_are_protected() {
     for path in [
         "/Users/me/bin/svalnir",
         "/Applications/Svalnir.app/Contents/MacOS/svalnir-agent",
+        "/Applications/Svalnir.app/Contents/MacOS/Svalnir",
     ] {
         assert_eq!(
             hard_protection(&[with_path(path)], &context(&[])),
@@ -181,7 +190,14 @@ fn missing_evidence_is_unknown_and_not_unprotected() {
     );
 
     // A path that the catalog cannot classify.
-    for path in ["/Applications/../System/tool", "relative/tool"] {
+    for path in [
+        "/Applications/../System/tool",
+        "relative/tool",
+        "//usr/bin/tool",
+        "/./Applications/tool",
+        "/Applications/tool/",
+        "/",
+    ] {
         assert_eq!(
             hard_protection(&[with_path(path)], &context(&[])),
             ProtectionFact::Unknown,

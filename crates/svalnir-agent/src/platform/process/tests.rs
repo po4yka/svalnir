@@ -823,6 +823,32 @@ fn cpu_use_rejects_samples_that_are_not_comparable() {
 }
 
 #[test]
+fn a_sleep_during_a_collection_gives_no_sleep_time_and_no_cpu_use() {
+    let before: ProcessSnapshot =
+        snapshot(FakeSource::new().with_process(info(100, 50), "/bin/a", usage(MIB, MIB)));
+    // The host sleeps after the first sleep-time read of the later
+    // collection, so the read at the start agrees with the earlier snapshot.
+    let mut later: FakeSource =
+        FakeSource::new().with_process(info(100, 50), "/bin/a", usage(MIB, MIB));
+    later.clock.set(9_000_000);
+    later.slept_later = Some(Nanoseconds::new(5_000_000_000));
+    let after: ProcessSnapshot = snapshot(later);
+    assert_eq!(
+        after.sleep_time,
+        Reading::Unavailable(UnavailableReason::ClockDiscontinuity)
+    );
+
+    let derived: DerivedMetrics = derive_between(&before, &after);
+    let id: &ProcessGenerationId = &record(&after, 100).identity.generation_id;
+    assert_eq!(
+        derived.cpu.get(id),
+        Some(&Err(DerivedUnavailable::SampleUnavailable(
+            UnavailableReason::ClockDiscontinuity
+        )))
+    );
+}
+
+#[test]
 fn derived_values_join_snapshots_by_generation() {
     let mut busy = usage(30 * MIB, MIB);
     busy.user_time_mach = 24_000;

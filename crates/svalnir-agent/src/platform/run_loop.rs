@@ -170,13 +170,28 @@ extern "C" fn record_stop(context: *mut c_void) {
     STOP_SIGNAL.store(signal, Ordering::SeqCst);
 }
 
+/// The registration handler of a signal source. The context is the signal
+/// number.
+///
+/// Dispatch calls it after the kernel started to record the signal for the
+/// source. Only then does the process ignore the default action: a signal
+/// that is ignored before that time is recorded nowhere. Before that time
+/// the default action ends the process, which is a correct result of a stop
+/// signal.
+#[cfg(target_os = "macos")]
+extern "C" fn ignore_default_action(context: *mut c_void) {
+    let signal: libc::c_int = libc::c_int::try_from(context as usize).unwrap_or(0);
+    if signal == libc::SIGINT || signal == libc::SIGTERM {
+        // SAFETY: `SIG_IGN` is a valid disposition of these two signals. The
+        // signal source reads the signal from the kernel event queue, which
+        // records a signal that the process ignores.
+        unsafe { libc::signal(signal, libc::SIG_IGN) };
+    }
+}
+
 /// Makes a Dispatch source on the main queue that records `signal`.
 #[cfg(target_os = "macos")]
 fn stop_source(signal: libc::c_int) -> DispatchRetained<DispatchSource> {
-    // SAFETY: `SIG_IGN` is a valid disposition. A Dispatch signal source
-    // reads the signal from the kernel event queue, so the process must not
-    // also take the default action, which ends it.
-    unsafe { libc::signal(signal, libc::SIG_IGN) };
     let source_type: dispatch_source_type_t = (&raw const _dispatch_source_type_signal).cast_mut();
     let handle: usize = usize::try_from(signal).unwrap_or(0);
     // SAFETY: the type is the signal source type of libdispatch, which takes
@@ -188,6 +203,7 @@ fn stop_source(signal: libc::c_int) -> DispatchRetained<DispatchSource> {
     // address that no handler dereferences, so it has no lifetime.
     unsafe { source.set_context(handle as *mut c_void) };
     source.set_event_handler_f(record_stop);
+    source.set_registration_handler_f(ignore_default_action);
     source.activate();
     source
 }

@@ -85,6 +85,10 @@ pub(super) struct FakeSource {
     pub(super) clock: Cell<u64>,
     /// The cumulative sleep time of the host.
     pub(super) slept: Result<Nanoseconds, UnavailableReason>,
+    /// The sleep time that the second and each later query gives, for a
+    /// host that sleeps during a collection.
+    pub(super) slept_later: Option<Nanoseconds>,
+    sleep_queries: Cell<u32>,
     /// The answer of `application_list_current`.
     pub(super) list_current: bool,
     /// The failure of the file evidence query of a path.
@@ -106,6 +110,8 @@ impl FakeSource {
             timebase: Ok(Timebase::new(125, 3).unwrap()),
             clock: Cell::new(1_000_000),
             slept: Ok(Nanoseconds::ZERO),
+            slept_later: None,
+            sleep_queries: Cell::new(0),
             list_current: true,
             file_failures: BTreeMap::new(),
         }
@@ -251,7 +257,12 @@ impl ProcessSource for FakeSource {
     }
 
     fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
-        self.slept.clone()
+        let query: u32 = self.sleep_queries.get();
+        self.sleep_queries.set(query.saturating_add(1));
+        match self.slept_later {
+            Some(later) if query > 0 => Ok(later),
+            _ => self.slept.clone(),
+        }
     }
 
     fn wall_now(&self) -> Result<WallTime, QueryFailure> {

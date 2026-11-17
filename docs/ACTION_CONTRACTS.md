@@ -182,12 +182,12 @@ The catalog of hard protections gives one fact for each application or job insta
 | `launchd` | Its process ID is 1 |
 | Control plane | It is the evaluating Svalnir process or one of its ancestors. An ancestor is identified by its process ID together with its start time |
 | Session application | Its bundle identifier is one of `com.apple.finder`, `com.apple.dock`, `com.apple.loginwindow`, `com.apple.systemuiserver`, `com.apple.controlcenter`, `com.apple.notificationcenterui`, `com.apple.WindowManager`, `com.apple.Spotlight`, `com.apple.SecurityAgent`, and `com.apple.coreservices.uiagent`. The comparison ignores ASCII case |
-| Svalnir component | Its bundle identifier is `dev.svalnir` or starts with `dev.svalnir.`, or its executable has the file name `svalnir`, `svalnir-agent`, `svalnir-privileged`, or `svalnir-gui` |
-| System executable | Its executable is below `/System/`, `/usr/`, `/bin/`, `/sbin/`, or `/Library/Apple/`, and not below `/usr/local/` |
+| Svalnir component | Its bundle identifier is `dev.svalnir` or starts with `dev.svalnir.`, or its executable has the file name `svalnir`, `svalnir-agent`, `svalnir-privileged`, or `svalnir-gui`. The comparison ignores ASCII case |
+| System executable | Its executable is below `/System/`, `/usr/`, `/bin/`, `/sbin/`, or `/Library/Apple/`, and not below `/usr/local/`. The comparison ignores ASCII case |
 
 A rule can only add a protection. A name, a path, or a bundle identifier never selects a target. A bundle identifier protects also when the membership of the process is not verified.
 
-With no protected member, the fact is unknown when the instance has no member, a member has no executable evidence, an executable path is relative or has a `..` component, or the control plane is not known. An evaluation skips an instance of unknown protection. No profile, policy, or grant changes the catalog; a user protection in the configuration is a separate exclusion. Automatic foreground protection is evaluated at each automatic termination boundary. Manual requests enforce their own exact authorization and applicable global/manual protections; `memory_guard.allow_force_quit` neither grants nor independently prohibits manual force quit.
+With no protected member, the fact is unknown when the instance has no member, a member has no executable evidence, an executable path is relative or has an empty, `.`, or `..` component, or the control plane is not known. An evaluation skips an instance of unknown protection. No profile, policy, or grant changes the catalog; a user protection in the configuration is a separate exclusion. Automatic foreground protection is evaluated at each automatic termination boundary. Manual requests enforce their own exact authorization and applicable global/manual protections; `memory_guard.allow_force_quit` neither grants nor independently prohibits manual force quit.
 
 The normal sequence is:
 

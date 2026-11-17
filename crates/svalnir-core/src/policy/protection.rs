@@ -14,7 +14,7 @@ use super::control::ProtectionFact;
 use crate::process::{Pid, ProcessAssociation, ProcessIdentity, ProcessStartTime, Uid};
 
 /// The directories of the operating system. An executable below one of them
-/// is an essential system process.
+/// is an essential system process. The comparison ignores ASCII case.
 pub const SYSTEM_DIRECTORIES: [&str; 5] =
     ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"];
 
@@ -40,7 +40,8 @@ pub const SESSION_BUNDLE_IDENTIFIERS: [&str; 10] = [
 /// identifiers of its components.
 pub const CONTROL_PLANE_BUNDLE_IDENTIFIER: &str = "dev.svalnir";
 
-/// The file names of the Svalnir executables.
+/// The file names of the Svalnir executables. The comparison ignores ASCII
+/// case.
 pub const CONTROL_PLANE_EXECUTABLES: [&str; 4] = [
     "svalnir",
     "svalnir-agent",
@@ -99,20 +100,36 @@ fn has_protected_bundle(association: &ProcessAssociation) -> bool {
 
 /// The protection that the executable path gives. `None` when the path is
 /// not one that the catalog can classify.
+///
+/// The comparison ignores ASCII case, because the default volume format of
+/// macOS does. A rule can only add a protection, so a match that a
+/// case-sensitive volume would not make is the safe direction.
 fn path_protection(path: &[u8]) -> Option<bool> {
-    // A path with a parent component can leave the directory of its prefix.
-    let has_parent_component: bool = path.split(|byte| *byte == b'/').any(|part| part == b"..");
-    if has_parent_component || !path.starts_with(b"/") {
+    // The path must be absolute, with no empty, `.`, or `..` component: such
+    // a component can make the text name a file outside its prefix.
+    let mut components = path.split(|byte| *byte == b'/');
+    if components.next() != Some(b"".as_slice()) {
         return None;
     }
+    let mut file_name: Option<&[u8]> = None;
+    for component in components {
+        if component.is_empty() || component == b"." || component == b".." {
+            return None;
+        }
+        file_name = Some(component);
+    }
+    let file_name: &[u8] = file_name?;
+    let has_prefix = |prefix: &str| {
+        path.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+    };
     let in_system_directory: bool = SYSTEM_DIRECTORIES
         .iter()
-        .any(|directory| path.starts_with(directory.as_bytes()))
-        && !path.starts_with(LOCAL_DIRECTORY.as_bytes());
-    let file_name: &[u8] = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        .any(|directory| has_prefix(directory))
+        && !has_prefix(LOCAL_DIRECTORY);
     let is_control_plane: bool = CONTROL_PLANE_EXECUTABLES
         .iter()
-        .any(|name| file_name == name.as_bytes());
+        .any(|name| file_name.eq_ignore_ascii_case(name.as_bytes()));
     Some(in_system_directory || is_control_plane)
 }
 
@@ -163,7 +180,8 @@ fn process_protection(
 ///
 /// With no protected member, the instance is [`ProtectionFact::Unknown`]
 /// when it has no member, a member has no executable evidence or a path that
-/// the catalog cannot classify, or the control plane is not known. In each
+/// the catalog cannot classify (a relative path, or a path with an empty,
+/// `.`, or `..` component), or the control plane is not known. In each
 /// other case it is [`ProtectionFact::NotProtected`].
 pub fn hard_protection(
     processes: &[ProcessIdentity],

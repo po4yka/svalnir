@@ -28,8 +28,9 @@ pub const MAX_CONTROL_PLANE_ANCESTORS: usize = 64;
 /// The process with `own_pid` and its ancestors in `snapshot`, as the
 /// control plane of a protection lookup.
 ///
-/// The function follows the parent PID of each record. It stops at
-/// `launchd`, at a parent that is not in the snapshot, and after
+/// The function follows the parent PID of each record. It stops at a parent
+/// that is not in the snapshot, at a parent that is already in the result,
+/// and after
 /// [`MAX_CONTROL_PLANE_ANCESTORS`] ancestors. A snapshot has only the
 /// processes of one user, so an ancestor of a different user is not in the
 /// result; the catalog protects such a process by its owner.
@@ -400,6 +401,21 @@ mod tests {
             .unwrap();
         let chain = control_plane(&snapshot, pid(500)).unwrap();
         assert_eq!(chain.len(), 2);
-        assert!(chain.len() <= MAX_CONTROL_PLANE_ANCESTORS + 1);
+    }
+
+    #[test]
+    fn the_control_plane_has_a_limit_of_ancestors() {
+        // A chain of 80 processes: each one is the child of the next.
+        let mut source: FakeSource = FakeSource::new();
+        for process in 1_000..1_080 {
+            let mut record = info(process, 100);
+            record.parent_pid = Some(pid(process + 1));
+            source = source.with_process(record, "/Users/me/bin/link", usage(MIB, MIB));
+        }
+        let snapshot: ProcessSnapshot = source.collector().collect().unwrap();
+        let chain = control_plane(&snapshot, pid(1_000)).unwrap();
+        // This process and the permitted number of ancestors.
+        assert_eq!(chain.len(), MAX_CONTROL_PLANE_ANCESTORS + 1);
+        assert_eq!(chain[0].pid, pid(1_000));
     }
 }

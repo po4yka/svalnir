@@ -13,6 +13,7 @@ use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds, PageCount};
 use super::context::{CollectError, CollectionContext, MetricSpec, Provenance, reading_from};
 use super::native;
 use super::raw::{RawSwapUsage, RawVmStatistics, RawVmStatisticsRevision1};
+use crate::platform::sleep::bracketed_sleep_reading;
 
 /// The native API of the physical-memory query.
 pub const PHYSICAL_NATIVE_API: &str = "sysctlbyname";
@@ -356,11 +357,17 @@ pub fn vm_statistics(
 ///
 /// Returns a [`CollectError`] when the clock gives no acquisition window.
 pub fn collect_vm_statistics(context: &CollectionContext) -> Result<VmStatistics, CollectError> {
+    // The sleep time is read before and after the counters, so a sleep
+    // during the acquisition does not give a sleep time that agrees with the
+    // next sample.
+    let sleep_before: Reading<Nanoseconds> = context.sleep_time();
     let acquisition = context.begin()?;
     let page_size: Result<u64, UnavailableReason> = native::vm_page_size();
     let raw: Result<RawVmStatistics, UnavailableReason> = native::vm_statistics();
     let sample: Sample = context.finish(acquisition)?;
-    Ok(vm_statistics(context, raw, page_size, &sample))
+    let mut statistics: VmStatistics = vm_statistics(context, raw, page_size, &sample);
+    statistics.sleep_time = bracketed_sleep_reading(&sleep_before, statistics.sleep_time);
+    Ok(statistics)
 }
 
 /// The swap space of the host from one `vm.swapusage` read.

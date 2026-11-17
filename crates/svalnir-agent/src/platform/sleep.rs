@@ -86,6 +86,30 @@ pub(crate) fn sleep_reading(
     }
 }
 
+/// The sleep time of one acquisition from a read before it and a read after
+/// it.
+///
+/// The result has a value only when the two reads agree: then the host did
+/// not sleep during the acquisition, and each value that the acquisition
+/// read has this sleep time. A sleep during the acquisition gives
+/// `clock_discontinuity`, so no interval that ends or starts at this
+/// acquisition gives a rate.
+pub(crate) fn bracketed_sleep_reading(
+    before: &Reading<Nanoseconds>,
+    after: Reading<Nanoseconds>,
+) -> Reading<Nanoseconds> {
+    match sleep_between(before, &after) {
+        Ok(()) => after,
+        Err(SleepBoundary::Slept | SleepBoundary::Decreased) => {
+            Reading::Unavailable(UnavailableReason::ClockDiscontinuity)
+        }
+        Err(SleepBoundary::Unavailable(reason)) => Reading::Unavailable(reason),
+        Err(SleepBoundary::Unrecognized) => {
+            Reading::Unavailable(UnavailableReason::InconsistentData)
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn clock_nanoseconds(clock: libc::clockid_t) -> Option<u64> {
     let mut time = libc::timespec {
@@ -150,7 +174,7 @@ mod tests {
     use svalnir_core::observation::{Reading, UnavailableReason};
     use svalnir_core::quantity::Nanoseconds;
 
-    use super::{SLEEP_TOLERANCE, SleepBoundary, sleep_between};
+    use super::{SLEEP_TOLERANCE, SleepBoundary, bracketed_sleep_reading, sleep_between};
 
     fn slept(nanoseconds: u64) -> Reading<Nanoseconds> {
         Reading::Available(Nanoseconds::new(nanoseconds))
@@ -196,6 +220,26 @@ mod tests {
         assert_eq!(
             sleep_between(&slept(0), &unavailable),
             Err(SleepBoundary::Unavailable(UnavailableReason::Unsupported))
+        );
+    }
+
+    #[test]
+    fn a_sleep_during_an_acquisition_gives_no_sleep_time() {
+        // The two reads agree: the acquisition has the later value.
+        assert_eq!(bracketed_sleep_reading(&slept(5), slept(6)), slept(6));
+        // The host slept between the two reads.
+        let after_sleep: u64 = SLEEP_TOLERANCE.get() + 6;
+        assert_eq!(
+            bracketed_sleep_reading(&slept(5), slept(after_sleep)),
+            Reading::Unavailable(UnavailableReason::ClockDiscontinuity)
+        );
+        // A read with no value keeps its reason.
+        assert_eq!(
+            bracketed_sleep_reading(
+                &Reading::Unavailable(UnavailableReason::Unsupported),
+                slept(6)
+            ),
+            Reading::Unavailable(UnavailableReason::Unsupported)
         );
     }
 

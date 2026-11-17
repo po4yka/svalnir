@@ -47,6 +47,8 @@ use svalnir_core::process::{
 };
 use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds};
 use svalnir_core::time::{MonotonicNanos, WallTime};
+
+use crate::platform::sleep::{bracketed_sleep_reading, sleep_reading};
 use thiserror::Error;
 
 use super::source::{
@@ -230,8 +232,8 @@ pub struct ProcessSnapshot {
     pub finished_monotonic_ns: MonotonicNanos,
     /// The wall-clock time of the collection, for display.
     pub captured_at: WallTime,
-    /// The cumulative sleep time of the host at the start of the collection.
-    /// A CPU use between two snapshots with different sleep times has a sleep
+    /// The cumulative sleep time of the host during the collection. It has
+    /// no value when the host slept during the collection. A CPU use between two snapshots with different sleep times has a sleep
     /// in its interval.
     pub sleep_time: Reading<Nanoseconds>,
     /// The recorded processes, in PID order.
@@ -351,8 +353,9 @@ impl<S: ProcessSource> ProcessCollector<S> {
     pub fn collect(&self) -> Result<ProcessSnapshot, CollectError> {
         let started: MonotonicNanos = self.now()?;
         let captured_at: WallTime = self.source.wall_now().map_err(CollectError::Clock)?;
-        let sleep_time: Reading<Nanoseconds> =
-            crate::platform::sleep::sleep_reading(self.source.sleep_time());
+        // The sleep time is read here and again after the last process, so a
+        // sleep during the collection gives no sleep time.
+        let sleep_before: Reading<Nanoseconds> = sleep_reading(self.source.sleep_time());
         let timebase: Result<Timebase, QueryFailure> = self.source.timebase();
         let mut pids: Vec<Pid> = self.source.list_pids().map_err(CollectError::ProcessList)?;
         pids.sort_unstable();
@@ -404,6 +407,8 @@ impl<S: ProcessSource> ProcessCollector<S> {
             records.push(self.record(entry, association, foreground, captured_at, timebase)?);
         }
 
+        let sleep_time: Reading<Nanoseconds> =
+            bracketed_sleep_reading(&sleep_before, sleep_reading(self.source.sleep_time()));
         Ok(ProcessSnapshot {
             boot_id: self.context.boot_id.clone(),
             clock_domain: self.clock_domain.clone(),

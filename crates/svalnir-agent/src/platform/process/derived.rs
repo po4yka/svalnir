@@ -16,6 +16,7 @@ use svalnir_core::time::MonotonicNanos;
 use thiserror::Error;
 
 use super::inventory::{ProcessRecord, ProcessSnapshot};
+use crate::platform::sleep::{SleepBoundary, sleep_between};
 
 /// The reason a derived value has no result.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -46,6 +47,23 @@ pub enum DerivedUnavailable {
     /// A sample has an availability that this build does not recognize.
     #[error("a sample has an availability that is not recognized")]
     SampleUnrecognized,
+    /// The host slept between the two samples.
+    #[error("the host slept in the interval")]
+    SleepInInterval,
+    /// The sleep time of the host decreased between the two samples.
+    #[error("the sleep time of the host decreased between the samples")]
+    SleepTimeDecreased,
+}
+
+impl From<SleepBoundary> for DerivedUnavailable {
+    fn from(boundary: SleepBoundary) -> Self {
+        match boundary {
+            SleepBoundary::Slept => Self::SleepInInterval,
+            SleepBoundary::Decreased => Self::SleepTimeDecreased,
+            SleepBoundary::Unavailable(reason) => Self::SampleUnavailable(reason),
+            SleepBoundary::Unrecognized => Self::SampleUnrecognized,
+        }
+    }
 }
 
 impl DerivedUnavailable {
@@ -55,10 +73,13 @@ impl DerivedUnavailable {
             Self::NoSamples => UnavailableReason::NotCollected,
             Self::InsufficientSamples => UnavailableReason::NotInitialized,
             Self::GenerationMismatch => UnavailableReason::IdentityChanged,
-            Self::ClockDomainMismatch => UnavailableReason::ClockDiscontinuity,
-            Self::NotOrdered | Self::CounterReset | Self::SampleUnrecognized => {
-                UnavailableReason::InconsistentData
+            Self::ClockDomainMismatch | Self::SleepInInterval => {
+                UnavailableReason::ClockDiscontinuity
             }
+            Self::NotOrdered
+            | Self::CounterReset
+            | Self::SampleUnrecognized
+            | Self::SleepTimeDecreased => UnavailableReason::InconsistentData,
             Self::SampleUnavailable(reason) => reason.clone(),
         }
     }
@@ -240,12 +261,16 @@ pub struct CpuSample {
     /// The cumulative CPU time in nanoseconds, or the reason there is no
     /// value.
     pub cpu_time: Reading<CounterValue>,
+    /// The cumulative sleep time of the host at the collection of the
+    /// sample.
+    pub sleep_time: Reading<Nanoseconds>,
 }
 
 impl CpuSample {
-    /// The CPU sample of a record.
-    pub fn from_record(record: &ProcessRecord) -> Self {
+    /// The CPU sample of a record of `snapshot`.
+    pub fn from_record(record: &ProcessRecord, snapshot: &ProcessSnapshot) -> Self {
         Self {
+            sleep_time: snapshot.sleep_time.clone(),
             generation_id: record.identity.generation_id.clone(),
             sample_id: record.metrics.sample().sample_id.clone(),
             clock_domain: record.metrics.sample().clock_domain.clone(),
@@ -303,8 +328,9 @@ fn counter_value(reading: &Reading<CounterValue>) -> Result<CounterValue, Derive
 /// # Errors
 ///
 /// Returns a [`DerivedUnavailable`] when the samples are not from the same
-/// generation and clock domain, `later` is not after `earlier`, a sample
-/// has no value, or the counter decreased.
+/// generation and clock domain, `later` is not after `earlier`, the host
+/// slept between the samples or a sleep time has no value, a sample has no
+/// value, or the counter decreased.
 pub fn cpu_usage(earlier: &CpuSample, later: &CpuSample) -> Result<CpuUsage, DerivedUnavailable> {
     if earlier.generation_id != later.generation_id {
         return Err(DerivedUnavailable::GenerationMismatch);
@@ -316,6 +342,9 @@ pub fn cpu_usage(earlier: &CpuSample, later: &CpuSample) -> Result<CpuUsage, Der
         Some(elapsed) if elapsed > Nanoseconds::ZERO => elapsed,
         _ => return Err(DerivedUnavailable::NotOrdered),
     };
+    // The elapsed time includes a sleep and the CPU time does not, so a
+    // sleep in the interval makes the ratio too small.
+    sleep_between(&earlier.sleep_time, &later.sleep_time)?;
     let before: CounterValue = counter_value(&earlier.cpu_time)?;
     let after: CounterValue = counter_value(&later.cpu_time)?;
     let increase: u64 = after
@@ -348,6 +377,9 @@ pub struct DerivedMetrics {
 /// it gets no value from the data of its predecessor. The generation text
 /// has no boot, so for two snapshots of different boots each generation with
 /// the same text in both gets [`DerivedUnavailable::GenerationMismatch`].
+///
+/// A sleep of the host between the snapshots gives no CPU use. The footprint
+/// growth is a gauge difference, which a sleep does not make invalid.
 pub fn derive_between(earlier: &ProcessSnapshot, later: &ProcessSnapshot) -> DerivedMetrics {
     let mut derived: DerivedMetrics = DerivedMetrics::default();
     let same_boot: bool = earlier.boot_id == later.boot_id;
@@ -382,8 +414,8 @@ pub fn derive_between(earlier: &ProcessSnapshot, later: &ProcessSnapshot) -> Der
         derived.cpu.insert(
             generation_id.clone(),
             cpu_usage(
-                &CpuSample::from_record(previous),
-                &CpuSample::from_record(record),
+                &CpuSample::from_record(previous, earlier),
+                &CpuSample::from_record(record, later),
             ),
         );
     }

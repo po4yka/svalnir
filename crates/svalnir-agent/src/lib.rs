@@ -15,6 +15,7 @@
 //! | [`platform::memory`] | Memory pressure, physical memory, VM statistics, swap usage, counter rates, pressure events, and the collection context |
 //! | [`platform::volume`] | Volume identities, capacity, Foundation planning values, and capacity pools |
 //! | [`platform::process`] | Process inventory, generation identity, footprint and resident size, application attribution, derived growth and CPU use, and ranking |
+//! | [`platform::sleep`] | The sleep time of the host and the sleep-boundary check of a rate interval |
 //! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |

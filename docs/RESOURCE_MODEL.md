@@ -151,6 +151,8 @@ rate_per_second = delta / (elapsed_monotonic_ns / 1_000_000_000)
 
 A valid interval requires matching metric definition, unit, scope generation, reset domain, and clock domain; distinct ordered samples; a positive elapsed duration; and no disallowed gap or sleep boundary. Use checked subtraction before approximate division. Retain both sample IDs and the interval in derived provenance.
 
+The evidence of a sleep boundary is the cumulative sleep time of the host in the current boot, read at each sample. On macOS it is the continuous monotonic clock minus the uptime clock, which stops while the host sleeps. Two samples with different sleep times have a sleep boundary between them, also when the interval is shorter than the permitted gap. A sample with no sleep time gives no evidence, so its interval is unavailable. A value that divides by the elapsed time, such as a counter rate or a CPU use, needs this evidence.
+
 If the counter decreases, report a reset or discontinuity. Do not emit negative activity, assume wraparound, clamp to zero, or join across restart without a documented counter-specific contract. A changed VM page size or CPU-capacity convention also invalidates the corresponding rate interval.
 
 Gauge differences, including footprint growth, are signed and have different semantics from counter activity. A growing footprint may identify a workload trend; it does not prove a leak. Missing samples create a gap, not evidence of steady growth. Forecasts carry their model and uncertainty and remain advisory under the policy specification.

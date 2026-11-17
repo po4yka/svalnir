@@ -9,4 +9,5 @@
 
 pub mod memory;
 pub mod process;
+pub mod sleep;
 pub mod volume;

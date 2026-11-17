@@ -35,7 +35,9 @@ static FIRST_APPLICATION_LIST: AtomicBool = AtomicBool::new(true);
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSWorkspace;
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
+use svalnir_core::observation::UnavailableReason;
 use svalnir_core::process::{Pid, ProcessStartTime, Uid};
+use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
@@ -423,6 +425,10 @@ impl ProcessSource for DarwinProcessSource {
 
     fn monotonic_now(&self) -> Result<MonotonicNanos, QueryFailure> {
         monotonic_now()
+    }
+
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+        crate::platform::sleep::native_sleep_time()
     }
 
     fn wall_now(&self) -> Result<WallTime, QueryFailure> {

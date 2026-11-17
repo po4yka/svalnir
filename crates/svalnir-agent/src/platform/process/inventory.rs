@@ -41,7 +41,7 @@ use svalnir_core::process::{
     AttributionMethod, ExecutableIdentity, Pid, ProcessAssociation, ProcessIdentity,
     ProcessStartTime, Uid, VerifiedMembership,
 };
-use svalnir_core::quantity::{Bytes, CounterValue};
+use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds};
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use thiserror::Error;
 
@@ -226,6 +226,10 @@ pub struct ProcessSnapshot {
     pub finished_monotonic_ns: MonotonicNanos,
     /// The wall-clock time of the collection, for display.
     pub captured_at: WallTime,
+    /// The cumulative sleep time of the host at the start of the collection.
+    /// A CPU use between two snapshots with different sleep times has a sleep
+    /// in its interval.
+    pub sleep_time: Reading<Nanoseconds>,
     /// The recorded processes, in PID order.
     pub records: Vec<ProcessRecord>,
     /// The processes that were found and not recorded.
@@ -343,6 +347,8 @@ impl<S: ProcessSource> ProcessCollector<S> {
     pub fn collect(&self) -> Result<ProcessSnapshot, CollectError> {
         let started: MonotonicNanos = self.now()?;
         let captured_at: WallTime = self.source.wall_now().map_err(CollectError::Clock)?;
+        let sleep_time: Reading<Nanoseconds> =
+            crate::platform::sleep::sleep_reading(self.source.sleep_time());
         let timebase: Result<Timebase, QueryFailure> = self.source.timebase();
         let mut pids: Vec<Pid> = self.source.list_pids().map_err(CollectError::ProcessList)?;
         pids.sort_unstable();
@@ -400,6 +406,7 @@ impl<S: ProcessSource> ProcessCollector<S> {
             started_monotonic_ns: started,
             finished_monotonic_ns: self.now()?,
             captured_at,
+            sleep_time,
             records,
             omissions,
             launch_services_unavailable: applications.err().map(QueryFailure::reason),

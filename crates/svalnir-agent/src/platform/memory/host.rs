@@ -8,7 +8,7 @@
 use svalnir_core::observation::{
     MetricId, MetricKind, Observation, Reading, Sample, UnavailableReason, Unit, metric,
 };
-use svalnir_core::quantity::{Bytes, CounterValue, PageCount};
+use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds, PageCount};
 
 use super::context::{CollectError, CollectionContext, MetricSpec, Provenance, reading_from};
 use super::native;
@@ -80,6 +80,9 @@ pub struct VmStatistics {
     pub page_size: Reading<Bytes>,
     /// The acquisition of the statistics and of the page size.
     pub sample: Sample,
+    /// The cumulative sleep time of the host at this sample. A rate between
+    /// two samples with different sleep times has a sleep in its interval.
+    pub sleep_time: Reading<Nanoseconds>,
     /// `memory.vm.free_pages`.
     pub free: Observation<PageCount>,
     /// `memory.vm.active_pages`.
@@ -247,6 +250,9 @@ impl VmFields<'_> {
 
 /// Makes the VM observations from a raw sample and a raw page size.
 ///
+/// The function also reads the sleep time of the host from the clock of
+/// `context`, as evidence for a rate interval.
+///
 /// A page size of zero is not valid. A field of revision 1 of the native
 /// structure is `unsupported` when the kernel returned only revision 0.
 pub fn vm_statistics(
@@ -272,6 +278,7 @@ pub fn vm_statistics(
         revision_1,
     };
     VmStatistics {
+        sleep_time: context.sleep_time(),
         free: fields.base_gauge(metric::MEMORY_VM_FREE_PAGES, "free_count", |raw| {
             raw.free_count.into()
         }),

@@ -217,6 +217,7 @@ pub(crate) fn memory_snapshot_at(index: u64) -> MemorySnapshot {
         vm: VmStatistics {
             page_size: Reading::Available(Bytes::new(16_384)),
             sample: vm_sample.clone(),
+            sleep_time: Reading::Available(Nanoseconds::ZERO),
             free: pages(metric::MEMORY_VM_FREE_PAGES, 65_536),
             active: pages(metric::MEMORY_VM_ACTIVE_PAGES, 300_000),
             inactive: pages(metric::MEMORY_VM_INACTIVE_PAGES, 200_000),
@@ -387,6 +388,7 @@ pub(crate) fn process_snapshot() -> ProcessSnapshot {
         started_monotonic_ns: MonotonicNanos::new(FIRST_SAMPLE_NS),
         finished_monotonic_ns: MonotonicNanos::new(FIRST_SAMPLE_NS + 60_000_000),
         captured_at: wall_time(),
+        sleep_time: Reading::Available(Nanoseconds::ZERO),
         records: vec![
             process_record(
                 200,

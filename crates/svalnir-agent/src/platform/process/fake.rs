@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{BootId, CollectorEpochId, WorkerId};
+use svalnir_core::observation::UnavailableReason;
 use svalnir_core::process::{Pid, ProcessStartTime, Uid};
+use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::inventory::{CollectionContext, ProcessCollector};
@@ -81,6 +83,8 @@ pub(super) struct FakeSource {
     pub(super) applications: Result<Vec<RunningApplication>, QueryFailure>,
     pub(super) timebase: Result<Timebase, QueryFailure>,
     pub(super) clock: Cell<u64>,
+    /// The cumulative sleep time of the host.
+    pub(super) slept: Result<Nanoseconds, UnavailableReason>,
     /// The answer of `application_list_current`.
     pub(super) list_current: bool,
     /// The failure of the file evidence query of a path.
@@ -101,6 +105,7 @@ impl FakeSource {
             applications: Ok(Vec::new()),
             timebase: Ok(Timebase::new(125, 3).unwrap()),
             clock: Cell::new(1_000_000),
+            slept: Ok(Nanoseconds::ZERO),
             list_current: true,
             file_failures: BTreeMap::new(),
         }
@@ -243,6 +248,10 @@ impl ProcessSource for FakeSource {
         let now: u64 = self.clock.get() + 1_000;
         self.clock.set(now);
         Ok(MonotonicNanos::new(now))
+    }
+
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+        self.slept.clone()
     }
 
     fn wall_now(&self) -> Result<WallTime, QueryFailure> {

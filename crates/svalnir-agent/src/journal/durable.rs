@@ -567,6 +567,33 @@ impl OperationJournal {
         Ok(operations)
     }
 
+    /// Reads the operation of a plan. A plan has at most one operation,
+    /// so this read finds the operation of an earlier apply with no bound
+    /// on the number of later records.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or the error of a record that this build
+    /// cannot decode.
+    pub fn operation_of_plan(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<Option<Operation>, OperationJournalError> {
+        use rusqlite::OptionalExtension as _;
+        let transaction = self.read_transaction()?;
+        let seq: Option<i64> = transaction
+            .query_row(
+                "SELECT seq FROM operation WHERE plan_id = ?1",
+                [plan_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match seq {
+            Some(seq) => Ok(Some(row::load_operation(&transaction, seq)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Reads the newest operations, the newest first, settled or not. The
     /// result has at most `limit` operations. This is the read of a history
     /// query; it changes nothing.

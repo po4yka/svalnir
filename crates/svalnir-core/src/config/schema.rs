@@ -1,0 +1,447 @@
+//! The typed values of a validated configuration, schema version 1.
+//!
+//! `docs/POLICY_SPEC.md` section 4 has the document that these types hold.
+//! Each field has a value: an omitted key has the value of the template
+//! (`super::template`). [`ValidatedConfig::is_explicit`] tells the two apart.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::num::NonZeroU32;
+use std::time::Duration;
+
+use super::path::ConfigPath;
+use crate::id::RuleId;
+use crate::quantity::{Bytes, EntryCount};
+
+/// The schema version that this module reads.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Makes an enumeration of configuration text values.
+macro_rules! text_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident { $($(#[$variant_meta:meta])* $variant:ident => $text:literal),+ $(,)? }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[non_exhaustive]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant,)+
+        }
+
+        impl $name {
+            /// Each value, in the sequence of the specification.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// The text of the value in a configuration document.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text,)+
+                }
+            }
+
+            /// Finds the value for a configuration text.
+            pub fn from_text(text: &str) -> Option<Self> {
+                match text {
+                    $($text => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+text_enum! {
+    /// The profile that supplies the starting values
+    /// (`docs/POLICY_SPEC.md` section 2). A profile does not create a grant.
+    Profile {
+        /// Collection and explanation, with no automatic intervention.
+        Observe => "observe",
+        /// Foreground protection and ordinary grace periods.
+        Balanced => "balanced",
+        /// Shorter configured waits and foreground eligibility.
+        Aggressive => "aggressive",
+    }
+}
+
+text_enum! {
+    /// The pressure state that starts the global memory trigger
+    /// (`docs/POLICY_SPEC.md` section 10).
+    GlobalTrigger {
+        /// Sustained native `critical` pressure.
+        Critical => "critical",
+    }
+}
+
+text_enum! {
+    /// The removal mode of automatic disk-guard work.
+    AutomaticMode {
+        /// Permanent eviction of approved regenerable data.
+        Permanent => "permanent",
+    }
+}
+
+text_enum! {
+    /// The restart strategy of an application budget
+    /// (`docs/POLICY_SPEC.md` section 10, "Relaunch and restart").
+    RestartPolicy {
+        /// Svalnir does not start the application again.
+        Never => "never",
+    }
+}
+
+text_enum! {
+    /// A group of applications that automatic memory intervention can select.
+    EligibleGroup {
+        /// Applications of the user that are not in the foreground.
+        BackgroundUserApplications => "background-user-applications",
+        /// Jobs that a supported managed-job adapter controls.
+        ManagedJobs => "managed-jobs",
+    }
+}
+
+/// Makes a validated text identifier.
+macro_rules! text_identifier {
+    ($(#[$meta:meta])* $name:ident, $max:literal, $extra:literal) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            /// The largest accepted length, in characters.
+            pub const MAX_LENGTH: usize = $max;
+
+            /// Validates the text. Returns `None` when the text is empty, is
+            /// too long, or has a character outside the grammar.
+            pub fn new(text: &str) -> Option<Self> {
+                let accepted: bool = !text.is_empty()
+                    && text.len() <= Self::MAX_LENGTH
+                    && text.chars().all(|character: char| {
+                        character.is_ascii_alphanumeric() || $extra.contains(character)
+                    });
+                accepted.then(|| Self(text.to_owned()))
+            }
+
+            /// The text.
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+text_identifier! {
+    /// A logical volume selector such as `startup-data`: 1 to 128 characters
+    /// of `A-Za-z0-9._:-`. The agent resolves it to a current volume
+    /// identity; this module does not.
+    VolumeSelector, 128, "._:-"
+}
+
+text_identifier! {
+    /// A bundle identifier as text: 1 to 255 characters of `A-Za-z0-9.-_`.
+    /// The text is not a verified application identity. The agent resolves
+    /// and verifies it; this module does not.
+    BundleId, 255, ".-_"
+}
+
+text_identifier! {
+    /// The identifier of an application budget in the document: 1 to 128
+    /// characters of `A-Za-z0-9._:-`.
+    AppBudgetId, 128, "._:-"
+}
+
+impl VolumeSelector {
+    /// The selector of the startup data volume.
+    pub(super) fn startup_data() -> Self {
+        Self("startup-data".to_owned())
+    }
+}
+
+/// The `[agent]` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentConfig {
+    /// The profile that supplies the starting values.
+    pub profile: Profile,
+    /// The ordinary sampling interval.
+    pub sample_interval: Duration,
+    /// The sampling interval while a guard qualifies or has an incident.
+    pub pressure_sample_interval: Duration,
+    /// The largest age of a sample that a decision can use.
+    pub decision_sample_max_age: Duration,
+    /// The largest gap between two samples of one qualification window.
+    pub max_qualifying_sample_gap: Duration,
+    /// The lifetime of a plan that the agent prepares automatically.
+    pub plan_ttl: Duration,
+    /// The lifetime of a plan that a user prepares and reviews.
+    pub manual_plan_ttl: Duration,
+}
+
+/// The `[protections]` table. It applies to manual and automatic actions. An
+/// empty list does not disable a built-in protection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Protections {
+    /// Paths that no action can include.
+    pub excluded_paths: Vec<ConfigPath>,
+    /// Bundle identifiers of protected applications, as unverified text.
+    pub protected_bundle_ids: Vec<BundleId>,
+    /// Executable paths of protected applications.
+    pub protected_executable_paths: Vec<ConfigPath>,
+}
+
+/// The `[disk_guard.exclusions]` table. It applies to automatic disk-guard
+/// work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is one key of the configuration schema"
+)]
+pub struct DiskExclusions {
+    /// Paths that automatic disk-guard work cannot include.
+    pub paths: Vec<ConfigPath>,
+    /// Always true in schema version 1.
+    pub protect_archives: bool,
+    /// Always true in schema version 1.
+    pub protect_backups: bool,
+    /// Always true in schema version 1.
+    pub protect_databases: bool,
+    /// Always true in schema version 1.
+    pub protect_model_weights: bool,
+}
+
+/// The `[disk_guard]` table. The validation makes sure that:
+///
+/// ```text
+/// 0 < emergency_below < reclaim_below < warn_below < recover_above
+/// 0 < emergency_sustain_for <= sustain_for
+/// 0 < batch_limit <= pass_limit <= incident_limit
+/// 0 < batch_item_limit <= pass_item_limit <= incident_item_limit
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiskGuard {
+    /// True when the document requests an active disk policy. The applicable
+    /// action grant is a separate condition.
+    pub enabled: bool,
+    /// Logical volume selectors, not resolved.
+    pub volumes: Vec<VolumeSelector>,
+    /// Available capacity below which the warning starts.
+    pub warn_below: Bytes,
+    /// Available capacity below which an incident can start.
+    pub reclaim_below: Bytes,
+    /// Available capacity below which the shorter qualification applies.
+    pub emergency_below: Bytes,
+    /// Available capacity at which new dispatch stops.
+    pub recover_above: Bytes,
+    /// The qualification window of `reclaim_below`.
+    pub sustain_for: Duration,
+    /// The qualification window of `emergency_below`.
+    pub emergency_sustain_for: Duration,
+    /// The stable-recovery window.
+    pub recovery_stable_for: Duration,
+    /// The `work_bytes` ceiling of one batch.
+    pub batch_limit: Bytes,
+    /// The `work_bytes` ceiling of one pass.
+    pub pass_limit: Bytes,
+    /// The `work_bytes` ceiling of one incident.
+    pub incident_limit: Bytes,
+    /// The entry ceiling of one batch.
+    pub batch_item_limit: EntryCount,
+    /// The entry ceiling of one pass.
+    pub pass_item_limit: EntryCount,
+    /// The entry ceiling of one incident.
+    pub incident_item_limit: EntryCount,
+    /// The time ceiling of one pass.
+    pub pass_time_limit: Duration,
+    /// The pass ceiling of one incident.
+    pub max_passes_per_incident: NonZeroU32,
+    /// The wait before another pass.
+    pub pass_cooldown: Duration,
+    /// The wait before the measurement after an action.
+    pub observe_after_action: Duration,
+    /// The backoff after a pass with no effect.
+    pub no_effect_backoff: Duration,
+    /// The removal mode of automatic work.
+    pub automatic_mode: AutomaticMode,
+    /// Rule identifiers, with a valid grammar only. The agent looks them up
+    /// in the compiled reviewed registry; this module does not.
+    pub approved_rules: Vec<RuleId>,
+    /// The `[disk_guard.exclusions]` table.
+    pub exclusions: DiskExclusions,
+}
+
+/// One `[[memory_guard.app_budgets]]` table. The validation makes sure that
+/// `0 < footprint_recover <= footprint_soft < footprint_stop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AppBudget {
+    /// The identifier of the budget, unique in the document.
+    pub id: AppBudgetId,
+    /// The bundle identifier of the target, as unverified text, unique in
+    /// the budgets of the document.
+    pub bundle_id: BundleId,
+    /// The advisory footprint threshold.
+    pub footprint_soft: Bytes,
+    /// The footprint threshold of stop eligibility.
+    pub footprint_stop: Bytes,
+    /// The footprint threshold of recovery. An omitted key has the value of
+    /// `footprint_soft`.
+    pub footprint_recover: Bytes,
+    /// The qualification window of `footprint_stop`.
+    pub over_limit_for: Duration,
+    /// The cooldown of the application.
+    pub cooldown: Duration,
+    /// The restart strategy.
+    pub restart: RestartPolicy,
+}
+
+/// The `[memory_guard]` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is one key of the configuration schema"
+)]
+pub struct MemoryGuard {
+    /// True when the document requests an active memory policy. The
+    /// applicable action grant is a separate condition.
+    pub enabled: bool,
+    /// The pressure state of the global trigger.
+    pub global_trigger: GlobalTrigger,
+    /// The qualification window of the global trigger.
+    pub sustain_for: Duration,
+    /// The wait between the graceful request and force escalation.
+    pub grace_period: Duration,
+    /// The wait before the measurement after an action.
+    pub observe_after_action: Duration,
+    /// The stable-recovery window.
+    pub recovery_stable_for: Duration,
+    /// The application ceiling of one incident.
+    pub max_applications_per_incident: NonZeroU32,
+    /// True when the foreground application is not eligible.
+    pub protect_foreground: bool,
+    /// True when the document permits automatic force quit.
+    pub allow_force_quit: bool,
+    /// True when the document permits memory intervention with a volatile
+    /// journal during critical pressure.
+    pub allow_volatile_journal_on_critical: bool,
+    /// The groups that automatic memory intervention can select from.
+    pub eligible_groups: Vec<EligibleGroup>,
+    /// Bundle identifiers that automatic memory intervention cannot select,
+    /// as unverified text.
+    pub protected_bundle_ids: Vec<BundleId>,
+    /// Executable paths that automatic memory intervention cannot select.
+    pub protected_executable_paths: Vec<ConfigPath>,
+    /// The application budgets, in the sequence of the document.
+    pub app_budgets: Vec<AppBudget>,
+}
+
+/// The `[history]` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct History {
+    /// The retention of history records, best effort within the size limit.
+    pub retention: Duration,
+    /// The hard size limit of the history database.
+    pub max_database_size: Bytes,
+    /// True when an export redacts paths.
+    pub redact_exported_paths: bool,
+}
+
+/// The `[privacy]` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Privacy {
+    /// True when the document permits telemetry.
+    pub telemetry: bool,
+    /// True when the document permits command arguments in records.
+    pub include_command_arguments: bool,
+}
+
+/// A configuration that passed the syntax, schema, and relationship checks.
+///
+/// Only [`super::parse_and_validate`] makes this value, and it has no
+/// mutable access, thus the relationships stay true. The value is a
+/// proposal. It is not an effective revision: the rule registry, the volume
+/// selectors, the application identities, the worker capabilities, and the
+/// grants are not checked (`docs/INTERFACES.md` section 13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedConfig {
+    pub(super) template_revision: u32,
+    pub(super) agent: AgentConfig,
+    pub(super) protections: Protections,
+    pub(super) disk_guard: DiskGuard,
+    pub(super) memory_guard: MemoryGuard,
+    pub(super) history: History,
+    pub(super) privacy: Privacy,
+    pub(super) explicit: BTreeSet<String>,
+}
+
+impl ValidatedConfig {
+    /// The schema version of the document.
+    pub const fn schema_version(&self) -> u32 {
+        SCHEMA_VERSION
+    }
+
+    /// The revision of the template that supplied the omitted values.
+    pub const fn template_revision(&self) -> u32 {
+        self.template_revision
+    }
+
+    /// The `[agent]` table.
+    pub const fn agent(&self) -> &AgentConfig {
+        &self.agent
+    }
+
+    /// The `[protections]` table.
+    pub const fn protections(&self) -> &Protections {
+        &self.protections
+    }
+
+    /// The `[disk_guard]` table.
+    pub const fn disk_guard(&self) -> &DiskGuard {
+        &self.disk_guard
+    }
+
+    /// The `[memory_guard]` table.
+    pub const fn memory_guard(&self) -> &MemoryGuard {
+        &self.memory_guard
+    }
+
+    /// The `[history]` table.
+    pub const fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// The `[privacy]` table.
+    pub const fn privacy(&self) -> &Privacy {
+        &self.privacy
+    }
+
+    /// True when the document gives the key, false when the value comes from
+    /// the template. `key_path` has the format of a finding path, for
+    /// example `disk_guard.warn_below` or
+    /// `memory_guard.app_budgets[0].footprint_recover`.
+    pub fn is_explicit(&self, key_path: &str) -> bool {
+        self.explicit.contains(key_path)
+    }
+
+    /// The key paths that the document gives, in lexical sequence.
+    pub fn explicit_keys(&self) -> impl Iterator<Item = &str> {
+        self.explicit.iter().map(String::as_str)
+    }
+}

@@ -153,7 +153,11 @@ fn a_failed_migration_keeps_the_previous_version() {
         error,
         OperationJournalError::Migration { version: 2, .. }
     ));
-    let journal = fixture.open();
+    // An open with only the first migration reads the version that the
+    // failed step left.
+    let journal =
+        OperationJournal::open_with_migrations(&fixture.path(), &options(), &MIGRATIONS[..1])
+            .unwrap();
     assert_eq!(journal.version().unwrap(), 1);
     let extra: i64 = journal
         .connection

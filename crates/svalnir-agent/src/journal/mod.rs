@@ -138,6 +138,7 @@ mod coordination;
 mod durable;
 mod error;
 mod migration;
+mod record;
 mod recovery;
 mod request;
 mod retention;
@@ -165,6 +166,7 @@ pub use self::coordination::{
 pub use self::error::{AdmissionStop, OperationJournalError, SequenceViolation};
 pub use self::migration::JOURNAL_VERSION;
 use self::migration::{MIGRATIONS, Migration};
+pub use self::record::{AgentRecord, MAX_AGENT_RECORD_BYTES, StoredAgentRecord};
 pub use self::recovery::{ConsumedDispatch, RecoveryPosition, RecoveryRecord, StepRecovery};
 pub use self::request::{
     ClaimedRequest, Enqueued, MAX_OPEN_REQUESTS, QueuedRequest, RequestBody, RequestCompletion,

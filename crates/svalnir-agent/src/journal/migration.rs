@@ -17,7 +17,7 @@ use super::error::OperationJournalError;
 ///
 /// It is independent of the configuration, CLI, IPC, and state-store
 /// versions.
-pub const JOURNAL_VERSION: u32 = 1;
+pub const JOURNAL_VERSION: u32 = 2;
 
 /// The `application_id` of a Svalnir operation journal: the ASCII text
 /// `SVLJ`. The catalog store has a different value, so that one file is
@@ -34,10 +34,16 @@ pub(super) struct Migration {
 }
 
 /// The migrations of this build, in order from version 1.
-pub(super) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: SCHEMA_V1,
-}];
+pub(super) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        sql: SCHEMA_V2,
+    },
+];
 
 /// Version 1.
 ///
@@ -140,6 +146,22 @@ CREATE TABLE coordinator (
     released INTEGER NOT NULL CHECK (released IN (0, 1)),
     reconciliation_pending INTEGER NOT NULL CHECK (reconciliation_pending IN (0, 1))
 ) STRICT;
+";
+
+/// Version 2.
+///
+/// - `agent_record`: the named records that the agent and a client share:
+///   the authority state, the state of the controller, the status of the
+///   agent, and its lifecycle record. One row for each name; a write
+///   replaces the row and increases its `revision`.
+const SCHEMA_V2: &str = "
+CREATE TABLE agent_record (
+    name TEXT NOT NULL PRIMARY KEY
+        CHECK (name IN ('authority', 'controller', 'status', 'lifecycle')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    updated_unix_s INTEGER NOT NULL,
+    content TEXT NOT NULL CHECK (json_valid(content))
+) STRICT, WITHOUT ROWID;
 ";
 
 /// Reads the recorded version without a change to the database.

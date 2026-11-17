@@ -790,12 +790,17 @@ fn read_app_budget(
     })
 }
 
-/// Reads the application budgets. The second value is the number of budget
-/// tables in the document, with or without findings.
-fn read_app_budgets(context: &mut Context, table: &mut TableReader<'_>) -> (Vec<AppBudget>, usize) {
+/// Reads the application budgets.
+///
+/// The second value is true when the document has budget tables, or when it
+/// has an `app_budgets` key that was rejected (wrong type or too many entries).
+/// A rejected key already has its finding; it is not the same as no budget.
+fn read_app_budgets(context: &mut Context, table: &mut TableReader<'_>) -> (Vec<AppBudget>, bool) {
     let mut seen: BudgetIdentifiers = BudgetIdentifiers::default();
+    let before: usize = context.finding_count();
     let tables: Vec<TableReader<'_>> = table.table_array(context, "app_budgets", MAX_APP_BUDGETS);
-    let count: usize = tables.len();
+    let rejected: bool = tables.is_empty() && context.finding_count() > before;
+    let count: bool = rejected || !tables.is_empty();
     let budgets: Vec<AppBudget> = tables
         .into_iter()
         .filter_map(|budget_table| read_app_budget(context, budget_table, &mut seen))
@@ -850,14 +855,14 @@ fn read_memory_guard(
     let protected_bundle_ids: Vec<BundleId> = read_bundle_ids(context, bundle_texts);
     let executable_texts = table.text_list(context, "protected_executable_paths");
     let protected_executable_paths: Vec<ConfigPath> = read_paths(context, executable_texts);
-    let (app_budgets, budget_tables): (Vec<AppBudget>, usize) =
+    let (app_budgets, budget_tables): (Vec<AppBudget>, bool) =
         read_app_budgets(context, &mut table);
     table.finish(context);
 
     // An enabled guard with no eligible group and no budget can select no
     // application: the protection is silently off.
     let enabled: bool = value_or(enabled, defaults.enabled);
-    if enabled && budget_tables == 0 && eligible_groups.as_ref().is_some_and(Vec::is_empty) {
+    if enabled && !budget_tables && eligible_groups.as_ref().is_some_and(Vec::is_empty) {
         context.report(
             FindingCode::EmptySelection,
             &join_path(&memory_path, "eligible_groups"),

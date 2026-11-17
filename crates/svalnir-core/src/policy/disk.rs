@@ -11,6 +11,7 @@
 //! facts.
 
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -157,23 +158,62 @@ pub struct DiskSnapshot {
     pub volumes: Vec<VolumeEvidence>,
     /// The cleanup candidates.
     pub candidates: Vec<CleanupCandidate>,
+    /// The per-rule allowances. A rule with no entry has no bound that the
+    /// caller states: the per-rule ceiling of `docs/CLEANUP_RULES.md` is not
+    /// evaluated for it, and a batch that has a target of the rule is not
+    /// admissible.
+    pub rule_allowances: Vec<RuleAllowance>,
+}
+
+/// What a rule can still charge in the plan: the minimum of its ceiling and
+/// its remaining budget, as the caller knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAllowance {
+    /// The rule.
+    pub rule_id: RuleId,
+    /// The `work_bytes` that the rule can still charge.
+    pub remaining_bytes: Bytes,
+    /// The entries that the rule can still charge.
+    pub remaining_items: EntryCount,
 }
 
 impl DiskSnapshot {
-    /// Checks the lengths of the lists.
+    /// Checks the lengths of the lists and the keys of the entries.
     ///
     /// # Errors
     ///
-    /// Returns a [`PolicyInputError`] when a list is longer than its limit.
-    pub const fn check(&self) -> Result<(), PolicyInputError> {
-        if let Err(error) = check_count("volumes", self.volumes.len(), MAX_VOLUMES) {
-            return Err(error);
-        }
+    /// Returns a [`PolicyInputError`] when a list is longer than its limit,
+    /// when two candidates have the same target identity on one volume, or
+    /// when two allowances have the same rule.
+    pub fn check(&self) -> Result<(), PolicyInputError> {
+        check_count("volumes", self.volumes.len(), MAX_VOLUMES)?;
         check_count(
             "cleanup candidates",
             self.candidates.len(),
             MAX_CLEANUP_CANDIDATES,
-        )
+        )?;
+        check_count(
+            "rule allowances",
+            self.rule_allowances.len(),
+            MAX_CLEANUP_CANDIDATES,
+        )?;
+        let mut targets: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for candidate in &self.candidates {
+            if !targets.insert((candidate.volume_id.as_str(), candidate.target_id.as_str())) {
+                return Err(PolicyInputError::DuplicateEntry {
+                    list: "cleanup candidates",
+                });
+            }
+        }
+        let mut rules: BTreeSet<&str> = BTreeSet::new();
+        for allowance in &self.rule_allowances {
+            if !rules.insert(allowance.rule_id.as_str()) {
+                return Err(PolicyInputError::DuplicateEntry {
+                    list: "rule allowances",
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -404,8 +444,12 @@ pub struct CapacityOverview {
     /// The selectors of volumes that have a usable capacity and no verified
     /// capacity-domain membership. Their capacity is not in the sum.
     pub not_summed: Vec<String>,
+    /// The selectors of volumes that have no usable capacity observation.
+    /// Their capacity is not in the sum, and `total_available` is `None`.
+    pub unusable: Vec<String>,
     /// The sum of the domain capacities. `None` when there is no verified
-    /// domain or the sum overflows.
+    /// domain, a selected volume has no usable observation, or the sum
+    /// overflows.
     pub total_available: Option<Bytes>,
 }
 
@@ -861,6 +905,7 @@ fn capacity_overview(volumes: &[VolumeTrigger]) -> CapacityOverview {
     let mut overview: CapacityOverview = CapacityOverview::default();
     for volume in volumes {
         let Some(available) = volume.available else {
+            overview.unusable.push(volume.selector.clone());
             continue;
         };
         let verified: Option<&CapacityDomainKey> =
@@ -884,7 +929,7 @@ fn capacity_overview(volumes: &[VolumeTrigger]) -> CapacityOverview {
             });
         }
     }
-    overview.total_available = if overview.domains.is_empty() {
+    overview.total_available = if overview.domains.is_empty() || !overview.unusable.is_empty() {
         None
     } else {
         overview
@@ -1031,6 +1076,10 @@ pub struct FirstBatch {
     pub estimated_reclaimable_bytes: Option<Bytes>,
     /// The allowance that the batch was built under.
     pub allowance: DiskAllowance,
+    /// The rules of the targets that have no per-rule allowance in the
+    /// snapshot. The per-rule ceiling was not evaluated for them, and the
+    /// batch is not admissible while the list has an entry.
+    pub rules_without_ceiling: Vec<RuleId>,
 }
 
 /// The result of [`plan_cleanup`].
@@ -1126,6 +1175,9 @@ impl CleanupChecks<'_> {
         if candidate.work_bytes.is_none() || candidate.item_count.is_none() {
             add(Reason::MetricUnavailable, Detail::WorkChargeUnknown);
         }
+        if candidate.item_count == Some(EntryCount::ZERO) {
+            add(Reason::TargetNotEligible, Detail::NoItems);
+        }
         reasons
     }
 }
@@ -1180,8 +1232,11 @@ type Pool = (Option<usize>, Option<CapacityDomainKey>);
 /// protection, no exclusion, the requesting user as its owner, known
 /// inactivity, and a known charge. The eligible candidates of a volume are
 /// ranked, and the first batch takes them in rank sequence under the batch,
-/// pass, and incident ceilings. A candidate is indivisible: one whose charge
-/// is larger than a remaining ceiling is skipped.
+/// pass, per-rule, and incident ceilings. A candidate is indivisible: one
+/// whose charge is larger than a remaining ceiling is skipped. The per-rule
+/// allowances of the snapshot are charged by the first batches of all volumes
+/// in sequence. A rule with no allowance is not bound: the batch lists it in
+/// `rules_without_ceiling` and is not admissible.
 ///
 /// The first batch is what an incident would dispatch first. `blocked_by`
 /// tells why it is not admissible at this snapshot. The function reserves no
@@ -1204,6 +1259,8 @@ pub fn plan_cleanup(
         context.authority_reasons(guard.enabled, context.grants.evict_regenerable_data);
 
     let mut plan: CleanupPlan = CleanupPlan::default();
+    // The per-rule allowances are shared by the first batches of the plan.
+    let mut rule_left: Vec<RuleAllowance> = snapshot.rule_allowances.clone();
     let mut placed: Vec<bool> = vec![false; snapshot.candidates.len()];
     // The charge of the first batches by incident, or by capacity domain
     // when no incident is open: the volumes of one domain share one
@@ -1243,6 +1300,7 @@ pub fn plan_cleanup(
             &authority,
             allowance,
             &eligible,
+            &mut rule_left,
             &mut plan.decisions,
         );
         if shared {
@@ -1276,6 +1334,84 @@ pub fn plan_cleanup(
     plan
 }
 
+/// True when the rule has an allowance and the charge is larger than it.
+fn exceeds_rule(rules: &[RuleAllowance], rule_id: &RuleId, work: Bytes, items: EntryCount) -> bool {
+    rules
+        .iter()
+        .find(|rule| rule.rule_id == *rule_id)
+        .is_some_and(|rule| work > rule.remaining_bytes || items > rule.remaining_items)
+}
+
+/// Charges the allowance of the rule of a placed candidate, or records that
+/// the rule has none.
+fn charge_rule(
+    rules: &mut [RuleAllowance],
+    candidate: &CleanupCandidate,
+    (work, items): (Bytes, EntryCount),
+    batch: &mut FirstBatch,
+) {
+    match rules
+        .iter_mut()
+        .find(|rule| rule.rule_id == candidate.rule_id)
+    {
+        Some(rule) => {
+            // `exceeds_rule` made sure that the charge fits.
+            rule.remaining_bytes = rule
+                .remaining_bytes
+                .checked_sub(work)
+                .unwrap_or(Bytes::ZERO);
+            rule.remaining_items = rule
+                .remaining_items
+                .checked_sub(items)
+                .unwrap_or(EntryCount::ZERO);
+        }
+        None => {
+            if !batch.rules_without_ceiling.contains(&candidate.rule_id) {
+                batch.rules_without_ceiling.push(candidate.rule_id.clone());
+            }
+        }
+    }
+}
+
+/// Sets the reasons that inhibit the batch and its admissibility.
+fn finish_batch(
+    batch: &mut FirstBatch,
+    trigger: &VolumeTrigger,
+    authority: &[Explanation],
+    budget_block: Option<Explanation>,
+) {
+    for reason in authority {
+        push_reason(&mut batch.blocked_by, *reason);
+    }
+    if trigger.state != TriggerState::Ready || !trigger.domain_verified {
+        for reason in &trigger.reasons {
+            push_reason(&mut batch.blocked_by, *reason);
+        }
+    }
+    if batch.targets.is_empty() {
+        if let Some(reason) = budget_block {
+            push_reason(&mut batch.blocked_by, reason);
+        }
+        push_reason(
+            &mut batch.blocked_by,
+            Explanation::new(
+                DecisionReason::TargetNotEligible,
+                ReasonDetail::NoEligibleCandidate,
+            ),
+        );
+    }
+    if !batch.rules_without_ceiling.is_empty() {
+        push_reason(
+            &mut batch.blocked_by,
+            Explanation::new(
+                DecisionReason::MetricUnavailable,
+                ReasonDetail::RuleCeilingNotEvaluated,
+            ),
+        );
+    }
+    batch.admissible_now = batch.blocked_by.is_empty();
+}
+
 /// Takes the ranked candidates into the first batch and records a decision
 /// for each one.
 fn fill_batch(
@@ -1283,6 +1419,7 @@ fn fill_batch(
     authority: &[Explanation],
     allowance: DiskAllowance,
     ranked: &[&CleanupCandidate],
+    rule_left: &mut [RuleAllowance],
     decisions: &mut Vec<CleanupDecision>,
 ) -> FirstBatch {
     let mut batch: FirstBatch = FirstBatch {
@@ -1295,6 +1432,7 @@ fn fill_batch(
         item_count: EntryCount::ZERO,
         estimated_reclaimable_bytes: Some(Bytes::ZERO),
         allowance,
+        rules_without_ceiling: Vec::new(),
     };
     let mut bytes_left: Bytes = allowance
         .batch_limit
@@ -1320,6 +1458,22 @@ fn fill_batch(
             budget_block.get_or_insert(reason);
             decision.reasons = vec![reason];
             decision.decision = CandidateDecision::Skipped;
+        } else if bytes_left == Bytes::ZERO || items_left == EntryCount::ZERO {
+            // A ceiling of the batch has nothing left. Not even a charge of
+            // zero bytes is placed.
+            decision.reasons = vec![Explanation::new(
+                DecisionReason::BudgetExhausted,
+                ReasonDetail::BatchFull,
+            )];
+            decision.decision = CandidateDecision::Skipped;
+        } else if exceeds_rule(rule_left, &candidate.rule_id, work, items) {
+            let reason: Explanation = Explanation::new(
+                DecisionReason::BudgetExhausted,
+                ReasonDetail::ExceedsRuleLimit,
+            );
+            budget_block.get_or_insert(reason);
+            decision.reasons = vec![reason];
+            decision.decision = CandidateDecision::Skipped;
         } else if let (Some(bytes_after), Some(items_after), Some(work_sum), Some(item_sum)) = (
             bytes_left.checked_sub(work),
             items_left.checked_sub(items),
@@ -1328,6 +1482,7 @@ fn fill_batch(
         ) {
             bytes_left = bytes_after;
             items_left = items_after;
+            charge_rule(rule_left, candidate, (work, items), &mut batch);
             batch.work_bytes = work_sum;
             batch.item_count = item_sum;
             batch.targets.push(candidate.target_id.clone());
@@ -1348,26 +1503,6 @@ fn fill_batch(
         decisions.push(decision);
     }
 
-    for reason in authority {
-        push_reason(&mut batch.blocked_by, *reason);
-    }
-    if trigger.state != TriggerState::Ready || !trigger.domain_verified {
-        for reason in &trigger.reasons {
-            push_reason(&mut batch.blocked_by, *reason);
-        }
-    }
-    if batch.targets.is_empty() {
-        if let Some(reason) = budget_block {
-            push_reason(&mut batch.blocked_by, reason);
-        }
-        push_reason(
-            &mut batch.blocked_by,
-            Explanation::new(
-                DecisionReason::TargetNotEligible,
-                ReasonDetail::NoEligibleCandidate,
-            ),
-        );
-    }
-    batch.admissible_now = batch.blocked_by.is_empty();
+    finish_batch(&mut batch, trigger, authority, budget_block);
     batch
 }

@@ -733,6 +733,7 @@ fn a_path_has_no_shell_evaluation() {
         "Documents",
         "./Documents",
         "~user/Documents",
+        "~",
         "$HOME/Documents",
         "~/$(whoami)",
         "~/`whoami`",
@@ -788,8 +789,10 @@ fn the_home_expansion_is_explicit_and_pure() {
         documents.expand(home),
         Ok(PathBuf::from("/Users/example/Documents/Work"))
     );
+    // A bare `~` is not accepted: only an explicit leading `~/` is.
+    assert_eq!(ConfigPath::parse("~"), Err(ConfigPathError::NotAnchored));
     assert_eq!(
-        ConfigPath::parse("~").unwrap().expand(home),
+        ConfigPath::parse("~/").unwrap().expand(home),
         Ok(PathBuf::from("/Users/example"))
     );
     // A path from the root does not use the home directory.
@@ -1121,4 +1124,13 @@ fn the_root_path_displays_as_a_path() {
     let root: ConfigPath = ConfigPath::parse("/").unwrap();
     assert_eq!(root.to_string(), "/");
     assert_eq!(ConfigPath::parse(&root.to_string()), Ok(root));
+}
+
+#[test]
+fn a_rejected_budget_array_is_not_an_empty_selection() {
+    assert_one(
+        "schema_version = 1\n[memory_guard]\nenabled = true\napp_budgets = 5\n",
+        FindingCode::WrongType,
+        "memory_guard.app_budgets",
+    );
 }

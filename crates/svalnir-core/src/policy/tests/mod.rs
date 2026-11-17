@@ -218,6 +218,7 @@ fn volume_evidence(
 /// capacity, sampled at `seconds`.
 fn disk_snapshot(bytes: u64, seconds: u64) -> DiskSnapshot {
     DiskSnapshot {
+        rule_allowances: Vec::new(),
         volumes: vec![volume_evidence(
             "startup-data",
             volume("data", shared("domain_disk3")),
@@ -455,4 +456,24 @@ impl Harness {
         }
         last.unwrap()
     }
+}
+
+/// An allowance with no practical bound for each rule of the candidates.
+pub(super) fn ample_allowances(
+    candidates: &[crate::policy::CleanupCandidate],
+) -> Vec<crate::policy::RuleAllowance> {
+    let mut allowances: Vec<crate::policy::RuleAllowance> = Vec::new();
+    for candidate in candidates {
+        if allowances
+            .iter()
+            .all(|rule| rule.rule_id != candidate.rule_id)
+        {
+            allowances.push(crate::policy::RuleAllowance {
+                rule_id: candidate.rule_id.clone(),
+                remaining_bytes: Bytes::new(u64::MAX),
+                remaining_items: crate::quantity::EntryCount::new(u64::MAX),
+            });
+        }
+    }
+    allowances
 }

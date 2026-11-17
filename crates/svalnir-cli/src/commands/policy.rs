@@ -418,6 +418,7 @@ fn collect_inputs(
 ) -> Result<SimulationInputs, ErrorBody> {
     let context = host.context();
     let mut disk = DiskSnapshot {
+        rule_allowances: Vec::new(),
         volumes: Vec::new(),
         candidates: Vec::new(),
     };
@@ -646,6 +647,7 @@ mod tests {
         // One GiB is below each threshold of the template.
         capacity.available.reading = Reading::Available(Bytes::new(1024 * 1024 * 1024));
         let disk = DiskSnapshot {
+            rule_allowances: Vec::new(),
             volumes: vec![VolumeEvidence {
                 selector: config.disk_guard().volumes[0].clone(),
                 identity,
@@ -695,6 +697,7 @@ mod tests {
         capacity.available.reading = Reading::Unavailable(UnavailableReason::TransientFailure);
         capacity.available.coverage = Coverage::Unknown;
         let disk = DiskSnapshot {
+            rule_allowances: Vec::new(),
             volumes: vec![VolumeEvidence {
                 selector: config.disk_guard().volumes[0].clone(),
                 identity,
@@ -797,6 +800,7 @@ mod tests {
             PolicyId::MemoryGuard,
             inputs(
                 DiskSnapshot {
+                    rule_allowances: Vec::new(),
                     volumes: Vec::new(),
                     candidates: Vec::new(),
                 },

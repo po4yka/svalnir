@@ -3,7 +3,10 @@
 
 use serde_json::{Value, json};
 
-use super::{BASE_CONFIG, GIB, Harness, MIB, app, base_config, disk_snapshot, memory_snapshot};
+use super::{
+    BASE_CONFIG, GIB, Harness, MIB, ample_allowances, app, base_config, disk_snapshot,
+    memory_snapshot,
+};
 use crate::file::LosslessPath;
 use crate::id::{RuleId, TargetId, VolumeId};
 use crate::observation::{Reading, UnavailableReason};
@@ -102,6 +105,7 @@ fn a_disk_simulation_reports_the_trigger_the_candidates_and_the_first_batch() {
         cleanup_candidate("cache_b", ProtectionFact::NotProtected),
         cleanup_candidate("cache_a", ProtectionFact::Protected),
     ];
+    snapshot.rule_allowances = ample_allowances(&snapshot.candidates);
     let before: PolicyState = PolicyState {
         disk: harness.disk.clone(),
         memory: harness.memory.clone(),

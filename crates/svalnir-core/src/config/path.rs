@@ -58,7 +58,7 @@ pub enum ExpandPathError {
 /// The directory that a configuration path starts from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathBase {
-    /// The path started with `~/`, or it was `~`.
+    /// The path started with `~/`.
     Home,
     /// The path started with `/`.
     Root,
@@ -92,9 +92,7 @@ impl ConfigPath {
         if text.chars().any(char::is_control) {
             return Err(ConfigPathError::ControlCharacter);
         }
-        let (base, rest): (PathBase, &str) = if text == "~" {
-            (PathBase::Home, "")
-        } else if let Some(rest) = text.strip_prefix("~/") {
+        let (base, rest): (PathBase, &str) = if let Some(rest) = text.strip_prefix("~/") {
             (PathBase::Home, rest)
         } else if let Some(rest) = text.strip_prefix('/') {
             (PathBase::Root, rest)
@@ -154,6 +152,7 @@ impl ConfigPath {
 impl std::fmt::Display for ConfigPath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.base {
+            PathBase::Home if self.components.is_empty() => formatter.write_str("~/")?,
             PathBase::Home => formatter.write_str("~")?,
             PathBase::Root if self.components.is_empty() => formatter.write_str("/")?,
             PathBase::Root => {}

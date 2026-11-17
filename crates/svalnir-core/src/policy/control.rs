@@ -46,6 +46,12 @@ pub enum PolicyInputError {
     /// The revision label is empty, is too long, or has a control character.
     #[error("the revision label is empty, is longer than 256 bytes, or has a control character")]
     InvalidRevisionLabel,
+    /// A list of the input has two entries with the same key.
+    #[error("the input has a repeated entry in {list}")]
+    DuplicateEntry {
+        /// The name of the list.
+        list: &'static str,
+    },
 }
 
 /// Checks the length of one input list.
@@ -411,22 +417,56 @@ pub(super) fn decision_of(reasons: &[Explanation]) -> CandidateDecision {
 
 /// A list of configuration paths as components, ready for a comparison.
 ///
-/// The comparison ignores ASCII case, because the default APFS format does.
-/// It does not apply a Unicode normalization.
+/// The default APFS volume ignores case and Unicode normalization. This module
+/// has no normalization table, so the comparison fails closed:
+///
+/// - A component is folded with the full Unicode lowercase mapping. A
+///   component that is not UTF-8 is folded by ASCII case only.
+/// - Two components that are not byte-equal after folding, where either one
+///   contains a non-ASCII byte, count as a match. They can be the same name in
+///   a different normalization form, and a missed match would expose a
+///   protected path.
+///
+/// The rule over-protects: an entry covers each sibling whose name has a
+/// non-ASCII character, at the position of the component that differs. It never
+/// under-protects a path that differs only in case or normalization.
 #[derive(Debug, Default)]
 pub(super) struct PathSet {
     entries: Vec<Vec<Vec<u8>>>,
-    /// True when a path starts from the home directory and no absolute home
-    /// directory was given.
+    /// True when a path starts from the home directory and no usable home
+    /// directory was given. A home directory is usable when it is absolute,
+    /// canonical, and has no empty component.
     pub(super) unresolved: bool,
+}
+
+fn fold(bytes: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_lowercase().into_bytes(),
+        Err(_) => bytes.to_ascii_lowercase(),
+    }
 }
 
 fn components(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
         .split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
-        .map(<[u8]>::to_ascii_lowercase)
+        .map(fold)
         .collect()
+}
+
+/// True when two folded components name the same entry, or can name it in a
+/// different normalization form.
+fn component_matches(left: &[u8], right: &[u8]) -> bool {
+    left == right || !left.is_ascii() || !right.is_ascii()
+}
+
+/// True when `path` starts with all components of `prefix`.
+fn has_prefix(path: &[Vec<u8>], prefix: &[Vec<u8>]) -> bool {
+    path.len() >= prefix.len()
+        && path
+            .iter()
+            .zip(prefix)
+            .all(|(left, right)| component_matches(left, right))
 }
 
 /// True when the path is absolute and has no `.` or `..` component. A path
@@ -440,6 +480,18 @@ pub(super) fn is_canonical(path: &LosslessPath) -> bool {
             .all(|component| component != b"." && component != b"..")
 }
 
+/// True when a home directory can anchor `~/` paths: it is canonical, it is
+/// not the root, and it has no repeated or trailing `/`.
+fn is_usable_home(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(b"/") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split(|byte| *byte == b'/')
+            .all(|component| !component.is_empty() && component != b"." && component != b"..")
+}
+
 impl PathSet {
     /// Resolves the paths of one or more configuration lists.
     pub(super) fn resolve<'a>(
@@ -448,7 +500,7 @@ impl PathSet {
     ) -> Self {
         let home_components: Option<Vec<Vec<u8>>> = home
             .map(LosslessPath::as_bytes)
-            .filter(|bytes| bytes.first() == Some(&b'/'))
+            .filter(|bytes| is_usable_home(bytes))
             .map(components);
         let mut set: Self = Self::default();
         for path in paths {
@@ -462,7 +514,7 @@ impl PathSet {
             };
             entry.extend(
                 path.components()
-                    .map(|component| component.as_bytes().to_ascii_lowercase()),
+                    .map(|component| fold(component.as_bytes())),
             );
             set.entries.push(entry);
         }
@@ -472,7 +524,7 @@ impl PathSet {
     /// True when `path` is an entry or is inside an entry.
     pub(super) fn covers(&self, path: &LosslessPath) -> bool {
         let path: Vec<Vec<u8>> = components(path.as_bytes());
-        self.entries.iter().any(|entry| path.starts_with(entry))
+        self.entries.iter().any(|entry| has_prefix(&path, entry))
     }
 
     /// True when `path` is an entry, is inside an entry, or contains an
@@ -481,6 +533,6 @@ impl PathSet {
         let path: Vec<Vec<u8>> = components(path.as_bytes());
         self.entries
             .iter()
-            .any(|entry| path.starts_with(entry) || entry.starts_with(&path))
+            .any(|entry| has_prefix(&path, entry) || has_prefix(entry, &path))
     }
 }

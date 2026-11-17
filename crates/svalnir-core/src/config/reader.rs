@@ -68,6 +68,11 @@ impl Context {
         });
     }
 
+    /// The number of findings so far.
+    pub(super) fn finding_count(&self) -> usize {
+        self.findings.len()
+    }
+
     pub(super) fn is_explicit(&self, path: &str) -> bool {
         self.explicit.contains(path)
     }

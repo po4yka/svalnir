@@ -179,6 +179,11 @@ pub enum ReasonDetail {
     ActivityUnknown,
     /// The work charge or the entry count of the target is not known.
     WorkChargeUnknown,
+    /// The candidate has an entry count of zero, so it has nothing to act on.
+    NoItems,
+    /// The caller gave no per-rule allowance for a rule of the batch, so the
+    /// per-rule ceiling was not evaluated.
+    RuleCeilingNotEvaluated,
     /// More than one running instance matches the budget.
     AmbiguousInstances,
     /// The process inventory is not complete, so an absent application is
@@ -218,6 +223,8 @@ pub enum ReasonDetail {
     ExceedsBatchLimit,
     /// The charge is larger than the remaining pass allowance.
     ExceedsPassLimit,
+    /// The charge is larger than the remaining allowance of its rule.
+    ExceedsRuleLimit,
     /// The charge is larger than the remaining incident allowance.
     ExceedsIncidentLimit,
     /// The incident has no pass left.

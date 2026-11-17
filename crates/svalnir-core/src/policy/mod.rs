@@ -58,8 +58,8 @@ pub use disk::{
     ActivityFact, CapacityDomainKey, CapacityLevel, CapacityOverview, CleanupCandidate,
     CleanupDecision, CleanupFacts, CleanupPlan, DiskAllowance, DiskEvaluation, DiskGuardState,
     DiskIncident, DiskSnapshot, DiskVolumeState, DomainCapacity, FirstBatch, OwnerFact,
-    ProtectedDataClass, RebuildCost, RuleReadiness, VolumeEvidence, VolumeTrigger, WorkUsage,
-    evaluate_disk_guard, plan_cleanup,
+    ProtectedDataClass, RebuildCost, RuleAllowance, RuleReadiness, VolumeEvidence, VolumeTrigger,
+    WorkUsage, evaluate_disk_guard, plan_cleanup,
 };
 pub use evidence::{CorroboratingEvidence, EvaluationClock, EvidenceProblem, EvidenceReport};
 pub use memory::{

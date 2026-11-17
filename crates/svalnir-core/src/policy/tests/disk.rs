@@ -2,8 +2,8 @@
 //! shortening, recovery hysteresis, capacity domains, and cleanup candidates.
 
 use super::{
-    BASE_CONFIG, GIB, Harness, MIB, SECOND, capacity_reading, disk_snapshot, shared, volume,
-    volume_evidence,
+    BASE_CONFIG, GIB, Harness, MIB, SECOND, ample_allowances, capacity_reading, disk_snapshot,
+    shared, volume, volume_evidence,
 };
 use crate::config::VolumeSelector;
 use crate::file::LosslessPath;
@@ -14,8 +14,8 @@ use crate::policy::{
     CleanupCandidate, CleanupDecision, CleanupFacts, CleanupPlan, Cooldown, CooldownCause,
     DecisionReason, DiskEvaluation, DiskSnapshot, EvaluationClock, Explanation, GrantBasis,
     MAX_CLEANUP_CANDIDATES, OwnerFact, PolicyInputError, ProtectedDataClass, ProtectionFact,
-    ReasonDetail, RebuildCost, ResetCause, RuleReadiness, TriggerState, VolumeEvidence,
-    VolumeTrigger, WindowTransition, WorkUsage, evaluate_disk_guard, plan_cleanup,
+    ReasonDetail, RebuildCost, ResetCause, RuleAllowance, RuleReadiness, TriggerState,
+    VolumeEvidence, VolumeTrigger, WindowTransition, WorkUsage, evaluate_disk_guard, plan_cleanup,
 };
 use crate::quantity::{Bytes, EntryCount, Nanoseconds};
 use crate::volume::CapacityDomainMembership;
@@ -442,6 +442,7 @@ fn volumes_of_one_domain_are_counted_once_and_unverified_ones_are_not_summed() {
     );
     let mut harness: Harness = Harness::with_config(&text);
     let snapshot: DiskSnapshot = DiskSnapshot {
+        rule_allowances: Vec::new(),
         volumes: vec![
             volume_evidence(
                 "startup-data",
@@ -515,6 +516,7 @@ fn two_volumes_of_one_domain_share_one_incident() {
     let mut harness: Harness = Harness::with_config(&text);
     for seconds in (0..=35).step_by(5) {
         let snapshot: DiskSnapshot = DiskSnapshot {
+            rule_allowances: Vec::new(),
             volumes: vec![
                 volume_evidence(
                     "startup-data",
@@ -571,6 +573,7 @@ fn temporary(id: &str, work: u64, items: u64) -> CleanupCandidate {
 /// cleanup of the candidates.
 fn plan_at(harness: &mut Harness, seconds: u64, candidates: Vec<CleanupCandidate>) -> CleanupPlan {
     let mut snapshot: DiskSnapshot = disk_snapshot(9 * GIB, seconds);
+    snapshot.rule_allowances = ample_allowances(&candidates);
     snapshot.candidates = candidates;
     let evaluation: DiskEvaluation = harness.disk(seconds, &snapshot);
     let clock: EvaluationClock = harness.clock(seconds);
@@ -1133,7 +1136,9 @@ fn the_first_batch_tells_why_it_is_not_admissible() {
 fn a_snapshot_above_its_limits_is_rejected() {
     let harness: Harness = Harness::new();
     let mut snapshot: DiskSnapshot = disk_snapshot(9 * GIB, 0);
-    snapshot.candidates = vec![temporary("a", 1, 1); MAX_CLEANUP_CANDIDATES + 1];
+    snapshot.candidates = (0..=MAX_CLEANUP_CANDIDATES)
+        .map(|index| temporary(&format!("target_{index}"), 1, 1))
+        .collect();
     let clock: EvaluationClock = harness.clock(0);
     let error: PolicyInputError =
         evaluate_disk_guard(&harness.context(&clock), &harness.disk, &snapshot).unwrap_err();
@@ -1159,6 +1164,7 @@ fn equal_inputs_give_an_equal_disk_evaluation() {
         available: reading,
     };
     let snapshot: DiskSnapshot = DiskSnapshot {
+        rule_allowances: Vec::new(),
         volumes: vec![evidence],
         candidates: Vec::new(),
     };
@@ -1277,6 +1283,7 @@ fn a_new_selector_for_the_same_volume_keeps_the_incident() {
 
 fn two_volumes(data: u64, system: u64, seconds: u64) -> DiskSnapshot {
     DiskSnapshot {
+        rule_allowances: Vec::new(),
         volumes: vec![
             volume_evidence(
                 "startup-data",
@@ -1343,6 +1350,7 @@ fn the_volumes_of_one_domain_share_one_allowance_in_a_plan() {
     on_system.volume_id = VolumeId::new("vol_system").unwrap();
     let mut snapshot: DiskSnapshot = two_volumes(9 * GIB, 9 * GIB, 40);
     snapshot.candidates = vec![temporary("a_data", GIB, 1), on_system];
+    snapshot.rule_allowances = ample_allowances(&snapshot.candidates);
     let evaluation: DiskEvaluation = harness.disk(40, &snapshot);
     let clock: EvaluationClock = harness.clock(40);
     let plan: CleanupPlan = plan_cleanup(&harness.context(&clock), &evaluation, &snapshot);
@@ -1371,7 +1379,7 @@ fn a_full_pass_admits_no_candidate_also_with_a_charge_of_zero() {
         consumed_bytes: Bytes::new(8 * GIB),
         ..WorkUsage::default()
     });
-    let plan: CleanupPlan = plan_at(&mut harness, 35, vec![temporary("a", 0, 0)]);
+    let plan: CleanupPlan = plan_at(&mut harness, 35, vec![temporary("a", 0, 1)]);
     assert_eq!(plan.first_batches[0].targets, []);
     assert!(!plan.first_batches[0].admissible_now);
     assert_eq!(
@@ -1387,4 +1395,216 @@ fn a_full_pass_admits_no_candidate_also_with_a_charge_of_zero() {
             ),
         ]
     );
+}
+
+fn allowance(rule: &str, bytes: u64, items: u64) -> RuleAllowance {
+    RuleAllowance {
+        rule_id: RuleId::new(rule).unwrap(),
+        remaining_bytes: Bytes::new(bytes),
+        remaining_items: EntryCount::new(items),
+    }
+}
+
+fn plan_with(
+    harness: &mut Harness,
+    candidates: Vec<CleanupCandidate>,
+    rules: Vec<RuleAllowance>,
+) -> CleanupPlan {
+    let mut snapshot: DiskSnapshot = disk_snapshot(9 * GIB, 35);
+    snapshot.candidates = candidates;
+    snapshot.rule_allowances = rules;
+    let evaluation: DiskEvaluation = harness.disk(35, &snapshot);
+    let clock: EvaluationClock = harness.clock(35);
+    plan_cleanup(&harness.context(&clock), &evaluation, &snapshot)
+}
+
+#[test]
+fn the_per_rule_ceiling_skips_a_candidate_that_does_not_fit() {
+    let rule: &str = "svalnir.expired-temporary";
+    let plan: CleanupPlan = plan_with(
+        &mut with_incident(),
+        vec![temporary("a", 3 * MIB, 1), temporary("b", MIB, 1)],
+        vec![allowance(rule, 2 * MIB, 10)],
+    );
+    let batch: &super::super::FirstBatch = &plan.first_batches[0];
+    assert_eq!(batch.targets, [TargetId::new("b").unwrap()]);
+    assert_eq!(
+        plan.decisions[0].reasons,
+        [explanation(
+            DecisionReason::BudgetExhausted,
+            ReasonDetail::ExceedsRuleLimit
+        )]
+    );
+    assert!(batch.admissible_now);
+    assert_eq!(batch.rules_without_ceiling, []);
+}
+
+#[test]
+fn an_unevaluated_per_rule_ceiling_makes_the_batch_not_admissible() {
+    let plan: CleanupPlan = plan_with(
+        &mut with_incident(),
+        vec![temporary("a", MIB, 1)],
+        Vec::new(),
+    );
+    let batch: &super::super::FirstBatch = &plan.first_batches[0];
+    assert_eq!(batch.targets.len(), 1);
+    assert!(!batch.admissible_now);
+    assert_eq!(
+        batch.rules_without_ceiling,
+        [RuleId::new("svalnir.expired-temporary").unwrap()]
+    );
+    assert_eq!(
+        batch.blocked_by,
+        [explanation(
+            DecisionReason::MetricUnavailable,
+            ReasonDetail::RuleCeilingNotEvaluated
+        )]
+    );
+}
+
+#[test]
+fn a_candidate_with_no_items_is_not_eligible() {
+    let decision: CleanupDecision = decide(|one| one.item_count = Some(EntryCount::ZERO));
+    assert_eq!(decision.decision, CandidateDecision::Skipped);
+    assert_eq!(
+        decision.reasons,
+        [explanation(
+            DecisionReason::TargetNotEligible,
+            ReasonDetail::NoItems
+        )]
+    );
+}
+
+#[test]
+fn nothing_is_placed_once_the_batch_has_no_bytes_left() {
+    let mut harness: Harness = with_incident();
+    let limit: Bytes = plan_with(&mut harness, Vec::new(), Vec::new()).first_batches[0]
+        .allowance
+        .batch_limit
+        .min(
+            plan_with(&mut harness, Vec::new(), Vec::new()).first_batches[0]
+                .allowance
+                .pass_remaining,
+        );
+    let fills: CleanupCandidate = temporary("a", limit.get(), 1);
+    let free: CleanupCandidate = temporary("b", 0, 1);
+    let rules: Vec<RuleAllowance> = ample_allowances(std::slice::from_ref(&fills));
+    let plan: CleanupPlan = plan_with(&mut harness, vec![fills, free], rules);
+    let batch: &super::super::FirstBatch = &plan.first_batches[0];
+    assert_eq!(batch.targets, [TargetId::new("a").unwrap()]);
+    assert_eq!(
+        plan.decisions[1].reasons,
+        [explanation(
+            DecisionReason::BudgetExhausted,
+            ReasonDetail::BatchFull
+        )]
+    );
+}
+
+#[test]
+fn a_repeated_target_on_one_volume_is_rejected() {
+    let harness: Harness = Harness::new();
+    let mut snapshot: DiskSnapshot = disk_snapshot(9 * GIB, 0);
+    snapshot.candidates = vec![temporary("a", 1, 1), temporary("a", 2, 1)];
+    let clock: EvaluationClock = harness.clock(0);
+    assert_eq!(
+        evaluate_disk_guard(&harness.context(&clock), &harness.disk, &snapshot).unwrap_err(),
+        PolicyInputError::DuplicateEntry {
+            list: "cleanup candidates"
+        }
+    );
+    snapshot.candidates = vec![temporary("a", 1, 1)];
+    snapshot.rule_allowances = vec![
+        allowance("svalnir.expired-temporary", 1, 1),
+        allowance("svalnir.expired-temporary", 2, 2),
+    ];
+    assert_eq!(
+        snapshot.check().unwrap_err(),
+        PolicyInputError::DuplicateEntry {
+            list: "rule allowances"
+        }
+    );
+}
+
+#[test]
+fn an_unusable_volume_makes_the_total_unknown() {
+    let harness: Harness = Harness::new();
+    let mut snapshot: DiskSnapshot = disk_snapshot(9 * GIB, 0);
+    let clock: EvaluationClock = harness.clock(0);
+    let usable: DiskEvaluation =
+        evaluate_disk_guard(&harness.context(&clock), &harness.disk, &snapshot).unwrap();
+    assert_eq!(usable.capacity.total_available, Some(Bytes::new(9 * GIB)));
+    assert_eq!(usable.capacity.unusable, Vec::<String>::new());
+    snapshot.volumes.clear();
+    let missing: DiskEvaluation =
+        evaluate_disk_guard(&harness.context(&clock), &harness.disk, &snapshot).unwrap();
+    assert_eq!(missing.capacity.total_available, None);
+    assert_eq!(missing.capacity.unusable, ["startup-data"]);
+}
+
+fn excluded_decision(home: &str, exclusion: &str, candidate: &str) -> CleanupDecision {
+    let text: String = BASE_CONFIG.replacen(
+        "paths = [\"~/Documents\"]",
+        &format!("paths = [\"{exclusion}\"]"),
+        1,
+    );
+    let mut harness: Harness = Harness::with_config(&text);
+    harness.home = Some(LosslessPath::from_bytes(home).unwrap());
+    let mut one: CleanupCandidate = temporary("target_1", MIB, 10);
+    one.path = path(candidate);
+    plan_at(&mut harness, 0, vec![one]).decisions.remove(0)
+}
+
+#[test]
+fn a_home_directory_that_is_not_canonical_is_unresolved() {
+    for home in [
+        "/Users/./tester",
+        "/Users/tester/",
+        "//Users/tester",
+        "/Users/../tester",
+        "/",
+    ] {
+        let decision: CleanupDecision =
+            excluded_decision(home, "~/Documents", "/Users/tester/Documents/x");
+        assert_eq!(decision.decision, CandidateDecision::Skipped, "{home}");
+        assert!(
+            decision.reasons.contains(&explanation(
+                DecisionReason::MetricUnavailable,
+                ReasonDetail::HomeDirectoryUnknown
+            )),
+            "{home}"
+        );
+    }
+    let decision: CleanupDecision =
+        excluded_decision("/Users/tester", "~/Documents", "/Users/tester/Documents/x");
+    assert_eq!(decision.decision, CandidateDecision::Protected);
+}
+
+#[test]
+fn exclusions_ignore_unicode_case_and_normalization_and_over_protect() {
+    // Unicode case folding.
+    let decision: CleanupDecision = excluded_decision(
+        "/Users/tester",
+        "~/Документы",
+        "/Users/tester/документы/cache",
+    );
+    assert_eq!(decision.decision, CandidateDecision::Protected);
+    // NFC exclusion, NFD candidate.
+    let decision: CleanupDecision = excluded_decision(
+        "/Users/tester",
+        "~/Caf\u{e9}",
+        "/Users/tester/Cafe\u{301}/cache",
+    );
+    assert_eq!(decision.decision, CandidateDecision::Protected);
+    // The documented over-protection: another non-ASCII sibling is covered.
+    let decision: CleanupDecision = excluded_decision(
+        "/Users/tester",
+        "~/Documents",
+        "/Users/tester/\u{dc}ber/cache",
+    );
+    assert_eq!(decision.decision, CandidateDecision::Protected);
+    // ASCII names that differ stay unprotected.
+    let decision: CleanupDecision =
+        excluded_decision("/Users/tester", "~/Documents", "/Users/tester/Other/cache");
+    assert_eq!(decision.decision, CandidateDecision::Eligible);
 }

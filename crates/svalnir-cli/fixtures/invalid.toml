@@ -1,0 +1,9 @@
+# A configuration proposal that is not valid: the thresholds are in the wrong
+# sequence, one key is not known, and one size has no unit.
+schema_version = 1
+
+[disk_guard]
+warn_below = "10GiB"
+reclaim_below = "20GiB"
+batch_limit = "5"
+no_such_key = true

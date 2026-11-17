@@ -100,6 +100,13 @@ impl<T> Envelope<T> {
             warnings: Vec::new(),
         }
     }
+
+    /// The same response with advisory findings.
+    #[must_use]
+    pub fn with_warnings(mut self, warnings: Vec<Warning>) -> Self {
+        self.warnings = warnings;
+        self
+    }
 }
 
 impl Envelope<()> {
@@ -148,6 +155,11 @@ pub struct ErrorBody {
 pub enum ErrorFamily {
     /// The request shape is invalid.
     Request,
+    /// The request names evidence that is stale or that does not exist, for
+    /// example a scan that is not recorded or a process that exited.
+    Evidence,
+    /// The local state store did not record or return a value.
+    Recording,
     /// The backend refused the request or does not support it.
     Native,
 }
@@ -157,6 +169,8 @@ impl ErrorFamily {
     pub fn exit_status(self) -> ExitStatus {
         match self {
             Self::Request => ExitStatus::Usage,
+            Self::Evidence => ExitStatus::Conflict,
+            Self::Recording => ExitStatus::Failure,
             Self::Native => ExitStatus::Unavailable,
         }
     }
@@ -170,6 +184,13 @@ pub enum ErrorStage {
     Arguments,
     /// Selection of the service that runs the command.
     Dispatch,
+    /// Reading of an input that the request names, for example a
+    /// configuration file.
+    Input,
+    /// Collection of observations from the host.
+    Collection,
+    /// Reading or writing of the local state store.
+    Storage,
 }
 
 /// The action that the caller is permitted to take next.
@@ -180,4 +201,7 @@ pub enum NextAction {
     None,
     /// Correct the request and send it again.
     CorrectRequest,
+    /// Make a new observation: list the targets or scan again. The command
+    /// is read-only, so a repeated request has no side effect.
+    RefreshObservation,
 }

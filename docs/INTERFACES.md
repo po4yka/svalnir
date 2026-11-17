@@ -1,6 +1,6 @@
 # Svalnir Interfaces
 
-**Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API.  
+**Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API. The Milestone 1 build implements the subset that section 4 names.  
 **Interface baseline:** 1  
 **Last reviewed:** 2026-11-17
 
@@ -113,6 +113,40 @@ Every admitted scan has a scan ID and bounded scope. `--save` retains its catalo
 A cleanup selection preset such as `--profile developer` filters candidates. It is separate from the Observe/Balanced/Aggressive operating templates and cannot enable rules or grant authority.
 
 The proposed manual cleanup modes are `trash`, `permanent`, and `evict`, mapping respectively to `MoveToTrash`, `DeleteSelectedFiles`, and rule-based `EvictRegenerableData`. The evict mode requires an exact supported rule selection, given as `--rule RULE_ID`. The policy's `automatic_mode = "permanent"` remains a separate configuration field.
+
+### Milestone 1 in-process build
+
+The Milestone 1 build has no background agent and no local protocol. The CLI links the agent library and runs each read-only command in its own process. The decisions in this subsection apply to this build only. A build with an agent replaces them.
+
+| Subject | Decision |
+| --- | --- |
+| Commands that run | `status`, `memory status`, `swap status`, `monitor`, `processes top`, `processes show`, `scan`, `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, `completions`, and `license` |
+| Commands that report `not_implemented` (exit `3`, no change) | `clean plan/show/apply`, `processes stop`, `operations show/wait/cancel`, `agent install/status/pause/resume/uninstall`, `policy enable/disable/rearm`, `config apply`, and `history` |
+| Response `kind` | `snapshot` for `status`, `memory status`, `swap status`, `processes top`, `processes show`, and `scan`. `report` for `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, and `license` |
+| State directory | `~/Library/Application Support/Svalnir/`. The environment variable `SVALNIR_STATE_DIR` replaces it with an absolute path; a value that is not absolute is a request error. Only `scan --save` creates the directory, with mode `0700` |
+| Catalog store | `catalog.sqlite` in the state directory holds the saved scan records. `scan --save` applies the `[history]` limits of the configuration template, because no effective revision exists. The `save` field of the result is `not_requested`, `saved`, `not_saved_interrupted`, or `removed_by_retention` |
+| Configuration proposal | The file of `--config PATH`, or `config.toml` in the state directory. `config validate` needs a file. `config show`, `policy list`, `policy show`, and `policy simulate` use the built-in template when the default file does not exist, and the result names that source |
+| `config show --effective` | The error `agent_unavailable`, exit `3` |
+| Target ID | The process generation identity `pg-<pid>-<start time in microseconds>`. No server holds identity evidence, so each invocation resolves the ID against a new snapshot. A target that is not in the snapshot gives `target_not_found`, exit `5`. The ID is never permission to act |
+| `processes top` | `--limit` has the default 20. `--sort growth` and `--sort cpu` compare two snapshots that are 1 second apart. The inventory has only the processes of the current user |
+| `processes show` | The policy eligibility is not evaluated, and the result says so |
+| `monitor` | `--interval DURATION` from 1 second to 1 hour, with the default 2 seconds. The formats are `text` and `ndjson`. The event types are `snapshot` for the first event and `observation_update` for each later event. `stream_id` is the request identity, and `stream_epoch` is the collector epoch. A collection failure gives one last event of the type `stream_error`, whose `data` is the structured error, and the exit status of the error family. The stream has no resume token, heartbeat, or gap event |
+| `report` | Exit `0` when the record is read, also for a record with partial coverage; the coverage is in the result. A scan ID with no record gives `scan_not_found`, exit `5` |
+| `policy simulate` | The grants are none, with the basis `recorded`. Only the `startup-data` selector is resolved. The snapshot has no cleanup candidate, because no rule registry exists. The product protection of each application is unknown, because no protection catalog exists, so no application is eligible |
+| Partial scope (exit `4`) | A required observation of the command has no value, a process identity query failed for a cause other than denial, or the coverage of the scan is partial. `status`, `memory status`, `swap status`, and `processes top` give `coverage.required_scope` and `coverage.missing_required`. `scan` gives `scan.coverage` and the list of regions |
+| `--timeout` | No effect on a command that runs in this process. A result has the warning `timeout_not_applied`: in `warnings` of the envelope, or on stderr for the text format and for `monitor`. An error response does not have it |
+| Interrupt | Ctrl+C ends `monitor` and `scan` with exit `130`. An interrupted scan writes its partial result and does not save it. Ctrl+C ends each other command at once |
+
+The error codes of this build and their families are:
+
+| Family | Exit | Codes |
+| --- | --- | --- |
+| `request` | `2` | `invalid_arguments`, `unsupported_format`, `unsupported_rule_selection`, `invalid_state_directory`, `invocation_directory_unavailable`, `invalid_target`, `invalid_scan_id`, `invalid_scan_root`, `scan_root_not_found`, `config_not_found`, `invalid_configuration` |
+| `evidence` | `5` | `target_not_found`, `scan_not_found` |
+| `recording` | `1` | `state_directory_not_writable`, `state_store_unavailable`, `scan_record_not_encoded`, `scan_record_unreadable` |
+| `native` | `3` | `not_implemented`, `agent_unavailable`, `collector_unavailable`, `unsupported_platform`, `state_directory_unavailable`, `scan_root_unavailable`, `scan_identity_unavailable`, `config_unreadable`, `simulation_input_too_large` |
+
+`config validate` writes its report and then ends with exit `2` when the document is not valid. That response has `kind` `report` and no `error`.
 
 ## 5. Manual approval and standing authorization
 

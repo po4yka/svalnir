@@ -15,17 +15,15 @@
 //! | [`volume`] | Volume identity and capacity-domain membership | `docs/RESOURCE_MODEL.md` section 7 |
 //! | [`encoding`] | Shared rules of the JSON encoding | `docs/INTERFACES.md` section 3 |
 //! | [`byte_size`], [`duration`] | Text grammars of configuration values | `docs/POLICY_SPEC.md` section 3 |
-//! | [`config`] | Configuration schema and validation (planned) | `docs/POLICY_SPEC.md` |
-//! | [`policy`] | Deterministic policy evaluation (planned) | `docs/POLICY_SPEC.md` |
+//! | [`config`] | Configuration schema, parsing, and validation with structured findings | `docs/POLICY_SPEC.md` sections 3 and 4, `docs/INTERFACES.md` section 13 |
+//! | [`policy`] | Deterministic policy evaluation, simulation, and policy descriptions | `docs/POLICY_SPEC.md` |
 
 #![forbid(unsafe_code)]
 
-// Only the tests use `serde_json` at this time, and the `config` module will
-// use `toml`.
-// TODO(npochaev): remove a line when a module uses the crate.
+// Only the tests use `serde_json` at this time.
+// TODO(npochaev): remove this line when a module uses the crate.
 #[cfg(not(test))]
 use serde_json as _;
-use toml as _;
 
 pub mod byte_size;
 pub mod config;

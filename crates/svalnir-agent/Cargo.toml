@@ -16,9 +16,8 @@ path = "src/lib.rs"
 name = "svalnir-agent"
 path = "src/main.rs"
 
-# The Milestone 1 modules use these dependencies. A session that fills one
-# module directory adds no dependency here. No rendering crate is permitted
-# in this graph.
+# The dependencies of the Milestone 1 modules. `sysinfo` has no user yet (see
+# `src/lib.rs`). No rendering crate is permitted in this graph.
 [dependencies]
 libc.workspace = true
 rusqlite.workspace = true

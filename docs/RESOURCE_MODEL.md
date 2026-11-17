@@ -1,6 +1,6 @@
 # Svalnir Resource Model
 
-**Status:** Design specification; no collector, native backend, or supported macOS matrix is claimed as implemented or verified.  
+**Status:** Design specification. The Milestone 1 collectors of `svalnir-agent` implement a part of this model for macOS. No collector, native backend, or supported macOS matrix is claimed as verified.  
 **Last reviewed:** 2026-11-17
 
 This document defines what Svalnir measures, how observations retain their meaning, and which conclusions consumers may draw. [ARCHITECTURE.md](ARCHITECTURE.md) assigns component responsibilities. [POLICY_SPEC.md](POLICY_SPEC.md) defines intervention thresholds and evidence windows; [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) defines execution outcomes. [CLEANUP_RULES.md](CLEANUP_RULES.md), [INTERFACES.md](INTERFACES.md), and [VALIDATION.md](VALIDATION.md) specify eligibility, transport, and verification. [THREAT_MODEL.md](THREAT_MODEL.md) covers incorrect or stale measurements as threat T-07.

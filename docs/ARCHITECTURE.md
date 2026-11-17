@@ -1,6 +1,6 @@
 # Svalnir Architecture
 
-**Status:** Design baseline. The repository currently contains project documentation and a skeleton Cargo workspace with no product behavior; the components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
+**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with the read-only Milestone 1 build: collectors, a scanner, a local store, capability probes, configuration validation, and policy simulation that the CLI runs in its own process. No agent, coordinator, protocol, or action exists. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
 
 **Last reviewed:** 2026-11-16
 
@@ -26,7 +26,7 @@ These invariants govern new integrations as well as the initial disk and memory 
 
 ## 2. Components and dependency direction
 
-The Cargo workspace contains five crates under `crates/`. `svalnir-cli` implements the argument and output contract of [INTERFACES.md](INTERFACES.md). `svalnir-core` has the domain types of [RESOURCE_MODEL.md](RESOURCE_MODEL.md): quantities, timestamps, identities, and the observation envelope. `svalnir-agent` has a library target with empty modules, and the other crates are placeholders. The table gives the intended responsibilities, which are not yet implemented.
+The Cargo workspace contains five crates under `crates/`. `svalnir-cli` implements the argument and output contract of [INTERFACES.md](INTERFACES.md) and runs the read-only commands in its own process. `svalnir-core` has the domain types of [RESOURCE_MODEL.md](RESOURCE_MODEL.md) (quantities, timestamps, identities, and the observation envelope), the configuration validation, and the pure policy evaluation of [POLICY_SPEC.md](POLICY_SPEC.md). `svalnir-agent` has a library target with the macOS collectors, the read-only scanner, the SQLite store for metric samples and scan records, and the capability probes; its binary is a skeleton, and the other crates are placeholders. The table gives the intended responsibilities. The agent lifecycle, the coordinator, the client IPC, the privileged helper, and each action are not yet implemented.
 
 | Component | Responsibilities | Must not own |
 | --- | --- | --- |
@@ -277,6 +277,8 @@ The user configuration location remains:
 ```
 
 The proposed state layout separates rebuildable catalog/telemetry storage from `operations.sqlite`, which holds action intents, dispatch state, outcomes, and links to the effective policy/grant revisions. Activated revisions needed to interpret actions must be retained with the journal; merely editing the TOML file does not acknowledge activation.
+
+The Milestone 1 build keeps saved scan records in `catalog.sqlite` in the user state directory. That file is rebuildable catalog storage, not the operation journal. [INTERFACES.md](INTERFACES.md) section 4 owns the state-directory override.
 
 Helper grants and its operation journal live in a separately protected, root-owned namespace under `/Library/Application Support/Svalnir/`. The helper must not consume a user-owned SQLite file or follow user-controlled links to load authoritative state.
 

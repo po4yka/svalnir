@@ -1,16 +1,34 @@
-//! Command execution.
+//! Command dispatch.
 //!
-//! The commands that need no agent run here. Each other command reports that
-//! this build does not implement it. No command in this module deletes a
-//! file or signals a process.
+//! This module selects the function that runs a command. Each command
+//! family is a module of its own, with the collection of the data separate
+//! from the rendering. The read-only commands run in this process through
+//! the agent library. Each command that changes the host, a policy, or the
+//! agent reports `not_implemented`. No command of this build deletes a file,
+//! moves a file to Trash, signals a process, registers a service, or
+//! activates a policy.
 
 use std::io::{self, Write};
 
 use clap::CommandFactory;
 use serde::Serialize;
 
-use crate::cli::{CleanCommand, CleanMode, Cli, Command, Format};
-use crate::output::{Envelope, ErrorBody, ErrorFamily, ErrorStage, Kind, NextAction, RequestId};
+use crate::cli::{
+    CleanCommand, CleanMode, Cli, Command, ConfigCommand, Format, MemoryCommand, PolicyCommand,
+    ProcessesCommand, SwapCommand,
+};
+use crate::environment::Environment;
+use crate::output::{
+    Envelope, ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction, RequestId, Warning,
+};
+
+pub(crate) mod config;
+pub(crate) mod doctor;
+pub(crate) mod monitor;
+pub(crate) mod policy;
+pub(crate) mod processes;
+pub(crate) mod resources;
+pub(crate) mod scan;
 
 const LICENSE_SPDX_ID: &str = "GPL-3.0-only";
 const LICENSE_TEXT: &str = include_str!("../../../LICENSE");
@@ -41,6 +59,42 @@ impl From<ErrorBody> for CommandFailure {
     }
 }
 
+/// The streams and the shared inputs of one command.
+pub(crate) struct Invocation<'a> {
+    pub(crate) format: Format,
+    pub(crate) request_id: &'a RequestId,
+    pub(crate) environment: &'a Environment,
+    pub(crate) stdout: &'a mut dyn Write,
+    pub(crate) stderr: &'a mut dyn Write,
+    /// Advisory findings. In a machine format they are in the envelope; in
+    /// the text format they go to stderr.
+    pub(crate) warnings: Vec<Warning>,
+}
+
+impl Invocation<'_> {
+    /// Writes one result: the envelope in a machine format, or `text`.
+    pub(crate) fn emit<T: Serialize>(
+        &mut self,
+        kind: Kind,
+        view: &T,
+        text: impl FnOnce(&T) -> String,
+    ) -> io::Result<()> {
+        let warnings: Vec<Warning> = std::mem::take(&mut self.warnings);
+        match self.format {
+            Format::Text => {
+                for warning in &warnings {
+                    writeln!(self.stderr, "warning: {}", warning.message)?;
+                }
+                self.stdout.write_all(text(view).as_bytes())
+            }
+            Format::Json | Format::Ndjson => write_json(
+                self.stdout,
+                &Envelope::result(self.request_id.clone(), kind, view).with_warnings(warnings),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct LicenseReport {
     spdx_id: &'static str,
@@ -50,38 +104,104 @@ struct LicenseReport {
 pub(crate) fn execute(
     cli: &Cli,
     request_id: &RequestId,
+    environment: &Environment,
     stdout: &mut dyn Write,
-) -> Result<(), CommandFailure> {
+    stderr: &mut dyn Write,
+) -> Result<ExitStatus, CommandFailure> {
     let format: Format = cli.common.format;
     check_format(&cli.command, format)?;
     check_rule_selection(&cli.command)?;
+    let mut invocation = Invocation {
+        format,
+        request_id,
+        environment,
+        stdout,
+        stderr,
+        warnings: Vec::new(),
+    };
+    if cli.common.timeout.is_some() && runs_in_process(&cli.command) {
+        invocation.warnings.push(Warning {
+            code: "timeout_not_applied",
+            message: format!(
+                "`svalnir {}` runs in this process and has no transport wait; `--timeout` has no effect",
+                cli.command.path()
+            ),
+        });
+    }
     match &cli.command {
         Command::Completions(arguments) => {
             // `generate` panics on a write error, so it writes to memory first.
             let mut script: Vec<u8> = Vec::new();
             clap_complete::generate(arguments.shell, &mut Cli::command(), "svalnir", &mut script);
-            stdout.write_all(&script)?;
+            invocation.stdout.write_all(&script)?;
+            Ok(ExitStatus::Success)
         }
-        Command::License => match format {
-            Format::Text => {
-                stdout.write_all(LICENSE_NOTICE.as_bytes())?;
-                stdout.write_all(b"\n")?;
-                stdout.write_all(LICENSE_TEXT.as_bytes())?;
-            }
-            Format::Json | Format::Ndjson => {
-                let report = LicenseReport {
-                    spdx_id: LICENSE_SPDX_ID,
-                    text: LICENSE_TEXT,
-                };
-                write_json(
-                    stdout,
-                    &Envelope::result(request_id.clone(), Kind::Report, report),
-                )?;
-            }
-        },
-        command => return Err(not_implemented(command).into()),
+        Command::License => {
+            let report = LicenseReport {
+                spdx_id: LICENSE_SPDX_ID,
+                text: LICENSE_TEXT,
+            };
+            invocation.emit(Kind::Report, &report, |report| {
+                format!("{LICENSE_NOTICE}\n{}", report.text)
+            })?;
+            Ok(ExitStatus::Success)
+        }
+        Command::Status => resources::status(&mut invocation),
+        Command::Memory {
+            command: MemoryCommand::Status,
+        } => resources::memory_status(&mut invocation),
+        Command::Swap {
+            command: SwapCommand::Status,
+        } => resources::swap_status(&mut invocation),
+        Command::Monitor(arguments) => monitor::run(arguments, &mut invocation),
+        Command::Processes {
+            command: ProcessesCommand::Top(arguments),
+        } => processes::top(arguments, &mut invocation),
+        Command::Processes {
+            command: ProcessesCommand::Show(arguments),
+        } => processes::show(arguments, &mut invocation),
+        Command::Scan(arguments) => scan::scan(arguments, &mut invocation),
+        Command::Report(arguments) => scan::report(arguments, &mut invocation),
+        Command::Doctor => doctor::run(&mut invocation),
+        Command::Config {
+            command: ConfigCommand::Validate(arguments),
+        } => config::validate(arguments, &mut invocation),
+        Command::Config {
+            command: ConfigCommand::Show(arguments),
+        } => config::show(arguments, &mut invocation),
+        Command::Policy {
+            command: PolicyCommand::List,
+        } => policy::list(&mut invocation),
+        Command::Policy {
+            command: PolicyCommand::Show(arguments),
+        } => policy::show(arguments, &mut invocation),
+        Command::Policy {
+            command: PolicyCommand::Simulate(arguments),
+        } => policy::simulate(arguments, &mut invocation),
+        command => Err(not_implemented(command).into()),
     }
-    Ok(())
+}
+
+/// Whether this build runs the command in the client process.
+fn runs_in_process(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Clean { .. }
+            | Command::Operations { .. }
+            | Command::Agent { .. }
+            | Command::History(_)
+            | Command::Processes {
+                command: ProcessesCommand::Stop(_)
+            }
+            | Command::Policy {
+                command: PolicyCommand::Enable(_)
+                    | PolicyCommand::Disable(_)
+                    | PolicyCommand::Rearm(_)
+            }
+            | Command::Config {
+                command: ConfigCommand::Apply(_)
+            }
+    )
 }
 
 /// Writes one JSON value and a newline.
@@ -97,6 +217,10 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
         }
         (command, Format::Ndjson) if !command.is_streaming() => format!(
             "`svalnir {}` is not a streaming command; use `--format json`",
+            command.path()
+        ),
+        (command, Format::Json) if command.is_streaming() => format!(
+            "`svalnir {}` is a streaming command; use `--format ndjson`",
             command.path()
         ),
         _ => return Ok(()),
@@ -150,6 +274,22 @@ pub(crate) fn invalid_arguments(reason: Option<&str>) -> ErrorBody {
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,
+    }
+}
+
+/// The error for a value that needs the background agent.
+pub(crate) fn agent_unavailable(what: &str) -> ErrorBody {
+    ErrorBody {
+        code: "agent_unavailable",
+        family: ErrorFamily::Native,
+        stage: ErrorStage::Dispatch,
+        message: format!(
+            "{what} needs the background agent, and this build has no agent; the command made no change"
+        ),
+        fields: Vec::new(),
+        operation_id: None,
+        plan_id: None,
+        next_action: NextAction::None,
     }
 }
 

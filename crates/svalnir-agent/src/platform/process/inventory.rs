@@ -47,7 +47,12 @@ use super::source::{
 
 /// The clock domain of each sample of this adapter:
 /// `clock_gettime(CLOCK_MONOTONIC_RAW)`, which continues during sleep.
-pub const CLOCK_DOMAIN: &str = "darwin.clock_monotonic_raw";
+///
+/// The text is that of the memory and volume adapters
+/// (`SystemClock::clock_domain`), which read the same clock. One clock has
+/// one domain identity: a policy evaluation rejects an observation whose
+/// clock domain is not that of the evaluation.
+pub const CLOCK_DOMAIN: &str = "macos.clock_monotonic_raw";
 
 /// The adapter identity in the source of each observation.
 pub const ADAPTER_ID: &str = "svalnir.process.darwin";

@@ -6,23 +6,24 @@
 //! byte, timestamp, identity, or observation type.
 //!
 //! In Milestone 1 the CLI links this library and runs read-only commands in
-//! its own process. No module deletes a file or signals a process.
+//! its own process. The `svalnir-agent` binary is a skeleton: no background
+//! agent, no coordinator, and no client API exist yet. No module deletes a
+//! file or signals a process.
 //!
-//! | Module | Planned responsibility |
+//! | Module | Contents |
 //! | --- | --- |
-//! | [`platform`] | Native macOS adapters for memory, volumes, and processes |
-//! | [`scan`] | Volume-aware filesystem scanner |
-//! | [`store`] | Local `SQLite` state |
-//! | [`capability`] | Diagnostic capability probes |
+//! | [`platform::memory`] | Memory pressure, physical memory, VM statistics, swap usage, counter rates, pressure events, and the collection context |
+//! | [`platform::volume`] | Volume identities, capacity, Foundation planning values, and capacity pools |
+//! | [`platform::process`] | Process inventory, generation identity, footprint and resident size, application attribution, derived growth and CPU use, and ranking |
+//! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
+//! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
+//! | [`capability`] | Diagnostic capability probes and the capability report |
 
-// The manifest has each dependency of the Milestone 1 modules, so that a
-// module can use one with no manifest change. These imports mark the
-// dependencies that no module uses yet.
-// TODO(npochaev): remove a line when a module uses the crate.
-#[cfg(target_os = "macos")]
-use objc2_app_kit as _;
-use rusqlite as _;
-use svalnir_core as _;
+// No module uses `sysinfo` yet. The native adapters of `platform::process`
+// read the process inventory. `README.md` plans `sysinfo` for the general
+// inventory.
+// TODO(npochaev): remove this line when a module uses the crate, or remove
+// the dependency.
 use sysinfo as _;
 
 pub mod capability;

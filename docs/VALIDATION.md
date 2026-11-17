@@ -1,6 +1,6 @@
 # Svalnir Validation Plan
 
-**Status:** Design specification. The repository contains a skeleton Cargo workspace. It does not yet contain a test suite for product behavior or a validated release. Every release gate below is initially **unverified**.  
+**Status:** Design specification. The repository contains the read-only Milestone 1 build and the unit tests of its modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Every release gate below is initially **unverified**.  
 **Last reviewed:** 2026-11-16
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).

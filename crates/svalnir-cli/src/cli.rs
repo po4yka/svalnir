@@ -79,7 +79,7 @@ pub enum Command {
         command: CleanCommand,
     },
     /// Stream live resource observations.
-    Monitor,
+    Monitor(MonitorArgs),
     /// Show memory pressure, composition, and growth signals.
     Memory {
         #[command(subcommand)]
@@ -137,7 +137,7 @@ impl Command {
                 CleanCommand::Show(_) => "clean show",
                 CleanCommand::Apply(_) => "clean apply",
             },
-            Self::Monitor => "monitor",
+            Self::Monitor(_) => "monitor",
             Self::Memory {
                 command: MemoryCommand::Status,
             } => "memory status",
@@ -183,7 +183,7 @@ impl Command {
 
     /// Whether the command emits a stream of events.
     pub fn is_streaming(&self) -> bool {
-        matches!(self, Self::Monitor)
+        matches!(self, Self::Monitor(_))
     }
 }
 
@@ -194,6 +194,29 @@ pub struct ScanArgs {
     /// Retain the scan catalog for later reports and plans.
     #[arg(long)]
     pub save: bool,
+}
+
+/// The shortest interval between two samples of `monitor`. The kernel gives
+/// cached host statistics to a process that reads them more frequently.
+pub const MIN_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The longest interval between two samples of `monitor`.
+pub const MAX_MONITOR_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Parses the sample interval of `monitor`.
+fn monitor_interval(text: &str) -> Result<Duration, String> {
+    let interval: Duration = positive_duration(text)?;
+    if !(MIN_MONITOR_INTERVAL..=MAX_MONITOR_INTERVAL).contains(&interval) {
+        return Err(format!("the interval `{text}` must be from 1s to 1h"));
+    }
+    Ok(interval)
+}
+
+#[derive(Debug, Args)]
+pub struct MonitorArgs {
+    /// Time between two samples, from 1s to 1h.
+    #[arg(long, value_name = "DURATION", default_value = "2s", value_parser = monitor_interval)]
+    pub interval: Duration,
 }
 
 #[derive(Debug, Args)]

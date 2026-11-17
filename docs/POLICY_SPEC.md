@@ -1,6 +1,6 @@
 # Svalnir Policy Specification
 
-**Status:** Design specification; no policy engine or configuration parser is implemented by this document.  
+**Status:** Design specification. `svalnir-core` has the configuration parser and the pure evaluation and simulation functions of this specification. No agent runs them, and no policy can become active.  
 **Specification revision:** 1  
 **Last reviewed:** 2026-11-16
 

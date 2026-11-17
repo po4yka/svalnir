@@ -1,12 +1,26 @@
 //! Svalnir command-line client.
 //!
-//! Parses arguments, renders output, and sends requests to the shared
-//! application services. It has no independent destructive execution path.
+//! Parses arguments, renders output, and runs the read-only commands. It has
+//! no destructive execution path.
 //!
-//! This build implements the argument contract, the machine-output envelope,
-//! the exit status, and the commands that need no agent (`completions` and
-//! `license`). Each other command reports `not_implemented` with exit
-//! status 3 and makes no change.
+//! Milestone 1 has no background agent and no IPC. The client links the
+//! agent library and runs each read-only command in its own process:
+//! `status`, `memory status`, `swap status`, `monitor`, `processes top`,
+//! `processes show`, `scan`, `report`, `doctor`, `config validate`,
+//! `config show`, `policy list`, `policy show`, `policy simulate`,
+//! `completions`, and `license`. Each command that changes the host, a
+//! policy, or the agent reports `not_implemented` with exit status 3 and
+//! makes no change. `docs/INTERFACES.md` owns the contract.
+//!
+//! | Module | Contents |
+//! | --- | --- |
+//! | [`cli`] | The argument definitions |
+//! | [`output`] | The JSON envelope, the structured error, and the exit status |
+//! | `commands` | The dispatcher and one module for each command family |
+//! | `environment` | The state directory, the home directory, and the invocation directory |
+//! | `host` | The collection context of this process |
+//! | `interrupt` | The Ctrl+C flag of `scan` and `monitor` |
+//! | `text` | Escaping and formatting of the human-readable output |
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -15,18 +29,20 @@ use clap::Parser;
 
 pub mod cli;
 mod commands;
+mod environment;
+mod host;
+mod interrupt;
 pub mod output;
+mod text;
 
-// The read-only commands of Milestone 1 will run in this process through the
-// agent library.
-// TODO(npochaev): remove this line when a command uses the crate.
-use svalnir_agent as _;
-
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
 use cli::{Cli, Format};
 use commands::CommandFailure;
+use environment::Environment;
 use output::{Envelope, ErrorBody, ExitStatus, RequestId};
 
 /// Runs one invocation and returns its exit status.
@@ -38,12 +54,19 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    run_with_request_id(arguments, output::generate_request_id(), stdout, stderr)
+    run_in(
+        arguments,
+        output::generate_request_id(),
+        &Environment::from_process(),
+        stdout,
+        stderr,
+    )
 }
 
-fn run_with_request_id<I, T>(
+fn run_in<I, T>(
     arguments: I,
     request_id: RequestId,
+    environment: &Environment,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitStatus
@@ -69,8 +92,8 @@ where
             return finish(written, ExitStatus::Usage, stderr);
         }
     };
-    match commands::execute(&cli, &request_id, stdout) {
-        Ok(()) => finish(stdout.flush(), ExitStatus::Success, stderr),
+    match commands::execute(&cli, &request_id, environment, stdout, stderr) {
+        Ok(status) => finish(stdout.flush(), status, stderr),
         // A closed pipe keeps the success status; another write error does not.
         Err(CommandFailure::Output(error)) => finish(Err(error), ExitStatus::Success, stderr),
         Err(CommandFailure::Rejected(error)) => {

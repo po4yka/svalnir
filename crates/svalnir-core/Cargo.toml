@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The Milestone 1 modules use these dependencies. A session that fills
-# `src/config` or `src/policy` adds no dependency here.
+# The dependencies of the Milestone 1 modules. Only the tests use `serde_json`
+# at this time (see `src/lib.rs`).
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

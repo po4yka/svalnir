@@ -70,19 +70,20 @@ pub(crate) struct Proposal {
 }
 
 fn input_error(code: &'static str, family: ErrorFamily, message: String) -> ErrorBody {
+    let next_action: NextAction = if family == ErrorFamily::Request {
+        NextAction::CorrectRequest
+    } else {
+        NextAction::None
+    };
     ErrorBody {
         code,
         family,
         stage: ErrorStage::Input,
         message,
-        fields: vec!["config"],
+        fields: &["config"],
         operation_id: None,
         plan_id: None,
-        next_action: if family == ErrorFamily::Request {
-            NextAction::CorrectRequest
-        } else {
-            NextAction::None
-        },
+        next_action,
     }
 }
 
@@ -158,7 +159,7 @@ pub(crate) fn load(
     allow_template: bool,
 ) -> Result<Proposal, ErrorBody> {
     if let Some(path) = &option.config {
-        let path: PathBuf = environment.resolve(path, "config")?;
+        let path: PathBuf = environment.resolve(path, &["config"])?;
         return Ok(Proposal {
             text: read_document(&path)?,
             source: SourceView {
@@ -433,7 +434,7 @@ mod tests {
         let directory = TempDirectory::new();
         let error = read_document(directory.path()).unwrap_err();
         assert_eq!(error.family, ErrorFamily::Request);
-        assert_eq!(error.family.exit_status(), ExitStatus::Usage);
+        assert_eq!(error.exit_status(), ExitStatus::Usage);
     }
 
     #[cfg(unix)]
@@ -564,6 +565,6 @@ mod tests {
     fn an_invalid_proposal_is_an_error_for_a_command_that_needs_values() {
         let error = validated(&proposal("schema_version = 2\n")).unwrap_err();
         assert_eq!(error.code, "invalid_configuration");
-        assert_eq!(error.family.exit_status(), ExitStatus::Usage);
+        assert_eq!(error.exit_status(), ExitStatus::Usage);
     }
 }

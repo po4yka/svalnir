@@ -1,7 +1,7 @@
 //! Svalnir privileged helper.
 //!
-//! Exposes only typed, independently validated administrative operations.
-//! It is never an arbitrary shell or an unrestricted delete service.
-//! No operations are implemented yet.
+//! The library `svalnir_privileged` has the typed operations and their
+//! validation. This binary runs no operation yet: no transport exists,
+//! and nothing installs it.
 
 fn main() {}

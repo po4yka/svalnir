@@ -382,7 +382,7 @@ fn generate_scan_id() -> Result<ScanId, ErrorBody> {
         family: ErrorFamily::Native,
         stage: ErrorStage::Collection,
         message: "the scan identity cannot be made".to_owned(),
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::None,
@@ -415,16 +415,17 @@ fn scan_error(error: &ScanError) -> ErrorBody {
         ScanError::RootUnavailable(source) => format!("{error}: {}", source.kind()),
         other => other.to_string(),
     };
+    let stage: ErrorStage = if family == ErrorFamily::Request {
+        ErrorStage::Arguments
+    } else {
+        ErrorStage::Collection
+    };
     ErrorBody {
         code,
         family,
-        stage: if family == ErrorFamily::Request {
-            ErrorStage::Arguments
-        } else {
-            ErrorStage::Collection
-        },
+        stage,
         message: format!("the scan did not start: {detail}; the command made no change"),
-        fields: vec!["path"],
+        fields: &["path"],
         operation_id: None,
         plan_id: None,
         next_action,
@@ -437,7 +438,7 @@ fn store_error(error: &StoreError) -> ErrorBody {
         family: ErrorFamily::Recording,
         stage: ErrorStage::Storage,
         message: format!("the catalog store gave an error: {error}"),
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::None,
@@ -606,7 +607,7 @@ pub(crate) fn scan_root(
                     family: ErrorFamily::Recording,
                     stage: ErrorStage::Storage,
                     message: "the scan result cannot be encoded; it is not saved".to_owned(),
-                    fields: Vec::new(),
+                    fields: &[],
                     operation_id: None,
                     plan_id: None,
                     next_action: NextAction::None,
@@ -659,7 +660,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         stage: ErrorStage::Arguments,
         message: "the scan ID is not valid; use the ID that `svalnir scan --save` printed"
             .to_owned(),
-        fields: vec!["scan"],
+        fields: &["scan"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,
@@ -670,7 +671,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         family: ErrorFamily::Evidence,
         stage: ErrorStage::Storage,
         message: "no saved scan has this ID: the scan was not saved, or the retention removed it; the command made no change".to_owned(),
-        fields: vec!["scan"],
+        fields: &["scan"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::RefreshObservation,
@@ -689,7 +690,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
                 family: ErrorFamily::Recording,
                 stage: ErrorStage::Storage,
                 message: format!("the catalog store cannot be inspected: {}", error.kind()),
-                fields: Vec::new(),
+                fields: &[],
                 operation_id: None,
                 plan_id: None,
                 next_action: NextAction::None,
@@ -707,7 +708,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         family: ErrorFamily::Recording,
         stage: ErrorStage::Storage,
         message: "the saved scan record is not readable by this build".to_owned(),
-        fields: vec!["scan"],
+        fields: &["scan"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::RefreshObservation,
@@ -724,7 +725,7 @@ pub(crate) fn scan(
     arguments: &ScanArgs,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    let root: PathBuf = invocation.environment.resolve(&arguments.path, "path")?;
+    let root: PathBuf = invocation.environment.resolve(&arguments.path, &["path"])?;
     let mut view: ScanView = scan_root(&root, arguments.save, invocation.environment)?;
     invocation.warnings.append(&mut view.warnings);
     invocation.emit(Kind::Snapshot, &view, ScanView::render)?;

@@ -1,6 +1,6 @@
 # Svalnir Cleanup Rules
 
-**Status:** Design specification. The registry below contains proposed integrations, not implemented adapters or verified claims that a directory is safe to delete.
+**Status:** Design specification. The registry below contains proposed integrations, not implemented adapters or verified claims that a directory is safe to delete. The `rule` module of `svalnir-core` has the declaration types, the registry interface, and the eligibility evidence of sections 2 to 9. No rule is implemented.
 
 **Last reviewed:** 2026-11-16
 
@@ -23,7 +23,7 @@ The rule answers:
 
 A valid rule does not itself grant permission to act. Execution also requires an applicable `PolicyRevision`, `ActionGrant`, current OS access, and, where relevant, a helper-enforced `PrivilegeGrant`. Selecting an ID in `approved_rules` cannot bypass any of these checks.
 
-Inspection, manual Trash, manual rule-based permanent eviction, and automatic permanent eviction are separate modes. A rule may support inspection only or any validated subset of the action modes. Approval for one mode must not imply approval for another.
+Inspection, manual Trash, manual rule-based permanent eviction, and automatic permanent eviction are separate modes, with the serialized names `inspection`, `manual_trash`, `manual_eviction`, and `automatic_eviction`. A rule may support inspection only or any validated subset of the action modes. Approval for one mode must not imply approval for another.
 
 ## 2. Identity, versions, and lifecycle
 
@@ -41,6 +41,8 @@ IDs use a stable producer/category namespace, such as `svalnir.expired-temporary
 | Retired | Existing history remains interpretable; new plans are rejected |
 
 Promotion requires recorded evidence, not merely changing a registry flag. An implementation can support different lifecycle states for different owner versions or layouts.
+
+The serialized lifecycle states are `proposed`, `inspection_validated`, `manual_action_validated`, `automatic_eviction_validated`, `disabled`, and `retired`. A declaration gives one state for each supported layout. Each validated state has a reference to its validation record under [VALIDATION.md](VALIDATION.md); a validated state with no reference is not a valid declaration. A `disabled` state says whether inspection stays permitted. A state that the reader does not recognize permits no mode.
 
 Changes that broaden roots, ownership, action modes, or consequences require corresponding grant review. An existing plan executes only its exact original revision while that revision remains registered, supported, and authorized; even a narrower replacement requires a new plan. A safety fix may revoke the old revision and inhibit its pending work. Unknown IDs, revisions, or layouts cannot fall back to a generic cleaner.
 
@@ -70,7 +72,9 @@ The following is the logical declaration contract.
 | `verification` | Observable effects and remaining uncertainty |
 | `provenance` | Primary documentation, relevant source revisions, and review evidence |
 
-A missing support range, age policy, concurrency argument, or work bound is an incomplete rule. No universal minimum age or cache-retention default is established here; each released revision must supply concrete validated values.
+The declaration type of `svalnir-core` has these parts of the contract: `id` and `revision`, `owner`, the supported layouts with their lifecycle states, the approved roots, `retention`, the checks and the windows of `activity_protocol`, `exclusions`, `modes`, the deletion method, `executor`, the rebuild cost, and the candidate and pass ceilings of `work_charge`. An approved root is relative to the home directory of the user, to the state directory of Svalnir, or to the location that the configuration of the producer names; it is never an absolute path from user input. `candidate_unit`, `regenerability`, `namespace_protocol`, `failure_policy`, `verification`, and `provenance` have no field in that type yet. A rule that needs one of them for a validated mode adds the field with its implementation.
+
+A missing support range, age policy, concurrency argument, or work bound is an incomplete rule. A declaration with no layout, no root, no activity check, a zero minimum age, a work ceiling with a zero part, or an unknown rebuild cost is rejected. So is a root path that is absolute or that has an empty, `.`, or `..` component, and a layout that is validated for a manual action or for automatic eviction when the implementation has no such mode. Each implementation has the inspection mode. No universal minimum age or cache-retention default is established here; each released revision must supply concrete validated values.
 
 Rule parameters may tighten approved scope. A parameter that expands it must be constrained by the rule and the corresponding grants. The most restrictive applicable exclusion, grant, and resource limit wins.
 
@@ -126,7 +130,9 @@ A candidate is eligible only when every required predicate is satisfied:
 9. Capabilities, leases, durable recording, and execution budgets are available.
 10. A fresh check immediately before the step still permits dispatch.
 
-Use three-valued evidence: satisfied, not satisfied, and unknown. Unknown activity, ownership, cost, or classification cannot be treated as an affirmative result.
+Use three-valued evidence: satisfied, not satisfied, and unknown. Unknown activity, ownership, cost, or classification cannot be treated as an affirmative result. The serialized values are `satisfied`, `not_satisfied`, and `unknown`. A candidate has one value for each of the ten predicates, and it is eligible only when each value is `satisfied`. A value that the reader does not recognize is not `satisfied`.
+
+The candidate that the disk policy evaluates carries facts that derive from this evidence. Such a fact is affirmative only when its predicate is `satisfied`: a rule that is ready needs predicate 1, an owner that is the requesting user needs predicate 2, a target with no protected data class needs predicates 4 and 7, a known rebuild cost needs predicate 4, an inactive target needs predicate 5, a target with no product protection needs predicate 7, and a known work charge needs predicate 8. A fact also claims no more than the declaration of the exact rule revision: a rule is ready only for a layout that is validated for automatic eviction, a known rebuild cost is the cost of the declaration, an inactive time is not shorter than the quiescence time, and a known charge fits the candidate ceiling.
 
 ### Age and use
 

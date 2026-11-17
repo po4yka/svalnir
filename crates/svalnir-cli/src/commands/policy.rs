@@ -162,7 +162,7 @@ fn input_error(error: &policy::PolicyInputError) -> ErrorBody {
         family: ErrorFamily::Native,
         stage: ErrorStage::Collection,
         message: format!("the snapshot is not usable for a simulation: {error}"),
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::RefreshObservation,

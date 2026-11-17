@@ -97,7 +97,7 @@ where
         // A closed pipe keeps the success status; another write error does not.
         Err(CommandFailure::Output(error)) => finish(Err(error), ExitStatus::Success, stderr),
         Err(CommandFailure::Rejected(error)) => {
-            let status: ExitStatus = error.family.exit_status();
+            let status: ExitStatus = error.exit_status();
             let written = report_error(
                 cli.common.format,
                 request_id,
@@ -110,7 +110,7 @@ where
         }
         Err(CommandFailure::RejectedWithWarnings(boxed)) => {
             let (error, warnings): (ErrorBody, Vec<Warning>) = *boxed;
-            let status: ExitStatus = error.family.exit_status();
+            let status: ExitStatus = error.exit_status();
             let written = report_error(
                 cli.common.format,
                 request_id,

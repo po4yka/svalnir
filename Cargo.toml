@@ -41,6 +41,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.2.1"
 
+# Content digests of plans and policy revisions. The same version is in the
+# GUI graph through gpui-kit.
+sha2 = "0.11.1"
+
 # Local state
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 
@@ -57,6 +61,9 @@ objc2-foundation = "0.3.2"
 objc2-app-kit = "0.3.2"
 dispatch2 = "0.3.1"
 libc = "0.2.191"
+
+# Tests only: disposable directories for the journal and the executors.
+tempfile = "3.27.0"
 
 [workspace.lints.cargo]
 # The selections above are pinned ahead of use while the crates are skeletons.

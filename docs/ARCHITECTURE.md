@@ -1,6 +1,6 @@
 # Svalnir Architecture
 
-**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with the read-only Milestone 1 build: collectors, a scanner, a local store, capability probes, configuration validation, and policy simulation that the CLI runs in its own process. No agent, coordinator, protocol, or action exists. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
+**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with the read-only Milestone 1 build: collectors, a scanner, a local store, capability probes, configuration validation, and policy simulation that the CLI runs in its own process. `svalnir-core` also has the action-contract, cleanup-rule, and authority types of Milestone 2, and the crates declare empty modules for the journal, the executors, the rule registry, the coordinator, the controllers, the runtime, and the helper requests. No agent, coordinator, or protocol exists, and no code executes an action. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
 
 **Last reviewed:** 2026-11-16
 
@@ -91,6 +91,8 @@ All boundary types are versioned. Units and observation quality are explicit rat
 | `OperationId` | Opaque correlation and deduplication identity; not an authorization capability by itself |
 | `ResourceLease` | Coordinator-issued ownership of a conflict domain for bounded work |
 
+In `svalnir-core`, the `ActionPlan` of this table is the type `action::Plan`, and `PolicyRevision`, `ActionGrant`, and `PrivilegeGrant` are three distinct types in `authority`.
+
 An identity must record which native evidence was available. An absent generation identifier must not be invented. Display paths and process names are labels; they are never sufficient target selectors.
 
 Use monotonic time for sustain periods, rate calculations, deadlines, and cooldowns within a running epoch. Wall-clock time supports human history. After restart or wake, invalidate observations and timing assumptions that cannot be established reliably.
@@ -165,6 +167,8 @@ stateDiagram-v2
     Admitted --> Failed: intent cannot be recorded
     Admitted --> IntentCommitted: durable intent
     IntentCommitted --> DispatchConsumed: durable dispatch reservation
+    IntentCommitted --> NoAction: stopped before dispatch reservation
+    IntentCommitted --> Failed: dispatch reservation cannot be recorded
     DispatchConsumed --> NoAction: final check fails, no call issued
     DispatchConsumed --> Verifying: external operation submitted
     DispatchConsumed --> UnknownOutcome: crash or lost evidence
@@ -182,7 +186,7 @@ stateDiagram-v2
     UnknownOutcome --> Reconciliation
 ```
 
-This diagram is a summary of the normal durable path. [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) owns the state definitions and the aggregation rules. Intent, dispatch consumption, and verification apply to each executable step. The settled states describe a step and, through the aggregation rules, its operation. A rejected request creates no operation. The critical-memory exception in section 12 uses explicitly marked volatile intent and dispatch records; it must never report those records as durably committed. Cancellation before dispatch can finish without effects; cancellation after dispatch stops subsequent work and reports any completed or uncertain effects.
+This diagram is a summary of the normal durable path. [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) owns the state definitions, the complete transition table, and the aggregation rules. Reconciliation replaces `UnknownOutcome` with a settled state only when the evidence establishes that state. Intent, dispatch consumption, and verification apply to each executable step. The settled states describe a step and, through the aggregation rules, its operation. A rejected request creates no operation. The critical-memory exception in section 12 uses explicitly marked volatile intent and dispatch records; it must never report those records as durably committed. Cancellation before dispatch can finish without effects; cancellation after dispatch stops subsequent work and reports any completed or uncertain effects.
 
 A consumed request is single-use. Duplicate requests return known status or require reconciliation. A crash after dispatch reservation may leave no effect, a completed effect, or a partial effect; Svalnir must not promise exactly-once external execution.
 

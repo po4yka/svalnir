@@ -140,39 +140,40 @@ pub struct ErrorBody {
     /// Text that is safe to show. It contains no payload from another party.
     pub message: String,
     /// Names of the request fields that caused the error.
-    pub fields: Vec<&'static str>,
-    pub operation_id: Option<String>,
-    pub plan_id: Option<String>,
+    pub fields: &'static [&'static str],
+    /// The operation, when the error has one. The text is boxed so that
+    /// the record stays small as an error value.
+    pub operation_id: Option<Box<str>>,
+    /// The plan, when the error has one.
+    pub plan_id: Option<Box<str>>,
     pub next_action: NextAction,
 }
 
-/// Family of an error. The family selects the exit status.
+pub use svalnir_core::action::ErrorFamily;
+
+/// The exit status of an error in `family` before admission.
 ///
-/// `docs/ACTION_CONTRACTS.md` section 10 owns the families. This enumeration
-/// has only the families that this build can return.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorFamily {
-    /// The request shape is invalid.
-    Request,
-    /// The request names evidence that is stale or that does not exist, for
-    /// example a scan that is not recorded or a process that exited.
-    Evidence,
-    /// The local state store did not record or return a value.
-    Recording,
-    /// The backend refused the request or does not support it.
-    Native,
+/// `docs/ACTION_CONTRACTS.md` section 10 owns the families and
+/// `docs/INTERFACES.md` section 8 owns the mapping. A family that this
+/// build does not recognize needs reconciliation, as an unknown outcome.
+pub fn family_exit_status(family: &ErrorFamily) -> ExitStatus {
+    match family {
+        ErrorFamily::Request => ExitStatus::Usage,
+        ErrorFamily::Authority | ErrorFamily::Eligibility | ErrorFamily::Native => {
+            ExitStatus::Unavailable
+        }
+        ErrorFamily::Evidence
+        | ErrorFamily::Limits
+        | ErrorFamily::Outcome
+        | ErrorFamily::Unrecognized(_) => ExitStatus::Conflict,
+        ErrorFamily::Recording => ExitStatus::Failure,
+    }
 }
 
-impl ErrorFamily {
-    /// The exit status of an error in this family before admission.
-    pub fn exit_status(self) -> ExitStatus {
-        match self {
-            Self::Request => ExitStatus::Usage,
-            Self::Evidence => ExitStatus::Conflict,
-            Self::Recording => ExitStatus::Failure,
-            Self::Native => ExitStatus::Unavailable,
-        }
+impl ErrorBody {
+    /// The exit status of the error.
+    pub fn exit_status(&self) -> ExitStatus {
+        family_exit_status(&self.family)
     }
 }
 
@@ -204,4 +205,36 @@ pub enum NextAction {
     /// Make a new observation: list the targets or scan again. The command
     /// is read-only, so a repeated request has no side effect.
     RefreshObservation,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorFamily, ExitStatus, family_exit_status};
+
+    #[test]
+    fn each_error_family_has_its_exit_status() {
+        let expected = [
+            (ErrorFamily::Request, 2, "request"),
+            (ErrorFamily::Authority, 3, "authority"),
+            (ErrorFamily::Evidence, 5, "evidence"),
+            (ErrorFamily::Eligibility, 3, "eligibility"),
+            (ErrorFamily::Limits, 5, "limits"),
+            (ErrorFamily::Recording, 1, "recording"),
+            (ErrorFamily::Native, 3, "native"),
+            (ErrorFamily::Outcome, 5, "outcome"),
+        ];
+        assert_eq!(expected.len(), ErrorFamily::ALL.len());
+        for (family, code, text) in expected {
+            assert_eq!(family_exit_status(&family).code(), code, "{family}");
+            // The spelling that the CLI emits.
+            assert_eq!(
+                serde_json::to_string(&family).unwrap(),
+                format!("\"{text}\"")
+            );
+        }
+        assert_eq!(
+            family_exit_status(&ErrorFamily::from_wire("quota")),
+            ExitStatus::Conflict
+        );
+    }
 }

@@ -8,9 +8,27 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+name = "svalnir_privileged"
+path = "src/lib.rs"
+
 [[bin]]
 name = "svalnir-privileged"
 path = "src/main.rs"
+
+# The dependencies of the declared request and validation modules. No
+# rendering crate and no agent crate is permitted in this graph: the helper
+# does not link the code of its caller.
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+svalnir-core.workspace = true
+thiserror.workspace = true
+
+# Tests only: disposable directories for the validation of file targets.
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

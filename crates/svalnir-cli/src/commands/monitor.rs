@@ -206,7 +206,7 @@ fn stream_events(
             // Each line of the stream has one shape. A collection failure
             // is the last event of the stream, not a response envelope.
             Err(error) if invocation.format != Format::Text => {
-                let status: ExitStatus = error.family.exit_status();
+                let status: ExitStatus = error.exit_status();
                 let line: Vec<u8> = json_line(&StreamLine {
                     schema_version: SCHEMA_VERSION,
                     stream_id: &stream_id,

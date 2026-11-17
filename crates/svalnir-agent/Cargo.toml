@@ -16,8 +16,9 @@ path = "src/lib.rs"
 name = "svalnir-agent"
 path = "src/main.rs"
 
-# The dependencies of the Milestone 1 modules. `sysinfo` has no user yet (see
-# `src/lib.rs`). No rendering crate is permitted in this graph.
+# The dependencies of the Milestone 1 modules, which are also those of the
+# declared Milestone 2 modules. `sysinfo` has no user yet (see `src/lib.rs`).
+# No rendering crate is permitted in this graph.
 [dependencies]
 libc.workspace = true
 rusqlite.workspace = true
@@ -34,6 +35,11 @@ dispatch2.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+
+# Tests only: disposable directories for the journal, the rules, and the
+# executors.
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

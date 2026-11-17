@@ -81,7 +81,7 @@ impl Environment {
                 message: format!(
                     "the home directory is not known; set `{STATE_DIRECTORY_VARIABLE}` to an absolute path"
                 ),
-                fields: Vec::new(),
+                fields: &[],
                 operation_id: None,
                 plan_id: None,
                 next_action: NextAction::None,
@@ -117,7 +117,7 @@ impl Environment {
             family: ErrorFamily::Recording,
             stage: ErrorStage::Storage,
             message: format!("the state directory cannot be created: {}", error.kind()),
-            fields: Vec::new(),
+            fields: &[],
             operation_id: None,
             plan_id: None,
             next_action: NextAction::None,
@@ -125,13 +125,18 @@ impl Environment {
         Ok(directory)
     }
 
-    /// Resolves a path argument against the invocation directory.
+    /// Resolves a path argument against the invocation directory. `fields`
+    /// names the argument in an error.
     ///
     /// # Errors
     ///
     /// Returns an error for a relative path when the invocation directory is
     /// not known.
-    pub(crate) fn resolve(&self, path: &Path, field: &'static str) -> Result<PathBuf, ErrorBody> {
+    pub(crate) fn resolve(
+        &self,
+        path: &Path,
+        fields: &'static [&'static str],
+    ) -> Result<PathBuf, ErrorBody> {
         if path.is_absolute() {
             return Ok(path.to_path_buf());
         }
@@ -142,7 +147,7 @@ impl Environment {
                 family: ErrorFamily::Request,
                 stage: ErrorStage::Arguments,
                 message: "the invocation directory is not known; give an absolute path".to_owned(),
-                fields: vec![field],
+                fields,
                 operation_id: None,
                 plan_id: None,
                 next_action: NextAction::CorrectRequest,
@@ -157,7 +162,7 @@ fn request_error(code: &'static str, message: String) -> ErrorBody {
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
         message,
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,

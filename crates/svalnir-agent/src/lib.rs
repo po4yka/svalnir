@@ -5,10 +5,13 @@
 //! types come from `svalnir_core`; a module here does not define a second
 //! byte, timestamp, identity, or observation type.
 //!
-//! In Milestone 1 the CLI links this library and runs read-only commands in
-//! its own process. The `svalnir-agent` binary is a skeleton: no background
-//! agent, no coordinator, and no client API exist yet. No module deletes a
-//! file or signals a process.
+//! The CLI links this library and runs read-only commands in its own
+//! process. The `svalnir-agent` binary is a skeleton: no background agent,
+//! no coordinator, and no client API exist yet. No module deletes a file or
+//! signals a process.
+//!
+//! The modules of Milestone 2 are declared and empty. Each one has only a
+//! comment that states its planned responsibility.
 //!
 //! | Module | Contents |
 //! | --- | --- |
@@ -18,6 +21,13 @@
 //! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |
+//! | [`journal`] | Declared, empty: the operation journal in `operations.sqlite` |
+//! | [`executor::fs`] | Declared, empty: Trash move and permanent removal |
+//! | [`executor::process`] | Declared, empty: graceful termination and force escalation |
+//! | [`rules`] | Declared, empty: the rule registry and the reviewed rules |
+//! | [`coordinator`] | Declared, empty: admission, serialization, and reconciliation |
+//! | [`controller`] | Declared, empty: background disk protection and application budgets |
+//! | [`runtime`] | Declared, empty: the agent process lifecycle |
 
 // No module uses `sysinfo` yet. The native adapters of `platform::process`
 // read the process inventory. `README.md` plans `sysinfo` for the general
@@ -27,6 +37,12 @@
 use sysinfo as _;
 
 pub mod capability;
+pub mod controller;
+pub mod coordinator;
+pub mod executor;
+pub mod journal;
 pub mod platform;
+pub mod rules;
+pub mod runtime;
 pub mod scan;
 pub mod store;

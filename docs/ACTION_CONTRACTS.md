@@ -1,6 +1,6 @@
 # Svalnir Action Contracts
 
-**Status:** Design specification. This document defines required behavior for the first implementation; the types and examples are conceptual, not a shipped API or evidence of runtime validation.
+**Status:** Design specification. This document defines required behavior for the first implementation; the examples are conceptual, and the types are not a shipped API or evidence of runtime validation. The `action` module of `svalnir-core` has the types of this contract and the serialized spellings that this document fixes. No executor, journal, or coordinator is implemented.
 
 **Last reviewed:** 2026-11-16
 
@@ -17,6 +17,8 @@ The initial action surface contains five classes:
 | `EvictRegenerableData` | Permanently remove candidates selected by a reviewed cleanup rule | Manual authorization or an applicable standing automatic grant |
 | `RequestApplicationExit` | Ask a verified application or managed job to exit gracefully | Manual authorization or an applicable standing automatic grant |
 | `ForceApplicationExit` | Escalate termination, or force an explicitly approved disposable target immediately | Explicit force permission within the applicable authorization |
+
+The serialized spelling of an action class is its name in this table. The trigger class of a plan is `manual`, `disk_pressure`, `global_critical_memory`, or `application_budget`. `MoveToTrash` and `DeleteSelectedFiles` accept only the `manual` trigger. A `disk_pressure` trigger selects only `EvictRegenerableData`, and the two memory triggers select only the two application classes.
 
 Graceful and forced termination are separate steps of one application intervention. A cooperative operation that unloads a model or releases another application-owned resource needs a typed adapter and its own completion predicate; it must not be mislabeled as application exit.
 
@@ -35,6 +37,12 @@ No action class accepts arbitrary shell text, arbitrary privileged executables, 
 | `ExecutorEpoch` | One executor lifetime; distinguishes stale in-memory requests and volatile consumption records |
 
 A cleanup operation may contain several bounded candidate steps. An application intervention contains a graceful step and, if authorized, a force step. Neither hierarchy permits silently adding targets.
+
+One plan has the steps of one filesystem action class, with one step for each target, or it has application steps only. The force strategy of an application plan is `none`, `force_after_grace`, or `immediate_force`. For each application target the steps are, in that sequence of strategies: one graceful step; one graceful step and then one force step; or one force step.
+
+A plan has a content digest: the text `sha256:` and the lowercase hexadecimal SHA-256 of the JSON encoding of the plan content. The JSON encoding is the one that `svalnir-core` writes: the fields in their declared sequence and no insignificant white space. It is a part of the schema version of the plan. The digest covers the action classes, the trigger, the target bindings, the limits with the force strategy and the grace period, the expiry, and the policy, grant, and rule revisions. An approval names the `PlanId` and the digest. A plan whose content does not agree with its digest is rejected.
+
+The expiry of a plan is a monotonic time in one clock domain and one boot. The plan is expired at that time. It is also expired when the clock of the check is in a different clock domain or boot, or is before the time at which the plan was built.
 
 Plan creation is observational. It does not reserve the target, consume an intervention budget, or authorize execution. A displayed preview may become stale immediately.
 
@@ -64,6 +72,8 @@ The conceptual envelope contains:
 The authenticated principal cannot be replaced by a UID supplied in a payload. Opaque identifiers correlate records; possession alone does not authorize access.
 
 File bindings include approved root identity, relative entry, volume/mount identity, object type and owner, and available native object identifiers. Process bindings include PID, start identity, UID, executable identity, application/job association, and explicitly attributed members.
+
+The envelope of a step repeats the checks of its plan, because it has its own copy of the target: the binding of the target, the trigger identities, and the agreement of the action class with the force strategy and the grace period. An automatic trigger has an incident identity and a decision identity, and a manual trigger has none. The application slot of an automatic step is a slot of the incident of its trigger. A plan or an envelope of the helper executor names a `PrivilegeGrant`, and one of the user executor names none. The initial process-control surface has the user executor only, so an application plan with the helper executor is rejected. The helper condition of the critical-memory exception in section 12 applies when a later surface gives the helper a step of an application intervention.
 
 Absent native evidence is represented as absent. A path string, bundle name, parent PID, or previously successful probe must not substitute for missing evidence required by the adapter.
 
@@ -104,6 +114,10 @@ Budget consumption and dispatch consumption must be committed consistently withi
 
 Acquire conflict leases for the application generation, cleanup root, and shared capacity domain as appropriate. The host broker coordinates cooperating Svalnir sessions. Leases do not prevent external writers or application relaunch.
 
+A lease names one conflict domain: a process generation of an application, a cleanup root, a shared capacity domain, or a volume with exclusive free space.
+
+Budget arithmetic is checked. A reservation, a consumption, or a release that does not fit or that overflows is an error and changes no allowance. A budget change applies at each level (batch, pass, rule, incident, grant, executor) or at no level.
+
 Loss of a lease blocks the next step. Lease expiry does not prove an already submitted effect stopped. A successor owner must reconcile unresolved work before conflicting dispatch; it must not rely on a fencing number to cancel an OS call already in progress.
 
 ## 6. Execution lifecycle
@@ -122,6 +136,22 @@ Use a durable normal path for all initial filesystem mutations, including Trash,
 
 `Prepared` describes a plan and `Admitted` describes an operation. `IntentCommitted`, `DispatchConsumed`, and `Verifying` apply to each step. The settled states apply to a step and, through the aggregation rules in section 9, to its operation. A request that fails admission creates no operation. It is reported as a rejection with reasons (section 4), not as an operation state.
 
+A step that has no intent record has the state of its operation, `Admitted`. An operation stays `Admitted` until its target results aggregate to a result state. The serialized spelling of a state is its name in the table. The permitted step transitions are:
+
+| From | To |
+| --- | --- |
+| `Admitted` | `IntentCommitted`; `NoAction` (canceled or already satisfied); `Failed` (the intent cannot be recorded); `DispatchConsumed`, only for the critical-memory exception of section 12, with the durability `volatile` |
+| `IntentCommitted` | `DispatchConsumed`; `NoAction` (stopped before the dispatch is consumed); `Failed` (the dispatch consumption cannot be recorded) |
+| `DispatchConsumed` | `Verifying`; `NoAction` (the final check fails and no call is issued); `UnknownOutcome` (a crash or lost evidence) |
+| `Verifying` | `Completed`, `Partial`, `Incomplete`, `Failed`, `UnknownOutcome` |
+| `UnknownOutcome` | `Completed`, `Partial`, `Incomplete`, `Failed`, only when reconciliation establishes the result; `NoAction`, only for a step whose dispatch state is `submission_uncertain` and for which reconciliation proves that no call was submitted |
+
+Each other step transition is rejected, and a settled state does not change. An operation goes from `Admitted` to each result state, and from `UnknownOutcome` to a settled state through reconciliation.
+
+A state is reported with two more values. The dispatch state is `not_submitted`, `submitted`, or `submission_uncertain`. The durability is `durable`, `volatile`, or `persistence_failed`. `Admitted`, `IntentCommitted`, `DispatchConsumed`, and `NoAction` are `not_submitted`. `Verifying` is `submitted`. `Completed`, `Partial`, `Incomplete`, and `UnknownOutcome` are `submitted` or `submission_uncertain`; a settled state is `submission_uncertain` only when reconciliation settles a step whose submission stays uncertain. `Failed` is `not_submitted` or `submitted`. A submission is recorded only for a step whose dispatch was consumed, so a step that fails before that boundary is `not_submitted`. A recorded submission is not removed; only reconciliation can change `submission_uncertain` to `not_submitted`. `Admitted` is `durable` or `volatile`. A `volatile` or `persistence_failed` record does not become `durable`, and a `durable` record does not become `volatile`. A record that was `volatile` keeps that value when it is written to the durable journal later.
+
+A step with a result state has a minimum of one target result, and the state is the aggregate of those results (section 9). No component writes a result state directly.
+
 After recording intent and before the external call, consume the step and its applicable budget charge. Immediately before submission, check cancellation, revisions, grant generation, deadline, target identity, protection state, and trigger continuity again.
 
 An open incident does not alone authorize the next step. A latched disk incident may continue bounded eviction toward its recovery threshold while its fresh continuation predicate holds. Memory steps, including force escalation, require the current qualified critical-pressure or application-stop predicate; remaining in an incident's hysteresis band is insufficient. Evidence gaps or wake require requalification without resetting consumed budgets. Plan expiry or a deadline blocks a later step; waiting for graceful exit does not extend either.
@@ -130,7 +160,7 @@ If that final check fails, record that no external call was issued. The consumed
 
 Never hold scheduling locks while awaiting an application, native callback, or storage transaction. Collectors, pause/revoke handling, and operation queries must remain responsive.
 
-The critical-memory exception in section 12 uses explicitly marked volatile intent and consumption. It must never label those records `IntentCommitted` with durable status.
+The critical-memory exception in section 12 uses explicitly marked volatile intent and consumption. It must never label those records `IntentCommitted` with durable status. A step of that exception goes from `Admitted` to `DispatchConsumed` with the durability `volatile`. It does not have the state `IntentCommitted`, which is always `durable`.
 
 ## 7. Filesystem execution
 
@@ -183,6 +213,8 @@ The normal sequence is:
 5. If it remains and the deadline expires, revalidate every force precondition.
 6. Submit at most one admitted force step, then observe within the verification window.
 
+In the `force_after_grace` strategy, a force step follows only a graceful step that was submitted and that left the target running: the state of the graceful step is `Incomplete`, `Partial`, or `Failed`, and its dispatch state is `submitted`. A graceful step that is `Completed`, `NoAction`, `UnknownOutcome`, not settled, or `Failed` with no submitted call permits no force step.
+
 Reconnection, unrelated events, or repeated queries must not restart the grace period. An immediate-force disposable-job policy skips the graceful step only when that consequence and target are separately authorized.
 
 An application may decline graceful termination or show a save dialog. Neither response authorizes bypassing the current foreground rule or force policy. If global pressure recovers, an application budget is no longer violated, or required evidence becomes unavailable before escalation, stop further automatic steps according to [POLICY_SPEC.md](POLICY_SPEC.md). An already issued graceful request may still complete.
@@ -206,9 +238,15 @@ A target record includes:
 | `evidence` | Native result and observation source/time, including unavailable evidence |
 | `attribution` | Whether Svalnir's action is established, merely possible, or not applicable |
 | `durability` | Durable, volatile, or persistence failed after an earlier durable boundary |
-| `stop_reason` | Cancellation, pause, policy change, cleared trigger, deadline, missing authority, failure, or normal completion |
+| `stop_reason` | Cancellation, pause, policy change, cleared trigger, deadline, missing authority, skipped target, failure, or normal completion |
 
-Action-specific effects include `Trashed`, `Removed`, `ExitVerified`, `AlreadyAbsent`, `AlreadyExited`, `Skipped`, `Refused`, `StillRunning`, and `UnknownOutcome`. These are conceptual variants, not final serialization spellings.
+A target record of an application can name one member. A record with no member is for the target as a whole.
+
+The action-specific effects are `Trashed`, `Removed`, `ExitVerified`, `AlreadyAbsent`, `AlreadyExited`, `Skipped`, `Refused`, `StillRunning`, and `UnknownOutcome`. The serialized spelling of an effect is its name. `attribution` is `established`, `possible`, or `not_applicable`. `stop_reason` is `COMPLETED`, `CANCELED`, `PAUSED`, `POLICY_CHANGED`, `TRIGGER_CLEARED`, `DEADLINE_EXPIRED`, `AUTHORITY_MISSING`, `TARGET_SKIPPED`, or `FAILED`.
+
+`TARGET_SKIPPED` means that the fresh check before dispatch did not permit this target because of its evidence, its eligibility, or a limit. It is not an execution error. A record with `TARGET_SKIPPED` or `FAILED` has the error of section 10, and no other record has one.
+
+The fields of a record agree with each other. `Trashed`, `Removed`, `ExitVerified`, `Refused`, and `StillRunning` need a `submitted` call. `Skipped` needs `not_submitted`. A verified effect has the attribution `established` or `possible`. `AlreadyAbsent` and `AlreadyExited` have `not_applicable` before a call and `possible` after a submitted or possibly submitted call. `UnknownOutcome` has `possible`. `Skipped`, `Refused`, and `StillRunning` have `not_applicable`. `Refused` has the stop reason `FAILED`. A target in its final condition (a verified effect, `AlreadyAbsent`, or `AlreadyExited`) does not have the stop reason `FAILED` or `TARGET_SKIPPED`. A record that does not agree with these rules is rejected.
 
 A pre-dispatch already-absent/exited result is a no-op. After a crash, finding the target absent may establish current state without establishing who removed or stopped it. Preserve that attribution uncertainty.
 
@@ -223,7 +261,15 @@ Aggregate as follows:
 
 A submitted graceful request that leaves an application running is not `NoAction`. An intentional stop with a known still-running target is `Incomplete`; a verified exit followed by incomplete work on another required member is `Partial`. All pre-dispatch already-satisfied targets produce `NoAction`. Cancellation after a verified removal produces partial completion with a cancellation reason, not a claim of zero effects. Unknown effects take precedence over aggregate completion; a settled error without verified effects takes precedence over `Incomplete` or `NoAction`.
 
-Report resource effects as before/after observations with source, scope, time window, signed capacity delta, pressure state, and quality. A negative delta is valid. Concurrent workloads prevent treating an observed improvement as exact causal reclamation. A completed operation may yield no resource improvement.
+These rules decide the cases that the list leaves open:
+
+- When more than one step has a result for one target, or for one member of an application, the last result is the final condition of that target or member. A later record for the target as a whole replaces each earlier record of the target and of its members, and a later record for one member replaces the earlier record for the target as a whole. A force step that is not necessary because the target exited records `AlreadyExited` with no submission.
+- A possibly submitted call counts as a submitted call.
+- A record with the stop reason `FAILED` is the known failure of the `Failed` rule. A record with `TARGET_SKIPPED` is not: an operation whose targets were all skipped is `NoAction`.
+- A record with a field value that the reader does not recognize (effect, dispatch state, attribution, durability, stop reason, or native result) is an indeterminate effect. It is never read as a known result.
+- An operation has a minimum of one target record. An operation that stops before its first target records `Skipped` for each target.
+
+Report resource effects as before/after observations with source, scope, time window, signed capacity delta, pressure state, and quality. The capacity delta is the later value minus the earlier value. It has a value only when the two observations have a value and the same scope; an unavailable observation gives no delta, not zero. A negative delta is valid. Concurrent workloads prevent treating an observed improvement as exact causal reclamation. A completed operation may yield no resource improvement.
 
 ## 10. Error and retry taxonomy
 
@@ -239,6 +285,8 @@ Errors describe the failed contract boundary, whether submission occurred, and h
 | Recording | Full database, sync failure, unavailable journal | Stop normal mutation; consider only the exact critical exception |
 | Native | Refusal, access denied, unsupported backend, definite no-effect failure | Report; retry only after fresh admission if safe |
 | Outcome | Lost reply, interrupted execution, unverifiable effect | Reconcile before any conflicting action |
+
+The serialized family names are `request`, `authority`, `evidence`, `eligibility`, `limits`, `recording`, `native`, and `outcome`. The permitted next steps are, in the same sequence, `correct_request`, `resolve_authority`, `refresh_observation`, `skip_target`, `respect_limits`, `stop_mutation`, `report_and_readmit`, and `reconcile`. The next step of a family applies only when no call was submitted. After a submitted or possibly submitted call, the next step is `reconcile` in each family. A family that the reader does not recognize also needs `reconcile`. An error code has lower-case letters, digits, and `_`.
 
 A native error is not universally proof of no effect. Map each backend's actual semantics; do not automatically retry `EINTR`, timeouts, or connection resets as if nothing happened.
 
@@ -283,6 +331,8 @@ The user executor and privileged helper each persist their own authoritative act
 SQLite WAL with `synchronous=FULL` is the architectural baseline; the actual build, VFS, sync options, and storage-error behavior require validation. WAL with `NORMAL` can lose committed transactions after power failure. [SQLite's WAL documentation][sqlite-wal] describes that distinction.
 
 A database transaction cannot atomically include an external unlink or signal. The journal is evidence for recovery, not an undo log for operating-system effects.
+
+The journal interface has this contract. A call of the durable journal returns success only after its record is durable. The bounded record of the critical-memory exception returns success with the durability `volatile`. The consumption of a plan and its operation are one transaction. A plan is consumed one time for its plan identity; a repeated apply of the same principal returns the operation or the recorded rejection of the first apply, and an apply of a different principal is a conflict. The consumption of a dispatch tells the caller whether this call consumed the step; only that caller submits the external call. The same transaction reads the stop fence of the operation, and a fenced operation consumes no dispatch. The result of a consumption states the durability of its record, and the dispatch check uses that value. The recording mode of a step is `durable` or `volatile_critical_exception`. A step with a `volatile` record is dispatched only when its mode is `volatile_critical_exception`, its action class is an application class, and its original trigger is `global_critical_memory`.
 
 ### Explicit critical-memory exception
 

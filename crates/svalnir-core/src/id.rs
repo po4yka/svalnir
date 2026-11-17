@@ -126,6 +126,26 @@ opaque_id! {
     /// Identity of one cleanup rule. A rule reference also needs the
     /// implementation revision of the rule.
     RuleId;
+    /// Identity of one immutable implementation revision of a cleanup rule.
+    RuleRevisionId;
+    /// Identity of one policy incident. Its budgets and stop conditions
+    /// govern automatic work.
+    IncidentId;
+    /// Identity of one policy decision.
+    DecisionId;
+    /// Identity of one executor lifetime. A restart makes a new epoch.
+    ExecutorEpochId;
+    /// Identity of one standing action grant.
+    ActionGrantId;
+    /// Identity of one privilege grant that the helper owns.
+    PrivilegeGrantId;
+    /// Identity of one resource lease.
+    LeaseId;
+    /// Identity of one approved cleanup root. The agent holds the identity
+    /// evidence of the root.
+    RootId;
+    /// Identity of one authenticated client session.
+    SessionId;
 
     /// Identity of the record that an observation scope refers to.
     IdentityId;

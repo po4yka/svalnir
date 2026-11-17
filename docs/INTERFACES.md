@@ -1,6 +1,6 @@
 # Svalnir Interfaces
 
-**Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API. The Milestone 1 build implements the subset that section 4 names.  
+**Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API. The Milestone 1 build implements the subset that section 4 names. `svalnir-core` has the types of the plan, the operation, the target result, and the error taxonomy with the encodings of section 3; no command uses them yet.  
 **Interface baseline:** 1  
 **Last reviewed:** 2026-11-17
 
@@ -63,7 +63,9 @@ Observation payloads use the canonical `Observation<T>` contract in RESOURCE_MOD
 
 Monotonic timestamps are comparable only under the specified clock domain and boot identity. Collector epochs remain separate. Wall time orders human history; it does not establish qualification, cooldown expiry, or cross-process clock compatibility.
 
-Enumeration values in this document's examples use the spellings of their source specifications: state and effect names from ACTION_CONTRACTS, decision reasons from POLICY_SPEC, and availability reasons from RESOURCE_MODEL. Those specifications mark the spellings as conceptual. The published schema must fix one serialized spelling for each enumeration before the interface is declared stable.
+Enumeration values in this document's examples use the spellings of their source specifications: state and effect names from ACTION_CONTRACTS, decision reasons from POLICY_SPEC, and availability reasons from RESOURCE_MODEL. ACTION_CONTRACTS fixes the serialized spellings of its enumerations: action classes, states, and effects have the names of that specification; dispatch state, durability, attribution, trigger class, force strategy, recording mode, error family, and permitted next step are lower-case snake case; a stop reason is upper-case snake case. CLEANUP_RULES fixes the spellings of its modes, lifecycle states, and evidence values. POLICY_SPEC and RESOURCE_MODEL mark their spellings as conceptual. The published schema must fix one serialized spelling for each enumeration before the interface is declared stable.
+
+A reader keeps an enumeration value that it does not recognize as an explicit unrecognized value. It never reads that value as completed, normal, eligible, or zero. A record that needs a recognized value to be executable, such as a plan or a request envelope, is rejected.
 
 An opaque ID has 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. A wall-clock timestamp has the `Z` offset and a fraction of zero, three, six, or nine digits, whichever is the smallest exact one; a decoder accepts a fraction of one to nine digits and rejects another offset and a leap second.
 
@@ -153,7 +155,7 @@ The error codes of this build and their families are:
 
 ## 5. Manual approval and standing authorization
 
-Preparing or displaying a plan is observational. Applying it requires authorization bound to its immutable ID, digest/identity, mode, target set, expiry, and relevant revisions.
+Preparing or displaying a plan is observational. Applying it requires authorization bound to its immutable ID, digest/identity, mode, target set, expiry, and relevant revisions. The digest has the form `sha256:` and 64 lowercase hexadecimal digits; [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 2 defines its content. An apply request names the plan ID and the digest that the client reviewed.
 
 Interactive clients show that scope and the material consequence before recording approval. Noninteractive clients use `--yes` or an existing grant explicitly covering that application mode and scope. The client retrieves the server's immutable plan and binds the approval to it; a bare confirmation flag is not a substitute for the plan.
 
@@ -291,7 +293,18 @@ Exit 0 from `operations show` means that the query succeeded even if the returne
 
 A diagnostic query may successfully report denied capabilities. Optional unsupported metrics do not automatically make an otherwise complete request partial; required scope and coverage determine that classification.
 
-For an operation-bearing response, unknown outcome takes precedence over partial completion. Otherwise use the settled domain outcome. For pre-admission failure, use its request/capability/state family. Do not collapse every native error into “permission denied.”
+For an operation-bearing response, unknown outcome takes precedence over partial completion. Otherwise use the settled domain outcome. For pre-admission failure, use its request/capability/state family; a recording failure is an internal execution failure. Do not collapse every native error into “permission denied.”
+
+The exit status of a pre-admission error is the status of its error family:
+
+| Family | Exit |
+| --- | --- |
+| `request` | `2` |
+| `authority`, `eligibility`, `native` | `3` |
+| `evidence`, `limits`, `outcome` | `5` |
+| `recording` | `1` |
+
+A family that the client does not recognize gives exit `5`: its permitted next step is `reconcile`, and the client has no conclusive result.
 
 Ctrl+C disconnects the waiting/streaming client. It does not uninstall the agent, disable a guard, or cancel an admitted operation. Explicit operation cancellation has separate acknowledgement semantics.
 

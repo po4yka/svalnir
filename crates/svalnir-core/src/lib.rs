@@ -17,24 +17,31 @@
 //! | [`byte_size`], [`duration`] | Text grammars of configuration values | `docs/POLICY_SPEC.md` section 3 |
 //! | [`config`] | Configuration schema, parsing, and validation with structured findings | `docs/POLICY_SPEC.md` sections 3 and 4, `docs/INTERFACES.md` section 13 |
 //! | [`policy`] | Deterministic policy evaluation, simulation, and policy descriptions | `docs/POLICY_SPEC.md` |
+//! | [`action`] | Action classes, plans, operations, outcomes, errors, budgets, leases, and the journal interface | `docs/ACTION_CONTRACTS.md` |
+//! | [`rule`] | Cleanup rule declarations, the registry interface, and candidate eligibility | `docs/CLEANUP_RULES.md` sections 2 to 9 |
+//! | [`authority`] | The policy revision, action grant, and privilege grant records | `docs/ARCHITECTURE.md` section 11 |
+//! | [`digest`] | Content digests | `docs/INTERFACES.md` section 5 |
+//! | [`plan`] | The manual plan builder (declared, not implemented) | `docs/ACTION_CONTRACTS.md` sections 2 and 3 |
+//! | [`grant`] | Activation and grant logic (declared, not implemented) | `docs/ARCHITECTURE.md` section 11 |
 
 #![forbid(unsafe_code)]
 
-// Only the tests use `serde_json` at this time.
-// TODO(npochaev): remove this line when a module uses the crate.
-#[cfg(not(test))]
-use serde_json as _;
-
+pub mod action;
+pub mod authority;
 pub mod byte_size;
 pub mod config;
+pub mod digest;
 pub mod duration;
 pub mod encoding;
 pub mod file;
+pub mod grant;
 pub mod id;
 pub mod observation;
+pub mod plan;
 pub mod policy;
 pub mod process;
 pub mod quantity;
+pub mod rule;
 pub mod state;
 pub mod time;
 pub mod volume;

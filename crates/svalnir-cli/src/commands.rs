@@ -259,7 +259,7 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
         message,
-        fields: vec!["format"],
+        fields: &["format"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,
@@ -282,7 +282,7 @@ fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
         message: "`--rule` applies only to `--mode evict`".to_owned(),
-        fields: vec!["rule", "mode"],
+        fields: &["rule", "mode"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,
@@ -299,7 +299,7 @@ pub(crate) fn invalid_arguments(reason: Option<&str>) -> ErrorBody {
             "the arguments are not valid: {}; stderr has the details",
             reason.unwrap_or("the parser rejected them")
         ),
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,
@@ -315,7 +315,7 @@ pub(crate) fn agent_unavailable(what: &str) -> ErrorBody {
         message: format!(
             "{what} needs the background agent, and this build has no agent; the command made no change"
         ),
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::None,
@@ -331,7 +331,7 @@ fn not_implemented(command: &Command) -> ErrorBody {
             "`svalnir {}` is not implemented in this build; the command made no change",
             command.path()
         ),
-        fields: Vec::new(),
+        fields: &[],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::None,

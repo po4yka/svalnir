@@ -6231,6 +6231,7 @@ dependencies = [
  "serde_json",
  "svalnir-core",
  "sysinfo 0.40.4",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
@@ -6255,6 +6256,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",
 ]
@@ -6270,6 +6272,14 @@ dependencies = [
 [[package]]
 name = "svalnir-privileged"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "svalnir-core",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "svg_fmt"

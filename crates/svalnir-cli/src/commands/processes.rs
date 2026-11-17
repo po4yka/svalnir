@@ -581,7 +581,7 @@ fn parse_target(text: &str) -> Result<ProcessGenerationId, ErrorBody> {
         stage: ErrorStage::Arguments,
         message: "the target ID is not valid; use a `TARGET ID` value of `svalnir processes top`"
             .to_owned(),
-        fields: vec!["target"],
+        fields: &["target"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,
@@ -612,7 +612,7 @@ pub(crate) fn find_target<'a>(
         family: ErrorFamily::Evidence,
         stage: ErrorStage::Collection,
         message: "the target is not in the snapshot of this invocation: the process exited, is of another user, or the ID is of another boot; the command made no change".to_owned(),
-        fields: vec!["target"],
+        fields: &["target"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::RefreshObservation,
@@ -867,11 +867,11 @@ mod tests {
         let gone = find_target(&snapshot, "pg-999-1").unwrap_err();
         assert_eq!(gone.code, "target_not_found");
         assert_eq!(gone.family, ErrorFamily::Evidence);
-        assert_eq!(gone.family.exit_status(), ExitStatus::Conflict);
+        assert_eq!(gone.exit_status(), ExitStatus::Conflict);
         for text in ["200", "editor", "pg 200", "app-200-1700000000000000", ""] {
             let invalid = find_target(&snapshot, text).unwrap_err();
             assert_eq!(invalid.code, "invalid_target", "{text}");
-            assert_eq!(invalid.family.exit_status(), ExitStatus::Usage);
+            assert_eq!(invalid.exit_status(), ExitStatus::Usage);
         }
     }
 }

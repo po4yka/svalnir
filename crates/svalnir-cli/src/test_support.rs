@@ -346,6 +346,7 @@ fn process_record(
         real_uid: Uid::new(501),
         parent_pid: Some(Pid::new(1).unwrap()),
         executable_unavailable: None,
+        executable_file_unavailable: Some(UnavailableReason::NotCollected),
         foreground,
         metrics: ProcessMetrics {
             footprint: bytes(metric::PROCESS_FOOTPRINT_BYTES, footprint),
@@ -420,6 +421,7 @@ pub(crate) fn process_snapshot() -> ProcessSnapshot {
             failed: 0,
         },
         launch_services_unavailable: None,
+        application_list_may_be_stale: false,
         responsible_process_unavailable: None,
     }
 }

@@ -190,6 +190,14 @@ pub trait ProcessSource {
     /// relationship or the query fails.
     fn responsible_pid(&self, pid: Pid) -> Result<Pid, QueryFailure>;
 
+    /// Whether the list of [`running_applications`](Self::running_applications)
+    /// is known to be current.
+    ///
+    /// The collector calls this once for each collection, before it reads the
+    /// list. The first collection in a process is current. A later one is
+    /// current only with evidence that the list was refreshed.
+    fn application_list_current(&self) -> bool;
+
     /// The applications that Launch Services registers as running.
     ///
     /// The list can be older than the call: `NSWorkspace` refreshes it only

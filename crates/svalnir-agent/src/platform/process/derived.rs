@@ -32,8 +32,9 @@ pub enum DerivedUnavailable {
     /// The samples are not from the same clock domain.
     #[error("the samples are not from the same clock domain")]
     ClockDomainMismatch,
-    /// The later sample is not after the earlier sample.
-    #[error("the later sample is not after the earlier sample")]
+    /// The later sample is not after the earlier sample, or two samples at
+    /// the same time have different values.
+    #[error("the samples are not in a consistent time order")]
     NotOrdered,
     /// The cumulative counter decreased. The result is a reset, not a
     /// negative activity.
@@ -144,8 +145,10 @@ pub struct FootprintGrowth {
     pub last_sample_id: SampleId,
     /// The number of available samples in the interval.
     pub available_samples: usize,
-    /// The number of samples in the interval that have no value. A gap is
-    /// not evidence of steady growth.
+    /// The number of samples in the window that have no value, also before
+    /// the first and after the last available sample. A gap is not evidence
+    /// of steady growth. A series that ends with unavailable samples has a
+    /// gap count that is more than zero.
     pub gaps: usize,
 }
 
@@ -153,7 +156,9 @@ pub struct FootprintGrowth {
 ///
 /// The function uses only the samples of that generation in `clock_domain`.
 /// A sample of a different generation is ignored, also when it has the same
-/// PID. The order of `samples` has no effect.
+/// PID. The order of `samples` has no effect. Two samples of the generation
+/// at the same time with different readings are inconsistent data: the result
+/// is [`DerivedUnavailable::NotOrdered`].
 ///
 /// # Errors
 ///
@@ -180,6 +185,12 @@ pub fn footprint_growth(
         return Err(DerivedUnavailable::ClockDomainMismatch);
     }
     in_window.sort_by_key(|sample| sample.at);
+    if in_window
+        .windows(2)
+        .any(|pair| pair[0].at == pair[1].at && pair[0].footprint != pair[1].footprint)
+    {
+        return Err(DerivedUnavailable::NotOrdered);
+    }
 
     let available = |sample: &&FootprintSample| -> Option<(MonotonicNanos, Bytes, SampleId)> {
         sample
@@ -197,12 +208,11 @@ pub fn footprint_growth(
         Some(elapsed) if elapsed > Nanoseconds::ZERO => elapsed,
         _ => return Err(DerivedUnavailable::InsufficientSamples),
     };
-    let interval = in_window
+    let available_samples: usize = in_window
         .iter()
-        .filter(|sample| sample.at >= first_at && sample.at <= last_at);
-    let available_samples: usize = interval
-        .clone()
-        .filter(|sample| sample.footprint.is_available())
+        .filter(|sample| {
+            sample.at >= first_at && sample.at <= last_at && sample.footprint.is_available()
+        })
         .count();
     Ok(FootprintGrowth {
         delta: last.delta_from(first),
@@ -212,7 +222,7 @@ pub fn footprint_growth(
         first_sample_id,
         last_sample_id,
         available_samples,
-        gaps: interval.count() - available_samples,
+        gaps: in_window.len() - available_samples,
     })
 }
 
@@ -335,14 +345,28 @@ pub struct DerivedMetrics {
 /// in the two snapshots.
 ///
 /// A process that restarted between the snapshots has a new generation, so
-/// it gets no value from the data of its predecessor.
+/// it gets no value from the data of its predecessor. The generation text
+/// has no boot, so for two snapshots of different boots each generation with
+/// the same text in both gets [`DerivedUnavailable::GenerationMismatch`].
 pub fn derive_between(earlier: &ProcessSnapshot, later: &ProcessSnapshot) -> DerivedMetrics {
     let mut derived: DerivedMetrics = DerivedMetrics::default();
+    let same_boot: bool = earlier.boot_id == later.boot_id;
     for record in &later.records {
         let generation_id: &ProcessGenerationId = &record.identity.generation_id;
         let Some(previous) = earlier.find_generation(generation_id) else {
             continue;
         };
+        if !same_boot {
+            derived.growth.insert(
+                generation_id.clone(),
+                Err(DerivedUnavailable::GenerationMismatch),
+            );
+            derived.cpu.insert(
+                generation_id.clone(),
+                Err(DerivedUnavailable::GenerationMismatch),
+            );
+            continue;
+        }
         let samples: [FootprintSample; 2] = [
             FootprintSample::from_record(previous),
             FootprintSample::from_record(record),

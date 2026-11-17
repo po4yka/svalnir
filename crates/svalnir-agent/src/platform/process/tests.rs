@@ -687,12 +687,22 @@ fn growth_rejects_a_different_clock_domain_and_equal_times() {
         Err(DerivedUnavailable::ClockDomainMismatch)
     );
 
+    // Two samples at one time with different values are inconsistent.
     let same_time: Vec<FootprintSample> = vec![
         footprint_at(&process, 100, 10 * MIB),
         footprint_at(&process, 100, 20 * MIB),
     ];
     assert_eq!(
         footprint_growth(&same_time, &process, &clock(), window(300, 300)),
+        Err(DerivedUnavailable::NotOrdered)
+    );
+    // Equal samples at one time are one point in time.
+    let same_value: Vec<FootprintSample> = vec![
+        footprint_at(&process, 100, 10 * MIB),
+        footprint_at(&process, 100, 10 * MIB),
+    ];
+    assert_eq!(
+        footprint_growth(&same_value, &process, &clock(), window(300, 300)),
         Err(DerivedUnavailable::InsufficientSamples)
     );
 }
@@ -781,6 +791,73 @@ fn derived_values_join_snapshots_by_generation() {
     let restarted: &ProcessGenerationId = &record(&after, 101).identity.generation_id;
     assert!(!derived.growth.contains_key(restarted));
     assert!(!derived.cpu.contains_key(restarted));
+}
+
+#[test]
+fn snapshots_of_different_boots_give_no_derived_values() {
+    let source = || FakeSource::new().with_process(info(100, 50), "/bin/a", usage(MIB, MIB));
+    let before: ProcessSnapshot = snapshot(source());
+    let mut after: ProcessSnapshot = snapshot(source());
+    after.boot_id = svalnir_core::id::BootId::new("boot-other").unwrap();
+
+    let derived: DerivedMetrics = derive_between(&before, &after);
+    let id: &ProcessGenerationId = &record(&after, 100).identity.generation_id;
+    assert_eq!(
+        derived.growth.get(id),
+        Some(&Err(DerivedUnavailable::GenerationMismatch))
+    );
+    assert_eq!(
+        derived.cpu.get(id),
+        Some(&Err(DerivedUnavailable::GenerationMismatch))
+    );
+}
+
+#[test]
+fn samples_at_the_same_time_with_different_values_are_inconsistent() {
+    let process: ProcessGenerationId = generation(100, 50);
+    let mut samples: Vec<FootprintSample> = vec![
+        footprint_at(&process, 100, 10 * MIB),
+        footprint_at(&process, 200, 20 * MIB),
+        footprint_at(&process, 200, 30 * MIB),
+    ];
+    let expected = Err(DerivedUnavailable::NotOrdered);
+    assert_eq!(
+        footprint_growth(&samples, &process, &clock(), window(200, 200)),
+        expected
+    );
+    // The input order has no effect.
+    samples.reverse();
+    assert_eq!(
+        footprint_growth(&samples, &process, &clock(), window(200, 200)),
+        expected
+    );
+    // The same value twice is not a conflict.
+    let same: Vec<FootprintSample> = vec![
+        footprint_at(&process, 100, 10 * MIB),
+        footprint_at(&process, 200, 20 * MIB),
+        footprint_at(&process, 200, 20 * MIB),
+    ];
+    assert!(footprint_growth(&same, &process, &clock(), window(200, 200)).is_ok());
+}
+
+#[test]
+fn a_series_that_ends_unavailable_counts_the_trailing_gaps() {
+    let process: ProcessGenerationId = generation(100, 50);
+    let unavailable = |at: u64| {
+        let mut gap: FootprintSample = footprint_at(&process, at, 0);
+        gap.footprint = Reading::Unavailable(UnavailableReason::PermissionDenied);
+        gap
+    };
+    let samples: Vec<FootprintSample> = vec![
+        unavailable(50),
+        footprint_at(&process, 100, 10 * MIB),
+        footprint_at(&process, 200, 12 * MIB),
+        unavailable(300),
+        unavailable(400),
+    ];
+    let growth = footprint_growth(&samples, &process, &clock(), window(400, 400)).unwrap();
+    assert_eq!(growth.available_samples, 2);
+    assert_eq!(growth.gaps, 3);
 }
 
 // Ranking.
@@ -924,4 +1001,126 @@ fn ranking_by_growth_and_cpu_needs_derived_values() {
         ranking.entries[3].value,
         Reading::Unavailable(UnavailableReason::InconsistentData)
     );
+}
+
+#[test]
+fn a_responsible_owner_after_pid_reuse_is_not_inherited_by_a_grandchild() {
+    // Application A (PID 500) started helper D (PID 260), then quit. PID 500
+    // went to application B. D started C (PID 270). C inherited the
+    // responsible PID 500, and B started before C, but C descends from D,
+    // which is not a member of B.
+    let mut d = info(260, 30);
+    d.parent_pid = Some(pid(250));
+    let mut c = info(270, 95);
+    c.parent_pid = Some(pid(260));
+    let source: FakeSource = FakeSource::new()
+        .with_process(info(250, 10), "/usr/bin/supervisor", usage(MIB, MIB))
+        .with_process(d, "/usr/bin/d", usage(MIB, MIB))
+        .with_process(c, "/usr/bin/c", usage(MIB, MIB))
+        .with_process(
+            info(500, 90),
+            "/Applications/B.app/Contents/MacOS/B",
+            usage(MIB, MIB),
+        )
+        .with_application(application(500, "com.example.B", true))
+        .with_responsible(260, 500)
+        .with_responsible(270, 500);
+    let snapshot: ProcessSnapshot = snapshot(source);
+
+    for process in [260, 270] {
+        assert_eq!(
+            record(&snapshot, process).identity.association,
+            ProcessAssociation::Unattributed,
+            "PID {process}"
+        );
+    }
+}
+
+#[test]
+fn a_chain_of_helpers_of_the_owner_is_attributed() {
+    // PID 201 is a child of the application. PID 202 is a child of 201. The
+    // smaller PID 199 is a child of 201 as well: the order of PIDs does not
+    // matter.
+    let mut h1 = info(201, 21);
+    h1.parent_pid = Some(pid(200));
+    let mut h2 = info(202, 22);
+    h2.parent_pid = Some(pid(201));
+    let mut h0 = info(199, 23);
+    h0.parent_pid = Some(pid(201));
+    let source: FakeSource = FakeSource::new()
+        .with_process(
+            info(200, 20),
+            "/Applications/Editor.app/Contents/MacOS/Editor",
+            usage(MIB, MIB),
+        )
+        .with_process(h1, "/bin/h1", usage(MIB, MIB))
+        .with_process(h2, "/bin/h2", usage(MIB, MIB))
+        .with_process(h0, "/bin/h0", usage(MIB, MIB))
+        .with_application(application(200, "com.example.Editor", true))
+        .with_responsible(201, 200)
+        .with_responsible(202, 200)
+        .with_responsible(199, 200);
+    let snapshot: ProcessSnapshot = snapshot(source);
+
+    for process in [201, 202, 199] {
+        assert!(
+            record(&snapshot, process)
+                .identity
+                .association
+                .verified_membership()
+                .is_some(),
+            "PID {process}"
+        );
+    }
+}
+
+#[test]
+fn a_list_that_is_not_known_to_be_current_gives_an_unknown_foreground() {
+    let mut source: FakeSource = application_fixture().with_responsible(201, 200);
+    source.list_current = false;
+    let snapshot: ProcessSnapshot = snapshot(source);
+
+    assert!(snapshot.application_list_may_be_stale);
+    for process in [200, 201] {
+        assert_eq!(
+            record(&snapshot, process).foreground,
+            ForegroundState::Unknown
+        );
+    }
+    // The membership evidence is unchanged.
+    assert!(
+        record(&snapshot, 200)
+            .identity
+            .association
+            .verified_membership()
+            .is_some()
+    );
+
+    let current: ProcessSnapshot = self::snapshot(application_fixture());
+    assert!(!current.application_list_may_be_stale);
+    assert_eq!(
+        record(&current, 200).foreground,
+        ForegroundState::Foreground
+    );
+}
+
+#[test]
+fn a_failed_file_evidence_query_keeps_its_reason() {
+    let mut source: FakeSource = FakeSource::new()
+        .with_process(info(100, 50), "/bin/denied", usage(MIB, MIB))
+        .with_process(info(101, 51), "/bin/ok", usage(MIB, MIB));
+    source
+        .file_failures
+        .insert(b"/bin/denied".to_vec(), QueryFailure::PermissionDenied);
+    let snapshot: ProcessSnapshot = snapshot(source);
+
+    let denied: &ProcessRecord = record(&snapshot, 100);
+    assert_eq!(denied.identity.executable.as_ref().unwrap().file, None);
+    assert_eq!(
+        denied.executable_file_unavailable,
+        Some(UnavailableReason::PermissionDenied)
+    );
+    let ok: &ProcessRecord = record(&snapshot, 101);
+    assert!(ok.identity.executable.as_ref().unwrap().file.is_some());
+    assert_eq!(ok.executable_file_unavailable, None);
 }

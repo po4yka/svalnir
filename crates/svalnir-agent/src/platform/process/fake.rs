@@ -81,6 +81,10 @@ pub(super) struct FakeSource {
     pub(super) applications: Result<Vec<RunningApplication>, QueryFailure>,
     pub(super) timebase: Result<Timebase, QueryFailure>,
     pub(super) clock: Cell<u64>,
+    /// The answer of `application_list_current`.
+    pub(super) list_current: bool,
+    /// The failure of the file evidence query of a path.
+    pub(super) file_failures: BTreeMap<Vec<u8>, QueryFailure>,
 }
 
 impl FakeSource {
@@ -97,6 +101,8 @@ impl FakeSource {
             applications: Ok(Vec::new()),
             timebase: Ok(Timebase::new(125, 3).unwrap()),
             clock: Cell::new(1_000_000),
+            list_current: true,
+            file_failures: BTreeMap::new(),
         }
     }
 
@@ -199,6 +205,9 @@ impl ProcessSource for FakeSource {
     }
 
     fn file_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        if let Some(failure) = self.file_failures.get(path.as_bytes()) {
+            return Err(*failure);
+        }
         self.files
             .get(path.as_bytes())
             .copied()
@@ -216,6 +225,10 @@ impl ProcessSource for FakeSource {
         // As on macOS, a process with no other responsible process is
         // responsible for itself.
         self.responsible.get(&pid).copied().unwrap_or(Ok(pid))
+    }
+
+    fn application_list_current(&self) -> bool {
+        self.list_current
     }
 
     fn running_applications(&self) -> Result<Vec<RunningApplication>, QueryFailure> {

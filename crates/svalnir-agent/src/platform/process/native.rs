@@ -26,7 +26,11 @@
 use std::ffi::{CStr, c_int, c_void};
 use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
+
+/// Whether the next application list is the first one of the process.
+static FIRST_APPLICATION_LIST: AtomicBool = AtomicBool::new(true);
 
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSWorkspace;
@@ -397,6 +401,16 @@ impl ProcessSource for DarwinProcessSource {
 
     fn responsible_pid(&self, pid: Pid) -> Result<Pid, QueryFailure> {
         responsible_pid(pid)
+    }
+
+    fn application_list_current(&self) -> bool {
+        // The first call in the process reads a fresh list. After it, the
+        // list is refreshed only when the main run loop runs, and this source
+        // has no evidence of that, so a later list is not known to be
+        // current.
+        // TODO(npochaev): report a later list as current when the host process
+        // runs the main run loop.
+        FIRST_APPLICATION_LIST.swap(false, Ordering::Relaxed)
     }
 
     fn running_applications(&self) -> Result<Vec<RunningApplication>, QueryFailure> {

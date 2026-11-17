@@ -19,8 +19,12 @@
 //! main run loop reads the list of its first call. An entry gives a
 //! membership only when its executable path is the path of the recorded
 //! process, so a new process that got the PID of an application that quit
-//! does not get the membership. The foreground state can be out of date in
-//! such a process.
+//! does not get the membership. The source says whether the list is known to
+//! be current ([`ProcessSource::application_list_current`]). When it is not,
+//! each foreground state is [`ForegroundState::Unknown`] and
+//! [`ProcessSnapshot::application_list_may_be_stale`] is set: an application
+//! that launched later can be `Unattributed`, and the active state is not
+//! fresh.
 
 use std::collections::BTreeMap;
 
@@ -162,6 +166,11 @@ pub struct ProcessRecord {
     /// The reason there is no executable path, when `identity.executable` is
     /// `None`.
     pub executable_unavailable: Option<UnavailableReason>,
+    /// The reason the file evidence of the executable was not read, when the
+    /// executable path is known and `identity.executable` has no file
+    /// evidence. A consumer can tell a denied query from evidence that was
+    /// not collected.
+    pub executable_file_unavailable: Option<UnavailableReason>,
     /// Whether the application of the process is frontmost.
     pub foreground: ForegroundState,
     /// The measurements.
@@ -224,6 +233,11 @@ pub struct ProcessSnapshot {
     /// The reason the running applications were not read. When it is set,
     /// no process has an application attribution.
     pub launch_services_unavailable: Option<UnavailableReason>,
+    /// The application list is not known to be current. A process with no
+    /// attribution can belong to an application that launched after the list
+    /// was read, and each foreground state is `Unknown`. A consumer must not
+    /// treat `Unattributed` or the foreground state as fresh.
+    pub application_list_may_be_stale: bool,
     /// The reason the responsible-process relationship was not read for one
     /// or more processes. Those processes have no `responsible_process`
     /// attribution.
@@ -268,6 +282,7 @@ impl ProcessSnapshot {
 struct Pending {
     info: RawProcessInfo,
     executable: Result<ExecutableIdentity, QueryFailure>,
+    file_unavailable: Option<UnavailableReason>,
     usage: Result<RawUsage, QueryFailure>,
     usage_started: MonotonicNanos,
     usage_finished: MonotonicNanos,
@@ -341,6 +356,7 @@ impl<S: ProcessSource> ProcessCollector<S> {
             }
         }
 
+        let list_current: bool = self.source.application_list_current();
         let applications: Result<Vec<RunningApplication>, QueryFailure> =
             self.source.running_applications();
         let mut responsible_unavailable: Option<UnavailableReason> = None;
@@ -366,17 +382,15 @@ impl<S: ProcessSource> ProcessCollector<S> {
             Ok(list) => registered_applications(list, &pending)?,
             Err(_) => BTreeMap::new(),
         };
+        let owners: BTreeMap<Pid, Pid> = responsible_owners(&pending, &responsible, &registered);
         let mut records: Vec<ProcessRecord> = Vec::with_capacity(pending.len());
         for (pid, entry) in &pending {
-            // The kernel keeps the responsible process as a PID. An owner
-            // that started after this process is a different process that
-            // got the PID of the first owner, so it gives no membership.
-            let owner: Option<&RegisteredApplication> = responsible
-                .get(pid)
-                .filter(|owner| *owner != pid)
-                .and_then(|owner| registered.get(owner))
-                .filter(|owner| owner.start_time <= entry.info.start_time);
-            let (association, foreground) = associate(registered.get(pid), owner);
+            let owner: Option<&RegisteredApplication> =
+                owners.get(pid).and_then(|owner| registered.get(owner));
+            let (association, mut foreground) = associate(registered.get(pid), owner);
+            if !list_current {
+                foreground = ForegroundState::Unknown;
+            }
             records.push(self.record(entry, association, foreground, captured_at, timebase)?);
         }
 
@@ -389,6 +403,7 @@ impl<S: ProcessSource> ProcessCollector<S> {
             records,
             omissions,
             launch_services_unavailable: applications.err().map(QueryFailure::reason),
+            application_list_may_be_stale: !list_current,
             responsible_process_unavailable: responsible_unavailable,
         })
     }
@@ -428,9 +443,16 @@ impl<S: ProcessSource> ProcessCollector<S> {
             return Ok(None);
         }
 
+        let mut file_unavailable: Option<UnavailableReason> = None;
         let executable: Result<ExecutableIdentity, QueryFailure> =
             self.source.executable_path(pid).map(|path| {
-                let file = self.source.file_evidence(&path).ok();
+                let file = match self.source.file_evidence(&path) {
+                    Ok(file) => Some(file),
+                    Err(failure) => {
+                        file_unavailable = Some(failure.reason());
+                        None
+                    }
+                };
                 ExecutableIdentity {
                     path,
                     file,
@@ -443,6 +465,7 @@ impl<S: ProcessSource> ProcessCollector<S> {
         Ok(Some(Pending {
             info,
             executable,
+            file_unavailable,
             usage,
             usage_started,
             usage_finished,
@@ -534,6 +557,7 @@ impl<S: ProcessSource> ProcessCollector<S> {
                 .as_ref()
                 .err()
                 .map(|failure| failure.reason()),
+            executable_file_unavailable: entry.file_unavailable.clone(),
             foreground,
             metrics,
         })
@@ -726,6 +750,62 @@ fn registered_applications(
         );
     }
     Ok(registered)
+}
+
+/// The responsible application of each process, as a map from the PID of the
+/// process to the PID of the registered application.
+///
+/// The kernel keeps the responsible process as a PID, and a child inherits
+/// it, so the PID alone does not name one process after a PID reuse. A
+/// process gets an owner only when
+///
+/// - the owner started no later than the process, and
+/// - the parent chain supports the owner: the parent is the owner process
+///   itself, or the parent is in the snapshot and has the same owner
+///   instance, or the parent is `launchd` (PID 1).
+///
+/// A parent is evaluated before its children: the loop runs to a fixed point
+/// and has at most one round for each process. A process that was
+/// reparented to `launchd` after its parent exited keeps only the start-time
+/// check, because the exited parent is not in the snapshot.
+fn responsible_owners(
+    pending: &BTreeMap<Pid, Pending>,
+    responsible: &BTreeMap<Pid, Pid>,
+    registered: &BTreeMap<Pid, RegisteredApplication>,
+) -> BTreeMap<Pid, Pid> {
+    let mut owners: BTreeMap<Pid, Pid> = BTreeMap::new();
+    for _ in 0..=pending.len() {
+        let mut changed: bool = false;
+        for (pid, entry) in pending {
+            if owners.contains_key(pid) || registered.contains_key(pid) {
+                continue;
+            }
+            let Some((owner_pid, owner)) = responsible
+                .get(pid)
+                .filter(|owner| *owner != pid)
+                .and_then(|owner| registered.get(owner).map(|found| (*owner, found)))
+                .filter(|(_, owner)| owner.start_time <= entry.info.start_time)
+            else {
+                continue;
+            };
+            let supported: bool = match entry.info.parent_pid {
+                Some(parent) if parent == owner_pid || parent.get() == 1 => true,
+                Some(parent) => owners
+                    .get(&parent)
+                    .and_then(|found| registered.get(found))
+                    .is_some_and(|found| found.instance_id == owner.instance_id),
+                None => false,
+            };
+            if supported {
+                owners.insert(*pid, owner_pid);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    owners
 }
 
 /// The association of a process from positive evidence only.

@@ -135,7 +135,10 @@ The Milestone 1 build has no background agent and no local protocol. The CLI lin
 | `policy simulate` | The grants are none, with the basis `recorded`. Only the `startup-data` selector is resolved. The snapshot has no cleanup candidate, because no rule registry exists. The product protection of each application is unknown, because no protection catalog exists, so no application is eligible |
 | Partial scope (exit `4`) | A required observation of the command has no value, a process identity query failed for a cause other than denial, or the coverage of the scan is partial. `status`, `memory status`, `swap status`, and `processes top` give `coverage.required_scope` and `coverage.missing_required`. `scan` gives `scan.coverage` and the list of regions |
 | `--timeout` | No effect on a command that runs in this process. A result has the warning `timeout_not_applied`: in `warnings` of the envelope, or on stderr for the text format and for `monitor`. An error response does not have it |
-| Interrupt | Ctrl+C ends `monitor` and `scan` with exit `130`. An interrupted scan writes its partial result and does not save it. Ctrl+C ends each other command at once |
+| Target ID | `processes show --target` accepts the form `pg-DIGITS-DIGITS` that `processes top` prints. Other text is an invalid argument (exit `2`) |
+| Configuration file | The path must be a regular file. A directory, a FIFO, or a device is an invalid argument (exit `2`) |
+| Save state | The scan result has `save` with one of `not_requested`, `saved`, `saved_readback_failed`, or `not_saved`. `save_detail` gives the reason for the last two |
+| Interrupt | Ctrl+C ends `monitor` and `scan` with exit `130`, also when the reader of a pipe closes at the same time. An interrupted scan writes its partial result and does not save it. Ctrl+C ends each other command at once |
 
 The error codes of this build and their families are:
 

@@ -11,7 +11,7 @@ use svalnir_agent::platform::memory::{
 };
 use svalnir_agent::platform::volume::{self, FoundationCapacity, VolumeCapacity};
 use svalnir_core::id::SampleId;
-use svalnir_core::observation::Observation;
+use svalnir_core::observation::{Observation, UnavailableReason};
 use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds, PageCount};
 use svalnir_core::state::PressureState;
 use svalnir_core::volume::VolumeIdentity;
@@ -48,6 +48,12 @@ pub(crate) enum DiskReading {
         capacity: VolumeCapacity,
         foundation: FoundationCapacity,
     },
+    /// The startup data volume has an identity, and the `statfs` capacity
+    /// collection failed. The reading has no capacity.
+    CapacityUnavailable {
+        identity: VolumeIdentity,
+        reason: String,
+    },
     /// The startup data volume has no identity, so nothing was measured.
     Unresolved(String),
 }
@@ -60,23 +66,51 @@ pub(crate) struct HostReading {
 }
 
 /// Reads the disk capacity of the startup data volume.
-pub(crate) fn collect_disk(host: &Host) -> Result<DiskReading, ErrorBody> {
-    match Host::startup_data_volume() {
-        Ok(mounted) => Ok(DiskReading::Measured {
-            capacity: volume::collect_capacity(host.context(), &mounted.identity)?,
-            foundation: volume::collect_foundation_capacity(host.context(), &mounted.identity)?,
-            identity: mounted.identity,
-        }),
-        Err(error) => Ok(DiskReading::Unresolved(error.to_string())),
+///
+/// A failed collection does not end the command. The `statfs` capacity is
+/// required: when it fails, the reading says so and the scope coverage is
+/// partial. The Foundation values are optional planning values: when they
+/// fail, their observations are unavailable and the coverage is unchanged.
+pub(crate) fn collect_disk(host: &Host) -> DiskReading {
+    let mounted = match Host::startup_data_volume() {
+        Ok(mounted) => mounted,
+        Err(error) => return DiskReading::Unresolved(error.to_string()),
+    };
+    let capacity: VolumeCapacity = match volume::collect_capacity(host.context(), &mounted.identity)
+    {
+        Ok(capacity) => capacity,
+        Err(error) => {
+            return DiskReading::CapacityUnavailable {
+                identity: mounted.identity,
+                reason: error.to_string(),
+            };
+        }
+    };
+    let foundation: FoundationCapacity =
+        match volume::collect_foundation_capacity(host.context(), &mounted.identity) {
+            Ok(foundation) => foundation,
+            Err(_) => volume::foundation_capacity_observations(
+                host.context(),
+                &mounted.identity,
+                Err(UnavailableReason::TransientFailure),
+                &capacity.total.sample,
+            ),
+        };
+    DiskReading::Measured {
+        identity: mounted.identity,
+        capacity,
+        foundation,
     }
 }
 
 /// Reads the disk capacity and the memory state of the host.
+///
+/// A disk collection failure keeps the memory reading. Only a memory
+/// collection failure is an error.
 pub(crate) fn collect(host: &Host) -> Result<HostReading, ErrorBody> {
-    Ok(HostReading {
-        disk: collect_disk(host)?,
-        memory: memory::collect_memory_snapshot(host.context())?,
-    })
+    let disk: DiskReading = collect_disk(host);
+    let memory: MemorySnapshot = memory::collect_memory_snapshot(host.context())?;
+    Ok(HostReading { disk, memory })
 }
 
 /// The disk capacity of the startup data volume.
@@ -116,6 +150,19 @@ impl DiskView {
                     opportunistic_available: Some(foundation.opportunistic.clone()),
                 }
             }
+            DiskReading::CapacityUnavailable { identity, reason } => {
+                coverage.missing("disk.available_bytes");
+                Self {
+                    selector: "startup-data",
+                    volume: Some(identity.clone()),
+                    unresolved_reason: Some(reason.clone()),
+                    total: None,
+                    free: None,
+                    available: None,
+                    important_available: None,
+                    opportunistic_available: None,
+                }
+            }
             DiskReading::Unresolved(reason) => {
                 coverage.missing("disk.available_bytes");
                 Self {
@@ -133,6 +180,20 @@ impl DiskView {
     }
 
     fn render(&self, out: &mut String) {
+        if let (Some(volume), Some(reason)) = (&self.volume, &self.unresolved_reason) {
+            put_line!(
+                out,
+                "Disk (startup data volume, {})",
+                volume.mount_point.display_label()
+            );
+            field(
+                out,
+                "Capacity",
+                13,
+                &format!("unavailable ({})", escape(reason)),
+            );
+            return;
+        }
         let Some(volume) = &self.volume else {
             let reason: &str = self.unresolved_reason.as_deref().unwrap_or("unknown");
             put_line!(out, "Disk (startup data volume)");
@@ -698,6 +759,29 @@ mod tests {
         assert_eq!(json["memory"]["pressure"]["value"], serde_json::Value::Null);
         assert_eq!(json["memory"]["pressure"]["reason"], "permission_denied");
         assert_eq!(json["coverage"]["missing_required"][0], "memory.pressure");
+    }
+
+    #[test]
+    fn a_failed_capacity_collection_keeps_memory_and_gives_a_partial_scope() {
+        let mut reading = reading();
+        if let DiskReading::Measured { identity, .. } = reading.disk.clone() {
+            reading.disk = DiskReading::CapacityUnavailable {
+                identity,
+                reason: "the clock failed".to_owned(),
+            };
+        }
+        let view = StatusView::new(&reading);
+        let text = view.render();
+        assert!(
+            text.contains("Capacity       unavailable (the clock failed)"),
+            "{text}"
+        );
+        assert!(text.contains("Pressure       normal"), "{text}");
+        assert!(text.contains("no value for disk.available_bytes"), "{text}");
+        assert_eq!(super::snapshot_status(&view.coverage), ExitStatus::Partial);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["memory"]["pressure"]["value"], "normal");
+        assert_eq!(json["disk"]["available"], serde_json::Value::Null);
     }
 
     #[test]

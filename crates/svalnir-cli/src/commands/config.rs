@@ -89,8 +89,18 @@ fn input_error(code: &'static str, family: ErrorFamily, message: String) -> Erro
 /// Reads a configuration file. The read stops one byte after the largest
 /// accepted document, so a large file cannot use much memory; the validation
 /// then reports `document_too_large`.
+///
+/// The file is opened with `O_NONBLOCK`, so opening a FIFO or a terminal
+/// cannot wait. Anything that is not a regular file is an invalid argument.
 fn read_document(path: &Path) -> Result<String, ErrorBody> {
-    let file = std::fs::File::open(path).map_err(|error| match error.kind() {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => input_error(
             "config_not_found",
             ErrorFamily::Request,
@@ -102,6 +112,14 @@ fn read_document(path: &Path) -> Result<String, ErrorBody> {
             format!("the configuration file cannot be read: {kind}"),
         ),
     })?;
+    let is_regular: bool = file.metadata().is_ok_and(|metadata| metadata.is_file());
+    if !is_regular {
+        return Err(input_error(
+            "invalid_configuration",
+            ErrorFamily::Request,
+            "the configuration path is not a regular file".to_owned(),
+        ));
+    }
     let limit: u64 = u64::try_from(MAX_DOCUMENT_BYTES)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
@@ -113,6 +131,12 @@ fn read_document(path: &Path) -> Result<String, ErrorBody> {
             format!("the configuration file cannot be read: {}", error.kind()),
         )
     })?;
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        // The cut can fall inside a character. The text is too large in any
+        // case, and the validation reports that. A replacement character
+        // is never shorter than the bytes it replaces.
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
     String::from_utf8(bytes).map_err(|_| {
         input_error(
             "invalid_configuration",
@@ -398,9 +422,45 @@ pub(crate) fn show(
 
 #[cfg(test)]
 mod tests {
-    use super::{Proposal, ShowView, SourceView, ValidateView, validated};
-    use crate::output::ExitStatus;
+    use super::{Proposal, ShowView, SourceView, ValidateView, read_document, validated};
+    use crate::output::{ErrorFamily, ExitStatus};
+    use crate::test_support::TempDirectory;
+    use svalnir_core::config::MAX_DOCUMENT_BYTES;
     use svalnir_core::file::LosslessPath;
+
+    #[test]
+    fn a_directory_is_an_invalid_argument() {
+        let directory = TempDirectory::new();
+        let error = read_document(directory.path()).unwrap_err();
+        assert_eq!(error.family, ErrorFamily::Request);
+        assert_eq!(error.family.exit_status(), ExitStatus::Usage);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_rejected_and_does_not_block() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let directory = TempDirectory::new();
+        let path = directory.path().join("fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path that lives through the call.
+        let made: libc::c_int = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0);
+        let error = read_document(&path).unwrap_err();
+        assert_eq!(error.family, ErrorFamily::Request);
+    }
+
+    #[test]
+    fn an_oversized_file_cut_inside_a_character_is_too_large_not_invalid_utf8() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("big.toml");
+        // Each character has 2 bytes, so the cut at MAX + 1 splits one
+        // when MAX is even.
+        let text: String = "\u{e9}".repeat(MAX_DOCUMENT_BYTES);
+        std::fs::write(&path, text).unwrap();
+        let read: String = read_document(&path).unwrap();
+        assert!(read.len() > MAX_DOCUMENT_BYTES);
+    }
 
     fn proposal(text: &str) -> Proposal {
         Proposal {

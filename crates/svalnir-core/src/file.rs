@@ -99,11 +99,21 @@ impl LosslessPath {
 fn is_invisible_format(character: char) -> bool {
     matches!(
         character,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2069}'
+            | '\u{3164}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
     )
 }
 
@@ -270,6 +280,30 @@ mod tests {
     fn the_display_label_escapes_invisible_format_characters() {
         let path = LosslessPath::from_bytes("/a/\u{202E}gpj.exe\u{200B}".as_bytes()).unwrap();
         assert_eq!(path.display_label(), "/a/\\u{202e}gpj.exe\\u{200b}");
+    }
+
+    #[test]
+    fn the_display_label_escapes_the_invisible_fillers_and_tags() {
+        for character in [
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{180E}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+            '\u{E0001}',
+            '\u{E0020}',
+            '\u{E0041}',
+            '\u{E007F}',
+        ] {
+            let path = LosslessPath::from_bytes(format!("/a{character}b").as_bytes()).unwrap();
+            let expected: String = character.escape_unicode().to_string();
+            assert_eq!(path.display_label(), format!("/a{expected}b"));
+        }
     }
 
     #[test]

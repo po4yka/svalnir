@@ -39,11 +39,21 @@ pub(crate) fn escape(text: &str) -> String {
 fn is_invisible_format(character: char) -> bool {
     matches!(
         character,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2069}'
+            | '\u{3164}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
     )
 }
 
@@ -222,6 +232,24 @@ fn write_tree(out: &mut String, value: &Value, depth: usize) {
 
 #[cfg(test)]
 mod tests {
+    /// Format characters that the label must escape, besides the bidi set.
+    const EXTRA_INVISIBLE: [char; 14] = [
+        '\u{00AD}',
+        '\u{034F}',
+        '\u{115F}',
+        '\u{1160}',
+        '\u{180E}',
+        '\u{3164}',
+        '\u{FFA0}',
+        '\u{FFF9}',
+        '\u{FFFA}',
+        '\u{FFFB}',
+        '\u{E0001}',
+        '\u{E0020}',
+        '\u{E0041}',
+        '\u{E007F}',
+    ];
+
     use super::{escape, human_byte_delta, human_bytes, human_duration, json_tree, table};
     use svalnir_core::quantity::Nanoseconds;
 
@@ -231,6 +259,10 @@ mod tests {
         assert_eq!(escape("line\nstatus: ok"), "line\\u{a}status: ok");
         assert_eq!(escape("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(escape("back\\slash"), "back\\\\slash");
+        for character in EXTRA_INVISIBLE {
+            let expected: String = character.escape_unicode().to_string();
+            assert_eq!(escape(&format!("a{character}b")), format!("a{expected}b"));
+        }
         assert_eq!(escape("plain name"), "plain name");
     }
 

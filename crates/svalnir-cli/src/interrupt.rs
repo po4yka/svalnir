@@ -82,14 +82,25 @@ fn install_handler() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         let handler: extern "C" fn(libc::c_int) = record_interrupt;
-        // SAFETY: `record_interrupt` has the signature of a signal handler
-        // and does only an atomic store, which is async-signal-safe. The
-        // function pointer is valid for the life of the process. `signal`
-        // has no other precondition.
-        let previous = unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) };
-        // On `SIG_ERR` the default action stays in effect: the process ends
+        // SAFETY: an all-zero `sigaction` is a valid value on the supported
+        // Unix targets.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as libc::sighandler_t;
+        // `sa_flags` stays zero, so `SA_RESTART` is not set: a blocked
+        // `write` returns `EINTR` and the caller can read the flag.
+        action.sa_flags = 0;
+        // SAFETY: the pointer is to the mask field of the live `action`,
+        // which `sigemptyset` initializes in place.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: `action` is fully initialized. `record_interrupt` has the
+        // signature of a signal handler and does only an atomic store, which
+        // is async-signal-safe; the pointer is valid for the life of the
+        // process. The old-action pointer is null, which `sigaction` permits.
+        let installed: libc::c_int =
+            unsafe { libc::sigaction(libc::SIGINT, &raw const action, std::ptr::null_mut()) };
+        // On failure the default action stays in effect: the process ends
         // on Ctrl+C, and the shell reports status 130.
-        let _ = previous;
+        let _ = installed;
     });
 }
 

@@ -195,6 +195,47 @@ fn json_mode_error_is_one_envelope_on_stdout() {
 }
 
 #[test]
+fn warnings_survive_a_command_error() {
+    let args = [
+        "config",
+        "validate",
+        "--config",
+        "missing.toml",
+        "--timeout",
+        "5s",
+    ];
+    let machine = svalnir(&[&args[..], &["--format", "json"]].concat());
+    assert_eq!(machine.status, ExitStatus::Usage);
+    let envelope = machine.envelope();
+    assert_eq!(envelope["kind"], "error");
+    assert_eq!(envelope["warnings"][0]["code"], "timeout_not_applied");
+    let text = svalnir(&args);
+    assert!(text.stderr.contains("warning: "), "{}", text.stderr);
+    assert!(text.stderr.contains("error: "), "{}", text.stderr);
+    assert_eq!(text.stdout, "");
+}
+
+#[test]
+fn completions_print_warnings_on_stderr() {
+    let outcome = svalnir(&["completions", "bash", "--timeout", "5s"]);
+    assert_eq!(outcome.status, ExitStatus::Success);
+    assert!(outcome.stderr.contains("timeout"), "{}", outcome.stderr);
+}
+
+#[test]
+fn json_line_serializes_before_writing() {
+    struct Bad;
+    impl serde::Serialize for Bad {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("fails"))
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    assert!(crate::commands::write_json(&mut out, &Bad).is_err());
+    assert_eq!(out, Vec::<u8>::new());
+}
+
+#[test]
 fn ndjson_is_rejected_for_a_command_that_does_not_stream() {
     let outcome = svalnir(&["memory", "status", "--format", "ndjson"]);
     assert_eq!(outcome.status, ExitStatus::Usage);

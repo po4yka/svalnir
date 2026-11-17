@@ -43,7 +43,7 @@ mod tests;
 use cli::{Cli, Format};
 use commands::CommandFailure;
 use environment::Environment;
-use output::{Envelope, ErrorBody, ExitStatus, RequestId};
+use output::{Envelope, ErrorBody, ExitStatus, RequestId, Warning};
 
 /// Runs one invocation and returns its exit status.
 ///
@@ -98,7 +98,27 @@ where
         Err(CommandFailure::Output(error)) => finish(Err(error), ExitStatus::Success, stderr),
         Err(CommandFailure::Rejected(error)) => {
             let status: ExitStatus = error.family.exit_status();
-            let written = report_error(cli.common.format, request_id, error, stdout, stderr);
+            let written = report_error(
+                cli.common.format,
+                request_id,
+                error,
+                Vec::new(),
+                stdout,
+                stderr,
+            );
+            finish(written, status, stderr)
+        }
+        Err(CommandFailure::RejectedWithWarnings(boxed)) => {
+            let (error, warnings): (ErrorBody, Vec<Warning>) = *boxed;
+            let status: ExitStatus = error.family.exit_status();
+            let written = report_error(
+                cli.common.format,
+                request_id,
+                error,
+                warnings,
+                stdout,
+                stderr,
+            );
             finish(written, status, stderr)
         }
     }
@@ -108,13 +128,22 @@ fn report_error(
     format: Format,
     request_id: RequestId,
     error: ErrorBody,
+    warnings: Vec<Warning>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
     match format {
-        Format::Text => writeln!(stderr, "error: {}", error.message),
+        Format::Text => {
+            for warning in &warnings {
+                writeln!(stderr, "warning: {}", warning.message)?;
+            }
+            writeln!(stderr, "error: {}", error.message)
+        }
         Format::Json | Format::Ndjson => {
-            commands::write_json(stdout, &Envelope::error(request_id, error))?;
+            commands::write_json(
+                stdout,
+                &Envelope::error(request_id, error).with_warnings(warnings),
+            )?;
             stdout.flush()
         }
     }

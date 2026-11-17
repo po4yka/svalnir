@@ -6,6 +6,7 @@
 //! since the event before it. The stream ends on Ctrl+C with exit status 130
 //! and on a closed pipe quietly. Ending the stream changes nothing else.
 
+use std::io::{self, Write};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -13,7 +14,7 @@ use svalnir_agent::platform::memory::VmStatistics;
 use svalnir_core::time::WallTime;
 
 use super::resources::{self, DiskView, HostReading, MemoryView, SwapView};
-use super::{CommandFailure, Invocation, write_json};
+use super::{CommandFailure, Invocation, json_line};
 use crate::cli::{Format, MonitorArgs};
 use crate::host::{Host, ScopeCoverage};
 use crate::interrupt::Interrupt;
@@ -49,6 +50,9 @@ impl SampleView {
         let available: String = match &reading.disk {
             resources::DiskReading::Measured { capacity, .. } => {
                 crate::text::observed_bytes(&capacity.available)
+            }
+            resources::DiskReading::CapacityUnavailable { .. } => {
+                "unavailable (capacity not collected)".to_owned()
             }
             resources::DiskReading::Unresolved(_) => "unavailable (volume not resolved)".to_owned(),
         };
@@ -104,10 +108,73 @@ impl Sampler for HostSampler {
     }
 }
 
+/// Writes all of `bytes`. The user can interrupt a write that blocks.
+///
+/// `write_all` retries a write that `EINTR` ended, so a blocked write to a
+/// full pipe would never return after Ctrl+C. This function reads the flag
+/// at each such point and ends with `ErrorKind::Interrupted` when it is set.
+fn write_interruptible(
+    stdout: &mut dyn Write,
+    mut bytes: &[u8],
+    interrupt: &Interrupt,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stdout.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if interrupt.is_requested() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Flushes `stdout`. A flush that `EINTR` ended is tried again until the
+/// user interrupts.
+fn flush_interruptible(stdout: &mut dyn Write, interrupt: &Interrupt) -> io::Result<()> {
+    loop {
+        match stdout.flush() {
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && !interrupt.is_requested() => {}
+            other => return other,
+        }
+    }
+}
+
 /// Writes events until the user interrupts or `max_events` is reached.
 ///
 /// `max_events` is `None` for the command. A test gives a number.
+///
+/// An output error that occurs after the user interrupted (a closed pipe,
+/// because the reader got the same signal, or `EINTR`) ends the stream with
+/// status 130, not with the quiet success of a closed pipe.
 pub(crate) fn stream(
+    sampler: &mut dyn Sampler,
+    interval: Duration,
+    stream_epoch: &str,
+    max_events: Option<u64>,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let interrupt: Interrupt = invocation.environment.interrupt.clone();
+    match stream_events(sampler, interval, stream_epoch, max_events, invocation) {
+        Err(CommandFailure::Output(error))
+            if interrupt.is_requested()
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::Interrupted
+                ) =>
+        {
+            Ok(ExitStatus::Interrupted)
+        }
+        other => other,
+    }
+}
+
+fn stream_events(
     sampler: &mut dyn Sampler,
     interval: Duration,
     stream_epoch: &str,
@@ -122,8 +189,10 @@ pub(crate) fn stream(
         writeln!(invocation.stderr, "warning: {}", warning.message)?;
     }
     if invocation.format == Format::Text {
-        invocation.stdout.write_all(
+        write_interruptible(
+            invocation.stdout,
             b"This stream reads the host in this process. No background agent and no policy is active.\n",
+            &interrupt,
         )?;
     }
     let mut earlier: Option<VmStatistics> = None;
@@ -138,44 +207,38 @@ pub(crate) fn stream(
             // is the last event of the stream, not a response envelope.
             Err(error) if invocation.format != Format::Text => {
                 let status: ExitStatus = error.family.exit_status();
-                write_json(
-                    invocation.stdout,
-                    &StreamLine {
-                        schema_version: SCHEMA_VERSION,
-                        stream_id: &stream_id,
-                        stream_epoch,
-                        sequence: sequence.to_string(),
-                        event_type: "stream_error",
-                        data: &error,
-                    },
-                )?;
+                let line: Vec<u8> = json_line(&StreamLine {
+                    schema_version: SCHEMA_VERSION,
+                    stream_id: &stream_id,
+                    stream_epoch,
+                    sequence: sequence.to_string(),
+                    event_type: "stream_error",
+                    data: &error,
+                })?;
+                write_interruptible(invocation.stdout, &line, &interrupt)?;
                 return Ok(status);
             }
             Err(error) => return Err(error.into()),
         };
         let view = SampleView::new(&reading, earlier.as_ref());
-        match invocation.format {
-            Format::Text => invocation
-                .stdout
-                .write_all(view.line(&reading).as_bytes())?,
-            Format::Json | Format::Ndjson => write_json(
-                invocation.stdout,
-                &StreamLine {
-                    schema_version: SCHEMA_VERSION,
-                    stream_id: &stream_id,
-                    stream_epoch,
-                    sequence: sequence.to_string(),
-                    event_type: if sequence == 0 {
-                        "snapshot"
-                    } else {
-                        "observation_update"
-                    },
-                    data: &view,
+        let event: Vec<u8> = match invocation.format {
+            Format::Text => view.line(&reading).into_bytes(),
+            Format::Json | Format::Ndjson => json_line(&StreamLine {
+                schema_version: SCHEMA_VERSION,
+                stream_id: &stream_id,
+                stream_epoch,
+                sequence: sequence.to_string(),
+                event_type: if sequence == 0 {
+                    "snapshot"
+                } else {
+                    "observation_update"
                 },
-            )?,
-        }
+                data: &view,
+            })?,
+        };
+        write_interruptible(invocation.stdout, &event, &interrupt)?;
         // A reader of a pipe gets each event when it is made.
-        invocation.stdout.flush()?;
+        flush_interruptible(invocation.stdout, &interrupt)?;
         earlier = Some(reading.memory.vm);
         sequence = sequence.saturating_add(1);
         if max_events.is_some_and(|limit| sequence >= limit) {
@@ -331,6 +394,83 @@ mod tests {
         assert_eq!(result.unwrap(), ExitStatus::Interrupted);
         assert_eq!(stdout.lines().count(), 2);
         assert_eq!(ExitStatus::Interrupted.code(), 130);
+    }
+
+    /// A writer that sets the interrupt flag and then fails.
+    struct FailingWriter {
+        kind: std::io::ErrorKind,
+        flag: Option<Arc<AtomicBool>>,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(flag) = &self.flag {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(self.kind.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_with_writer(
+        kind: std::io::ErrorKind,
+        interrupted: bool,
+    ) -> Result<ExitStatus, CommandFailure> {
+        let (mut environment, _directory) = environment();
+        let (interrupt, flag) = Interrupt::manual();
+        environment.interrupt = interrupt;
+        let mut sampler = FakeSampler {
+            fail_at: None,
+            samples: 0,
+            waits: 0,
+            stop_after: None,
+            flag: Arc::clone(&flag),
+        };
+        let request_id = request_id();
+        let mut stdout = FailingWriter {
+            kind,
+            flag: interrupted.then_some(flag),
+        };
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut invocation = Invocation {
+            format: Format::Ndjson,
+            request_id: &request_id,
+            environment: &environment,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            warnings: Vec::new(),
+        };
+        stream(
+            &mut sampler,
+            Duration::from_secs(1),
+            "epoch_test",
+            None,
+            &mut invocation,
+        )
+    }
+
+    #[test]
+    fn a_closed_pipe_after_an_interrupt_ends_with_status_130() {
+        let result = run_with_writer(std::io::ErrorKind::BrokenPipe, true);
+        assert_eq!(result.unwrap(), ExitStatus::Interrupted);
+    }
+
+    #[test]
+    fn a_write_that_the_signal_ended_returns_status_130() {
+        let result = run_with_writer(std::io::ErrorKind::Interrupted, true);
+        assert_eq!(result.unwrap(), ExitStatus::Interrupted);
+    }
+
+    #[test]
+    fn a_closed_pipe_without_an_interrupt_stays_an_output_error() {
+        let result = run_with_writer(std::io::ErrorKind::BrokenPipe, false);
+        assert!(matches!(
+            result,
+            Err(CommandFailure::Output(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[test]

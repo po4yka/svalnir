@@ -587,7 +587,15 @@ fn parse_target(text: &str) -> Result<ProcessGenerationId, ErrorBody> {
         next_action: NextAction::CorrectRequest,
     };
     let id: ProcessGenerationId = ProcessGenerationId::new(text).map_err(|_| invalid())?;
-    if !id.as_str().starts_with("pg-") {
+    // The shape is `pg-<pid>-<start time>`, both decimal.
+    let is_shaped: bool = id.as_str().strip_prefix("pg-").is_some_and(|rest| {
+        rest.split_once('-').is_some_and(|(pid, start)| {
+            [pid, start]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+    });
+    if !is_shaped {
         return Err(invalid());
     }
     Ok(id)
@@ -673,6 +681,29 @@ pub(crate) fn show(
     let view = ShowView::new(&snapshot, record);
     invocation.emit(Kind::Snapshot, &view, ShowView::render)?;
     Ok(ExitStatus::Success)
+}
+
+#[cfg(test)]
+mod target_shape_tests {
+    use super::parse_target;
+
+    #[test]
+    fn a_target_has_the_shape_pg_digits_digits() {
+        assert!(parse_target("pg-123-456789").is_ok());
+        for text in [
+            "pg-",
+            "pg-abc.def",
+            "pg-1",
+            "pg-1-",
+            "pg--2",
+            "pg-1-2-3",
+            "pg-a-b",
+            "xx-1-2",
+        ] {
+            let error = parse_target(text).unwrap_err();
+            assert_eq!(error.code, "invalid_target", "{text}");
+        }
+    }
 }
 
 #[cfg(test)]

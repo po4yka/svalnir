@@ -45,6 +45,9 @@ pub(crate) enum CommandFailure {
     Output(io::Error),
     /// The command returned a structured error.
     Rejected(ErrorBody),
+    /// The command returned a structured error after the invocation had
+    /// collected advisory findings. The findings are not lost.
+    RejectedWithWarnings(Box<(ErrorBody, Vec<Warning>)>),
 }
 
 impl From<io::Error> for CommandFailure {
@@ -128,11 +131,28 @@ pub(crate) fn execute(
             ),
         });
     }
+    let result: Result<ExitStatus, CommandFailure> = dispatch(cli, &mut invocation);
+    match result {
+        Err(CommandFailure::Rejected(error)) if !invocation.warnings.is_empty() => {
+            Err(CommandFailure::RejectedWithWarnings(Box::new((
+                error,
+                std::mem::take(&mut invocation.warnings),
+            ))))
+        }
+        other => other,
+    }
+}
+
+fn dispatch(cli: &Cli, invocation: &mut Invocation<'_>) -> Result<ExitStatus, CommandFailure> {
     match &cli.command {
         Command::Completions(arguments) => {
             // `generate` panics on a write error, so it writes to memory first.
             let mut script: Vec<u8> = Vec::new();
             clap_complete::generate(arguments.shell, &mut Cli::command(), "svalnir", &mut script);
+            // The script has no envelope, so each finding goes to stderr.
+            for warning in std::mem::take(&mut invocation.warnings) {
+                writeln!(invocation.stderr, "warning: {}", warning.message)?;
+            }
             invocation.stdout.write_all(&script)?;
             Ok(ExitStatus::Success)
         }
@@ -146,38 +166,38 @@ pub(crate) fn execute(
             })?;
             Ok(ExitStatus::Success)
         }
-        Command::Status => resources::status(&mut invocation),
+        Command::Status => resources::status(invocation),
         Command::Memory {
             command: MemoryCommand::Status,
-        } => resources::memory_status(&mut invocation),
+        } => resources::memory_status(invocation),
         Command::Swap {
             command: SwapCommand::Status,
-        } => resources::swap_status(&mut invocation),
-        Command::Monitor(arguments) => monitor::run(arguments, &mut invocation),
+        } => resources::swap_status(invocation),
+        Command::Monitor(arguments) => monitor::run(arguments, invocation),
         Command::Processes {
             command: ProcessesCommand::Top(arguments),
-        } => processes::top(arguments, &mut invocation),
+        } => processes::top(arguments, invocation),
         Command::Processes {
             command: ProcessesCommand::Show(arguments),
-        } => processes::show(arguments, &mut invocation),
-        Command::Scan(arguments) => scan::scan(arguments, &mut invocation),
-        Command::Report(arguments) => scan::report(arguments, &mut invocation),
-        Command::Doctor => doctor::run(&mut invocation),
+        } => processes::show(arguments, invocation),
+        Command::Scan(arguments) => scan::scan(arguments, invocation),
+        Command::Report(arguments) => scan::report(arguments, invocation),
+        Command::Doctor => doctor::run(invocation),
         Command::Config {
             command: ConfigCommand::Validate(arguments),
-        } => config::validate(arguments, &mut invocation),
+        } => config::validate(arguments, invocation),
         Command::Config {
             command: ConfigCommand::Show(arguments),
-        } => config::show(arguments, &mut invocation),
+        } => config::show(arguments, invocation),
         Command::Policy {
             command: PolicyCommand::List,
-        } => policy::list(&mut invocation),
+        } => policy::list(invocation),
         Command::Policy {
             command: PolicyCommand::Show(arguments),
-        } => policy::show(arguments, &mut invocation),
+        } => policy::show(arguments, invocation),
         Command::Policy {
             command: PolicyCommand::Simulate(arguments),
-        } => policy::simulate(arguments, &mut invocation),
+        } => policy::simulate(arguments, invocation),
         command => Err(not_implemented(command).into()),
     }
 }
@@ -205,9 +225,18 @@ fn runs_in_process(command: &Command) -> bool {
 }
 
 /// Writes one JSON value and a newline.
+///
+/// The value is serialized to memory first, so a serialization failure
+/// leaves no partial line in `stdout`.
 pub(crate) fn write_json<T: Serialize>(stdout: &mut dyn Write, value: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *stdout, value)?;
-    stdout.write_all(b"\n")
+    stdout.write_all(&json_line(value)?)
+}
+
+/// The bytes of one JSON value and a newline.
+pub(crate) fn json_line<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut bytes: Vec<u8> = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {

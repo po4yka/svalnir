@@ -1592,8 +1592,8 @@ fn exclusions_ignore_unicode_case_and_normalization_and_over_protect() {
     // NFC exclusion, NFD candidate.
     let decision: CleanupDecision = excluded_decision(
         "/Users/tester",
-        "~/Caf\u{e9}",
-        "/Users/tester/Cafe\u{301}/cache",
+        "~/Ros\u{e9}",
+        "/Users/tester/Rose\u{301}/cache",
     );
     assert_eq!(decision.decision, CandidateDecision::Protected);
     // The documented over-protection: another non-ASCII sibling is covered.

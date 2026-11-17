@@ -29,7 +29,7 @@ use crate::cli::{ReportArgs, ScanArgs};
 use crate::environment::Environment;
 use crate::host::Host;
 use crate::interrupt::Interrupt;
-use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
+use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction, Warning};
 use crate::text::{escape, field, human_bytes, human_duration, put_line, table};
 
 /// The number of entries of each list in the text form. The JSON form has
@@ -72,6 +72,13 @@ pub(crate) enum SaveState {
     Saved,
     /// The user interrupted the scan, so the result was not saved.
     NotSavedInterrupted,
+    /// `--save` was given and the result was not saved. `save_detail` has the
+    /// reason.
+    NotSaved,
+    /// The record was committed, and the read-back that checks it failed.
+    /// `save_detail` has the reason. `svalnir report` can still read it, or
+    /// it can fail for the same cause.
+    SavedReadbackFailed,
     /// The result was saved, and the size limit of the catalog store then
     /// removed it. A report cannot read it.
     RemovedByRetention,
@@ -85,6 +92,11 @@ pub(crate) struct ScanView {
     /// context or no monotonic time.
     observations: Option<ObservationsView>,
     save: SaveState,
+    /// The reason for `not_saved` or `saved_readback_failed`.
+    save_detail: Option<String>,
+    /// Advisory findings of the save. They go to the envelope or to stderr.
+    #[serde(skip)]
+    warnings: Vec<Warning>,
     /// The error of the retention pass after the save, when it failed. The
     /// record stays saved.
     retention_error: Option<String>,
@@ -288,6 +300,21 @@ impl ScanView {
             }
             SaveState::NotSavedInterrupted => {
                 out.push_str("The scan was interrupted, so the result is not saved.\n");
+            }
+            SaveState::NotSaved => {
+                put_line!(
+                    out,
+                    "`--save` was given and the result is not saved: {}.",
+                    escape(self.save_detail.as_deref().unwrap_or("no reason is known"))
+                );
+            }
+            SaveState::SavedReadbackFailed => {
+                put_line!(
+                    out,
+                    "Saved as `svalnir report --scan {}`, but the read-back of the record failed: {}.",
+                    self.scan.scan_id,
+                    escape(self.save_detail.as_deref().unwrap_or("no reason is known"))
+                );
             }
             SaveState::RemovedByRetention => {
                 out.push_str(
@@ -555,6 +582,12 @@ pub(crate) fn scan_root(
     .map_err(|error| scan_error(&error))?;
 
     let mut save_state: SaveState = SaveState::NotRequested;
+    let mut save_detail: Option<String> = None;
+    let mut warnings: Vec<Warning> = Vec::new();
+    if save && store.is_none() {
+        save_state = SaveState::NotSaved;
+        save_detail = Some("the root is not a directory, so no store was opened".to_owned());
+    }
     let mut retention_error: Option<String> = None;
     if let Some(store) = &mut store {
         if result.completion == ScanCompletion::Cancelled {
@@ -592,7 +625,18 @@ pub(crate) fn scan_root(
             save_state = match store.scan(&record.scan_id) {
                 Ok(Some(_)) => SaveState::Saved,
                 Ok(None) => SaveState::RemovedByRetention,
-                Err(error) => return Err(store_error(&error)),
+                // The record is committed, so the scan result is not dropped.
+                Err(error) => {
+                    let detail: String = store_error(&error).message;
+                    warnings.push(Warning {
+                        code: "save_readback_failed",
+                        message: format!(
+                            "the scan record was saved, but reading it back failed: {detail}"
+                        ),
+                    });
+                    save_detail = Some(detail);
+                    SaveState::SavedReadbackFailed
+                }
             };
         }
     }
@@ -600,6 +644,8 @@ pub(crate) fn scan_root(
         observations: observations(&result, host.as_ref()),
         scan: result,
         save: save_state,
+        save_detail,
+        warnings,
         retention_error,
         note: AUTHORITY_NOTE,
     })
@@ -631,9 +677,24 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
     }
     };
     let path: PathBuf = environment.catalog_path()?;
-    // A report does not create the store.
-    if !path.is_file() {
-        return Err(not_found());
+    // A report does not create the store. Only a missing file is "no saved
+    // scan"; another error is a state directory or store problem.
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(not_found()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
+        Err(error) => {
+            return Err(ErrorBody {
+                code: "state_store_unavailable",
+                family: ErrorFamily::Recording,
+                stage: ErrorStage::Storage,
+                message: format!("the catalog store cannot be inspected: {}", error.kind()),
+                fields: Vec::new(),
+                operation_id: None,
+                plan_id: None,
+                next_action: NextAction::None,
+            });
+        }
     }
     let (options, _) = catalog_limits();
     let store: Store = Store::open(&path, &options).map_err(|error| store_error(&error))?;
@@ -664,7 +725,8 @@ pub(crate) fn scan(
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
     let root: PathBuf = invocation.environment.resolve(&arguments.path, "path")?;
-    let view: ScanView = scan_root(&root, arguments.save, invocation.environment)?;
+    let mut view: ScanView = scan_root(&root, arguments.save, invocation.environment)?;
+    invocation.warnings.append(&mut view.warnings);
     invocation.emit(Kind::Snapshot, &view, ScanView::render)?;
     Ok(view.status())
 }
@@ -707,6 +769,8 @@ mod tests {
             scan: result,
             observations: None,
             save: SaveState::NotRequested,
+            save_detail: None,
+            warnings: Vec::new(),
             retention_error: None,
             note: super::AUTHORITY_NOTE,
         };
@@ -722,6 +786,8 @@ mod tests {
             scan: result,
             observations: None,
             save: SaveState::Saved,
+            save_detail: None,
+            warnings: Vec::new(),
             retention_error: None,
             note: super::AUTHORITY_NOTE,
         };
@@ -747,6 +813,61 @@ mod tests {
         assert_eq!(json["scan"]["root"]["encoding"], "utf8");
         assert_eq!(json["save"], "saved");
         assert_eq!(json["observations"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_requested_save_that_was_not_done_says_why() {
+        let view = ScanView {
+            scan: scan_result(false),
+            observations: None,
+            save: SaveState::NotSaved,
+            save_detail: Some("the root is not a directory".to_owned()),
+            warnings: Vec::new(),
+            retention_error: None,
+            note: super::AUTHORITY_NOTE,
+        };
+        assert!(
+            view.render()
+                .contains("`--save` was given and the result is not saved")
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["save"], "not_saved");
+        assert_eq!(json["save_detail"], "the root is not a directory");
+    }
+
+    #[test]
+    fn a_failed_read_back_keeps_the_scan_result() {
+        let view = ScanView {
+            scan: scan_result(false),
+            observations: None,
+            save: SaveState::SavedReadbackFailed,
+            save_detail: Some("io".to_owned()),
+            warnings: Vec::new(),
+            retention_error: None,
+            note: super::AUTHORITY_NOTE,
+        };
+        assert!(view.render().contains("read-back of the record failed"));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["save"], "saved_readback_failed");
+        assert_eq!(json["scan"]["scan_id"], "scan_test");
+    }
+
+    #[test]
+    fn a_state_directory_error_is_not_reported_as_no_saved_scan() {
+        let (mut environment, directory) = crate::test_support::environment();
+        // The state directory is a file, so the catalog path is under a file.
+        let state = directory.path().join("state-file");
+        std::fs::write(&state, b"x").unwrap();
+        environment.state_directory_override = Some(state.into_os_string());
+        let error = super::load_report("scan_test", &environment).unwrap_err();
+        assert_eq!(error.code, "state_store_unavailable");
+    }
+
+    #[test]
+    fn a_missing_catalog_is_no_saved_scan() {
+        let (environment, _directory) = crate::test_support::environment();
+        let error = super::load_report("scan_test", &environment).unwrap_err();
+        assert_eq!(error.code, "scan_not_found");
     }
 
     #[test]

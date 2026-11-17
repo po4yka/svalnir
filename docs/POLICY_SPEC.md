@@ -45,7 +45,8 @@ The user configuration path is `~/Library/Application Support/Svalnir/config.tom
 - Sizes use nonnegative integer quantities with explicit units: `B`, `KiB`, `MiB`, `GiB`, or `TiB`. Conversion is checked integer arithmetic. Ambiguous units, negative values, overflow, and fractional byte results are rejected.
 - Durations use an integer and one explicit unit: `ms`, `s`, `m`, `h`, or `d`. Qualification, freshness, and budget windows must be positive. Zero must not silently disable a protection.
 - Counts and ceilings are finite positive integers. Omitted values resolve through a versioned, bounded template; omission never means unlimited.
-- Paths support explicit leading `~/` expansion for the relevant user. No shell evaluation, command substitution, environment-driven root authority, or cleanup-root globs are allowed.
+- Paths support explicit leading `~/` expansion for the relevant user. A bare `~` is not accepted. No shell evaluation, command substitution, environment-driven root authority, or cleanup-root globs are allowed.
+- A home directory that is not a canonical absolute path is unresolved, and a `~/` path then protects by making the affected candidates ineligible. Path components are compared after Unicode lowercase. Two components that still differ and have a non-ASCII character count as a match for protection, because the default APFS volume ignores case and normalization. This rule can protect too much; it must not protect too little.
 - Logical selectors such as `startup-data` resolve to current volume identities. A mount path is not a persistent identity.
 - Application selectors resolve through verified application/job identity. Names and a bundle identifier supplied without identity validation are insufficient.
 - Rule IDs resolve through the compiled reviewed registry. Unsupported versions or missing automatic eligibility cannot become active automatic rules.
@@ -277,7 +278,7 @@ No-effect or immediate-regrowth results activate backoff; they do not justify br
 
 ### Global pressure
 
-The first release's automatic global trigger is sustained native `critical` pressure, with fresh corroborating system and target observations. `normal`, `warning`, and `unknown` do not independently admit global-pressure termination.
+The first release's automatic global trigger is sustained native `critical` pressure, with fresh corroborating system and target observations. `normal`, `warning`, and `unknown` do not independently admit global-pressure termination. Only host memory observations corroborate the pressure state: the VM page and paging metrics, the compressor metrics, and the swap metrics. A metric of another resource, such as CPU or disk, does not. When the application list of the collector can be stale, no application candidate is admissible and the absence of a budgeted application is not proven; the decision detail is `application_list_stale`. A process with an unrecognized association also prevents the conclusion that a budgeted application is absent.
 
 Before a graceful request and again before force escalation, the critical predicate must remain currently qualified. If it clears or required evidence becomes stale, stop subsequent termination steps while retaining the incident and observing any submitted request. Later critical pressure requires qualification again.
 
@@ -297,7 +298,7 @@ Falling below `footprint_stop` inhibits subsequent budget-trigger termination, e
 
 All overlapping memory trigger episodes share the principal's incident ceiling. An application selected under both triggers consumes one intervention slot, and the plan records its admission trigger. A budget-trigger operation cannot silently change to global-critical authority during escalation. To change admission authority, settle the old operation and admit a fresh plan under the same memory incident, preserving its consumed charge; a newly dispatched intervention consumes another slot and must satisfy the remaining budget and cooldowns.
 
-Prefer configured disposable workloads and explicitly configured applications before broadly eligible background applications, then use declared termination priority, verified budget violation, footprint, and deterministic identity tie-breaking. Unknown optional growth does not become a fabricated zero; unknown required attribution blocks selection.
+Prefer configured disposable workloads and explicitly configured applications before broadly eligible background applications, then use declared termination priority, verified budget violation, footprint, and deterministic identity tie-breaking. A managed job ranks before a broadly eligible application. The configuration has no declared termination priority field yet, so the evaluation does not use one. Unknown optional growth does not become a fabricated zero; unknown required attribution blocks selection.
 
 Foreground protection is checked before each step. Hard-protected OS/session identities and Svalnir's control plane remain ineligible in every profile. Ordinary first-release control targets the requesting user's applications/jobs; ambiguous or cross-user ownership is rejected.
 
@@ -315,7 +316,7 @@ Budgets are admission ceilings, not predictions of benefit.
 
 For filesystem work, `work_bytes` is the rule's conservative charge for the fixed bounded target set. Supported ordinary-file rules can use the larger of logical and allocated bytes with checked aggregation; every rule states its exact basis. It is distinct from actual I/O and reclaimable bytes. Unknown or unbounded charge blocks automatic dispatch. Entry-count and time bounds still apply to tiny-file workloads.
 
-Reserve all applicable limits before dispatch. A file candidate must fit the remaining batch, pass, rule, and incident bounds; an indivisible candidate is skipped if it does not fit. Splitting is permitted only where the rule defines independently safe units. Dynamic enumeration cannot add unreserved entries behind a plan.
+Reserve all applicable limits before dispatch. A file candidate must fit the remaining batch, pass, rule, and incident bounds; an indivisible candidate is skipped if it does not fit. The caller supplies the remaining allowance of each rule. A first batch that has a target whose rule has no supplied allowance is not admissible, and its report states that the rule ceiling was not evaluated. A candidate with no items is not eligible, and a repeated target on one volume is an input error. Splitting is permitted only where the rule defines independently safe units. Dynamic enumeration cannot add unreserved entries behind a plan.
 
 For memory, reserve one application slot before starting an intervention. Charge the slot together with the dispatch consumption of the first termination step, before the external call, as [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) specifies. Graceful and force steps of that intervention share the slot. A submitted failed or uncertain request remains charged. Release a reservation or charge only when the executor proves that no external call was issued. Exit or pressure improvement does not refund consumed usage.
 

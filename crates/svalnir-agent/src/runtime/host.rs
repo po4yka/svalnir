@@ -243,6 +243,20 @@ impl fmt::Debug for SystemMeasurements {
     }
 }
 
+impl SystemMeasurements {
+    /// The measurements of `context` for the volumes of `volumes`. A
+    /// volume that is not in the list has no capacity value. A transient
+    /// coordinator, which has no collector, uses this function with the
+    /// volumes of its plan.
+    #[must_use]
+    pub fn new(context: Arc<CollectionContext>, volumes: Vec<VolumeIdentity>) -> Self {
+        Self {
+            context,
+            volumes: Arc::new(Mutex::new(volumes)),
+        }
+    }
+}
+
 impl Measurements for SystemMeasurements {
     fn capacity(&mut self, volume: &VolumeId) -> Observation<Bytes> {
         let identity: Option<VolumeIdentity> = self

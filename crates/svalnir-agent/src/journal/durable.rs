@@ -567,6 +567,34 @@ impl OperationJournal {
         Ok(operations)
     }
 
+    /// Reads the newest operations, the newest first, settled or not. The
+    /// result has at most `limit` operations. This is the read of a history
+    /// query; it changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or the error of a record that this build
+    /// cannot decode.
+    pub fn recent_operations(&self, limit: usize) -> Result<Vec<Operation>, OperationJournalError> {
+        let transaction = self.read_transaction()?;
+        let limit: i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sequence: Vec<i64> = {
+            let mut statement =
+                transaction.prepare("SELECT seq FROM operation ORDER BY seq DESC LIMIT ?1")?;
+            let rows = statement.query_map([limit], |row| row.get(0))?;
+            let mut sequence: Vec<i64> = Vec::new();
+            for seq in rows {
+                sequence.push(seq?);
+            }
+            sequence
+        };
+        let mut operations: Vec<Operation> = Vec::with_capacity(sequence.len());
+        for seq in sequence {
+            operations.push(row::load_operation(&transaction, seq)?);
+        }
+        Ok(operations)
+    }
+
     /// [`Journal::set_stop_fence`] with the detailed failure.
     ///
     /// # Errors

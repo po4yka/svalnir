@@ -2,7 +2,7 @@
 
 **Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API.  
 **Interface baseline:** 1  
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-17
 
 This document connects CLI and GPUI requests to the shared agent and privileged helper. Metric semantics belong to [RESOURCE_MODEL.md](RESOURCE_MODEL.md), decisions to [POLICY_SPEC.md](POLICY_SPEC.md), and execution to [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md). Rule modes belong to [CLEANUP_RULES.md](CLEANUP_RULES.md). [ARCHITECTURE.md](ARCHITECTURE.md), [THREAT_MODEL.md](THREAT_MODEL.md), and [VALIDATION.md](VALIDATION.md) define boundaries and required evidence.
 
@@ -67,7 +67,7 @@ Enumeration values in this document's examples use the spellings of their source
 
 An opaque ID has 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. A wall-clock timestamp has the `Z` offset and a fraction of zero, three, six, or nine digits, whichever is the smallest exact one; a decoder accepts a fraction of one to nine digits and rejects another offset and a leap second.
 
-Identity evidence uses these encodings. A process ID, a user ID, and a device number are JSON integers. A process start time is microseconds since the Unix epoch as a canonical base-10 string, and an inode number is a canonical base-10 string. A filesystem path in a response is a tagged object: `{"encoding": "utf8", "value": "..."}` for a path that is valid UTF-8, and `{"encoding": "hex", "value": "..."}` with lowercase hexadecimal bytes for another path. A decoder rejects an empty path, a NUL byte, an unknown encoding, and `hex` for bytes that are valid UTF-8.
+Identity evidence uses these encodings. A process ID, a user ID, and a device number are JSON integers. A process start time is microseconds since the Unix epoch as a canonical base-10 string, and an inode number is a canonical base-10 string. A filesystem path in a response is a tagged object: `{"encoding": "utf8", "value": "..."}` for a path that is valid UTF-8, and `{"encoding": "hex", "value": "..."}` with lowercase hexadecimal bytes for another path. A decoder rejects an empty path, a NUL byte, an unknown encoding, a field other than `encoding` and `value`, and `hex` for bytes that are valid UTF-8.
 
 An opaque target ID resolves to server-held identity evidence. It is not permission to inspect or modify that entity. A client cannot replace the owner, start time, mount generation, or rule scope in an apply request.
 

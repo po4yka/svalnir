@@ -36,7 +36,7 @@ pub enum PathError {
 /// `{"encoding": "hex", "value": "2f66ff"}`: its bytes as lowercase
 /// hexadecimal. Each path has one encoding, so decoding rejects `hex` for
 /// bytes that are valid UTF-8. Decoding also rejects an empty path, a NUL
-/// byte, and an unknown encoding.
+/// byte, an unknown encoding, and a field other than `encoding` and `value`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "PathWire", into = "PathWire")]
 pub struct LosslessPath(Vec<u8>);
@@ -112,6 +112,7 @@ impl LosslessPath {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PathWire {
     encoding: String,
     value: String,
@@ -296,6 +297,9 @@ mod tests {
             assert_eq!(message, error.to_string());
         }
         assert!(serde_json::from_value::<LosslessPath>(json!("/a")).is_err());
+        // A second representation in one object is ambiguous.
+        let competing = json!({ "encoding": "utf8", "value": "/a", "bytes": "2f62" });
+        assert!(serde_json::from_value::<LosslessPath>(competing).is_err());
         assert_eq!(LosslessPath::from_bytes(Vec::new()), Err(PathError::Empty));
     }
 

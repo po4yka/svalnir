@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::encoding::unsigned_quantity;
+use crate::encoding::{unsigned_quantity, wire_enum};
 use crate::file::{FileObjectEvidence, LosslessPath};
 use crate::id::{ApplicationInstanceId, BootId, ProcessGenerationId};
 
@@ -110,6 +110,36 @@ pub struct ExecutableIdentity {
     pub path: LosslessPath,
     /// The file object at that path, when the collector can read it.
     pub file: Option<FileObjectEvidence>,
+    /// The code signature of the executable, when the collector validated
+    /// it. `None` means that no signature evidence is recorded; it does not
+    /// mean that the executable is unsigned.
+    pub code_signature: Option<CodeSignatureEvidence>,
+}
+
+/// Evidence from a validated code signature.
+///
+/// A shared signing identity alone does not make a process a member of an
+/// application.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CodeSignatureEvidence {
+    /// The signing identifier of the code.
+    pub signing_identifier: String,
+    /// The team identifier, when the signature has one.
+    pub team_identifier: Option<String>,
+}
+
+wire_enum! {
+    /// How the collector established that a process belongs to an
+    /// application or a managed job.
+    AttributionMethod {
+        /// The process is the registered process of a running application.
+        LaunchServices => "launch_services",
+        /// The system names the application process as responsible for this
+        /// process.
+        ResponsibleProcess => "responsible_process",
+        /// The process belongs to a launchd job with this label.
+        LaunchdJob => "launchd_job",
+    }
 }
 
 /// The application or managed job that a process belongs to.
@@ -129,6 +159,8 @@ pub enum ProcessAssociation {
         instance_id: ApplicationInstanceId,
         /// The bundle identifier of the application.
         bundle_identifier: String,
+        /// How the membership was established.
+        attribution: AttributionMethod,
     },
     /// The process belongs to a managed job, for example a launchd job.
     ManagedJob {
@@ -136,6 +168,8 @@ pub enum ProcessAssociation {
         instance_id: ApplicationInstanceId,
         /// The label of the job.
         label: String,
+        /// How the membership was established.
+        attribution: AttributionMethod,
     },
     /// No application or job evidence was found.
     Unattributed,
@@ -187,8 +221,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ExecutableIdentity, Pid, PidError, ProcessAssociation, ProcessIdentity, ProcessStartTime,
-        Uid,
+        AttributionMethod, CodeSignatureEvidence, ExecutableIdentity, Pid, PidError,
+        ProcessAssociation, ProcessIdentity, ProcessStartTime, Uid,
     };
     use crate::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
     use crate::id::{ApplicationInstanceId, BootId, ProcessGenerationId};
@@ -207,10 +241,15 @@ mod tests {
                     device: DeviceNumber::new(16_777_234),
                     inode: InodeNumber::new(991),
                 }),
+                code_signature: Some(CodeSignatureEvidence {
+                    signing_identifier: "com.example.Example".to_owned(),
+                    team_identifier: Some("ABCDE12345".to_owned()),
+                }),
             }),
             association: ProcessAssociation::Application {
                 instance_id: ApplicationInstanceId::new("app_example").unwrap(),
                 bundle_identifier: "com.example.Example".to_owned(),
+                attribution: AttributionMethod::LaunchServices,
             },
         }
     }
@@ -232,12 +271,17 @@ mod tests {
                         "encoding": "utf8",
                         "value": "/Applications/Example.app/Contents/MacOS/Example"
                     },
-                    "file": { "device": 16_777_234, "inode": "991" }
+                    "file": { "device": 16_777_234, "inode": "991" },
+                    "code_signature": {
+                        "signing_identifier": "com.example.Example",
+                        "team_identifier": "ABCDE12345"
+                    }
                 },
                 "association": {
                     "kind": "application",
                     "instance_id": "app_example",
-                    "bundle_identifier": "com.example.Example"
+                    "bundle_identifier": "com.example.Example",
+                    "attribution": "launch_services"
                 }
             })
         );
@@ -293,11 +337,17 @@ mod tests {
         let job = ProcessAssociation::ManagedJob {
             instance_id: ApplicationInstanceId::new("job_example").unwrap(),
             label: "com.example.agent".to_owned(),
+            attribution: AttributionMethod::LaunchdJob,
         };
         let value: Value = serde_json::to_value(&job).unwrap();
         assert_eq!(
             value,
-            json!({ "kind": "managed_job", "instance_id": "job_example", "label": "com.example.agent" })
+            json!({
+                "kind": "managed_job",
+                "instance_id": "job_example",
+                "label": "com.example.agent",
+                "attribution": "launchd_job"
+            })
         );
         assert_eq!(
             serde_json::from_value::<ProcessAssociation>(value).unwrap(),
@@ -307,6 +357,32 @@ mod tests {
             serde_json::to_value(ProcessAssociation::Unattributed).unwrap(),
             json!({ "kind": "unattributed" })
         );
+    }
+
+    #[test]
+    fn an_unknown_attribution_method_stays_unrecognized() {
+        let association: ProcessAssociation = serde_json::from_value(json!({
+            "kind": "application",
+            "instance_id": "app_example",
+            "bundle_identifier": "com.example.Example",
+            "attribution": "parent_process"
+        }))
+        .unwrap();
+        let ProcessAssociation::Application { attribution, .. } = association else {
+            panic!("the association is not an application");
+        };
+        assert!(!attribution.is_recognized());
+        assert_eq!(attribution.as_str(), "parent_process");
+    }
+
+    #[test]
+    fn a_changed_code_signature_is_different_evidence() {
+        let first: ProcessIdentity = example();
+        let mut resigned: ProcessIdentity = example();
+        if let Some(executable) = resigned.executable.as_mut() {
+            executable.code_signature = None;
+        }
+        assert!(!first.has_same_evidence(&resigned));
     }
 
     #[test]

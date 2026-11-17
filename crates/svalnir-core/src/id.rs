@@ -163,6 +163,12 @@ impl RequestId {
     }
 }
 
+impl From<ScanId> for IdentityId {
+    fn from(id: ScanId) -> Self {
+        Self(id.0)
+    }
+}
+
 impl From<VolumeId> for IdentityId {
     fn from(id: VolumeId) -> Self {
         Self(id.0)

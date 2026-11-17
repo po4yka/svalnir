@@ -1,7 +1,7 @@
 # Svalnir Resource Model
 
 **Status:** Design specification; no collector, native backend, or supported macOS matrix is claimed as implemented or verified.  
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-17
 
 This document defines what Svalnir measures, how observations retain their meaning, and which conclusions consumers may draw. [ARCHITECTURE.md](ARCHITECTURE.md) assigns component responsibilities. [POLICY_SPEC.md](POLICY_SPEC.md) defines intervention thresholds and evidence windows; [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) defines execution outcomes. [CLEANUP_RULES.md](CLEANUP_RULES.md), [INTERFACES.md](INTERFACES.md), and [VALIDATION.md](VALIDATION.md) specify eligibility, transport, and verification. [THREAT_MODEL.md](THREAT_MODEL.md) covers incorrect or stale measurements as threat T-07.
 
@@ -122,7 +122,7 @@ Coverage is independent of availability. A scan can successfully report a partia
 
 A failed current query produces an unavailable observation. An older successful observation can remain in history with its original timestamp. Clients may label it “last observed,” but must not substitute it into current admission without satisfying freshness.
 
-The initial registered `unit` spellings are `byte`, `page`, `entry`, `nanosecond`, `percent`, and `state`. The initial scope `kind` spellings are `host`, `volume`, `capacity_domain`, `process`, and `application`. A decoder keeps an unknown `unit`, `kind`, `coverage`, `reason`, scope `kind`, or state value as an explicit unrecognized value with its received text. A decoder rejects an observation whose `availability` is not `available` or `unavailable`, whose `value` and `reason` do not agree with its `availability`, or whose sample finishes before it starts.
+The initial registered `unit` spellings are `byte`, `page`, `entry`, `nanosecond`, `percent`, and `state`. The initial scope `kind` spellings are `host`, `volume`, `capacity_domain`, `process`, `application`, and `scan`. A `scan` scope references one scan and its recorded inventory. A decoder keeps an unknown `unit`, `kind`, `coverage`, `reason`, scope `kind`, or state value as an explicit unrecognized value with its received text. An `availability` other than `available` and `unavailable` is also kept as an unrecognized value: the observation has no usable value and no usable reason, and a consumer must not read it as available. A decoder rejects an observation whose `value` and `reason` do not agree with a known `availability`, or whose sample finishes before it starts. An observation value type must not encode to JSON `null`.
 
 Unknown units, states, metric definitions, or incompatible revisions cannot be coerced to known meanings. A client that cannot interpret a new pressure state renders it as unsupported or unknown, never normal.
 
@@ -258,7 +258,7 @@ A process adapter may use supported `proc_pidinfo`/`proc_pid_rusage` flavors whe
 
 The application-scoped `application.attributed_footprint_bytes` gauge is the checked sum of the selected native footprint measure over a verified membership snapshot. Record the member list, membership revision, per-member sample IDs, maximum skew, and attribution method. Label it “sum of attributed process footprints.” It is neither exact exclusive physical allocation nor predicted RAM recovery.
 
-Membership requires positive application/job evidence. Parentage, display name, executable basename, or shared signing identity alone does not establish exclusive ownership. Shared services remain separately identified unless a tested adapter supplies defensible attribution.
+Membership requires positive application/job evidence. An association records its attribution method; the initial spellings are `launch_services`, `responsible_process`, and `launchd_job`. Executable evidence can include the signing identifier and the team identifier of a validated code signature. Parentage, display name, executable basename, or shared signing identity alone does not establish exclusive ownership. Shared services remain separately identified unless a tested adapter supplies defensible attribution.
 
 An exited member is not simply a zero reading. Verify its exit and update the membership snapshot; an inaccessible member remains missing. Partial coverage cannot silently satisfy or clear a complete-application budget predicate. A membership change invalidates the corresponding qualifying window while preserving incident usage and cooldown history.
 

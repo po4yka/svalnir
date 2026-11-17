@@ -12,7 +12,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::encoding::wire_enum;
+use crate::encoding::{UnrecognizedText, wire_enum};
 use crate::id::{
     AdapterId, BootId, ClockDomainId, CollectorEpochId, IdentityId, SampleId, WorkerId,
 };
@@ -195,6 +195,8 @@ wire_enum! {
         Process => "process",
         /// One application membership snapshot.
         Application => "application",
+        /// One scan and its recorded inventory.
+        Scan => "scan",
     }
 }
 
@@ -398,6 +400,10 @@ pub enum Reading<T> {
     Available(T),
     /// The measurement has no value.
     Unavailable(UnavailableReason),
+    /// The `availability` text is one that this build does not recognize.
+    /// The reading has no usable value and no usable reason. It is not
+    /// available and it is not a known unavailable condition.
+    Unrecognized(UnrecognizedText),
 }
 
 impl<T> Reading<T> {
@@ -405,14 +411,14 @@ impl<T> Reading<T> {
     pub fn value(&self) -> Option<&T> {
         match self {
             Self::Available(value) => Some(value),
-            Self::Unavailable(_) => None,
+            Self::Unavailable(_) | Self::Unrecognized(_) => None,
         }
     }
 
     /// The reason of an unavailable reading.
     pub fn reason(&self) -> Option<&UnavailableReason> {
         match self {
-            Self::Available(_) => None,
+            Self::Available(_) | Self::Unrecognized(_) => None,
             Self::Unavailable(reason) => Some(reason),
         }
     }
@@ -427,6 +433,7 @@ impl<T> Reading<T> {
         match self {
             Self::Available(value) => Reading::Available(convert(value)),
             Self::Unavailable(reason) => Reading::Unavailable(reason),
+            Self::Unrecognized(text) => Reading::Unrecognized(text),
         }
     }
 }
@@ -446,9 +453,6 @@ pub enum ObservationError {
     /// `availability` is `unavailable` and `reason` is `null`.
     #[error("the observation is unavailable and has no reason")]
     UnavailableWithoutReason,
-    /// `availability` has a value that this build does not recognize.
-    #[error("the observation has an availability that is not recognized")]
-    UnrecognizedAvailability,
     /// The sample finishes before it starts.
     #[error("the sample finishes before it starts")]
     SampleFinishesBeforeStart,
@@ -464,7 +468,9 @@ pub enum ObservationError {
 /// JSON has the fields `metric_id`, `scope`, `value`, `unit`, `kind`,
 /// `availability`, `reason`, `coverage`, `source`, and `sample`. The
 /// [`Reading`] gives `value`, `availability`, and `reason`. Decoding needs
-/// each field and rejects a combination that is not consistent.
+/// each field and rejects a combination that is not consistent. An
+/// `availability` that this build does not recognize decodes to
+/// [`Reading::Unrecognized`]; its `value` and `reason` are not kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation<T> {
     /// The metric that the value belongs to.
@@ -510,10 +516,10 @@ impl<T: Serialize> Serialize for Observation<T> {
         fields.serialize_field("value", &self.reading.value())?;
         fields.serialize_field("unit", &self.unit)?;
         fields.serialize_field("kind", &self.kind)?;
-        let availability: Availability = if self.reading.is_available() {
-            Availability::Available
-        } else {
-            Availability::Unavailable
+        let availability: Availability = match &self.reading {
+            Reading::Available(_) => Availability::Available,
+            Reading::Unavailable(_) => Availability::Unavailable,
+            Reading::Unrecognized(text) => Availability::Unrecognized(text.clone()),
         };
         fields.serialize_field("availability", &availability)?;
         fields.serialize_field("reason", &self.reading.reason())?;
@@ -569,9 +575,7 @@ impl<T> TryFrom<ObservationWire<T>> for Observation<T> {
             (Availability::Unavailable, None, None) => {
                 return Err(ObservationError::UnavailableWithoutReason);
             }
-            (Availability::Unrecognized(_), _, _) => {
-                return Err(ObservationError::UnrecognizedAvailability);
-            }
+            (Availability::Unrecognized(text), _, _) => Reading::Unrecognized(text),
         };
         Ok(Self {
             metric_id: wire.metric_id,
@@ -750,22 +754,37 @@ mod tests {
         let mut unavailable_without_reason: Value = specification_example();
         unavailable_without_reason["availability"] = json!("unavailable");
         unavailable_without_reason["value"] = Value::Null;
-        let mut unrecognized_availability: Value = specification_example();
-        unrecognized_availability["availability"] = json!("stale");
 
         for (value, message) in [
             (available_without_value, "available and has no value"),
             (available_with_reason, "available and has a reason"),
             (unavailable_with_value, "unavailable and has a value"),
             (unavailable_without_reason, "unavailable and has no reason"),
-            (
-                unrecognized_availability,
-                "availability that is not recognized",
-            ),
         ] {
             let error: String = decode(value).unwrap_err().to_string();
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    #[test]
+    fn an_unknown_availability_is_not_available_and_has_no_value() {
+        let mut value: Value = specification_example();
+        value["availability"] = json!("stale");
+        let observation: Observation<Bytes> = decode(value).unwrap();
+        let Reading::Unrecognized(text) = &observation.reading else {
+            panic!("the reading is recognized");
+        };
+        assert_eq!(text.as_str(), "stale");
+        assert!(!observation.is_available());
+        assert_eq!(observation.value(), None);
+        assert_eq!(observation.reason(), None);
+
+        // The value and the reason of an unknown availability are not kept.
+        let encoded: Value = serde_json::to_value(&observation).unwrap();
+        assert_eq!(encoded["availability"], json!("stale"));
+        assert_eq!(encoded["value"], Value::Null);
+        assert_eq!(encoded["reason"], Value::Null);
+        assert_eq!(decode(encoded).unwrap(), observation);
     }
 
     #[test]

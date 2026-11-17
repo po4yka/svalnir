@@ -16,15 +16,14 @@ path = "src/lib.rs"
 name = "svalnir-agent"
 path = "src/main.rs"
 
-# The dependencies of the Milestone 1 modules. `sysinfo` has no user yet (see
-# `src/lib.rs`). No rendering crate is permitted in this graph.
+# The dependencies of the Milestone 1 modules. No rendering crate is permitted
+# in this graph.
 [dependencies]
 libc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 svalnir-core.workspace = true
-sysinfo.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

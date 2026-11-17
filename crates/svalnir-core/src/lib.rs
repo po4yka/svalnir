@@ -20,11 +20,6 @@
 
 #![forbid(unsafe_code)]
 
-// Only the tests use `serde_json` at this time.
-// TODO(npochaev): remove this line when a module uses the crate.
-#[cfg(not(test))]
-use serde_json as _;
-
 pub mod byte_size;
 pub mod config;
 pub mod duration;

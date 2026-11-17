@@ -19,13 +19,6 @@
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |
 
-// No module uses `sysinfo` yet. The native adapters of `platform::process`
-// read the process inventory. `README.md` plans `sysinfo` for the general
-// inventory.
-// TODO(npochaev): remove this line when a module uses the crate, or remove
-// the dependency.
-use sysinfo as _;
-
 pub mod capability;
 pub mod platform;
 pub mod scan;

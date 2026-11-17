@@ -155,11 +155,11 @@ impl Command {
                 OperationsCommand::Cancel(_) => "operations cancel",
             },
             Self::Agent { command } => match command {
-                AgentCommand::Install => "agent install",
+                AgentCommand::Install(_) => "agent install",
                 AgentCommand::Status => "agent status",
                 AgentCommand::Pause(_) => "agent pause",
                 AgentCommand::Resume => "agent resume",
-                AgentCommand::Uninstall => "agent uninstall",
+                AgentCommand::Uninstall(_) => "agent uninstall",
             },
             Self::Policy { command } => match command {
                 PolicyCommand::List => "policy list",
@@ -378,7 +378,7 @@ pub struct OperationRef {
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
     /// Register the user-session agent in observation mode.
-    Install,
+    Install(AgentServiceArgs),
     /// Show the state of the agent.
     Status,
     /// Suspend new automatic interventions.
@@ -386,7 +386,15 @@ pub enum AgentCommand {
     /// Resume automatic interventions.
     Resume,
     /// Remove the registered services of Svalnir.
-    Uninstall,
+    Uninstall(AgentServiceArgs),
+}
+
+/// Options of a command that changes the registered services of the host.
+#[derive(Debug, Args)]
+pub struct AgentServiceArgs {
+    /// Approve the change of the registered services without a prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

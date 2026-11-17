@@ -21,8 +21,8 @@
 //! | [`rule`] | Cleanup rule declarations, the registry interface, and candidate eligibility | `docs/CLEANUP_RULES.md` sections 2 to 9 |
 //! | [`authority`] | The policy revision, action grant, and privilege grant records | `docs/ARCHITECTURE.md` section 11 |
 //! | [`digest`] | Content digests | `docs/INTERFACES.md` section 5 |
-//! | [`plan`] | The manual plan builder (declared, not implemented) | `docs/ACTION_CONTRACTS.md` sections 2 and 3 |
-//! | [`grant`] | Activation and grant logic (declared, not implemented) | `docs/ARCHITECTURE.md` section 11 |
+//! | [`plan`] | The plan builder for a cleanup and for an application stop, the apply checks, and the plan explanation | `docs/ACTION_CONTRACTS.md` sections 2 and 3 |
+//! | [`grant`] | Activation and grant logic: activation, enablement, disable and revoke, pause and resume, rearm, and the authorization question | `docs/ARCHITECTURE.md` section 11 |
 
 #![forbid(unsafe_code)]
 

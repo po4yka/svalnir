@@ -1,16 +1,19 @@
 //! Svalnir command-line client.
 //!
-//! Parses arguments, renders output, and runs the read-only commands. It has
-//! no destructive execution path.
+//! Parses arguments, renders output, runs the read-only commands in its own
+//! process, and wires the commands that change state to the libraries:
+//! the plan builder and the grant logic of `svalnir-core`, and the journal,
+//! the coordinator, and the executors of `svalnir-agent`.
 //!
-//! Milestone 1 has no background agent and no IPC. The client links the
-//! agent library and runs each read-only command in its own process:
-//! `status`, `memory status`, `swap status`, `monitor`, `processes top`,
-//! `processes show`, `scan`, `report`, `doctor`, `config validate`,
-//! `config show`, `policy list`, `policy show`, `policy simulate`,
-//! `completions`, and `license`. Each command that changes the host, a
-//! policy, or the agent reports `not_implemented` with exit status 3 and
-//! makes no change. `docs/INTERFACES.md` owns the contract.
+//! Milestone 2 has no socket. A command reads and writes the operation
+//! journal in the state directory. A plan is applied by the process that
+//! holds the coordinator lock of the journal: the agent when one runs, and
+//! otherwise this process, as a transient coordinator that evaluates no
+//! guard. `docs/INTERFACES.md` owns the contract.
+//!
+//! No command acts without a plan that the journal has and an approval of
+//! that plan. `agent install` and `agent uninstall` change the registered
+//! services of the host only through `seams::ServiceHost`.
 //!
 //! | Module | Contents |
 //! | --- | --- |
@@ -19,7 +22,8 @@
 //! | `commands` | The dispatcher and one module for each command family |
 //! | `environment` | The state directory, the home directory, and the invocation directory |
 //! | `host` | The collection context of this process |
-//! | `interrupt` | The Ctrl+C flag of `scan` and `monitor` |
+//! | `interrupt` | The Ctrl+C flag of `scan`, `monitor`, and a wait for an operation |
+//! | `seams` | The terminal question, the Trash operation, and the service manager, which a test replaces |
 //! | `text` | Escaping and formatting of the human-readable output |
 
 use std::ffi::OsString;
@@ -33,8 +37,12 @@ mod environment;
 mod host;
 mod interrupt;
 pub mod output;
+mod seams;
 mod text;
 
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod intervention_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Access to the collectors of the agent library, in this process.
 //!
-//! Milestone 1 has no background agent and no IPC. A read-only command makes
+//! This build has no IPC. A read-only command makes
 //! one [`Host`], which holds one collection context, and reads the host
 //! through the adapters of `svalnir_agent`. No function here changes the
 //! host.
@@ -83,7 +83,7 @@ impl Host {
 /// The error for a collector that gave no observation envelope.
 pub(crate) fn collector_unavailable(detail: &str) -> ErrorBody {
     ErrorBody {
-        code: "collector_unavailable",
+        code: "collector_unavailable".into(),
         family: ErrorFamily::Native,
         stage: ErrorStage::Collection,
         message: format!("a collector of this host is not available: {detail}"),
@@ -104,7 +104,7 @@ impl From<CollectError> for ErrorBody {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn unsupported_platform(command: &str) -> ErrorBody {
     ErrorBody {
-        code: "unsupported_platform",
+        code: "unsupported_platform".into(),
         family: ErrorFamily::Native,
         stage: ErrorStage::Collection,
         message: format!("`svalnir {command}` has a collector for macOS only"),

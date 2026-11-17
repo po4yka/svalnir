@@ -106,6 +106,7 @@ pub(crate) fn environment() -> (Environment, TempDirectory) {
             home: Some(home),
             current_directory: Some(directory.path().to_path_buf()),
             interrupt,
+            seams: crate::seams::Seams::default(),
         },
         directory,
     )
@@ -561,5 +562,54 @@ pub(crate) fn capability_report(denied: bool) -> CapabilityReport {
         probed_at: Some(wall_time()),
         summary: Summary::of(&capabilities),
         capabilities,
+    }
+}
+
+/// A Trash operation that moves the entry to a directory of the test. It
+/// never moves an entry to the Trash of the user.
+#[derive(Debug)]
+pub(crate) struct DirectoryTrash {
+    directory: PathBuf,
+}
+
+impl DirectoryTrash {
+    pub(crate) fn new(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+}
+
+impl svalnir_agent::executor::fs::TrashBackend for DirectoryTrash {
+    fn move_to_trash(
+        &self,
+        request: &svalnir_agent::executor::fs::TrashRequest<'_>,
+    ) -> svalnir_agent::executor::fs::TrashReply {
+        use svalnir_agent::executor::fs::{TrashFailure, TrashReply};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let source: PathBuf = request.path.to_path_buf();
+        let Some(name) = source.file_name() else {
+            return TrashReply::Failed(TrashFailure::Other);
+        };
+        let mut item_name = name.to_owned();
+        item_name.push(format!(".{}", NEXT.fetch_add(1, Ordering::SeqCst)));
+        let item: PathBuf = self.directory.join(item_name);
+        match std::fs::rename(&source, &item) {
+            Ok(()) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let object = std::fs::symlink_metadata(&item).ok().and_then(|metadata| {
+                    Some(FileObjectEvidence {
+                        device: DeviceNumber::new(i32::try_from(metadata.dev()).ok()?),
+                        inode: InodeNumber::new(metadata.ino()),
+                    })
+                });
+                TrashReply::Moved {
+                    item: LosslessPath::from_path(&item).ok(),
+                    item_object: object,
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                TrashReply::Failed(TrashFailure::NotFound)
+            }
+            Err(_) => TrashReply::Failed(TrashFailure::Other),
+        }
     }
 }

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::interrupt::Interrupt;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
+use crate::seams::Seams;
 
 /// The environment variable that replaces the state directory.
 pub(crate) const STATE_DIRECTORY_VARIABLE: &str = "SVALNIR_STATE_DIR";
@@ -19,6 +20,12 @@ const DEFAULT_STATE_DIRECTORY: &str = "Library/Application Support/Svalnir";
 
 /// The file name of the configuration proposal in the state directory.
 const CONFIG_FILE_NAME: &str = "config.toml";
+
+/// The directory of the plan documents in the state directory.
+const PLAN_DIRECTORY_NAME: &str = "plans";
+
+/// The file name of the log of the agent in the state directory.
+const AGENT_LOG_FILE_NAME: &str = "agent.log";
 
 /// The file name of the catalog store in the state directory. It holds scan
 /// records and metric samples, which are rebuildable. The operation journal
@@ -37,6 +44,8 @@ pub(crate) struct Environment {
     pub(crate) current_directory: Option<PathBuf>,
     /// The interrupt request of the user.
     pub(crate) interrupt: Interrupt,
+    /// The host effects that a test replaces.
+    pub(crate) seams: Seams,
 }
 
 impl Environment {
@@ -49,6 +58,7 @@ impl Environment {
                 .map(PathBuf::from),
             current_directory: std::env::current_dir().ok(),
             interrupt: Interrupt::for_process(),
+            seams: Seams::default(),
         }
     }
 
@@ -75,7 +85,7 @@ impl Environment {
         match &self.home {
             Some(home) if home.is_absolute() => Ok(home.join(DEFAULT_STATE_DIRECTORY)),
             _ => Err(ErrorBody {
-                code: "state_directory_unavailable",
+                code: "state_directory_unavailable".into(),
                 family: ErrorFamily::Native,
                 stage: ErrorStage::Dispatch,
                 message: format!(
@@ -99,6 +109,23 @@ impl Environment {
         Ok(self.state_directory()?.join(CATALOG_FILE_NAME))
     }
 
+    /// The path of the operation journal.
+    pub(crate) fn journal_path(&self) -> Result<PathBuf, ErrorBody> {
+        Ok(svalnir_agent::runtime::journal_path(
+            &self.state_directory()?,
+        ))
+    }
+
+    /// The directory of the plan documents.
+    pub(crate) fn plan_directory(&self) -> Result<PathBuf, ErrorBody> {
+        Ok(self.state_directory()?.join(PLAN_DIRECTORY_NAME))
+    }
+
+    /// The path of the log of the agent.
+    pub(crate) fn agent_log_path(&self) -> Result<PathBuf, ErrorBody> {
+        Ok(self.state_directory()?.join(AGENT_LOG_FILE_NAME))
+    }
+
     /// Creates the state directory, for a command that must write.
     ///
     /// A new directory is readable only by its owner, because the records can
@@ -113,7 +140,7 @@ impl Environment {
             builder.mode(0o700);
         }
         builder.create(&directory).map_err(|error| ErrorBody {
-            code: "state_directory_not_writable",
+            code: "state_directory_not_writable".into(),
             family: ErrorFamily::Recording,
             stage: ErrorStage::Storage,
             message: format!("the state directory cannot be created: {}", error.kind()),
@@ -143,7 +170,7 @@ impl Environment {
         match &self.current_directory {
             Some(directory) => Ok(directory.join(path)),
             None => Err(ErrorBody {
-                code: "invocation_directory_unavailable",
+                code: "invocation_directory_unavailable".into(),
                 family: ErrorFamily::Request,
                 stage: ErrorStage::Arguments,
                 message: "the invocation directory is not known; give an absolute path".to_owned(),
@@ -158,7 +185,7 @@ impl Environment {
 
 fn request_error(code: &'static str, message: String) -> ErrorBody {
     ErrorBody {
-        code,
+        code: code.into(),
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
         message,

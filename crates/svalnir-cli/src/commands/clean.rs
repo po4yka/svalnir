@@ -1,0 +1,803 @@
+//! `clean plan`, `clean show`, and `clean apply`.
+//!
+//! `clean plan` and `clean show` change no file of the user: they read a
+//! saved scan, the current identity of each recorded entry, and the
+//! journal, and they write only the sealed plan and the plan document of
+//! this client. `clean apply` hands the plan to the coordinator
+//! ([`super::apply`]).
+//!
+//! The candidates of a plan in the `trash` or the `permanent` mode are the
+//! entries that the saved scan record names: its largest files and its
+//! largest directories below the scan root. The plan builder leaves out a
+//! protected, excluded, or overlapping entry and states the reason.
+
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use svalnir_agent::journal::OperationJournal;
+use svalnir_agent::platform::volume;
+use svalnir_agent::scan::ScanResult;
+use svalnir_core::action::{FileObjectType, Plan, WorkCharge};
+use svalnir_core::authority::AuthorityBinding;
+use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
+use svalnir_core::id::{OperationId, PlanId, RootId, ScanId, StepId, TargetId};
+use svalnir_core::plan::{
+    CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, PlanBuildError, PlanContext,
+    PlanExplanation, PlanMode, PlanOutcome, PlanPreview, SizeEstimate, TargetPreview,
+    build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
+};
+use svalnir_core::policy::ProtectionFact;
+use svalnir_core::process::Uid;
+use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
+use svalnir_core::rule::{RuleMode, RuleRegistry as _};
+use svalnir_core::volume::VolumeIdentity;
+
+use super::apply::{self, ApplyFlow};
+use super::plan_store::{self, PlanDocument, RootRecord};
+use super::plan_view;
+use super::session::{self, ActiveConfig, Now, journal_error};
+use super::{CommandFailure, Invocation};
+use crate::cli::{CleanApplyArgs, CleanMode, CleanPlanArgs, PlanRef};
+use crate::environment::Environment;
+use crate::host::Host;
+use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
+use crate::text::{escape, put_line};
+
+/// The work ceiling of one manual cleanup plan. A manual plan is bounded
+/// by its selection; these values only keep the arithmetic in range.
+const PLAN_WORK_BYTES: u64 = 1 << 50;
+const PLAN_WORK_ITEMS: u64 = 4_000_000;
+
+/// The work ceiling of one batch of a manual cleanup plan.
+const BATCH_WORK_ITEMS: u64 = 100_000;
+
+/// The time that the execution of a manual cleanup plan can use.
+const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000_000);
+
+/// The time in which the executor verifies the effect of one step.
+const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
+
+const PLAN_NOTE: &str = "This command changed no file. The plan gives no authority: apply it with `svalnir clean apply --plan PLAN_ID`, which asks for the approval of this plan and checks each target again.";
+
+const EMPTY_PLAN_NOTE: &str =
+    "No entry is in the plan, so there is no plan to apply. This command changed no file.";
+
+/// An entry of the scan record that is not a candidate now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StaleEntry {
+    pub(crate) path: LosslessPath,
+    /// `absent`, `changed_since_scan`, `outside_scan_root`,
+    /// `type_not_supported`, or `not_readable`.
+    pub(crate) reason: &'static str,
+}
+
+/// The result of `clean plan` and `clean show`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PlanView {
+    /// The scan that supplied the candidates.
+    pub(crate) scan_id: Option<ScanId>,
+    /// The plan, its consequence, its targets, and the entries that were
+    /// left out.
+    pub(crate) explanation: PlanExplanation,
+    /// The entries of the scan record that are not candidates now.
+    pub(crate) stale_entries: Vec<StaleEntry>,
+    /// The operation of the plan, when it was applied.
+    pub(crate) operation_id: Option<OperationId>,
+    /// False when this client has no plan document: the display paths and
+    /// the estimates are then not known.
+    pub(crate) has_plan_document: bool,
+    pub(crate) note: &'static str,
+}
+
+impl PlanView {
+    pub(crate) fn render(&self) -> String {
+        let mut out = String::new();
+        plan_view::render(&self.explanation, &mut out);
+        if !self.stale_entries.is_empty() {
+            put_line!(
+                out,
+                "\nNot candidates now ({} entries of the scan record):",
+                self.stale_entries.len()
+            );
+            for entry in self.stale_entries.iter().take(plan_view::TEXT_LIST_LIMIT) {
+                put_line!(out, "  {}  {}", entry.reason, entry.path.display_label());
+            }
+            if self.stale_entries.len() > plan_view::TEXT_LIST_LIMIT {
+                out.push_str("  ...\n");
+            }
+        }
+        if let Some(operation_id) = &self.operation_id {
+            put_line!(out, "\nApplied: operation {operation_id}");
+        }
+        if !self.has_plan_document {
+            out.push_str(
+                "\nThis client has no plan document for the plan, so the paths and the estimates are not known.\n",
+            );
+        }
+        put_line!(out, "\n{}", escape(self.note));
+        out
+    }
+}
+
+fn plan_error(error: &PlanBuildError) -> ErrorBody {
+    let code: &'static str = match error {
+        PlanBuildError::TooManyEntries { .. } => "selection_too_large",
+        PlanBuildError::Rule(_) => "rule_mode_not_validated",
+        PlanBuildError::UnsupportedExecutor => "helper_not_available",
+        PlanBuildError::Authority | PlanBuildError::Principal => "plan_authority_not_usable",
+        PlanBuildError::Lifetime | PlanBuildError::Limits => "plan_limits_not_usable",
+        _ => "plan_not_buildable",
+    };
+    ErrorBody::new(
+        code,
+        error.family(),
+        ErrorStage::Admission,
+        format!("the plan cannot be built: {error}; the command made no change"),
+    )
+}
+
+/// The device and inode of a file, when the device number fits.
+fn object_of(metadata: &std::fs::Metadata) -> Option<FileObjectEvidence> {
+    Some(FileObjectEvidence {
+        device: DeviceNumber::new(i32::try_from(metadata.dev()).ok()?),
+        inode: InodeNumber::new(metadata.ino()),
+    })
+}
+
+fn scan_stale(detail: &str) -> ErrorBody {
+    ErrorBody::new(
+        "scan_stale",
+        ErrorFamily::Evidence,
+        ErrorStage::Collection,
+        format!("the saved scan does not describe the current state: {detail}; scan again; the command made no change"),
+    )
+    .with_fields(&["scan"])
+    .with_next_action(NextAction::RefreshObservation)
+}
+
+/// The cleanup root of a scan: the scan root, with its current identity
+/// and its volume. The root must be the directory that the scan read.
+fn root_record(scan: &ScanResult) -> Result<RootRecord, ErrorBody> {
+    let path: PathBuf = scan.root.to_path_buf();
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| scan_stale("the scan root is not readable"))?;
+    let object: FileObjectEvidence = object_of(&metadata)
+        .filter(|_| metadata.is_dir())
+        .ok_or_else(|| scan_stale("the scan root is not a directory"))?;
+    if object != scan.volume.root_object {
+        return Err(scan_stale(
+            "the scan root is a different directory than at the scan",
+        ));
+    }
+    // The volume identity is read again, so a volume that was mounted
+    // again has its current mount generation.
+    let volume: VolumeIdentity = volume::volume_at(&path)
+        .map(|mounted| mounted.identity)
+        .map_err(|_| {
+            ErrorBody::new(
+                "volume_identity_unavailable",
+                ErrorFamily::Evidence,
+                ErrorStage::Collection,
+                "the volume of the scan root has no identity that a plan can bind; the command made no change",
+            )
+        })?;
+    Ok(RootRecord {
+        root_id: root_id_of(&scan.root, object, &volume).ok_or_else(session::identity_error)?,
+        path: scan.root.clone(),
+        object,
+        volume,
+    })
+}
+
+/// The identity of a cleanup root: a digest of its path, its device and
+/// inode, its volume, and its mount generation.
+///
+/// The sealed plan binds the root identity of each target and not the
+/// path of the root. With this identity, a plan document whose root has a
+/// different path or a different object does not agree with the sealed
+/// plan, and the client does not use it.
+fn root_id_of(
+    path: &LosslessPath,
+    object: FileObjectEvidence,
+    volume: &VolumeIdentity,
+) -> Option<RootId> {
+    let digest = svalnir_core::digest::ContentDigest::of_json(&(
+        path,
+        object,
+        &volume.volume_id,
+        &volume.mount_id,
+    ))
+    .ok()?;
+    let text: &str = digest.as_str();
+    RootId::new(format!(
+        "root-{}",
+        text.strip_prefix("sha256:").unwrap_or(text)
+    ))
+    .ok()
+}
+
+/// Whether a plan document agrees with the sealed plan of the journal:
+/// the same digest, the same plan, and cleanup roots whose identities are
+/// those that the plan binds.
+fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
+    let roots_agree = || {
+        document.roots.iter().all(|root| {
+            root_id_of(&root.path, root.object, &root.volume).as_ref() == Some(&root.root_id)
+        })
+    };
+    &document.digest == plan.digest()
+        && document.outcome.plan.as_ref() == Some(plan)
+        && roots_agree()
+}
+
+/// The path of a file target: the path of its cleanup root and its
+/// relative entry, which the sealed plan binds.
+fn bound_path(
+    document: &PlanDocument,
+    binding: &svalnir_core::action::FileBinding,
+) -> Option<LosslessPath> {
+    let root: &RootRecord = document
+        .roots
+        .iter()
+        .find(|root| root.root_id == binding.root_id)?;
+    let mut bytes: Vec<u8> = root.path.as_bytes().to_vec();
+    if bytes.last() != Some(&b'/') {
+        bytes.push(b'/');
+    }
+    bytes.extend_from_slice(binding.relative_entry.as_bytes());
+    LosslessPath::from_bytes(bytes).ok()
+}
+
+/// The product protection of a file entry. This build has no catalog of
+/// protected file locations in `svalnir-core`; the client protects the
+/// home directory, each directory that contains it, and the state
+/// directory of Svalnir. The filesystem executor refuses the first two
+/// again, and the plan builder applies the `[protections]` table.
+fn file_protection(path: &Path, home: Option<&Path>, state_directory: &Path) -> ProtectionFact {
+    let Some(home) = home else {
+        return ProtectionFact::Unknown;
+    };
+    if home.starts_with(path)
+        || path.starts_with(state_directory)
+        || state_directory.starts_with(path)
+    {
+        ProtectionFact::Protected
+    } else {
+        ProtectionFact::NotProtected
+    }
+}
+
+/// The type of a file object that a plan can bind.
+fn object_type_of(metadata: &std::fs::Metadata) -> Option<FileObjectType> {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        Some(FileObjectType::Directory)
+    } else if file_type.is_file() {
+        Some(FileObjectType::RegularFile)
+    } else if file_type.is_symlink() {
+        Some(FileObjectType::SymbolicLink)
+    } else {
+        None
+    }
+}
+
+/// The entry relative to the scan root, whose path with a last `/` is
+/// `prefix`. `None` for a path that is not below the root.
+fn relative_entry(path: &LosslessPath, prefix: &[u8]) -> Option<LosslessPath> {
+    path.as_bytes()
+        .strip_prefix(prefix)
+        .filter(|relative| !relative.is_empty())
+        .and_then(|relative| LosslessPath::from_bytes(relative.to_vec()).ok())
+}
+
+/// One recorded entry of a scan.
+struct Recorded<'a> {
+    path: &'a LosslessPath,
+    object: FileObjectEvidence,
+    logical: Bytes,
+    allocated: Bytes,
+    /// The number of entries below a directory.
+    entries: Option<EntryCount>,
+}
+
+struct Selection {
+    entries: Vec<CleanupEntry>,
+    stale: Vec<StaleEntry>,
+}
+
+/// Makes the candidates of a plan from the entries that the scan record
+/// names. Each entry is measured again with `lstat`; an entry that is
+/// absent or is a different object than at the scan is not a candidate.
+fn select(
+    scan: &ScanResult,
+    root: &RootRecord,
+    mode: CleanMode,
+    plan_text: &str,
+    environment: &Environment,
+) -> Result<Selection, ErrorBody> {
+    let home: Option<PathBuf> = environment
+        .home
+        .as_ref()
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    let state_directory: PathBuf = environment.state_directory()?;
+    let state_directory: PathBuf =
+        std::fs::canonicalize(&state_directory).unwrap_or(state_directory);
+    let mut prefix: Vec<u8> = scan.root.as_bytes().to_vec();
+    if prefix.last() != Some(&b'/') {
+        prefix.push(b'/');
+    }
+    let recorded = scan
+        .largest_directories
+        .iter()
+        .map(|directory| Recorded {
+            path: &directory.path,
+            object: directory.object,
+            logical: directory.logical_bytes,
+            allocated: directory.allocated_bytes,
+            entries: Some(directory.entries),
+        })
+        .chain(scan.largest_files.iter().map(|file| Recorded {
+            path: &file.path,
+            object: file.object,
+            logical: file.logical_bytes,
+            allocated: file.allocated_bytes,
+            entries: None,
+        }));
+    let mut selection = Selection {
+        entries: Vec::new(),
+        stale: Vec::new(),
+    };
+    for (index, entry) in recorded.enumerate() {
+        let mut stale = |reason: &'static str| {
+            selection.stale.push(StaleEntry {
+                path: entry.path.clone(),
+                reason,
+            });
+        };
+        // The scan root itself is the cleanup root; it is never a target.
+        if entry.path == &scan.root {
+            continue;
+        }
+        let Some(relative) = relative_entry(entry.path, &prefix) else {
+            stale("outside_scan_root");
+            continue;
+        };
+        let path: PathBuf = entry.path.to_path_buf();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                stale("absent");
+                continue;
+            }
+            Err(_) => {
+                stale("not_readable");
+                continue;
+            }
+        };
+        if object_of(&metadata) != Some(entry.object) {
+            stale("changed_since_scan");
+            continue;
+        }
+        let Some(object_type) = object_type_of(&metadata) else {
+            stale("type_not_supported");
+            continue;
+        };
+        let work_bytes: Bytes = entry.logical.max(entry.allocated);
+        let items: EntryCount = EntryCount::new(
+            entry
+                .entries
+                .map_or(1, |entries| entries.get().saturating_add(1)),
+        );
+        let identity = |kind: char| format!("{plan_text}-{kind}{index:04}");
+        selection.entries.push(CleanupEntry {
+            target_id: TargetId::new(identity('t')).map_err(|_| session::identity_error())?,
+            step_id: StepId::new(identity('s')).map_err(|_| session::identity_error())?,
+            path: entry.path.clone(),
+            root_id: root.root_id.clone(),
+            root_path: root.path.clone(),
+            relative_entry: relative,
+            volume_id: root.volume.volume_id.clone(),
+            mount_id: root.volume.mount_id.clone(),
+            object_type,
+            owner: Some(Uid::new(metadata.uid())),
+            object: Some(entry.object),
+            charge: Some(WorkCharge::new(work_bytes, items)),
+            estimate: SizeEstimate {
+                logical_bytes: Some(entry.logical),
+                allocated_bytes: Some(entry.allocated),
+                // A move to Trash reclaims nothing. For a permanent
+                // removal the allocated size is the estimate; shared
+                // storage can make the reclaimed size smaller.
+                estimated_reclaimable_bytes: (mode != CleanMode::Trash).then_some(entry.allocated),
+            },
+            // The comparison uses the path with no symbolic link, as the
+            // home directory and the state directory are.
+            hard_protection: std::fs::canonicalize(&path)
+                .map_or(ProtectionFact::Unknown, |canonical| {
+                    file_protection(&canonical, home.as_deref(), &state_directory)
+                }),
+            rule: None,
+        });
+    }
+    Ok(selection)
+}
+
+/// The `evict` mode needs the candidates of one reviewed rule with a
+/// recorded validation for manual eviction. No rule of this build has one,
+/// and the rule discovery is not connected to this command.
+#[cfg(unix)]
+fn evict_refusal(rule: Option<&str>) -> ErrorBody {
+    let Ok(registry) = svalnir_agent::rules::ReviewedRules::new() else {
+        return ErrorBody::new(
+            "rule_registry_unavailable",
+            ErrorFamily::Native,
+            ErrorStage::Dispatch,
+            "the rule registry of this build is not usable; the command made no change",
+        );
+    };
+    let name: &str = rule.unwrap_or_default();
+    let Some(found) = registry
+        .rules()
+        .into_iter()
+        .find(|candidate| candidate.reference.id.as_str() == name)
+    else {
+        return ErrorBody::new(
+            "unknown_rule",
+            ErrorFamily::Request,
+            ErrorStage::Arguments,
+            "the rule registry of this build has no rule with this ID; the command made no change",
+        )
+        .with_fields(&["rule"]);
+    };
+    let validated: bool = found
+        .layouts
+        .iter()
+        .any(|layout| layout.lifecycle.permits(&RuleMode::ManualEviction));
+    if validated {
+        ErrorBody::new(
+            "evict_discovery_not_available",
+            ErrorFamily::Native,
+            ErrorStage::Dispatch,
+            "the candidate discovery of a reviewed rule is not connected to `svalnir clean plan` in this build; the command made no change",
+        )
+    } else {
+        ErrorBody::new(
+            "rule_mode_not_validated",
+            ErrorFamily::Eligibility,
+            ErrorStage::Admission,
+            "the rule has no recorded validation for manual eviction, so the `evict` mode is not permitted for it; the command made no change",
+        )
+        .with_fields(&["rule", "mode"])
+    }
+}
+
+fn plan_not_found(plan_id: &str) -> ErrorBody {
+    ErrorBody::new(
+        "plan_not_found",
+        ErrorFamily::Evidence,
+        ErrorStage::Storage,
+        "the journal has no plan with this ID; the command made no change",
+    )
+    .with_fields(&["plan"])
+    .with_plan(plan_id)
+    .with_next_action(NextAction::PrepareNewPlan)
+}
+
+fn parse_plan_id(text: &str) -> Result<PlanId, ErrorBody> {
+    PlanId::new(text)
+        .map_err(|_| session::invalid_identifier("invalid_plan_id", "plan ID", &["plan"]))
+}
+
+/// Builds the plan of a selection with the plan builder.
+fn build(
+    environment: &Environment,
+    now: &Now,
+    config: &svalnir_core::config::ValidatedConfig,
+    plan_id: &PlanId,
+    policy_revision: &svalnir_core::id::PolicyRevisionId,
+    mode: CleanMode,
+    entries: &[CleanupEntry],
+) -> Result<PlanOutcome, ErrorBody> {
+    let home: Option<LosslessPath> = environment
+        .home
+        .as_ref()
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .and_then(|home| LosslessPath::from_path(&home).ok());
+    let lifetime: Nanoseconds =
+        manual_plan_lifetime(config).ok_or_else(|| plan_error(&PlanBuildError::Lifetime))?;
+    let context = PlanContext {
+        plan_id: plan_id.clone(),
+        principal: session::principal(),
+        authority: AuthorityBinding {
+            policy_revision: policy_revision.clone(),
+            action_grants: Vec::new(),
+            privilege_grant: None,
+        },
+        clock: &now.clock,
+        created_wall: now.wall,
+        lifetime,
+        protections: config.protections(),
+        home_directory: home.as_ref(),
+    };
+    let request = CleanupRequest {
+        mode: match mode {
+            CleanMode::Permanent => ModeSelection::Permanent,
+            CleanMode::Trash | CleanMode::Evict => ModeSelection::Trash,
+        },
+        entries,
+        preset: None,
+        limits: CleanupLimits {
+            plan: WorkCharge::new(
+                Bytes::new(PLAN_WORK_BYTES),
+                EntryCount::new(PLAN_WORK_ITEMS),
+            ),
+            batch: WorkCharge::new(
+                Bytes::new(PLAN_WORK_BYTES),
+                EntryCount::new(BATCH_WORK_ITEMS),
+            ),
+            execution_deadline: EXECUTION_DEADLINE,
+            verification_window: VERIFICATION_WINDOW,
+        },
+    };
+    build_cleanup_plan(&context, &request).map_err(|error| plan_error(&error))
+}
+
+pub(crate) fn plan(
+    arguments: &CleanPlanArgs,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    if arguments.profile.is_some() {
+        return Err(ErrorBody::new(
+            "selection_preset_not_available",
+            ErrorFamily::Native,
+            ErrorStage::Dispatch,
+            "this build defines no selection preset, so `--profile` cannot filter the candidates; send the request with no `--profile`; the command made no change",
+        )
+        .with_fields(&["profile"])
+        .into());
+    }
+    if arguments.mode == CleanMode::Evict {
+        return Err(evict_refusal(arguments.rule.as_deref()).into());
+    }
+    let environment: &Environment = invocation.environment;
+    let scan: ScanResult = super::scan::load_scan(&arguments.scan, environment)?;
+    let host: Host = Host::open()?;
+    let now: Now = Now::read(&host)?;
+    let mut journal: OperationJournal = session::open_journal(environment)?;
+    let authority = session::read_authority(&journal)?;
+    let ActiveConfig { active, config } = session::active_config(&journal, &authority.state)?;
+
+    let plan_text: String = session::new_id("plan");
+    let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
+    let root: RootRecord = root_record(&scan)?;
+    let selection: Selection = select(&scan, &root, arguments.mode, &plan_text, environment)?;
+    let outcome: PlanOutcome = build(
+        environment,
+        &now,
+        &config,
+        &plan_id,
+        &active.revision.revision_id,
+        arguments.mode,
+        &selection.entries,
+    )?;
+    let has_plan: bool = outcome.plan.is_some();
+    if let Some(plan) = &outcome.plan {
+        // The journal has the sealed plan before the document names it.
+        journal
+            .try_record_plan(plan)
+            .map_err(|error| journal_error(&error))?;
+        let mut document =
+            PlanDocument::new(plan_id.clone(), plan.digest().clone(), outcome.clone());
+        document.roots = vec![root];
+        document.scan_id = Some(scan.scan_id.clone());
+        plan_store::save_plan(environment, &document)?;
+        plan_store::prune(environment);
+    }
+    let view = PlanView {
+        scan_id: Some(scan.scan_id),
+        explanation: explain(&outcome, &now.clock),
+        stale_entries: selection.stale,
+        operation_id: None,
+        has_plan_document: has_plan,
+        note: if has_plan { PLAN_NOTE } else { EMPTY_PLAN_NOTE },
+    };
+    invocation.emit(Kind::Report, &view, PlanView::render)?;
+    Ok(ExitStatus::Success)
+}
+
+/// The stored plan and the plan document of this client. A document whose
+/// digest is not that of the stored plan is not used.
+pub(crate) struct StoredPlan {
+    pub(crate) plan: Plan,
+    pub(crate) document: Option<PlanDocument>,
+}
+
+pub(crate) fn load_plan(
+    journal: Option<&OperationJournal>,
+    environment: &Environment,
+    plan_id: &PlanId,
+) -> Result<StoredPlan, ErrorBody> {
+    let plan: Plan = journal
+        .ok_or_else(|| plan_not_found(plan_id.as_str()))?
+        .try_plan(plan_id)
+        .map_err(|error| journal_error(&error))?
+        .ok_or_else(|| plan_not_found(plan_id.as_str()))?;
+    let document: Option<PlanDocument> = plan_store::load_plan(environment, plan_id)?
+        .filter(|document| document_agrees(document, &plan));
+    Ok(StoredPlan { plan, document })
+}
+
+/// The builder result of a stored plan: that of the plan document, or a
+/// result with the plan and no display data.
+pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> {
+    if let Some(document) = &stored.document {
+        // The display path of a file target comes from the values that
+        // the sealed plan binds, not from the text of the document.
+        let mut outcome: PlanOutcome = document.outcome.clone();
+        for preview in &mut outcome.preview.targets {
+            if let Some(svalnir_core::action::TargetBinding::File(binding)) = stored
+                .plan
+                .target(&preview.target_id)
+                .map(|target| &target.binding)
+            {
+                preview.path = bound_path(document, binding);
+            }
+        }
+        return Ok(outcome);
+    }
+    let mode: PlanMode = mode_of(&stored.plan).ok_or_else(|| {
+        ErrorBody::new(
+            "plan_not_executable",
+            ErrorFamily::Request,
+            ErrorStage::Storage,
+            "the stored plan has a mode that this build does not recognize",
+        )
+    })?;
+    Ok(PlanOutcome {
+        mode,
+        preview: PlanPreview {
+            targets: stored
+                .plan
+                .targets
+                .iter()
+                .map(|target| TargetPreview {
+                    target_id: target.target_id.clone(),
+                    path: None,
+                    estimate: SizeEstimate::default(),
+                })
+                .collect(),
+            batches: Vec::new(),
+            omitted: Vec::new(),
+            preset: None,
+        },
+        plan: Some(stored.plan.clone()),
+    })
+}
+
+pub(crate) fn show(
+    arguments: &PlanRef,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let plan_id: PlanId = parse_plan_id(&arguments.plan)?;
+    let environment: &Environment = invocation.environment;
+    let journal: Option<OperationJournal> = session::open_existing_journal(environment)?;
+    let stored: StoredPlan = load_plan(journal.as_ref(), environment, &plan_id)?;
+    let host: Host = Host::open()?;
+    let now: Now = Now::read(&host)?;
+    let operation_id: Option<OperationId> = match &journal {
+        Some(journal) => apply::existing_operation(journal, &plan_id)?
+            .map(|operation| operation.operation_id().clone()),
+        None => None,
+    };
+    let view = PlanView {
+        scan_id: stored
+            .document
+            .as_ref()
+            .and_then(|document| document.scan_id.clone()),
+        explanation: explain(&outcome_of(&stored)?, &now.clock),
+        stale_entries: Vec::new(),
+        operation_id,
+        has_plan_document: stored.document.is_some(),
+        note: "This command changed nothing.",
+    };
+    invocation.emit(Kind::Report, &view, PlanView::render)?;
+    Ok(ExitStatus::Success)
+}
+
+pub(crate) fn apply(
+    arguments: &CleanApplyArgs,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let plan_id: PlanId = parse_plan_id(&arguments.plan.plan)?;
+    let environment: &Environment = invocation.environment;
+    let journal: Option<OperationJournal> = session::open_existing_journal(environment)?;
+    let stored: StoredPlan = load_plan(journal.as_ref(), environment, &plan_id)?;
+    let is_cleanup: bool = matches!(mode_of(&stored.plan), Some(PlanMode::Cleanup(_)));
+    if !is_cleanup {
+        return Err(ErrorBody::new(
+            "not_a_cleanup_plan",
+            ErrorFamily::Request,
+            ErrorStage::Arguments,
+            "the plan is not a cleanup plan; a stop plan is applied by `svalnir processes stop`; the command made no change",
+        )
+        .with_fields(&["plan"])
+        .with_plan(plan_id.as_str())
+        .into());
+    }
+    let authority = match &journal {
+        Some(journal) => session::read_authority(journal)?.state,
+        None => return Err(plan_not_found(plan_id.as_str()).into()),
+    };
+    // The executor needs the cleanup roots, which only the plan document
+    // has. A plan that was applied before needs none: its operation is
+    // reported.
+    let applied_before: bool = match &journal {
+        Some(journal) => apply::existing_operation(journal, &plan_id)?.is_some(),
+        None => false,
+    };
+    if stored.document.is_none() && !applied_before {
+        return Err(ErrorBody::new(
+            "plan_document_missing",
+            ErrorFamily::Evidence,
+            ErrorStage::Storage,
+            "this client has no plan document for the plan, so the cleanup roots are not known; prepare a new plan; the command made no change",
+        )
+        .with_plan(plan_id.as_str())
+        .with_next_action(NextAction::PrepareNewPlan)
+        .into());
+    }
+    drop(journal);
+    let summary: String = match Host::open().and_then(|host| Now::read(&host)) {
+        Ok(now) => {
+            let mut out = String::new();
+            plan_view::render(&explain(&outcome_of(&stored)?, &now.clock), &mut out);
+            out
+        }
+        Err(_) => String::new(),
+    };
+    apply::run(
+        ApplyFlow {
+            plan: &stored.plan,
+            document: stored.document.clone(),
+            authority,
+            control_plane: None,
+            no_wait: arguments.apply.no_wait,
+            yes: arguments.apply.yes,
+            summary,
+            what: "the apply of the plan",
+        },
+        invocation,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use svalnir_core::policy::ProtectionFact;
+
+    use super::file_protection;
+
+    #[test]
+    fn the_home_directory_its_ancestors_and_the_state_directory_are_protected() {
+        let home = Path::new("/Users/test");
+        let state = Path::new("/Users/test/Library/Application Support/Svalnir");
+        let protection = |path: &str| file_protection(Path::new(path), Some(home), state);
+        assert_eq!(protection("/Users/test"), ProtectionFact::Protected);
+        assert_eq!(protection("/Users"), ProtectionFact::Protected);
+        assert_eq!(
+            protection("/Users/test/Library/Application Support/Svalnir/plans"),
+            ProtectionFact::Protected
+        );
+        assert_eq!(protection("/Users/test/Library"), ProtectionFact::Protected);
+        assert_eq!(
+            protection("/Users/test/project/build"),
+            ProtectionFact::NotProtected
+        );
+        assert_eq!(
+            file_protection(Path::new("/tmp/x"), None, state),
+            ProtectionFact::Unknown
+        );
+    }
+}

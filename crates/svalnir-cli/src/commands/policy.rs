@@ -36,10 +36,10 @@ use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAc
 const STARTUP_DATA_SELECTOR: &str = "startup-data";
 
 /// The statement of `policy list` and `policy show`.
-const NOT_ACTIVE_NOTE: &str = "These policies are a proposal. No policy is active in this build, and this command recorded no grant.";
+const NOT_ACTIVE_NOTE: &str = "These policies are a proposal: the configuration file, or the built-in template. This command recorded no grant. `svalnir agent status` shows the revision in effect and the standing of each guard.";
 
 /// The statement of `policy simulate` about its inputs.
-const SIMULATION_NOTE: &str = "This is a simulation of a proposal that is not active. The grants are the recorded state of this build: none. The snapshot has no cleanup candidate, because this build has no rule registry. The product protection of each application comes from the catalog of hard protections; this process and its ancestors are protected. One snapshot starts a qualification window and cannot complete it.";
+const SIMULATION_NOTE: &str = "This is a simulation of a proposal that is not active. The simulation uses no grant: it does not read the authority record. The snapshot has no cleanup candidate, because this build has no rule registry. The product protection of each application comes from the catalog of hard protections; this process and its ancestors are protected. One snapshot starts a qualification window and cannot complete it.";
 
 const fn policy_id(name: PolicyName) -> PolicyId {
     match name {
@@ -154,7 +154,7 @@ pub(crate) struct SimulationInputs {
 
 fn input_error(error: &policy::PolicyInputError) -> ErrorBody {
     ErrorBody {
-        code: "simulation_input_too_large",
+        code: "simulation_input_too_large".into(),
         family: ErrorFamily::Native,
         stage: ErrorStage::Collection,
         message: format!("the snapshot is not usable for a simulation: {error}"),
@@ -490,7 +490,7 @@ mod tests {
         assert!(text.contains("Source: built-in template"), "{text}");
         assert!(text.contains("policy: disk-guard"), "{text}");
         assert!(text.contains("policy: memory-guard"), "{text}");
-        assert!(text.contains("No policy is active in this build"), "{text}");
+        assert!(text.contains("These policies are a proposal"), "{text}");
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json["active"], false);
         assert_eq!(json["policies"][1]["policy"], "memory-guard");

@@ -347,6 +347,7 @@ mod tests {
                 environment: &environment,
                 stdout: &mut stdout,
                 stderr: &mut stderr,
+                timeout: None,
                 warnings: Vec::new(),
             };
             stream(
@@ -441,6 +442,7 @@ mod tests {
             environment: &environment,
             stdout: &mut stdout,
             stderr: &mut stderr,
+            timeout: None,
             warnings: Vec::new(),
         };
         stream(

@@ -378,7 +378,7 @@ fn generate_scan_id() -> Result<ScanId, ErrorBody> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     ScanId::new(format!("scan_{nanoseconds:x}_{:x}", std::process::id())).map_err(|_| ErrorBody {
-        code: "scan_identity_unavailable",
+        code: "scan_identity_unavailable".into(),
         family: ErrorFamily::Native,
         stage: ErrorStage::Collection,
         message: "the scan identity cannot be made".to_owned(),
@@ -421,7 +421,7 @@ fn scan_error(error: &ScanError) -> ErrorBody {
         ErrorStage::Collection
     };
     ErrorBody {
-        code,
+        code: code.into(),
         family,
         stage,
         message: format!("the scan did not start: {detail}; the command made no change"),
@@ -434,7 +434,7 @@ fn scan_error(error: &ScanError) -> ErrorBody {
 
 fn store_error(error: &StoreError) -> ErrorBody {
     ErrorBody {
-        code: "state_store_unavailable",
+        code: "state_store_unavailable".into(),
         family: ErrorFamily::Recording,
         stage: ErrorStage::Storage,
         message: format!("the catalog store gave an error: {error}"),
@@ -603,7 +603,7 @@ pub(crate) fn scan_root(
                 started_at: result.started.wall.unwrap_or(finished_at),
                 finished_at,
                 result_json: serde_json::to_string(&result).map_err(|_| ErrorBody {
-                    code: "scan_record_not_encoded",
+                    code: "scan_record_not_encoded".into(),
                     family: ErrorFamily::Recording,
                     stage: ErrorStage::Storage,
                     message: "the scan result cannot be encoded; it is not saved".to_owned(),
@@ -630,7 +630,7 @@ pub(crate) fn scan_root(
                 Err(error) => {
                     let detail: String = store_error(&error).message;
                     warnings.push(Warning {
-                        code: "save_readback_failed",
+                        code: "save_readback_failed".into(),
                         message: format!(
                             "the scan record was saved, but reading it back failed: {detail}"
                         ),
@@ -655,7 +655,7 @@ pub(crate) fn scan_root(
 /// Reads a saved scan.
 pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<ReportView, ErrorBody> {
     let scan_id: ScanId = ScanId::new(scan).map_err(|_| ErrorBody {
-        code: "invalid_scan_id",
+        code: "invalid_scan_id".into(),
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
         message: "the scan ID is not valid; use the ID that `svalnir scan --save` printed"
@@ -667,7 +667,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
     })?;
     let not_found = || {
         ErrorBody {
-        code: "scan_not_found",
+        code: "scan_not_found".into(),
         family: ErrorFamily::Evidence,
         stage: ErrorStage::Storage,
         message: "no saved scan has this ID: the scan was not saved, or the retention removed it; the command made no change".to_owned(),
@@ -686,7 +686,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
         Err(error) => {
             return Err(ErrorBody {
-                code: "state_store_unavailable",
+                code: "state_store_unavailable".into(),
                 family: ErrorFamily::Recording,
                 stage: ErrorStage::Storage,
                 message: format!("the catalog store cannot be inspected: {}", error.kind()),
@@ -704,7 +704,7 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         .map_err(|error| store_error(&error))?
         .ok_or_else(not_found)?;
     let result: ScanResult = serde_json::from_str(&record.result_json).map_err(|_| ErrorBody {
-        code: "scan_record_unreadable",
+        code: "scan_record_unreadable".into(),
         family: ErrorFamily::Recording,
         stage: ErrorStage::Storage,
         message: "the saved scan record is not readable by this build".to_owned(),
@@ -719,6 +719,11 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         recorded_finished_at: record.finished_at,
         note: AUTHORITY_NOTE,
     })
+}
+
+/// Reads the result of a saved scan, for a cleanup plan.
+pub(crate) fn load_scan(scan: &str, environment: &Environment) -> Result<ScanResult, ErrorBody> {
+    load_report(scan, environment).map(|report| report.scan)
 }
 
 pub(crate) fn scan(
@@ -861,14 +866,14 @@ mod tests {
         std::fs::write(&state, b"x").unwrap();
         environment.state_directory_override = Some(state.into_os_string());
         let error = super::load_report("scan_test", &environment).unwrap_err();
-        assert_eq!(error.code, "state_store_unavailable");
+        assert_eq!(&*error.code, "state_store_unavailable");
     }
 
     #[test]
     fn a_missing_catalog_is_no_saved_scan() {
         let (environment, _directory) = crate::test_support::environment();
         let error = super::load_report("scan_test", &environment).unwrap_err();
-        assert_eq!(error.code, "scan_not_found");
+        assert_eq!(&*error.code, "scan_not_found");
     }
 
     #[test]

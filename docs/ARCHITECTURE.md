@@ -1,6 +1,6 @@
 # Svalnir Architecture
 
-**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with the read-only Milestone 1 build: collectors, a scanner, a local store, capability probes, configuration validation, and policy simulation that the CLI runs in its own process. `svalnir-core` also has the action-contract, cleanup-rule, and authority types of Milestone 2, and the crates declare empty modules for the journal, the executors, the rule registry, the coordinator, the controllers, the runtime, and the helper requests. No agent, coordinator, or protocol exists, and no code executes an action. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
+**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with a Milestone 2 build that is not packaged and not validated. It has the collectors, the scanner, the local store, the capability probes, the configuration validation, and the policy simulation of Milestone 1, and the plan builder, the grant logic, the operation journal, the coordinator, the filesystem and process executors, the rule registry, the guard controller, and the agent runtime of Milestone 2. The CLI applies a manual plan through the coordinator: through the request queue of the journal when an agent holds the coordinator lock, and as a transient coordinator in its own process when none does. No socket and no XPC service exist, the helper has its request types and decision logic only, and each reviewed rule is in the `proposed` lifecycle state, so no eviction is permitted. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
 
 **Last reviewed:** 2026-11-16
 
@@ -282,7 +282,7 @@ The user configuration location remains:
 
 The proposed state layout separates rebuildable catalog/telemetry storage from `operations.sqlite`, which holds action intents, dispatch state, outcomes, and links to the effective policy/grant revisions. Activated revisions needed to interpret actions must be retained with the journal; merely editing the TOML file does not acknowledge activation.
 
-The Milestone 1 build keeps saved scan records in `catalog.sqlite` in the user state directory. That file is rebuildable catalog storage, not the operation journal. [INTERFACES.md](INTERFACES.md) section 4 owns the state-directory override.
+The current build keeps saved scan records in `catalog.sqlite` in the user state directory. That file is rebuildable catalog storage, not the operation journal. The operation journal is `operations.sqlite` in the same directory, and the CLI keeps its plan documents in `plans/` of that directory. [INTERFACES.md](INTERFACES.md) section 4 owns the state-directory override.
 
 Helper grants and its operation journal live in a separately protected, root-owned namespace under `/Library/Application Support/Svalnir/`. The helper must not consume a user-owned SQLite file or follow user-controlled links to load authoritative state.
 

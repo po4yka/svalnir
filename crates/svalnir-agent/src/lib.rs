@@ -5,13 +5,16 @@
 //! types come from `svalnir_core`; a module here does not define a second
 //! byte, timestamp, identity, or observation type.
 //!
-//! The CLI links this library and runs read-only commands in its own
-//! process. The `svalnir-agent` binary is a skeleton that runs the main run
-//! loop until a stop signal: no background agent, no coordinator, and no
-//! client API exist yet. No module deletes a file or signals a process.
+//! The CLI links this library. It runs the read-only commands in its own
+//! process, and it applies a manual plan through the coordinator of this
+//! library: as a transient coordinator when no agent holds the coordinator
+//! lock, and through the request queue of the journal when one does. The
+//! `svalnir-agent` binary runs the agent in the foreground. No socket and
+//! no XPC service exist: a client and the agent share the journal.
 //!
-//! The modules of Milestone 2 are declared and empty. Each one has only a
-//! comment that states its planned responsibility.
+//! An executor acts only for a step that the coordinator admitted. Each
+//! reviewed rule is in the `proposed` lifecycle state, so no rule permits
+//! an eviction.
 //!
 //! | Module | Contents |
 //! | --- | --- |
@@ -23,13 +26,13 @@
 //! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |
-//! | [`journal`] | Declared, empty: the operation journal in `operations.sqlite` |
-//! | [`executor::fs`] | Declared, empty: Trash move and permanent removal |
-//! | [`executor::process`] | Declared, empty: graceful termination and force escalation |
-//! | [`rules`] | Declared, empty: the rule registry and the reviewed rules |
-//! | [`coordinator`] | Declared, empty: admission, serialization, and reconciliation |
-//! | [`controller`] | Declared, empty: background disk protection and application budgets |
-//! | [`runtime`] | Declared, empty: the agent process lifecycle |
+//! | [`journal`] | The operation journal in `operations.sqlite`: plans, operations, revisions and grants, the request queue, the coordinator lock, recovery reads, and the named agent records |
+//! | [`executor::fs`] | The filesystem executor: the Trash move and the descriptor-relative permanent removal of one admitted step |
+//! | [`executor::process`] | The process executor: the graceful request, the force signal, and the exit observation of one admitted step |
+//! | [`rules`] | The rule registry and the two reviewed rules, each in the `proposed` lifecycle state |
+//! | [`coordinator`] | The operation coordinator: admission, serialization, dispatch records, cancellation, the queue service, and reconciliation |
+//! | [`controller`] | The guard controller: the decisions of the disk guard and the memory guard from the authority record |
+//! | [`runtime`] | The agent process: the driver loop, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |
 
 pub mod capability;
 pub mod controller;

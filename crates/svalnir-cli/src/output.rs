@@ -126,7 +126,7 @@ impl Envelope<()> {
 /// A structured advisory finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Warning {
-    pub code: &'static str,
+    pub code: Box<str>,
     pub message: String,
 }
 
@@ -134,7 +134,7 @@ pub struct Warning {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorBody {
     /// Stable identifier of the error.
-    pub code: &'static str,
+    pub code: Box<str>,
     pub family: ErrorFamily,
     pub stage: ErrorStage,
     /// Text that is safe to show. It contains no payload from another party.
@@ -171,6 +171,64 @@ pub fn family_exit_status(family: &ErrorFamily) -> ExitStatus {
 }
 
 impl ErrorBody {
+    /// An error with no field reference and no operation or plan ID. The
+    /// next action is that of the family before a submission.
+    pub fn new(
+        code: impl Into<Box<str>>,
+        family: ErrorFamily,
+        stage: ErrorStage,
+        message: impl Into<String>,
+    ) -> Self {
+        let next_action: NextAction = match &family {
+            ErrorFamily::Request => NextAction::CorrectRequest,
+            ErrorFamily::Authority => NextAction::ResolveAuthority,
+            ErrorFamily::Evidence => NextAction::RefreshObservation,
+            ErrorFamily::Limits => NextAction::RespectLimits,
+            ErrorFamily::Outcome | ErrorFamily::Unrecognized(_) => NextAction::Reconcile,
+            ErrorFamily::Eligibility | ErrorFamily::Recording | ErrorFamily::Native => {
+                NextAction::None
+            }
+        };
+        Self {
+            code: code.into(),
+            family,
+            stage,
+            message: message.into(),
+            fields: &[],
+            operation_id: None,
+            plan_id: None,
+            next_action,
+        }
+    }
+
+    /// The same error with the request fields that caused it.
+    #[must_use]
+    pub fn with_fields(mut self, fields: &'static [&'static str]) -> Self {
+        self.fields = fields;
+        self
+    }
+
+    /// The same error with the plan that it is about.
+    #[must_use]
+    pub fn with_plan(mut self, plan_id: &str) -> Self {
+        self.plan_id = Some(plan_id.into());
+        self
+    }
+
+    /// The same error with the operation that it is about.
+    #[must_use]
+    pub fn with_operation(mut self, operation_id: &str) -> Self {
+        self.operation_id = Some(operation_id.into());
+        self
+    }
+
+    /// The same error with a different next action.
+    #[must_use]
+    pub fn with_next_action(mut self, next_action: NextAction) -> Self {
+        self.next_action = next_action;
+        self
+    }
+
     /// The exit status of the error.
     pub fn exit_status(&self) -> ExitStatus {
         family_exit_status(&self.family)
@@ -192,6 +250,10 @@ pub enum ErrorStage {
     Collection,
     /// Reading or writing of the local state store.
     Storage,
+    /// Admission of a plan or of a control request.
+    Admission,
+    /// Execution of an admitted operation.
+    Execution,
 }
 
 /// The action that the caller is permitted to take next.
@@ -205,6 +267,18 @@ pub enum NextAction {
     /// Make a new observation: list the targets or scan again. The command
     /// is read-only, so a repeated request has no side effect.
     RefreshObservation,
+    /// Resolve the authority: activate a configuration, enable a policy, or
+    /// give the acceptance that the request needs.
+    ResolveAuthority,
+    /// Respect the limit: wait for the cooldown, the lease, or the queue.
+    RespectLimits,
+    /// Prepare a new plan. The plan of the request cannot be applied.
+    PrepareNewPlan,
+    /// Query the operation by its ID. Do not send the request again as new
+    /// work.
+    QueryOperation,
+    /// Reconcile: the effect is not known. Start no conflicting work.
+    Reconcile,
 }
 
 #[cfg(test)]

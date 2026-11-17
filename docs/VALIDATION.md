@@ -1,6 +1,6 @@
 # Svalnir Validation Plan
 
-**Status:** Design specification. The repository contains the read-only Milestone 1 build, the contract types of Milestone 2, and the unit tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Every release gate below is initially **unverified**.  
+**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Every release gate below is initially **unverified**.  
 **Last reviewed:** 2026-11-16
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).

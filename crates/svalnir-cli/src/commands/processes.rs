@@ -9,7 +9,7 @@
 //!
 //! A target ID is the text of a process generation identity,
 //! `pg-<pid>-<start time in microseconds>`. It names one generation of a
-//! process, not a PID. This build has no agent that holds identity evidence,
+//! process, not a PID. No server holds identity evidence,
 //! so each invocation resolves the ID against a new snapshot: the ID resolves
 //! while that generation runs and gives `target_not_found` after it exits.
 //! A target ID is never permission to act on the process.
@@ -43,7 +43,7 @@ pub(crate) const DEFAULT_TOP_LIMIT: usize = 20;
 const DERIVED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The statement about target IDs in each result.
-const TARGET_NOTE: &str = "A target ID names one process generation (PID and start time). This build has no agent, so each invocation resolves the ID against a new snapshot. A target ID is not permission to act on the process.";
+const TARGET_NOTE: &str = "A target ID names one process generation (PID and start time). No server holds identity evidence, so each invocation resolves the ID against a new snapshot. A target ID is not permission to act on the process.";
 
 /// The statement about policy eligibility in `processes show`.
 const ELIGIBILITY_NOTE: &str =
@@ -575,9 +575,9 @@ impl ShowView {
 }
 
 /// Parses the `--target` value.
-fn parse_target(text: &str) -> Result<ProcessGenerationId, ErrorBody> {
+pub(crate) fn parse_target(text: &str) -> Result<ProcessGenerationId, ErrorBody> {
     let invalid = || ErrorBody {
-        code: "invalid_target",
+        code: "invalid_target".into(),
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
         message: "the target ID is not valid; use a `TARGET ID` value of `svalnir processes top`"
@@ -609,7 +609,7 @@ pub(crate) fn find_target<'a>(
 ) -> Result<&'a ProcessRecord, ErrorBody> {
     let id: ProcessGenerationId = parse_target(target)?;
     snapshot.find_generation(&id).ok_or_else(|| ErrorBody {
-        code: "target_not_found",
+        code: "target_not_found".into(),
         family: ErrorFamily::Evidence,
         stage: ErrorStage::Collection,
         message: "the target is not in the snapshot of this invocation: the process exited, is of another user, or the ID is of another boot; the command made no change".to_owned(),
@@ -657,6 +657,11 @@ fn collect(
     Err(crate::host::unsupported_platform("processes"))
 }
 
+/// Reads the process inventory one time, for a stop request.
+pub(crate) fn collect_snapshot() -> Result<ProcessSnapshot, ErrorBody> {
+    collect(false).map(|(snapshot, _, _)| snapshot)
+}
+
 pub(crate) fn top(
     arguments: &ProcessesTopArgs,
     invocation: &mut Invocation<'_>,
@@ -702,7 +707,7 @@ mod target_shape_tests {
             "xx-1-2",
         ] {
             let error = parse_target(text).unwrap_err();
-            assert_eq!(error.code, "invalid_target", "{text}");
+            assert_eq!(&*error.code, "invalid_target", "{text}");
         }
     }
 }
@@ -866,12 +871,12 @@ mod tests {
     fn an_unknown_or_malformed_target_is_an_error() {
         let snapshot = process_snapshot();
         let gone = find_target(&snapshot, "pg-999-1").unwrap_err();
-        assert_eq!(gone.code, "target_not_found");
+        assert_eq!(&*gone.code, "target_not_found");
         assert_eq!(gone.family, ErrorFamily::Evidence);
         assert_eq!(gone.exit_status(), ExitStatus::Conflict);
         for text in ["200", "editor", "pg 200", "app-200-1700000000000000", ""] {
             let invalid = find_target(&snapshot, text).unwrap_err();
-            assert_eq!(invalid.code, "invalid_target", "{text}");
+            assert_eq!(&*invalid.code, "invalid_target", "{text}");
             assert_eq!(invalid.exit_status(), ExitStatus::Usage);
         }
     }

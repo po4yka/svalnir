@@ -16,7 +16,11 @@ use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds, PageCount};
 use svalnir_core::state::PressureState;
 use svalnir_core::volume::VolumeIdentity;
 
+use super::agent::{self, AgentSummary};
+use super::authority::AuthorityView;
+use super::history::{self, HistoryRecord};
 use super::{CommandFailure, Invocation};
+use crate::environment::Environment;
 use crate::host::{Host, ReadingView, ScopeCoverage};
 use crate::output::{ErrorBody, ExitStatus, Kind};
 use crate::text::{escape, field, human_bytes, observed, observed_bytes, put_line};
@@ -26,10 +30,11 @@ pub(crate) const MAX_RATE_INTERVAL: Nanoseconds =
     Nanoseconds::new(3_600_000_000_000 + 60_000_000_000);
 
 /// The statement of each snapshot about the agent.
-const AGENT_NOTE: &str = "This build has no background agent. The command measured the host in its own process, one time.";
+const AGENT_NOTE: &str = "No agent process runs on this state directory. The command measured the host in its own process, one time.";
 
 /// The statement of each snapshot about the policies.
-const POLICY_NOTE: &str = "No policy is active in this build. No automatic cleanup and no automatic application control can occur.";
+const POLICY_NOTE: &str =
+    "No guard is enabled. No automatic cleanup and no automatic application control can occur.";
 
 /// The statement about the growth signals of `memory status`.
 const GROWTH_NOTE: &str =
@@ -536,11 +541,135 @@ impl SwapView {
     }
 }
 
-/// The state of the agent and of the policies in this build.
+/// The state of the agent in a status snapshot.
 #[derive(Debug, Clone, Serialize)]
-struct ServiceView {
+pub(crate) struct AgentState {
+    /// `running`, `client_coordinator`, `not_running`, or `unknown`.
     state: &'static str,
-    note: &'static str,
+    note: String,
+}
+
+/// The state of the standing policies in a status snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PolicyState {
+    /// `none_active`, `active`, `paused`, or `unknown`.
+    state: &'static str,
+    /// The revision in effect, the standing of each guard, and the pause.
+    authority: Option<AuthorityView>,
+    note: String,
+}
+
+/// The agent, the policies, and the latest intervention, from the journal
+/// of the state directory.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ServiceState {
+    agent: AgentState,
+    policies: PolicyState,
+    /// The newest operation of the journal.
+    latest_intervention: Option<HistoryRecord>,
+}
+
+impl ServiceState {
+    /// The state of a host with no journal: no agent and no policy.
+    pub(crate) fn none() -> Self {
+        Self {
+            agent: AgentState {
+                state: "not_running",
+                note: AGENT_NOTE.to_owned(),
+            },
+            policies: PolicyState {
+                state: "none_active",
+                authority: None,
+                note: POLICY_NOTE.to_owned(),
+            },
+            latest_intervention: None,
+        }
+    }
+
+    /// Reads the journal and the coordinator lock. A journal that cannot
+    /// be read gives the state `unknown`; it does not fail the snapshot.
+    pub(crate) fn collect(environment: &Environment) -> Self {
+        let summary: AgentSummary = agent::summary_or_problem(environment);
+        if summary.journal == "absent" {
+            return Self::none();
+        }
+        let agent = AgentState {
+            state: summary.state(),
+            note: summary.statement.clone(),
+        };
+        let policies: PolicyState = match &summary.authority {
+            None => PolicyState {
+                state: "unknown",
+                authority: None,
+                note: summary
+                    .problem
+                    .clone()
+                    .unwrap_or_else(|| "The authority record cannot be read.".to_owned()),
+            },
+            Some(authority) => {
+                let paused: bool = authority
+                    .pause
+                    .as_ref()
+                    .is_some_and(svalnir_core::grant::PauseStatus::is_paused);
+                let (state, note): (&'static str, &str) = if !authority.any_guard_active() {
+                    ("none_active", POLICY_NOTE)
+                } else if paused {
+                    (
+                        "paused",
+                        "A guard is enabled, and automatic interventions are paused.",
+                    )
+                } else if summary.state() == "running" {
+                    (
+                        "active",
+                        "A guard is enabled, and an agent runs: eligible incidents proceed with no further question.",
+                    )
+                } else {
+                    (
+                        "active",
+                        "A guard is enabled in the record, and no agent runs: no automatic intervention occurs until an agent starts.",
+                    )
+                };
+                PolicyState {
+                    state,
+                    authority: Some(authority.clone()),
+                    note: note.to_owned(),
+                }
+            }
+        };
+        let latest_intervention: Option<HistoryRecord> = history::collect(environment, 1)
+            .ok()
+            .and_then(|view| view.into_records().into_iter().next());
+        Self {
+            agent,
+            policies,
+            latest_intervention,
+        }
+    }
+
+    fn render(&self, out: &mut String) {
+        put_line!(
+            out,
+            "Agent: {}. {}",
+            self.agent.state.replace('_', " "),
+            escape(&self.agent.note)
+        );
+        put_line!(
+            out,
+            "Policies: {}. {}",
+            self.policies.state.replace('_', " "),
+            escape(&self.policies.note)
+        );
+        if let Some(authority) = &self.policies.authority {
+            authority.render(out);
+        }
+        match &self.latest_intervention {
+            Some(record) => {
+                out.push_str("Latest intervention:\n  ");
+                record.render(out);
+            }
+            None => out.push_str("Latest intervention: none recorded\n"),
+        }
+    }
 }
 
 /// The result of `status`.
@@ -549,26 +678,19 @@ pub(crate) struct StatusView {
     disk: DiskView,
     memory: MemoryView,
     swap: SwapView,
-    agent: ServiceView,
-    policies: ServiceView,
+    #[serde(flatten)]
+    services: ServiceState,
     coverage: ScopeCoverage,
 }
 
 impl StatusView {
-    pub(crate) fn new(reading: &HostReading) -> Self {
+    pub(crate) fn new(reading: &HostReading, services: ServiceState) -> Self {
         let mut coverage = ScopeCoverage::new();
         Self {
             disk: DiskView::new(&reading.disk, &mut coverage),
             memory: MemoryView::new(&reading.memory, &mut coverage),
             swap: SwapView::new(&reading.memory, None, &mut coverage),
-            agent: ServiceView {
-                state: "not_running",
-                note: AGENT_NOTE,
-            },
-            policies: ServiceView {
-                state: "none_active",
-                note: POLICY_NOTE,
-            },
+            services,
             coverage,
         }
     }
@@ -581,8 +703,7 @@ impl StatusView {
         out.push('\n');
         self.swap.render(&mut out, false);
         out.push('\n');
-        put_line!(out, "Agent: not running. {AGENT_NOTE}");
-        put_line!(out, "Policies: none active. {POLICY_NOTE}");
+        self.services.render(&mut out);
         out.push_str(&self.coverage.text_line());
         out
     }
@@ -647,7 +768,10 @@ pub(crate) fn snapshot_status(coverage: &ScopeCoverage) -> ExitStatus {
 
 pub(crate) fn status(invocation: &mut Invocation<'_>) -> Result<ExitStatus, CommandFailure> {
     let host: Host = Host::open()?;
-    let view = StatusView::new(&collect(&host)?);
+    let view = StatusView::new(
+        &collect(&host)?,
+        ServiceState::collect(invocation.environment),
+    );
     invocation.emit(Kind::Snapshot, &view, StatusView::render)?;
     Ok(snapshot_status(&view.coverage))
 }
@@ -674,7 +798,9 @@ pub(crate) fn swap_status(invocation: &mut Invocation<'_>) -> Result<ExitStatus,
 mod tests {
     use svalnir_core::observation::{Reading, UnavailableReason};
 
-    use super::{DiskReading, HostReading, MemoryStatusView, StatusView, SwapStatusView};
+    use super::{
+        DiskReading, HostReading, MemoryStatusView, ServiceState, StatusView, SwapStatusView,
+    };
     use crate::output::ExitStatus;
     use crate::test_support::{memory_snapshot, volume_capacity};
 
@@ -692,7 +818,7 @@ mod tests {
 
     #[test]
     fn status_text_shows_each_part_and_the_absent_agent() {
-        let view = StatusView::new(&reading());
+        let view = StatusView::new(&reading(), ServiceState::none());
         let text = view.render();
         assert!(text.contains("Disk (startup data volume, /System/Volumes/Data)"));
         assert!(text.contains("Available      100.0 GiB"), "{text}");
@@ -711,7 +837,7 @@ mod tests {
 
     #[test]
     fn status_json_has_canonical_observations() {
-        let view = StatusView::new(&reading());
+        let view = StatusView::new(&reading(), ServiceState::none());
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(
             json["disk"]["available"]["metric_id"],
@@ -747,7 +873,7 @@ mod tests {
     fn an_unavailable_required_metric_makes_the_scope_partial() {
         let mut reading = reading();
         reading.memory.pressure.reading = Reading::Unavailable(UnavailableReason::PermissionDenied);
-        let view = StatusView::new(&reading);
+        let view = StatusView::new(&reading, ServiceState::none());
         let text = view.render();
         assert!(
             text.contains("Pressure       unavailable (permission_denied)"),
@@ -770,7 +896,7 @@ mod tests {
                 reason: "the clock failed".to_owned(),
             };
         }
-        let view = StatusView::new(&reading);
+        let view = StatusView::new(&reading, ServiceState::none());
         let text = view.render();
         assert!(
             text.contains("Capacity       unavailable (the clock failed)"),
@@ -792,7 +918,7 @@ mod tests {
         }
         reading.memory.vm.speculative.reading =
             Reading::Unavailable(UnavailableReason::Unsupported);
-        let view = StatusView::new(&reading);
+        let view = StatusView::new(&reading, ServiceState::none());
         assert!(
             view.render()
                 .contains("Important      unavailable (unsupported)")
@@ -804,7 +930,7 @@ mod tests {
     fn an_unresolved_volume_is_partial_and_is_not_zero() {
         let mut reading = reading();
         reading.disk = DiskReading::Unresolved("the volume query is unavailable".to_owned());
-        let view = StatusView::new(&reading);
+        let view = StatusView::new(&reading, ServiceState::none());
         let text = view.render();
         assert!(text.contains("Volume         not resolved (the volume query is unavailable)"));
         assert!(!text.contains("0 B"));

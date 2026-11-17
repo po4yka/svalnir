@@ -57,98 +57,198 @@ fn command_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
-/// The commands of README.md and docs/INTERFACES.md section 6 that change
-/// the host, a policy, or the agent, or that need the agent.
-const NOT_IMPLEMENTED_COMMANDS: &[&[&str]] = &[
-    &[
-        "clean",
-        "plan",
-        "--scan",
-        "SCAN_ID",
-        "--profile",
-        "developer",
-        "--mode",
-        "trash",
-    ],
-    &["clean", "show", "--plan", "PLAN_ID"],
-    &["clean", "apply", "--plan", "PLAN_ID"],
-    &["clean", "apply", "--plan", "PLAN_ID", "--yes", "--no-wait"],
-    &[
-        "operations",
-        "show",
-        "--operation",
-        "OPERATION_ID",
-        "--format",
-        "json",
-    ],
-    &[
-        "operations",
-        "wait",
-        "--operation",
-        "OPERATION_ID",
-        "--timeout",
-        "30s",
-    ],
-    &["operations", "cancel", "--operation", "OPERATION_ID"],
-    &[
-        "processes",
-        "stop",
-        "--target",
-        "TARGET_ID",
-        "--grace",
-        "10s",
-        "--force-after-timeout",
-    ],
-    &["processes", "stop", "--target", "TARGET_ID", "--force"],
-    &["agent", "install"],
-    &["agent", "status"],
-    &["agent", "pause", "--for", "1h"],
-    &["agent", "resume"],
-    &["agent", "uninstall"],
-    &[
-        "policy",
-        "enable",
-        "disk-guard",
-        "--accept-permanent-eviction",
-    ],
-    &["policy", "enable", "memory-guard", "--accept-force-quit"],
-    &["policy", "disable", "memory-guard"],
-    &[
-        "policy",
-        "rearm",
-        "memory-guard",
-        "--incident",
-        "INCIDENT_ID",
-        "--generation",
-        "GENERATION",
-    ],
-    &[
-        "config",
-        "apply",
-        "--config",
-        "./config.toml",
-        "--expected-revision",
-        "POLICY_REVISION",
-    ],
-    &["history", "--limit", "20"],
+/// Queries and refused requests on a state directory that does not exist:
+/// the arguments, the exit status, and the error code. `None` is a result.
+const EMPTY_STATE_COMMANDS: &[(&[&str], u8, Option<&str>)] = &[
+    (
+        &[
+            "clean",
+            "plan",
+            "--scan",
+            "SCAN_ID",
+            "--profile",
+            "developer",
+            "--mode",
+            "trash",
+        ],
+        3,
+        Some("selection_preset_not_available"),
+    ),
+    (
+        &["clean", "plan", "--scan", "SCAN_ID", "--mode", "trash"],
+        5,
+        Some("scan_not_found"),
+    ),
+    (
+        &[
+            "clean", "plan", "--scan", "SCAN_ID", "--mode", "evict", "--rule", "no.rule",
+        ],
+        2,
+        Some("unknown_rule"),
+    ),
+    (
+        &[
+            "clean",
+            "plan",
+            "--scan",
+            "SCAN_ID",
+            "--mode",
+            "evict",
+            "--rule",
+            "svalnir.expired-temporary",
+        ],
+        3,
+        Some("rule_mode_not_validated"),
+    ),
+    (
+        &["clean", "show", "--plan", "PLAN_ID"],
+        5,
+        Some("plan_not_found"),
+    ),
+    (
+        &["clean", "apply", "--plan", "PLAN_ID"],
+        5,
+        Some("plan_not_found"),
+    ),
+    (
+        &["clean", "apply", "--plan", "PLAN_ID", "--yes", "--no-wait"],
+        5,
+        Some("plan_not_found"),
+    ),
+    (
+        &["clean", "apply", "--plan", "not a plan"],
+        2,
+        Some("invalid_plan_id"),
+    ),
+    (
+        &["operations", "show", "--operation", "OPERATION_ID"],
+        5,
+        Some("operation_not_found"),
+    ),
+    (
+        &[
+            "operations",
+            "wait",
+            "--operation",
+            "OPERATION_ID",
+            "--timeout",
+            "30s",
+        ],
+        5,
+        Some("operation_not_found"),
+    ),
+    (
+        &["operations", "cancel", "--operation", "OPERATION_ID"],
+        5,
+        Some("operation_not_found"),
+    ),
+    (
+        &[
+            "processes",
+            "stop",
+            "--target",
+            "TARGET_ID",
+            "--grace",
+            "10s",
+            "--force-after-timeout",
+        ],
+        2,
+        Some("invalid_target"),
+    ),
+    (
+        &[
+            "processes",
+            "stop",
+            "--target",
+            "pg-1-1",
+            "--grace",
+            "10m",
+            "--yes",
+        ],
+        2,
+        Some("invalid_grace"),
+    ),
+    (&["agent", "status"], 0, None),
+    (&["agent", "uninstall"], 3, Some("approval_required")),
+    (
+        &[
+            "policy",
+            "enable",
+            "disk-guard",
+            "--accept-permanent-eviction",
+        ],
+        3,
+        Some("no_active_policy_revision"),
+    ),
+    (
+        &[
+            "policy",
+            "rearm",
+            "memory-guard",
+            "--incident",
+            "INCIDENT_ID",
+            "--generation",
+            "2",
+        ],
+        3,
+        Some("rearm_not_available"),
+    ),
+    (
+        &[
+            "policy",
+            "rearm",
+            "memory-guard",
+            "--incident",
+            "INCIDENT_ID",
+            "--generation",
+            "GENERATION",
+        ],
+        2,
+        Some("invalid_generation"),
+    ),
+    (
+        &[
+            "config",
+            "apply",
+            "--config",
+            "./config.toml",
+            "--expected-revision",
+            "POLICY_REVISION",
+        ],
+        2,
+        Some("config_not_found"),
+    ),
+    (
+        &["config", "show", "--effective"],
+        3,
+        Some("no_active_policy_revision"),
+    ),
+    (&["history", "--limit", "20"], 0, None),
 ];
 
 #[test]
-fn mutating_commands_report_not_implemented_and_write_nothing() {
-    for arguments in NOT_IMPLEMENTED_COMMANDS {
+fn queries_and_refused_requests_make_no_state_directory() {
+    for (arguments, status, code) in EMPTY_STATE_COMMANDS {
         let (environment, directory) = environment();
         let mut machine: Vec<&str> = arguments.to_vec();
-        if !machine.contains(&"--format") {
-            machine.extend(["--format", "json"]);
-        }
+        machine.extend(["--format", "json"]);
         let outcome = run_with(&environment, &machine);
         assert_eq!(
-            outcome.status,
-            ExitStatus::Unavailable,
-            "{arguments:?}: {}",
+            outcome.status.code(),
+            *status,
+            "{arguments:?}: {} {}",
+            outcome.stdout,
             outcome.stderr
         );
-        assert_eq!(outcome.envelope()["error"]["code"], "not_implemented");
+        let envelope = outcome.envelope();
+        match code {
+            Some(code) => {
+                assert_eq!(envelope["error"]["code"], *code, "{arguments:?}");
+                assert_eq!(envelope["kind"], "error");
+                assert!(envelope["result"].is_null());
+            }
+            None => assert!(envelope["error"].is_null(), "{arguments:?}"),
+        }
         assert!(!state_directory_exists(&directory), "{arguments:?}");
     }
 }
@@ -156,18 +256,25 @@ fn mutating_commands_report_not_implemented_and_write_nothing() {
 #[test]
 fn text_mode_error_goes_to_stderr_only() {
     let outcome = svalnir(&["clean", "apply", "--plan", "PLAN_ID", "--yes"]);
-    assert_eq!(outcome.status.code(), 3);
+    assert_eq!(outcome.status.code(), 5);
     assert_eq!(outcome.stdout, "");
     assert_eq!(
         outcome.stderr,
-        "error: `svalnir clean apply` is not implemented in this build; the command made no change\n"
+        "error: the journal has no plan with this ID; the command made no change\n"
     );
 }
 
 #[test]
 fn json_mode_error_is_one_envelope_on_stdout() {
-    let outcome = svalnir(&["agent", "status", "--format", "json"]);
-    assert_eq!(outcome.status, ExitStatus::Unavailable);
+    let outcome = svalnir(&[
+        "operations",
+        "show",
+        "--operation",
+        "operation_1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(outcome.status, ExitStatus::Conflict);
     assert_eq!(outcome.stderr, "");
     assert!(outcome.stdout.ends_with('\n'));
     assert_eq!(outcome.stdout.lines().count(), 1);
@@ -180,14 +287,14 @@ fn json_mode_error_is_one_envelope_on_stdout() {
             "kind": "error",
             "result": null,
             "error": {
-                "code": "not_implemented",
-                "family": "native",
-                "stage": "dispatch",
-                "message": "`svalnir agent status` is not implemented in this build; the command made no change",
-                "fields": [],
-                "operation_id": null,
+                "code": "operation_not_found",
+                "family": "evidence",
+                "stage": "storage",
+                "message": "the journal has no operation with this ID: the ID is of a different state directory, or the retention removed the record; the command made no change",
+                "fields": ["operation"],
+                "operation_id": "operation_1",
                 "plan_id": null,
-                "next_action": "none"
+                "next_action": "refresh_observation"
             },
             "warnings": []
         })
@@ -735,12 +842,13 @@ fn without_a_file_the_proposal_is_the_built_in_template() {
 }
 
 #[test]
-fn the_effective_configuration_needs_the_agent() {
+fn the_effective_configuration_needs_a_revision_in_effect() {
     let outcome = svalnir(&["config", "show", "--effective", "--format", "json"]);
     assert_eq!(outcome.status, ExitStatus::Unavailable);
     let envelope = outcome.envelope();
-    assert_eq!(envelope["error"]["code"], "agent_unavailable");
-    assert_eq!(envelope["error"]["family"], "native");
+    assert_eq!(envelope["error"]["code"], "no_active_policy_revision");
+    assert_eq!(envelope["error"]["family"], "authority");
+    assert_eq!(envelope["error"]["next_action"], "resolve_authority");
 }
 
 #[test]

@@ -15,7 +15,7 @@ use svalnir_core::file::LosslessPath;
 use svalnir_core::policy::{self, PolicyDescription, PolicyId};
 use svalnir_core::quantity::{Bytes, Nanoseconds};
 
-use super::{CommandFailure, Invocation, agent_unavailable};
+use super::{CommandFailure, Invocation};
 use crate::cli::{ConfigShowArgs, ProposalOption};
 use crate::environment::Environment;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
@@ -28,10 +28,13 @@ const TEMPLATE_DOCUMENT: &str = "schema_version = 1\n";
 /// The statement of each result about activation.
 const PROPOSAL_NOTE: &str = "This is a proposal. It is not active, and this command did not change the active behavior. A check with the status `requires_agent` did not run: the rule registry, the volume selectors, the application identities, the worker capabilities, and the action grants need the background agent.";
 
+/// The statement of `config show --effective`.
+const EFFECTIVE_NOTE: &str = "These are the values of the revision in effect, from the operation journal. A value that the revision does not give comes from the built-in template. An activation makes no grant: `svalnir agent status` shows the standing of each guard.";
+
 /// Where a proposal comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SourceView {
-    /// `file` or `built_in_template`.
+    /// `file`, `built_in_template`, or `active_revision`.
     pub(crate) kind: &'static str,
     /// The file, or the default path that has no file.
     pub(crate) path: Option<LosslessPath>,
@@ -47,6 +50,7 @@ impl SourceView {
             .as_ref()
             .map_or_else(|| "unknown path".to_owned(), LosslessPath::display_label);
         match self.kind {
+            "active_revision" => "the revision in effect, from the operation journal".to_owned(),
             "file" => format!("{path} (file, selected by {})", self.selected_by),
             _ => format!("built-in template (no file at {path})"),
         }
@@ -76,7 +80,7 @@ fn input_error(code: &'static str, family: ErrorFamily, message: String) -> Erro
         NextAction::None
     };
     ErrorBody {
-        code,
+        code: code.into(),
         family,
         stage: ErrorStage::Input,
         message,
@@ -180,7 +184,7 @@ pub(crate) fn load(
                 selected_by: "default",
             },
         }),
-        Err(error) if error.code == "config_not_found" && allow_template => Ok(Proposal {
+        Err(error) if &*error.code == "config_not_found" && allow_template => Ok(Proposal {
             text: TEMPLATE_DOCUMENT.to_owned(),
             source: SourceView {
                 kind: "built_in_template",
@@ -189,7 +193,7 @@ pub(crate) fn load(
             },
         }),
         Err(mut error) => {
-            if error.code == "config_not_found" {
+            if &*error.code == "config_not_found" {
                 "no configuration file is at the default path; give `--config PATH`"
                     .clone_into(&mut error.message);
             }
@@ -319,8 +323,11 @@ struct PrivacyView {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ShowView {
     source: SourceView,
-    /// Always false: this build has no effective revision.
+    /// True for the revision in effect (`--effective`). False for a
+    /// proposal.
     active: bool,
+    /// The revision in effect, for `--effective`.
+    revision: Option<svalnir_core::authority::PolicyRevision>,
     schema_version: u32,
     template_revision: u32,
     profile: &'static str,
@@ -342,6 +349,7 @@ impl ShowView {
         Self {
             source,
             active: false,
+            revision: None,
             schema_version: config.schema_version(),
             template_revision: config.template_revision(),
             profile: config.agent().profile.as_str(),
@@ -365,8 +373,29 @@ impl ShowView {
         }
     }
 
+    /// The view of the revision in effect.
+    pub(crate) fn effective(active: &super::session::ActiveConfig) -> Self {
+        let mut view = Self::new(
+            SourceView {
+                kind: "active_revision",
+                path: None,
+                selected_by: "journal",
+            },
+            &active.config,
+        );
+        view.active = true;
+        view.revision = Some(active.active.revision.clone());
+        view.note = EFFECTIVE_NOTE;
+        view
+    }
+
     pub(crate) fn render(&self) -> String {
-        proposal_text("Configuration proposal (not active)", &self.source, self)
+        let heading: &str = if self.active {
+            "Effective configuration (the revision in effect)"
+        } else {
+            "Configuration proposal (not active)"
+        };
+        proposal_text(heading, &self.source, self)
     }
 }
 
@@ -408,7 +437,13 @@ pub(crate) fn show(
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
     if arguments.effective {
-        return Err(agent_unavailable("the effective configuration").into());
+        let journal = super::session::open_existing_journal(invocation.environment)?
+            .ok_or_else(super::session::no_active_revision)?;
+        let authority = super::session::read_authority(&journal)?;
+        let active = super::session::active_config(&journal, &authority.state)?;
+        let view = ShowView::effective(&active);
+        invocation.emit(Kind::Report, &view, ShowView::render)?;
+        return Ok(ExitStatus::Success);
     }
     let proposal: Proposal = load(
         invocation.environment,
@@ -564,7 +599,7 @@ mod tests {
     #[test]
     fn an_invalid_proposal_is_an_error_for_a_command_that_needs_values() {
         let error = validated(&proposal("schema_version = 2\n")).unwrap_err();
-        assert_eq!(error.code, "invalid_configuration");
+        assert_eq!(&*error.code, "invalid_configuration");
         assert_eq!(error.exit_status(), ExitStatus::Usage);
     }
 }

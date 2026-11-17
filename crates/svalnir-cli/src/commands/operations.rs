@@ -1,0 +1,298 @@
+//! `operations show`, `operations wait`, and `operations cancel`.
+//!
+//! Each command reads the operation record of the journal. `show` and
+//! `wait` change nothing. `cancel` sets the stop fence of the operation in
+//! the journal: the executor dispatches no further step after it reads the
+//! fence. A call that the executor issued is not recalled.
+
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use svalnir_agent::journal::{OperationJournal, OperationJournalError};
+use svalnir_core::action::{Operation, OperationState};
+use svalnir_core::id::OperationId;
+
+use super::apply::{ApplyView, target_paths};
+use super::operation_view::OperationReport;
+use super::plan_store;
+use super::session::{self, CoordinatorPresence, coordinator_presence, journal_error};
+use super::{CommandFailure, Invocation};
+use crate::cli::OperationRef;
+use crate::environment::Environment;
+use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
+use crate::text::put_line;
+
+/// The time between two reads of the journal.
+const POLL: Duration = Duration::from_millis(100);
+
+/// The number of journal reads between two reads of the coordinator lock.
+const LOCK_CHECK_INTERVAL: u32 = 10;
+
+/// How long `operations cancel` waits for the executor to settle the
+/// operation after the fence, before it reports the fence alone.
+const SETTLE_WAIT: Duration = Duration::from_secs(2);
+
+const NO_COORDINATOR_NOTE: &str = "No process holds the coordinator lock, so no process executes this operation now. The next coordinator reconciles it from fresh evidence before it admits other work; it does not dispatch it again.";
+
+const TIMEOUT_NOTE: &str = "The client wait ended before a final result. Nothing was canceled. The result is not known to this response; query it again with `svalnir operations show`.";
+
+const INTERRUPT_NOTE: &str = "The client was interrupted. Nothing was canceled.";
+
+fn parse(text: &str) -> Result<OperationId, ErrorBody> {
+    OperationId::new(text).map_err(|_| {
+        session::invalid_identifier("invalid_operation_id", "operation ID", &["operation"])
+    })
+}
+
+fn not_found(operation_id: &OperationId) -> ErrorBody {
+    ErrorBody::new(
+        "operation_not_found",
+        ErrorFamily::Evidence,
+        ErrorStage::Storage,
+        "the journal has no operation with this ID: the ID is of a different state directory, or the retention removed the record; the command made no change",
+    )
+    .with_fields(&["operation"])
+    .with_operation(operation_id.as_str())
+    .with_next_action(NextAction::RefreshObservation)
+}
+
+fn read(journal: &OperationJournal, operation_id: &OperationId) -> Result<Operation, ErrorBody> {
+    journal
+        .try_operation(operation_id)
+        .map_err(|error| journal_error(&error))?
+        .ok_or_else(|| not_found(operation_id))
+}
+
+/// The view of a journal record, with the display paths and the
+/// measurements of the plan document of this client when it has one.
+fn report(
+    journal: &OperationJournal,
+    environment: &Environment,
+    operation: &Operation,
+) -> OperationReport {
+    let stop_fence: Option<bool> = journal.try_has_stop_fence(operation.operation_id()).ok();
+    let document = plan_store::load_plan(environment, operation.plan_id())
+        .ok()
+        .flatten();
+    OperationReport::of_record(operation, stop_fence)
+        .with_measurements(
+            document
+                .as_ref()
+                .and_then(|document| document.measurements.as_ref()),
+        )
+        .with_paths(target_paths(document.as_ref()))
+}
+
+/// Whether the operation has its last record. An unknown outcome is not
+/// settled, and it does not change until a reconciliation.
+fn is_ended(operation: &Operation) -> bool {
+    operation.state().is_settled() || operation.state() == &OperationState::UnknownOutcome
+}
+
+/// The result of `operations show`.
+#[derive(Debug, Clone, Serialize)]
+struct ShowView {
+    operation: OperationReport,
+    /// Whether a process holds the coordinator lock.
+    coordinator: CoordinatorPresence,
+    notes: Vec<&'static str>,
+}
+
+impl ShowView {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        self.operation.render(&mut out);
+        for note in &self.notes {
+            put_line!(out, "  Note: {note}");
+        }
+        out
+    }
+}
+
+fn open(
+    environment: &Environment,
+    operation_id: &OperationId,
+) -> Result<OperationJournal, ErrorBody> {
+    session::open_existing_journal(environment)?.ok_or_else(|| not_found(operation_id))
+}
+
+pub(crate) fn show(
+    arguments: &OperationRef,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let operation_id: OperationId = parse(&arguments.operation)?;
+    let environment: &Environment = invocation.environment;
+    let journal: OperationJournal = open(environment, &operation_id)?;
+    let operation: Operation = read(&journal, &operation_id)?;
+    let coordinator: CoordinatorPresence = coordinator_presence(&environment.journal_path()?);
+    let view = ShowView {
+        operation: report(&journal, environment, &operation),
+        coordinator,
+        notes: if !is_ended(&operation) && coordinator == CoordinatorPresence::NotRunning {
+            vec![NO_COORDINATOR_NOTE]
+        } else {
+            Vec::new()
+        },
+    };
+    invocation.emit(Kind::Operation, &view, ShowView::render)?;
+    // The query succeeded. The state of the operation is in the result.
+    Ok(ExitStatus::Success)
+}
+
+pub(crate) fn wait(
+    arguments: &OperationRef,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let operation_id: OperationId = parse(&arguments.operation)?;
+    let environment: &Environment = invocation.environment;
+    let journal: OperationJournal = open(environment, &operation_id)?;
+    let journal_path = environment.journal_path()?;
+    let timeout: Option<Duration> = invocation.timeout;
+    environment.interrupt.arm();
+    let started: Instant = Instant::now();
+    let mut reads: u32 = 0;
+    let (wait, operation, note): (&'static str, Operation, Option<&'static str>) = loop {
+        let operation: Operation = read(&journal, &operation_id)?;
+        if is_ended(&operation) {
+            break ("finished", operation, None);
+        }
+        // The lock is read at the first read and then one time each
+        // second: a read holds the lock for an instant.
+        let check_lock: bool = reads.is_multiple_of(LOCK_CHECK_INTERVAL);
+        reads = reads.wrapping_add(1);
+        if check_lock && coordinator_presence(&journal_path) == CoordinatorPresence::NotRunning {
+            // The operation can have ended between the two reads.
+            let operation: Operation = read(&journal, &operation_id)?;
+            if is_ended(&operation) {
+                break ("finished", operation, None);
+            }
+            break ("no_coordinator", operation, Some(NO_COORDINATOR_NOTE));
+        }
+        if environment.interrupt.is_requested() {
+            break ("interrupted", operation, Some(INTERRUPT_NOTE));
+        }
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            break ("timed_out", operation, Some(TIMEOUT_NOTE));
+        }
+        std::thread::sleep(POLL);
+    };
+    let view = ApplyView {
+        wait,
+        existing_operation: false,
+        plan_id: operation.plan_id().clone(),
+        executor: None,
+        request_id: None,
+        operation: Some(report(&journal, environment, &operation)),
+        notes: note.into_iter().collect(),
+    };
+    invocation.emit(Kind::Operation, &view, ApplyView::render)?;
+    Ok(view.status())
+}
+
+/// The result of `operations cancel`.
+#[derive(Debug, Clone, Serialize)]
+struct CancelView {
+    operation_id: OperationId,
+    /// The acknowledgement that the request reached
+    /// (`docs/INTERFACES.md` section 12): `durable_stop_fence` when the
+    /// journal has the fence and the operation is not settled, and
+    /// `settled` when the operation has its final record.
+    acknowledgement: &'static str,
+    /// True when this request wrote the fence. False when the operation
+    /// was settled before the request.
+    fence_written: bool,
+    coordinator: CoordinatorPresence,
+    operation: OperationReport,
+    notes: Vec<&'static str>,
+}
+
+const CANCEL_NOTE: &str = "A cancel stops the dispatch of further steps. It does not recall a call that was issued, and it does not undo an effect: the operation can end as Partial, Incomplete, or UnknownOutcome.";
+
+const SETTLED_BEFORE_NOTE: &str =
+    "The operation had its final record before the request, so the request changed nothing.";
+
+impl CancelView {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        put_line!(
+            out,
+            "Cancel of operation {}: {}",
+            self.operation_id,
+            match self.acknowledgement {
+                "settled" => "settled; no step is executing",
+                _ => "durable stop fence; the executor dispatches no further step",
+            }
+        );
+        self.operation.render(&mut out);
+        for note in &self.notes {
+            put_line!(out, "  Note: {note}");
+        }
+        out
+    }
+}
+
+pub(crate) fn cancel(
+    arguments: &OperationRef,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let operation_id: OperationId = parse(&arguments.operation)?;
+    let environment: &Environment = invocation.environment;
+    let mut journal: OperationJournal = open(environment, &operation_id)?;
+    let journal_path = environment.journal_path()?;
+    let mut operation: Operation = read(&journal, &operation_id)?;
+    let mut notes: Vec<&'static str> = Vec::new();
+    let fence_written: bool = if operation.state().is_settled() {
+        notes.push(SETTLED_BEFORE_NOTE);
+        false
+    } else {
+        journal
+            .try_set_stop_fence(&operation_id)
+            .map_err(|error| match error {
+                OperationJournalError::NotFound => not_found(&operation_id),
+                other => {
+                    let mut body: ErrorBody = journal_error(&other);
+                    body.message = format!(
+                        "{}; the stop fence was not written, so the cancel is NOT in effect: this client has no executor that it can stop",
+                        body.message
+                    );
+                    body.with_operation(operation_id.as_str())
+                }
+            })?;
+        notes.push(CANCEL_NOTE);
+        true
+    };
+    let coordinator: CoordinatorPresence = coordinator_presence(&journal_path);
+    // An executor that runs settles the operation at its next boundary.
+    if fence_written && coordinator == CoordinatorPresence::Running {
+        let started: Instant = Instant::now();
+        while started.elapsed() < SETTLE_WAIT {
+            // The fence is written. A read that fails here does not
+            // change that: the response has the last state that was read.
+            match read(&journal, &operation_id) {
+                Ok(current) => operation = current,
+                Err(_) => break,
+            }
+            if operation.state().is_settled() {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+    if fence_written && !is_ended(&operation) && coordinator == CoordinatorPresence::NotRunning {
+        notes.push(NO_COORDINATOR_NOTE);
+    }
+    let view = CancelView {
+        operation_id,
+        acknowledgement: if operation.state().is_settled() {
+            "settled"
+        } else {
+            "durable_stop_fence"
+        },
+        fence_written,
+        coordinator,
+        operation: report(&journal, environment, &operation),
+        notes,
+    };
+    invocation.emit(Kind::Operation, &view, CancelView::render)?;
+    Ok(ExitStatus::Success)
+}

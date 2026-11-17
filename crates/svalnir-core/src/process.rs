@@ -179,6 +179,54 @@ pub enum ProcessAssociation {
     Unrecognized,
 }
 
+/// A membership that has positive evidence of a kind this build knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedMembership<'a> {
+    /// The process belongs to a running application.
+    Application {
+        /// The running application instance.
+        instance_id: &'a ApplicationInstanceId,
+        /// The bundle identifier of the application.
+        bundle_identifier: &'a str,
+    },
+    /// The process belongs to a managed job.
+    ManagedJob {
+        /// The running job instance.
+        instance_id: &'a ApplicationInstanceId,
+        /// The label of the job.
+        label: &'a str,
+    },
+}
+
+impl ProcessAssociation {
+    /// The membership, when its attribution method is one that this build
+    /// knows and that can establish this kind of membership.
+    ///
+    /// Use this method, not a match on the variant, before a sum, a group,
+    /// or an action that depends on membership. A method that this build
+    /// does not recognize gives `None`: it can be parentage or a name match,
+    /// which do not make a process a member.
+    pub fn verified_membership(&self) -> Option<VerifiedMembership<'_>> {
+        match self {
+            Self::Application {
+                instance_id,
+                bundle_identifier,
+                attribution:
+                    AttributionMethod::LaunchServices | AttributionMethod::ResponsibleProcess,
+            } => Some(VerifiedMembership::Application {
+                instance_id,
+                bundle_identifier,
+            }),
+            Self::ManagedJob {
+                instance_id,
+                label,
+                attribution: AttributionMethod::LaunchdJob,
+            } => Some(VerifiedMembership::ManagedJob { instance_id, label }),
+            _ => None,
+        }
+    }
+}
+
 /// The identity of one observed process generation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessIdentity {
@@ -204,8 +252,11 @@ impl ProcessIdentity {
     /// boot, and executable.
     ///
     /// The opaque identity and the association are not compared. A `false`
-    /// result means that the process was replaced, changed its owner, or
-    /// changed its executable. A `true` result does not make a later signal
+    /// result means that the evidence does not show the same process: the
+    /// process was replaced, changed its owner, or changed its executable, or
+    /// one record has executable evidence that the other does not have. Do
+    /// not signal the process, and do not record an exit or a replacement
+    /// from this result alone. A `true` result does not make a later signal
     /// atomic with this check.
     pub fn has_same_evidence(&self, other: &Self) -> bool {
         self.pid == other.pid
@@ -373,6 +424,40 @@ mod tests {
         };
         assert!(!attribution.is_recognized());
         assert_eq!(attribution.as_str(), "parent_process");
+    }
+
+    #[test]
+    fn membership_needs_a_known_and_matching_attribution_method() {
+        let decode = |kind: &str, name_field: &str, attribution: &str| -> ProcessAssociation {
+            serde_json::from_value(json!({
+                "kind": kind,
+                "instance_id": "instance_example",
+                name_field: "com.example.Example",
+                "attribution": attribution
+            }))
+            .unwrap()
+        };
+        let application =
+            |attribution: &str| decode("application", "bundle_identifier", attribution);
+        let job = |attribution: &str| decode("managed_job", "label", attribution);
+
+        assert!(
+            application("launch_services")
+                .verified_membership()
+                .is_some()
+        );
+        assert!(
+            application("responsible_process")
+                .verified_membership()
+                .is_some()
+        );
+        assert!(job("launchd_job").verified_membership().is_some());
+        // Parentage, or a method for the other kind, is not membership.
+        assert_eq!(application("parent_process").verified_membership(), None);
+        assert_eq!(application("launchd_job").verified_membership(), None);
+        assert_eq!(job("launch_services").verified_membership(), None);
+        assert_eq!(ProcessAssociation::Unattributed.verified_membership(), None);
+        assert_eq!(ProcessAssociation::Unrecognized.verified_membership(), None);
     }
 
     #[test]

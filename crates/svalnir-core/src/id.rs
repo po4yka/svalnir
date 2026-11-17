@@ -153,6 +153,9 @@ opaque_id! {
     ProcessGenerationId;
     /// Identity of one running application or managed-job instance.
     ApplicationInstanceId;
+    /// Identity of one verified member list of an application. A membership
+    /// change makes a new identity.
+    MembershipSnapshotId;
 }
 
 impl RequestId {
@@ -187,8 +190,10 @@ impl From<ProcessGenerationId> for IdentityId {
     }
 }
 
-impl From<ApplicationInstanceId> for IdentityId {
-    fn from(id: ApplicationInstanceId) -> Self {
+// An application scope refers to a membership snapshot. An application
+// instance does not convert, because its members can change.
+impl From<MembershipSnapshotId> for IdentityId {
+    fn from(id: MembershipSnapshotId) -> Self {
         Self(id.0)
     }
 }

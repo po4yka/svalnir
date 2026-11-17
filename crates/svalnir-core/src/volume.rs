@@ -80,13 +80,17 @@ pub struct VolumeIdentity {
 
 impl VolumeIdentity {
     /// The pool of free space that this volume draws on. Returns `None`
-    /// when the relationship is not verified; the capacity of such a volume
+    /// when the relationship is not verified or the domain has a kind that
+    /// this build does not recognize; the capacity of such a volume
     /// cannot be added to that of another volume.
     pub fn capacity_key(&self) -> Option<CapacityKey<'_>> {
         match &self.capacity_domain {
-            CapacityDomainMembership::Shared { domain_id, .. } => {
-                Some(CapacityKey::Domain(domain_id))
-            }
+            CapacityDomainMembership::Shared {
+                domain_id,
+                domain_kind,
+            } => domain_kind
+                .is_recognized()
+                .then_some(CapacityKey::Domain(domain_id)),
             CapacityDomainMembership::Exclusive => Some(CapacityKey::Volume(&self.volume_id)),
             CapacityDomainMembership::Unknown | CapacityDomainMembership::Unrecognized => None,
         }
@@ -207,6 +211,11 @@ mod tests {
             panic!("the membership is not shared");
         };
         assert!(!domain_kind.is_recognized());
+        let shared: CapacityDomainMembership = CapacityDomainMembership::Shared {
+            domain_id: CapacityDomainId::new("domain_x").unwrap(),
+            domain_kind,
+        };
+        assert_eq!(volume("x", "/x", shared).capacity_key(), None);
         assert_eq!(
             serde_json::to_value(CapacityDomainMembership::Exclusive).unwrap(),
             json!({ "membership": "exclusive" })

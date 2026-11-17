@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use clap::CommandFactory;
 use serde::Serialize;
 
-use crate::cli::{Cli, Command, Format};
+use crate::cli::{CleanCommand, CleanMode, Cli, Command, Format};
 use crate::output::{Envelope, ErrorBody, ErrorFamily, ErrorStage, Kind, NextAction, RequestId};
 
 const LICENSE_SPDX_ID: &str = "GPL-3.0-only";
@@ -54,6 +54,7 @@ pub(crate) fn execute(
 ) -> Result<(), CommandFailure> {
     let format: Format = cli.common.format;
     check_format(&cli.command, format)?;
+    check_rule_selection(&cli.command)?;
     match &cli.command {
         Command::Completions(arguments) => {
             // `generate` panics on a write error, so it writes to memory first.
@@ -106,6 +107,29 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
         stage: ErrorStage::Arguments,
         message,
         fields: vec!["format"],
+        operation_id: None,
+        plan_id: None,
+        next_action: NextAction::CorrectRequest,
+    })
+}
+
+/// A rule selects the candidates of the `evict` mode only.
+fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
+    let Command::Clean {
+        command: CleanCommand::Plan(plan),
+    } = command
+    else {
+        return Ok(());
+    };
+    if plan.rule.is_none() || plan.mode == CleanMode::Evict {
+        return Ok(());
+    }
+    Err(ErrorBody {
+        code: "unsupported_rule_selection",
+        family: ErrorFamily::Request,
+        stage: ErrorStage::Arguments,
+        message: "`--rule` applies only to `--mode evict`".to_owned(),
+        fields: vec!["rule", "mode"],
         operation_id: None,
         plan_id: None,
         next_action: NextAction::CorrectRequest,

@@ -14,9 +14,11 @@ use thiserror::Error;
 
 use crate::encoding::{UnrecognizedText, wire_enum};
 use crate::id::{
-    AdapterId, BootId, ClockDomainId, CollectorEpochId, IdentityId, SampleId, WorkerId,
+    AdapterId, BootId, CapacityDomainId, ClockDomainId, CollectorEpochId, IdentityId,
+    MembershipSnapshotId, ProcessGenerationId, SampleId, ScanId, VolumeId, WorkerId,
 };
-use crate::quantity::Nanoseconds;
+use crate::quantity::{ByteDelta, Bytes, CounterValue, EntryCount, Nanoseconds, PageCount};
+use crate::state::{CapabilityState, PressureState};
 use crate::time::{MonotonicNanos, WallTime};
 
 /// The largest length of a metric name, in bytes.
@@ -207,6 +209,42 @@ pub struct Scope {
     pub kind: ScopeKind,
     /// The identity record of the subject.
     pub identity_id: IdentityId,
+}
+
+impl Scope {
+    /// The scope of one mounted volume.
+    pub fn volume(id: VolumeId) -> Self {
+        Self::new(ScopeKind::Volume, id)
+    }
+
+    /// The scope of one verified shared-capacity domain.
+    pub fn capacity_domain(id: CapacityDomainId) -> Self {
+        Self::new(ScopeKind::CapacityDomain, id)
+    }
+
+    /// The scope of one process generation.
+    pub fn process(id: ProcessGenerationId) -> Self {
+        Self::new(ScopeKind::Process, id)
+    }
+
+    /// The scope of one application membership snapshot. A sum over this
+    /// scope cannot get new members, because a membership change makes a new
+    /// snapshot identity.
+    pub fn application(id: MembershipSnapshotId) -> Self {
+        Self::new(ScopeKind::Application, id)
+    }
+
+    /// The scope of one scan and its recorded inventory.
+    pub fn scan(id: ScanId) -> Self {
+        Self::new(ScopeKind::Scan, id)
+    }
+
+    fn new(kind: ScopeKind, id: impl Into<IdentityId>) -> Self {
+        Self {
+            kind,
+            identity_id: id.into(),
+        }
+    }
 }
 
 wire_enum! {
@@ -438,6 +476,40 @@ impl<T> Reading<T> {
     }
 }
 
+/// A value type that an observation can carry.
+///
+/// The type states the units that give its value a meaning. An observation
+/// does not give out a value under a unit that the type does not accept, so a
+/// page count is never read as bytes. A value type must not encode to JSON
+/// `null`.
+pub trait ObservationValue {
+    /// Whether a value of this type has a meaning in `unit`.
+    fn accepts_unit(unit: &Unit) -> bool;
+}
+
+macro_rules! observation_value {
+    ($($type:ty => $($unit:ident)|+;)+) => {
+        $(
+            impl ObservationValue for $type {
+                fn accepts_unit(unit: &Unit) -> bool {
+                    matches!(unit, $(Unit::$unit)|+)
+                }
+            }
+        )+
+    };
+}
+
+observation_value! {
+    Bytes => Byte;
+    ByteDelta => Byte;
+    PageCount => Page;
+    EntryCount => Entry;
+    Nanoseconds => Nanosecond;
+    CounterValue => Byte | Page | Entry | Nanosecond;
+    PressureState => State;
+    CapabilityState => State;
+}
+
 /// The reason a serialized observation was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ObservationError {
@@ -456,13 +528,17 @@ pub enum ObservationError {
     /// The sample finishes before it starts.
     #[error("the sample finishes before it starts")]
     SampleFinishesBeforeStart,
+    /// The value is available and its registered unit is not a unit of the
+    /// value type.
+    #[error("the unit of the observation is not compatible with its value")]
+    UnitIncompatible,
 }
 
 /// One measurement of one scope.
 ///
 /// `T` is the value type that the metric definition registers, for example
-/// [`Bytes`](crate::quantity::Bytes) or
-/// [`PressureState`](crate::state::PressureState). `T` must not encode to
+/// [`Bytes`] or
+/// [`PressureState`]. `T` must not encode to
 /// JSON `null`.
 ///
 /// JSON has the fields `metric_id`, `scope`, `value`, `unit`, `kind`,
@@ -470,7 +546,10 @@ pub enum ObservationError {
 /// [`Reading`] gives `value`, `availability`, and `reason`. Decoding needs
 /// each field and rejects a combination that is not consistent. An
 /// `availability` that this build does not recognize decodes to
-/// [`Reading::Unrecognized`]; its `value` and `reason` are not kept.
+/// [`Reading::Unrecognized`]; its `value` and `reason` are not kept. Decoding
+/// rejects an available value whose registered unit is not a unit of `T`. A
+/// unit that this build does not recognize is kept, and [`Observation::value`]
+/// then gives no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation<T> {
     /// The metric that the value belongs to.
@@ -491,20 +570,29 @@ pub struct Observation<T> {
     pub sample: Sample,
 }
 
-impl<T> Observation<T> {
-    /// The value of an available observation.
+impl<T: ObservationValue> Observation<T> {
+    /// The value of an available observation whose unit is a unit of `T`.
+    ///
+    /// Returns `None` for a unit that this build does not recognize or that
+    /// `T` does not accept: the number has no known meaning.
     pub fn value(&self) -> Option<&T> {
-        self.reading.value()
+        if T::accepts_unit(&self.unit) {
+            self.reading.value()
+        } else {
+            None
+        }
     }
 
+    /// Whether the observation has a value that [`Observation::value`] gives.
+    pub fn is_available(&self) -> bool {
+        self.value().is_some()
+    }
+}
+
+impl<T> Observation<T> {
     /// The reason of an unavailable observation.
     pub fn reason(&self) -> Option<&UnavailableReason> {
         self.reading.reason()
-    }
-
-    /// Whether the observation has a value.
-    pub fn is_available(&self) -> bool {
-        self.reading.is_available()
     }
 }
 
@@ -556,7 +644,7 @@ struct ObservationWire<T> {
     sample: Sample,
 }
 
-impl<T> TryFrom<ObservationWire<T>> for Observation<T> {
+impl<T: ObservationValue> TryFrom<ObservationWire<T>> for Observation<T> {
     type Error = ObservationError;
 
     fn try_from(wire: ObservationWire<T>) -> Result<Self, Self::Error> {
@@ -577,6 +665,9 @@ impl<T> TryFrom<ObservationWire<T>> for Observation<T> {
             }
             (Availability::Unrecognized(text), _, _) => Reading::Unrecognized(text),
         };
+        if reading.is_available() && wire.unit.is_recognized() && !T::accepts_unit(&wire.unit) {
+            return Err(ObservationError::UnitIncompatible);
+        }
         Ok(Self {
             metric_id: wire.metric_id,
             scope: wire.scope,
@@ -590,7 +681,7 @@ impl<T> TryFrom<ObservationWire<T>> for Observation<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Observation<T> {
+impl<'de, T: Deserialize<'de> + ObservationValue> Deserialize<'de> for Observation<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire: ObservationWire<T> = ObservationWire::deserialize(deserializer)?;
         Self::try_from(wire).map_err(serde::de::Error::custom)
@@ -847,6 +938,19 @@ mod tests {
     }
 
     #[test]
+    fn a_known_unit_that_the_value_type_does_not_accept_is_rejected() {
+        let mut value: Value = specification_example();
+        value["unit"] = json!("page");
+        let error = decode(value).unwrap_err();
+        assert!(error.to_string().contains("not compatible"), "{error}");
+
+        // No value is given out when the mismatch is made in memory.
+        let mut observation = example_observation(Reading::Available(Bytes::ZERO));
+        observation.unit = Unit::Page;
+        assert_eq!(observation.value(), None);
+    }
+
+    #[test]
     fn an_unknown_enumeration_value_stays_unrecognized() {
         let mut value: Value = specification_example();
         value["unit"] = json!("block");
@@ -864,6 +968,9 @@ mod tests {
         assert_ne!(observation.coverage, Coverage::Unknown);
         assert_ne!(observation.coverage, Coverage::Complete);
         assert!(!observation.scope.kind.is_recognized());
+        // A number under an unknown unit has no known meaning.
+        assert_eq!(observation.value(), None);
+        assert!(!observation.is_available());
         // The value is written again as it was received.
         assert_eq!(serde_json::to_value(&observation).unwrap(), value);
     }

@@ -68,7 +68,8 @@ impl LosslessPath {
         std::str::from_utf8(&self.0).ok()
     }
 
-    /// Text for display only. A backslash is `\\`, a control character is
+    /// Text for display only. A backslash is `\\`, a control character or an
+    /// invisible format character (for example a bidirectional override) is
     /// `\u{..}`, and a byte that is not valid UTF-8 is `\xNN`. Do not use
     /// the label to address a file.
     pub fn display_label(&self) -> String {
@@ -77,7 +78,7 @@ impl LosslessPath {
             for character in chunk.valid().chars() {
                 if character == '\\' {
                     label.push_str("\\\\");
-                } else if character.is_control() {
+                } else if character.is_control() || is_invisible_format(character) {
                     label.extend(character.escape_unicode());
                 } else {
                     label.push(character);
@@ -90,6 +91,20 @@ impl LosslessPath {
         }
         label
     }
+}
+
+/// Whether the character changes how the text around it is shown and has no
+/// glyph of its own: zero-width characters, bidirectional controls, and line
+/// and paragraph separators.
+fn is_invisible_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 #[cfg(unix)]
@@ -249,6 +264,12 @@ mod tests {
         assert_eq!(decoded.as_bytes(), b"/f\xff");
         assert_eq!(decoded.as_utf8(), None);
         assert_eq!(decoded.display_label(), "/f\\xff");
+    }
+
+    #[test]
+    fn the_display_label_escapes_invisible_format_characters() {
+        let path = LosslessPath::from_bytes("/a/\u{202E}gpj.exe\u{200B}".as_bytes()).unwrap();
+        assert_eq!(path.display_label(), "/a/\\u{202e}gpj.exe\\u{200b}");
     }
 
     #[test]

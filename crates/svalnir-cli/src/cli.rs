@@ -10,6 +10,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use svalnir_core::duration::parse_duration;
 
+/// Parses a duration that is longer than zero.
+///
+/// A zero wait, grace period, or pause has no meaning, and a zero grace period
+/// would make `--force-after-timeout` an immediate force.
+fn positive_duration(text: &str) -> Result<Duration, String> {
+    let duration: Duration = parse_duration(text).map_err(|error| error.to_string())?;
+    if duration.is_zero() {
+        return Err(format!("the duration `{text}` must be longer than zero"));
+    }
+    Ok(duration)
+}
+
 /// Local macOS resource manager.
 #[derive(Debug, Parser)]
 #[command(name = "svalnir", version, about, propagate_version = true)]
@@ -27,7 +39,7 @@ pub struct CommonOptions {
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
     pub format: Format,
     /// Maximum time that the client waits. It does not cancel admitted work.
-    #[arg(long, global = true, value_name = "DURATION", value_parser = parse_duration)]
+    #[arg(long, global = true, value_name = "DURATION", value_parser = positive_duration)]
     pub timeout: Option<Duration>,
     /// Color of the human-readable output. Machine output has no color.
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
@@ -212,7 +224,7 @@ pub struct CleanPlanArgs {
     /// Removal mode.
     #[arg(long, value_enum, default_value_t = CleanMode::Trash)]
     pub mode: CleanMode,
-    /// Reviewed cleanup rule. The `evict` mode requires it.
+    /// Reviewed cleanup rule. Only the `evict` mode accepts it, and requires it.
     #[arg(long, value_name = "RULE_ID", required_if_eq("mode", "evict"))]
     pub rule: Option<String>,
 }
@@ -282,7 +294,7 @@ pub struct ProcessesTopArgs {
     #[arg(long, value_enum, default_value_t = ProcessSort::Footprint)]
     pub sort: ProcessSort,
     /// Maximum number of entries.
-    #[arg(long, value_name = "COUNT")]
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
     pub limit: Option<u32>,
 }
 
@@ -311,7 +323,7 @@ pub struct ProcessesStopArgs {
     #[command(flatten)]
     pub target: TargetRef,
     /// Time that the target has to exit after the graceful request.
-    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    #[arg(long, value_name = "DURATION", value_parser = positive_duration)]
     pub grace: Option<Duration>,
     /// Force termination immediately. Hard protections stay in effect.
     #[arg(long, conflicts_with = "force_after_timeout")]
@@ -357,7 +369,7 @@ pub enum AgentCommand {
 #[derive(Debug, Args)]
 pub struct AgentPauseArgs {
     /// Time after which the pause ends.
-    #[arg(long = "for", value_name = "DURATION", value_parser = parse_duration)]
+    #[arg(long = "for", value_name = "DURATION", value_parser = positive_duration)]
     pub duration: Option<Duration>,
 }
 
@@ -464,7 +476,7 @@ pub struct ConfigApplyArgs {
 #[derive(Debug, Args)]
 pub struct HistoryArgs {
     /// Maximum number of records.
-    #[arg(long, value_name = "COUNT")]
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
     pub limit: Option<u32>,
 }
 

@@ -34,7 +34,7 @@ pub(crate) fn parse_canonical_u64(text: &str) -> Result<u64, QuantityError> {
 /// canonical integer.
 pub(crate) fn parse_canonical_i128(text: &str) -> Result<i128, QuantityError> {
     let digits: &str = match text.strip_prefix('-') {
-        Some("0") => return Err(QuantityError::NonCanonical),
+        Some("0" | "") => return Err(QuantityError::NonCanonical),
         Some(rest) => rest,
         None => text,
     };
@@ -274,7 +274,7 @@ mod tests {
             parse_canonical_i128("--1"),
             Err(QuantityError::NonCanonical)
         );
-        assert_eq!(parse_canonical_i128("-"), Err(QuantityError::Empty));
+        assert_eq!(parse_canonical_i128("-"), Err(QuantityError::NonCanonical));
         assert_eq!(
             parse_canonical_i128("999999999999999999999999999999999999999999"),
             Err(QuantityError::OutOfRange)

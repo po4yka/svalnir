@@ -43,7 +43,8 @@ pub use capacity::{
 };
 pub use identity::{
     CapacityDomainEvidence, ContainerLookup, MountEvidence, MountedVolume, VolumeIdentityError,
-    apfs_device_name, mounted_volume, reject_ambiguous_containers,
+    VolumeUuidLookup, apfs_device_name, mounted_volume, reject_ambiguous_containers,
+    reject_duplicate_volume_uuids,
 };
 pub use pool::{CapacityGrouping, CapacityPool, CapacityPoolMembers, group_by_capacity_pool};
 pub use raw::{RawApfsContainer, RawFoundationCapacity, RawMount};
@@ -76,9 +77,9 @@ pub enum VolumeQueryError {
 ///
 /// The two probes are made only for a local filesystem, so that a network
 /// filesystem that does not answer cannot stop the enumeration.
-fn probe(raw: &RawMount) -> (Option<[u8; 16]>, ContainerLookup) {
+fn probe(raw: &RawMount) -> (VolumeUuidLookup, ContainerLookup) {
     if raw.flags & raw::MOUNT_FLAG_LOCAL == 0 {
-        return (None, ContainerLookup::NotExamined);
+        return (VolumeUuidLookup::NotExamined, ContainerLookup::NotExamined);
     }
     let container: ContainerLookup = match apfs_device_name(raw) {
         Some(device_name) => match native::apfs_container(device_name) {
@@ -87,14 +88,18 @@ fn probe(raw: &RawMount) -> (Option<[u8; 16]>, ContainerLookup) {
         },
         None => ContainerLookup::NotExamined,
     };
-    (native::volume_uuid(&raw.mount_point), container)
+    (
+        native::volume_uuid(&raw.mount_point, raw.fsid).into(),
+        container,
+    )
 }
 
 /// Makes the inventory of a list of raw mounts with the probes of the host.
 fn inventory_of(mounts: &[RawMount]) -> VolumeInventory {
-    let (uuids, mut lookups): (Vec<Option<[u8; 16]>>, Vec<ContainerLookup>) =
+    let (mut uuids, mut lookups): (Vec<VolumeUuidLookup>, Vec<ContainerLookup>) =
         mounts.iter().map(probe).unzip();
     reject_ambiguous_containers(&mut lookups);
+    reject_duplicate_volume_uuids(mounts, &mut uuids);
     let mut inventory = VolumeInventory {
         volumes: Vec::with_capacity(mounts.len()),
         rejected: Vec::new(),
@@ -148,10 +153,14 @@ pub fn volume_at(path: &Path) -> Result<MountedVolume, VolumeQueryError> {
         .ok_or(VolumeQueryError::Unavailable(
             UnavailableReason::ResourceGone,
         ))?;
-    let (uuids, mut lookups): (Vec<Option<[u8; 16]>>, Vec<ContainerLookup>) =
+    let (mut uuids, mut lookups): (Vec<VolumeUuidLookup>, Vec<ContainerLookup>) =
         mounts.iter().map(probe).unzip();
     reject_ambiguous_containers(&mut lookups);
-    let volume_uuid: Option<[u8; 16]> = uuids.get(position).copied().flatten();
+    reject_duplicate_volume_uuids(&mounts, &mut uuids);
+    let volume_uuid: VolumeUuidLookup = uuids
+        .into_iter()
+        .nth(position)
+        .unwrap_or(VolumeUuidLookup::NotExamined);
     let container: ContainerLookup = lookups
         .into_iter()
         .nth(position)
@@ -168,8 +177,9 @@ mod tests {
     use svalnir_core::volume::CapacityDomainMembership;
 
     use super::{
-        CapacityDomainEvidence, CollectionContext, VolumeQueryError, collect_capacity,
-        collect_foundation_capacity, enumerate_volumes, group_by_capacity_pool, volume_at,
+        CapacityDomainEvidence, CollectionContext, VolumeQueryError, VolumeUuidLookup,
+        collect_capacity, collect_foundation_capacity, enumerate_volumes, group_by_capacity_pool,
+        volume_at,
     };
 
     #[test]
@@ -184,6 +194,11 @@ mod tests {
         assert_ne!(root.identity.filesystem_type, "");
         assert_eq!(root.evidence.fsid[0], root.identity.device.get());
         assert!(root.evidence.local);
+        // The `fsid` of `getattrlist` agrees with the one of `getfsstat`.
+        assert!(!matches!(
+            root.evidence.volume_uuid,
+            VolumeUuidLookup::Failed(_)
+        ));
 
         // Each mount generation is in the list one time.
         let mut mount_ids: Vec<&str> = inventory

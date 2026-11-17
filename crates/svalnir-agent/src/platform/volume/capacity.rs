@@ -175,6 +175,23 @@ pub fn foundation_capacity_observations(
     }
 }
 
+/// Runs the Foundation query only for the mount of `identity`.
+///
+/// The Foundation query takes a path, so it can reach another filesystem when
+/// the volume was ejected or another one was mounted at the path. `statfs`
+/// must show the mount of `identity` before the query and after it; otherwise
+/// the values are not the values of this volume.
+fn guarded_foundation_capacity(
+    identity: &VolumeIdentity,
+    statfs: impl Fn() -> Result<RawMount, UnavailableReason>,
+    query: impl FnOnce() -> Result<RawFoundationCapacity, UnavailableReason>,
+) -> Result<RawFoundationCapacity, UnavailableReason> {
+    same_mount(identity, &statfs()?)?;
+    let values: Result<RawFoundationCapacity, UnavailableReason> = query();
+    same_mount(identity, &statfs()?)?;
+    values
+}
+
 /// Reads the `statfs` capacity of the volume `identity`.
 ///
 /// The query is `statfs` of the mount point, so the values are current. The
@@ -206,8 +223,12 @@ pub fn collect_foundation_capacity(
     identity: &VolumeIdentity,
 ) -> Result<FoundationCapacity, CollectError> {
     let acquisition = context.begin()?;
-    let raw: Result<RawFoundationCapacity, UnavailableReason> =
-        super::native::foundation_capacity(identity.mount_point.as_bytes());
+    let mount_point: &[u8] = identity.mount_point.as_bytes();
+    let raw: Result<RawFoundationCapacity, UnavailableReason> = guarded_foundation_capacity(
+        identity,
+        || super::native::filesystem_at(mount_point),
+        || super::native::foundation_capacity(mount_point),
+    );
     let sample: Sample = context.finish(acquisition)?;
     Ok(foundation_capacity_observations(
         context, identity, raw, &sample,
@@ -225,7 +246,9 @@ mod tests {
     use super::super::identity::testing::apfs_mount;
     use super::super::identity::{ContainerLookup, mounted_volume};
     use super::super::raw::{RawFoundationCapacity, RawMount};
-    use super::{capacity_observations, foundation_capacity_observations};
+    use super::{
+        capacity_observations, foundation_capacity_observations, guarded_foundation_capacity,
+    };
     use crate::platform::memory::context::testing;
 
     fn data_volume() -> (RawMount, VolumeIdentity) {
@@ -445,5 +468,63 @@ mod tests {
             assert_eq!(observation.value(), None);
             assert_eq!(observation.reason(), Some(&UnavailableReason::ResourceGone));
         }
+    }
+
+    #[test]
+    fn the_foundation_query_runs_only_for_the_mount_of_the_volume() {
+        let (raw, identity) = data_volume();
+        let values = || RawFoundationCapacity {
+            important: Ok(1),
+            opportunistic: Ok(2),
+        };
+
+        // The same mount before and after: the values are published.
+        let same = guarded_foundation_capacity(&identity, || Ok(raw.clone()), || Ok(values()));
+        assert_eq!(same, Ok(values()));
+
+        // Another mount at the path before the query: no query is made.
+        let mut other = raw.clone();
+        other.fsid[0] += 1;
+        let queried = std::cell::Cell::new(false);
+        let before = guarded_foundation_capacity(
+            &identity,
+            || Ok(other.clone()),
+            || {
+                queried.set(true);
+                Ok(values())
+            },
+        );
+        assert_eq!(before, Err(UnavailableReason::IdentityChanged));
+        assert!(!queried.get());
+
+        // The volume is not mounted: `statfs` reaches the parent filesystem.
+        let mut parent = raw.clone();
+        parent.mount_point = b"/".to_vec();
+        let gone = guarded_foundation_capacity(&identity, || Ok(parent.clone()), || Ok(values()));
+        assert_eq!(gone, Err(UnavailableReason::ResourceGone));
+
+        // The mount changes during the query.
+        let calls = std::cell::Cell::new(0_u32);
+        let during = guarded_foundation_capacity(
+            &identity,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(if calls.get() == 1 {
+                    raw.clone()
+                } else {
+                    other.clone()
+                })
+            },
+            || Ok(values()),
+        );
+        assert_eq!(during, Err(UnavailableReason::IdentityChanged));
+
+        // A failed `statfs` is a reason, not a value.
+        let failed = guarded_foundation_capacity(
+            &identity,
+            || Err(UnavailableReason::PermissionDenied),
+            || Ok(values()),
+        );
+        assert_eq!(failed, Err(UnavailableReason::PermissionDenied));
     }
 }

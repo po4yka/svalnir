@@ -15,8 +15,11 @@ pub(super) fn filesystem_at(_path: &[u8]) -> Result<RawMount, UnavailableReason>
     Err(UnavailableReason::Unsupported)
 }
 
-pub(super) fn volume_uuid(_mount_point: &[u8]) -> Option<[u8; 16]> {
-    None
+pub(super) fn volume_uuid(
+    _mount_point: &[u8],
+    _expected_fsid: [i32; 2],
+) -> Result<Option<[u8; 16]>, UnavailableReason> {
+    Err(UnavailableReason::Unsupported)
 }
 
 pub(super) fn apfs_container(_bsd_name: &[u8]) -> Result<RawApfsContainer, UnavailableReason> {

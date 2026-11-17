@@ -427,9 +427,7 @@ impl SwapView {
         let activity: SwapActivity = memory::swap_activity(
             earlier,
             &snapshot.vm,
-            RateLimits {
-                max_interval: MAX_RATE_INTERVAL,
-            },
+            RateLimits::with_max_interval(MAX_RATE_INTERVAL),
         );
         Self {
             allocated: swap.allocated.clone(),

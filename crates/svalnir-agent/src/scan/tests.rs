@@ -25,7 +25,7 @@ use svalnir_core::volume::{CapacityDomainMembership, VolumeIdentity};
 
 use super::native::RawMetadata;
 use super::top::TopList;
-use super::walk::{Injection, MetadataHook, join_name, scan_with};
+use super::walk::{Injection, MetadataHook, budget_from_limit, join_name, scan_with};
 use super::{
     CancellationToken, DirectoryRecord, EntryKind, EntryRecord, LargeFile, NoObserver, RegionCause,
     RegionKind, ScanClock, ScanCompletion, ScanError, ScanLimits, ScanObserver, ScanRequest,
@@ -182,6 +182,7 @@ fn scan_injected(
         &mut NoObserver,
         Injection {
             metadata: Some(hook),
+            ..Injection::default()
         },
     )
     .unwrap()
@@ -604,6 +605,7 @@ fn the_boundary_list_is_bounded() {
         &mut NoObserver,
         Injection {
             metadata: Some(hook),
+            ..Injection::default()
         },
     )
     .unwrap();
@@ -638,7 +640,7 @@ fn metadata_that_is_not_valid_is_a_region_and_not_a_zero() {
 }
 
 #[test]
-fn a_total_that_overflows_is_a_region() {
+fn a_field_that_overflows_keeps_the_other_fields() {
     let tree = TempTree::new("overflow");
     tree.file("huge-a", 1);
     tree.file("huge-b", 1);
@@ -656,6 +658,7 @@ fn a_total_that_overflows_is_a_region() {
         &mut NoObserver,
         Injection {
             metadata: Some(hook),
+            ..Injection::default()
         },
     )
     .unwrap();
@@ -664,8 +667,12 @@ fn a_total_that_overflows_is_a_region() {
     assert_eq!(result.regions.len(), 1);
     assert_eq!(result.regions[0].cause, RegionCause::Overflow);
     assert_eq!(result.regions[0].kind(), RegionKind::Incomplete);
-    assert_eq!(result.totals.files, count(1));
-    assert_eq!(result.totals.entries, count(1));
+    // The allocated total keeps its earlier value, and the second file still
+    // adds its logical size, its entry, and its kind count.
+    assert_eq!(result.totals.files, count(2));
+    assert_eq!(result.totals.entries, count(2));
+    assert_eq!(result.totals.logical_bytes, Bytes::new(2));
+    assert_kind_counts_agree(&result);
     let root_allocated: u64 = fs::metadata(&tree.root).unwrap().blocks() * 512;
     assert_eq!(
         result.totals.allocated_bytes,
@@ -674,14 +681,15 @@ fn a_total_that_overflows_is_a_region() {
 }
 
 #[test]
-fn a_hard_linked_object_that_is_not_in_the_totals_is_not_reported_as_counted() {
+fn a_hard_linked_object_whose_allocation_overflows_is_still_tracked() {
     let tree = TempTree::new("overflow-hardlink");
     for object in ["b", "c"] {
         let first: PathBuf = tree.file(&format!("{object}-1"), 1);
         fs::hard_link(&first, tree.path(&format!("{object}-2"))).unwrap();
     }
     // Each object gets 2^63 allocated bytes, so only one object fits the
-    // total. The two names of the other object are regions.
+    // allocated total. The other object keeps its other fields, its entry,
+    // and its place in the hard-link set; one region records the overflow.
     let hook: MetadataHook = Box::new(|path: &Path, metadata: &mut RawMetadata| {
         if metadata.kind == EntryKind::File && path.file_name().is_some() {
             metadata.blocks = 1_i64 << 54;
@@ -694,24 +702,21 @@ fn a_hard_linked_object_that_is_not_in_the_totals_is_not_reported_as_counted() {
         &mut NoObserver,
         Injection {
             metadata: Some(hook),
+            ..Injection::default()
         },
     )
     .unwrap();
 
     assert_eq!(result.coverage, Coverage::Partial);
-    assert_eq!(result.regions.len(), 2);
-    assert!(
-        result
-            .regions
-            .iter()
-            .all(|region| region.cause == RegionCause::Overflow)
-    );
-    assert_eq!(result.shared_storage.hard_linked_objects, count(1));
+    assert_eq!(result.regions.len(), 1);
+    assert_eq!(result.regions[0].cause, RegionCause::Overflow);
+    assert_eq!(result.shared_storage.hard_linked_objects, count(2));
     assert_eq!(
         result.shared_storage.hard_link_names_not_counted_again,
-        count(1)
+        count(2)
     );
-    assert_eq!(result.totals.files, count(2));
+    assert_eq!(result.totals.files, count(4));
+    assert_eq!(result.totals.entries, count(4));
     assert_kind_counts_agree(&result);
 }
 
@@ -1536,4 +1541,149 @@ fn manual_scan_of_a_selected_root() {
         },
     );
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
+}
+
+/// Makes a file that has the apparent size of `i64::MAX` bytes in the
+/// injected metadata. The file on the disk is small.
+fn huge_logical_hook(names: &'static [&'static str]) -> MetadataHook {
+    Box::new(move |path: &Path, metadata: &mut RawMetadata| {
+        if metadata.kind == EntryKind::File
+            && path
+                .file_name()
+                .is_some_and(|name| names.iter().any(|huge| name == OsStr::new(huge)))
+        {
+            metadata.size = i64::MAX;
+        }
+    })
+}
+
+fn scan_with_injection(root: &Path, limits: ScanLimits, injection: Injection) -> ScanResult {
+    scan_with(
+        &request(root, limits),
+        &CancellationToken::new(),
+        &WallScanClock,
+        &mut NoObserver,
+        injection,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_logical_overflow_in_a_directory_keeps_the_allocation_and_the_count() {
+    let tree = TempTree::new("logical-overflow");
+    for name in ["huge1", "huge2", "huge3"] {
+        tree.file(name, 1);
+    }
+    let result: ScanResult = scan_with_injection(
+        &tree.root,
+        ScanLimits::default(),
+        Injection {
+            metadata: Some(huge_logical_hook(&["huge1", "huge2", "huge3"])),
+            ..Injection::default()
+        },
+    );
+
+    assert_eq!(result.coverage, Coverage::Partial);
+    assert_eq!(result.regions.len(), 1);
+    assert_eq!(result.regions[0].cause, RegionCause::Overflow);
+    // Two files fit the logical total, and the third keeps the earlier value.
+    assert_eq!(result.totals.logical_bytes, Bytes::new(2 * i64::MAX as u64));
+    assert_eq!(
+        result.totals.allocated_bytes.get(),
+        expected(&tree.root).allocated
+    );
+    assert_eq!(result.totals.entries, count(3));
+    assert_eq!(result.totals.files, count(3));
+    assert_kind_counts_agree(&result);
+}
+
+#[test]
+fn a_logical_overflow_in_a_subtree_keeps_its_allocation_and_its_entries() {
+    let tree = TempTree::new("subtree-overflow");
+    tree.file("a/huge1", 1);
+    tree.file("a/huge2", 1);
+    tree.file("b/huge3", 1);
+    tree.file("b/huge4", 1);
+    let result: ScanResult = scan_with_injection(
+        &tree.root,
+        ScanLimits::default(),
+        Injection {
+            metadata: Some(huge_logical_hook(&["huge1", "huge2", "huge3", "huge4"])),
+            ..Injection::default()
+        },
+    );
+
+    assert_eq!(result.coverage, Coverage::Partial);
+    assert_eq!(result.regions.len(), 1);
+    assert_eq!(result.regions[0].cause, RegionCause::Overflow);
+    assert_eq!(
+        result.totals.allocated_bytes.get(),
+        expected(&tree.root).allocated
+    );
+    assert_eq!(result.totals.entries, count(6));
+    assert_kind_counts_agree(&result);
+}
+
+#[test]
+fn the_descriptor_budget_leaves_most_of_the_limit_to_the_process() {
+    assert_eq!(budget_from_limit(1_024, Some(256)), 64);
+    assert_eq!(budget_from_limit(3, Some(256)), 4);
+    assert_eq!(budget_from_limit(1_024, Some(10_240)), 1_025);
+    assert_eq!(budget_from_limit(1_024, None), 32);
+    assert_eq!(budget_from_limit(0, Some(0)), 1);
+}
+
+#[test]
+fn a_directory_deeper_than_the_descriptor_budget_is_a_resource_limit_region() {
+    let tree = TempTree::new("descriptor-budget");
+    tree.file("d1/d2/d3/d4/d5/deep.bin", 10);
+    let result: ScanResult = scan_with_injection(
+        &tree.root,
+        ScanLimits::default(),
+        Injection {
+            descriptor_budget: Some(3),
+            ..Injection::default()
+        },
+    );
+
+    // The root, `d1`, and `d2` are open. `d3` is a name that the scan does
+    // not open.
+    assert_eq!(result.coverage, Coverage::Partial);
+    assert_eq!(result.regions.len(), 1);
+    assert_eq!(result.regions[0].path, lossless(&tree.path("d1/d2/d3")));
+    assert_eq!(result.regions[0].cause, RegionCause::ResourceLimit);
+    assert_eq!(result.totals.directories, count(3));
+    assert_eq!(result.totals.files, count(0));
+}
+
+#[test]
+fn a_directory_that_is_already_open_on_the_stack_is_not_entered_again() {
+    let tree = TempTree::new("cycle");
+    tree.file("a/loop/inside.bin", 10);
+    tree.file("keep.bin", 10);
+    let root_inode: u64 = fs::metadata(&tree.root).unwrap().ino();
+    // A bind mount cannot be made without rights. The injection gives the
+    // directory `loop` the identity of the root, as a bind mount does.
+    let same_as_root = move || -> MetadataHook {
+        Box::new(move |path: &Path, metadata: &mut RawMetadata| {
+            if path.file_name() == Some(OsStr::new("loop")) {
+                metadata.inode = root_inode;
+            }
+        })
+    };
+    let result: ScanResult = scan_with_injection(
+        &tree.root,
+        ScanLimits::default(),
+        Injection {
+            metadata: Some(same_as_root()),
+            opened: Some(same_as_root()),
+            ..Injection::default()
+        },
+    );
+
+    assert_eq!(result.coverage, Coverage::Partial);
+    assert_eq!(result.regions.len(), 1);
+    assert_eq!(result.regions[0].path, lossless(&tree.path("a/loop")));
+    assert_eq!(result.regions[0].cause, RegionCause::IdentityChanged);
+    assert_eq!(result.totals.files, count(1));
 }

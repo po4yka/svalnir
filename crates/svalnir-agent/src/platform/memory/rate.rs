@@ -79,6 +79,11 @@ pub enum RateUnavailable {
     /// The interval is longer than the permitted maximum: a gap or a sleep.
     #[error("the interval is longer than the permitted maximum")]
     IntervalTooLong,
+    /// The interval is shorter than the permitted minimum. The kernel can
+    /// return the counters of an earlier call for a call that is too soon, so
+    /// the later counters can be old values with a new sample time.
+    #[error("the interval is shorter than the permitted minimum")]
+    IntervalTooShort,
     /// The counter decreased: it was reset.
     #[error("the counter decreased; it was reset")]
     CounterReset,
@@ -101,6 +106,8 @@ impl RateUnavailable {
             | Self::DefinitionMismatch
             | Self::CounterReset
             | Self::PageSizeChanged => UnavailableReason::InconsistentData,
+            // The counters of the later sample are possibly not new values.
+            Self::IntervalTooShort => UnavailableReason::NotCollected,
             Self::BootChanged
             | Self::ClockDomainChanged
             | Self::NotOrdered
@@ -111,8 +118,9 @@ impl RateUnavailable {
 
 /// The limits of a valid rate interval.
 ///
-/// There is no default: the caller states the longest interval that is one
-/// continuous observation. The monotonic clock of the host continues during
+/// There is no default maximum: the caller states the longest interval that is
+/// one continuous observation. [`RateLimits::DEFAULT_MIN_INTERVAL`] is the
+/// default minimum. The monotonic clock of the host continues during
 /// sleep, so a sleep that is longer than the limit shows as a gap. This code
 /// does not detect a sleep or a wake that is shorter than the limit.
 // TODO(npochaev): reject an interval that has a wake event when the agent
@@ -122,6 +130,27 @@ pub struct RateLimits {
     /// The longest permitted interval. A longer interval is a gap: the host
     /// slept or the collector missed samples.
     pub max_interval: Nanoseconds,
+    /// The shortest permitted interval. A shorter interval gives no rate.
+    ///
+    /// The kernel can answer a process that calls `host_statistics64` too
+    /// often with the values of an earlier call and `KERN_SUCCESS`. This
+    /// build does not verify the length of that window. The minimum is a
+    /// conservative bound that keeps such a repeated value from becoming a
+    /// measured rate of zero or an inflated rate.
+    pub min_interval: Nanoseconds,
+}
+
+impl RateLimits {
+    /// The default minimum interval: one second.
+    pub const DEFAULT_MIN_INTERVAL: Nanoseconds = Nanoseconds::new(1_000_000_000);
+
+    /// Limits with `max_interval` and the default minimum interval.
+    pub const fn with_max_interval(max_interval: Nanoseconds) -> Self {
+        Self {
+            max_interval,
+            min_interval: Self::DEFAULT_MIN_INTERVAL,
+        }
+    }
 }
 
 fn counter_value(observation: &Observation<CounterValue>) -> Result<CounterValue, RateUnavailable> {
@@ -144,7 +173,8 @@ fn counter_value(observation: &Observation<CounterValue>) -> Result<CounterValue
 /// Returns a [`RateUnavailable`] when the two readings do not make a valid
 /// interval: a first sample, a reading with no value, two different metrics
 /// or scopes, two boots, two collector lifetimes, two clock domains, samples
-/// that are not distinct and ordered, an interval longer than the limit, or
+/// that are not distinct and ordered, an interval shorter than the minimum
+/// or longer than the maximum, or
 /// a counter that decreased.
 pub fn counter_rate(
     earlier: Option<&Observation<CounterValue>>,
@@ -183,6 +213,9 @@ pub fn counter_rate(
         .checked_duration_since(earlier.sample.started_monotonic_ns)
         .filter(|interval| *interval > Nanoseconds::ZERO)
         .ok_or(RateUnavailable::NotOrdered)?;
+    if interval < limits.min_interval {
+        return Err(RateUnavailable::IntervalTooShort);
+    }
     if interval > limits.max_interval {
         return Err(RateUnavailable::IntervalTooLong);
     }
@@ -293,9 +326,7 @@ mod tests {
 
     const SECOND: u64 = 1_000_000_000;
     /// A limit that is longer than each interval of these tests.
-    const LIMITS: RateLimits = RateLimits {
-        max_interval: Nanoseconds::new(3_600 * SECOND),
-    };
+    const LIMITS: RateLimits = RateLimits::with_max_interval(Nanoseconds::new(3_600 * SECOND));
     const PAGE_16K: u64 = 16_384;
 
     fn raw(swapins: u64, swapouts: u64) -> RawVmStatistics {
@@ -473,9 +504,7 @@ mod tests {
     #[test]
     fn an_interval_longer_than_the_limit_is_a_gap() {
         let (context, _clock) = testing::context();
-        let limits = RateLimits {
-            max_interval: Nanoseconds::new(30 * SECOND),
-        };
+        let limits = RateLimits::with_max_interval(Nanoseconds::new(30 * SECOND));
         let earlier = vm_at(&context, 10 * SECOND, 1_000, 5_000);
         let at_limit = vm_at(&context, 40 * SECOND, 1_300, 5_000);
         assert_eq!(
@@ -494,6 +523,31 @@ mod tests {
         assert_eq!(
             RateUnavailable::IntervalTooLong.reason(),
             UnavailableReason::ClockDiscontinuity
+        );
+    }
+
+    #[test]
+    fn an_interval_shorter_than_the_minimum_gives_no_rate() {
+        let (context, _clock) = testing::context();
+        let earlier = vm_at(&context, 10 * SECOND, 1_000, 5_000);
+        // The kernel can give the earlier values to a call that is too soon.
+        let too_soon = vm_at(&context, 10 * SECOND + 999_999_999, 1_000, 5_000);
+        let activity = swap_activity(Some(&earlier), &too_soon, LIMITS);
+        assert_eq!(activity.swapins, Err(RateUnavailable::IntervalTooShort));
+        assert_eq!(activity.swapouts, Err(RateUnavailable::IntervalTooShort));
+        assert_eq!(
+            RateUnavailable::IntervalTooShort.reason(),
+            UnavailableReason::NotCollected
+        );
+        // The minimum itself is a valid interval.
+        let at_minimum = vm_at(&context, 11 * SECOND, 1_300, 5_000);
+        assert_eq!(
+            swap_activity(Some(&earlier), &at_minimum, LIMITS)
+                .swapins
+                .unwrap()
+                .rate
+                .interval,
+            RateLimits::DEFAULT_MIN_INTERVAL
         );
     }
 
@@ -579,7 +633,7 @@ mod tests {
     fn the_largest_increase_gives_a_finite_rate() {
         let (context, _clock) = testing::context();
         let earlier = vm_at(&context, 10 * SECOND, 0, 0);
-        let later = vm_at(&context, 10 * SECOND + 1_000_001, u64::MAX, 0);
+        let later = vm_at(&context, 11 * SECOND + 1, u64::MAX, 0);
         let rate = swap_activity(Some(&earlier), &later, LIMITS)
             .swapins
             .unwrap();

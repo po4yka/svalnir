@@ -13,7 +13,7 @@ use libc::{c_int, kern_return_t, mach_port_t};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
 use objc2_foundation::{
-    NSArray, NSError, NSNumber, NSString, NSURL, NSURLResourceKey,
+    NSArray, NSCocoaErrorDomain, NSError, NSNumber, NSString, NSURL, NSURLResourceKey,
     NSURLVolumeAvailableCapacityForImportantUsageKey,
     NSURLVolumeAvailableCapacityForOpportunisticUsageKey,
 };
@@ -92,6 +92,9 @@ fn reason_from_errno(error: &io::Error) -> UnavailableReason {
         Some(libc::EPERM | libc::EACCES) => UnavailableReason::PermissionDenied,
         Some(libc::ENOENT | libc::ENOTDIR) => UnavailableReason::ResourceGone,
         Some(libc::ENOTSUP | libc::EINVAL) => UnavailableReason::Unsupported,
+        // The path is not valid for this query. Another attempt with the same
+        // path fails in the same way, so the failure is not transient.
+        Some(libc::ENAMETOOLONG | libc::ELOOP) => UnavailableReason::InconsistentData,
         _ => UnavailableReason::TransientFailure,
     }
 }
@@ -187,25 +190,43 @@ pub(super) fn filesystem_at(path: &[u8]) -> Result<RawMount, UnavailableReason> 
     Ok(raw_mount(&native))
 }
 
-/// The result buffer of `getattrlist` for `ATTR_VOL_UUID`: the length of the
-/// result and the UUID. The structure has no padding.
+/// The result buffer of `getattrlist` for `ATTR_CMN_FSID` and
+/// `ATTR_VOL_UUID`. The kernel writes the length word first, then the common
+/// attributes in bit order, then the volume attributes. The structure has no
+/// padding: each field has an alignment of at most four bytes.
 #[repr(C)]
 struct VolumeUuidAttributes {
     length: u32,
+    fsid: [i32; 2],
     uuid: [u8; 16],
 }
 
-const _: () = assert!(size_of::<VolumeUuidAttributes>() == 20);
+const _: () = assert!(size_of::<VolumeUuidAttributes>() == 28);
 
-/// `getattrlist` with `ATTR_VOL_UUID`: the UUID of the volume that is
-/// mounted at `mount_point`. Returns `None` when the filesystem gives no
-/// UUID or the query fails.
-pub(super) fn volume_uuid(mount_point: &[u8]) -> Option<[u8; 16]> {
-    let path: CString = CString::new(mount_point).ok()?;
+/// `getattrlist` with `ATTR_CMN_FSID` and `ATTR_VOL_UUID`: the UUID of the
+/// volume that is mounted at `mount_point`.
+///
+/// The query asks for the `fsid` of the object in the same call. A result
+/// whose `fsid` is not `expected_fsid` is another mount that took the path
+/// after the enumeration, and gives `IdentityChanged`, not a UUID.
+///
+/// Returns `Ok(None)` when the filesystem has no UUID (`ENOTSUP`, or a zero
+/// UUID). A failed query is an error with its reason.
+///
+/// # Errors
+///
+/// Returns the reason of a failed query, of a result of an unexpected size,
+/// or of an `fsid` that is not the expected one.
+pub(super) fn volume_uuid(
+    mount_point: &[u8],
+    expected_fsid: [i32; 2],
+) -> Result<Option<[u8; 16]>, UnavailableReason> {
+    let path: CString =
+        CString::new(mount_point).map_err(|_| UnavailableReason::InconsistentData)?;
     let mut request = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: 0,
+        commonattr: libc::ATTR_CMN_FSID,
         volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
         dirattr: 0,
         fileattr: 0,
@@ -213,27 +234,40 @@ pub(super) fn volume_uuid(mount_point: &[u8]) -> Option<[u8; 16]> {
     };
     let mut attributes = VolumeUuidAttributes {
         length: 0,
+        fsid: [0; 2],
         uuid: [0; 16],
     };
     // SAFETY: `path` is a NUL-terminated string. `request` is a valid
-    // attribute list that asks for one fixed-size volume attribute.
-    // `attributes` is writable for its size, and the kernel writes no more
-    // than that size.
+    // attribute list that asks for fixed-size attributes only. `attributes`
+    // is writable for its size, and the kernel writes no more than that
+    // size. `FSOPT_NOFOLLOW` keeps a symbolic link at the path from
+    // redirecting the query.
     let status: c_int = unsafe {
         libc::getattrlist(
             path.as_ptr(),
             (&raw mut request).cast::<c_void>(),
             (&raw mut attributes).cast::<c_void>(),
             size_of::<VolumeUuidAttributes>(),
-            0,
+            libc::FSOPT_NOFOLLOW,
         )
     };
     if status != 0 {
-        return None;
+        let error: io::Error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOTSUP) {
+            Ok(None)
+        } else {
+            Err(reason_from_errno(&error))
+        };
     }
     let complete: bool = usize::try_from(attributes.length)
         .is_ok_and(|length| length == size_of::<VolumeUuidAttributes>());
-    (complete && attributes.uuid != [0; 16]).then_some(attributes.uuid)
+    if !complete {
+        return Err(UnavailableReason::InconsistentData);
+    }
+    if attributes.fsid != expected_fsid {
+        return Err(UnavailableReason::IdentityChanged);
+    }
+    Ok((attributes.uuid != [0; 16]).then_some(attributes.uuid))
 }
 
 /// An I/O Registry object handle that is released on drop.
@@ -354,7 +388,7 @@ pub(super) fn apfs_container(bsd_name: &[u8]) -> Result<RawApfsContainer, Unavai
 
     autoreleasepool(|_| {
         let mut entry: RegistryEntry = RegistryEntry::media_with_bsd_name(&bsd_name)?;
-        for _ in 0..=MAX_REGISTRY_PARENT_STEPS {
+        for step in 0..=MAX_REGISTRY_PARENT_STEPS {
             if entry.conforms_to(&container_class) {
                 return Ok(RawApfsContainer {
                     uuid: entry
@@ -363,6 +397,11 @@ pub(super) fn apfs_container(bsd_name: &[u8]) -> Result<RawApfsContainer, Unavai
                     registry_entry_id: entry.registry_entry_id()?,
                 });
             }
+            if step == MAX_REGISTRY_PARENT_STEPS {
+                // The last entry was checked. A parent call now would be
+                // unused, and its failure would hide `Unsupported`.
+                break;
+            }
             entry = entry.parent(&service_plane)?;
         }
         Err(UnavailableReason::Unsupported)
@@ -370,6 +409,13 @@ pub(super) fn apfs_container(bsd_name: &[u8]) -> Result<RawApfsContainer, Unavai
 }
 
 fn reason_from_foundation_error(error: &NSError) -> UnavailableReason {
+    // SAFETY: Foundation initializes the constant before any code of this
+    // process runs, and does not change it.
+    let cocoa_domain: &NSString = unsafe { NSCocoaErrorDomain };
+    if *error.domain() != *cocoa_domain {
+        // The Cocoa codes do not apply to an error of another domain.
+        return UnavailableReason::TransientFailure;
+    }
     match error.code() {
         NS_FILE_READ_NO_PERMISSION => UnavailableReason::PermissionDenied,
         NS_FILE_NO_SUCH_FILE | NS_FILE_READ_NO_SUCH_FILE => UnavailableReason::ResourceGone,

@@ -18,6 +18,19 @@ use svalnir_core::file::DeviceNumber;
 
 use super::model::EntryKind;
 
+/// Reads the soft limit of open descriptors of the process
+/// (`RLIMIT_NOFILE`). Returns `None` when the call fails.
+pub(super) fn soft_descriptor_limit() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid `rlimit` structure for a write, and the
+    // call keeps no pointer after it returns.
+    let status: libc::c_int = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+    (status == 0).then_some(limit.rlim_cur)
+}
+
 /// The `stat` fields that the scanner uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RawMetadata {

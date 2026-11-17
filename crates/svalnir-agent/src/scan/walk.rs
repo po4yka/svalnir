@@ -41,6 +41,14 @@ pub(super) type MetadataHook = Box<dyn FnMut(&Path, &mut RawMetadata)>;
 pub(super) struct Injection {
     #[cfg(test)]
     pub(super) metadata: Option<MetadataHook>,
+    /// Replaces the descriptor budget that the scan derives from the limit
+    /// of the process.
+    #[cfg(test)]
+    pub(super) descriptor_budget: Option<usize>,
+    /// Changes the metadata of an opened directory, which a test uses to
+    /// show a directory that is already open on the stack.
+    #[cfg(test)]
+    pub(super) opened: Option<MetadataHook>,
 }
 
 fn valid_bytes(value: i64) -> Option<Bytes> {
@@ -135,12 +143,22 @@ struct Subtree {
 }
 
 impl Subtree {
-    fn plus(self, other: Self) -> Option<Self> {
-        Some(Self {
-            logical: self.logical.checked_add(other.logical)?,
-            allocated: self.allocated.checked_add(other.allocated)?,
-            entries: self.entries.checked_add(other.entries)?,
-        })
+    /// Adds each field of `other` to the field of `self`. A field whose sum
+    /// overflows keeps its earlier value, and the other fields still get
+    /// their addition. The flag tells whether one field overflowed.
+    fn plus(self, other: Self) -> (Self, bool) {
+        let logical: Option<Bytes> = self.logical.checked_add(other.logical);
+        let allocated: Option<Bytes> = self.allocated.checked_add(other.allocated);
+        let entries: Option<EntryCount> = self.entries.checked_add(other.entries);
+        let overflow: bool = logical.is_none() || allocated.is_none() || entries.is_none();
+        (
+            Self {
+                logical: logical.unwrap_or(self.logical),
+                allocated: allocated.unwrap_or(self.allocated),
+                entries: entries.unwrap_or(self.entries),
+            },
+            overflow,
+        )
     }
 }
 
@@ -173,6 +191,8 @@ struct Walker<'a> {
     cancel: &'a CancellationToken,
     observer: &'a mut dyn ScanObserver,
     injection: Injection,
+    /// The most open directories (stack frames) at one time.
+    descriptor_budget: usize,
     stack: Vec<Frame>,
     /// The path of the entry or directory that the traversal works on.
     path: Vec<u8>,
@@ -239,7 +259,7 @@ impl Walker<'_> {
     /// Opens the current name as a directory, relative to the current
     /// directory, and checks that the open object is the measured object.
     fn open_current(
-        &self,
+        &mut self,
         measured: &RawMetadata,
     ) -> Result<DirStream, (RegionCause, Option<io::Error>)> {
         let failed = |error: io::Error| (cause_of(&error), Some(error));
@@ -247,6 +267,14 @@ impl Walker<'_> {
         let name: &CStr = self.current_name().map_err(failed)?;
         let descriptor = native::open_child(frame.stream.descriptor(), name).map_err(failed)?;
         let opened: RawMetadata = native::stat_descriptor(descriptor.as_fd()).map_err(failed)?;
+        #[cfg(test)]
+        let opened: RawMetadata = {
+            let mut opened: RawMetadata = opened;
+            if let Some(hook) = self.injection.opened.as_mut() {
+                hook(as_path(&self.path), &mut opened);
+            }
+            opened
+        };
         if opened.kind != EntryKind::Directory
             || opened.device != measured.device
             || opened.inode != measured.inode
@@ -336,15 +364,16 @@ impl Walker<'_> {
                 .unwrap_or(Bytes::ZERO),
             entries: EntryCount::new(1),
         };
-        let sum: Option<Subtree> = self
-            .stack
-            .last()
-            .and_then(|frame| frame.subtree.plus(addition));
-        let (Some(sum), Some(frame)) = (sum, self.stack.last_mut()) else {
-            self.record(RegionCause::Overflow, None);
-            return None;
+        let Some(frame) = self.stack.last_mut() else {
+            return Some(ScanCompletion::Finished);
         };
+        // A field that overflows keeps its earlier value. The entry stays in
+        // the other totals, in the hard-link set, and in the counts.
+        let (sum, overflow) = frame.subtree.plus(addition);
         frame.subtree = sum;
+        if overflow {
+            self.record(RegionCause::Overflow, None);
+        }
         match hard_link {
             HardLink::FirstName => {
                 self.hard_links.insert(metadata.inode);
@@ -428,6 +457,10 @@ impl Walker<'_> {
             self.record(RegionCause::DepthLimit, None);
             return;
         }
+        if self.stack.len() >= self.descriptor_budget {
+            self.record(RegionCause::ResourceLimit, None);
+            return;
+        }
         let stream: DirStream = match self.open_current(measured) {
             Ok(stream) => stream,
             Err((cause, error)) => {
@@ -435,6 +468,12 @@ impl Walker<'_> {
                 return;
             }
         };
+        // A bind mount can show a directory below itself on the same
+        // device. The inode of an open directory on the stack means a cycle.
+        if self.stack.iter().any(|frame| frame.object == object) {
+            self.record(RegionCause::IdentityChanged, None);
+            return;
+        }
         self.observer.directory_opened(as_path(&self.path));
         self.stack.push(Frame {
             stream,
@@ -467,9 +506,10 @@ impl Walker<'_> {
         let has_parent: bool = match self.stack.last_mut() {
             Some(parent) => {
                 parent.partial |= partial;
-                match parent.subtree.plus(frame.subtree) {
-                    Some(sum) => parent.subtree = sum,
-                    None => self.record(RegionCause::Overflow, None),
+                let (sum, overflow) = parent.subtree.plus(frame.subtree);
+                parent.subtree = sum;
+                if overflow {
+                    self.record(RegionCause::Overflow, None);
                 }
                 true
             }
@@ -637,6 +677,33 @@ fn open_root(request: &ScanRequest) -> Result<OpenRoot, ScanError> {
     })
 }
 
+/// The descriptor budget used when the soft limit cannot be read.
+const FALLBACK_DESCRIPTOR_BUDGET: usize = 32;
+
+/// The most directories that a scan keeps open at one time. The scan leaves
+/// at least three quarters of the soft descriptor limit to the rest of the
+/// process, and it never needs more than `max_depth + 1`.
+pub(super) fn budget_from_limit(max_depth: u32, soft_limit: Option<u64>) -> usize {
+    let needed: usize =
+        usize::try_from(max_depth).map_or(usize::MAX, |depth| depth.saturating_add(1));
+    let allowed: usize = soft_limit.map_or(FALLBACK_DESCRIPTOR_BUDGET, |limit| {
+        usize::try_from(limit / 4).unwrap_or(usize::MAX)
+    });
+    needed.min(allowed).max(1)
+}
+
+#[cfg(test)]
+fn descriptor_budget(max_depth: u32, injection: &Injection) -> usize {
+    injection
+        .descriptor_budget
+        .unwrap_or_else(|| budget_from_limit(max_depth, native::soft_descriptor_limit()))
+}
+
+#[cfg(not(test))]
+fn descriptor_budget(max_depth: u32, _injection: &Injection) -> usize {
+    budget_from_limit(max_depth, native::soft_descriptor_limit())
+}
+
 pub(super) fn scan_with(
     request: &ScanRequest,
     cancel: &CancellationToken,
@@ -660,6 +727,7 @@ pub(super) fn scan_with(
         root_device: volume.device,
         cancel,
         observer,
+        descriptor_budget: descriptor_budget(request.limits.max_depth, &injection),
         injection,
         stack: Vec::new(),
         path: request.root.as_bytes().to_vec(),

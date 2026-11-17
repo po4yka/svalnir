@@ -102,9 +102,8 @@ mod tests {
 
     use super::{CollectionContext, RateLimits, collect_memory_snapshot, swap_activity};
 
-    const LIMITS: RateLimits = RateLimits {
-        max_interval: svalnir_core::quantity::Nanoseconds::new(60_000_000_000),
-    };
+    const LIMITS: RateLimits =
+        RateLimits::with_max_interval(svalnir_core::quantity::Nanoseconds::new(60_000_000_000));
 
     #[test]
     fn a_snapshot_of_the_host_has_each_part_with_its_own_sample() {
@@ -131,7 +130,7 @@ mod tests {
         let context = CollectionContext::for_current_process().unwrap();
         let earlier = collect_memory_snapshot(&context).unwrap().vm;
         assert!(swap_activity(None, &earlier, LIMITS).swapins.is_err());
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
         let later = collect_memory_snapshot(&context).unwrap().vm;
         let activity = swap_activity(Some(&earlier), &later, LIMITS);
         let swapins = activity.swapins.unwrap();

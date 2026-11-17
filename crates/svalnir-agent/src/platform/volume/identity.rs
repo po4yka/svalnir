@@ -60,6 +60,39 @@ pub enum CapacityDomainEvidence {
     LookupFailed(UnavailableReason),
 }
 
+/// How the volume UUID of a mount was established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeUuidLookup {
+    /// No query was made, for example for a network filesystem.
+    NotExamined,
+    /// The query gave this UUID for the mount.
+    Found([u8; 16]),
+    /// The filesystem has no volume UUID. The identity is fsid-based.
+    NotProvided,
+    /// The query failed, so the identity is fsid-based because of this
+    /// reason. It is not the same as a filesystem with no UUID.
+    Failed(UnavailableReason),
+    /// Mounts with different `f_fsid` have this UUID, for example two copies
+    /// of one disk image. The UUID does not name one volume, so the identity
+    /// is fsid-based.
+    Duplicate([u8; 16]),
+}
+
+impl From<Option<[u8; 16]>> for VolumeUuidLookup {
+    fn from(uuid: Option<[u8; 16]>) -> Self {
+        uuid.map_or(Self::NotProvided, Self::Found)
+    }
+}
+
+impl From<Result<Option<[u8; 16]>, UnavailableReason>> for VolumeUuidLookup {
+    fn from(result: Result<Option<[u8; 16]>, UnavailableReason>) -> Self {
+        match result {
+            Ok(uuid) => uuid.into(),
+            Err(reason) => Self::Failed(reason),
+        }
+    }
+}
+
 /// The `statfs` evidence of one mount, apart from the identity fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEvidence {
@@ -76,6 +109,8 @@ pub struct MountEvidence {
     pub browsable: bool,
     /// How the capacity-domain membership was established.
     pub capacity_domain: CapacityDomainEvidence,
+    /// How the volume UUID was established.
+    pub volume_uuid: VolumeUuidLookup,
 }
 
 /// One mounted volume: its identity and the evidence of the identity.
@@ -199,6 +234,39 @@ fn capacity_domain(
     }
 }
 
+/// Marks each volume UUID that mounts with different `f_fsid` words have.
+///
+/// Two attached copies of one disk image have the same volume UUID. The UUID
+/// then does not name one volume, so each such lookup becomes
+/// [`VolumeUuidLookup::Duplicate`], and the identity of each of those mounts
+/// is derived from its `f_fsid`.
+///
+/// `mounts` and `lookups` have the same length and order.
+pub fn reject_duplicate_volume_uuids(mounts: &[RawMount], lookups: &mut [VolumeUuidLookup]) {
+    let mut first_fsid: HashMap<[u8; 16], [i32; 2]> = HashMap::new();
+    let mut duplicated: HashSet<[u8; 16]> = HashSet::new();
+    for (raw, lookup) in mounts.iter().zip(lookups.iter()) {
+        if let VolumeUuidLookup::Found(uuid) = lookup {
+            match first_fsid.get(uuid) {
+                Some(fsid) if *fsid != raw.fsid => {
+                    duplicated.insert(*uuid);
+                }
+                Some(_) => {}
+                None => {
+                    first_fsid.insert(*uuid, raw.fsid);
+                }
+            }
+        }
+    }
+    for lookup in lookups.iter_mut() {
+        if let VolumeUuidLookup::Found(uuid) = *lookup
+            && duplicated.contains(&uuid)
+        {
+            *lookup = VolumeUuidLookup::Duplicate(uuid);
+        }
+    }
+}
+
 /// Rejects each container UUID that two different container objects have.
 ///
 /// Two attached copies of one disk image have the same container UUID and
@@ -246,15 +314,19 @@ pub fn reject_ambiguous_containers(lookups: &mut [ContainerLookup]) {
 /// the filesystem type name is not text.
 pub fn mounted_volume(
     raw: &RawMount,
-    volume_uuid: Option<[u8; 16]>,
+    volume_uuid: impl Into<VolumeUuidLookup>,
     container: ContainerLookup,
 ) -> Result<MountedVolume, VolumeIdentityError> {
+    let uuid_lookup: VolumeUuidLookup = volume_uuid.into();
     let mount_point: LosslessPath = LosslessPath::from_bytes(raw.mount_point.clone())?;
     let filesystem_type: String = String::from_utf8(raw.filesystem_type.clone())
         .ok()
         .filter(|name| !name.is_empty())
         .ok_or(VolumeIdentityError::FilesystemType)?;
-    let volume_uuid: Option<String> = volume_uuid.map(uuid_text);
+    let volume_uuid: Option<String> = match uuid_lookup {
+        VolumeUuidLookup::Found(uuid) => Some(uuid_text(uuid)),
+        _ => None,
+    };
     let (membership, evidence) = capacity_domain(container)?;
     Ok(MountedVolume {
         identity: VolumeIdentity {
@@ -273,6 +345,7 @@ pub fn mounted_volume(
             local: raw.flags & MOUNT_FLAG_LOCAL != 0,
             browsable: raw.flags & MOUNT_FLAG_DONT_BROWSE == 0,
             capacity_domain: evidence,
+            volume_uuid: uuid_lookup,
         },
     })
 }
@@ -317,8 +390,9 @@ mod tests {
     };
     use super::testing::{apfs_mount, found};
     use super::{
-        CapacityDomainEvidence, ContainerLookup, VolumeIdentityError, apfs_device_name, mount_id,
-        mounted_volume, reject_ambiguous_containers, uuid_text,
+        CapacityDomainEvidence, ContainerLookup, VolumeIdentityError, VolumeUuidLookup,
+        apfs_device_name, mount_id, mounted_volume, reject_ambiguous_containers,
+        reject_duplicate_volume_uuids, uuid_text,
     };
 
     const CONTAINER: &str = "B700DD4E-AFB3-4299-B1D2-EE46695C99E5";
@@ -531,5 +605,59 @@ mod tests {
         raw.mount_point = b"/Volumes/\xff\xfe".to_vec();
         let volume = mounted_volume(&raw, None, ContainerLookup::NotExamined).unwrap();
         assert_eq!(volume.identity.mount_point.as_bytes(), b"/Volumes/\xff\xfe");
+    }
+
+    #[test]
+    fn two_mounts_with_one_volume_uuid_get_identities_from_their_fsid() {
+        let first = apfs_mount("disk4s1", "/Volumes/Image", 40);
+        let second = apfs_mount("disk5s1", "/Volumes/Image 1", 50);
+        let other = apfs_mount("disk6s1", "/Volumes/Other", 60);
+        let mut same_fsid = first.clone();
+        same_fsid.mount_point = b"/Volumes/Alias".to_vec();
+        let mounts = [first, second, other, same_fsid];
+        let mut lookups = vec![
+            VolumeUuidLookup::Found(VOLUME_UUID),
+            VolumeUuidLookup::Found(VOLUME_UUID),
+            VolumeUuidLookup::Found([9; 16]),
+            VolumeUuidLookup::Found(VOLUME_UUID),
+        ];
+        reject_duplicate_volume_uuids(&mounts, &mut lookups);
+        assert_eq!(lookups[0], VolumeUuidLookup::Duplicate(VOLUME_UUID));
+        assert_eq!(lookups[1], VolumeUuidLookup::Duplicate(VOLUME_UUID));
+        assert_eq!(lookups[2], VolumeUuidLookup::Found([9; 16]));
+        assert_eq!(lookups[3], VolumeUuidLookup::Duplicate(VOLUME_UUID));
+
+        let ids: Vec<String> = mounts
+            .iter()
+            .zip(&lookups)
+            .map(|(raw, lookup)| {
+                let volume =
+                    mounted_volume(raw, lookup.clone(), ContainerLookup::NotExamined).unwrap();
+                assert_eq!(volume.evidence.volume_uuid, lookup.clone(),);
+                volume.identity.volume_id.as_str().to_owned()
+            })
+            .collect();
+        assert_eq!(ids[0], "vol_fsid_00000028_0000001a");
+        assert_eq!(ids[1], "vol_fsid_00000032_0000001a");
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids[2].starts_with("vol_09090909"));
+    }
+
+    #[test]
+    fn a_failed_uuid_query_is_kept_apart_from_a_filesystem_with_no_uuid() {
+        let raw = apfs_mount("disk3s5", "/", 7);
+        let failed = mounted_volume(
+            &raw,
+            Err::<Option<[u8; 16]>, _>(UnavailableReason::IdentityChanged),
+            ContainerLookup::NotExamined,
+        )
+        .unwrap();
+        let none = mounted_volume(&raw, None, ContainerLookup::NotExamined).unwrap();
+        assert_eq!(failed.identity.volume_id, none.identity.volume_id);
+        assert_eq!(
+            failed.evidence.volume_uuid,
+            VolumeUuidLookup::Failed(UnavailableReason::IdentityChanged)
+        );
+        assert_eq!(none.evidence.volume_uuid, VolumeUuidLookup::NotProvided);
     }
 }

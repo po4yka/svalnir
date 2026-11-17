@@ -166,6 +166,9 @@ pub enum ReasonDetail {
     MembersInconsistent,
     /// The foreground status is not known.
     ForegroundUnknown,
+    /// The list of applications can be stale, so the attribution of the
+    /// candidate is not current.
+    ApplicationListStale,
     /// A process has no executable evidence, and a protected path applies.
     ExecutableUnknown,
     /// A path starts from the home directory, and no home directory was

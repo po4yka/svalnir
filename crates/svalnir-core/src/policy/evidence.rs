@@ -383,6 +383,35 @@ pub struct CorroboratingEvidence {
     pub sample: Sample,
 }
 
+/// The host memory metrics that can corroborate the pressure state: the
+/// page counts of the virtual memory statistics, the compressor, the swap
+/// space and the swap and paging activity. `memory.pressure` is not in the
+/// list: it does not corroborate itself. `memory.physical_bytes` is not in
+/// the list: the installed memory does not change with the pressure. A metric
+/// of another resource, such as CPU or disk, is not in the list.
+///
+/// This is the only list. Add a new host memory metric here.
+pub const CORROBORATING_MEMORY_METRICS: &[MetricId] = &[
+    metric::MEMORY_VM_FREE_PAGES,
+    metric::MEMORY_VM_ACTIVE_PAGES,
+    metric::MEMORY_VM_INACTIVE_PAGES,
+    metric::MEMORY_VM_WIRED_PAGES,
+    metric::MEMORY_VM_SPECULATIVE_PAGES,
+    metric::MEMORY_VM_INTERNAL_PAGES,
+    metric::MEMORY_VM_EXTERNAL_PAGES,
+    metric::MEMORY_VM_PAGEINS_TOTAL,
+    metric::MEMORY_VM_PAGEOUTS_TOTAL,
+    metric::MEMORY_COMPRESSOR_PHYSICAL_PAGES,
+    metric::MEMORY_COMPRESSOR_UNCOMPRESSED_PAGES,
+    metric::MEMORY_COMPRESSOR_COMPRESSIONS_TOTAL,
+    metric::MEMORY_COMPRESSOR_DECOMPRESSIONS_TOTAL,
+    metric::MEMORY_SWAP_SWAPINS_TOTAL,
+    metric::MEMORY_SWAP_SWAPOUTS_TOTAL,
+    metric::MEMORY_SWAP_ALLOCATED_BYTES,
+    metric::MEMORY_SWAP_USED_BYTES,
+    metric::MEMORY_SWAP_AVAILABLE_BYTES,
+];
+
 impl CorroboratingEvidence {
     /// Takes the corroboration facts of an observation.
     pub fn from_observation<T: ObservationValue>(observation: &Observation<T>) -> Self {
@@ -396,12 +425,13 @@ impl CorroboratingEvidence {
     }
 
     /// True when the observation is an available, complete, fresh host
-    /// observation of a metric other than the pressure state. The pressure
-    /// state does not corroborate itself.
+    /// observation of a metric in [`CORROBORATING_MEMORY_METRICS`]. The
+    /// pressure state does not corroborate itself, and a metric of another
+    /// resource does not corroborate memory pressure.
     pub(super) fn corroborates(&self, clock: &EvaluationClock, max_age: Nanoseconds) -> bool {
         self.available
             && self.coverage == Coverage::Complete
-            && self.metric_id != metric::MEMORY_PRESSURE
+            && CORROBORATING_MEMORY_METRICS.contains(&self.metric_id)
             && self.scope.kind == ScopeKind::Host
             && sample_age(&self.sample, clock, max_age).is_ok()
     }

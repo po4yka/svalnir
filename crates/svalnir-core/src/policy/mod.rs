@@ -61,7 +61,10 @@ pub use disk::{
     ProtectedDataClass, RebuildCost, RuleAllowance, RuleReadiness, VolumeEvidence, VolumeTrigger,
     WorkUsage, evaluate_disk_guard, plan_cleanup,
 };
-pub use evidence::{CorroboratingEvidence, EvaluationClock, EvidenceProblem, EvidenceReport};
+pub use evidence::{
+    CORROBORATING_MEMORY_METRICS, CorroboratingEvidence, EvaluationClock, EvidenceProblem,
+    EvidenceReport,
+};
 pub use memory::{
     AdmissionTrigger, ApplicationCandidate, ApplicationCooldown, ApplicationDecision,
     ApplicationKind, BudgetState, BudgetTrigger, FirstIntervention, FootprintLevel,

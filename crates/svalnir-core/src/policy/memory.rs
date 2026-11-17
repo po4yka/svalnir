@@ -95,6 +95,10 @@ pub struct MemorySnapshot {
     pub applications: Vec<ApplicationCandidate>,
     /// The evidence of the process inventory.
     pub inventory: Option<InventoryEvidence>,
+    /// True when the list of applications of the collector can be stale. No
+    /// application candidate is admissible then, and an absent application
+    /// is not known to be absent.
+    pub application_list_may_be_stale: bool,
 }
 
 impl MemorySnapshot {
@@ -667,6 +671,19 @@ fn budget_subject<'a>(
     match running.as_slice() {
         [(candidate, identity)] => BudgetSubject::Running(candidate, *identity),
         [] => {
+            // A process of an unrecognized association could be any
+            // application, so the absence of the application is not
+            // proven. A stale list of applications does not prove it
+            // either.
+            let unrecognized: bool = snapshot.applications.iter().any(|candidate| {
+                candidate
+                    .processes
+                    .iter()
+                    .any(|process| process.association == ProcessAssociation::Unrecognized)
+            });
+            if unrecognized || snapshot.application_list_may_be_stale {
+                return BudgetSubject::Unusable(EvidenceProblem::MembershipUnverified);
+            }
             let Some(inventory) = &snapshot.inventory else {
                 return BudgetSubject::Unusable(EvidenceProblem::Missing);
             };
@@ -973,6 +990,7 @@ struct ApplicationChecks<'a> {
     protected_paths: PathSet,
     has_protected_paths: bool,
     max_age: Nanoseconds,
+    list_may_be_stale: bool,
 }
 
 /// A candidate after the checks.
@@ -1097,6 +1115,16 @@ impl<'a> ApplicationChecks<'a> {
             group_eligible || budget.is_some(),
         );
         let mut add = |explanation: Explanation| push_reason(&mut reasons, explanation);
+        // A candidate of a stale list is not admissible for any trigger: the
+        // checks do not separate the budget path from the global path.
+        if self.list_may_be_stale
+            && identity.is_none_or(|identity| identity.kind == ApplicationKind::Application)
+        {
+            add(Explanation::new(
+                DecisionReason::MetricStale,
+                ReasonDetail::ApplicationListStale,
+            ));
+        }
 
         let scope: Scope = Scope::application(candidate.membership_snapshot.clone());
         let assessed = assess(
@@ -1178,11 +1206,18 @@ fn budget_violation(checked: &Checked<'_>) -> bool {
 }
 
 /// The rank key of an eligible candidate: an explicitly configured
-/// application first, then a verified budget violation, the larger
-/// footprint, and the instance identity.
-fn rank_key<'a>(checked: &'a Checked<'_>) -> (bool, bool, Reverse<Bytes>, &'a str) {
+/// application first, then a managed job before an application, then a
+/// verified budget violation, the larger footprint, and the instance
+/// identity.
+///
+/// `docs/POLICY_SPEC.md` also names a declared termination priority. The
+/// configuration has no field for it, so the key has none.
+fn rank_key<'a>(checked: &'a Checked<'_>) -> (bool, bool, bool, Reverse<Bytes>, &'a str) {
     (
         checked.budget.is_none(),
+        checked
+            .identity
+            .is_none_or(|identity| identity.kind != ApplicationKind::ManagedJob),
         !budget_violation(checked),
         Reverse(checked.decision.footprint.unwrap_or(Bytes::ZERO)),
         checked
@@ -1225,6 +1260,7 @@ pub fn plan_intervention(
         ),
         has_protected_paths,
         max_age: nanoseconds(context.config.agent().decision_sample_max_age),
+        list_may_be_stale: snapshot.application_list_may_be_stale,
     };
 
     let mut checked: Vec<Checked<'_>> = snapshot

@@ -454,7 +454,6 @@ fn collect_inputs(
             let host_memory = memory::collect_memory_snapshot(context)?;
             let vm = &host_memory.vm;
             memory_snapshot.corroborating = vec![
-                CorroboratingEvidence::from_observation(&host_memory.physical),
                 CorroboratingEvidence::from_observation(&vm.free),
                 CorroboratingEvidence::from_observation(&vm.active),
                 CorroboratingEvidence::from_observation(&vm.inactive),
@@ -468,6 +467,8 @@ fn collect_inputs(
                     memory_snapshot.applications = application_candidates(&processes);
                     memory_snapshot.inventory =
                         inventory_evidence(&processes, &context.identity().collector_epoch);
+                    memory_snapshot.application_list_may_be_stale =
+                        processes.application_list_may_be_stale;
                     summary.applications = memory_snapshot.applications.len();
                     summary.applications_not_evaluated = instance_count(&processes)
                         .saturating_sub(memory_snapshot.applications.len());
@@ -776,12 +777,11 @@ mod tests {
         let memory = MemorySnapshot {
             pressure: Some(host_memory.pressure.clone()),
             corroborating: vec![
-                svalnir_core::policy::CorroboratingEvidence::from_observation(
-                    &host_memory.physical,
-                ),
+                svalnir_core::policy::CorroboratingEvidence::from_observation(&host_memory.vm.free),
             ],
             applications: application_candidates(&snapshot),
             inventory: inventory_evidence(&snapshot, &epoch),
+            application_list_may_be_stale: snapshot.application_list_may_be_stale,
         };
         assert_eq!(
             memory.inventory.as_ref().unwrap().coverage,

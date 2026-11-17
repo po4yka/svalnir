@@ -273,6 +273,7 @@ fn memory_snapshot(
             coverage: Coverage::Complete,
             sample: sample_at(&format!("s_inventory_{seconds}"), seconds),
         }),
+        application_list_may_be_stale: false,
     }
 }
 

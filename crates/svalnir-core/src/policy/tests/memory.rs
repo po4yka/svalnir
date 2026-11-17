@@ -1332,3 +1332,130 @@ fn a_target_with_no_admission_trigger_is_never_admissible() {
         )]
     );
 }
+
+#[test]
+fn a_metric_of_another_resource_does_not_corroborate_memory_pressure() {
+    use crate::observation::metric;
+    for other in [
+        metric::DISK_OPPORTUNISTIC_AVAILABLE_BYTES,
+        metric::PROCESS_CPU_CORE_EQUIVALENT_PERCENT,
+        metric::MEMORY_PHYSICAL_BYTES,
+    ] {
+        let mut harness: Harness = Harness::new();
+        pressure_hold(&mut harness, 0, 10, &PressureState::Critical);
+        let mut snapshot: MemorySnapshot = memory_snapshot(PressureState::Critical, 15, Vec::new());
+        snapshot.corroborating[0].metric_id = other.clone();
+        let evaluation: MemoryEvaluation = harness.memory(15, &snapshot);
+        assert_eq!(evaluation.global.state, TriggerState::Blocked, "{other:?}");
+        assert_eq!(
+            evaluation.global.reasons,
+            [explanation(
+                DecisionReason::MetricUnavailable,
+                ReasonDetail::CorroborationMissing
+            )]
+        );
+    }
+}
+
+#[test]
+fn an_unrecognized_process_keeps_a_latched_budget_from_recovering_by_absence() {
+    let mut harness: Harness = Harness::new();
+    let ready: MemoryEvaluation = harness.worker_hold(0, 30, 7 * GIB);
+    assert_eq!(budget(&ready).state, TriggerState::Ready);
+    let mut latest: Option<MemoryEvaluation> = None;
+    for seconds in (35..=700).step_by(5) {
+        let mut unknown: ApplicationCandidate = app("Mystery", GIB, seconds);
+        unknown.processes[0].association = ProcessAssociation::Unrecognized;
+        let snapshot: MemorySnapshot =
+            memory_snapshot(PressureState::Normal, seconds, vec![unknown]);
+        latest = Some(harness.memory(seconds, &snapshot));
+    }
+    let evaluation: MemoryEvaluation = latest.unwrap();
+    assert_eq!(budget(&evaluation).level, FootprintLevel::Unknown);
+    assert!(budget(&evaluation).latched);
+    assert!(harness.memory.incident.is_some());
+    assert_eq!(
+        budget(&evaluation).reasons,
+        [explanation(
+            DecisionReason::MetricUnavailable,
+            ReasonDetail::MembershipUnverified
+        )]
+    );
+}
+
+#[test]
+fn a_managed_job_ranks_before_a_larger_background_application() {
+    let mut harness: Harness = Harness::new();
+    let snapshot: MemorySnapshot = memory_snapshot(
+        PressureState::Normal,
+        0,
+        vec![app("Editor", 2 * GIB, 0), job("Indexer", GIB / 5, 0)],
+    );
+    let evaluation: MemoryEvaluation = harness.memory(0, &snapshot);
+    let clock: EvaluationClock = harness.clock(0);
+    let plan: InterventionPlan =
+        plan_intervention(&harness.context(&clock), &evaluation, &snapshot);
+    assert_eq!(plan.decisions[0].kind, Some(ApplicationKind::ManagedJob));
+    assert_eq!(plan.decisions[0].rank, Some(1));
+    assert_eq!(plan.decisions[1].kind, Some(ApplicationKind::Application));
+    assert_eq!(plan.decisions[1].rank, Some(2));
+}
+
+#[test]
+fn a_stale_application_list_makes_each_application_candidate_inadmissible() {
+    let mut harness: Harness = Harness::new();
+    let mut snapshot: MemorySnapshot = memory_snapshot(
+        PressureState::Normal,
+        0,
+        vec![app("Editor", 2 * GIB, 0), job("Indexer", GIB, 0)],
+    );
+    snapshot.application_list_may_be_stale = true;
+    let evaluation: MemoryEvaluation = harness.memory(0, &snapshot);
+    let clock: EvaluationClock = harness.clock(0);
+    let plan: InterventionPlan =
+        plan_intervention(&harness.context(&clock), &evaluation, &snapshot);
+    let editor: &ApplicationDecision = plan
+        .decisions
+        .iter()
+        .find(|decision| decision.kind == Some(ApplicationKind::Application))
+        .unwrap();
+    assert_eq!(editor.decision, CandidateDecision::Skipped);
+    assert_eq!(
+        editor.reasons,
+        [explanation(
+            DecisionReason::MetricStale,
+            ReasonDetail::ApplicationListStale
+        )]
+    );
+    let indexer: &ApplicationDecision = plan
+        .decisions
+        .iter()
+        .find(|decision| decision.kind == Some(ApplicationKind::ManagedJob))
+        .unwrap();
+    assert_eq!(indexer.decision, CandidateDecision::Eligible);
+}
+
+#[test]
+fn a_stale_application_list_blocks_a_ready_budget_and_proves_no_absence() {
+    let mut harness: Harness = Harness::new();
+    let ready: MemoryEvaluation = harness.worker_hold(0, 30, 7 * GIB);
+    assert_eq!(budget(&ready).state, TriggerState::Ready);
+    let mut snapshot: MemorySnapshot = memory_snapshot(
+        PressureState::Normal,
+        35,
+        vec![app("BuildWorker", 7 * GIB, 35)],
+    );
+    snapshot.application_list_may_be_stale = true;
+    let evaluation: MemoryEvaluation = harness.memory(35, &snapshot);
+    let clock: EvaluationClock = harness.clock(35);
+    let plan: InterventionPlan =
+        plan_intervention(&harness.context(&clock), &evaluation, &snapshot);
+    assert_eq!(plan.decisions[0].decision, CandidateDecision::Skipped);
+    assert!(!plan.first.admissible_now);
+
+    let mut absent: MemorySnapshot = memory_snapshot(PressureState::Normal, 40, Vec::new());
+    absent.application_list_may_be_stale = true;
+    let evaluation: MemoryEvaluation = harness.memory(40, &absent);
+    assert_eq!(budget(&evaluation).level, FootprintLevel::Unknown);
+    assert!(budget(&evaluation).latched);
+}

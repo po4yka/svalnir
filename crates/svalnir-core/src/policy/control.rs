@@ -373,8 +373,8 @@ impl Cooldown {
 
 /// What the caller knows about a product protection of a target.
 ///
-/// The catalog of hard protections is outside this module. The caller looks
-/// the target up and gives the result.
+/// The caller looks the target up and gives the result. For an application
+/// or job instance the lookup is [`hard_protection`](super::hard_protection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectionFact {

@@ -14,6 +14,7 @@
 //! | [`ProcessCollector`] | Identity, metrics, and attribution of a snapshot |
 //! | [`footprint_growth`], [`cpu_usage`], [`derive_between`] | Pure functions over injected samples |
 //! | [`rank_processes`] | The order for `processes top` |
+//! | [`application_candidates`], [`control_plane`] | The instances of a snapshot as candidates of a memory-guard evaluation, with their hard protection |
 //!
 //! # Identity
 //!
@@ -45,6 +46,7 @@
 //! parent, or the signing team gives no membership. Read a membership
 //! through `ProcessAssociation::verified_membership`.
 
+mod candidates;
 mod derived;
 mod inventory;
 #[cfg(target_os = "macos")]
@@ -60,6 +62,10 @@ mod smoke_tests;
 #[cfg(test)]
 mod tests;
 
+pub use candidates::{
+    MAX_CONTROL_PLANE_ANCESTORS, application_candidates, control_plane,
+    control_plane_of_this_process, instance_count,
+};
 pub use derived::{
     CpuSample, CpuUsage, DerivedMetrics, DerivedUnavailable, FootprintGrowth, FootprintSample,
     GrowthWindow, cpu_usage, derive_between, footprint_growth,

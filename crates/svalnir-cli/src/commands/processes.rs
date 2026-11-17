@@ -46,7 +46,8 @@ const DERIVED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const TARGET_NOTE: &str = "A target ID names one process generation (PID and start time). This build has no agent, so each invocation resolves the ID against a new snapshot. A target ID is not permission to act on the process.";
 
 /// The statement about policy eligibility in `processes show`.
-const ELIGIBILITY_NOTE: &str = "Policy eligibility needs the protection catalog and the grants of the background agent. This build does not evaluate it.";
+const ELIGIBILITY_NOTE: &str =
+    "Policy eligibility needs the grants of the background agent. This build does not evaluate it.";
 
 /// The value that orders a ranking, or the reason there is none.
 #[derive(Debug, Clone, Serialize)]

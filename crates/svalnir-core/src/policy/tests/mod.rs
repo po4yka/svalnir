@@ -5,6 +5,7 @@
 
 mod disk;
 mod memory;
+mod protection;
 mod simulate;
 mod window;
 

@@ -16,6 +16,7 @@
 //! | [`advance`], [`QualificationWindow`] | Qualification windows as explicit state (section 6) |
 //! | [`DecisionReason`], [`Explanation`] | Stable decision reasons (section 7) |
 //! | [`TriggerState`], [`controller_summary`] | Incident states and the summary for presentation (section 8) |
+//! | [`hard_protection`] | The catalog of hard protections of application and job instances (`docs/ACTION_CONTRACTS.md` section 8) |
 //! | [`simulate`] | The simulation report (section 15) |
 //! | [`list_policies`], [`show_policy`] | Descriptions of the standing policies |
 //!
@@ -37,6 +38,7 @@ mod describe;
 mod disk;
 mod evidence;
 mod memory;
+mod protection;
 mod reason;
 mod simulate;
 #[cfg(test)]
@@ -71,6 +73,11 @@ pub use memory::{
     ForceEscalation, ForegroundStatus, GlobalPressureTrigger, InterventionPlan, InventoryEvidence,
     MemoryEvaluation, MemoryGuardState, MemoryIncident, MemorySnapshot, evaluate_memory_guard,
     plan_intervention,
+};
+pub use protection::{
+    CONTROL_PLANE_BUNDLE_IDENTIFIER, CONTROL_PLANE_EXECUTABLES, ControlPlaneProcess,
+    LOCAL_DIRECTORY, ProtectionContext, SESSION_BUNDLE_IDENTIFIERS, SYSTEM_DIRECTORIES,
+    hard_protection,
 };
 pub use reason::{DecisionReason, Explanation, ReasonDetail};
 pub use simulate::{

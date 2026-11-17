@@ -831,7 +831,8 @@ fn full_disk_access_entry(
     } else if attempts.is_empty() {
         Classified::not_available(
             CapabilityState::Unknown,
-            "The probe could not resolve a privacy-protected location to try.",
+            "The probe could not resolve a privacy-protected location to try. The home \
+             directory of the account database is not known.",
         )
     } else {
         Classified::not_available(
@@ -845,6 +846,15 @@ fn full_disk_access_entry(
             &path_label(&attempt.path),
             protected_outcome_text(&attempt.outcome),
         );
+    }
+    if let Some(error) = &probed.finding.account_home_error {
+        classified = classified.fact("account_home_error", error.clone());
+    }
+    if let Some(home) = &probed.finding.home_variable_differs {
+        classified = classified.fact("home_variable_differs", path_label(home));
+        if let Some(account) = &probed.finding.account_home {
+            classified = classified.fact("account_home", path_label(account));
+        }
     }
     classified.into_entry(CapabilityId::FullDiskAccess, probed.method)
 }

@@ -26,6 +26,8 @@ struct InjectedProbes {
     state: DirectoryFinding,
     logs: DirectoryFinding,
     protected: Vec<ProtectedReadOutcome>,
+    protected_home_differs: Option<PathBuf>,
+    protected_lookup_error: Option<String>,
     failing_source: Option<(MetricSource, SourceFinding)>,
     agent: Vec<ServiceLocationOutcome>,
     helper: Vec<ServiceLocationOutcome>,
@@ -55,6 +57,8 @@ impl InjectedProbes {
             state: absent("/Users/test/Library/Application Support/Svalnir", true),
             logs: absent("/Users/test/Library/Logs/Svalnir", true),
             protected: vec![ProtectedReadOutcome::NotPermitted],
+            protected_home_differs: None,
+            protected_lookup_error: None,
             failing_source: None,
             agent: vec![
                 ServiceLocationOutcome::NotFound,
@@ -127,7 +131,15 @@ impl CapabilityProbes for InjectedProbes {
             .collect();
         Probed::new(
             "injected protected read",
-            ProtectedLocationsFinding { attempts },
+            ProtectedLocationsFinding {
+                attempts,
+                account_home: self
+                    .protected_lookup_error
+                    .is_none()
+                    .then(|| PathBuf::from("/Users/test")),
+                account_home_error: self.protected_lookup_error.clone(),
+                home_variable_differs: self.protected_home_differs.clone(),
+            },
         )
     }
 
@@ -463,6 +475,41 @@ fn full_disk_access_is_denied_only_on_the_refusal_of_the_privacy_control() {
     assert_eq!(
         state_of(vec![Failed("injected".to_owned()), Absent]),
         CapabilityState::Unknown
+    );
+}
+
+#[test]
+fn full_disk_access_records_a_different_home_and_a_failed_lookup() {
+    let fact = |entry: &CapabilityEntry, name: &str| {
+        entry
+            .evidence
+            .facts
+            .iter()
+            .find(|fact| fact.name == name)
+            .map(|fact| fact.value.clone())
+    };
+
+    let mut differs = InjectedProbes::healthy();
+    differs.protected = vec![ProtectedReadOutcome::Listed];
+    differs.protected_home_differs = Some(PathBuf::from("/tmp/h"));
+    let entry_differs = entry(&differs, CapabilityId::FullDiskAccess);
+    assert_eq!(
+        fact(&entry_differs, "home_variable_differs").as_deref(),
+        Some("/tmp/h")
+    );
+    assert_eq!(
+        fact(&entry_differs, "account_home").as_deref(),
+        Some("/Users/test")
+    );
+
+    let mut failed_lookup = InjectedProbes::healthy();
+    failed_lookup.protected = vec![];
+    failed_lookup.protected_lookup_error = Some("getpwuid_r: injected".to_owned());
+    let entry_failed = entry(&failed_lookup, CapabilityId::FullDiskAccess);
+    assert_eq!(entry_failed.state, CapabilityState::Unknown);
+    assert_eq!(
+        fact(&entry_failed, "account_home_error").as_deref(),
+        Some("getpwuid_r: injected")
     );
 }
 

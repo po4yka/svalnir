@@ -121,20 +121,36 @@ pub enum StoreError {
         /// The column or setting.
         column: &'static str,
     },
+    /// The path is empty or is the `SQLite` name `:memory:`, which does not
+    /// open a durable file. Use `Store::open_in_memory` for a store in
+    /// memory. Nothing was opened.
+    #[error("the state store path `{0}` does not name a durable file")]
+    InvalidPath(String),
     /// A different `SQLite` failure.
     #[error("the state store operation failed")]
     Sqlite(#[source] rusqlite::Error),
 }
 
 impl StoreError {
-    /// Tells if the store could not record durably: it is full, locked,
-    /// corrupt, read-only, or had an I/O failure. A caller that needs a
-    /// durable record must stop the related mutation when this is true.
+    /// Tells if a write may have failed to record durably. It is `true` for
+    /// each storage failure: full, locked, corrupt, read-only, I/O, and any
+    /// other `SQLite` failure ([`StoreError::Sqlite`], for example
+    /// `SQLITE_NOMEM`, `SQLITE_PROTOCOL`, `SQLITE_INTERRUPT`, or
+    /// `SQLITE_CONSTRAINT`), and for a duplicate scan record. It is `false`
+    /// only for an error that the store raises before it attempts a write:
+    /// a refused input, a refused path, a database that this build must not
+    /// use, or a read-side decode failure. A caller that needs a durable
+    /// record must stop the related mutation when this is true. A failed
+    /// write is never reported as recorded.
     pub fn recording_failed(&self) -> bool {
         match self {
-            Self::Full(_) | Self::Busy(_) | Self::Corrupt(_) | Self::Io(_) | Self::ReadOnly(_) => {
-                true
-            }
+            Self::Full(_)
+            | Self::Busy(_)
+            | Self::Corrupt(_)
+            | Self::Io(_)
+            | Self::ReadOnly(_)
+            | Self::Sqlite(_)
+            | Self::DuplicateScan(_) => true,
             Self::Migration { source, .. } => source.recording_failed(),
             _ => false,
         }

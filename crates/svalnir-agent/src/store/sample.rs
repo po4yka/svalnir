@@ -200,6 +200,10 @@ impl Store {
                     Reading::Unavailable(reason) => {
                         (Availability::Unavailable.as_str(), Some(reason.as_str()))
                     }
+                    // Only decoding makes an `UnrecognizedText`, and only for a
+                    // spelling that is not `available` or `unavailable`. The
+                    // text thus cannot read back as a known availability or
+                    // break the `reason` CHECK of the table.
                     Reading::Unrecognized(text) => (text.as_str(), None),
                 };
                 statement.execute(params![

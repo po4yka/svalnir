@@ -53,17 +53,50 @@ const MAX_SERVICE_NAMES: usize = 8;
 /// The probes of the real host, under the identity of this process.
 #[derive(Debug, Clone)]
 pub struct HostProbes {
+    /// The home directory that the state-directory, log-directory, and
+    /// service entries describe: the `HOME` variable, as the CLI resolves
+    /// its state directory (`svalnir-cli`, `environment.rs`). The entries
+    /// describe where this process will write, not the account home.
     home: Option<PathBuf>,
+    /// The home directory of the account database, for the effective user
+    /// ID. The protected-location probe uses it, because `HOME` can name a
+    /// directory that the caller controls. The error text when the lookup
+    /// failed.
+    account_home: Result<PathBuf, String>,
     root: PathBuf,
 }
 
 impl HostProbes {
-    /// Makes the probes for the home directory of the user and the root
-    /// directory of the host.
+    /// Makes the probes for the root directory of the host.
+    ///
+    /// The directory entries use the `HOME` variable, as the CLI does. The
+    /// protected-location probe uses the account home directory from the
+    /// account database; see [`HostProbes::with_homes`].
     pub fn new() -> Self {
+        Self::with_homes(
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from),
+            account_home_lookup(),
+            PathBuf::from("/"),
+        )
+    }
+
+    /// Makes the probes with a given `HOME` value and account lookup result.
+    ///
+    /// `home` is what the directory and service probes use. `account_home`
+    /// is what the protected-location probe uses: the home directory that
+    /// the account database gives, or the text of the failure. A test uses
+    /// this to cover equal homes, a different `HOME`, and a failed lookup.
+    pub fn with_homes(
+        home: Option<PathBuf>,
+        account_home: Result<PathBuf, String>,
+        root: PathBuf,
+    ) -> Self {
         Self {
-            home: std::env::home_dir().filter(|home| !home.as_os_str().is_empty()),
-            root: PathBuf::from("/"),
+            home,
+            account_home,
+            root,
         }
     }
 
@@ -71,8 +104,12 @@ impl HostProbes {
     ///
     /// The directory, protected-location, and service probes look below
     /// these directories. A test uses this with a temporary directory.
+    /// The account home directory is the same as `home`.
     pub fn with_roots(home: Option<PathBuf>, root: PathBuf) -> Self {
-        Self { home, root }
+        let account_home: Result<PathBuf, String> = home
+            .clone()
+            .ok_or_else(|| "No home directory was given.".to_owned());
+        Self::with_homes(home, account_home, root)
     }
 
     fn directory_path(&self, directory: UserDirectory) -> Option<PathBuf> {
@@ -107,6 +144,17 @@ impl ProbeSubject {
             effective_uid,
         }
     }
+}
+
+/// The account home directory of the effective user ID.
+#[cfg(target_os = "macos")]
+fn account_home_lookup() -> Result<PathBuf, String> {
+    native::account_home().map_err(|error| format!("getpwuid_r: {error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn account_home_lookup() -> Result<PathBuf, String> {
+    Err("The account lookup is implemented for macOS only.".to_owned())
 }
 
 /// The real and the effective user ID of this process.
@@ -149,22 +197,38 @@ impl CapabilityProbes for HostProbes {
     }
 
     fn protected_locations(&self) -> Probed<ProtectedLocationsFinding> {
-        let attempts = self.home.as_ref().map_or_else(Vec::new, |home| {
-            PROTECTED_LOCATIONS
-                .iter()
-                .map(|relative| {
-                    let path = home.join(relative);
-                    let outcome = list_protected(&path);
-                    ProtectedAttempt { path, outcome }
-                })
-                .collect()
-        });
+        // `HOME` is not trusted here: a caller can point it at a directory
+        // with its own `Library/Mail`, which no privacy control protects.
+        let (attempts, account_home, account_home_error) = match &self.account_home {
+            Ok(account) => {
+                let attempts = PROTECTED_LOCATIONS
+                    .iter()
+                    .map(|relative| {
+                        let path = account.join(relative);
+                        let outcome = list_protected(&path);
+                        ProtectedAttempt { path, outcome }
+                    })
+                    .collect();
+                (attempts, Some(account.clone()), None)
+            }
+            Err(error) => (Vec::new(), None, Some(error.clone())),
+        };
+        let home_variable_differs: Option<PathBuf> = match (&self.home, &account_home) {
+            (Some(home), Some(account)) if home != account => Some(home.clone()),
+            _ => None,
+        };
         Probed::new(
-            "A read-only attempt to open each directory and read one entry. The directories \
+            "A read-only attempt to open each directory under the home directory of the \
+             account database (`getpwuid_r`, not `HOME`) and read one entry. The directories \
              hold data of Safari, Mail, and Messages, which Full Disk Access covers. `EPERM` \
              is the refusal of the privacy control. The probe keeps no entry name, reads no \
              file content, and does not read a TCC database.",
-            ProtectedLocationsFinding { attempts },
+            ProtectedLocationsFinding {
+                attempts,
+                account_home,
+                account_home_error,
+                home_variable_differs,
+            },
         )
     }
 
@@ -565,6 +629,75 @@ mod tests {
             ));
         }
         assert_eq!(probes.protected_locations().finding.attempts, []);
+    }
+
+    #[test]
+    fn protected_locations_use_the_account_home_when_home_is_equal() {
+        let temp = TempDir::new("fda-equal");
+        let account = temp.0.join("account");
+        fs::create_dir_all(account.join("Library/Mail")).unwrap();
+        let probes = HostProbes::with_homes(
+            Some(account.clone()),
+            Ok(account.clone()),
+            temp.0.join("root"),
+        );
+        let finding = probes.protected_locations().finding;
+        assert_eq!(finding.home_variable_differs, None);
+        assert_eq!(finding.account_home, Some(account.clone()));
+        assert_eq!(finding.attempts.len(), PROTECTED_LOCATIONS.len());
+        assert!(
+            finding
+                .attempts
+                .iter()
+                .all(|attempt| attempt.path.starts_with(&account))
+        );
+    }
+
+    #[test]
+    fn a_different_home_variable_is_recorded_and_not_probed() {
+        let temp = TempDir::new("fda-differs");
+        let account = temp.0.join("account");
+        let fake = temp.0.join("fake");
+        // A listable `Library/Mail` under `HOME` must not count.
+        fs::create_dir_all(fake.join("Library/Mail")).unwrap();
+        fs::create_dir_all(&account).unwrap();
+        let probes =
+            HostProbes::with_homes(Some(fake.clone()), Ok(account.clone()), temp.0.join("root"));
+        let finding = probes.protected_locations().finding;
+        assert_eq!(finding.home_variable_differs, Some(fake.clone()));
+        assert!(
+            finding
+                .attempts
+                .iter()
+                .all(|attempt| attempt.path.starts_with(&account)
+                    && attempt.outcome == ProtectedReadOutcome::Absent)
+        );
+        // The state and log entries keep describing `HOME`, as the CLI does.
+        assert_eq!(
+            probes.user_directory(UserDirectory::State).finding,
+            inspect_directory(&fake.join(STATE_DIRECTORY))
+        );
+    }
+
+    #[test]
+    fn a_failed_account_lookup_gives_no_attempt() {
+        let temp = TempDir::new("fda-lookup");
+        let fake = temp.0.join("fake");
+        fs::create_dir_all(fake.join("Library/Mail")).unwrap();
+        let probes =
+            HostProbes::with_homes(Some(fake), Err("injected".to_owned()), temp.0.join("root"));
+        let finding = probes.protected_locations().finding;
+        assert_eq!(finding.attempts, []);
+        assert_eq!(finding.account_home, None);
+        assert_eq!(finding.account_home_error.as_deref(), Some("injected"));
+        assert_eq!(finding.home_variable_differs, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_account_home_is_an_absolute_path() {
+        let home = native::account_home().unwrap();
+        assert!(home.is_absolute());
     }
 
     #[test]

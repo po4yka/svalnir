@@ -723,6 +723,7 @@ fn retention_by_age_deletes_only_the_older_samples() {
     let policy = RetentionPolicy {
         max_age: Some(Duration::new(400, 750_000_000)),
         max_used_size: None,
+        ..RetentionPolicy::default()
     };
     let report = store.apply_retention(now, &policy).unwrap();
     assert_eq!(report.samples_deleted_by_age, EntryCount::new(600));
@@ -740,6 +741,7 @@ fn retention_by_age_deletes_only_the_older_samples() {
     let policy = RetentionPolicy {
         max_age: Some(Duration::MAX),
         max_used_size: None,
+        ..RetentionPolicy::default()
     };
     let report = store.apply_retention(now, &policy).unwrap();
     assert_eq!(report.samples_deleted_by_age, EntryCount::ZERO);
@@ -757,6 +759,7 @@ fn retention_by_size_deletes_the_oldest_samples_before_scan_records() {
     let policy = RetentionPolicy {
         max_age: None,
         max_used_size: Some(target),
+        ..RetentionPolicy::default()
     };
     let report = store.apply_retention(at(5000), &policy).unwrap();
     assert!(report.size_target_met);
@@ -783,6 +786,7 @@ fn retention_by_size_deletes_the_oldest_samples_before_scan_records() {
     let policy = RetentionPolicy {
         max_age: None,
         max_used_size: Some(before.page_size),
+        ..RetentionPolicy::default()
     };
     let report = store.apply_retention(at(5000), &policy).unwrap();
     assert!(!report.size_target_met);
@@ -846,6 +850,7 @@ fn a_full_store_gives_the_full_error_and_no_partial_row() {
     let policy = RetentionPolicy {
         max_age: None,
         max_used_size: Some(Bytes::new(size.used.get() / 2)),
+        ..RetentionPolicy::default()
     };
     let report = store.apply_retention(at(0), &policy).unwrap();
     assert!(report.size_target_met);
@@ -966,4 +971,99 @@ fn an_open_that_cannot_get_the_lock_for_a_migration_gives_the_busy_error() {
     drop(holder);
     let store = Store::open(&path, &short).unwrap();
     assert_eq!(store.version().unwrap(), STATE_STORE_VERSION);
+}
+
+#[test]
+fn retention_stops_at_the_batch_budget_and_the_next_call_continues() {
+    let mut store = memory();
+    insert_series(&mut store, 0..1200);
+    let policy = RetentionPolicy {
+        max_age: Some(Duration::from_secs(1)),
+        max_used_size: None,
+        max_batches: 1,
+    };
+    let now = at(10_000);
+    let first = store.apply_retention(now, &policy).unwrap();
+    assert_eq!(first.samples_deleted_by_age, EntryCount::new(500));
+    assert!(first.work_remaining);
+    assert_eq!(store.sample_count().unwrap(), EntryCount::new(700));
+
+    let more = RetentionPolicy {
+        max_batches: 10,
+        ..policy
+    };
+    let second = store.apply_retention(now, &more).unwrap();
+    assert_eq!(second.samples_deleted_by_age, EntryCount::new(700));
+    assert!(!second.work_remaining);
+    assert_eq!(store.sample_count().unwrap(), EntryCount::ZERO);
+}
+
+#[test]
+fn the_size_rule_obeys_the_batch_budget_and_keeps_scan_records() {
+    let mut store = memory();
+    store.insert_scan(&scan_record("scan-old", 0)).unwrap();
+    insert_series(&mut store, 0..3000);
+    let policy = RetentionPolicy {
+        max_age: None,
+        max_used_size: Some(Bytes::new(4096)),
+        max_batches: 2,
+    };
+    let report = store.apply_retention(at(5000), &policy).unwrap();
+    assert!(report.work_remaining);
+    assert!(!report.size_target_met);
+    assert_eq!(report.samples_deleted_by_size, EntryCount::new(1000));
+    assert_eq!(report.scans_deleted_by_size, EntryCount::ZERO);
+    assert_eq!(store.scan_count().unwrap(), EntryCount::new(1));
+}
+
+#[test]
+fn open_refuses_an_empty_path_and_the_memory_name() {
+    for name in ["", ":memory:"] {
+        let error = Store::open(Path::new(name), &options()).unwrap_err();
+        assert!(matches!(error, StoreError::InvalidPath(_)), "{name}");
+        assert!(!error.recording_failed());
+    }
+}
+
+#[test]
+fn a_file_without_wal_takes_full_synchronous() {
+    assert_eq!(super::synchronous_for("wal", true), "NORMAL");
+    assert_eq!(super::synchronous_for("memory", false), "NORMAL");
+    assert_eq!(super::synchronous_for("delete", true), "FULL");
+    assert_eq!(super::synchronous_for("memory", true), "FULL");
+
+    let directory = TempDir::new();
+    let store = Store::open(&directory.database(), &options()).unwrap();
+    let mode: String = store
+        .connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    let synchronous: i64 = store
+        .connection
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    assert_eq!(synchronous, 1);
+}
+
+#[test]
+fn recording_failed_is_true_for_every_failed_write_variant() {
+    use rusqlite::ffi;
+    for code in [
+        ffi::SQLITE_NOMEM,
+        ffi::SQLITE_PROTOCOL,
+        ffi::SQLITE_INTERRUPT,
+        ffi::SQLITE_CONSTRAINT,
+    ] {
+        let error: StoreError = rusqlite::Error::SqliteFailure(ffi::Error::new(code), None).into();
+        assert!(matches!(error, StoreError::Sqlite(_)), "code {code}");
+        assert!(error.recording_failed(), "code {code}");
+    }
+    let migration = StoreError::Migration {
+        version: 2,
+        source: Box::new(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows)),
+    };
+    assert!(migration.recording_failed());
+    let refused = StoreError::BatchTooLarge { size: 2, limit: 1 };
+    assert!(!refused.recording_failed());
 }

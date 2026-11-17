@@ -126,6 +126,14 @@ pub struct ProtectedLocationsFinding {
     /// One attempt for each candidate location. Empty when the probe could
     /// not resolve a candidate.
     pub attempts: Vec<ProtectedAttempt>,
+    /// The account home directory under which the probe tried the
+    /// locations. `None` when the account lookup failed.
+    pub account_home: Option<PathBuf>,
+    /// The error of the account lookup, when it failed.
+    pub account_home_error: Option<String>,
+    /// The value of the `HOME` variable when it is set and differs from the
+    /// account home directory. The probe does not try a location under it.
+    pub home_variable_differs: Option<PathBuf>,
 }
 
 /// One read-only attempt on a protected location.

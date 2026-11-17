@@ -23,8 +23,8 @@
 //! | Setting | Value | Reason |
 //! | --- | --- | --- |
 //! | `busy_timeout` | [`StoreOptions::busy_timeout`] | A locked database gives [`StoreError::Busy`] after a bounded wait |
-//! | `journal_mode` | `WAL` | A reader in a different process does not block the writer |
-//! | `synchronous` | `NORMAL` | History can be rebuilt; a power loss can lose the last commits and does not corrupt the file |
+//! | `journal_mode` | `WAL` (`memory` for a store in memory) | A reader in a different process does not block the writer |
+//! | `synchronous` | `NORMAL`; `FULL` when `WAL` is not in effect for a file | History can be rebuilt; with `WAL`, a power loss can lose the last commits and does not corrupt the file. `SQLite` does not fail when it cannot set `WAL` (for example on some network volumes), so the store reads the mode that it reports and takes `FULL` in a different mode for a file |
 //! | `foreign_keys` | `ON` | Later versions can add references between tables |
 //! | `secure_delete` | `ON` | A deleted row is overwritten with zeros in the database file |
 //! | `journal_size_limit` | 4 MiB | The write-ahead log file is cut to this size when a checkpoint resets the log |
@@ -71,7 +71,7 @@ pub use self::error::StoreError;
 pub use self::migration::STATE_STORE_VERSION;
 use self::migration::{MIGRATIONS, Migration};
 pub use self::query::{QueryLimit, TimeOrder, TimeRange};
-pub use self::retention::{RetentionPolicy, RetentionReport};
+pub use self::retention::{DEFAULT_MAX_BATCHES, RetentionPolicy, RetentionReport};
 pub use self::sample::{EncodedSample, MAX_SAMPLE_BATCH, SampleQuery, SampleRow};
 pub use self::scan::{MAX_SCAN_RESULT_BYTES, ScanQuery, ScanRecord, ScanSummary};
 
@@ -80,6 +80,13 @@ const JOURNAL_SIZE_LIMIT_BYTES: i64 = 4 * 1024 * 1024;
 
 /// The largest `max_page_count` that `SQLite` accepts.
 const MAX_PAGE_COUNT: u64 = 4_294_967_294;
+
+/// The `synchronous` setting for the journal mode that `SQLite` reports.
+fn synchronous_for(mode: &str, is_file: bool) -> &'static str {
+    let durable_mode: bool =
+        mode.eq_ignore_ascii_case("wal") || (!is_file && mode.eq_ignore_ascii_case("memory"));
+    if durable_mode { "NORMAL" } else { "FULL" }
+}
 
 /// The settings of one store connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +150,13 @@ impl Store {
     /// [`STATE_STORE_VERSION`]. A file that does not exist is made; its
     /// directory must exist.
     ///
+    /// An empty path and the name `:memory:` are refused: `SQLite` opens an
+    /// in-memory database or a private temporary file for them, and the
+    /// history would be lost silently.
+    ///
     /// # Errors
     ///
+    /// Returns [`StoreError::InvalidPath`] for an empty path or `:memory:`.
     /// Returns [`StoreError::NewerVersion`] or [`StoreError::NotAStateStore`]
     /// for a database that this build must not use; the content of the
     /// database is then not changed (`SQLite` can make or remove the
@@ -164,7 +176,7 @@ impl Store {
     /// Returns the errors of [`Store::open`].
     pub fn open_in_memory(options: &StoreOptions) -> Result<Self, StoreError> {
         let connection: Connection = Connection::open_in_memory_with_flags(open_flags())?;
-        Self::prepare(connection, options, MIGRATIONS)
+        Self::prepare(connection, options, MIGRATIONS, false)
     }
 
     fn open_with_migrations(
@@ -174,14 +186,18 @@ impl Store {
     ) -> Result<Self, StoreError> {
         // Refuse a defective migration list before the open makes a file.
         migration::supported_version(migrations)?;
+        if path.as_os_str().is_empty() || path.as_os_str() == ":memory:" {
+            return Err(StoreError::InvalidPath(path.display().to_string()));
+        }
         let connection: Connection = Connection::open_with_flags(path, open_flags())?;
-        Self::prepare(connection, options, migrations)
+        Self::prepare(connection, options, migrations, true)
     }
 
     fn prepare(
         connection: Connection,
         options: &StoreOptions,
         migrations: &[Migration],
+        is_file: bool,
     ) -> Result<Self, StoreError> {
         // Refuse a defective migration list, a database of a newer build,
         // or a database of a different application before a setting can
@@ -190,10 +206,13 @@ impl Store {
         connection.busy_timeout(options.busy_timeout)?;
         migration::recorded_version(&connection, supported)?;
 
-        // An in-memory database reports the mode `memory`; that is correct.
-        let _mode: String =
+        // `SQLite` reports the mode in effect and does not fail when it
+        // cannot set `WAL`. An in-memory database reports `memory`, which is
+        // correct. A file in a different mode has no write-ahead log, so
+        // `NORMAL` would weaken durability: take `FULL` there.
+        let mode: String =
             connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "synchronous", synchronous_for(&mode, is_file))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let _secure: i64 =
             connection.pragma_update_and_check(None, "secure_delete", "ON", |row| row.get(0))?;

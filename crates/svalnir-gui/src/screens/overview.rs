@@ -16,9 +16,10 @@ use crate::{
     ui::{
         data_state::{format_age, format_bytes, used_capacity},
         entry::card_entry,
-        pill::{StatusPill, Tone},
+        pill::{MonoTag, StatusPill, Tone},
         provenance::ProvenanceLine,
         rolling::RollingNumber,
+        stat_row::{StatItem, StatRow},
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
@@ -26,11 +27,12 @@ use crate::{
         alloc::count_f32,
         capacity_grid::{capacity_label, known_capacity},
         dial::{
-            DialLegend, DialModel, HeadMove, HeadroomDial, dial_model, lit_of, sweep_total,
-            with_lit_counts,
+            DialColors, DialDetail, DialKey, DialLegend, DialModel, HeadMove, HeadroomDial,
+            dial_model, level_sector, lit_of, names_hidden, share_percent_text, share_ppm,
+            sweep_total, with_lit_counts,
         },
         led::{LedChart, LedField, LedSegment},
-        session::{SessionChart, live_progress, session_model},
+        session::{LEFT_GUTTER, RIGHT_GUTTER, SessionChart, live_progress, session_model},
         treemap::CellRect,
     },
 };
@@ -49,9 +51,10 @@ use std::{
 
 const MIN_CARD_WIDTH: f32 = 320.0;
 /// The width of the dial card when it shares a row with the session chart.
-const DIAL_CARD_WIDTH: f32 = 560.0;
-/// The least content width at which the two cards share a row.
-const PAIR_MIN_WIDTH: f32 = 980.0;
+const DIAL_CARD_WIDTH: f32 = 610.0;
+/// The least content width at which the two cards share a row: the dial card,
+/// the gap, and a session chart of 60 columns with its gutters and padding.
+const PAIR_MIN_WIDTH: f32 = 1150.0;
 /// The sidebar width at full size and collapsed, and the content padding.
 const SIDEBAR_FULL: f32 = 256.0;
 const SIDEBAR_COLLAPSED: f32 = 49.0;
@@ -246,6 +249,16 @@ fn card(header: ShellHeader, body: impl IntoElement) -> AnyElement {
 /// A card whose content is centered in the height of its panel when
 /// `centered` is true, and starts at the top otherwise.
 fn card_aligned(header: ShellHeader, body: impl IntoElement, centered: bool) -> AnyElement {
+    card_full(header, body, None, centered)
+}
+
+/// A card with an optional footer in the shell, below the panel.
+fn card_full(
+    header: ShellHeader,
+    body: impl IntoElement,
+    footer: Option<AnyElement>,
+    centered: bool,
+) -> AnyElement {
     let mut content = v_flex().flex_1().gap(tokens::SPACE_3);
     if centered {
         content = content.justify_center();
@@ -254,6 +267,10 @@ fn card_aligned(header: ShellHeader, body: impl IntoElement, centered: bool) -> 
         .grow()
         .child(header)
         .child(Panel::new().grow().child(content.child(body)))
+        .children(footer.map(|row| {
+            // The inner padding of a control, like the header, not a layout gap.
+            div().px(px(10.0)).py(tokens::SPACE_3).child(row)
+        }))
         .into_any_element()
 }
 
@@ -375,7 +392,88 @@ fn hero_card(
     card(header, body)
 }
 
-/// The Headroom card: the dial, its legend, and the provenance line.
+/// The aside of the Headroom card: the memory pressure while it is not
+/// normal, otherwise the used share of the startup volume. `None` when the
+/// disk is not measured and the pressure is normal or unavailable.
+#[must_use]
+pub fn headroom_aside(host: &HostSnapshot) -> Option<(String, Tone)> {
+    if matches!(
+        host.pressure,
+        Measured::Value(PressureLevel::Warning | PressureLevel::Critical)
+    ) {
+        let (text, tone) = pressure_pill(&host.pressure);
+        return Some((text.to_owned(), tone));
+    }
+    let used: Measured<u64> = used_capacity(&host.disk_total, &host.disk_available);
+    let (used, total) = known_capacity(&used, &host.disk_total)?;
+    Some((
+        format!("{} disk used", share_percent_text(share_ppm(used, total))),
+        Tone::Neutral,
+    ))
+}
+
+/// The value and the suffix of the swap item of the stat row. It follows the
+/// rule of the swap ring: a use that cannot be in the space is an em dash
+/// (no value), and a swap with no space and no use is "None".
+#[must_use]
+pub fn swap_stat(host: &HostSnapshot) -> (Option<String>, Option<String>) {
+    let split = |value: &Measured<u64>| -> Option<(String, &'static str)> {
+        value.value().map(|bytes| format_bytes(*bytes))
+    };
+    match (&host.swap_used, &host.swap_total) {
+        (Measured::Value(0), Measured::Value(0)) => (Some("None".to_owned()), None),
+        (Measured::Value(used), Measured::Value(total)) if used > total || *total == 0 => {
+            (None, None)
+        }
+        (Measured::Value(_), Measured::Value(_)) => {
+            match (split(&host.swap_used), split(&host.swap_total)) {
+                (Some((text, unit)), Some((total, total_unit))) => {
+                    (Some(text), Some(format!("{unit} of {total} {total_unit}")))
+                }
+                _ => (None, None),
+            }
+        }
+        (used, _) => match split(used) {
+            Some((text, unit)) => (Some(text), Some(unit.to_owned())),
+            None => (None, None),
+        },
+    }
+}
+
+/// The stat row of the Headroom card: the available disk space, the used
+/// swap, and the pressure state. An unavailable value is an em dash.
+fn headroom_stats(host: &HostSnapshot, dark: bool) -> StatRow {
+    let colors: DialColors = DialColors::for_dark(dark);
+    let split = |value: &Measured<u64>| -> Option<(String, &'static str)> {
+        value.value().map(|bytes| format_bytes(*bytes))
+    };
+    let mut disk: StatItem = StatItem::new(
+        "disk",
+        "Disk available",
+        split(&host.disk_available).map(|(text, _)| text),
+        colors.disk,
+    );
+    if let Some((_, unit)) = split(&host.disk_available) {
+        disk = disk.suffix(unit);
+    }
+    let (swap_value, swap_suffix): (Option<String>, Option<String>) = swap_stat(host);
+    let mut swap: StatItem = StatItem::new("swap", "Swap used", swap_value, colors.swap);
+    if let Some(suffix) = swap_suffix {
+        swap = swap.suffix(suffix);
+    }
+    let (state, color): (Option<&str>, _) = match &host.pressure {
+        Measured::Value(level) => (Some(level.label()), colors.sector(level_sector(*level))),
+        Measured::Unavailable(_) => (None, colors.muted),
+    };
+    StatRow::new("headroom-stat-")
+        .item(disk)
+        .item(swap)
+        .item(StatItem::new("pressure", "Pressure", state, color))
+}
+
+/// The Headroom card: the dial, its legend, the detail panel, and the
+/// provenance line.
+#[expect(clippy::too_many_arguments, reason = "one card of the screen")]
 fn headroom_card(
     view: &View,
     pick: Option<usize>,
@@ -384,33 +482,45 @@ fn headroom_card(
     focus: [FocusHandle; 3],
     on_pick: impl Fn(Option<usize>, &mut Window, &mut gpui_kit::App) + 'static,
     tokens: &Tokens,
+    dark: bool,
 ) -> AnyElement {
-    let header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Headroom");
-    let body: AnyElement = match view {
-        View::Loading => skeleton_value(),
-        View::Failed(reason) => unavailable_body("headroom-value", reason, tokens),
+    let mut header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Headroom");
+    let (body, footer): (AnyElement, Option<AnyElement>) = match view {
+        View::Loading => (skeleton_value(), None),
+        View::Failed(reason) => (unavailable_body("headroom-value", reason, tokens), None),
         View::Data { host, stale } => {
             let model: DialModel = dial_model(host);
             let shown: DialModel =
                 lit_counts.map_or_else(|| model.clone(), |counts| with_lit_counts(&model, counts));
             let pill: (&'static str, Tone) = pressure_pill(&host.pressure);
-            v_flex()
+            if let Some((text, tone)) = headroom_aside(host) {
+                header = header.aside(StatusPill::new(text, tone).id("headroom-aside"));
+            }
+            let effective: usize = pick.unwrap_or(model.picked).min(2);
+            let detail: DialDetail = DialDetail::new(model.rings[effective].clone()).muted(*stale);
+            let body: AnyElement = v_flex()
                 .gap(tokens::SPACE_3)
                 .child(
                     h_flex()
                         .flex_wrap()
-                        .items_center()
+                        .items_start()
                         .gap(tokens::SPACE_6)
                         .child(
-                            HeadroomDial::new(shown)
-                                .picked(pick)
-                                .sweep(sweep)
-                                .muted(*stale),
+                            v_flex()
+                                .gap(tokens::SPACE_3)
+                                .child(
+                                    HeadroomDial::new(shown)
+                                        .hidden_names(names_hidden(&model))
+                                        .picked(pick)
+                                        .sweep(sweep)
+                                        .muted(*stale),
+                                )
+                                .child(DialKey),
                         )
                         .child(
                             v_flex()
                                 .flex_1()
-                                .min_w(px(240.0))
+                                .min_w(px(300.0))
                                 .gap(tokens::SPACE_3)
                                 .child(
                                     DialLegend::new(model, pill)
@@ -418,6 +528,7 @@ fn headroom_card(
                                         .focus_handles(focus)
                                         .on_pick(on_pick),
                                 )
+                                .child(detail)
                                 .children(stale.then(|| {
                                     caption("headroom-stale", stale_caption(host), tokens)
                                 }))
@@ -431,10 +542,11 @@ fn headroom_card(
                                 ),
                         ),
                 )
-                .into_any_element()
+                .into_any_element();
+            (body, Some(headroom_stats(host, dark).into_any_element()))
         }
     };
-    card_aligned(header, body, true)
+    card_full(header, body, footer, true)
 }
 
 /// The columns of the session chart that fit `width` pixels.
@@ -460,14 +572,29 @@ fn session_card(
 ) -> AnyElement {
     let header: ShellHeader = ShellHeader::new(IconName::HardDrive, "This session")
         .subtitle("Readings since this window opened");
+    let mut footer: Option<AnyElement> = None;
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
         View::Failed(reason) => unavailable_body("session-value", reason, tokens),
         View::Data { host, stale } => {
-            // The shell and the panel pad the chart on both sides.
-            let padding: f32 = 2.0 * f32::from(tokens::SHELL_PADDING + tokens::PANEL_PADDING);
+            // The shell and the panel pad the chart on both sides; the chart
+            // has a gutter of names and a gutter of newest values.
+            let padding: f32 = 2.0 * f32::from(tokens::SHELL_PADDING + tokens::PANEL_PADDING)
+                + LEFT_GUTTER
+                + RIGHT_GUTTER;
             let slots: usize = session_slots((width - padding).max(0.0));
             let model = session_model(history, operation, slots);
+            let tags = model.tags();
+            footer = Some(
+                h_flex()
+                    .flex_wrap()
+                    .gap(tokens::SPACE_2)
+                    .child(MonoTag::new("session-tag-readings", tags.readings))
+                    .child(MonoTag::new("session-tag-range", tags.range))
+                    .child(MonoTag::new("session-tag-events", tags.events))
+                    .child(MonoTag::new("session-tag-state", tags.state))
+                    .into_any_element(),
+            );
             v_flex()
                 .gap(tokens::SPACE_3)
                 .child(SessionChart::new(model).live(live).muted(*stale))
@@ -479,7 +606,7 @@ fn session_card(
                 .into_any_element()
         }
     };
-    card(header, body)
+    card_full(header, body, footer, false)
 }
 
 fn agent_card(agent: &Loadable<AgentSnapshot>, glow: bool, tokens: &Tokens) -> AnyElement {
@@ -826,6 +953,7 @@ impl Render for OverviewScreen {
                     });
                 },
                 tokens,
+                cx.theme().is_dark(),
             ),
             session_card(
                 &view,
@@ -928,5 +1056,64 @@ mod tests {
             sentence.contains("not known whether an agent runs"),
             "{sentence}"
         );
+    }
+
+    #[test]
+    fn the_aside_shows_pressure_when_not_normal_else_the_disk_share() {
+        let mut host = HostSnapshot {
+            captured_at: SystemTime::UNIX_EPOCH,
+            volume_name: None,
+            disk_total: Measured::Value(1000),
+            disk_available: Measured::Value(510),
+            disk_free: Measured::Value(500),
+            pressure: Measured::Value(PressureLevel::Normal),
+            memory_total: Measured::Value(1),
+            swap_used: Measured::Value(0),
+            swap_total: Measured::Value(0),
+            source: "test",
+        };
+        let (text, tone) = headroom_aside(&host).expect("aside");
+        assert_eq!((text.as_str(), tone), ("49% disk used", Tone::Neutral));
+        host.pressure = Measured::Value(PressureLevel::Warning);
+        assert_eq!(headroom_aside(&host).expect("aside").0, "Warning");
+        host.pressure = Measured::Unavailable("x".into());
+        host.disk_total = Measured::Unavailable("x".into());
+        assert!(headroom_aside(&host).is_none());
+    }
+
+    fn host_with(swap_used: u64, swap_total: u64) -> HostSnapshot {
+        HostSnapshot {
+            captured_at: SystemTime::UNIX_EPOCH,
+            volume_name: None,
+            disk_total: Measured::Value(1_000_000_000),
+            disk_available: Measured::Value(999_999_999),
+            disk_free: Measured::Value(999_999_999),
+            pressure: Measured::Value(PressureLevel::Normal),
+            memory_total: Measured::Value(1),
+            swap_used: Measured::Value(swap_used),
+            swap_total: Measured::Value(swap_total),
+            source: "test",
+        }
+    }
+
+    #[test]
+    fn the_swap_stat_follows_the_rule_of_the_swap_ring() {
+        assert_eq!(swap_stat(&host_with(0, 0)), (Some("None".to_owned()), None));
+        assert_eq!(swap_stat(&host_with(2_000_000_000, 0)), (None, None));
+        assert_eq!(swap_stat(&host_with(5, 4)), (None, None));
+        let (value, suffix) = swap_stat(&host_with(1_000_000_000, 4_000_000_000));
+        assert_eq!(value.as_deref(), Some("1.0"));
+        assert_eq!(suffix.as_deref(), Some("GB of 4.0 GB"));
+    }
+
+    #[test]
+    fn a_small_disk_share_is_not_zero_and_a_nearly_full_disk_is_not_full() {
+        let host = host_with(0, 0);
+        assert_eq!(headroom_aside(&host).expect("aside").0, "<1% disk used");
+        let mut full = host_with(0, 0);
+        full.disk_available = Measured::Value(1);
+        assert_eq!(headroom_aside(&full).expect("aside").0, "99% disk used");
+        full.disk_available = Measured::Value(0);
+        assert_eq!(headroom_aside(&full).expect("aside").0, "100% disk used");
     }
 }

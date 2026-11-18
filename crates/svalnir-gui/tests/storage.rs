@@ -180,6 +180,14 @@ fn storage_screen_scan_button_runs_the_scan(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let total = label_of(handle, "scan-total", cx).expect("total text");
     assert_eq!(total, "266.1");
+    let scanned = label_of(handle, "storage-stat-scanned", cx).expect("scanned stat");
+    assert!(scanned.starts_with("Scanned 266.1 "), "{scanned}");
+    let unread = label_of(handle, "storage-stat-unread", cx).expect("unread stat");
+    assert!(
+        unread.starts_with("Not read ") && unread.ends_with("cause"),
+        "{unread}"
+    );
+    assert!(label_of(handle, "storage-stat-free", cx).is_some());
     let row = label_of(handle, "storage-legend-row-0", cx).expect("first legend row");
     assert!(row.starts_with("Pictures: "), "row {row}");
     let allocated = label_of(handle, "scan-metric", cx).expect("caption");

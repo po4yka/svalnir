@@ -101,3 +101,48 @@ impl RenderOnce for StatusPill {
             .child(div().child(self.text))
     }
 }
+
+/// A small tag with a mono text: `surface-raised` fill, 6 px radius, 11 px
+/// text (`DESIGN.md` section 4).
+#[derive(IntoElement)]
+pub struct MonoTag {
+    text: SharedString,
+    id: SharedString,
+}
+
+impl std::fmt::Debug for MonoTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonoTag")
+            .field("text", &self.text)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MonoTag {
+    /// Creates a tag with a text and an element id.
+    pub fn new(id: impl Into<SharedString>, text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            id: id.into(),
+        }
+    }
+}
+
+impl RenderOnce for MonoTag {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        div()
+            .id(self.id)
+            .test_support()
+            .aria_label(self.text.clone())
+            .px(tokens::SPACE_2)
+            .py(tokens::SPACE_1)
+            .rounded(px(6.0))
+            .bg(to_hsla(tokens.surface_raised))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(px(11.0))
+            .text_color(to_hsla(tokens.muted_foreground))
+            .whitespace_nowrap()
+            .child(self.text)
+    }
+}

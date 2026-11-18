@@ -296,3 +296,115 @@ fn keyboard_focus_on_a_legend_row_picks_the_ring_and_blur_clears_it(cx: &mut Tes
     }
     assert!(cleared, "blur did not clear the pick");
 }
+
+#[gpui_kit::test]
+fn the_header_aside_shows_pressure_or_the_disk_share(cx: &mut TestAppContext) {
+    let healthy = open(FixtureScenario::Healthy, cx);
+    let text = label(healthy, "headroom-aside", cx).expect("aside");
+    assert!(text.ends_with("% disk used"), "{text}");
+    let pressure = open(FixtureScenario::Pressure, cx);
+    assert_eq!(
+        label(pressure, "headroom-aside", cx).as_deref(),
+        Some("Warning")
+    );
+}
+
+#[gpui_kit::test]
+fn the_detail_panel_has_rows_and_dashes_for_unknown_values(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    let detail = label(handle, "dial-detail", cx).expect("detail");
+    for row in ["Used ", "Available ", "Free ", "Reclaimable ", "Total "] {
+        assert!(detail.contains(row), "{detail}");
+    }
+    assert!(detail.contains("in use"), "{detail}");
+    let none = open(FixtureScenario::Unavailable, cx);
+    let detail = label(none, "dial-detail", cx).expect("detail");
+    assert!(detail.contains('\u{2014}'), "{detail}");
+    assert!(!detail.contains("0 B"), "{detail}");
+    assert!(label(none, "dial-key", cx).is_some());
+}
+
+#[gpui_kit::test]
+fn the_detail_panel_follows_the_focused_legend_row(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    assert!(
+        label(handle, "dial-detail", cx)
+            .expect("detail")
+            .starts_with("Disk")
+    );
+    let mut seen: bool = false;
+    for _ in 0..16 {
+        cx.update_window(handle, |_, window, cx| window.press("tab", cx))
+            .unwrap();
+        cx.run_until_parked();
+        if label(handle, "dial-center-caption", cx).as_deref() == Some("Swap used") {
+            let detail = label(handle, "dial-detail", cx).expect("detail");
+            assert!(detail.starts_with("Swap. "), "{detail}");
+            assert!(
+                detail.contains("swap space that the system uses"),
+                "{detail}"
+            );
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "tab never focused the swap row");
+}
+
+#[gpui_kit::test]
+fn the_headroom_stat_row_shows_three_values(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    let disk = label(handle, "headroom-stat-disk", cx).expect("disk stat");
+    assert!(disk.starts_with("Disk available "), "{disk}");
+    assert!(
+        label(handle, "headroom-stat-swap", cx)
+            .expect("swap")
+            .contains(" of ")
+    );
+    assert_eq!(
+        label(handle, "headroom-stat-pressure", cx).as_deref(),
+        Some("Pressure Normal")
+    );
+    let none = open(FixtureScenario::Unavailable, cx);
+    assert_eq!(
+        label(none, "headroom-stat-pressure", cx).as_deref(),
+        Some("Pressure \u{2014}")
+    );
+    assert!(
+        label(none, "headroom-stat-disk", cx)
+            .expect("disk stat")
+            .ends_with('\u{2014}')
+    );
+}
+
+#[gpui_kit::test]
+fn the_session_tags_state_readings_events_and_state(cx: &mut TestAppContext) {
+    let handle = open_drift(100, cx);
+    assert_eq!(
+        label(handle, "session-tag-readings", cx).as_deref(),
+        Some("readings 100")
+    );
+    assert_eq!(
+        label(handle, "session-tag-events", cx).as_deref(),
+        Some("events 4")
+    );
+    let state = label(handle, "session-tag-state", cx).expect("state tag");
+    assert!(state.starts_with("now "), "{state}");
+    let range = label(handle, "session-tag-range", cx).expect("range tag");
+    assert!(range.starts_with("range "), "{range}");
+    assert!(label(handle, "session-rows", cx).is_none());
+    assert!(label(handle, "session-key", cx).is_some());
+}
+
+#[gpui_kit::test]
+fn the_chip_names_the_newest_event_with_its_fact(cx: &mut TestAppContext) {
+    let handle = open_drift(100, cx);
+    let chip = label(handle, "session-chip", cx).expect("chip");
+    assert!(chip.contains(" UTC"), "{chip}");
+    assert!(
+        chip.contains("after ") && chip.contains(" readings") || chip.ends_with("Completed"),
+        "{chip}"
+    );
+    let chart = label(handle, "session-chart", cx).expect("chart");
+    assert!(chart.contains(", min "), "{chart}");
+}

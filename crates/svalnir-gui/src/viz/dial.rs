@@ -15,12 +15,13 @@ use crate::{
         data_state::{UNAVAILABLE_TEXT, format_bytes, used_capacity},
         pill::{StatusPill, Tone},
         ring_center::RingCenter,
+        surface::Inset,
     },
     viz::led::{LedStyle, lit_color},
 };
 use gpui_kit::{
-    App, Bounds, BoxShadow, Corners, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
+    App, Bounds, BoxShadow, Corners, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
     component::{
         ActiveTheme as _,
@@ -35,7 +36,27 @@ use std::{
 };
 
 /// The side of the square of the dial, in pixels.
-pub const DIAL_SIZE: f32 = 196.0;
+pub const DIAL_SIZE: f32 = 240.0;
+/// The number of tick dots on the dial face.
+pub const TICK_DOTS: usize = 48;
+/// The radius of the tick dots, in pixels.
+pub const TICK_RADIUS: f32 = 102.0;
+/// The diameter of a tick dot, in pixels.
+const TICK_PX: f32 = 2.0;
+/// The radius of the scale labels, in pixels.
+pub const LABEL_RADIUS: f32 = 113.0;
+/// The scale labels, at the top, right, bottom, and left.
+pub const SCALE_LABELS: [&str; 4] = ["0", "25", "50", "75"];
+/// The radius where the start line begins and ends, in pixels.
+pub const START_INNER: f32 = 52.0;
+/// The outer radius of the start line, in pixels.
+pub const START_OUTER: f32 = 98.0;
+/// The gap between a ring name and the start line, in pixels.
+const NAME_GAP: f32 = 6.0;
+/// The width of one character of a mono text of 10 px, in pixels.
+const MONO_10: f32 = 6.0;
+/// The height of a line of a 10 px label, in pixels.
+const LABEL_LINE: f32 = 12.0;
 /// The radius of each ring, from the outside.
 pub const RING_RADII: [f32; 3] = [90.0, 76.0, 62.0];
 /// The number of dots of each ring.
@@ -66,6 +87,26 @@ impl RingKind {
             Self::Disk => "Disk",
             Self::Swap => "Swap",
             Self::Pressure => "Memory pressure",
+        }
+    }
+
+    /// The name of the ring on the dial face, in lower case.
+    #[must_use]
+    pub const fn short_name(self) -> &'static str {
+        match self {
+            Self::Disk => "disk",
+            Self::Swap => "swap",
+            Self::Pressure => "pressure",
+        }
+    }
+
+    /// The sentence of the detail panel that says what the ring shows.
+    #[must_use]
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Self::Disk => "The share of the startup volume that is in use.",
+            Self::Swap => "The swap space that the system uses.",
+            Self::Pressure => "The memory pressure state that the system reports.",
         }
     }
 
@@ -116,6 +157,108 @@ pub struct Ring {
     pub center_value: String,
     /// The one-line center caption when this ring is picked.
     pub center_caption: String,
+    /// The rows of the detail panel: a label and a value. A value that is
+    /// not measured is an em dash.
+    pub rows: Vec<(&'static str, String)>,
+    /// The sentence below the rows of the detail panel.
+    pub note: String,
+}
+
+impl Ring {
+    /// The headline of the detail panel: the used share of a ring that has
+    /// one ("49% used"), and the center value otherwise. The rows have the
+    /// used value, so the headline does not repeat it.
+    #[must_use]
+    pub fn detail_headline(&self) -> String {
+        match (self.kind, self.share_ppm) {
+            (RingKind::Disk | RingKind::Swap, Some(ppm)) => {
+                format!("{} used", share_percent_text(ppm))
+            }
+            _ => self.center_value.clone(),
+        }
+    }
+
+    /// The accessible label of the detail panel: the title, the headline,
+    /// each row, and the sentence.
+    #[must_use]
+    pub fn detail_label(&self) -> String {
+        let mut parts: Vec<String> = vec![self.kind.name().to_owned(), self.detail_headline()];
+        parts.extend(
+            self.rows
+                .iter()
+                .map(|(label, value)| format!("{label} {value}")),
+        );
+        parts.push(self.note.clone());
+        parts.join(". ")
+    }
+}
+
+fn text_or_dash(value: &Measured<u64>) -> String {
+    match value {
+        Measured::Value(bytes) => bytes_text(*bytes),
+        Measured::Unavailable(_) => UNAVAILABLE_TEXT.to_owned(),
+    }
+}
+
+/// The rows of the detail panel of ring `kind` for `host`. A value that is
+/// not measured is an em dash. A swap with no swap space has no row.
+fn detail_rows(kind: RingKind, host: &HostSnapshot) -> Vec<(&'static str, String)> {
+    match kind {
+        RingKind::Disk => {
+            // The ring has no reading for a volume of no capacity: no row
+            // shows a number then.
+            if host.disk_total.value() == Some(&0) {
+                return ["Used", "Available", "Free", "Reclaimable", "Total"]
+                    .map(|label| (label, UNAVAILABLE_TEXT.to_owned()))
+                    .to_vec();
+            }
+            let used: Measured<u64> = used_capacity(&host.disk_total, &host.disk_available);
+            let reclaimable: String = match (&host.disk_available, &host.disk_free) {
+                (Measured::Value(available), Measured::Value(free)) if available >= free => {
+                    bytes_text(available - free)
+                }
+                _ => UNAVAILABLE_TEXT.to_owned(),
+            };
+            vec![
+                ("Used", text_or_dash(&used)),
+                ("Available", text_or_dash(&host.disk_available)),
+                ("Free", text_or_dash(&host.disk_free)),
+                ("Reclaimable", reclaimable),
+                ("Total", text_or_dash(&host.disk_total)),
+            ]
+        }
+        RingKind::Swap => match (&host.swap_used, &host.swap_total) {
+            (Measured::Value(_), Measured::Value(0)) if host.swap_used.value() == Some(&0) => {
+                Vec::new()
+            }
+            (Measured::Value(used), Measured::Value(total)) if used <= total && *total > 0 => {
+                vec![("Used", bytes_text(*used)), ("Total", bytes_text(*total))]
+            }
+            (Measured::Value(_), Measured::Value(_)) => vec![
+                ("Used", UNAVAILABLE_TEXT.to_owned()),
+                ("Total", UNAVAILABLE_TEXT.to_owned()),
+            ],
+            (used, total) => vec![("Used", text_or_dash(used)), ("Total", text_or_dash(total))],
+        },
+        RingKind::Pressure => {
+            let (state, source): (String, String) = match &host.pressure {
+                Measured::Value(level) => (level.label().to_owned(), host.source.to_owned()),
+                Measured::Unavailable(_) => {
+                    (UNAVAILABLE_TEXT.to_owned(), UNAVAILABLE_TEXT.to_owned())
+                }
+            };
+            vec![("State", state), ("Source", source)]
+        }
+    }
+}
+
+/// The sentence below the rows of the detail panel.
+fn detail_note(kind: RingKind, rows: &[(&'static str, String)]) -> String {
+    if kind == RingKind::Swap && rows.is_empty() {
+        "The system has no swap space, so the panel has no row.".to_owned()
+    } else {
+        kind.sentence().to_owned()
+    }
 }
 
 /// The three rings and the picked ring.
@@ -161,13 +304,34 @@ pub fn lit_dots(value: u64, capacity: u64, dots: usize) -> usize {
     rounded.clamp(1, dots.saturating_sub(1).max(1))
 }
 
-/// The share of `value` in `capacity` in parts per million.
-fn share_ppm(value: u64, capacity: u64) -> u64 {
-    if capacity == 0 {
+/// The share of `value` in `capacity` in parts per million. A nonzero value
+/// below capacity is at least 1 and at most 999 999, so a text of the share
+/// can tell it from 0 and from the full capacity.
+#[must_use]
+pub fn share_ppm(value: u64, capacity: u64) -> u64 {
+    if capacity == 0 || value == 0 {
         return 0;
     }
-    let ppm: u128 = u128::from(value.min(capacity)) * 1_000_000 / u128::from(capacity);
-    u64::try_from(ppm).unwrap_or(1_000_000)
+    if value >= capacity {
+        return 1_000_000;
+    }
+    let ppm: u128 = u128::from(value) * 1_000_000 / u128::from(capacity);
+    u64::try_from(ppm).unwrap_or(999_999).clamp(1, 999_999)
+}
+
+/// The text of a share in parts per million: "0%" only for 0, "<1%" below
+/// 1%, "100%" only for the full capacity, and 99% at most otherwise.
+#[must_use]
+pub fn share_percent_text(ppm: u64) -> String {
+    if ppm == 0 {
+        "0%".to_owned()
+    } else if ppm >= 1_000_000 {
+        "100%".to_owned()
+    } else if ppm < 10_000 {
+        "<1%".to_owned()
+    } else {
+        format!("{}%", (ppm / 10_000).min(99))
+    }
 }
 
 fn bytes_text(bytes: u64) -> String {
@@ -185,6 +349,8 @@ fn unavailable_ring(kind: RingKind, reason: &str) -> Ring {
         share_ppm: None,
         center_value: UNAVAILABLE_TEXT.to_owned(),
         center_caption: format!("{} unavailable", kind.name()),
+        rows: Vec::new(),
+        note: String::new(),
     }
 }
 
@@ -217,15 +383,12 @@ fn disk_ring(host: &HostSnapshot) -> Ring {
         dots,
         state: RingState::Used { lit, soft },
         value: format!("{} used of {}", bytes_text(*used), bytes_text(*total)),
-        detail: soft_bytes.map(|bytes| {
-            format!(
-                "Soft part: {} that the system can reclaim",
-                bytes_text(bytes)
-            )
-        }),
+        detail: None,
         share_ppm: Some(share_ppm(*used, *total)),
         center_value: bytes_text(*used),
         center_caption: "Disk used".to_owned(),
+        rows: Vec::new(),
+        note: String::new(),
     }
 }
 
@@ -250,9 +413,11 @@ fn swap_ring(host: &HostSnapshot) -> Ring {
             state: RingState::Used { lit: 0, soft: 0 },
             value: "No swap space".to_owned(),
             detail: None,
-            share_ppm: Some(0),
+            share_ppm: None,
             center_value: "None".to_owned(),
             center_caption: "No swap space".to_owned(),
+            rows: Vec::new(),
+            note: String::new(),
         };
     }
     if used > total {
@@ -270,6 +435,8 @@ fn swap_ring(host: &HostSnapshot) -> Ring {
         share_ppm: Some(share_ppm(*used, *total)),
         center_value: bytes_text(*used),
         center_caption: "Swap used".to_owned(),
+        rows: Vec::new(),
+        note: String::new(),
     }
 }
 
@@ -285,6 +452,8 @@ fn pressure_ring(host: &HostSnapshot) -> Ring {
             share_ppm: None,
             center_value: level.label().to_owned(),
             center_caption: "Memory pressure".to_owned(),
+            rows: Vec::new(),
+            note: String::new(),
         },
         Measured::Unavailable(reason) => unavailable_ring(kind, reason),
     }
@@ -326,7 +495,11 @@ fn pick(rings: &[Ring; 3]) -> usize {
 /// The model of the dial for one host reading.
 #[must_use]
 pub fn dial_model(host: &HostSnapshot) -> DialModel {
-    let rings: [Ring; 3] = [disk_ring(host), swap_ring(host), pressure_ring(host)];
+    let mut rings: [Ring; 3] = [disk_ring(host), swap_ring(host), pressure_ring(host)];
+    for ring in &mut rings {
+        ring.rows = detail_rows(ring.kind, host);
+        ring.note = detail_note(ring.kind, &ring.rows);
+    }
     let picked: usize = pick(&rings);
     DialModel { rings, picked }
 }
@@ -596,6 +769,10 @@ pub struct DialColors {
     pub empty: Hsla,
     /// The radial marker.
     pub marker: Hsla,
+    /// The tick dots, the rails, and the empty marks of a key.
+    pub border: Hsla,
+    /// The labels, the major ticks, and the start line.
+    pub muted: Hsla,
 }
 
 impl DialColors {
@@ -611,6 +788,8 @@ impl DialColors {
             negative: to_hsla(tokens.negative),
             empty: LedStyle::for_dark(dark).lattice,
             marker: to_hsla(tokens.foreground),
+            border: to_hsla(tokens.border),
+            muted: to_hsla(tokens.muted_foreground),
         }
     }
 
@@ -635,6 +814,48 @@ fn dot_bounds(origin: Point<Pixels>, center: (f32, f32), side: f32) -> Bounds<Pi
     )
 }
 
+/// The box of the name of ring `index` from the center of the dial: left,
+/// top, right, and bottom, in pixels. The name ends `NAME_GAP` left of the
+/// start line, at the height of the ring.
+#[must_use]
+pub fn name_box(index: usize) -> (f32, f32, f32, f32) {
+    let kind: RingKind = [RingKind::Disk, RingKind::Swap, RingKind::Pressure][index.min(2)];
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a name has fewer than 16 characters"
+    )]
+    let width: f32 = kind.short_name().chars().count() as f32 * MONO_10;
+    let right: f32 = -(0.5 + NAME_GAP);
+    let y: f32 = -RING_RADII[index.min(2)];
+    (
+        right - width,
+        y - LABEL_LINE / 2.0,
+        right,
+        y + LABEL_LINE / 2.0,
+    )
+}
+
+/// Whether the name of ring `index` would cover a lit, soft, or dim dot of
+/// any ring in the final state. The name is then hidden.
+#[must_use]
+pub fn name_hidden(model: &DialModel, index: usize) -> bool {
+    let (left, top, right, bottom) = name_box(index);
+    let reach: f32 = DOT_PX / 2.0;
+    model.rings.iter().enumerate().any(|(ring_index, ring)| {
+        dot_kinds(ring, None).iter().enumerate().any(|(dot, kind)| {
+            let drawn: bool = matches!(kind, Dot::Lit | Dot::Head | Dot::Soft | Dot::Dim);
+            let (x, y) = dot_center(dot, ring.dots, RING_RADII[ring_index]);
+            drawn && x + reach > left && x - reach < right && y + reach > top && y - reach < bottom
+        })
+    })
+}
+
+/// Which ring names are hidden in the final state of `model`.
+#[must_use]
+pub fn names_hidden(model: &DialModel) -> [bool; 3] {
+    std::array::from_fn(|index| name_hidden(model, index))
+}
+
 /// The inputs of one paint of the dial.
 #[derive(Debug, Clone)]
 struct DialPaint {
@@ -646,6 +867,7 @@ struct DialPaint {
     muted: bool,
 }
 
+#[expect(clippy::too_many_lines, reason = "one pass in paint order")]
 fn paint_dial(paint: &DialPaint, bounds: Bounds<Pixels>, window: &mut Window) {
     let origin: Point<Pixels> = bounds.origin;
     let white: Hsla = hsla(0.0, 0.0, 1.0, 1.0);
@@ -663,6 +885,38 @@ fn paint_dial(paint: &DialPaint, bounds: Bounds<Pixels>, window: &mut Window) {
             (index, dot_kinds(ring, progress))
         })
         .collect();
+    // The dial face: tick dots and the start line, under the rings.
+    for tick in 0..TICK_DOTS {
+        let color: Hsla = if tick % 12 == 0 {
+            paint.colors.muted
+        } else {
+            paint.colors.border
+        };
+        window.paint_quad(
+            fill(
+                dot_bounds(origin, dot_center(tick, TICK_DOTS, TICK_RADIUS), TICK_PX),
+                color,
+            )
+            .corner_radii(Corners::all(px(TICK_PX / 2.0))),
+        );
+    }
+    window.paint_quad(fill(
+        Bounds::new(
+            point(
+                origin.x + px(DIAL_SIZE / 2.0 - 0.5),
+                origin.y + px(DIAL_SIZE / 2.0 - START_OUTER),
+            ),
+            size(px(1.0), px(START_OUTER - START_INNER)),
+        ),
+        paint.colors.muted.opacity(rest),
+    ));
+    window.paint_quad(
+        fill(
+            dot_bounds(origin, (0.0, -START_OUTER), 4.0),
+            paint.colors.muted.opacity(rest),
+        )
+        .corner_radii(Corners::all(px(2.0))),
+    );
     // The glow of the heads first: the dots cover it.
     if paint.glow {
         for (index, dots) in &kinds {
@@ -745,6 +999,7 @@ pub struct HeadroomDial {
     picked: Option<usize>,
     sweep: Option<f32>,
     muted: bool,
+    hidden: Option<[bool; 3]>,
 }
 
 impl HeadroomDial {
@@ -756,7 +1011,16 @@ impl HeadroomDial {
             picked: None,
             sweep: None,
             muted: false,
+            hidden: None,
         }
+    }
+
+    /// Sets which ring names are hidden. Compute them from the measured
+    /// model with `names_hidden`, so an animation does not toggle a name.
+    #[must_use]
+    pub const fn hidden_names(mut self, hidden: [bool; 3]) -> Self {
+        self.hidden = Some(hidden);
+        self
     }
 
     /// Picks the ring `index` in place of the ring of the model.
@@ -783,6 +1047,7 @@ impl HeadroomDial {
 }
 
 impl RenderOnce for HeadroomDial {
+    #[expect(clippy::too_many_lines, reason = "one build of the face and the texts")]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let picked: usize = self.picked.unwrap_or(self.model.picked).min(2);
@@ -793,6 +1058,65 @@ impl RenderOnce for HeadroomDial {
         let center_state: RingState = center.state;
         let center_unavailable: bool = center_state == RingState::Unavailable;
         let colors: DialColors = DialColors::for_dark(dark);
+        let mono: SharedString = cx.theme().mono_font_family.clone();
+        let hidden: [bool; 3] = self.hidden.unwrap_or_else(|| names_hidden(&self.model));
+        let mut face: Vec<gpui_kit::AnyElement> = Vec::new();
+        for (index, text) in SCALE_LABELS.iter().enumerate() {
+            let (x, y): (f32, f32) = dot_center(index * 12, TICK_DOTS, LABEL_RADIUS);
+            face.push(
+                div()
+                    .id(SharedString::from(format!("dial-scale-{text}")))
+                    .absolute()
+                    .left(px(DIAL_SIZE / 2.0 + x - 12.0))
+                    .top(px(DIAL_SIZE / 2.0 + y - LABEL_LINE / 2.0))
+                    .w(px(24.0))
+                    .h(px(LABEL_LINE))
+                    .flex()
+                    .justify_center()
+                    .font_family(mono.clone())
+                    .text_size(px(10.0))
+                    .line_height(px(LABEL_LINE))
+                    .text_color(colors.muted)
+                    .child(*text)
+                    .into_any_element(),
+            );
+        }
+        for (index, ring) in self.model.rings.iter().enumerate() {
+            if hidden[index] {
+                continue;
+            }
+            let ring_color: Hsla = match ring.state {
+                RingState::Pressure(level) => colors.sector(level_sector(level)),
+                _ if ring.kind == RingKind::Swap => colors.swap,
+                _ if ring.kind == RingKind::Disk => colors.disk,
+                _ => colors.muted,
+            };
+            let color: Hsla = if index == picked {
+                ring_color
+            } else {
+                colors.muted
+            };
+            face.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "dial-name-{}",
+                        ring.kind.short_name()
+                    )))
+                    .absolute()
+                    .right(px(DIAL_SIZE / 2.0 + 0.5 + NAME_GAP))
+                    .top(px(DIAL_SIZE / 2.0 - RING_RADII[index] - LABEL_LINE / 2.0))
+                    .h(px(LABEL_LINE))
+                    .flex()
+                    .justify_end()
+                    .font_family(mono.clone())
+                    .text_size(px(10.0))
+                    .line_height(px(LABEL_LINE))
+                    .text_color(color)
+                    .whitespace_nowrap()
+                    .child(ring.kind.short_name())
+                    .into_any_element(),
+            );
+        }
         let paint: DialPaint = DialPaint {
             model: self.model,
             picked,
@@ -821,6 +1145,7 @@ impl RenderOnce for HeadroomDial {
                     .size_full(),
                 ),
             )
+            .children(face)
             .child({
                 let mut center_view = RingCenter::new(
                     "dial-center-value",
@@ -1053,6 +1378,136 @@ const fn count_f32(count: usize) -> f32 {
     count as f32
 }
 
+/// The detail panel of one ring: the name and the headline value, the rows,
+/// and one sentence. It is an inset and has no control.
+#[derive(IntoElement, Debug)]
+pub struct DialDetail {
+    ring: Ring,
+    muted: bool,
+}
+
+impl DialDetail {
+    /// Creates the panel for `ring`.
+    #[must_use]
+    pub const fn new(ring: Ring) -> Self {
+        Self { ring, muted: false }
+    }
+
+    /// Draws the values muted, for stale data.
+    #[must_use]
+    pub const fn muted(mut self, muted: bool) -> Self {
+        self.muted = muted;
+        self
+    }
+}
+
+impl RenderOnce for DialDetail {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        let mono: SharedString = cx.theme().mono_font_family.clone();
+        let muted: Hsla = to_hsla(tokens.muted_foreground);
+        let value_color: Hsla = if self.muted {
+            muted
+        } else {
+            to_hsla(tokens.foreground)
+        };
+        let label: SharedString = self.ring.detail_label().into();
+        let mut rows = v_flex().gap(tokens::SPACE_1);
+        for (name, value) in &self.ring.rows {
+            rows = rows.child(
+                h_flex()
+                    .justify_between()
+                    .gap(tokens::SPACE_2)
+                    .child(div().text_size(px(12.0)).text_color(muted).child(*name))
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(value_color)
+                            .child(value.clone()),
+                    ),
+            );
+        }
+        div()
+            .id("dial-detail")
+            .role(Role::Group)
+            .test_support()
+            .aria_label(label)
+            .child(
+                Inset::new().child(
+                    v_flex()
+                        .gap(tokens::SPACE_2)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_baseline()
+                                .gap(tokens::SPACE_2)
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(self.ring.kind.name()),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(mono.clone())
+                                        .text_size(px(12.0))
+                                        .text_color(value_color)
+                                        .child(self.ring.detail_headline()),
+                                ),
+                        )
+                        .child(rows)
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(muted)
+                                .child(self.ring.note.clone()),
+                        ),
+                ),
+            )
+    }
+}
+
+/// The key below the dial: a lit dot, a soft dot, and an empty dot.
+#[derive(IntoElement, Debug, Default)]
+pub struct DialKey;
+
+impl RenderOnce for DialKey {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let dark: bool = cx.theme().is_dark();
+        let colors: DialColors = DialColors::for_dark(dark);
+        let mut row = h_flex()
+            .id("dial-key")
+            .test_support()
+            .aria_label("Key: Used, Reclaimable, Empty")
+            .gap(tokens::SPACE_3)
+            .items_center()
+            .text_size(px(11.0))
+            .text_color(colors.muted);
+        let marks: [(&str, Hsla); 3] = [
+            ("Used", lit_color(colors.disk)),
+            ("Reclaimable", colors.disk.opacity(0.28)),
+            ("Empty", colors.empty),
+        ];
+        for (text, color) in marks {
+            row = row.child(
+                h_flex()
+                    .gap(tokens::SPACE_1)
+                    .items_center()
+                    .child(
+                        div()
+                            .size(px(DOT_PX))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(color),
+                    )
+                    .child(text),
+            );
+        }
+        row
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,11 +1559,11 @@ mod tests {
         };
         assert_eq!(lit, 48);
         assert!(soft > 0 && lit + soft <= 96, "{soft}");
+        assert!(model.rings[0].detail.is_none(), "the soft part is a row");
         assert!(
             model.rings[0]
-                .detail
-                .as_deref()
-                .is_some_and(|d| d.contains("Soft part"))
+                .rows
+                .contains(&("Reclaimable", "56.0 GB".to_owned()))
         );
         let kinds = dot_kinds(&model.rings[0], None);
         assert_eq!(kinds[lit - 1], Dot::Head);
@@ -1317,5 +1772,131 @@ mod tests {
         assert!(x.abs() < 1e-3 && (y + 90.0).abs() < 1e-3);
         let (x, _) = dot_center(24, 96, 90.0);
         assert!((x - 90.0).abs() < 1e-3, "a quarter turn is at the right");
+    }
+
+    #[test]
+    fn the_detail_rows_follow_the_ring_and_never_show_zero_for_unknown() {
+        let model = dial_model(&host());
+        let labels = |ring: &Ring| ring.rows.iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(
+            labels(&model.rings[0]),
+            ["Used", "Available", "Free", "Reclaimable", "Total"]
+        );
+        assert_eq!(labels(&model.rings[1]), ["Used", "Total"]);
+        assert_eq!(labels(&model.rings[2]), ["State", "Source"]);
+        assert_eq!(model.rings[2].rows[1].1, "test");
+        let mut snapshot = host();
+        snapshot.disk_free = Measured::Unavailable("x".into());
+        snapshot.swap_used = Measured::Unavailable("x".into());
+        snapshot.pressure = Measured::Unavailable("x".into());
+        let model = dial_model(&snapshot);
+        assert_eq!(model.rings[0].rows[2].1, "\u{2014}");
+        assert_eq!(model.rings[0].rows[3].1, "\u{2014}");
+        assert_eq!(model.rings[1].rows[0].1, "\u{2014}");
+        assert_eq!(model.rings[2].rows[0].1, "\u{2014}");
+        for ring in &model.rings {
+            assert!(
+                !ring.detail_label().contains("0 B"),
+                "{}",
+                ring.detail_label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_swap_without_space_has_no_row_and_the_note_says_why() {
+        let mut snapshot = host();
+        snapshot.swap_used = Measured::Value(0);
+        snapshot.swap_total = Measured::Value(0);
+        let model = dial_model(&snapshot);
+        assert_eq!(model.rings[1].rows, Vec::new());
+        assert!(model.rings[1].note.contains("no swap space"));
+    }
+
+    #[test]
+    fn the_sentences_name_what_each_ring_shows() {
+        let model = dial_model(&host());
+        assert_eq!(
+            model.rings[0].note,
+            "The share of the startup volume that is in use."
+        );
+        assert_eq!(model.rings[1].note, "The swap space that the system uses.");
+        assert_eq!(
+            model.rings[2].note,
+            "The memory pressure state that the system reports."
+        );
+    }
+
+    #[test]
+    fn a_name_hides_when_a_lit_dot_reaches_it() {
+        let model = dial_model(&host());
+        assert!(!(0..3).any(|i| name_hidden(&model, i)), "half-full rings");
+        let mut snapshot = host();
+        snapshot.disk_available = Measured::Value(512 * GB / 50);
+        snapshot.disk_free = Measured::Value(0);
+        let model = dial_model(&snapshot);
+        assert!(name_hidden(&model, 0), "a ring at 98% reaches its name");
+        let (left, _, right, _) = name_box(2);
+        assert!(left < right && right < 0.0, "the name is left of the line");
+    }
+
+    #[test]
+    fn the_scale_labels_sit_at_the_quarter_turns() {
+        let (x, y) = dot_center(12, TICK_DOTS, LABEL_RADIUS);
+        assert!((x - LABEL_RADIUS).abs() < 1e-3 && y.abs() < 1e-3);
+        assert_eq!(SCALE_LABELS, ["0", "25", "50", "75"]);
+    }
+
+    #[test]
+    fn a_volume_of_no_capacity_has_only_dashes() {
+        let mut snapshot = host();
+        snapshot.disk_total = Measured::Value(0);
+        snapshot.disk_available = Measured::Value(0);
+        let model = dial_model(&snapshot);
+        assert_eq!(model.rings[0].state, RingState::Unavailable);
+        assert_eq!(model.rings[0].rows.len(), 5);
+        assert!(model.rings[0].rows.iter().all(|(_, v)| v == "\u{2014}"));
+        assert!(!model.rings[0].detail_label().contains("0 B"));
+    }
+
+    #[test]
+    fn a_swap_without_space_has_no_share_and_the_headline_is_the_center() {
+        let mut snapshot = host();
+        snapshot.swap_used = Measured::Value(0);
+        snapshot.swap_total = Measured::Value(0);
+        let model = dial_model(&snapshot);
+        assert_eq!(model.rings[1].share_ppm, None);
+        assert_eq!(model.rings[1].detail_headline(), "None");
+        assert_eq!(model.picked, 0, "the pick is the disk ring");
+    }
+
+    #[test]
+    fn a_share_text_is_zero_only_for_zero_and_full_only_for_full() {
+        assert_eq!(share_percent_text(share_ppm(0, 100)), "0%");
+        assert_eq!(share_percent_text(share_ppm(1, 1_000_000_000)), "<1%");
+        assert_eq!(share_percent_text(share_ppm(49, 100)), "49%");
+        assert_eq!(
+            share_percent_text(share_ppm(999_999_999, 1_000_000_000)),
+            "99%"
+        );
+        assert_eq!(share_percent_text(share_ppm(100, 100)), "100%");
+        let mut snapshot = host();
+        snapshot.disk_available = Measured::Value(512 * GB - 1);
+        assert_eq!(dial_model(&snapshot).rings[0].detail_headline(), "<1% used");
+    }
+
+    #[test]
+    fn the_hidden_names_come_from_the_model_that_is_given() {
+        let mut snapshot = host();
+        snapshot.disk_available = Measured::Value(512 * GB / 50);
+        snapshot.disk_free = Measured::Value(0);
+        let measured = dial_model(&snapshot);
+        let shown = with_lit_counts(&measured, [Some(10), Some(5), None]);
+        assert_ne!(names_hidden(&measured), names_hidden(&shown));
+        let flags = names_hidden(&measured);
+        assert_eq!(
+            HeadroomDial::new(shown).hidden_names(flags).hidden,
+            Some(flags)
+        );
     }
 }

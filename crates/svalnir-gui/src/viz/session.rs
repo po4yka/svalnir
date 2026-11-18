@@ -1,9 +1,9 @@
-//! The session chart: a value curve, event flags, a live head, a sample
+//! The session chart: a value curve, an event rail, a live head, a sample
 //! matrix, and a change strip on one time axis (`DESIGN.md` section 5).
 //!
 //! `session_model` is pure: it turns the readings of this window into
-//! columns and events. `SessionChart` paints the dots from one canvas and
-//! places the flags as small elements over it.
+//! columns and events, and places the labels. `SessionChart` paints the dots
+//! from one canvas and places the texts as small elements over it.
 
 use crate::{
     data::model::{HostSample, Measured, OperationRow, PressureLevel},
@@ -14,7 +14,7 @@ use crate::{
     ui::data_state::{UNAVAILABLE_TEXT, format_bytes},
     viz::{
         dial::DialColors,
-        led::{LedStyle, lit_color},
+        led::lit_color,
         tick_track::{TickState, state_of, track_label},
     },
 };
@@ -25,6 +25,7 @@ use gpui_kit::{
     component::{ActiveTheme as _, h_flex, v_flex},
     div, fill, hsla, point, px, quad, size,
 };
+use std::time::SystemTime;
 
 /// The rows of the curve part.
 pub const CURVE_ROWS: usize = 10;
@@ -44,15 +45,19 @@ const SWAP_ROW: usize = DISK_ROW + MATRIX_DOTS + 1;
 const PRESSURE_ROW: usize = SWAP_ROW + MATRIX_DOTS + 1;
 /// The rows of the whole lattice.
 pub const TOTAL_ROWS: usize = PRESSURE_ROW + MATRIX_DOTS;
-/// The height of a flag, in pixels.
-const FLAG_HEIGHT: f32 = 16.0;
-/// The distance between two flag lanes, in pixels.
-const LANE_STEP: f32 = 18.0;
-/// The estimated width of one character of a flag, in pixels.
-const FLAG_CHAR_PX: f32 = 6.6;
-/// The padding of a flag at both sides, in pixels.
-const FLAG_PAD: f32 = 12.0;
-/// The longest flag text, in characters.
+/// The width of the left gutter with the names of the rows, in pixels.
+pub const LEFT_GUTTER: f32 = 56.0;
+/// The width of the right gutter with the newest values, in pixels.
+pub const RIGHT_GUTTER: f32 = 64.0;
+/// The height of one line of a 10 px text, in pixels.
+const LABEL_LINE: f32 = 12.0;
+/// The height of the zone of the two-line event labels, in pixels.
+const LABEL_BAND: f32 = 28.0;
+/// The distance from the top of the rail zone to the lattice, in pixels.
+const RAIL_TO_LATTICE: f32 = 10.0;
+/// The height of the time axis, in pixels.
+const AXIS_BAND: f32 = 16.0;
+/// The longest text of an operation event, in characters.
 const FLAG_TEXT_MAX: usize = 16;
 /// The seconds that the ring of the live head takes to expand and fade.
 pub const LIVE_PERIOD_SECS: f32 = 1.6;
@@ -60,6 +65,8 @@ pub const LIVE_PERIOD_SECS: f32 = 1.6;
 /// One column: one reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
+    /// When the reading was taken.
+    pub at: SystemTime,
     /// The row of the curve dot from the bottom, `0..CURVE_ROWS`; `None`
     /// for an unavailable reading.
     pub curve: Option<usize>,
@@ -84,21 +91,38 @@ pub enum EventKind {
     Operation,
 }
 
+/// The box of the label of an event, in the lattice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabelBox {
+    /// The left edge in pixels.
+    pub left: f32,
+    /// The width in pixels.
+    pub width: f32,
+}
+
 /// An event on the time axis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     /// The column of the event.
     pub column: usize,
     /// What the event is.
     pub kind: EventKind,
-    /// The text of the flag.
+    /// The name: the new state, or the trigger of the operation.
     pub text: String,
-    /// Whether the flag shows its text; an older event keeps its line only.
+    /// The time of the reading, "HH:MM" in UTC.
+    pub time: String,
+    /// The fact of the chip: "after 40 normal readings", or the state text
+    /// of the operation.
+    pub fact: String,
+    /// Whether the event shows its label; an older event keeps its marker and
+    /// its guide only.
     pub labeled: bool,
+    /// The box of the label, when it shows.
+    pub label: Option<LabelBox>,
 }
 
 /// The model of the chart.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionModel {
     /// The columns that the chart has; the newest column is at the right.
     pub slots: usize,
@@ -108,6 +132,13 @@ pub struct SessionModel {
     pub range: Option<(u64, u64)>,
     /// The events, by column.
     pub events: Vec<Event>,
+    /// The lowest available space on screen; `None` with fewer than two
+    /// measured readings or a range of one value.
+    pub min: Option<MinMark>,
+    /// The newest reading; `None` without a reading.
+    pub newest: Option<Newest>,
+    /// The time labels of the axis.
+    pub axis: Vec<AxisLabel>,
 }
 
 /// The range of the measured values of `values`.
@@ -175,6 +206,7 @@ fn grew(now: &Measured<u64>, before: &Measured<u64>) -> bool {
 
 /// The model of the chart for the newest `slots` readings of `samples`.
 #[must_use]
+#[expect(clippy::too_many_lines, reason = "one pass over the readings")]
 pub fn session_model(
     samples: &[HostSample],
     operation: Option<&OperationRow>,
@@ -227,8 +259,10 @@ pub fn session_model(
             },
             state: state_of(&sample.pressure),
             change,
+            at: sample.at,
         });
     }
+    let offset: usize = slots.saturating_sub(visible.len());
     let mut events: Vec<Event> = Vec::new();
     // The last measured state before the window, across unavailable readings.
     let mut last: Option<PressureLevel> = samples
@@ -236,12 +270,15 @@ pub fn session_model(
         .and_then(|older| older.iter().rev().find_map(|s| s.pressure.value().copied()));
     for (column, sample) in visible.iter().enumerate() {
         if let Measured::Value(level) = &sample.pressure {
-            if last.is_some_and(|old| old != *level) {
+            if let Some(old) = last.filter(|old| old != level) {
                 events.push(Event {
                     column,
                     kind: EventKind::Pressure(*level),
                     text: level.label().to_owned(),
+                    time: clock_text(sample.at),
+                    fact: after_text(readings_before(samples, start + column, old), old),
                     labeled: false,
+                    label: None,
                 });
             }
             last = Some(*level);
@@ -257,19 +294,51 @@ pub fn session_model(
             column,
             kind: EventKind::Operation,
             text: short_text(operation),
+            time: clock_text(visible[column].at),
+            fact: operation.state_text.clone(),
             labeled: false,
+            label: None,
         });
     }
     events.sort_by_key(|event| event.column);
-    let count: usize = events.len();
-    for event in events.iter_mut().skip(count.saturating_sub(MAX_FLAGS)) {
-        event.labeled = true;
-    }
+    place_labels(&mut events, offset, slots);
+    let measured: usize = visible
+        .iter()
+        .filter(|s| s.disk_available.value().is_some())
+        .count();
+    let min: Option<MinMark> = available
+        .filter(|(low, high)| measured >= 2 && low < high)
+        .map(|range| MinMark {
+            row: CURVE_ROWS - 1 - step_in(range.0, range, CURVE_ROWS - 1),
+            value: range.0,
+        });
+    let newest: Option<Newest> =
+        visible
+            .last()
+            .zip(columns.last())
+            .map(|(sample, column)| Newest {
+                available: sample.disk_available.value().copied(),
+                disk_used: sample.disk_used.value().copied(),
+                swap_used: sample.swap_used.value().copied(),
+                state: column.state,
+            });
+    let axis: Vec<AxisLabel> = (0..columns.len())
+        .rev()
+        .step_by(AXIS_STEP)
+        .filter(|index| slot_center(offset + index) >= AXIS_HALF)
+        .map(|index| AxisLabel {
+            slot: offset + index,
+            text: clock_text(columns[index].at),
+        })
+        .collect();
     SessionModel {
         slots,
         columns,
         range: available,
         events,
+        min,
+        newest,
+        axis,
     }
 }
 
@@ -305,9 +374,6 @@ pub fn range_caption(range: Option<(u64, u64)>) -> String {
 
 /// The caption of the scale.
 pub const SCALE_CAPTION: &str = "1 column = 1 reading";
-/// The caption that names the rows of the sample matrix.
-pub const ROWS_CAPTION: &str =
-    "Rows from the top: change count, disk used, swap used, memory pressure";
 
 impl SessionModel {
     /// The pressure states of the columns, for the pressure row.
@@ -321,8 +387,11 @@ impl SessionModel {
     #[must_use]
     pub fn label(&self) -> String {
         let count = |wanted: TickState| self.columns.iter().filter(|c| c.state == wanted).count();
+        let min: String = self.min.map_or_else(String::new, |min| {
+            format!(", min {}", bytes_text(min.value))
+        });
         format!(
-            "Session chart: {}, {}, pressure {} normal, {} warning, {} critical, {}",
+            "Session chart: {}, {}, pressure {} normal, {} warning, {} critical{min}, {}",
             readings_text(self.columns.len()),
             range_caption(self.range),
             count(TickState::Normal),
@@ -339,72 +408,367 @@ impl SessionModel {
     }
 }
 
-/// A flag with its place.
+/// The width of one character of a mono text of 10 px, in pixels.
+const MONO_10: f32 = 6.0;
+/// The half width of an axis label ("12:04"), in pixels.
+const AXIS_HALF: f32 = 15.0;
+/// The columns between two axis labels: 8 columns of 6 px are 48 px.
+pub const AXIS_STEP: usize = 8;
+/// The gap that two event labels keep, in pixels.
+const LABEL_GAP: f32 = 4.0;
+/// The padding of the chip at both sides, in pixels.
+const CHIP_PAD: f32 = 8.0;
+
+/// A count as pixels.
+#[expect(clippy::cast_precision_loss, reason = "a count is far below 2^24")]
+const fn count_px(count: usize) -> f32 {
+    count as f32
+}
+
+/// The width of a lattice of `slots` columns, in pixels.
+#[must_use]
+pub const fn lattice_width(slots: usize) -> f32 {
+    count_px(slots) * PITCH - (PITCH - DOT)
+}
+
+/// The x of the center of column `slot` in the lattice, in pixels.
+#[must_use]
+pub const fn slot_center(slot: usize) -> f32 {
+    count_px(slot) * PITCH + DOT / 2.0
+}
+
+/// The span of `width` centered at `center`, moved to lie inside `0..total`.
+#[must_use]
+pub fn clamp_span(center: f32, width: f32, total: f32) -> f32 {
+    (center - width / 2.0).min(total - width).max(0.0)
+}
+
+/// The text of a pressure state of a column, or an em dash.
+#[must_use]
+pub fn state_word(state: TickState) -> &'static str {
+    match state {
+        TickState::Normal => "Normal",
+        TickState::Warning => "Warning",
+        TickState::Critical => "Critical",
+        TickState::Empty => UNAVAILABLE_TEXT,
+    }
+}
+
+/// The time of day of `time` as "HH:MM" in UTC. The crate has no local-time
+/// helper, so the chip adds "UTC".
+#[must_use]
+pub fn clock_text(time: SystemTime) -> String {
+    let Ok(since) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+        return UNAVAILABLE_TEXT.to_owned();
+    };
+    let seconds: u64 = since.as_secs();
+    format!("{:02}:{:02}", seconds / 3600 % 24, seconds / 60 % 60)
+}
+
+/// The count of measured readings of `level` right before `index`, up to the
+/// first measured reading of another state. An unavailable reading is skipped.
+fn readings_before(samples: &[HostSample], index: usize, level: PressureLevel) -> usize {
+    let mut count: usize = 0;
+    for sample in samples[..index.min(samples.len())].iter().rev() {
+        match &sample.pressure {
+            Measured::Value(state) if *state == level => count += 1,
+            Measured::Value(_) => break,
+            Measured::Unavailable(_) => {}
+        }
+    }
+    count
+}
+
+/// The fact of a change: "after 40 normal readings".
+fn after_text(count: usize, level: PressureLevel) -> String {
+    format!(
+        "after {count} {} {}",
+        level.label().to_lowercase(),
+        if count == 1 { "reading" } else { "readings" }
+    )
+}
+
+impl EventKind {
+    /// The name of the kind, as the second line of a label.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pressure(_) => "pressure",
+            Self::Operation => "operation",
+        }
+    }
+}
+
+impl Event {
+    /// The width of the label of this event: its longer line.
+    #[must_use]
+    pub fn label_width(&self) -> f32 {
+        count_px(
+            self.text
+                .chars()
+                .count()
+                .max(self.kind.name().chars().count()),
+        ) * MONO_10
+    }
+}
+
+/// Gives the label to the newest `MAX_FLAGS` events whose label boxes do not
+/// overlap. It walks from the newest event to the oldest and skips an event
+/// that overlaps a label that is placed already. `events` are sorted by column.
+fn place_labels(events: &mut [Event], offset: usize, slots: usize) {
+    let lattice: f32 = lattice_width(slots);
+    let mut placed: Vec<(f32, f32)> = Vec::new();
+    for event in events.iter_mut().rev() {
+        if placed.len() >= MAX_FLAGS {
+            break;
+        }
+        let width: f32 = event.label_width();
+        if width > lattice {
+            continue;
+        }
+        let left: f32 = clamp_span(slot_center(offset + event.column), width, lattice);
+        let overlaps: bool = placed.iter().any(|(other, other_width)| {
+            left < other + other_width + LABEL_GAP && *other < left + width + LABEL_GAP
+        });
+        if !overlaps {
+            placed.push((left, width));
+            event.label = Some(LabelBox { left, width });
+            event.labeled = true;
+        }
+    }
+}
+
+/// The pixel sizes of the chart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layout {
+    /// The height of the label zone above the rail; 0 without a label.
+    pub label_band: f32,
+    /// The y of the top of the lattice.
+    pub band: f32,
+    /// The width of the lattice.
+    pub lattice: f32,
+    /// The width of the chart with both gutters.
+    pub width: f32,
+    /// The y of the bottom of the matrix.
+    pub matrix_bottom: f32,
+    /// The height of the chart with the time axis.
+    pub height: f32,
+}
+
+/// The chip of the newest event.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Flag {
+pub struct Chip {
     /// The index of the event.
     pub event: usize,
-    /// The lane from the top.
-    pub lane: usize,
-    /// The left edge in pixels.
+    /// The left edge in the lattice, in pixels.
     pub left: f32,
     /// The width in pixels.
     pub width: f32,
+    /// The name of the event.
+    pub name: String,
+    /// The time of the reading, in UTC.
+    pub time: String,
+    /// The fact.
+    pub fact: String,
 }
 
-/// The x of the line of column `slot`, in pixels.
-fn line_x(slot: usize) -> f32 {
-    #[expect(clippy::cast_precision_loss, reason = "a slot count is far below 2^24")]
-    let x: f32 = slot as f32 * 6.0 + 1.75;
-    x
+/// A time label of the axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxisLabel {
+    /// The slot of the reading.
+    pub slot: usize,
+    /// The time of the reading, "HH:MM".
+    pub text: String,
 }
 
-/// The places of the flags with text. A flag starts at its line and runs to
-/// the right; at the right edge it runs to the left of its line. A flag that
-/// would touch a flag in the lane above it goes to the next lane.
-#[must_use]
-pub fn place_flags(model: &SessionModel, chart_width: f32) -> Vec<Flag> {
-    let mut flags: Vec<Flag> = Vec::new();
-    let mut lane_ends: Vec<f32> = Vec::new();
-    for (index, event) in model.events.iter().enumerate().filter(|(_, e)| e.labeled) {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a flag text is far shorter than 2^24"
-        )]
-        let width: f32 = event.text.chars().count() as f32 * FLAG_CHAR_PX + FLAG_PAD;
-        let x: f32 = line_x(model.offset() + event.column);
-        let left: f32 = if x + width > chart_width {
-            (x - width + 1.0).max(0.0)
-        } else {
-            x
-        };
-        let lane: usize = lane_ends
-            .iter()
-            .position(|end| left >= *end + 4.0)
-            .unwrap_or(lane_ends.len());
-        if lane == lane_ends.len() {
-            lane_ends.push(left + width);
-        } else {
-            lane_ends[lane] = left + width;
+/// The lowest available value on screen and its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinMark {
+    /// The row of the curve from the top.
+    pub row: usize,
+    /// The value in bytes.
+    pub value: u64,
+}
+
+/// The newest reading of each series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Newest {
+    /// The available space.
+    pub available: Option<u64>,
+    /// The used space of the volume.
+    pub disk_used: Option<u64>,
+    /// The used swap.
+    pub swap_used: Option<u64>,
+    /// The pressure state.
+    pub state: TickState,
+}
+
+/// The texts of the footer tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTags {
+    /// "readings N".
+    pub readings: String,
+    /// "range A-B GB", or an em dash.
+    pub range: String,
+    /// "events N".
+    pub events: String,
+    /// "now STATE".
+    pub state: String,
+}
+
+/// "260.0-310.2 GB", or the two values with their units.
+fn range_tag(range: Option<(u64, u64)>) -> String {
+    match range {
+        None => UNAVAILABLE_TEXT.to_owned(),
+        Some((low, high)) if low == high => bytes_text(low),
+        Some((low, high)) => {
+            let (a, a_unit) = format_bytes(low);
+            let (b, b_unit) = format_bytes(high);
+            if a_unit == b_unit {
+                format!("{a}\u{2013}{b} {a_unit}")
+            } else {
+                format!("{a} {a_unit}\u{2013}{b} {b_unit}")
+            }
         }
-        flags.push(Flag {
+    }
+}
+
+impl Chip {
+    /// The text after the name: the time and the fact, each with a dot
+    /// before it; empty when both are dropped.
+    #[must_use]
+    pub fn suffix(&self) -> String {
+        let mut text: String = String::new();
+        for part in [&self.time, &self.fact] {
+            if !part.is_empty() {
+                text.push_str(" \u{b7} ");
+                text.push_str(part);
+            }
+        }
+        text
+    }
+
+    /// The accessible label: the name, the time, and the fact that show.
+    #[must_use]
+    pub fn label_text(&self) -> String {
+        let mut parts: Vec<&str> = vec![&self.name];
+        parts.extend(
+            [&self.time, &self.fact]
+                .map(String::as_str)
+                .into_iter()
+                .filter(|p| !p.is_empty()),
+        );
+        parts.join(", ")
+    }
+}
+
+impl SessionModel {
+    /// The sizes of the chart.
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        let label_band: f32 = if self.events.iter().any(|e| e.labeled) {
+            LABEL_BAND
+        } else {
+            0.0
+        };
+        let band: f32 = label_band + RAIL_TO_LATTICE;
+        let lattice: f32 = lattice_width(self.slots);
+        let matrix_bottom: f32 = band + lattice_width(TOTAL_ROWS);
+        Layout {
+            label_band,
+            band,
+            lattice,
+            width: LEFT_GUTTER + lattice + RIGHT_GUTTER,
+            matrix_bottom,
+            height: matrix_bottom + AXIS_BAND,
+        }
+    }
+
+    /// The chip of the newest event, clamped inside the lattice.
+    #[must_use]
+    pub fn chip(&self) -> Option<Chip> {
+        let index: usize = self.events.len().checked_sub(1)?;
+        let event: &Event = &self.events[index];
+        let time: String = if event.time == UNAVAILABLE_TEXT {
+            event.time.clone()
+        } else {
+            format!("{} UTC", event.time)
+        };
+        // The chip ends inside the lattice and the right gutter. A chip that
+        // is too wide drops the fact first, then the time.
+        let room: f32 = lattice_width(self.slots) + RIGHT_GUTTER;
+        let name_chars: usize = event.text.chars().count();
+        let time_chars: usize = time.chars().count();
+        let fact_chars: usize = event.fact.chars().count();
+        let candidates: [(usize, bool, bool); 3] = [
+            (name_chars + 3 + time_chars + 3 + fact_chars, true, true),
+            (name_chars + 3 + time_chars, true, false),
+            (name_chars, false, false),
+        ];
+        let (chars, with_time, with_fact) = candidates
+            .into_iter()
+            .find(|(chars, _, _)| count_px(*chars) * MONO_10 + 2.0 * CHIP_PAD <= room)?;
+        let width: f32 = count_px(chars) * MONO_10 + 2.0 * CHIP_PAD;
+        let left: f32 = clamp_span(slot_center(self.offset() + event.column), width, room);
+        Some(Chip {
             event: index,
-            lane,
             left,
             width,
-        });
+            name: event.text.clone(),
+            time: if with_time { time } else { String::new() },
+            fact: if with_fact {
+                event.fact.clone()
+            } else {
+                String::new()
+            },
+        })
     }
-    flags
-}
 
-/// The height of the flag band for `flags`, in pixels.
-#[must_use]
-pub fn flag_band(flags: &[Flag]) -> f32 {
-    flags.iter().map(|f| f.lane).max().map_or(0.0, |lane| {
-        #[expect(clippy::cast_precision_loss, reason = "a lane count is at most 4")]
-        let lanes: f32 = (lane + 1) as f32;
-        lanes * LANE_STEP + 2.0
-    })
+    /// The lowest value on screen for the label of the right gutter. The
+    /// label gives way to the newest value when the live head is at its row;
+    /// an unavailable newest reading has no head, so it keeps the label.
+    #[must_use]
+    pub fn min_label(&self) -> Option<MinMark> {
+        let head: Option<usize> = self
+            .columns
+            .last()
+            .and_then(|c| c.curve)
+            .map(|value| CURVE_ROWS - 1 - value);
+        self.min.filter(|min| head != Some(min.row))
+    }
+
+    /// The newest values of the right gutter: the available space, the used
+    /// space, the used swap, and the pressure state. An unavailable value is
+    /// an em dash.
+    #[must_use]
+    pub fn newest_texts(&self) -> [String; 4] {
+        let text =
+            |value: Option<u64>| value.map_or_else(|| UNAVAILABLE_TEXT.to_owned(), bytes_text);
+        match self.newest {
+            Some(newest) => [
+                text(newest.available),
+                text(newest.disk_used),
+                text(newest.swap_used),
+                state_word(newest.state).to_owned(),
+            ],
+            None => std::array::from_fn(|_| UNAVAILABLE_TEXT.to_owned()),
+        }
+    }
+
+    /// The texts of the footer tags.
+    #[must_use]
+    pub fn tags(&self) -> SessionTags {
+        SessionTags {
+            readings: format!("readings {}", self.columns.len()),
+            range: format!("range {}", range_tag(self.range)),
+            events: format!("events {}", self.events.len()),
+            state: format!(
+                "now {}",
+                self.newest
+                    .map_or(UNAVAILABLE_TEXT, |newest| state_word(newest.state))
+            ),
+        }
+    }
 }
 
 /// The progress `0.0..=1.0` of the ring of the live head at `phase` seconds.
@@ -427,8 +791,7 @@ fn event_color(kind: EventKind, colors: &DialColors, brand: Hsla) -> Hsla {
 #[derive(Debug, Clone)]
 struct SessionPaint {
     model: SessionModel,
-    flags: Vec<Flag>,
-    band: f32,
+    layout: Layout,
     colors: DialColors,
     brand: Hsla,
     muted_ink: Hsla,
@@ -451,21 +814,35 @@ fn dot_at(origin: Point<Pixels>, x: f32, y: f32, side: f32) -> Bounds<Pixels> {
     )
 }
 
+/// A rectangle at `x`, `y` in the chart.
+fn rect_at(origin: Point<Pixels>, x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+    Bounds::new(
+        point(origin.x + px(x), origin.y + px(y)),
+        size(px(width), px(height)),
+    )
+}
+
+/// A diamond of 6 px as five stepped rows.
+fn paint_diamond(window: &mut Window, origin: Point<Pixels>, cx: f32, cy: f32, color: Hsla) {
+    let step: f32 = 1.2;
+    let widths: [f32; 5] = [1.2, 3.6, 6.0, 3.6, 1.2];
+    for (index, width) in widths.iter().enumerate() {
+        let top: f32 = cy - 3.0 + count_px(index) * step;
+        window.paint_quad(fill(
+            rect_at(origin, cx - width / 2.0, top, *width, step),
+            color,
+        ));
+    }
+}
+
 #[expect(clippy::too_many_lines, reason = "one pass in paint order")]
 fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Window) {
     let origin: Point<Pixels> = bounds.origin;
     let model: &SessionModel = &paint.model;
+    let layout: Layout = paint.layout;
     let rest: f32 = if paint.muted { 0.6 } else { 1.0 };
-    let row_y = |row: usize| -> f32 {
-        #[expect(clippy::cast_precision_loss, reason = "a row index is below 32")]
-        let y: f32 = paint.band + row as f32 * PITCH;
-        y
-    };
-    let slot_x = |slot: usize| -> f32 {
-        #[expect(clippy::cast_precision_loss, reason = "a slot index is below 2^24")]
-        let x: f32 = slot as f32 * PITCH;
-        x
-    };
+    let row_y = |row: usize| -> f32 { layout.band + count_px(row) * PITCH };
+    let slot_x = |slot: usize| -> f32 { LEFT_GUTTER + count_px(slot) * PITCH };
     let round: Corners<Pixels> = Corners::all(px(DOT / 2.0));
     let put = |window: &mut Window, slot: usize, row: usize, color: Hsla| {
         window.paint_quad(
@@ -557,26 +934,49 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
             }
         }
     }
-    // The event lines and the live head.
-    for (index, event) in model.events.iter().enumerate() {
-        let x: f32 = line_x(model.offset() + event.column);
-        let top: f32 = paint
-            .flags
-            .iter()
-            .find(|f| f.event == index)
-            .map_or(paint.band, |f| {
-                #[expect(clippy::cast_precision_loss, reason = "a lane count is at most 4")]
-                let lane: f32 = f.lane as f32;
-                lane * LANE_STEP + FLAG_HEIGHT
-            });
-        let height: f32 = row_y(TOTAL_ROWS - 1) + DOT - top;
-        window.paint_quad(fill(
-            Bounds::new(
-                point(origin.x + px(x), origin.y + px(top)),
-                size(px(1.0), px(height)),
+    // The dashed line of the lowest value on screen.
+    if let Some(min) = model.min {
+        let y: f32 = row_y(min.row) + DOT / 2.0;
+        let mut x: f32 = 0.0;
+        while x < layout.lattice {
+            let length: f32 = (layout.lattice - x).min(4.0);
+            window.paint_quad(fill(
+                rect_at(origin, LEFT_GUTTER + x, y, length, 1.0),
+                paint.muted_ink.opacity(0.5 * rest),
+            ));
+            x += 7.0;
+        }
+    }
+    // The event rail, the guides, and the markers.
+    let rail_y: f32 = layout.label_band + 3.0;
+    window.paint_quad(fill(
+        rect_at(origin, LEFT_GUTTER, rail_y, layout.lattice, 1.0),
+        paint.colors.border.opacity(rest),
+    ));
+    for event in &model.events {
+        let x: f32 = slot_x(model.offset() + event.column) + DOT / 2.0 - 0.5;
+        let tone: Hsla = event_color(event.kind, &paint.colors, paint.brand);
+        let mut y: f32 = rail_y + 4.0;
+        while y < layout.matrix_bottom {
+            let length: f32 = (layout.matrix_bottom - y).min(2.0);
+            window.paint_quad(fill(
+                rect_at(origin, x, y, 1.0, length),
+                tone.opacity(0.6 * rest),
+            ));
+            y += 4.0;
+        }
+        match event.kind {
+            EventKind::Pressure(_) => window.paint_quad(
+                fill(
+                    rect_at(origin, x + 0.5 - 3.0, rail_y + 0.5 - 3.0, 6.0, 6.0),
+                    tone.opacity(rest),
+                )
+                .corner_radii(Corners::all(px(3.0))),
             ),
-            event_color(event.kind, &paint.colors, paint.brand).opacity(0.6 * rest),
-        ));
+            EventKind::Operation => {
+                paint_diamond(window, origin, x + 0.5, rail_y + 0.5, tone.opacity(rest));
+            }
+        }
     }
     let head: Option<(usize, usize)> = head_slot.and_then(|slot| {
         model
@@ -616,7 +1016,7 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
     }
 }
 
-/// The chart as an element with its captions.
+/// The chart as an element with its key.
 #[derive(IntoElement, Debug)]
 pub struct SessionChart {
     model: SessionModel,
@@ -651,76 +1051,233 @@ impl SessionChart {
     }
 }
 
+/// How a small text sits in its box.
+#[derive(Clone, Copy)]
+enum Align {
+    Start,
+    Center,
+    End,
+}
+
+/// A mono text of 10 px in a box of `width` at `left`, `top`.
+fn small_text(
+    id: SharedString,
+    mono: &SharedString,
+    spot: (f32, f32, f32),
+    align: Align,
+    color: Hsla,
+    text: impl Into<SharedString>,
+) -> gpui_kit::AnyElement {
+    let (left, top, width) = spot;
+    let text: SharedString = text.into();
+    let mut line = div()
+        .id(id)
+        .test_support()
+        .aria_label(text.clone())
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(width))
+        .h(px(LABEL_LINE))
+        .flex()
+        .font_family(mono.clone())
+        .text_size(px(10.0))
+        .line_height(px(LABEL_LINE))
+        .text_color(color)
+        .whitespace_nowrap();
+    line = match align {
+        Align::Start => line.justify_start(),
+        Align::Center => line.justify_center(),
+        Align::End => line.justify_end(),
+    };
+    line.child(text).into_any_element()
+}
+
 impl RenderOnce for SessionChart {
     #[expect(
         clippy::too_many_lines,
-        reason = "one build of the chart and its flags"
+        reason = "one build of the chart and its texts"
     )]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
-        let style: LedStyle = LedStyle::for_dark(dark);
         let mono: SharedString = cx.theme().mono_font_family.clone();
         let muted_ink: Hsla = to_hsla(tokens.muted_foreground);
         let colors: DialColors = DialColors::for_dark(dark);
-        let slots: u16 = u16::try_from(self.model.slots).unwrap_or(u16::MAX);
-        let width: f32 = style.span(slots);
-        let flags: Vec<Flag> = place_flags(&self.model, width);
-        let band: f32 = flag_band(&flags);
-        let rows: u16 = u16::try_from(TOTAL_ROWS).unwrap_or(u16::MAX);
-        let height: f32 = band + style.span(rows);
+        let brand: Hsla = to_hsla(tokens.brand);
+        let layout: Layout = self.model.layout();
         let label: SharedString = self.model.label().into();
         let pressure_label: SharedString = track_label(&self.model.states()).into();
         let range: SharedString = range_caption(self.model.range).into();
-        #[expect(clippy::cast_precision_loss, reason = "a row index is below 32")]
-        let pressure_top: f32 = band + PRESSURE_ROW as f32 * PITCH;
+        let row_top = |row: usize| layout.band + count_px(row) * PITCH;
+        let center_of = |top_row: usize, dots: usize| row_top(top_row) + lattice_width(dots) / 2.0;
         let mut root = div()
             .id("session-chart")
             .role(Role::Image)
             .test_support()
             .aria_label(label)
             .relative()
-            .w(px(width))
-            .h(px(height))
+            .w(px(layout.width))
+            .h(px(layout.height))
             .flex_shrink_0();
-        let mut flag_elements: Vec<gpui_kit::AnyElement> = Vec::new();
-        for flag in &flags {
-            let event: &Event = &self.model.events[flag.event];
-            let tone: Hsla = event_color(event.kind, &colors, to_hsla(tokens.brand));
-            let text: SharedString = event.text.clone().into();
-            #[expect(clippy::cast_precision_loss, reason = "a lane count is at most 4")]
-            let top: f32 = flag.lane as f32 * LANE_STEP;
-            flag_elements.push(
+        let mut texts: Vec<gpui_kit::AnyElement> = Vec::new();
+        // The two-line labels above the rail.
+        for (index, event) in self.model.events.iter().enumerate() {
+            let Some(place) = event.label else { continue };
+            let tone: Hsla = event_color(event.kind, &colors, brand);
+            let left: f32 = LEFT_GUTTER + place.left;
+            texts.push(
                 div()
-                    .id(SharedString::from(format!("session-flag-{}", flag.event)))
+                    .id(SharedString::from(format!("session-event-{index}")))
                     .test_support()
-                    .aria_label(text.clone())
+                    .aria_label(SharedString::from(format!(
+                        "{}, {}",
+                        event.text,
+                        event.kind.name()
+                    )))
                     .absolute()
-                    .left(px(flag.left))
-                    .top(px(top))
-                    .h(px(FLAG_HEIGHT))
-                    .w(px(flag.width))
+                    .left(px(left))
+                    .top(px(layout.label_band - 2.0 * LABEL_LINE - 2.0))
+                    .w(px(place.width))
                     .flex()
+                    .flex_col()
                     .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(tone.opacity(0.15))
-                    .text_color(tone)
                     .font_family(mono.clone())
-                    .text_size(px(11.0))
+                    .text_size(px(10.0))
+                    .line_height(px(LABEL_LINE))
                     .whitespace_nowrap()
-                    .child(text)
+                    .child(div().text_color(tone).child(event.text.clone()))
+                    .child(div().text_color(muted_ink).child(event.kind.name()))
                     .into_any_element(),
             );
         }
+        // The chip of the newest event.
+        if let Some(chip) = self.model.chip() {
+            let tone: Hsla = event_color(self.model.events[chip.event].kind, &colors, brand);
+            texts.push(
+                div()
+                    .id("session-chip")
+                    .test_support()
+                    .aria_label(SharedString::from(chip.label_text()))
+                    .absolute()
+                    .left(px(LEFT_GUTTER + chip.left))
+                    .top(px(layout.label_band + 8.0))
+                    .w(px(chip.width))
+                    .px(tokens::SPACE_2)
+                    .py(tokens::SPACE_1)
+                    .rounded(px(6.0))
+                    .bg(to_hsla(tokens.surface_raised))
+                    .font_family(mono.clone())
+                    .text_size(px(10.0))
+                    .line_height(px(LABEL_LINE))
+                    .whitespace_nowrap()
+                    .flex()
+                    .child(div().text_color(tone).child(chip.name.clone()))
+                    .child(div().text_color(muted_ink).child(chip.suffix()))
+                    .into_any_element(),
+            );
+        }
+        // The names of the rows, centered on each row.
+        let name_width: f32 = LEFT_GUTTER - 6.0;
+        let names: [(&str, f32); 5] = [
+            ("avail.", center_of(0, CURVE_ROWS)),
+            ("changes", center_of(STRIP_ROW, STRIP_DOTS)),
+            ("disk", center_of(DISK_ROW, MATRIX_DOTS)),
+            ("swap", center_of(SWAP_ROW, MATRIX_DOTS)),
+            ("pressure", center_of(PRESSURE_ROW, MATRIX_DOTS)),
+        ];
+        for (name, center) in names {
+            texts.push(small_text(
+                SharedString::from(format!("session-row-{name}")),
+                &mono,
+                (0.0, center - LABEL_LINE / 2.0, name_width),
+                Align::End,
+                muted_ink,
+                name,
+            ));
+        }
+        // The newest values and the minimum, in the right gutter.
+        let value_left: f32 = LEFT_GUTTER + layout.lattice + 6.0;
+        let value_width: f32 = RIGHT_GUTTER - 6.0;
+        let [available, disk, swap, state] = self.model.newest_texts();
+        let head_row: usize = self
+            .model
+            .columns
+            .last()
+            .and_then(|c| c.curve)
+            .map_or(CURVE_ROWS - 1, |value| CURVE_ROWS - 1 - value);
+        let state_color: Hsla = match self.model.newest.map(|n| n.state) {
+            Some(TickState::Warning) => colors.warning,
+            Some(TickState::Critical) => colors.negative,
+            _ => muted_ink,
+        };
+        let ink: Hsla = to_hsla(tokens.foreground);
+        let values: [(&'static str, f32, String, Hsla); 4] = [
+            ("avail", row_top(head_row) + DOT / 2.0, available, ink),
+            ("disk", center_of(DISK_ROW, MATRIX_DOTS), disk, ink),
+            ("swap", center_of(SWAP_ROW, MATRIX_DOTS), swap, ink),
+            (
+                "pressure",
+                center_of(PRESSURE_ROW, MATRIX_DOTS),
+                state,
+                state_color,
+            ),
+        ];
+        for (name, center, text, color) in values {
+            texts.push(small_text(
+                SharedString::from(format!("session-newest-{name}")),
+                &mono,
+                (value_left, center - LABEL_LINE / 2.0, value_width),
+                Align::Start,
+                color,
+                text,
+            ));
+        }
+        if let Some(min) = self.model.min_label() {
+            texts.push(small_text(
+                SharedString::from("session-min"),
+                &mono,
+                (
+                    value_left,
+                    row_top(min.row) + DOT / 2.0 - LABEL_LINE / 2.0,
+                    value_width,
+                ),
+                Align::Start,
+                muted_ink,
+                format!("min {}", bytes_text(min.value)),
+            ));
+        }
+        // The time axis.
+        let axis_top: f32 = layout.matrix_bottom + 4.0;
+        texts.push(small_text(
+            SharedString::from("session-axis-zone"),
+            &mono,
+            (0.0, axis_top, name_width),
+            Align::End,
+            muted_ink,
+            "UTC",
+        ));
+        for axis in &self.model.axis {
+            texts.push(small_text(
+                SharedString::from(format!("session-axis-{}", axis.slot)),
+                &mono,
+                (
+                    LEFT_GUTTER + slot_center(axis.slot) - AXIS_HALF,
+                    axis_top,
+                    2.0 * AXIS_HALF,
+                ),
+                Align::Center,
+                muted_ink,
+                axis.text.clone(),
+            ));
+        }
         let paint: SessionPaint = SessionPaint {
             model: self.model,
-            flags,
-            band,
+            layout,
             colors,
-            brand: to_hsla(tokens.brand),
+            brand,
             muted_ink,
-            ink: to_hsla(tokens.foreground),
+            ink,
             glow: glow::enabled(cx),
             live: self.live,
             muted: self.muted,
@@ -731,8 +1288,8 @@ impl RenderOnce for SessionChart {
                     .absolute()
                     .top_0()
                     .left_0()
-                    .w(px(width))
-                    .h(px(height))
+                    .w(px(layout.width))
+                    .h(px(layout.height))
                     .child(
                         canvas(
                             |_, _, _| (),
@@ -743,7 +1300,7 @@ impl RenderOnce for SessionChart {
                         .size_full(),
                     ),
             )
-            .children(flag_elements)
+            .children(texts)
             .child(
                 div()
                     .id("pressure-track")
@@ -751,32 +1308,63 @@ impl RenderOnce for SessionChart {
                     .test_support()
                     .aria_label(pressure_label)
                     .absolute()
-                    .left_0()
-                    .top(px(pressure_top))
-                    .w(px(width))
-                    .h(px(style.span(u16::try_from(MATRIX_DOTS).unwrap_or(4)))),
+                    .left(px(LEFT_GUTTER))
+                    .top(px(row_top(PRESSURE_ROW)))
+                    .w(px(layout.lattice))
+                    .h(px(lattice_width(MATRIX_DOTS))),
             );
         let caption = |id: &'static str, text: SharedString| {
             div()
                 .id(id)
                 .test_support()
                 .aria_label(text.clone())
-                .text_size(px(12.0))
+                .text_size(px(11.0))
                 .text_color(muted_ink)
                 .child(text)
         };
+        // A column of `count` dots of the key.
+        let key_column = |count: usize, color: Hsla| {
+            // 2 px: the gap of the lattice of the chart, not layout spacing.
+            let mut column = v_flex().gap(px(PITCH - DOT));
+            for _ in 0..count {
+                column = column.child(div().size(px(DOT)).rounded_full().bg(color));
+            }
+            column
+        };
+        let dot_color: Hsla = muted_ink.opacity(0.8);
         v_flex().gap(tokens::SPACE_3).child(root).child(
             v_flex()
                 .gap(tokens::SPACE_1)
+                .child(caption("session-range", range))
                 .child(
                     h_flex()
+                        .id("session-key")
+                        .test_support()
+                        .aria_label("Key: one column is one reading, fewer to more, not normal")
                         .flex_wrap()
+                        .items_center()
                         .gap_x(tokens::SPACE_4)
                         .gap_y(tokens::SPACE_1)
-                        .child(caption("session-range", range))
-                        .child(caption("session-scale", SCALE_CAPTION.into())),
-                )
-                .child(caption("session-rows", ROWS_CAPTION.into())),
+                        .text_size(px(11.0))
+                        .text_color(muted_ink)
+                        .child(caption("session-scale", SCALE_CAPTION.into()))
+                        .child(
+                            h_flex()
+                                .gap(tokens::SPACE_2)
+                                .items_center()
+                                .child("Fewer")
+                                .child(key_column(1, dot_color))
+                                .child(key_column(4, dot_color))
+                                .child("More"),
+                        )
+                        .child(
+                            h_flex()
+                                .gap(tokens::SPACE_1)
+                                .items_center()
+                                .child(key_column(1, colors.warning))
+                                .child("Not normal"),
+                        ),
+                ),
         )
     }
 }
@@ -804,7 +1392,7 @@ mod tests {
             pressure: pressure.map_or_else(no, Measured::Value),
             swap_used: Measured::Value(swap),
             disk_available: available.map_or_else(no, Measured::Value),
-            disk_used: available.map_or_else(no, |a| Measured::Value(1_000 - a)),
+            disk_used: available.map_or_else(no, |a| Measured::Value(1_000_u64.saturating_sub(a))),
         }
     }
 
@@ -963,48 +1551,208 @@ mod tests {
         assert_eq!(outside.events.len(), 0);
     }
 
-    #[test]
-    fn at_most_four_flags_show_text_and_the_newest_keep_it() {
-        let levels = [PressureLevel::Normal, PressureLevel::Warning];
-        let samples: Vec<HostSample> = (0..8)
-            .map(|n| {
-                sample(
-                    n,
-                    Some(100),
-                    Some(levels[usize::try_from(n).unwrap_or(0) % 2]),
-                    0,
-                )
-            })
+    fn normal_then_warning(normal: u64) -> Vec<HostSample> {
+        let mut samples: Vec<HostSample> = (0..normal)
+            .map(|n| sample(n * 60, Some(100 + n), Some(PressureLevel::Normal), 0))
             .collect();
-        let model = session_model(&samples, None, 20);
-        assert_eq!(model.events.len(), 7);
-        assert_eq!(model.events.iter().filter(|e| e.labeled).count(), MAX_FLAGS);
-        assert!(model.events[..3].iter().all(|e| !e.labeled));
-        assert!(model.events[3..].iter().all(|e| e.labeled));
-        let flags = place_flags(&model, 500.0);
-        assert_eq!(flags.len(), MAX_FLAGS);
+        samples.push(sample(
+            normal * 60,
+            Some(100),
+            Some(PressureLevel::Warning),
+            0,
+        ));
+        samples
     }
 
     #[test]
-    fn flags_that_would_touch_use_another_lane_and_stay_inside_the_chart() {
-        let levels = [PressureLevel::Normal, PressureLevel::Critical];
-        let samples: Vec<HostSample> = (0..6)
+    fn the_fact_of_a_change_counts_the_readings_of_the_old_state() {
+        let model = session_model(&normal_then_warning(40), None, 60);
+        let event = &model.events[0];
+        assert_eq!(event.fact, "after 40 normal readings");
+        assert_eq!(model.chip().map(|chip| chip.fact), Some(event.fact.clone()));
+        let one = session_model(&normal_then_warning(1), None, 60);
+        assert_eq!(one.events[0].fact, "after 1 normal reading");
+        // The count reaches back before the window.
+        let narrow = session_model(&normal_then_warning(40), None, 5);
+        assert_eq!(narrow.events[0].fact, "after 40 normal readings");
+    }
+
+    #[test]
+    fn an_operation_event_has_its_state_text_as_the_fact() {
+        let samples = [
+            sample(10, Some(100), Some(PressureLevel::Normal), 0),
+            sample(30, Some(100), Some(PressureLevel::Normal), 0),
+        ];
+        let model = session_model(&samples, Some(&operation(25)), 10);
+        assert_eq!(model.events[0].fact, "Completed");
+        assert_eq!(model.events[0].kind.name(), "operation");
+    }
+
+    #[test]
+    fn the_clock_is_hours_and_minutes_in_utc() {
+        assert_eq!(clock_text(at(0)), "00:00");
+        assert_eq!(clock_text(at(12 * 3600 + 4 * 60 + 59)), "12:04");
+        assert_eq!(clock_text(at(25 * 3600 + 60)), "01:01");
+    }
+
+    #[test]
+    fn labels_go_to_the_newest_events_that_do_not_overlap() {
+        let levels = [PressureLevel::Normal, PressureLevel::Warning];
+        let samples: Vec<HostSample> = (0..40)
             .map(|n| {
                 sample(
                     n,
                     Some(100),
-                    Some(levels[usize::try_from(n).unwrap_or(0) % 2]),
+                    Some(levels[usize::try_from(n / 8).unwrap_or(0) % 2]),
                     0,
                 )
             })
             .collect();
-        let model = session_model(&samples, None, 6);
-        let width: f32 = 6.0 * 6.0 - 1.5;
-        let flags = place_flags(&model, width);
-        assert!(flags.iter().any(|f| f.lane > 0));
-        assert!(flags.iter().all(|f| f.left >= 0.0));
-        assert!(flag_band(&flags) > 0.0);
-        assert_eq!(flag_band(&[]), 0.0);
+        let model = session_model(&samples, None, 40);
+        let labeled: Vec<&Event> = model.events.iter().filter(|e| e.labeled).collect();
+        assert!(!labeled.is_empty() && labeled.len() <= MAX_FLAGS);
+        // The newest event always has its label.
+        assert!(model.events.last().is_some_and(|e| e.label.is_some()));
+        for pair in labeled.windows(2) {
+            let (a, b) = (pair[0].label.expect("a"), pair[1].label.expect("b"));
+            assert!(a.left + a.width <= b.left, "{a:?} {b:?}");
+        }
+        for event in &labeled {
+            let place = event.label.expect("label");
+            assert!(place.left >= 0.0 && place.left + place.width <= lattice_width(40) + 1e-3);
+        }
+    }
+
+    #[test]
+    fn at_most_four_labels_show() {
+        let levels = [PressureLevel::Normal, PressureLevel::Warning];
+        let samples: Vec<HostSample> = (0..180)
+            .map(|n| {
+                sample(
+                    n,
+                    Some(100),
+                    Some(levels[usize::try_from(n / 20).unwrap_or(0) % 2]),
+                    0,
+                )
+            })
+            .collect();
+        let model = session_model(&samples, None, 180);
+        assert!(model.events.len() > MAX_FLAGS);
+        assert_eq!(model.events.iter().filter(|e| e.labeled).count(), MAX_FLAGS);
+        assert!(
+            model.events[..model.events.len() - MAX_FLAGS]
+                .iter()
+                .all(|e| !e.labeled)
+        );
+    }
+
+    #[test]
+    fn a_label_stays_inside_the_lattice() {
+        assert!((clamp_span(2.0, 48.0, 200.0)).abs() < 1e-6);
+        assert!((clamp_span(199.0, 48.0, 200.0) - 152.0).abs() < 1e-6);
+        assert!((clamp_span(100.0, 48.0, 200.0) - 76.0).abs() < 1e-6);
+        for slots in [6, 20, 60] {
+            let chip = session_model(&normal_then_warning(3), None, slots)
+                .chip()
+                .expect("chip");
+            let room = lattice_width(slots) + RIGHT_GUTTER;
+            assert!(chip.left >= 0.0, "{slots}");
+            assert!(chip.left + chip.width <= room + 1e-3, "{slots} {chip:?}");
+        }
+    }
+
+    #[test]
+    fn the_min_line_needs_two_readings_and_a_range() {
+        let one = session_model(
+            &[sample(1, Some(100), Some(PressureLevel::Normal), 0)],
+            None,
+            10,
+        );
+        assert_eq!(one.min, None);
+        let same = session_model(
+            &[
+                sample(1, Some(100), Some(PressureLevel::Normal), 0),
+                sample(2, Some(100), Some(PressureLevel::Normal), 0),
+            ],
+            None,
+            10,
+        );
+        assert_eq!(same.min, None);
+        let two = session_model(
+            &[
+                sample(1, Some(300), Some(PressureLevel::Normal), 0),
+                sample(2, Some(100), Some(PressureLevel::Normal), 0),
+            ],
+            None,
+            10,
+        );
+        assert_eq!(
+            two.min,
+            Some(MinMark {
+                row: CURVE_ROWS - 1,
+                value: 100
+            })
+        );
+        assert!(two.label().contains("min 100 B"), "{}", two.label());
+        assert!(!one.label().contains("min"));
+    }
+
+    #[test]
+    fn the_axis_labels_keep_48_px_and_include_the_newest_reading() {
+        let samples: Vec<HostSample> = (0..40)
+            .map(|n| sample(n * 60, Some(100 + n), Some(PressureLevel::Normal), 0))
+            .collect();
+        let model = session_model(&samples, None, 40);
+        assert_eq!(model.axis.first().map(|a| a.slot), Some(39), "newest first");
+        assert_eq!(model.axis[0].text, "00:39");
+        for pair in model.axis.windows(2) {
+            let gap = slot_center(pair[0].slot) - slot_center(pair[1].slot);
+            assert!(gap >= 48.0, "{gap}");
+        }
+    }
+
+    #[test]
+    fn the_tags_and_the_newest_values_never_show_zero_for_unknown() {
+        let samples = [
+            sample(1, Some(1_000_000_000), Some(PressureLevel::Normal), 0),
+            sample(2, None, None, 0),
+        ];
+        let model = session_model(&samples, None, 10);
+        let tags = model.tags();
+        assert_eq!(tags.readings, "readings 2");
+        assert_eq!(tags.range, "range 1.0 GB");
+        assert_eq!(tags.events, "events 0");
+        assert_eq!(tags.state, "now \u{2014}");
+        let newest = model.newest_texts();
+        assert_eq!(newest[0], "\u{2014}");
+        assert_eq!(newest[3], "\u{2014}");
+        let none = session_model(&[], None, 10);
+        assert_eq!(none.tags().range, "range \u{2014}");
+        assert_eq!(none.newest_texts()[1], "\u{2014}");
+        let wide = session_model(
+            &[
+                sample(1, Some(260_000_000_000), Some(PressureLevel::Normal), 0),
+                sample(2, Some(310_200_000_000), Some(PressureLevel::Normal), 0),
+            ],
+            None,
+            10,
+        );
+        assert_eq!(wide.tags().range, "range 260.0\u{2013}310.2 GB");
+    }
+
+    #[test]
+    fn the_layout_has_room_for_the_gutters_and_the_labels() {
+        let calm = session_model(
+            &[sample(1, Some(1), Some(PressureLevel::Normal), 0)],
+            None,
+            10,
+        );
+        let layout = calm.layout();
+        assert_eq!(layout.label_band, 0.0);
+        assert!((layout.width - (LEFT_GUTTER + lattice_width(10) + RIGHT_GUTTER)).abs() < 1e-3);
+        let busy = session_model(&normal_then_warning(5), None, 10);
+        assert!(busy.layout().label_band > 0.0);
+        assert!(busy.layout().height > layout.height);
     }
 
     #[test]
@@ -1034,5 +1782,62 @@ mod tests {
     #[test]
     fn the_lattice_has_a_known_height() {
         assert_eq!(TOTAL_ROWS, 29);
+    }
+
+    #[test]
+    fn a_narrow_chart_drops_the_fact_then_the_time_and_the_chip_stays_inside() {
+        let model = session_model(&normal_then_warning(40), None, 20);
+        let chip = model.chip().expect("chip");
+        assert!(chip.fact.is_empty(), "{chip:?}");
+        let layout = model.layout();
+        assert!(chip.left + chip.width <= layout.width - LEFT_GUTTER + 1e-3);
+        let wide = session_model(&normal_then_warning(40), None, 60)
+            .chip()
+            .expect("chip");
+        assert_eq!(wide.fact, "after 40 normal readings");
+        assert_eq!(wide.label_text().matches(", ").count(), 2);
+        let tiny = session_model(&normal_then_warning(40), None, 2)
+            .chip()
+            .expect("chip");
+        assert!(tiny.time.is_empty() && tiny.fact.is_empty(), "{tiny:?}");
+    }
+
+    #[test]
+    fn a_label_wider_than_the_lattice_is_not_placed() {
+        let model = session_model(&normal_then_warning(5), None, 6);
+        assert!(
+            model.events.iter().all(|e| e.label.is_none()),
+            "{:?}",
+            model.events
+        );
+        let wide = session_model(&normal_then_warning(5), None, 20);
+        assert!(wide.events.iter().all(|e| {
+            e.label
+                .is_none_or(|l| l.left + l.width <= lattice_width(20) + 1e-3)
+        }));
+    }
+
+    #[test]
+    fn the_min_label_stays_when_the_newest_reading_is_unavailable() {
+        let samples = [
+            sample(1, Some(300), Some(PressureLevel::Normal), 0),
+            sample(2, Some(100), Some(PressureLevel::Normal), 0),
+            sample(3, None, None, 0),
+        ];
+        let model = session_model(&samples, None, 10);
+        assert!(model.min.is_some());
+        assert_eq!(model.min_label(), model.min);
+        let at_min = session_model(&samples[..2], None, 10);
+        assert_eq!(
+            at_min.min_label(),
+            None,
+            "the newest value is at the min row"
+        );
+    }
+
+    #[test]
+    fn a_time_before_the_epoch_is_an_em_dash() {
+        let before = SystemTime::UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(clock_text(before), "\u{2014}");
     }
 }

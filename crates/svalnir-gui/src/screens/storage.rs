@@ -21,6 +21,7 @@ use crate::{
         provenance::ProvenanceLine,
         rolling::RollingNumber,
         segmented::SegmentedControl,
+        stat_row::{StatItem, StatRow},
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
@@ -1088,6 +1089,31 @@ impl StorageScreen {
         } else {
             col = col.child(chart).child(legend);
         }
+        let (scanned, scanned_unit) = format_bytes(summary.total(self.metric));
+        let mut stats: StatRow = StatRow::new("storage-stat-").item(
+            StatItem::new("scanned", "Scanned", Some(scanned), to_hsla(tokens.brand))
+                .suffix(scanned_unit),
+        );
+        if let Some(free) = free_bytes {
+            let (text, unit) = format_bytes(free);
+            stats = stats.item(
+                StatItem::new("free", "Free", Some(text), to_hsla(tokens.muted_foreground))
+                    .suffix(unit),
+            );
+        }
+        if !summary.gaps.is_empty() {
+            let causes: usize = summary.gaps.len();
+            stats = stats.item(
+                StatItem::new(
+                    "unread",
+                    "Not read",
+                    Some(causes.to_string()),
+                    to_hsla(tokens.warning),
+                )
+                .suffix(if causes == 1 { "cause" } else { "causes" }),
+            );
+        }
+        col = col.child(stats);
         col.child(caption("scan-footer", done_footer(summary), tokens))
             .child(
                 h_flex().child(

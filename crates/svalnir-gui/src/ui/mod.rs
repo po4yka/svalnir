@@ -9,5 +9,6 @@ pub mod provenance;
 pub mod ring_center;
 pub mod rolling;
 pub mod segmented;
+pub mod stat_row;
 pub mod surface;
 pub mod value;

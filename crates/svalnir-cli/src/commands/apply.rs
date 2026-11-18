@@ -545,6 +545,18 @@ pub(crate) fn run(
         }
         Applied::Transient(running) => run_transient(&mut flow, *running, invocation),
         Applied::Queued(queued) => run_queued(&mut flow, &queued, invocation),
+        Applied::Stopped(signal) => Err(ErrorBody::new(
+            "stopped_by_signal",
+            ErrorFamily::Outcome,
+            ErrorStage::Admission,
+            format!(
+                "{} stopped this process before the admission of the plan; no operation was admitted and nothing changed; apply the plan again",
+                signal.name()
+            ),
+        )
+        .with_plan(flow.plan.plan_id.as_str())
+        .with_next_action(NextAction::None)
+        .into()),
     }
 }
 

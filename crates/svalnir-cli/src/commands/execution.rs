@@ -120,6 +120,9 @@ pub(crate) enum Applied {
     Transient(Box<Running>),
     /// The request is in the queue of the journal.
     Queued(Box<Queued>),
+    /// A stop signal stopped the transient coordinator before the
+    /// admission. No operation was admitted.
+    Stopped(StopSignal),
 }
 
 /// The number of reads in sequence that a wait tries again when the
@@ -387,11 +390,24 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
                     }
                 };
             // The operations of an earlier executor lifetime are
-            // reconciled before a new admission.
+            // reconciled before a new admission. After a stop signal, the
+            // coordinator claims no request of the queue.
+            let interrupt: &Interrupt = &input.environment.interrupt;
+            let mut stopped: bool = false;
             let mut steps: u32 = 0;
             while coordinator.reconciliation_pending() && steps < MAX_RECONCILIATION_STEPS {
+                if !stopped && interrupt.stop_signal().is_some() {
+                    stop_coordinator(&mut coordinator);
+                    stopped = true;
+                }
                 steps = steps.saturating_add(1);
                 coordinator.step();
+            }
+            // A stop signal before the admission admits no operation.
+            if let Some(signal) = interrupt.stop_signal() {
+                stop_coordinator(&mut coordinator);
+                release(coordinator);
+                return Ok(Applied::Stopped(signal));
             }
             let outcome: ApplyOutcome = coordinator.apply(ApplyRequest {
                 approval,

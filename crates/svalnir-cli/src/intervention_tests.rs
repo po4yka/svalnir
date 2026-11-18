@@ -2044,6 +2044,31 @@ fn a_stop_signal_stops_a_transient_coordinator_before_the_force_step() {
     assert_eq!(status.result()["lock_holder"], "none", "{}", status.stdout);
 }
 
+/// A stop signal that the transient coordinator records before the
+/// admission admits no operation: no step, no operation record, and the
+/// exit status of the signal.
+#[test]
+fn a_stop_signal_before_the_admission_admits_no_operation() {
+    let mut world = world_for_stop();
+    let (interrupt, _flag, signal) = crate::interrupt::Interrupt::manual_with_stop_signal();
+    world.environment.interrupt = interrupt;
+    let mut child: ChildGuard = spawn_child(false);
+    let target: String = child.target();
+    // The signal is in the flag when the coordinator holds the lock.
+    signal.store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+    let stop = json(
+        &world.environment,
+        &["processes", "stop", "--target", &target, "--yes"],
+    );
+    assert_eq!(stop.status, ExitStatus::Terminated, "{}", stop.stdout);
+    assert_eq!(stop.error_code(), "stopped_by_signal", "{}", stop.stdout);
+    assert!(!child.has_exited());
+    let history = json(&world.environment, &["history"]);
+    assert_eq!(history.result()["records"], serde_json::json!([]));
+    let status = json(&world.environment, &["agent", "status"]);
+    assert_eq!(status.result()["lock_holder"], "none", "{}", status.stdout);
+}
+
 #[test]
 fn a_stop_refuses_a_protected_process_and_a_process_that_is_absent() {
     let world = world_for_stop();

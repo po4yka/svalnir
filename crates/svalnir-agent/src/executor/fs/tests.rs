@@ -2289,6 +2289,38 @@ fn a_tree_with_an_entry_that_is_not_supported_is_refused_as_a_whole() {
     }
 }
 
+#[test]
+fn a_tree_with_a_directory_that_is_the_home_directory_is_refused_as_a_whole() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let before = listing(&tree);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    // The directory `tree/a/b` shows the identity of the home directory,
+    // as one name of a directory with more than one name does.
+    let home = fs::metadata(&fixture.home).unwrap();
+    let hook: MetadataHook = Box::new(move |path: &[u8], metadata: &mut Metadata| {
+        if path.ends_with(b"/tree/a/b") {
+            metadata.device = Some(DeviceNumber::new(i32::try_from(home.dev()).unwrap()));
+            metadata.inode = home.ino();
+        }
+    });
+
+    let outcome = run(
+        &fixture.executor_with(metadata_injection(hook)),
+        &fixture.roots(),
+        &envelope,
+    );
+
+    assert_skipped(
+        &outcome,
+        &ErrorFamily::Eligibility,
+        code::HOME_DIRECTORY_PROTECTED,
+    );
+    assert_eq!(listing(&tree), before);
+    assert!(fixture.home.is_dir());
+    fixture.assert_outside_unchanged();
+}
+
 // ---------------------------------------------------------------------
 // The receipt
 // ---------------------------------------------------------------------

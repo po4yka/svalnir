@@ -41,7 +41,8 @@ use super::errors::{CallVerdict, Cause, code, mutation_verdict, read_cause};
 use super::model::{ExecutorLimits, ProcessedWork, Stop, StopSignal};
 use super::native::{self, DirStream, Kind, Metadata};
 use super::resolve::{
-    Checkpoint, Injection, Located, Refusal, identity_of, is_absent, is_not_directory, push_name,
+    Checkpoint, HomeGuard, Injection, Located, Refusal, identity_of, is_absent, is_not_directory,
+    push_name,
 };
 
 /// The size in bytes of one `st_blocks` unit.
@@ -264,6 +265,8 @@ impl Snapshot {
 /// The read-only measurement of a directory target.
 struct Measure<'a> {
     limits: &'a ExecutorLimits,
+    /// The home directory and each directory that contains it.
+    home: &'a HomeGuard,
     device: DeviceNumber,
     /// The owner of the target directory, which is the owner of the plan.
     owner: u32,
@@ -354,6 +357,18 @@ impl Measure<'_> {
                 Kind::Other => {
                     return Err(Refusal::skipped(Cause::eligibility(
                         code::UNSUPPORTED_FILE_TYPE,
+                    )));
+                }
+                Kind::Directory
+                    if identity_of(&metadata)
+                        .is_some_and(|object| self.home.has_object(object)) =>
+                {
+                    // A directory with more than one name, as on a volume
+                    // with directory hard links, can be the home directory
+                    // inside a tree. The measurement refuses the whole
+                    // tree before the first mutation call.
+                    return Err(Refusal::skipped(Cause::eligibility(
+                        code::HOME_DIRECTORY_PROTECTED,
                     )));
                 }
                 Kind::Directory => self.directory(
@@ -659,6 +674,7 @@ impl Removal<'_> {
 /// permitted. No mutation call was issued then.
 pub(super) fn remove_tree(
     located: &Located,
+    home: &HomeGuard,
     limits: &ExecutorLimits,
     injection: &Injection,
     stop: &dyn StopSignal,
@@ -666,6 +682,7 @@ pub(super) fn remove_tree(
     let mut path: Vec<u8> = located.path.clone();
     let mut measure = Measure {
         limits,
+        home,
         device: located.device,
         owner: located.metadata.owner,
         injection,

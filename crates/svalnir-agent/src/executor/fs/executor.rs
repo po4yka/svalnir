@@ -412,10 +412,12 @@ impl FsExecutor {
                 }
                 Draft::of_entry(outcome, work)
             }
-            Kind::Directory => match remove_tree(&located, &self.limits, &self.injection, signal) {
-                Ok(removal) => Self::draft_of_tree(removal),
-                Err(refusal) => Draft::refused(refusal),
-            },
+            Kind::Directory => {
+                match remove_tree(&located, &self.home, &self.limits, &self.injection, signal) {
+                    Ok(removal) => Self::draft_of_tree(removal),
+                    Err(refusal) => Draft::refused(refusal),
+                }
+            }
             Kind::Other => Draft::refused(Refusal::skipped(Cause::eligibility(
                 code::UNSUPPORTED_FILE_TYPE,
             ))),

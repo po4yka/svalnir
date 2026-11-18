@@ -203,7 +203,7 @@ impl HomeGuard {
 
     /// Whether `object` is the home directory or a directory that
     /// contains it.
-    fn has_object(&self, object: FileObjectEvidence) -> bool {
+    pub(super) fn has_object(&self, object: FileObjectEvidence) -> bool {
         self.objects.contains(&object)
     }
 }

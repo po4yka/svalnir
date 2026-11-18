@@ -503,8 +503,13 @@ fn excluded_reasons(
     one.path = path(entry_path);
     one.root_path = path(if root.is_empty() { "/" } else { root });
     one.relative_entry = path(name);
-    let entries: [CleanupEntry; 1] = [one];
-    let mut results: Vec<Vec<OmissionReason>> = modes(&rule)
+    reasons_of(&fixture, &rule, &one)
+}
+
+/// The reasons of the entry `a` of one entry, the same in each mode.
+fn reasons_of(fixture: &Fixture, rule: &Rule, one: &CleanupEntry) -> Vec<OmissionReason> {
+    let entries: [CleanupEntry; 1] = [one.clone()];
+    let mut results: Vec<Vec<OmissionReason>> = modes(rule)
         .into_iter()
         .map(|selection| {
             let outcome: PlanOutcome =
@@ -513,7 +518,12 @@ fn excluded_reasons(
         })
         .collect();
     results.dedup();
-    assert_eq!(results.len(), 1, "the modes disagree for {entry_path}");
+    assert_eq!(
+        results.len(),
+        1,
+        "the modes disagree for {}",
+        one.path.display_label()
+    );
     results.remove(0)
 }
 
@@ -581,6 +591,26 @@ fn a_path_of_the_protections_table_excludes_the_entry_in_each_mode() {
     assert_eq!(
         excluded_reasons("excluded_paths = []", home, "/Users/a/Documents"),
         []
+    );
+}
+
+/// The list applies to each resolved form of an entry that the caller
+/// gives, not only to the path of the entry.
+#[test]
+fn a_resolved_form_of_the_entry_in_an_excluded_path_excludes_the_entry() {
+    let rule: Rule = rule();
+    let mut fixture: Fixture = Fixture::with_protections("excluded_paths = [\"~/Documents\"]");
+    fixture.home = Some(path("/Users/a"));
+    let mut one: CleanupEntry = entry("a", 100);
+    one.path = path("/Volumes/Work/link/Documents/drafts");
+    one.root_path = path("/Volumes/Work/link/Documents");
+    one.relative_entry = path("drafts");
+    let outside: Vec<OmissionReason> = reasons_of(&fixture, &rule, &one);
+    assert_eq!(outside, []);
+    one.resolved_paths = vec![path("/Users/a/Documents/drafts")];
+    assert_eq!(
+        reasons_of(&fixture, &rule, &one),
+        [OmissionReason::ExcludedPath]
     );
 }
 

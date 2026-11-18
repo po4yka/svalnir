@@ -426,6 +426,33 @@ fn an_entry_in_a_personal_folder_is_protected_until_the_configuration_permits_it
     assert_eq!(targets[0]["path"]["value"], drafts.to_str().unwrap());
 }
 
+/// The `[protections]` list applies to the resolved location of an entry
+/// too: a scan root that reaches a personal folder through a symbolic-link
+/// component does not make its entries look outside the folder.
+#[test]
+fn an_entry_reached_through_a_link_component_has_the_protection_of_its_location() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let home: PathBuf = std::fs::canonicalize(world.path("home")).unwrap();
+    std::fs::create_dir_all(home.join("Documents/drafts")).unwrap();
+    std::fs::write(home.join("Documents/drafts/a.txt"), vec![1_u8; 4096]).unwrap();
+    let link: PathBuf = std::fs::canonicalize(world.path("")).unwrap().join("link");
+    std::os::unix::fs::symlink(&home, &link).unwrap();
+    let root: PathBuf = link.join("Documents");
+    let scan: String = world.scan(&root);
+    let drafts: PathBuf = root.join("drafts");
+    let before = state_files(&world);
+    let refused = plan_with(&world, &scan, "permanent", &[&drafts]);
+    assert_eq!(
+        refused.status,
+        ExitStatus::Unavailable,
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.error_code(), "target_protected");
+    assert_eq!(state_files(&world), before);
+}
+
 #[test]
 fn the_list_of_the_candidates_escapes_a_name() {
     let world = World::new();

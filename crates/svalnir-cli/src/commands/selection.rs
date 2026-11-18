@@ -30,8 +30,8 @@ pub(crate) const NO_ENTRY_STATUS: ExitStatus = ExitStatus::Usage;
 const CANDIDATES_NOTE: &str = "This command made no plan and changed nothing. Name each entry to clean with `--entry PATH`, as the path of the candidate. The plan builder then applies the protections and the `[protections]` table to each named entry.";
 
 /// The location of `path`: its directory with each symbolic link resolved,
-/// and its name. The protections compare this form, so the selection does
-/// also. `None` for a path with no name or whose directory does not
+/// and its name. The hard protection and the `[protections]` list compare
+/// this form as well as the path text, so the selection does also. `None` for a path with no name or whose directory does not
 /// resolve.
 fn location(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?;

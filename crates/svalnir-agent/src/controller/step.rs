@@ -1525,6 +1525,9 @@ impl<'a> Run<'a> {
                 charge: prepared.charge,
                 estimate: prepared.estimate,
                 hard_protection: candidate.facts.hard_protection,
+                // The rule roots of the agent are canonical paths of its
+                // own resolution; the agent gives no other form.
+                resolved_paths: Vec::new(),
                 rule: Some(RuleEvidence::of(&prepared.candidate)),
             });
         }

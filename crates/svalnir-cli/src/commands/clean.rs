@@ -402,6 +402,30 @@ fn entry_protection(
     }
 }
 
+/// The two forms of [`entry_protection`] that resolve: the own location
+/// and the resolved form. The plan builder applies the `[protections]`
+/// list to them as well as to the path of the entry.
+fn resolved_forms(path: &Path) -> Vec<LosslessPath> {
+    let own_location: Option<PathBuf> = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .ok()
+            .map(|directory| directory.join(name)),
+        _ => None,
+    };
+    let mut forms: Vec<LosslessPath> = Vec::new();
+    for form in [own_location, std::fs::canonicalize(path).ok()]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(form) = LosslessPath::from_path(&form)
+            && !forms.contains(&form)
+        {
+            forms.push(form);
+        }
+    }
+    forms
+}
+
 /// The type of a file object that a plan can bind.
 fn object_type_of(metadata: &std::fs::Metadata) -> Option<FileObjectType> {
     let file_type = metadata.file_type();
@@ -533,11 +557,8 @@ fn select(
             continue;
         };
         let work_bytes: Bytes = entry.logical.max(entry.allocated);
-        let items: EntryCount = EntryCount::new(
-            entry
-                .entries
-                .map_or(1, |entries| entries.get().saturating_add(1)),
-        );
+        let below: Option<u64> = entry.entries.map(EntryCount::get);
+        let items: EntryCount = EntryCount::new(below.map_or(1, |count| count.saturating_add(1)));
         let identity = |kind: char| format!("{plan_text}-{kind}{index:04}");
         selection.entries.push(CleanupEntry {
             target_id: TargetId::new(identity('t')).map_err(|_| session::identity_error())?,
@@ -565,6 +586,7 @@ fn select(
                 estimated_reclaimable_bytes: (mode != CleanMode::Trash).then_some(entry.allocated),
             },
             hard_protection: entry_protection(&path, home.as_deref(), state_directory.as_deref()),
+            resolved_paths: resolved_forms(&path),
             rule: None,
         });
     }

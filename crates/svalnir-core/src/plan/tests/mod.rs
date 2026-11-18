@@ -245,6 +245,7 @@ fn entry(name: &str, bytes: u64) -> CleanupEntry {
             estimated_reclaimable_bytes: Some(Bytes::new(bytes / 2)),
         },
         hard_protection: ProtectionFact::NotProtected,
+        resolved_paths: Vec::new(),
         rule: Some(RuleEvidence {
             rule: rule_reference("r1"),
             layout: LAYOUT.to_owned(),

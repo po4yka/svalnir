@@ -138,6 +138,13 @@ pub struct CleanupEntry {
     /// The hard protection of the entry (OS-managed storage, swap, and the
     /// control-plane state of Svalnir), as the caller established it.
     pub hard_protection: ProtectionFact,
+    /// The other forms of `path` with symbolic links resolved, as the
+    /// caller established them for the hard protection: the directory of
+    /// the entry resolved and the name, and the entry itself resolved. The
+    /// `[protections]` list applies to `path` and to each of these, so an
+    /// entry that a symbolic-link component makes look outside an excluded
+    /// path is still excluded. Empty when the caller has no other form.
+    pub resolved_paths: Vec<LosslessPath>,
     /// The rule evidence, when a rule found the entry. The `evict` mode
     /// needs it.
     pub rule: Option<RuleEvidence>,
@@ -240,7 +247,12 @@ impl EntryChecks<'_> {
         if entry.hard_protection == ProtectionFact::Protected {
             add(Reason::HardProtected);
         }
-        if self.excluded.overlaps(&entry.path) {
+        if self.excluded.overlaps(&entry.path)
+            || entry
+                .resolved_paths
+                .iter()
+                .any(|form| self.excluded.overlaps(form))
+        {
             add(Reason::ExcludedPath);
         }
         if entry.owner.is_some_and(|owner| owner != self.principal) {

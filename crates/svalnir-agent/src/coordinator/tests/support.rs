@@ -1468,11 +1468,22 @@ impl Bench {
         Coordinator::start(journal, &self.tree.database, epoch, config, dependencies).unwrap()
     }
 
+    /// Starts a coordinator when no coordinator of the test holds the
+    /// lock.
+    ///
+    /// A test of a different thread can start a child process at the same
+    /// time. Between its `fork` and its `exec`, that child has a copy of
+    /// each open file of this process, also of a lock file that a test
+    /// dropped a moment before, and the lock stays held for that instant.
+    /// The start is thus tried again for a short time.
     pub(super) fn start(&mut self) -> Box<TestCoordinator> {
-        match self.try_start() {
-            Start::Coordinating(coordinator) => coordinator,
-            Start::Busy { .. } => panic!("a different coordinator holds the lock"),
+        for _ in 0..500 {
+            match self.try_start() {
+                Start::Coordinating(coordinator) => return coordinator,
+                Start::Busy { .. } => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
         }
+        panic!("a different coordinator holds the lock");
     }
 
     /// Stores a plan as a client does, with a connection of its own.

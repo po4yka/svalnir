@@ -559,13 +559,28 @@ fn missing_evidence_is_degraded_and_never_normal() {
     });
     assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Degraded);
     assert_eq!(output.status.summary, Summary::Degraded);
+}
 
-    // A sample that is older than the decision age is not usable.
-    let old = observations(Some(5 * GIBIBYTE), Some(PressureState::Critical), bench.now);
-    bench.advance(60 * SECOND);
+#[test]
+fn a_sample_that_is_older_than_the_decision_age_supports_no_plan() {
+    let mut bench = Bench::new();
+    // The critical window runs until a fresh sample supports a plan. The
+    // state of the bench stays one step before that plan.
+    let limit: u64 = bench.now + 120 * SECOND;
+    while applies(&bench.peek(&critical(two_jobs)(bench.now), &[])).is_empty() {
+        assert!(bench.now < limit, "no plan in the time of the test");
+        bench.step(&critical(two_jobs)(bench.now), &[]);
+        bench.advance(SAMPLE);
+    }
+    // At this time a fresh sample supports the plan, so the age of the
+    // sample is the only cause of the result below.
+    let fresh = bench.peek(&critical(two_jobs)(bench.now), &[]);
+    assert_eq!(the_apply(&fresh).guard, Guard::Memory);
+    let old = critical(two_jobs)(bench.now - 60 * SECOND);
     let output = bench.step(&old, &[]);
     assert_eq!(output.status.summary, Summary::Degraded);
     assert_eq!(applies(&output).len(), 0);
+    assert!(bench.state.outstanding.is_none());
 }
 
 #[test]
@@ -890,9 +905,22 @@ fn a_rule_in_the_proposed_state_is_a_specific_refusal_and_not_a_plan() {
         made.candidates = Some(candidate_set(&proposed, &all, at));
         made
     };
-    let output = bench.run(60 * SECOND, low);
+    // Each step of the run, with its intents: a notification is an intent
+    // of the step in which the reason changed.
+    let mut intents: Vec<Intent> = Vec::new();
+    let mut output: StepOutput = bench.step(&low(bench.now), &[]);
+    intents.extend(output.intents.iter().cloned());
+    for _ in 0..12 {
+        bench.advance(SAMPLE);
+        output = bench.step(&low(bench.now), &[]);
+        intents.extend(output.intents.iter().cloned());
+    }
     assert!(bench.state.outstanding.is_none());
-    assert_eq!(applies(&output).len(), 0);
+    assert!(
+        !intents
+            .iter()
+            .any(|intent| matches!(intent, Intent::Apply(_)))
+    );
     // The controller does not prepare candidates for a rule that cannot
     // act, and it does not make a plan of another kind.
     assert_eq!(preparations(&output).len(), 0);
@@ -904,17 +932,21 @@ fn a_rule_in_the_proposed_state_is_a_specific_refusal_and_not_a_plan() {
     );
     assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Blocked);
     assert_eq!(output.status.summary, Summary::Warning);
-    assert!(
-        output.intents.iter().any(|intent| matches!(
-            intent,
-            Intent::Notify(Notification::Blocked {
-                guard: Guard::Disk,
-                reason: BlockedReason::RuleNotValidated { .. }
-            })
-        )) || output
-            .intents
-            .contains(&Intent::ReduceOptionalWork(ReduceReason::IncidentOpen))
-    );
+    // One notification for the reason, and not one for each step.
+    let blocked: usize = intents
+        .iter()
+        .filter(|intent| {
+            matches!(
+                intent,
+                Intent::Notify(Notification::Blocked {
+                    guard: Guard::Disk,
+                    reason: BlockedReason::RuleNotValidated { .. }
+                })
+            )
+        })
+        .count();
+    assert_eq!(blocked, 1);
+    assert!(intents.contains(&Intent::ReduceOptionalWork(ReduceReason::IncidentOpen)));
     // The incident is open, and its budget has no charge.
     let incident = &bench.state.policy.disk.incidents[0];
     assert_eq!(incident.usage.consumed_bytes.get(), 0);

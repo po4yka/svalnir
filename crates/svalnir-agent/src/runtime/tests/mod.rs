@@ -587,11 +587,21 @@ impl Bench {
         .unwrap()
     }
 
+    /// Starts a driver when no coordinator of the test holds the lock.
+    ///
+    /// A test of a different thread can start a child process at the same
+    /// time. Between its `fork` and its `exec`, that child has a copy of
+    /// each open file of this process, also of a lock file that a test
+    /// dropped a moment before, and the lock stays held for that instant.
+    /// The start is thus tried again for a short time.
     fn start(&mut self) -> Box<Driver> {
-        match self.try_start() {
-            DriverStart::Running(driver) => driver,
-            DriverStart::Busy { .. } => panic!("a different coordinator holds the lock"),
+        for _ in 0..500 {
+            match self.try_start() {
+                DriverStart::Running(driver) => return driver,
+                DriverStart::Busy { .. } => std::thread::sleep(Duration::from_millis(10)),
+            }
         }
+        panic!("a different coordinator holds the lock");
     }
 
     fn file(&self, name: &str) -> PathBuf {
@@ -983,6 +993,16 @@ fn an_automatic_stop_ends_a_child_of_the_test_and_charges_one_slot() {
     // The graceful request ends the child. The exit is observed, and
     // then the operation is finished.
     let limit: Instant = Instant::now() + Duration::from_secs(20);
+    // The child ends at the graceful request. Until its exit, the clock
+    // of the test moves less than the real time does, so the grace
+    // period of the plan does not end and no force step can be the cause
+    // of the exit on a slow host.
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < limit, "the child did not end");
+        std::thread::sleep(Duration::from_millis(20));
+        bench.clock.advance(SECOND / 100);
+        driver.tick(None);
+    }
     while driver.controller_state().outstanding.is_some() {
         assert!(Instant::now() < limit, "the operation did not finish");
         bench.clock.advance(SECOND);

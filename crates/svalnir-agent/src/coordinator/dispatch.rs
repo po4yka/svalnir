@@ -6,6 +6,8 @@
 //! through the functions of [`Operation`], so each state is one that the
 //! state machine of `docs/ACTION_CONTRACTS.md` section 6 permits.
 
+use std::cell::Cell;
+
 use svalnir_core::action::{
     ActionClass, ActionError, ActionStage, Attribution, CapacityEffect, Checked, Correlation,
     DispatchConsumption, DispatchReceipt, DispatchState, Durability, EffectEvidence,
@@ -25,7 +27,7 @@ use super::core::{Active, Coordinator, GracefulOutcome, MAX_MEASURED_VOLUMES, Ob
 use super::error::{action_error, action_error_with, code};
 use super::ledger::Benefit;
 use super::ports::{CoordinatorJournal, TimeReading, TriggerStanding};
-use crate::executor::fs::{AdmittedStep, FsTargetOutcome, ProcessedWork, StepOutcome};
+use crate::executor::fs::{AdmittedStep, FsTargetOutcome, ProcessedWork, StepOutcome, Stop};
 use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
@@ -201,6 +203,19 @@ fn stop_reason_of(reason: RefusalReason) -> StopReason {
         | RefusalReason::MeasurementBeforeResume => StopReason::TriggerCleared,
         // A revoked, expired, or missing grant, and each other reason.
         _ => StopReason::AuthorityMissing,
+    }
+}
+
+/// The stop of the filesystem executor for a stop reason of the final
+/// check.
+fn stop_signal_of(reason: &StopReason) -> Stop {
+    match reason {
+        StopReason::Paused => Stop::Paused,
+        StopReason::PolicyChanged => Stop::PolicyChanged,
+        StopReason::TriggerCleared => Stop::TriggerCleared,
+        StopReason::DeadlineExpired => Stop::DeadlineExpired,
+        StopReason::AuthorityMissing => Stop::AuthorityMissing,
+        _ => Stop::Canceled,
     }
 }
 
@@ -719,10 +734,29 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             )?;
             return Ok(StepEnd::Next);
         };
-        // The executor call. The status board is not locked here.
-        let outcome: StepOutcome = self.filesystem.execute(&self.roots, admitted);
+        // The executor call. The status board is not locked here. The
+        // executor reads the signal between the entries of a directory
+        // target. The signal is the final check, read again: the stop
+        // request, the deadline, the plan expiry, the leases, the trigger,
+        // the authorization, and the durable stop fence.
+        let stopped: Cell<Option<StopReason>> = Cell::new(None);
+        let outcome: StepOutcome = {
+            let active: &Active = active;
+            let signal = || -> Option<Stop> {
+                let stop: Stop = stop_signal_of(&self.final_check(active, step)?);
+                stopped.set(Some(stop.stop_reason()));
+                Some(stop)
+            };
+            self.filesystem.execute(&self.roots, admitted, &signal)
+        };
         let result: TargetResult = Self::filesystem_result(active, step, outcome)?;
         self.settle_called(active, step, vec![result], charge, charged, false)?;
+        // A stop inside a directory target ends the operation: the target
+        // has the result that the executor gave (no call, a part removed,
+        // or no effect), and each later step is skipped.
+        if let Some(reason) = stopped.take() {
+            return Ok(StepEnd::Stop(reason, None));
+        }
         active.since_measurement = active.since_measurement.saturating_add(1);
         if active.since_measurement >= self.config.batch_targets.max(1) {
             self.measure(active);

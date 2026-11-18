@@ -19,7 +19,7 @@ use svalnir_core::quantity::Bytes;
 use svalnir_core::state::PressureState;
 use svalnir_core::time::WallTime;
 
-use crate::executor::fs::{AdmittedStep, ApprovedRoots, FsExecutor, StepOutcome};
+use crate::executor::fs::{AdmittedStep, ApprovedRoots, FsExecutor, StepOutcome, StopSignal};
 use crate::executor::process::{
     ExecutorError, GenerationState, Observation as ExitObservation, ProcessControl,
     ProcessExecutor, StepClock, StepInput, StepRun, StopRequest,
@@ -132,16 +132,34 @@ pub trait IdSource: Debug {
 pub trait FilesystemExecutor: Debug {
     /// Does one admitted step under `roots`.
     ///
+    /// The caller reads its stop conditions before the call. The
+    /// executor reads `stop` between the entries of a directory target,
+    /// and issues no further call after a stop. A stopped directory
+    /// target has one of these results: `Skipped` with no submission (no
+    /// call was issued), `UnknownOutcome` with a submission and the stop
+    /// reason of the signal (a part of the tree was removed), or
+    /// `Refused` (each issued call had no effect).
+    ///
     /// # Errors
     ///
     /// Returns the fault of the executor: it finished the work on the
     /// target and made no consistent target result.
-    fn execute(&self, roots: &ApprovedRoots, step: AdmittedStep<'_>) -> StepOutcome;
+    fn execute(
+        &self,
+        roots: &ApprovedRoots,
+        step: AdmittedStep<'_>,
+        stop: &dyn StopSignal,
+    ) -> StepOutcome;
 }
 
 impl FilesystemExecutor for FsExecutor {
-    fn execute(&self, roots: &ApprovedRoots, step: AdmittedStep<'_>) -> StepOutcome {
-        self.execute_step(roots, step)
+    fn execute(
+        &self,
+        roots: &ApprovedRoots,
+        step: AdmittedStep<'_>,
+        stop: &dyn StopSignal,
+    ) -> StepOutcome {
+        self.execute_step_until(roots, step, stop)
     }
 }
 

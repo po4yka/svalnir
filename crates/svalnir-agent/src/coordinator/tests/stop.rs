@@ -6,6 +6,8 @@ use svalnir_core::action::{
     TargetEffect, TriggerClass,
 };
 
+use svalnir_core::quantity::EntryCount;
+
 use super::super::{Phase, StopAcknowledgement};
 use super::support::{
     Bench, FailPoint, GRACE, START, admitted, allowance, automatic_request, automatic_stop_plan,
@@ -342,10 +344,11 @@ impl super::super::FilesystemExecutor for Gate {
         &self,
         roots: &crate::executor::fs::ApprovedRoots,
         step: crate::executor::fs::AdmittedStep<'_>,
+        stop: &dyn crate::executor::fs::StopSignal,
     ) -> crate::executor::fs::StepOutcome {
         self.entered.lock().unwrap().send(()).unwrap();
         self.release.lock().unwrap().recv().unwrap();
-        self.inner.execute_step(roots, step)
+        self.inner.execute_step_until(roots, step, stop)
     }
 }
 
@@ -407,4 +410,165 @@ fn a_query_and_a_cancel_are_answered_while_an_executor_call_runs() {
         StopReason::Canceled
     );
     assert_eq!(bench.intents(), 1);
+}
+
+/// Makes the directory `name` below the root of `bench`, with one file in
+/// each of the directories `children` below it.
+fn directory_with(bench: &Bench, name: &str, children: &[&str]) -> Vec<std::path::PathBuf> {
+    children
+        .iter()
+        .map(|child| {
+            let directory = bench.tree.root.join(name).join(child);
+            std::fs::create_dir_all(&directory).unwrap();
+            let file = directory.join("file");
+            std::fs::write(&file, b"content").unwrap();
+            file
+        })
+        .collect()
+}
+
+#[test]
+fn a_cancel_during_the_call_of_a_directory_target_stops_before_its_first_entry() {
+    let mut bench = Bench::new();
+    let files = directory_with(&bench, "d", &["sub"]);
+    let later = bench.tree.file("z");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["d", "z"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let (entered_sender, entered) = std::sync::mpsc::channel();
+    let (release, release_receiver) = std::sync::mpsc::channel();
+    let inner = bench.tree.executor(super::support::TrashMode::Move);
+    let started = bench.start_with(|dependencies, _| {
+        dependencies.filesystem = Box::new(Gate {
+            inner,
+            entered: std::sync::Mutex::new(entered_sender),
+            release: std::sync::Mutex::new(release_receiver),
+        });
+    });
+    let super::super::Start::Coordinating(mut coordinator) = started else {
+        panic!("a different coordinator holds the lock");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let handle = coordinator.handle();
+    let clock = bench.clock.clone();
+    let id = operation_id.clone();
+    let driver = std::thread::spawn(move || run(&mut coordinator, &clock, &id));
+    entered.recv().unwrap();
+    // The final check of the step passed. The cancel arrives while the
+    // executor call is in progress, before the first entry of the tree.
+    assert_eq!(
+        handle.cancel(&operation_id),
+        Some(StopAcknowledgement::Received)
+    );
+    release.send(()).unwrap();
+    drop(release);
+    let view = driver.join().unwrap();
+    // The executor read the stop signal before the directory `sub` and
+    // issued no call.
+    assert!(files[0].exists());
+    assert!(later.exists());
+    let result = &view.operation.steps()[0].results()[0];
+    assert_eq!(result.effect, TargetEffect::Skipped);
+    assert_eq!(result.dispatch, DispatchState::NotSubmitted);
+    assert_eq!(result.stop_reason, StopReason::Canceled);
+    assert_eq!(
+        view.operation.steps()[1].results()[0].stop_reason,
+        StopReason::Canceled
+    );
+    assert_eq!(view.operation.state(), &OperationState::NoAction);
+    assert_eq!(bench.intents(), 1);
+}
+
+/// A filesystem executor whose stop signal gets a cancel of the operation
+/// immediately before its second reading.
+#[derive(Debug)]
+struct CancelInside {
+    inner: crate::executor::fs::FsExecutor,
+    cancel: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                super::super::CoordinatorHandle,
+                svalnir_core::id::OperationId,
+            )>,
+        >,
+    >,
+    readings: std::sync::atomic::AtomicUsize,
+}
+
+impl super::super::FilesystemExecutor for CancelInside {
+    fn execute(
+        &self,
+        roots: &crate::executor::fs::ApprovedRoots,
+        step: crate::executor::fs::AdmittedStep<'_>,
+        stop: &dyn crate::executor::fs::StopSignal,
+    ) -> crate::executor::fs::StepOutcome {
+        let signal = || {
+            let reading = self
+                .readings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if reading == 1
+                && let Some((handle, operation_id)) = self.cancel.lock().unwrap().as_ref()
+            {
+                handle.cancel(operation_id);
+            }
+            stop.check()
+        };
+        self.inner.execute_step_until(roots, step, &signal)
+    }
+}
+
+#[test]
+fn a_cancel_between_two_entries_of_a_directory_target_leaves_the_rest_of_the_tree() {
+    let mut bench = Bench::new();
+    let files = directory_with(&bench, "d", &["one", "two"]);
+    let later = bench.tree.file("z");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["d", "z"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let cancel = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let inner = bench.tree.executor(super::support::TrashMode::Move);
+    let shared = std::sync::Arc::clone(&cancel);
+    let started = bench.start_with(|dependencies, _| {
+        dependencies.filesystem = Box::new(CancelInside {
+            inner,
+            cancel: shared,
+            readings: std::sync::atomic::AtomicUsize::new(0),
+        });
+    });
+    let super::super::Start::Coordinating(mut coordinator) = started else {
+        panic!("a different coordinator holds the lock");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let handle = coordinator.handle();
+    *cancel.lock().unwrap() = Some((handle, operation_id.clone()));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    // The executor removed the first directory of the tree, read the
+    // stop, and issued no further call.
+    assert_eq!(files.iter().filter(|file| file.exists()).count(), 1);
+    assert!(bench.tree.root.join("d").exists());
+    assert!(later.exists());
+    let result = &view.operation.steps()[0].results()[0];
+    assert_eq!(result.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(result.dispatch, DispatchState::Submitted);
+    assert_eq!(result.stop_reason, StopReason::Canceled);
+    assert!(result.failure.is_none());
+    // The later target got no dispatch.
+    assert_eq!(
+        view.operation.steps()[1].results()[0].stop_reason,
+        StopReason::Canceled
+    );
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+    assert_eq!(bench.intents(), 1);
+    // The work of the removed part stays in the totals.
+    assert!(view.work.removed_entries > EntryCount::ZERO);
 }

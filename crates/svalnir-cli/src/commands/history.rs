@@ -77,7 +77,8 @@ pub(crate) struct HistoryRecord {
     pub(crate) estimate: Option<EstimateView>,
     /// What the executor acted on, as it measured it.
     pub(crate) work: Option<WorkView>,
-    /// The before and after observations.
+    /// The before and after observations, from the journal or from the
+    /// plan document of this client. `None` when neither has a record.
     pub(crate) resource_effects: Option<Vec<ResourceEffect>>,
 }
 
@@ -86,6 +87,7 @@ impl HistoryRecord {
         operation: &Operation,
         mode: Option<PlanMode>,
         document: Option<&PlanDocument>,
+        recorded: Option<Vec<ResourceEffect>>,
     ) -> Self {
         let measurements = document
             .and_then(|document| document.measurements.as_ref())
@@ -101,8 +103,8 @@ impl HistoryRecord {
             effects: EffectCounts::of(&operation.target_results()),
             estimate: document.map(EstimateView::of),
             work: measurements.map(|measurements| measurements.work),
-            resource_effects: measurements
-                .map(|measurements| measurements.resource_effects.clone()),
+            resource_effects: recorded
+                .or_else(|| measurements.map(|measurements| measurements.resource_effects.clone())),
         }
     }
 
@@ -118,6 +120,7 @@ impl HistoryRecord {
             operation,
             stored.as_ref().and_then(|stored| mode_of(&stored.plan)),
             stored.as_ref().and_then(|stored| stored.document.as_ref()),
+            super::operation_view::recorded_effects(journal, operation.operation_id()),
         )
     }
 

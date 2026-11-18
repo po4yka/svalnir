@@ -799,6 +799,7 @@ fn a_revision_that_changes_while_the_question_waits_refuses_the_enable() {
         ],
     );
     assert_eq!(enabled.status, ExitStatus::Conflict, "{}", enabled.stdout);
+    assert_eq!(enabled.error_code(), "authority_record_changed");
     world.environment.seams.test.while_asked = None;
     let status = json(&world.environment, &["agent", "status"]);
     let guard = &status.result()["authority"]["guards"][0];
@@ -885,6 +886,50 @@ fn a_pause_and_a_resume_are_in_the_authority_record() {
     assert_eq!(
         status.result()["authority"]["pause"]["status"],
         "not_paused"
+    );
+}
+
+/// A pause whose write fails is not in effect, so the command reports an
+/// error and no pause: a pause report of a change that is not durable would
+/// show an end time that no record has.
+#[test]
+fn a_pause_that_is_not_written_reports_an_error_and_no_pause() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let state: PathBuf = world.environment.state_directory().unwrap();
+    let files: Vec<PathBuf> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .collect();
+    let set_mode = |mode: u32| {
+        for file in &files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    };
+    set_mode(0o400);
+    let paused = json(&world.environment, &["agent", "pause", "--for", "1h"]);
+    set_mode(0o600);
+    assert_ne!(paused.status, ExitStatus::Success, "{}", paused.stdout);
+    let envelope = paused.envelope();
+    assert_eq!(envelope["result"], Value::Null, "{}", paused.stdout);
+    assert!(!paused.stdout.contains("\"until\""), "{}", paused.stdout);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("NOT in effect"),
+        "{}",
+        paused.stdout
+    );
+    let status = json(&world.environment, &["agent", "status"]);
+    assert_eq!(
+        status.result()["authority"]["pause"]["status"],
+        "not_paused",
+        "{}",
+        status.stdout
     );
 }
 
@@ -1787,11 +1832,16 @@ fn a_plan_document_that_names_a_different_root_is_not_used() {
     assert_eq!(apply.error_code(), "plan_document_not_usable");
     assert_eq!(entries(&tree).len(), 3);
     assert_eq!(entries(&other), ["build"]);
-    // The view of the plan does not show the text of the document.
+    // The view of the plan does not show the text of the document. Its
+    // cleanup root is the root that the sealed plan binds.
     let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
     assert_eq!(show.result()["has_plan_document"], false);
     assert_eq!(show.result()["plan_document"], "disagrees_with_plan");
-    assert_eq!(show.result()["cleanup_roots"], serde_json::json!([]));
+    assert_eq!(
+        show.result()["cleanup_roots"],
+        serde_json::json!([path(&std::fs::canonicalize(&tree).unwrap())])
+    );
+    assert!(!show.stdout.contains("/other"), "{}", show.stdout);
 }
 
 /// A standard output whose reader closed the pipe.
@@ -1874,6 +1924,103 @@ fn document_path(world: &World, plan: &str) -> PathBuf {
         .path("state")
         .join("plans")
         .join(format!("plan-{plan}.json"))
+}
+
+/// A client that did not execute an operation has no plan document with
+/// its measurements. It reads the resource observations of the operation
+/// from the journal.
+#[test]
+fn a_client_with_no_plan_document_reads_the_observations_from_the_journal() {
+    let (world, _tree, plan) = World::with_plan("permanent");
+    let apply = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    assert_eq!(apply.status, ExitStatus::Success, "{}", apply.stdout);
+    let executed = apply.result()["operation"].clone();
+    let operation_id: String = executed["operation_id"].as_str().unwrap().to_owned();
+    assert!(
+        !executed["resource_effects"].as_array().unwrap().is_empty(),
+        "{}",
+        apply.stdout
+    );
+    // The state of a different client: the plan document is absent.
+    std::fs::remove_file(document_path(&world, &plan)).unwrap();
+
+    let show = json(
+        &world.environment,
+        &["operations", "show", "--operation", &operation_id],
+    );
+    assert_eq!(show.status, ExitStatus::Success, "{}", show.stdout);
+    let shown = &show.result()["operation"];
+    assert_eq!(shown["resource_effects"], executed["resource_effects"]);
+    // The journal has the observations and not the work totals.
+    assert_eq!(shown["work"], Value::Null);
+    let notes: String = shown["notes"].to_string();
+    assert!(notes.contains("observed capacity change"), "{notes}");
+    assert!(!notes.contains("no resource observation"), "{notes}");
+
+    let history = json(&world.environment, &["history"]);
+    assert_eq!(history.status, ExitStatus::Success, "{}", history.stdout);
+    let record = &history.result()["records"][0];
+    assert_eq!(record["operation_id"], operation_id.as_str());
+    assert_eq!(record["resource_effects"], executed["resource_effects"]);
+    let text = run(&world.environment, &["history"]);
+    assert!(
+        !text
+            .stdout
+            .contains("Observed capacity change: not recorded"),
+        "{}",
+        text.stdout
+    );
+}
+
+/// A client that has no plan document, as a client that did not prepare
+/// the plan, applies the plan under the roots that the sealed plan binds.
+/// The plan document gives the executor no root.
+#[test]
+fn an_apply_with_no_plan_document_acts_under_the_roots_of_the_sealed_plan() {
+    let (world, tree, plan) = World::with_plan("permanent");
+    std::fs::remove_file(document_path(&world, &plan)).unwrap();
+    let apply = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    assert_eq!(apply.status, ExitStatus::Success, "{}", apply.stdout);
+    let operation = &apply.result()["operation"];
+    assert_eq!(operation["state"], "Completed", "{}", apply.stdout);
+    assert_eq!(operation["effects"]["permanently_removed"], 3);
+    // The volume of the capacity observations is that of the root of the
+    // plan, so the operation has its observations with no document.
+    assert!(
+        !operation["resource_effects"].as_array().unwrap().is_empty(),
+        "{}",
+        apply.stdout
+    );
+    assert_eq!(entries(&tree), Vec::<String>::new());
+    // Only the scanned tree changed.
+    assert!(world.path("config.toml").exists());
+
+    // The view of a client with no document has each path and the root.
+    let (world, tree, plan) = World::with_plan("permanent");
+    std::fs::remove_file(document_path(&world, &plan)).unwrap();
+    let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
+    assert_eq!(show.status, ExitStatus::Success, "{}", show.stdout);
+    let result = show.result();
+    assert_eq!(result["plan_document"], "absent");
+    assert_eq!(result["cleanup_roots"].as_array().unwrap().len(), 1);
+    let root: String = std::fs::canonicalize(&tree)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(result["cleanup_roots"][0]["value"], root.as_str());
+    let text = run(&world.environment, &["clean", "show", "--plan", &plan]);
+    assert!(
+        text.stdout.contains(&format!("{root}/build")),
+        "{}",
+        text.stdout
+    );
 }
 
 /// A plan document with a second cleanup root, which no target of the

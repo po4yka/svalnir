@@ -62,8 +62,9 @@ fn read(journal: &OperationJournal, operation_id: &OperationId) -> Result<Operat
         .ok_or_else(|| not_found(operation_id))
 }
 
-/// The view of a journal record, with the display paths and the
-/// measurements of the plan document of this client when it has one.
+/// The view of a journal record, with the resource observations of the
+/// journal, and with the display paths and the measurements of the plan
+/// document of this client when it has one.
 fn report(
     journal: &OperationJournal,
     environment: &Environment,
@@ -74,12 +75,13 @@ fn report(
     let stored = super::clean::load_for_report(journal, environment, operation.plan_id());
     let document = stored.as_ref().and_then(|stored| stored.document.as_ref());
     OperationReport::of_record(operation, stop_fence)
+        .with_recorded_effects(journal)
         .with_measurements(document.and_then(|document| document.measurements.as_ref()))
         .with_paths(
             stored
                 .as_ref()
                 .map_or_else(std::collections::BTreeMap::new, |stored| {
-                    target_paths(&stored.plan, document)
+                    target_paths(&stored.plan)
                 }),
         )
 }

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use svalnir_agent::coordinator::{OperationView, Phase, WorkTotals};
+use svalnir_agent::journal::OperationJournal;
 use svalnir_core::action::{
     DispatchState, Durability, Operation, OperationState, ResourceEffect, TargetEffect,
     TargetResult, TriggerClass,
@@ -34,7 +35,7 @@ pub(crate) const TRASH_NOTE: &str = "An entry that was moved to Trash still uses
 pub(crate) const CAPACITY_NOTE: &str = "The observed capacity change is the available capacity of the volume after the operation minus the value before it. Other activity on the volume contributes to it, so it is not the reclaimed size.";
 
 /// The statement about a view that has no measurement.
-const NO_MEASUREMENT_NOTE: &str = "The journal does not record the capacity measurements of an operation. They are known only to the process that executed it.";
+const NO_MEASUREMENT_NOTE: &str = "The journal has no resource observation for this operation: its executor recorded none. A value that is not recorded is not a measurement of no change.";
 
 /// The statement about a record that the durable journal does not have.
 const DEGRADED_NOTE: &str = "A record of this operation is not in the durable journal. The state is that of the executing process; a restart reconciles the operation from fresh evidence.";
@@ -128,8 +129,9 @@ impl From<WorkTotals> for WorkView {
     }
 }
 
-/// The measurements of an operation that only its executor has. The
-/// client that executed the operation keeps them in the plan document.
+/// The measurements of an operation that its executor has. The client
+/// that executed the operation keeps them in the plan document. The journal
+/// has the resource observations for each client, and not the work totals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Measurements {
     pub(crate) operation_id: OperationId,
@@ -167,17 +169,33 @@ pub(crate) struct OperationReport {
     pub(crate) stop: Option<StopFenceView>,
     pub(crate) effects: EffectCounts,
     pub(crate) target_results: Vec<TargetResult>,
-    /// The display path of each file target, from the plan document of
-    /// this client. A display path is not evidence.
+    /// The display path of each file target: the root path and the
+    /// relative entry that the sealed plan binds. A display path is not
+    /// evidence.
     pub(crate) target_paths: BTreeMap<TargetId, LosslessPath>,
     /// What the executor acted on. `None` when this client has no record.
     pub(crate) work: Option<WorkView>,
-    /// The before and after observations. `None` when this client has no
-    /// record; an empty list when the executor measured nothing.
+    /// The before and after observations, from the process that executes
+    /// the operation, from the journal, or from the plan document of this
+    /// client. `None` when none of them has a record; an empty list when
+    /// the executor measured nothing.
     pub(crate) resource_effects: Option<Vec<ResourceEffect>>,
     /// True when a record of the operation is not in the durable journal.
     pub(crate) degraded_recording: Option<bool>,
     pub(crate) notes: Vec<&'static str>,
+}
+
+/// The resource observations that the journal has for an operation.
+/// `None` when the journal has no record, or when the record cannot be
+/// read: an observation that is not recorded is not an empty measurement.
+pub(crate) fn recorded_effects(
+    journal: &OperationJournal,
+    operation_id: &OperationId,
+) -> Option<Vec<ResourceEffect>> {
+    journal
+        .resource_effects(operation_id)
+        .ok()
+        .filter(|effects| !effects.is_empty())
 }
 
 fn phase_text(phase: Phase) -> &'static str {
@@ -226,15 +244,32 @@ impl OperationReport {
         report.with_notes()
     }
 
-    /// Adds the measurements that the plan document has.
+    /// Adds the resource observations that the journal has for the
+    /// operation. Each client reads them, also a client that did not
+    /// execute the operation. A journal with no record, or a record that
+    /// cannot be read, adds nothing: the view then says that no
+    /// observation is recorded.
+    #[must_use]
+    pub(crate) fn with_recorded_effects(mut self, journal: &OperationJournal) -> Self {
+        if self.resource_effects.is_none() {
+            self.resource_effects = recorded_effects(journal, &self.operation_id);
+        }
+        self.with_notes()
+    }
+
+    /// Adds the measurements that the plan document has, where the view
+    /// has none.
     #[must_use]
     pub(crate) fn with_measurements(mut self, measurements: Option<&Measurements>) -> Self {
         if let Some(measurements) = measurements
             && measurements.operation_id == self.operation_id
-            && self.resource_effects.is_none()
         {
-            self.work = Some(measurements.work);
-            self.resource_effects = Some(measurements.resource_effects.clone());
+            if self.work.is_none() {
+                self.work = Some(measurements.work);
+            }
+            if self.resource_effects.is_none() {
+                self.resource_effects = Some(measurements.resource_effects.clone());
+            }
         }
         self.with_notes()
     }

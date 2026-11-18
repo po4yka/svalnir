@@ -21,9 +21,7 @@ use svalnir_agent::coordinator::{
     ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies, Idle, Phase,
     Progress, Start, SystemProbe,
 };
-use svalnir_agent::executor::fs::{
-    ApprovedRoot, ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig,
-};
+use svalnir_agent::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
 use svalnir_agent::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
@@ -33,10 +31,13 @@ use svalnir_agent::journal::{
 };
 use svalnir_agent::platform::memory::CollectionContext;
 use svalnir_agent::platform::process::DarwinProcessSource;
+use svalnir_agent::platform::volume;
 use svalnir_agent::rules::ReviewedRules;
 use svalnir_agent::runtime::host::{EpochIds, SystemAgentClock, SystemMeasurements};
 use svalnir_agent::runtime::{AgentClock, ClockHandle, ThreadIdle};
-use svalnir_core::action::{ActionError, Operation, OperationState, Plan, PlanApproval};
+use svalnir_core::action::{
+    ActionError, Operation, OperationState, Plan, PlanApproval, TargetBinding,
+};
 use svalnir_core::file::LosslessPath;
 use svalnir_core::grant::AuthorityState;
 use svalnir_core::id::{AdapterId, ExecutorEpochId, OperationId, RequestId};
@@ -45,7 +46,6 @@ use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::volume::VolumeIdentity;
 
 use super::operation_view::OperationReport;
-use super::plan_store::RootRecord;
 use super::session::{self, journal_error, open_journal};
 use crate::environment::Environment;
 use crate::interrupt::Interrupt;
@@ -92,8 +92,6 @@ pub(crate) enum Executor {
 pub(crate) struct ExecutionInput<'a> {
     pub(crate) environment: &'a Environment,
     pub(crate) plan: &'a Plan,
-    /// The cleanup roots of a filesystem plan.
-    pub(crate) roots: &'a [RootRecord],
     /// The authority record of the journal.
     pub(crate) authority: AuthorityState,
     /// The processes that this client must not stop: itself and its
@@ -156,28 +154,35 @@ fn coordinator_config() -> Result<CoordinatorConfig, ErrorBody> {
     })
 }
 
-fn approved_roots(roots: &[RootRecord]) -> Result<ApprovedRoots, ErrorBody> {
-    ApprovedRoots::new(
-        roots
+/// The volumes of the capacity observations of a plan: the volume at the
+/// root path that the sealed plan binds for each file target. The volume is
+/// read now, and it is used only when its identity and its mount generation
+/// are those of the binding. A root whose volume cannot be read, or that is
+/// on a different volume or mount than at the plan, gives no volume: the
+/// operation then has no capacity observation for it, and the executor
+/// examines the root itself before each call.
+fn observed_volumes(plan: &Plan) -> Vec<VolumeIdentity> {
+    let mut volumes: Vec<VolumeIdentity> = Vec::new();
+    for target in &plan.targets {
+        let TargetBinding::File(binding) = &target.binding else {
+            continue;
+        };
+        if volumes
             .iter()
-            .map(|root| ApprovedRoot {
-                root_id: root.root_id.clone(),
-                path: root.path.clone(),
-                object: root.object,
-                volume_id: root.volume.volume_id.clone(),
-                mount_id: root.volume.mount_id.clone(),
-            })
-            .collect(),
-    )
-    .map_err(|_| {
-        ErrorBody::new(
-            "plan_document_not_usable",
-            ErrorFamily::Evidence,
-            ErrorStage::Admission,
-            "the cleanup roots of the plan document are not usable; prepare a new plan; the command made no change",
-        )
-        .with_next_action(NextAction::PrepareNewPlan)
-    })
+            .any(|volume| volume.volume_id == binding.volume_id)
+        {
+            continue;
+        }
+        let Ok(mounted) = volume::volume_at(&binding.root_path.to_path_buf()) else {
+            continue;
+        };
+        if mounted.identity.volume_id == binding.volume_id
+            && mounted.identity.mount_id == binding.mount_id
+        {
+            volumes.push(mounted.identity);
+        }
+    }
+    volumes
 }
 
 /// The home directory of the user as a canonical path. The filesystem
@@ -212,7 +217,11 @@ fn dependencies(
             "the rule registry of this build is not usable",
         )
     })?;
-    let roots: ApprovedRoots = approved_roots(input.roots)?;
+    // This process has no approved root of its own. The coordinator gives
+    // the executor the roots that the file targets of the sealed plan
+    // bind, which the digest of the approval covers. The plan document is
+    // thus no input of the authorization.
+    let roots: ApprovedRoots = ApprovedRoots::default();
     let filesystem: FsExecutor = FsExecutor::new(
         &FsExecutorConfig {
             home_directory: home_directory(input.environment)?,
@@ -243,15 +252,7 @@ fn dependencies(
     records.state = Some(input.authority.clone());
     records.control_plane.clone_from(&input.control_plane);
     let authority: SharedAuthority = SharedAuthority::new(records);
-    let mut volumes: Vec<VolumeIdentity> = Vec::new();
-    for root in input.roots {
-        if !volumes
-            .iter()
-            .any(|volume| volume.volume_id == root.volume.volume_id)
-        {
-            volumes.push(root.volume.clone());
-        }
-    }
+    let volumes: Vec<VolumeIdentity> = observed_volumes(input.plan);
     Ok((
         Dependencies {
             clock: Box::new(ClockHandle(Arc::clone(&clock))),
@@ -721,7 +722,10 @@ impl Queued {
                 Err(error) => return WaitEnd::Failed(self.read_failure(error, last.as_ref())),
                 Ok(QueueState::Rejected(error)) => return WaitEnd::Rejected(error),
                 Ok(QueueState::Operation(operation)) => {
-                    let report = OperationReport::of_record(&operation, None);
+                    // The coordinator that serves the request records its
+                    // observations in the journal.
+                    let report = OperationReport::of_record(&operation, None)
+                        .with_recorded_effects(&self.journal);
                     let ended: bool = operation.state().is_settled()
                         || operation.state() == &OperationState::UnknownOutcome;
                     if ended || admission_only {

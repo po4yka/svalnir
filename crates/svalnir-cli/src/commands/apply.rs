@@ -189,15 +189,10 @@ impl ApplyView {
     }
 }
 
-/// The display path of each file target of a plan, from the values that
-/// the sealed plan binds and the cleanup roots of the plan document.
-pub(crate) fn target_paths(
-    plan: &Plan,
-    document: Option<&PlanDocument>,
-) -> BTreeMap<TargetId, LosslessPath> {
-    document.map_or_else(BTreeMap::new, |document| {
-        super::clean::bound_paths(plan, document)
-    })
+/// The display path of each file target of a plan, from the root path
+/// and the relative entry that the sealed plan binds.
+pub(crate) fn target_paths(plan: &Plan) -> BTreeMap<TargetId, LosslessPath> {
+    super::clean::bound_paths(plan)
 }
 
 /// Finds the operation of a plan that was applied before. A plan has at
@@ -247,12 +242,13 @@ fn existing_view(
         request_id: None,
         operation: Some(
             OperationReport::of_record(operation, stop_fence)
+                .with_recorded_effects(journal)
                 .with_measurements(
                     flow.document
                         .as_ref()
                         .and_then(|document| document.measurements.as_ref()),
                 )
-                .with_paths(target_paths(flow.plan, flow.document.as_ref())),
+                .with_paths(target_paths(flow.plan)),
         ),
         notes: Vec::new(),
     }
@@ -367,8 +363,7 @@ fn respond_transient(
         plan_id: flow.plan.plan_id.clone(),
         executor: Some(Executor::TransientCoordinator),
         request_id: None,
-        operation: operation
-            .map(|report| report.with_paths(target_paths(flow.plan, flow.document.as_ref()))),
+        operation: operation.map(|report| report.with_paths(target_paths(flow.plan))),
         notes: note.into_iter().collect(),
     };
     let status: ExitStatus = view.status();
@@ -479,8 +474,7 @@ fn run_queued(
         plan_id: flow.plan.plan_id.clone(),
         executor: Some(Executor::QueuedForCoordinator),
         request_id: Some(request_id),
-        operation: report
-            .map(|report| report.with_paths(target_paths(flow.plan, flow.document.as_ref()))),
+        operation: report.map(|report| report.with_paths(target_paths(flow.plan))),
         notes: std::iter::once(QUEUED_NOTE).chain(note).collect(),
     };
     let status: ExitStatus = view.status();
@@ -508,17 +502,12 @@ pub(crate) fn run(
         return Err(plan_expired(&flow.plan.plan_id).into());
     }
     approve(invocation, flow.yes, &flow.summary, &flow.plan.plan_id)?;
-    let roots = flow
-        .document
-        .as_ref()
-        .map_or_else(Vec::new, |document| document.roots.clone());
     // From the admission on, Ctrl+C does not end this process: it can be
     // the executor of the operation.
     invocation.environment.interrupt.arm();
     let applied: Applied = execution::apply(&ExecutionInput {
         environment: invocation.environment,
         plan: flow.plan,
-        roots: &roots,
         authority: flow.authority.clone(),
         control_plane: flow.control_plane.clone(),
         request_id: invocation.request_id.clone(),

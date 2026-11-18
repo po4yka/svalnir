@@ -628,6 +628,10 @@ pub(crate) fn agent_pause(
         )
         .with_fields(&["for"]),
     })?;
+    // A write that fails ends the command here with an error and no
+    // report: this client has no running instance that keeps the pause, so
+    // `report.pause` would show an end time that is not in effect. The
+    // status below is thus always that of the durable record.
     let (acknowledged, record_changed) = persist(&mut journal, &stored, change, now.wall)?;
     let status: PauseStatus = pause_status(acknowledged.state.pause.as_ref(), &now.control());
     let acknowledged = Acknowledged {

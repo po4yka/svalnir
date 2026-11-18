@@ -85,12 +85,13 @@ pub(crate) struct PlanView {
     pub(crate) stale_entries: Vec<StaleEntry>,
     /// The operation of the plan, when it was applied.
     pub(crate) operation_id: Option<OperationId>,
-    /// The cleanup roots of the plan: the executor changes no entry that
-    /// is not below one of them. Empty when the plan has no file target or
-    /// this client has no usable plan document.
+    /// The cleanup roots of the plan, from the root path that the sealed
+    /// plan binds for each file target: the executor changes no entry that
+    /// is not below one of them. Empty when the plan has no file target.
     pub(crate) cleanup_roots: Vec<LosslessPath>,
-    /// False when this client has no usable plan document: the display
-    /// paths and the estimates are then not known.
+    /// False when this client has no usable plan document: the estimates
+    /// and the entries that were left out are then not known. The paths
+    /// are those of the sealed plan.
     pub(crate) has_plan_document: bool,
     /// `used`, `absent`, `not_readable`, or `disagrees_with_plan`.
     pub(crate) plan_document: &'static str,
@@ -120,13 +121,13 @@ impl PlanView {
         if !self.has_plan_document {
             out.push_str(match self.plan_document {
                 "not_readable" => {
-                    "\nThe plan document of this client cannot be read, so the paths and the estimates are not known.\n"
+                    "\nThe plan document of this client cannot be read, so the estimates are not known.\n"
                 }
                 "disagrees_with_plan" => {
-                    "\nThe plan document of this client does not agree with the stored plan and is not used, so the paths and the estimates are not known.\n"
+                    "\nThe plan document of this client does not agree with the stored plan and is not used, so the estimates are not known.\n"
                 }
                 _ => {
-                    "\nThis client has no plan document for the plan, so the paths and the estimates are not known.\n"
+                    "\nThis client has no plan document for the plan, so the estimates are not known.\n"
                 }
             });
         }
@@ -238,8 +239,10 @@ fn root_id_of(
 /// the object that the sealed plan binds for it and with the identity
 /// that its values give.
 ///
-/// A root that no target binds is refused: the approved roots of the
-/// executor are then never wider than the plan.
+/// A root that no target binds is refused. The document gives the
+/// executor no root: the coordinator takes the approved roots from the
+/// sealed plan. The check keeps a changed document out of the view and out
+/// of the volumes of the capacity observations.
 fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
     let roots_agree = || {
         let bindings = || {
@@ -274,18 +277,14 @@ fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
 }
 
 /// The display path of each file target of a stored plan: the path of its
-/// cleanup root and its relative entry, which the sealed plan binds. The
-/// path text of the document is not used.
-pub(crate) fn bound_paths(
-    plan: &Plan,
-    document: &PlanDocument,
-) -> BTreeMap<TargetId, LosslessPath> {
+/// cleanup root and its relative entry, which the sealed plan binds. No
+/// plan document is necessary, and the path text of a document is not
+/// used.
+pub(crate) fn bound_paths(plan: &Plan) -> BTreeMap<TargetId, LosslessPath> {
     plan.targets
         .iter()
         .filter_map(|target| match &target.binding {
-            TargetBinding::File(binding) => {
-                Some((target.target_id.clone(), bound_path(document, binding)?))
-            }
+            TargetBinding::File(binding) => Some((target.target_id.clone(), bound_path(binding)?)),
             TargetBinding::Application(_) | TargetBinding::Process(_) => None,
         })
         .collect()
@@ -293,15 +292,8 @@ pub(crate) fn bound_paths(
 
 /// The path of a file target: the path of its cleanup root and its
 /// relative entry, which the sealed plan binds.
-fn bound_path(
-    document: &PlanDocument,
-    binding: &svalnir_core::action::FileBinding,
-) -> Option<LosslessPath> {
-    let root: &RootRecord = document
-        .roots
-        .iter()
-        .find(|root| root.root_id == binding.root_id)?;
-    let mut bytes: Vec<u8> = root.path.as_bytes().to_vec();
+fn bound_path(binding: &svalnir_core::action::FileBinding) -> Option<LosslessPath> {
+    let mut bytes: Vec<u8> = binding.root_path.as_bytes().to_vec();
     if bytes.last() != Some(&b'/') {
         bytes.push(b'/');
     }
@@ -719,16 +711,21 @@ pub(crate) struct StoredPlan {
 }
 
 impl StoredPlan {
-    /// The cleanup roots of the plan, from the document that agrees with
-    /// it.
+    /// The cleanup roots of the plan: the root path that the sealed plan
+    /// binds for each file target, one time for each root identity. The
+    /// digest that the user approves covers these values, so the list
+    /// needs no plan document.
     pub(crate) fn cleanup_roots(&self) -> Vec<LosslessPath> {
-        self.document.as_ref().map_or_else(Vec::new, |document| {
-            document
-                .roots
-                .iter()
-                .map(|root| root.path.clone())
-                .collect()
-        })
+        let roots: BTreeMap<&RootId, &LosslessPath> = self
+            .plan
+            .targets
+            .iter()
+            .filter_map(|target| match &target.binding {
+                TargetBinding::File(binding) => Some((&binding.root_id, &binding.root_path)),
+                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+            })
+            .collect();
+        roots.into_values().cloned().collect()
     }
 }
 
@@ -787,7 +784,7 @@ pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> 
                 .target(&preview.target_id)
                 .map(|target| &target.binding)
             {
-                preview.path = bound_path(document, binding);
+                preview.path = bound_path(binding);
             }
         }
         return Ok(outcome);
@@ -809,7 +806,11 @@ pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> 
                 .iter()
                 .map(|target| TargetPreview {
                     target_id: target.target_id.clone(),
-                    path: None,
+                    // The path of a file target is in the sealed plan.
+                    path: match &target.binding {
+                        TargetBinding::File(binding) => bound_path(binding),
+                        TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+                    },
                     estimate: SizeEstimate::default(),
                 })
                 .collect(),
@@ -877,34 +878,37 @@ pub(crate) fn apply(
         Some(journal) => session::read_authority(journal)?.state,
         None => return Err(plan_not_found(plan_id.as_str()).into()),
     };
-    // The executor needs the cleanup roots, which only the plan document
-    // has. A plan that was applied before needs none: its operation is
-    // reported.
+    // The sealed plan binds the cleanup root of each file target, so a
+    // client with no plan document can apply the plan: the question then
+    // has each path and no estimate. A document that is present and that
+    // cannot be read, or that does not agree with the stored plan, is a
+    // sign of a changed state directory: the plan is not applied. A plan
+    // that was applied before is reported in each case.
     let applied_before: bool = match &journal {
         Some(journal) => apply::existing_operation(journal, &plan_id)?.is_some(),
         None => false,
     };
-    if stored.document.is_none() && !applied_before {
-        let (code, message): (&'static str, &'static str) = match stored.document_state {
-            DocumentState::NotReadable => (
-                "plan_document_not_usable",
-                "the plan document of this client cannot be read, so the cleanup roots are not known; prepare a new plan; the command made no change",
-            ),
-            DocumentState::Disagrees => (
-                "plan_document_not_usable",
-                "the plan document of this client does not agree with the stored plan, so it gives no cleanup root; prepare a new plan; the command made no change",
-            ),
-            DocumentState::Absent | DocumentState::Used => (
-                "plan_document_missing",
-                "this client has no plan document for the plan, so the cleanup roots are not known; prepare a new plan; the command made no change",
-            ),
-        };
-        return Err(
-            ErrorBody::new(code, ErrorFamily::Evidence, ErrorStage::Storage, message)
-                .with_plan(plan_id.as_str())
-                .with_next_action(NextAction::PrepareNewPlan)
-                .into(),
-        );
+    let unusable: Option<&'static str> = match stored.document_state {
+        DocumentState::NotReadable => Some(
+            "the plan document of this client cannot be read; prepare a new plan; the command made no change",
+        ),
+        DocumentState::Disagrees => Some(
+            "the plan document of this client does not agree with the stored plan; prepare a new plan; the command made no change",
+        ),
+        DocumentState::Absent | DocumentState::Used => None,
+    };
+    if let Some(message) = unusable
+        && !applied_before
+    {
+        return Err(ErrorBody::new(
+            "plan_document_not_usable",
+            ErrorFamily::Evidence,
+            ErrorStage::Storage,
+            message,
+        )
+        .with_plan(plan_id.as_str())
+        .with_next_action(NextAction::PrepareNewPlan)
+        .into());
     }
     drop(journal);
     // The question has each target and the cleanup roots. A clock that

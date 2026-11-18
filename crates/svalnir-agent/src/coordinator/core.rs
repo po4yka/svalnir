@@ -327,7 +327,7 @@ fn total_charge(plan: &Plan) -> Result<Option<WorkCharge>, NotChargeable> {
                     .ok_or(NotChargeable)?;
                 total = Some(sum);
             }
-            Some(TargetBinding::Application(_)) => {}
+            Some(TargetBinding::Application(_) | TargetBinding::Process(_)) => {}
             None => return Err(NotChargeable),
         }
     }
@@ -351,6 +351,11 @@ fn lease_resources(plan: &Plan) -> Vec<LeaseResource> {
                         member.generation_id.clone(),
                     ));
                 }
+            }
+            TargetBinding::Process(binding) => {
+                resources.insert(LeaseResource::ProcessGeneration(
+                    binding.process.generation_id.clone(),
+                ));
             }
         }
     }
@@ -628,6 +633,21 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 plan_id,
             )));
         }
+        // The process executor of this build signals the members of an
+        // application or of a managed job. It has no step for a target of
+        // one process, and the protection port is for an application
+        // binding. Such a plan is refused here, before a reservation.
+        let has_process_target: bool = plan
+            .targets
+            .iter()
+            .any(|target| matches!(target.binding, TargetBinding::Process(_)));
+        if has_process_target {
+            return Err(Box::new(admission_error(
+                code::PROCESS_TARGET_NOT_AVAILABLE,
+                ErrorFamily::Request,
+                plan_id,
+            )));
+        }
         self.check_revisions(plan, &request.approval, mode, time)?;
         self.authorize_each(
             plan,
@@ -716,7 +736,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     ) -> Result<(), Box<ActionError>> {
         let (incident, evidence) = self.automatic_evidence(plan, stage, time)?;
         for step in &plan.steps {
-            let layout: Option<String> = self.authority.layout(plan, &step.target_id);
             let request = ActionRequest {
                 principal: principal.uid,
                 plan,
@@ -724,7 +743,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 stage: stage.clone(),
                 approval: Some(approval),
                 recording,
-                layout: layout.as_deref(),
                 incident: incident.as_ref(),
                 evidence: evidence.as_ref(),
             };

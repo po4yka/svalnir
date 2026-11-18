@@ -71,7 +71,22 @@ The conceptual envelope contains:
 
 The authenticated principal cannot be replaced by a UID supplied in a payload. Opaque identifiers correlate records; possession alone does not authorize access.
 
-File bindings include approved root identity, relative entry, volume/mount identity, object type and owner, and available native object identifiers. Process bindings include PID, start identity, UID, executable identity, application/job association, and explicitly attributed members.
+File bindings include approved root identity, the absolute path and the native object identifiers of that root, relative entry, volume/mount identity, object type and owner, and available native object identifiers. A file binding of a target that a rule selected also has the rule revision and the producer layout that the rule found for the target; a target with no rule has neither. The plan digest covers each of these values. Thus an approval of a plan is for one place, and the authorization reads the layout of a rule target from the sealed plan and not from its caller. One root identity of a plan has one root path and one root object. An executor acts under a root record only when that record has the root path and the root object of the binding; a different record gives the evidence error `approved_root_mismatch`, and no call is issued.
+
+The schema version of a plan and of a request envelope is 2. Version 2 added the root path, the root object, and the layout to the file binding. A stored plan or envelope of version 1 is refused: it is not decoded, and no absent field gets a default value. A plan is valid for a short time in one boot, so there is no migration. In the serialized form of a file binding, a field with no value is `null`, and a binding with an absent key is not decoded.
+
+Process bindings include PID, start identity, UID, executable identity, application/job association, and explicitly attributed members.
+
+A target has one of three bindings: a file, an application or managed-job instance with its members, or one process. The binding of one process is for a process that has no verified membership in an application or a managed job. It has the identity evidence of that process and no member list: a child, a process with a similar name, and a process group are not targets. These rules apply to it in the sealed plan and again in the envelope of each step:
+
+- Only a manual plan has it. A guard selects an application or a job instance and never one process.
+- The executor is the user executor.
+- The process has no verified membership. A member of an application or of a job is a target only through its instance, so that the member rules of section 8 apply to it.
+- The process is a process of the principal, is not a process of root, and is not `launchd`.
+- The process has executable evidence, so that an executor can revalidate its identity.
+- One process generation is one target: it is not a second target of the plan and not a member of an application target of the plan.
+
+The hard protections of section 8 apply to the one process as they apply to an instance with one member, and only a process with no protection is a target. In the serialized form the kind of this binding is `process`. A reader that does not know a binding kind rejects the plan and does not read the target as a different kind. The Milestone 2 build has the binding and its checks, and it executes no step for it (`docs/INTERFACES.md` section 4).
 
 The envelope of a step repeats the checks of its plan, because it has its own copy of the target: the binding of the target, the trigger identities, and the agreement of the action class with the force strategy and the grace period. An automatic trigger has an incident identity and a decision identity, and a manual trigger has none. The application slot of an automatic step is a slot of the incident of its trigger. A plan or an envelope of the helper executor names a `PrivilegeGrant`, and one of the user executor names none. The initial process-control surface has the user executor only, so an application plan with the helper executor is rejected. The helper condition of the critical-memory exception in section 12 applies when a later surface gives the helper a step of an application intervention.
 
@@ -265,6 +280,8 @@ The action-specific effects are `Trashed`, `Removed`, `ExitVerified`, `AlreadyAb
 
 The fields of a record agree with each other. `Trashed`, `Removed`, `ExitVerified`, `Refused`, and `StillRunning` need a `submitted` call. `Skipped` needs `not_submitted`. A verified effect has the attribution `established` or `possible`. `AlreadyAbsent` and `AlreadyExited` have `not_applicable` before a call and `possible` after a submitted or possibly submitted call. `UnknownOutcome` has `possible`. `Skipped`, `Refused`, and `StillRunning` have `not_applicable`. `Refused` has the stop reason `FAILED`. A target in its final condition (a verified effect, `AlreadyAbsent`, or `AlreadyExited`) does not have the stop reason `FAILED` or `TARGET_SKIPPED`. A record that does not agree with these rules is rejected.
 
+The native result of a record is `not_called`, `succeeded`, `errno` with the error number, `refused`, `unavailable`, or `covered_by_application_request`. A record with `not_submitted` has `not_called`, and each other record has a different value. `covered_by_application_request` is for one member of an application target: no call was issued for that member, because the request to its application covers it. Such a record names its member and has the dispatch state `submitted`. The value states that no native call was issued to the member itself. The request to the application is the graceful request for the member also, so a force step can follow for a covered member that is still running. The value was added after the first form of the record. The record has no schema version of its own: a reader that does not know the value applies the rule for a field value that it does not recognize, and a record with one of the other values is read unchanged.
+
 A pre-dispatch already-absent/exited result is a no-op. After a crash, finding the target absent may establish current state without establishing who removed or stopped it. Preserve that attribution uncertainty.
 
 Aggregate as follows:
@@ -317,7 +334,7 @@ Deduplicate by principal, operation/step identity, and executor context. The sam
 
 Record durable dispatch consumption before normal external submission. Duplicate apply/dispatch messages return status and must not create a second native call. Keep consumption records for at least the request's full validity window; after retention expires, reject an old request rather than treating it as new.
 
-Agent and helper maintain their own consumption state. The helper associates a delegated step with its authenticated principal and parent operation. A missing helper reply causes a status query and reconciliation, not a second deletion or signal.
+Agent and helper maintain their own consumption state. The helper associates a delegated step with its authenticated principal and parent operation. A missing helper reply causes a status query and reconciliation, not a second deletion or signal. When the helper starts again, a delegated step that its earlier lifetime consumed and did not settle has an unknown outcome: the call was possibly submitted, and no executor has the step now. The helper records that state for the step, and its storage layer writes the changed record back. The step stays consumed, so the same request gets the recorded state and no second acceptance. The agent thus expects `unknown_outcome` from a status query after a restart of the helper, and it reconciles the step before it reports a result.
 
 ### Cancellation
 

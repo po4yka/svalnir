@@ -9,14 +9,15 @@ use super::super::{
     disable, pause, resume, revoke,
 };
 use super::{
-    LAYOUT, Registry, TEMPORARY, USER, activated, active_state, application_content, as_automatic,
-    automatic, base_config, clock, clock_in, config, control, durable, enabled, enabled_state,
-    eviction_plan, file_content, grant_id, grant_ref, incident_id, intervention_plan, monotonic,
-    registry, registry_with, rule_ref, seal, wall,
+    DERIVED_DATA, Registry, TEMPORARY, USER, activated, active_state, application_content,
+    as_automatic, automatic, base_config, clock, clock_in, config, control, declaration, durable,
+    enabled, enabled_state, eviction_plan, eviction_plan_of_layout, file_content, grant_id,
+    grant_ref, incident_id, intervention_plan, monotonic, registry, registry_with, rule, rule_ref,
+    seal, wall,
 };
 use crate::action::{
-    ActionClass, ActionStage, DispatchState, ErrorFamily, Escalation, PermittedNextStep, Plan,
-    PlanApproval, RecordingMode, TriggerClass,
+    ActionClass, ActionStage, Checked, DispatchState, ErrorFamily, Escalation, PermittedNextStep,
+    Plan, PlanApproval, RecordingMode, TriggerClass,
 };
 use crate::authority::{ActionGrantRef, Generation};
 use crate::digest::ContentDigest;
@@ -24,7 +25,7 @@ use crate::id::{IncidentId, StepId};
 use crate::policy::{EvaluationClock, PolicyId};
 use crate::process::Uid;
 use crate::quantity::Nanoseconds;
-use crate::rule::LifecycleState;
+use crate::rule::{LayoutSupport, LifecycleState};
 
 const DISK: PolicyId = PolicyId::DiskGuard;
 const MEMORY: PolicyId = PolicyId::MemoryGuard;
@@ -41,7 +42,6 @@ struct Ask {
     step: &'static str,
     approval: Option<PlanApproval>,
     recording: RecordingMode,
-    layout: Option<&'static str>,
     incident: Option<IncidentBudget>,
     evidence: Option<EvidenceStamp>,
 }
@@ -82,7 +82,6 @@ impl Ask {
             step,
             approval: None,
             recording: RecordingMode::Durable,
-            layout: Some(LAYOUT),
             incident,
             evidence: Some(evidence_at(199)),
         }
@@ -108,7 +107,6 @@ impl Ask {
         Self {
             approval: Some(approval),
             evidence: None,
-            layout: None,
             ..Self::new(state, plan, "s1")
         }
     }
@@ -129,7 +127,6 @@ impl Ask {
             stage: ActionStage::Admission,
             approval: self.approval.as_ref(),
             recording: &self.recording,
-            layout: self.layout,
             incident: self.incident.as_ref(),
             evidence: self.evidence.as_ref(),
         };
@@ -338,13 +335,6 @@ fn refusals() -> Vec<(RefusalReason, Ask)> {
         R::UnsupportedValue,
         Ask {
             recording: RecordingMode::from_wire("best_effort"),
-            ..Ask::eviction(enabled_state())
-        },
-    );
-    case(
-        R::LayoutMissing,
-        Ask {
-            layout: None,
             ..Ask::eviction(enabled_state())
         },
     );
@@ -602,13 +592,10 @@ fn scope_refusals() -> Vec<(RefusalReason, Ask)> {
             ..Ask::eviction(enabled_state())
         },
     );
-    case(
-        R::LayoutNotSupported,
-        Ask {
-            layout: Some("layout-v9"),
-            ..Ask::eviction(enabled_state())
-        },
-    );
+    // The layout is the one that the sealed plan binds for the target.
+    let state = enabled_state();
+    let plan = eviction_plan_of_layout(&state, "layout-v9");
+    case(R::LayoutNotSupported, Ask::new(state, plan, "s1"));
     // A rule that is only proposed cannot act automatically.
     case(
         R::RuleModeNotValidated,
@@ -763,6 +750,10 @@ fn each_refusal_has_its_reason_and_its_error_family() {
         );
         seen.insert(expected.code());
     }
+    // A sealed plan binds the layout of each rule target (`Plan::seal`
+    // refuses a rule target with none), so no sealed plan gives this
+    // reason. It stays for a binding that a later change makes possible.
+    seen.insert(RefusalReason::LayoutMissing.code());
     // The table has each reason of the module.
     let all: BTreeSet<&'static str> = RefusalReason::ALL.iter().map(|one| one.code()).collect();
     assert_eq!(all.len(), RefusalReason::ALL.len());
@@ -1028,7 +1019,6 @@ fn a_pause_that_ended_on_the_wall_clock_in_this_boot_needs_a_new_measurement() {
             stage: ActionStage::Dispatch,
             approval: None,
             recording: &ask.recording,
-            layout: ask.layout,
             incident: ask.incident.as_ref(),
             evidence: ask.evidence.as_ref(),
         };
@@ -1082,4 +1072,36 @@ fn a_force_step_of_an_automatic_plan_with_no_force_strategy_is_refused() {
     };
     let ask = Ask::new(state, plan, "force");
     assert_eq!(ask.reason(), RefusalReason::EscalationNotGranted);
+}
+
+#[test]
+fn a_layout_that_is_only_proposed_is_not_evicted_under_a_validated_layout_of_its_rule() {
+    // One rule revision with a validated layout and a proposed layout.
+    let mut declaration = declaration(TEMPORARY, "r1", automatic());
+    declaration.layouts.push(LayoutSupport {
+        layout: "layout-v2".to_owned(),
+        lifecycle: LifecycleState::Proposed,
+    });
+    let two_layouts = || {
+        Registry(vec![
+            Checked::new(declaration.clone()).unwrap(),
+            rule(DERIVED_DATA, "r1", automatic()),
+        ])
+    };
+    let ask = |layout: &str| {
+        let state = enabled_state();
+        let plan = eviction_plan_of_layout(&state, layout);
+        Ask {
+            registry: two_layouts(),
+            ..Ask::new(state, plan, "s1")
+        }
+    };
+    // The target of the validated layout is permitted.
+    ask("layout-v1").answer().unwrap();
+    // The target of the proposed layout is refused. The request has no
+    // field with which a caller can name the validated layout.
+    assert_eq!(
+        ask("layout-v2").reason(),
+        RefusalReason::RuleModeNotValidated
+    );
 }

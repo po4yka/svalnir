@@ -337,6 +337,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     incident_id: plan.trigger.incident_id.clone(),
                 },
             ),
+            // Admission refuses a plan with a process target, so no step
+            // of one gets an envelope.
+            TargetBinding::Process(_) => return Err(Fault),
         };
         Checked::new(EnvelopeContent {
             schema_version: PLAN_SCHEMA_VERSION,
@@ -414,7 +417,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 .as_ref()
                 .and_then(|incident_id| self.authority.incident(incident_id));
         }
-        let layout: Option<String> = self.authority.layout(&active.plan, &step.target_id);
         let recording = active.recording();
         let request = ActionRequest {
             principal: active.principal.uid,
@@ -423,7 +425,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             stage: stage.clone(),
             approval: Some(&active.approval),
             recording: &recording,
-            layout: layout.as_deref(),
             incident: incident.as_ref(),
             evidence: evidence.as_ref(),
         };
@@ -1235,7 +1236,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                         volumes.push(file.volume_id.clone());
                     }
                 }
-                TargetBinding::Application(_) => has_application = true,
+                TargetBinding::Application(_) | TargetBinding::Process(_) => {
+                    has_application = true;
+                }
             }
         }
         for volume in volumes {

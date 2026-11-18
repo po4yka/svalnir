@@ -100,13 +100,18 @@ pub struct CleanupEntry {
     /// The identity of the step that removes the entry.
     pub step_id: StepId,
     /// The absolute path of the entry, for the exclusion lists and for
-    /// display. The plan does not have it.
+    /// display. The plan does not have it; the plan has the root path and
+    /// the relative entry.
     pub path: LosslessPath,
     /// The approved root.
     pub root_id: RootId,
     /// The absolute path of the approved root, as the caller resolved it.
-    /// Each entry of one root has the same root path.
+    /// Each entry of one root has the same root path. The plan binds it.
     pub root_path: LosslessPath,
+    /// The native identifiers of the root directory, as the caller
+    /// measured them. Each entry of one root has the same root object. The
+    /// plan binds it.
+    pub root_object: FileObjectEvidence,
     /// The entry, relative to the root. `path` is exactly `root_path` and
     /// then this entry.
     pub relative_entry: LosslessPath,
@@ -121,6 +126,10 @@ pub struct CleanupEntry {
     /// The native identifiers of the object. `None` means that the
     /// evidence is absent; the adapter decides whether it can act.
     pub object: Option<FileObjectEvidence>,
+    /// The number of names of the object (`st_nlink`). `None` when it is
+    /// not known: an unknown number is not one. The `evict` mode needs it
+    /// for a rule that skips hard-linked objects.
+    pub link_count: Option<EntryCount>,
     /// The known conservative charge of the entry. `None` when it is not
     /// known: an unknown charge is not zero.
     pub charge: Option<WorkCharge>,
@@ -272,6 +281,14 @@ impl EntryChecks<'_> {
         if entry.owner.is_none() {
             add(Reason::OwnerUnknown);
         }
+        if self
+            .rule
+            .as_ref()
+            .is_some_and(|checks| Self::skips_links(checks, entry))
+            && entry.link_count.is_none()
+        {
+            add(Reason::LinkCountUnknown);
+        }
         if let (Some(_), Some(evidence)) = (&self.rule, &entry.rule) {
             for (predicate, fact) in evidence.eligibility.facts() {
                 if !matches!(fact, Fact::Satisfied | Fact::NotSatisfied) {
@@ -288,6 +305,13 @@ impl EntryChecks<'_> {
             add(Reason::ExceedsCandidateCeiling);
         }
         reasons
+    }
+
+    /// Whether the rule skips the entry when it has more than one name:
+    /// the rule has `skip_hard_linked`, and the entry is not a directory.
+    fn skips_links(checks: &RuleChecks<'_>, entry: &CleanupEntry) -> bool {
+        checks.rule.exclusions.skip_hard_linked
+            && !matches!(entry.object_type, FileObjectType::Directory)
     }
 
     /// The reasons of the `evict` mode that the rule revision gives: the
@@ -329,6 +353,19 @@ impl EntryChecks<'_> {
         if checks.descendants.overlaps(&entry.relative_entry) {
             add(Reason::RuleExclusion);
         }
+        // Only a count of one is one name. A count of zero is an object
+        // that was unlinked after the measurement.
+        // A hard-linked object has a name that the rule did not find. Its
+        // removal frees no storage, and the other name can be outside the
+        // root. A directory has one name; its link count is the number of
+        // its subdirectories.
+        if Self::skips_links(checks, entry)
+            && entry
+                .link_count
+                .is_some_and(|count| count != EntryCount::new(1))
+        {
+            add(Reason::RuleExclusion);
+        }
         for (predicate, fact) in evidence.eligibility.facts() {
             if matches!(fact, Fact::NotSatisfied) {
                 add(Reason::EligibilityNotSatisfied { predicate });
@@ -363,11 +400,13 @@ fn check_request(request: &CleanupRequest<'_>) -> Result<(), PlanBuildError> {
             return Err(PlanBuildError::DuplicateIdentity);
         }
     }
-    // One root identity has one path. With two paths, the exclusion check
-    // of one entry would not be for the object that the plan binds.
-    let mut roots: BTreeMap<&RootId, &LosslessPath> = BTreeMap::new();
+    // One root identity has one path and one object. With two paths, the
+    // exclusion check of one entry would not be for the object that the
+    // plan binds.
+    let mut roots: BTreeMap<&RootId, (&LosslessPath, &FileObjectEvidence)> = BTreeMap::new();
     for entry in request.entries {
-        if *roots.entry(&entry.root_id).or_insert(&entry.root_path) != &entry.root_path {
+        let root = (&entry.root_path, &entry.root_object);
+        if *roots.entry(&entry.root_id).or_insert(root) != root {
             return Err(PlanBuildError::RootPath);
         }
     }
@@ -416,7 +455,9 @@ fn rule_checks<'a>(mode: &ModeSelection<'a>) -> Result<Option<RuleChecks<'a>>, P
 /// - For the `evict` mode: the entry is a candidate of the exact rule
 ///   revision, the revision is validated for manual eviction of the layout,
 ///   no protected descendant of the rule overlaps the entry, the rule
-///   removes the object type, each of the ten eligibility predicates is
+///   removes the object type, for a rule that skips hard-linked objects an
+///   entry that is not a directory has a known link count of one, each of
+///   the ten eligibility predicates is
 ///   `satisfied`, and the charge fits the candidate ceiling of the rule.
 /// - No other selected entry that passed the checks above is the same
 ///   path or contains it. The comparison is made before the limits, so an
@@ -438,7 +479,8 @@ fn rule_checks<'a>(mode: &ModeSelection<'a>) -> Result<Option<RuleChecks<'a>>, P
 /// # Errors
 ///
 /// Returns a [`PlanBuildError`] when the selection is too large, two
-/// entries have one identity, one root identity has two root paths, a duration is zero, the lifetime is zero or
+/// entries have one identity, one root identity has two root paths or two
+/// root objects, a duration is zero, the lifetime is zero or
 /// overflows, the authority names a privilege grant or one grant two
 /// times, the registry refused the rule of the `evict` mode, the rule
 /// needs the helper executor, or the check of the foundation rejects the
@@ -567,6 +609,8 @@ fn plan_parts(
             target_id: entry.target_id.clone(),
             binding: TargetBinding::File(FileBinding {
                 root_id: entry.root_id.clone(),
+                root_path: entry.root_path.clone(),
+                root_object: entry.root_object,
                 relative_entry: entry.relative_entry.clone(),
                 volume_id: entry.volume_id.clone(),
                 mount_id: entry.mount_id.clone(),
@@ -574,6 +618,12 @@ fn plan_parts(
                 owner: *owner,
                 object: entry.object,
                 rule: rule.cloned(),
+                // The layout of the rule evidence of the entry. The plan
+                // binds a rule only for the `evict` mode, and each entry of
+                // that mode has the evidence of that rule.
+                layout: rule
+                    .and(entry.rule.as_ref())
+                    .map(|evidence| evidence.layout.clone()),
                 charge: *charge,
             }),
         });
@@ -748,7 +798,7 @@ pub fn split_batches(plan: &PlanContent, batch: &WorkCharge) -> Result<Vec<PlanB
     let has_application: bool = plan
         .targets
         .iter()
-        .any(|target| matches!(target.binding, TargetBinding::Application(_)));
+        .any(|target| !matches!(target.binding, TargetBinding::File(_)));
     if has_application {
         return Ok(Vec::new());
     }
@@ -758,7 +808,9 @@ pub fn split_batches(plan: &PlanContent, batch: &WorkCharge) -> Result<Vec<PlanB
         let target: &PlanTarget = plan.target(&step.target_id).ok_or(BatchError::Content)?;
         let charge: WorkCharge = match &target.binding {
             TargetBinding::File(file) => file.charge,
-            TargetBinding::Application(_) => return Err(BatchError::Content),
+            TargetBinding::Application(_) | TargetBinding::Process(_) => {
+                return Err(BatchError::Content);
+            }
         };
         if !charge.fits_in(batch) {
             return Err(BatchError::ExceedsBatch);

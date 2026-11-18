@@ -1698,13 +1698,17 @@ fn a_plan_document_that_names_a_different_root_is_not_used() {
         .path("state")
         .join("plans")
         .join(format!("plan-{plan}.json"));
+    // Only the root record of the document changes. The sealed plan in
+    // the document binds the path of its root, and it stays as it is.
     let text: String = std::fs::read_to_string(&document).unwrap();
-    let changed: String = text.replace(
-        &format!("{}\"", tree.to_str().unwrap()),
-        &format!("{}\"", other.to_str().unwrap()),
-    );
-    assert_ne!(changed, text);
-    std::fs::write(&document, changed).unwrap();
+    let mut value: Value = serde_json::from_str(&text).unwrap();
+    let path = |directory: &Path| {
+        serde_json::to_value(svalnir_core::file::LosslessPath::from_path(directory).unwrap())
+            .unwrap()
+    };
+    assert_eq!(value["roots"][0]["path"], path(&tree));
+    value["roots"][0]["path"] = path(&other);
+    std::fs::write(&document, serde_json::to_string(&value).unwrap()).unwrap();
     let apply = json(
         &world.environment,
         &["clean", "apply", "--plan", &plan, "--yes"],

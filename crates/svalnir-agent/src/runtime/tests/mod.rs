@@ -388,6 +388,7 @@ impl CandidateSource for TempCandidates {
                     let spec = CandidateSpec {
                         name: name.clone(),
                         root_path: LosslessPath::from_path(&self.root).unwrap(),
+                        root_object: object_of(&self.root),
                         object: object_of(&self.root.join(name)),
                         object_type: FileObjectType::RegularFile,
                         work_bytes: 1_000,
@@ -1193,6 +1194,8 @@ fn trash_plan(bench: &Bench, name: &str) -> Plan {
             target_id: target_id.clone(),
             binding: TargetBinding::File(FileBinding {
                 root_id: RootId::new(ROOT_ID).unwrap(),
+                root_path: LosslessPath::from_path(&bench.root).unwrap(),
+                root_object: object_of(&bench.root),
                 relative_entry: LosslessPath::from_bytes(name.as_bytes()).unwrap(),
                 volume_id: VolumeId::new(VOLUME).unwrap(),
                 mount_id: MountId::new(MOUNT).unwrap(),
@@ -1200,6 +1203,7 @@ fn trash_plan(bench: &Bench, name: &str) -> Plan {
                 owner: user(),
                 object: Some(object_of(&bench.root.join(name))),
                 rule: None,
+                layout: None,
                 charge: WorkCharge::new(Bytes::new(10), EntryCount::new(1)),
             }),
         }],

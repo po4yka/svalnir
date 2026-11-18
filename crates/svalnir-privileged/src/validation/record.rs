@@ -188,6 +188,26 @@ pub enum RecordError {
     State,
 }
 
+/// The result of a restore from the durable record of an earlier lifetime
+/// of the helper.
+///
+/// A restore changes the state of each step that the earlier lifetime left
+/// in work. The durable record still has the earlier state of those steps.
+/// The storage layer writes the record of each step in `changed` back
+/// before it reports the helper as ready, so that the durable record and
+/// the state in memory agree. A restore of a record that was not written
+/// back gives the same state again, so a failed write permits no replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored<T> {
+    /// The restored value.
+    pub state: T,
+    /// The steps whose recorded state the restore changed to
+    /// `UnknownOutcome`, in the sequence of their keys. A status query for
+    /// one of them reports `unknown_outcome`, and reconciliation settles
+    /// it.
+    pub changed: Vec<StepKey>,
+}
+
 /// The bounded record of consumed requests.
 ///
 /// The record has a fixed capacity. When it is full, the helper refuses
@@ -225,7 +245,8 @@ impl ConsumedRequests {
 
     /// Makes the record from the requests of an earlier lifetime of the
     /// helper. A step that the earlier lifetime left in `DispatchConsumed`
-    /// or `Verifying` gets the state `UnknownOutcome`.
+    /// or `Verifying` gets the state `UnknownOutcome`, and the result names
+    /// it in [`Restored::changed`].
     ///
     /// # Errors
     ///
@@ -237,8 +258,9 @@ impl ConsumedRequests {
         capacity: usize,
         retention: Nanoseconds,
         requests: impl IntoIterator<Item = ConsumedRequest>,
-    ) -> Result<Self, RecordError> {
+    ) -> Result<Restored<Self>, RecordError> {
         let mut record: Self = Self::new(capacity, retention)?;
+        let mut changed: Vec<StepKey> = Vec::new();
         for mut request in requests {
             // The lifetime that did the step is gone. A step that it did
             // not settle has no executor now, and its effect is not known:
@@ -250,10 +272,15 @@ impl ConsumedRequests {
                 StepState::DispatchConsumed | StepState::Verifying
             ) {
                 request.state = StepState::UnknownOutcome;
+                changed.push(request.key.clone());
             }
             record.insert(request)?;
         }
-        Ok(record)
+        changed.sort();
+        Ok(Restored {
+            state: record,
+            changed,
+        })
     }
 
     /// The capacity, in requests.

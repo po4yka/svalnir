@@ -518,6 +518,8 @@ impl DiscoveredCandidate {
     pub fn file_binding(&self) -> FileBinding {
         FileBinding {
             root_id: self.root.root_id.clone(),
+            root_path: self.root.path.clone(),
+            root_object: self.root.object,
             relative_entry: self.evidence.relative_entry.clone(),
             volume_id: self.root.volume_id.clone(),
             mount_id: self.root.mount_id.clone(),
@@ -525,6 +527,7 @@ impl DiscoveredCandidate {
             owner: self.evidence.owner,
             object: Some(self.evidence.object),
             rule: Some(self.candidate.rule.clone()),
+            layout: Some(self.candidate.layout.clone()),
             charge: self.measurement.charge,
         }
     }

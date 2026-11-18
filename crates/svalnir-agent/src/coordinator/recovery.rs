@@ -163,6 +163,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 }
                 (!results.is_empty()).then_some(results)
             }
+            // Admission refuses a plan with a process target, so no
+            // operation has one. The evidence settles nothing.
+            TargetBinding::Process(_) => None,
         }
     }
 

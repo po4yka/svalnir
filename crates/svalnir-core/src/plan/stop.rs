@@ -264,6 +264,13 @@ fn target_reasons(
 /// In each other case the result has no plan, and `preview.omitted` has
 /// the target with each reason. That result is not an error.
 ///
+/// A process with no verified membership is not a target of this builder,
+/// and the reason is `MembershipNotVerified`. The binding for one such
+/// process exists ([`TargetBinding::Process`]), and [`Plan::seal`] has its
+/// checks. This builder makes no plan with it, because this build has no
+/// executor step that revalidates and signals one process with no
+/// membership.
+///
 /// The steps are one graceful step, one graceful step and then one force
 /// step, or one force step, as the strategy says.
 ///

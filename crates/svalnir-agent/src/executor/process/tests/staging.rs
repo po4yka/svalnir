@@ -1668,3 +1668,32 @@ delegate_source!(ChangingOwner, |self, pid| {
     }
     Ok(info)
 });
+
+#[test]
+fn a_step_for_one_process_with_no_membership_gives_no_call() {
+    use svalnir_core::action::{ProcessBinding, TargetBinding};
+    // This executor signals the members of an application or of a managed
+    // job. An envelope with a process target is not one of its steps.
+    let host: Host = Host::new().with_process(100, 10);
+    for (class, escalation) in [
+        (ActionClass::RequestApplicationExit, Escalation::None),
+        (
+            ActionClass::ForceApplicationExit,
+            Escalation::ImmediateForce,
+        ),
+    ] {
+        let mut process: ProcessIdentity = member(100, 10, job());
+        let mut content = content(class, escalation, vec![process.clone()], USER);
+        process.association = ProcessAssociation::Unattributed;
+        content.target.binding = TargetBinding::Process(ProcessBinding { process });
+        let envelope: RequestEnvelope = Checked::new(content).unwrap();
+        assert_eq!(
+            host.executor()
+                .begin(input(&envelope, &receipt()))
+                .unwrap_err(),
+            ExecutorError::NotApplicationStep
+        );
+    }
+    assert_eq!(host.calls(), Vec::new());
+    assert_eq!(host.0.borrow().info_queries, 0);
+}

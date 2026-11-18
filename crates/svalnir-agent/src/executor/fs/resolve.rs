@@ -256,6 +256,14 @@ fn check_binding<'a>(
             code::OUTSIDE_APPROVED_ROOTS,
         )));
     };
+    // The sealed plan binds the path and the object of the root. A root
+    // record with the same identity and a different place is not the root
+    // that the approval is for.
+    if file.root_path != root.root.path || file.root_object != root.root.object {
+        return Err(Refusal::skipped(Cause::evidence(
+            code::APPROVED_ROOT_MISMATCH,
+        )));
+    }
     let Some(relative) = path_components(file.relative_entry.as_bytes(), false) else {
         return Err(Refusal::skipped(Cause::request(
             code::RELATIVE_ENTRY_INVALID,

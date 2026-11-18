@@ -401,7 +401,11 @@ pub fn resume(
 /// time and the monotonic expiry of each expired pause, in the boot and the
 /// clock domain of `clock`. A time of a different boot gives no floor: each
 /// measurement of the current boot is newer.
-pub(super) fn measurement_floor(
+///
+/// The authorization uses this floor. A component that keeps its own
+/// record of the trigger evidence, for example the guard controller, calls
+/// it also, so that the rule for an expired pause has one implementation.
+pub fn measurement_floor(
     state: &AuthorityState,
     inhibition: &InstanceInhibition,
     clock: &ControlClock<'_>,

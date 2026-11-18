@@ -5,14 +5,15 @@ use super::{
     BUILT_AT, Fixture, charge, clock_at, declaration, entry, manual_validated, path, planned,
     request, rule, trash,
 };
-use crate::action::Checked;
+use crate::action::{Checked, FileBinding, FileObjectType, TargetBinding};
+use crate::file::InodeNumber;
 use crate::id::{RootId, VolumeId};
 use crate::plan::{
-    CleanupEntry, ModeSelection, OmissionReason, PlanExplanation, PlanOutcome, TargetExplanation,
-    build_cleanup_plan, explain,
+    CleanupEntry, ModeSelection, OmissionReason, PlanBuildError, PlanExplanation, PlanOutcome,
+    TargetExplanation, build_cleanup_plan, explain,
 };
 use crate::policy::ProtectionFact;
-use crate::quantity::Bytes;
+use crate::quantity::{Bytes, EntryCount};
 use crate::rule::Rule;
 
 fn reasons(outcome: &PlanOutcome, name: &str) -> Vec<OmissionReason> {
@@ -184,4 +185,97 @@ fn a_target_of_a_trash_plan_has_no_estimate_of_reclaimable_bytes() {
         reclaimable(ModeSelection::Evict { rule: Ok(&rule) }),
         Some(Bytes::new(50))
     );
+}
+
+/// The file binding of the first target of the plan of an outcome.
+fn first_binding(outcome: &PlanOutcome) -> FileBinding {
+    match &outcome.plan.as_ref().unwrap().targets[0].binding {
+        TargetBinding::File(file) => file.clone(),
+        _ => panic!("the target is a file target"),
+    }
+}
+
+#[test]
+fn the_plan_binds_the_root_and_the_rule_layout_of_each_entry() {
+    let fixture: Fixture = Fixture::new();
+    let rule: Rule = rule();
+    let entries: [CleanupEntry; 1] = [entry("a", 100)];
+    let evidence = entries[0].rule.clone().unwrap();
+
+    // The `evict` mode binds the rule revision and the layout that the rule
+    // found for the entry.
+    let selection = ModeSelection::Evict { rule: Ok(&rule) };
+    let outcome: PlanOutcome =
+        build_cleanup_plan(&fixture.context(), &request(selection, &entries)).unwrap();
+    let file: FileBinding = first_binding(&outcome);
+    assert_eq!(file.root_path, entries[0].root_path);
+    assert_eq!(file.root_object, entries[0].root_object);
+    assert_eq!(file.rule, Some(evidence.rule));
+    assert_eq!(file.layout, Some(evidence.layout));
+
+    // A mode with no rule binds the root, no rule, and no layout.
+    let file: FileBinding = first_binding(&trash(&entries));
+    assert_eq!(file.root_path, entries[0].root_path);
+    assert_eq!(file.root_object, entries[0].root_object);
+    assert_eq!(file.rule, None);
+    assert_eq!(file.layout, None);
+
+    // One root identity has one root object.
+    let mut other: CleanupEntry = entry("b", 100);
+    other.root_object.inode = InodeNumber::new(9);
+    let entries: [CleanupEntry; 2] = [entry("a", 100), other];
+    assert_eq!(
+        build_cleanup_plan(&fixture.context(), &request(ModeSelection::Trash, &entries))
+            .unwrap_err(),
+        PlanBuildError::RootPath
+    );
+}
+
+#[test]
+fn the_evict_mode_leaves_out_a_hard_linked_object_of_a_rule_that_skips_them() {
+    let fixture: Fixture = Fixture::new();
+    let evict = |rule: &Rule, entries: &[CleanupEntry]| {
+        let selection = ModeSelection::Evict { rule: Ok(rule) };
+        build_cleanup_plan(&fixture.context(), &request(selection, entries)).unwrap()
+    };
+    let file = |id: &str, link_count: Option<u64>| {
+        let mut entry: CleanupEntry = entry(id, 100);
+        entry.object_type = FileObjectType::RegularFile;
+        entry.link_count = link_count.map(EntryCount::new);
+        entry
+    };
+    // The rule of the tests skips hard-linked objects.
+    let rule: Rule = rule();
+    assert!(rule.exclusions.skip_hard_linked);
+    let mut directory: CleanupEntry = entry("d", 100);
+    directory.link_count = Some(EntryCount::new(7));
+    let mut unknown_directory: CleanupEntry = entry("e", 100);
+    unknown_directory.link_count = None;
+    let entries: [CleanupEntry; 6] = [
+        file("a", Some(1)),
+        file("b", Some(2)),
+        file("c", None),
+        directory,
+        unknown_directory,
+        file("f", Some(0)),
+    ];
+    let outcome: PlanOutcome = evict(&rule, &entries);
+    // One name, and a directory with each link count: in the plan. The
+    // link count of a directory is the number of its subdirectories.
+    assert_eq!(planned(&outcome), ["target_a", "target_d", "target_e"]);
+    // Two names: a mandatory exclusion of the rule.
+    assert_eq!(reasons(&outcome, "b"), [OmissionReason::RuleExclusion]);
+    // A number that is not known is not one name.
+    assert_eq!(reasons(&outcome, "c"), [OmissionReason::LinkCountUnknown]);
+    // No name: the object was unlinked. Only a count of one is in the plan.
+    assert_eq!(reasons(&outcome, "f"), [OmissionReason::RuleExclusion]);
+
+    // A rule with a tested link-accounting contract does not skip them.
+    let mut declaration = declaration(manual_validated());
+    declaration.exclusions.skip_hard_linked = false;
+    let accounting: Rule = Checked::new(declaration).unwrap();
+    assert_eq!(planned(&evict(&accounting, &entries)).len(), entries.len());
+
+    // A mode with no rule has no rule exclusion.
+    assert_eq!(planned(&trash(&entries)).len(), entries.len());
 }

@@ -10,9 +10,7 @@ use std::fmt::Debug;
 use svalnir_core::action::{ApplicationBinding, Journal, Plan, StopFence, TargetBinding};
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
-use svalnir_core::id::{
-    ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, TargetId, VolumeId,
-};
+use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
 use svalnir_core::observation::Observation;
 use svalnir_core::plan::PlanMode;
 use svalnir_core::policy::{EvaluationClock, ProtectionFact};
@@ -97,10 +95,6 @@ pub trait AuthoritySource: Debug {
 
     /// The revisions in effect, for a plan of `mode`.
     fn revisions(&self, mode: PlanMode, time: &TimeReading) -> RevisionSnapshot;
-
-    /// The producer layout of a target that a rule selected. The plan
-    /// does not contain it.
-    fn layout(&self, plan: &Plan, target_id: &TargetId) -> Option<String>;
 
     /// The budget record of an incident.
     fn incident(&self, incident_id: &IncidentId) -> Option<IncidentBudget>;
@@ -243,6 +237,12 @@ impl<S: ProcessSource + Debug> TargetProbe for SystemProbe<S> {
         let Some(root) = self.roots.root(&file.root_id) else {
             return FileProbe::Unknown;
         };
+        // A root record that is not the root of the plan gives no
+        // conclusion: the entry name below a different directory is not
+        // the target.
+        if root.path != file.root_path || root.object != file.root_object {
+            return FileProbe::Unknown;
+        }
         // `st_dev` is a signed number, and the standard library gives it
         // with its sign extended.
         let is_object = |metadata: &std::fs::Metadata, object: &FileObjectEvidence| {

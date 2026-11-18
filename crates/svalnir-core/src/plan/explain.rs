@@ -25,7 +25,7 @@ use crate::id::{
     VolumeId,
 };
 use crate::policy::EvaluationClock;
-use crate::process::{Pid, Uid};
+use crate::process::{Pid, ProcessIdentity, Uid};
 use crate::quantity::{Bytes, Nanoseconds};
 use crate::rule::RuleRef;
 use crate::time::{MonotonicNanos, WallTime};
@@ -144,7 +144,8 @@ impl ExpiryView {
     }
 }
 
-/// One member of an application target.
+/// One member of an application target, or the process of a process
+/// target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemberView {
     /// The identity of the process generation.
@@ -196,6 +197,14 @@ pub enum TargetExplanation {
         membership: MembershipSnapshotId,
         /// The members. No other process is a target.
         members: Vec<MemberView>,
+    },
+    /// One process with no verified membership. No other process is a
+    /// target.
+    Process {
+        /// The identity of the target.
+        target_id: TargetId,
+        /// The process.
+        process: MemberView,
     },
 }
 
@@ -300,19 +309,24 @@ fn target_explanation(
             target_id: target.target_id.clone(),
             instance_id: application.instance_id.clone(),
             membership: application.membership.clone(),
-            members: application
-                .members
-                .iter()
-                .map(|member| MemberView {
-                    generation_id: member.generation_id.clone(),
-                    pid: member.pid,
-                    executable: member
-                        .executable
-                        .as_ref()
-                        .map(|executable| executable.path.clone()),
-                })
-                .collect(),
+            members: application.members.iter().map(member_view).collect(),
         },
+        TargetBinding::Process(binding) => TargetExplanation::Process {
+            target_id: target.target_id.clone(),
+            process: member_view(&binding.process),
+        },
+    }
+}
+
+/// The view of one process of a target.
+fn member_view(member: &ProcessIdentity) -> MemberView {
+    MemberView {
+        generation_id: member.generation_id.clone(),
+        pid: member.pid,
+        executable: member
+            .executable
+            .as_ref()
+            .map(|executable| executable.path.clone()),
     }
 }
 

@@ -13,7 +13,7 @@
 //!
 //! The builder of a plan is in [`crate::plan`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use super::budget::WorkCharge;
 use super::checked::{Check, Checked};
 use super::class::{ActionClass, TriggerClass};
 use super::state::PlanState;
-use crate::authority::AuthorityBinding;
+use crate::authority::{AuthorityBinding, required_option};
 use crate::digest::ContentDigest;
 use crate::encoding::wire_enum;
 use crate::file::{FileObjectEvidence, LosslessPath};
@@ -40,7 +40,13 @@ use crate::rule::RuleRef;
 use crate::time::{MonotonicNanos, WallTime};
 
 /// The schema version of a plan and of a request envelope.
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added the root path, the root object, and the rule layout to
+/// [`FileBinding`]. A plan or an envelope of version 1 is refused: it does
+/// not have these values, and this build does not make them from a
+/// default. A plan is valid for a short time in one boot, so there is no
+/// migration.
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// The largest number of targets and of steps in one plan.
 pub const MAX_PLAN_TARGETS: usize = 4096;
@@ -168,13 +174,25 @@ impl Validity {
 
 /// The binding of a file target.
 ///
-/// A display path is not in the binding: the entry is relative to an
-/// approved root that the agent holds the identity evidence of.
+/// A display path of the entry is not in the binding: the entry is
+/// relative to an approved root. The binding has the path and the native
+/// identifiers of that root, so the digest of the plan covers the place
+/// that the approval is for. The root record that an executor acts under
+/// must have the same path and the same object.
+///
+/// JSON has each field. A field with no value is `null`: a binding with
+/// a key that is absent is not decoded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileBinding {
     /// The approved root.
     pub root_id: RootId,
+    /// The absolute path of the approved root, with no `.` and no `..`
+    /// component. Each target of one root has the same root path.
+    pub root_path: LosslessPath,
+    /// The native identifiers of the root directory. Each target of one
+    /// root has the same root object.
+    pub root_object: FileObjectEvidence,
     /// The entry, relative to the root.
     pub relative_entry: LosslessPath,
     /// The volume of the entry.
@@ -187,12 +205,40 @@ pub struct FileBinding {
     pub owner: Uid,
     /// The native identifiers of the object. `None` means that the
     /// evidence is absent; the adapter decides whether it can act.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub object: Option<FileObjectEvidence>,
     /// The rule revision that selected the entry. `EvictRegenerableData`
     /// needs it.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub rule: Option<RuleRef>,
+    /// The producer layout that the rule found for the entry. A target
+    /// with a rule has it, and a target with no rule has none. The
+    /// lifecycle state of a rule is for one layout, so the authorization
+    /// reads the layout from here and not from its caller.
+    #[serde(deserialize_with = "required_option::deserialize")]
+    pub layout: Option<String>,
     /// The known conservative charge of the entry.
     pub charge: WorkCharge,
+}
+
+impl FileBinding {
+    /// Whether `other` names the same approved root with the same
+    /// evidence: the path and the object. The volume and the mount
+    /// generation are those of the entry, and an entry can be on a
+    /// different volume than a second entry of its root.
+    fn has_same_root(&self, other: &Self) -> bool {
+        self.root_path == other.root_path && self.root_object == other.root_object
+    }
+}
+
+/// True when `path` is absolute and has no `.` or `..` component. This is
+/// the rule of the plan builder for a root path.
+fn is_absolute_root(path: &LosslessPath) -> bool {
+    let bytes: &[u8] = path.as_bytes();
+    bytes.first() == Some(&b'/')
+        && bytes
+            .split(|byte| *byte == b'/')
+            .all(|component| component != b"." && component != b"..")
 }
 
 /// The binding of an application target: one verified application
@@ -280,11 +326,42 @@ impl ApplicationBinding {
     }
 }
 
+/// The binding of a process target: one process that has no verified
+/// membership in an application or a managed job, for example a process
+/// that a shell started.
+///
+/// The binding has the identity evidence of the process and nothing else.
+/// It has no member list: a child, a process with a similar name, and a
+/// process group are not targets. A process with a verified membership is
+/// a target only through its instance ([`ApplicationBinding`]), so that
+/// the member rules of the instance apply to it.
+///
+/// Only a manual plan has this binding. A guard selects an application or
+/// a job instance and never one process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBinding {
+    /// The process: its generation identity, its process ID, its start
+    /// time, its owner, its boot, and its executable.
+    pub process: ProcessIdentity,
+}
+
+impl ProcessBinding {
+    /// The hard protection of the process, from the catalog of the policy
+    /// module. It is the protection of an instance with this one member:
+    /// only `NotProtected` permits a step.
+    pub fn hard_protection(&self, context: &ProtectionContext<'_>) -> ProtectionFact {
+        hard_protection(std::slice::from_ref(&self.process), context)
+    }
+}
+
 /// The verified identity that a target is bound to.
 ///
 /// JSON encodes the binding as an object with a `kind` field. An unknown
 /// `kind` is rejected: a plan with a target that this build cannot bind is
-/// not executable.
+/// not executable. A build that does not know the kind `process` thus
+/// refuses a plan with a process target; it does not read the target as an
+/// application.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetBinding {
@@ -292,6 +369,8 @@ pub enum TargetBinding {
     File(FileBinding),
     /// An application or a managed job.
     Application(ApplicationBinding),
+    /// One process with no verified membership.
+    Process(ProcessBinding),
 }
 
 /// One target of a plan.
@@ -379,17 +458,21 @@ pub enum PlanError {
     /// no step.
     #[error("a step and a target do not refer to each other")]
     StepTarget,
-    /// The trigger cannot select an action class of the plan, or the
-    /// trigger identities do not agree with the trigger class.
+    /// The trigger cannot select an action class of the plan, the trigger
+    /// identities do not agree with the trigger class, or an automatic
+    /// plan has a process target.
     #[error("the trigger does not agree with the action classes")]
     Trigger,
     /// The steps mix action classes that one plan cannot have, or the
-    /// steps of an application do not agree with the force strategy.
+    /// steps of an application or of a process do not agree with the force
+    /// strategy.
     #[error("the steps do not agree with each other or with the force strategy")]
     Steps,
     /// The binding of a target does not agree with the action class of its
-    /// step, with the principal, or with its own evidence, or the charge
-    /// of a file target has no item.
+    /// step, with the principal, or with its own evidence, the charge of a
+    /// file target has no item, a rule target has no layout, the root path
+    /// of a file target is not absolute, or one root identity has two
+    /// roots.
     #[error("a target binding does not agree with its step or its evidence")]
     Binding,
     /// The limits are missing, are not finite, or are smaller than the sum
@@ -437,13 +520,28 @@ pub(super) fn check_file_binding(
     }
     let rule_agrees: bool =
         !matches!(class, ActionClass::EvictRegenerableData) || file.rule.is_some();
+    // The lifecycle state of a rule is for one layout. A rule target with
+    // no layout would get its layout from the caller of the authorization,
+    // and a layout with no rule has no meaning.
+    let layout_agrees: bool = match (&file.rule, &file.layout) {
+        (Some(_), Some(layout)) => !layout.is_empty(),
+        (None, None) => true,
+        _ => false,
+    };
+    let root_agrees: bool = is_absolute_root(&file.root_path);
     // The executor of the owning user changes only the objects of that
     // user.
     let owner_agrees: bool = !matches!(executor, ExecutorRole::User) || file.owner == principal;
     // An entry is a minimum of one item. A charge of no items would use
     // no part of an item limit, and it fits in an exhausted allowance.
     let charge_agrees: bool = file.charge.items != EntryCount::ZERO;
-    if class.is_filesystem() && rule_agrees && owner_agrees && charge_agrees {
+    if class.is_filesystem()
+        && rule_agrees
+        && layout_agrees
+        && root_agrees
+        && owner_agrees
+        && charge_agrees
+    {
         Ok(())
     } else {
         Err(PlanError::Binding)
@@ -485,6 +583,47 @@ pub(super) fn check_application_binding(
     Ok(())
 }
 
+/// The process ID of `launchd`.
+const LAUNCHD_PID: i32 = 1;
+
+/// The user ID of root.
+const ROOT_UID: u32 = 0;
+
+/// Checks the binding of a process target for a plan with the trigger
+/// `trigger`. These are the rules that need no observation; the catalog of
+/// hard protections applies in addition, at each boundary.
+///
+/// - The plan is manual, and the executor is the user executor.
+/// - The process has no verified membership.
+/// - The process is a process of `principal`, is not a process of root,
+///   and is not `launchd`.
+/// - The process has executable evidence: an executor cannot show that a
+///   process with the same process ID is the planned one without it.
+pub(super) fn check_process_binding(
+    binding: &ProcessBinding,
+    principal: Uid,
+    executor: &ExecutorRole,
+    trigger: &TriggerClass,
+) -> Result<(), PlanError> {
+    if !matches!(trigger, TriggerClass::Manual) {
+        return Err(PlanError::Trigger);
+    }
+    let process: &ProcessIdentity = &binding.process;
+    let is_single: bool = process.association.verified_membership().is_none();
+    let owner_agrees: bool = process.uid == principal && process.uid.get() != ROOT_UID;
+    let is_launchd: bool = process.pid.get() == LAUNCHD_PID;
+    if matches!(executor, ExecutorRole::User)
+        && is_single
+        && owner_agrees
+        && !is_launchd
+        && process.executable.is_some()
+    {
+        Ok(())
+    } else {
+        Err(PlanError::Binding)
+    }
+}
+
 /// Whether a step of `class` agrees with the force strategy and the grace
 /// period: a graceful step with `none` or `force_after_grace`, a force
 /// step with `force_after_grace` or `immediate_force`, and a grace period
@@ -521,18 +660,42 @@ impl PlanContent {
             .find(|target| &target.target_id == target_id)
     }
 
+    /// Checks that one root identity has one root: each file target that
+    /// names it has the same root path and the same root object. With
+    /// two, the identity would not say which place the approval is for.
+    fn check_roots(&self) -> Result<(), PlanError> {
+        let mut roots: BTreeMap<&RootId, &FileBinding> = BTreeMap::new();
+        for target in &self.targets {
+            if let TargetBinding::File(file) = &target.binding {
+                let first: &FileBinding = roots.entry(&file.root_id).or_insert(file);
+                if !first.has_same_root(file) {
+                    return Err(PlanError::Binding);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Checks that no two targets bind the same object: the same entry of
     /// one root, the same application instance, or the same process
     /// generation. Two target identities for one object would give two
     /// steps and two charges for one irreversible action.
     fn check_distinct_objects(&self) -> Result<(), PlanError> {
         let mut entries: BTreeSet<(&RootId, &[u8])> = BTreeSet::new();
+        // Two root identities can name one root. The root object then
+        // shows that the two entries are one object.
+        let mut placed: BTreeSet<(&FileObjectEvidence, &[u8])> = BTreeSet::new();
         let mut instances: BTreeSet<&ApplicationInstanceId> = BTreeSet::new();
         let mut generations: BTreeSet<&str> = BTreeSet::new();
         for target in &self.targets {
             let is_new: bool = match &target.binding {
                 TargetBinding::File(file) => {
-                    entries.insert((&file.root_id, file.relative_entry.as_bytes()))
+                    let entry: &[u8] = file.relative_entry.as_bytes();
+                    // The two sets get the entry also when the first one
+                    // has it.
+                    let new_in_root: bool = entries.insert((&file.root_id, entry));
+                    let new_in_place: bool = placed.insert((&file.root_object, entry));
+                    new_in_root && new_in_place
                 }
                 TargetBinding::Application(application) => {
                     instances.insert(&application.instance_id)
@@ -540,6 +703,10 @@ impl PlanContent {
                             .members
                             .iter()
                             .all(|member| generations.insert(member.generation_id.as_str()))
+                }
+                // A process is one target, as a member or by itself.
+                TargetBinding::Process(binding) => {
+                    generations.insert(binding.process.generation_id.as_str())
                 }
             };
             if !is_new {
@@ -590,7 +757,7 @@ impl PlanContent {
                 check_file_binding(class, file, self.principal.uid, &self.executor)?;
                 Ok(file.charge)
             }
-            TargetBinding::Application(application) => {
+            binding @ (TargetBinding::Application(_) | TargetBinding::Process(_)) => {
                 use ActionClass::{ForceApplicationExit, RequestApplicationExit};
                 let steps_agree: bool = match (&self.limits.escalation, classes.as_slice()) {
                     (Escalation::Unrecognized(_), _) => return Err(PlanError::Unrecognized),
@@ -606,7 +773,16 @@ impl PlanContent {
                 if !steps_agree {
                     return Err(PlanError::Steps);
                 }
-                check_application_binding(application, self.principal.uid, &self.executor)?;
+                let uid: Uid = self.principal.uid;
+                match binding {
+                    TargetBinding::Application(application) => {
+                        check_application_binding(application, uid, &self.executor)?;
+                    }
+                    TargetBinding::Process(process) => {
+                        check_process_binding(process, uid, &self.executor, &self.trigger.class)?;
+                    }
+                    TargetBinding::File(_) => return Err(PlanError::Binding),
+                }
                 Ok(WorkCharge::ZERO)
             }
         }
@@ -670,6 +846,7 @@ impl Check for PlanContent {
             }
         }
         self.check_distinct_objects()?;
+        self.check_roots()?;
         let mut step_ids: BTreeSet<&StepId> = BTreeSet::new();
         for step in &self.steps {
             if !step_ids.insert(&step.step_id) {

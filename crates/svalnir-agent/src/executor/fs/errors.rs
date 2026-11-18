@@ -27,6 +27,9 @@ pub mod code {
     pub const PRINCIPAL_MISMATCH: &str = "principal_mismatch";
     /// The root of the target is not an approved root.
     pub const OUTSIDE_APPROVED_ROOTS: &str = "outside_approved_roots";
+    /// The approved root with the identity of the target does not have
+    /// the path and the object that the plan binds for the root.
+    pub const APPROVED_ROOT_MISMATCH: &str = "approved_root_mismatch";
     /// The target is the home directory or a directory that contains it.
     pub const HOME_DIRECTORY_PROTECTED: &str = "home_directory_protected";
     /// The target is the approved root itself.
@@ -129,7 +132,8 @@ pub mod code {
     pub const BATCH_LIMIT: &str = "batch_limit";
 
     /// Each code of the executor.
-    pub const ALL: [&str; 50] = [
+    pub const ALL: [&str; 51] = [
+        APPROVED_ROOT_MISMATCH,
         TREE_ENTRY_OWNER_MISMATCH,
         BATCH_LIMIT,
         TRASH_ITEM_IDENTITY_MISMATCH,

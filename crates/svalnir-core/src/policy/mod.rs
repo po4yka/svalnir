@@ -37,6 +37,7 @@ mod control;
 mod describe;
 mod disk;
 mod evidence;
+mod file_protection;
 mod memory;
 mod protection;
 mod reason;
@@ -66,6 +67,9 @@ pub use disk::{
 pub use evidence::{
     CORROBORATING_MEMORY_METRICS, CorroboratingEvidence, EvaluationClock, EvidenceProblem,
     EvidenceReport,
+};
+pub use file_protection::{
+    FileProtectionContext, VIRTUAL_MEMORY_DIRECTORIES, file_hard_protection,
 };
 pub use memory::{
     AdmissionTrigger, ApplicationCandidate, ApplicationCooldown, ApplicationDecision,

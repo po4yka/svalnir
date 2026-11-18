@@ -2,8 +2,8 @@
 
 use super::super::{
     AcknowledgementLevel, AuthorityState, InstanceInhibition, MeasurementFloor, Pause, PauseBasis,
-    PauseRefusal, PauseRequest, PauseStatus, Persistence, ResumeRefusal, ResumeRequest, pause,
-    pause_status, resume,
+    PauseRefusal, PauseRequest, PauseStatus, Persistence, ResumeRefusal, ResumeRequest,
+    measurement_floor, pause, pause_status, resume,
 };
 use super::{SECOND, USER, clock, clock_in, control, durable, enabled_state, monotonic, wall};
 use crate::process::Uid;
@@ -384,5 +384,49 @@ fn a_resume_is_refused_for_another_user() {
         )
         .unwrap_err(),
         ResumeRefusal::WrongPrincipal
+    );
+}
+
+/// The floor is a public function of the module, so that the controller
+/// and the authorization use one rule.
+#[test]
+fn the_public_floor_is_the_latest_of_the_resume_and_each_expired_pause() {
+    let none = InstanceInhibition::default();
+    // A pause of one hour from second 100 is in effect at second 200: no
+    // floor.
+    let state = paused_for_an_hour();
+    let during = clock(200);
+    assert_eq!(
+        measurement_floor(&state, &none, &control(&during, 200)),
+        None
+    );
+    // After its expiry, the monotonic expiry is the floor.
+    let after = clock(100 + HOUR + 50);
+    assert_eq!(
+        measurement_floor(&state, &none, &control(&after, 100 + HOUR + 50)),
+        Some(monotonic(100 + HOUR))
+    );
+    // A later resume of this boot is a later floor.
+    let resumed = InstanceInhibition {
+        measurement_floor: Some(MeasurementFloor {
+            at: monotonic(100 + HOUR + 20),
+            clock_domain: after.clock_domain.clone(),
+            boot_id: after.boot_id.clone(),
+        }),
+        ..InstanceInhibition::default()
+    };
+    assert_eq!(
+        measurement_floor(&state, &resumed, &control(&after, 100 + HOUR + 50)),
+        Some(monotonic(100 + HOUR + 20))
+    );
+    // A resume of a different boot gives no floor.
+    let other_boot = clock_in("boot_2", 10);
+    assert_eq!(
+        measurement_floor(
+            &enabled_state(),
+            &resumed,
+            &control(&other_boot, 100 + HOUR + 50)
+        ),
+        None
     );
 }

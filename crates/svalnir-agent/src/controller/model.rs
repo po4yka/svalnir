@@ -514,6 +514,9 @@ pub struct PreparedCandidate {
     pub root_id: RootId,
     /// The path of the approved root.
     pub root_path: LosslessPath,
+    /// The native identifiers of the root directory. The plan binds them
+    /// with the root path.
+    pub root_object: FileObjectEvidence,
     /// The entry below the root.
     pub relative_entry: LosslessPath,
     /// The mount generation of the volume.
@@ -524,6 +527,10 @@ pub struct PreparedCandidate {
     pub owner: Option<Uid>,
     /// The object of the entry at the time of the evidence.
     pub object: Option<FileObjectEvidence>,
+    /// The number of names of the object (`st_nlink`), when it is known.
+    /// A rule that skips hard-linked objects needs it for an entry that is
+    /// not a directory.
+    pub link_count: Option<svalnir_core::quantity::EntryCount>,
     /// The work charge. `None` when it is not known.
     pub charge: Option<WorkCharge>,
     /// The size estimates.

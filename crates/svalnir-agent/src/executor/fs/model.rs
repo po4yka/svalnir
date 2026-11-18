@@ -538,8 +538,9 @@ pub struct ExecutionFault {
 }
 
 /// The result of one step: a target outcome, or the fault that prevented
-/// its record.
-pub type StepOutcome = Result<FsTargetOutcome, ExecutionFault>;
+/// its record. The fault is boxed: it has the work of the target, and it
+/// is the rare result.
+pub type StepOutcome = Result<FsTargetOutcome, Box<ExecutionFault>>;
 
 /// The result of one batch.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -135,7 +135,7 @@ pub trait FilesystemExecutor: Debug {
     /// Does one admitted step under `roots`.
     ///
     /// The caller reads its stop conditions before the call. The
-    /// executor reads `stop` between the entries of a directory target,
+    /// executor reads `signal` between the entries of a directory target,
     /// and issues no further call after a stop. A stopped directory
     /// target has one of these results: `Skipped` with no submission (no
     /// call was issued), `UnknownOutcome` with a submission and the stop
@@ -150,7 +150,7 @@ pub trait FilesystemExecutor: Debug {
         &self,
         roots: &ApprovedRoots,
         step: AdmittedStep<'_>,
-        stop: &dyn StopSignal,
+        signal: &dyn StopSignal,
     ) -> StepOutcome;
 }
 
@@ -159,9 +159,9 @@ impl FilesystemExecutor for FsExecutor {
         &self,
         roots: &ApprovedRoots,
         step: AdmittedStep<'_>,
-        stop: &dyn StopSignal,
+        signal: &dyn StopSignal,
     ) -> StepOutcome {
-        self.execute_step_until(roots, step, stop)
+        self.execute_step_until(roots, step, signal)
     }
 }
 

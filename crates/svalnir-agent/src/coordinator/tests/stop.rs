@@ -344,11 +344,11 @@ impl super::super::FilesystemExecutor for Gate {
         &self,
         roots: &crate::executor::fs::ApprovedRoots,
         step: crate::executor::fs::AdmittedStep<'_>,
-        stop: &dyn crate::executor::fs::StopSignal,
+        signal: &dyn crate::executor::fs::StopSignal,
     ) -> crate::executor::fs::StepOutcome {
         self.entered.lock().unwrap().send(()).unwrap();
         self.release.lock().unwrap().recv().unwrap();
-        self.inner.execute_step_until(roots, step, stop)
+        self.inner.execute_step_until(roots, step, signal)
     }
 }
 
@@ -505,7 +505,7 @@ impl super::super::FilesystemExecutor for CancelInside {
         &self,
         roots: &crate::executor::fs::ApprovedRoots,
         step: crate::executor::fs::AdmittedStep<'_>,
-        stop: &dyn crate::executor::fs::StopSignal,
+        inner_signal: &dyn crate::executor::fs::StopSignal,
     ) -> crate::executor::fs::StepOutcome {
         let signal = || {
             let reading = self
@@ -516,7 +516,7 @@ impl super::super::FilesystemExecutor for CancelInside {
             {
                 handle.cancel(operation_id);
             }
-            stop.check()
+            inner_signal.check()
         };
         self.inner.execute_step_until(roots, step, &signal)
     }

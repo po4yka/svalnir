@@ -675,7 +675,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 // The calls of the target ran before the fault: their
                 // work is in the totals of the operation.
                 add_work(&mut active.work, &fault.work);
-                Self::faulted(active, step, fault)
+                Self::faulted(active, step, *fault)
             }
         }
     }
@@ -760,9 +760,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let outcome: StepOutcome = {
             let active: &Active = active;
             let signal = || -> Option<Stop> {
-                let stop: Stop = stop_signal_of(&self.final_check(active, step)?);
-                stopped.set(Some(stop.stop_reason()));
-                Some(stop)
+                let halt: Stop = stop_signal_of(&self.final_check(active, step)?);
+                stopped.set(Some(halt.stop_reason()));
+                Some(halt)
             };
             self.filesystem.execute(&active.roots, admitted, &signal)
         };

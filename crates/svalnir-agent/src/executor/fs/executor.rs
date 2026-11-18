@@ -173,12 +173,14 @@ fn seal(step: &AdmittedStep<'_>, draft: Draft) -> StepOutcome {
     let envelope = step.envelope();
     // The fault keeps the work and the Trash item of the draft: the
     // calls ran, and only the record of them was rejected.
-    let fault = |dispatch: &DispatchState, reason| ExecutionFault {
-        target_id: step.target_id().clone(),
-        dispatch: dispatch.clone(),
-        reason,
-        work: draft.work,
-        trash_item: draft.trash_item.clone(),
+    let fault = |dispatch: &DispatchState, reason| {
+        Box::new(ExecutionFault {
+            target_id: step.target_id().clone(),
+            dispatch: dispatch.clone(),
+            reason,
+            work: draft.work,
+            trash_item: draft.trash_item.clone(),
+        })
     };
     let failure = match &draft.failure {
         Some((cause, stage)) => Some(

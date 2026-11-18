@@ -17,25 +17,24 @@ use super::{
 };
 use svalnir_core::action::Durability;
 
-/// Each envelope of `changes` has one field that is not the field of the
+/// Each envelope of `edits` has one field that is not the field of the
 /// stored plan. The journal refuses each one, records no intent, and then
 /// takes the envelope of the plan.
-fn refuses_each(
-    plan: &svalnir_core::action::Plan,
-    step: &str,
-    changes: Vec<(&str, Box<dyn Fn(&mut EnvelopeContent)>)>,
-) {
+/// A named change of the content of an envelope.
+type Edit = (&'static str, Box<dyn Fn(&mut EnvelopeContent)>);
+
+fn refuses_each(plan: &svalnir_core::action::Plan, step: &str, edits: Vec<Edit>) {
     let fixture = Fixture::new();
     let mut journal = fixture.open();
     let operation = admit(&mut journal, plan, "operation_1", "epoch_1");
-    for (name, change) in changes {
+    for (name, edit) in edits {
         let mut content: EnvelopeContent = envelope_content(plan, &operation, step);
-        change(&mut content);
-        let changed = Checked::new(content).unwrap_or_else(|error| {
+        edit(&mut content);
+        let refused = Checked::new(content).unwrap_or_else(|error| {
             panic!("the changed envelope `{name}` is not a valid envelope: {error}")
         });
         assert_eq!(
-            journal.commit_intent(&changed),
+            journal.commit_intent(&refused),
             Err(JournalError::Conflict),
             "{name}"
         );

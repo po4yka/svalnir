@@ -184,7 +184,7 @@ impl super::super::FilesystemExecutor for FaultAfterWork {
     ) -> crate::executor::fs::StepOutcome {
         use svalnir_core::quantity::Bytes;
 
-        Err(crate::executor::fs::ExecutionFault {
+        Err(Box::new(crate::executor::fs::ExecutionFault {
             target_id: svalnir_core::id::TargetId::new("plan_1_target_a").unwrap(),
             dispatch: DispatchState::Submitted,
             reason: crate::executor::fs::FaultReason::Record(
@@ -198,7 +198,7 @@ impl super::super::FilesystemExecutor for FaultAfterWork {
                 ..crate::executor::fs::ProcessedWork::default()
             },
             trash_item: None,
-        })
+        }))
     }
 }
 

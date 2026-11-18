@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(stop_of(libc::SIGTERM), Some(StopSignal::Terminate));
         // The request of the process is not read as a signal.
         assert_eq!(stop_of(STOP_REQUESTED), Some(StopSignal::Requested));
-        assert!(STOP_REQUESTED != libc::SIGINT && STOP_REQUESTED != libc::SIGTERM);
+        const { assert!(STOP_REQUESTED != libc::SIGINT && STOP_REQUESTED != libc::SIGTERM) };
     }
 
     #[test]

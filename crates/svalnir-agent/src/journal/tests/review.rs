@@ -237,3 +237,40 @@ fn the_observations_of_an_operation_are_recorded_and_go_with_it() {
         .unwrap();
     assert_eq!(rows, 0);
 }
+
+/// A stored plan of a different schema version is refused with its own
+/// error before a field of it is read, and a plan of this version reads
+/// back unchanged.
+#[test]
+fn a_stored_plan_of_a_different_schema_version_is_refused_by_its_version() {
+    use super::super::OperationJournalError;
+    use svalnir_core::action::PLAN_SCHEMA_VERSION;
+
+    let fixture = Fixture::new();
+    let mut journal = fixture.open();
+    let plan = file_plan("plan_1", 1);
+    journal.record_plan(&plan).unwrap();
+    assert_eq!(journal.try_plan(&plan.plan_id).unwrap(), Some(plan.clone()));
+
+    for version in [1, 2, PLAN_SCHEMA_VERSION + 1] {
+        // A plan of version 1 has no root path and no budget generation:
+        // the field is removed, so only the number refuses it.
+        journal
+            .connection
+            .execute(
+                "UPDATE plan SET content = json_remove(json_set(content, \
+                 '$.content.schema_version', ?1), '$.content.trigger.budget_generation')",
+                [version],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                journal.try_plan(&plan.plan_id),
+                Err(OperationJournalError::PlanVersion { found, supported })
+                    if found == version && supported == PLAN_SCHEMA_VERSION
+            ),
+            "{version}"
+        );
+        assert_eq!(journal.plan(&plan.plan_id), Err(JournalError::Corrupt));
+    }
+}

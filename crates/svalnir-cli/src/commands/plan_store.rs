@@ -23,10 +23,16 @@ use svalnir_core::volume::VolumeIdentity;
 
 use super::operation_view::Measurements;
 use crate::environment::Environment;
-use crate::output::{ErrorBody, ErrorFamily, ErrorStage};
+use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 
-/// The version of the document format.
-const DOCUMENT_VERSION: u32 = 1;
+/// The version of the document format. A development build has one
+/// format: a document of a different version is refused, with no
+/// migration.
+const DOCUMENT_VERSION: u32 = 2;
+
+/// The code of a stored plan or plan document of a different schema
+/// version.
+pub(crate) const PLAN_VERSION_NOT_SUPPORTED: &str = "plan_version_not_supported";
 
 /// The largest document that this client reads.
 const MAX_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
@@ -126,6 +132,26 @@ fn store_error(detail: &str) -> ErrorBody {
     )
 }
 
+/// The refusal of a stored plan or plan document of a different schema
+/// version. This build has no migration: the user makes a new plan.
+pub(crate) fn plan_version_not_supported(record: &str) -> ErrorBody {
+    ErrorBody::new(
+        PLAN_VERSION_NOT_SUPPORTED,
+        ErrorFamily::Request,
+        ErrorStage::Storage,
+        format!(
+            "the {record} has a schema version that this build does not read, and there is no migration; make a new plan with `svalnir clean plan` or `svalnir processes stop`; the command made no change"
+        ),
+    )
+    .with_next_action(NextAction::PrepareNewPlan)
+}
+
+/// The schema version of a document, read before the document itself.
+#[derive(Deserialize)]
+struct VersionProbe {
+    schema_version: u32,
+}
+
 fn plan_path(environment: &Environment, plan_id: &PlanId) -> Result<PathBuf, ErrorBody> {
     Ok(environment
         .plan_directory()?
@@ -202,8 +228,13 @@ fn write_file<T: Serialize>(path: &Path, document: &T) -> Result<(), ErrorBody> 
     })
 }
 
-/// Reads a document. `Ok(None)` when the file does not exist.
-fn read_document<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, ErrorBody> {
+/// Reads a document. `Ok(None)` when the file does not exist. A document
+/// of a different version is the error of `other_version`; no field of it
+/// is read.
+fn read_document<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    other_version: impl FnOnce() -> ErrorBody,
+) -> Result<Option<T>, ErrorBody> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -228,6 +259,11 @@ fn read_document<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>,
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_DOCUMENT_BYTES {
         return Err(store_error("is too large"));
     }
+    if serde_json::from_slice::<VersionProbe>(&bytes)
+        .is_ok_and(|probe| probe.schema_version != DOCUMENT_VERSION)
+    {
+        return Err(other_version());
+    }
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|_| store_error("is not readable by this build"))
@@ -246,15 +282,15 @@ pub(crate) fn save_plan(
 }
 
 /// Reads the document of a plan. A document of a different plan identity
-/// or of a format that this build does not know is not used.
+/// is not used. A document of a different version is refused.
 pub(crate) fn load_plan(
     environment: &Environment,
     plan_id: &PlanId,
 ) -> Result<Option<PlanDocument>, ErrorBody> {
-    let document: Option<PlanDocument> = read_document(&plan_path(environment, plan_id)?)?;
-    Ok(document.filter(|document| {
-        document.schema_version == DOCUMENT_VERSION && &document.plan_id == plan_id
-    }))
+    let document: Option<PlanDocument> = read_document(&plan_path(environment, plan_id)?, || {
+        plan_version_not_supported("plan document of this client")
+    })?;
+    Ok(document.filter(|document| &document.plan_id == plan_id))
 }
 
 /// Writes the stop record of a process generation.
@@ -271,16 +307,16 @@ pub(crate) fn load_stop(
     environment: &Environment,
     target: &ProcessGenerationId,
 ) -> Result<Option<StopRecord>, ErrorBody> {
-    let record: Option<StopRecord> = read_document(&stop_path(environment, target)?)?;
+    // A record that this build cannot interpret is not "no record": an
+    // earlier request possibly sent a signal, so it permits no new plan.
+    let different = || {
+        store_error(
+            "of an earlier stop request is of a different format; this build makes no second plan for the process",
+        )
+    };
+    let record: Option<StopRecord> = read_document(&stop_path(environment, target)?, different)?;
     match record {
-        // A record that this build cannot interpret is not "no record":
-        // an earlier request possibly sent a signal, so it permits no
-        // new plan.
-        Some(record) if record.schema_version != DOCUMENT_VERSION || &record.target != target => {
-            Err(store_error(
-                "of an earlier stop request is of a different format; this build makes no second plan for the process",
-            ))
-        }
+        Some(record) if &record.target != target => Err(different()),
         other => Ok(other),
     }
 }

@@ -41,12 +41,14 @@ use crate::time::{MonotonicNanos, WallTime};
 
 /// The schema version of a plan and of a request envelope.
 ///
-/// Version 2 added the root path, the root object, and the rule layout to
-/// [`FileBinding`]. A plan or an envelope of version 1 is refused: it does
-/// not have these values, and this build does not make them from a
-/// default. A plan is valid for a short time in one boot, so there is no
-/// migration.
-pub const PLAN_SCHEMA_VERSION: u32 = 2;
+/// A development build has one plan schema: this version. A plan or an
+/// envelope of a different version is refused, and no value is made from
+/// a default. There is no migration and no compatibility code: the user
+/// makes a new plan. A plan is valid for a short time in one boot.
+///
+/// Version 3 added the budget generation to [`Trigger`] and the target of
+/// one process.
+pub const PLAN_SCHEMA_VERSION: u32 = 3;
 
 /// The largest number of targets and of steps in one plan.
 pub const MAX_PLAN_TARGETS: usize = 4096;

@@ -194,6 +194,9 @@ pub(crate) fn journal_error(error: &OperationJournalError) -> ErrorBody {
             ErrorFamily::Evidence,
             "the journal has no such record",
         ),
+        OperationJournalError::PlanVersion { .. } => {
+            return super::plan_store::plan_version_not_supported("stored plan");
+        }
         _ => (
             "journal_unavailable",
             ErrorFamily::Recording,

@@ -108,6 +108,18 @@ pub enum OperationJournalError {
         #[source]
         source: serde_json::Error,
     },
+    /// A stored plan has a plan schema version that is not that of this
+    /// build. There is no migration: the user makes a new plan.
+    #[error(
+        "the stored plan has schema version {found}, and this build reads version {supported} \
+         only; make a new plan"
+    )]
+    PlanVersion {
+        /// The version that the stored plan records.
+        found: u32,
+        /// The version of this build.
+        supported: u32,
+    },
     /// A record cannot be encoded as JSON.
     #[error("a record cannot be encoded")]
     Encode(#[source] serde_json::Error),
@@ -203,7 +215,7 @@ impl OperationJournalError {
     /// | --- | --- |
     /// | Full, admission stopped, queue full | `Full` |
     /// | A failed file operation or synchronization | `Sync` |
-    /// | Corrupt file, record that cannot be decoded, value out of range | `Corrupt` |
+    /// | Corrupt file, record that cannot be decoded, plan of a different schema version, value out of range | `Corrupt` |
     /// | A locked database (`Busy`), `NotFound`, `Conflict`, `Expired`, `Sequence` | The same name |
     /// | Each other failure | `Unavailable` |
     pub fn to_journal_error(&self) -> JournalError {
@@ -212,9 +224,10 @@ impl OperationJournalError {
                 JournalError::Full
             }
             Self::Io(_) | Self::File(_) => JournalError::Sync,
-            Self::Corrupt(_) | Self::Decode { .. } | Self::InvalidRow { .. } => {
-                JournalError::Corrupt
-            }
+            Self::Corrupt(_)
+            | Self::Decode { .. }
+            | Self::PlanVersion { .. }
+            | Self::InvalidRow { .. } => JournalError::Corrupt,
             Self::Busy(_) => JournalError::Busy,
             Self::NotFound => JournalError::NotFound,
             Self::Conflict => JournalError::Conflict,

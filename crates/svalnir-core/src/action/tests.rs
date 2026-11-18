@@ -510,7 +510,7 @@ fn a_plan_round_trips_and_a_changed_plan_is_rejected() {
         let plan = seal(content);
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["digest"], json!(plan.digest().as_str()));
-        assert_eq!(value["content"]["schema_version"], json!(2));
+        assert_eq!(value["content"]["schema_version"], json!(3));
         assert_eq!(serde_json::from_value::<Plan>(value).unwrap(), plan);
     }
 
@@ -574,7 +574,8 @@ fn a_filesystem_plan_that_does_not_agree_with_itself_is_rejected() {
     let base = || file_content(&EvictRegenerableData);
     let cases: Vec<(PlanError, PlanChange)> = vec![
         (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 1)),
-        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 3)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 2)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 4)),
         (PlanError::Count, Box::new(|c| c.targets.clear())),
         (PlanError::Count, Box::new(|c| c.steps.clear())),
         (

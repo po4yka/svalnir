@@ -3,8 +3,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use svalnir_core::action::{
     ActionError, Admission, DispatchConsumption, DispatchReceipt, DispatchState, Durability,
-    Journal, JournalError, Operation, OperationState, Plan, PlanApproval, Principal,
-    RequestEnvelope, Step, StepState,
+    Journal, JournalError, Operation, OperationState, PLAN_SCHEMA_VERSION, Plan, PlanApproval,
+    Principal, RequestEnvelope, Step, StepState,
 };
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::id::{OperationId, PlanId, StepId};
@@ -50,6 +50,32 @@ fn find_plan(
             },
         )
         .optional()?)
+}
+
+/// The schema version of a stored plan, read before the plan itself.
+#[derive(serde::Deserialize)]
+struct PlanVersionProbe {
+    content: PlanVersionContent,
+}
+
+#[derive(serde::Deserialize)]
+struct PlanVersionContent {
+    schema_version: u32,
+}
+
+/// Decodes a stored plan. A plan of a different schema version is
+/// [`OperationJournalError::PlanVersion`]: this build has no migration and
+/// reads no field of it.
+fn decode_plan(content: &str) -> Result<Plan, OperationJournalError> {
+    if let Ok(probe) = serde_json::from_str::<PlanVersionProbe>(content)
+        && probe.content.schema_version != PLAN_SCHEMA_VERSION
+    {
+        return Err(OperationJournalError::PlanVersion {
+            found: probe.content.schema_version,
+            supported: PLAN_SCHEMA_VERSION,
+        });
+    }
+    decode("plan", content)
 }
 
 fn find_consumption(
@@ -290,7 +316,7 @@ impl OperationJournal {
         let Some(stored) = find_plan(&self.connection, plan_id)? else {
             return Ok(None);
         };
-        let plan: Plan = decode("plan", &stored.content)?;
+        let plan: Plan = decode_plan(&stored.content)?;
         if &plan.plan_id == plan_id && plan.digest().as_str() == stored.digest {
             Ok(Some(plan))
         } else {
@@ -338,7 +364,7 @@ impl OperationJournal {
         if row::find_operation(&transaction, operation.operation_id())?.is_some() {
             return Err(OperationJournalError::Conflict);
         }
-        let plan: Plan = decode("plan", &stored.content)?;
+        let plan: Plan = decode_plan(&stored.content)?;
         check_new_admission(&plan, operation)?;
         coordination::check_work_gate(&transaction, operation.executor_epoch())?;
         check_admission_capacity(&transaction, path, limits)?;

@@ -1928,6 +1928,68 @@ fn a_plan_document_that_names_a_different_root_is_not_used() {
     assert!(!show.stdout.contains("/other"), "{}", show.stdout);
 }
 
+/// A plan document of a different version is refused with a stable code,
+/// and no field of it is read. A document of this version is used.
+#[test]
+fn a_plan_document_of_a_different_version_is_refused() {
+    let (world, tree, plan) = World::with_plan("permanent");
+    let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
+    assert_eq!(show.status, ExitStatus::Success, "{}", show.stdout);
+    assert_eq!(show.result()["plan_document"], "used");
+    let document: PathBuf = world
+        .path("state")
+        .join("plans")
+        .join(format!("plan-{plan}.json"));
+    // Version 1 had no cleanup roots: the field is removed, so only the
+    // number refuses the document.
+    let text: String = std::fs::read_to_string(&document).unwrap();
+    let mut value: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    value["schema_version"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("roots");
+    std::fs::write(&document, serde_json::to_string(&value).unwrap()).unwrap();
+    for arguments in [
+        &["clean", "show", "--plan", &plan][..],
+        &["clean", "apply", "--plan", &plan, "--yes"][..],
+    ] {
+        let refused = json(&world.environment, arguments);
+        assert_eq!(refused.status, ExitStatus::Usage, "{}", refused.stdout);
+        assert_eq!(refused.error_code(), "plan_version_not_supported");
+        assert_eq!(
+            refused.envelope()["error"]["next_action"],
+            "prepare_new_plan"
+        );
+        assert!(
+            refused.envelope()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("make a new plan"),
+            "{}",
+            refused.stdout
+        );
+    }
+    assert_eq!(entries(&tree).len(), 3);
+}
+
+/// A stored plan of a different schema version in the journal has the
+/// same code as a plan document of a different version.
+#[test]
+fn a_stored_plan_of_a_different_version_has_the_stable_code() {
+    let error = crate::commands::session::journal_error(
+        &svalnir_agent::journal::OperationJournalError::PlanVersion {
+            found: 1,
+            supported: svalnir_core::action::PLAN_SCHEMA_VERSION,
+        },
+    );
+    assert_eq!(&*error.code, "plan_version_not_supported");
+    assert!(error.message.contains("stored plan"), "{}", error.message);
+    assert!(
+        error.message.contains("make a new plan"),
+        "{}",
+        error.message
+    );
+}
+
 /// A standard output whose reader closed the pipe.
 struct ClosedPipe;
 

@@ -816,6 +816,11 @@ pub(crate) fn load_plan(
             }
             Ok(Some(_)) => (None, DocumentState::Disagrees),
             Ok(None) => (None, DocumentState::Absent),
+            // A document of a different version is refused, as a stored
+            // plan of a different version is: there is no migration.
+            Err(error) if &*error.code == plan_store::PLAN_VERSION_NOT_SUPPORTED => {
+                return Err(error.with_plan(plan_id.as_str()));
+            }
             Err(_) => (None, DocumentState::NotReadable),
         };
     Ok(StoredPlan {

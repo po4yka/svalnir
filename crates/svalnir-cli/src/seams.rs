@@ -61,6 +61,10 @@ pub(crate) fn examined_agent_program(own: &Path, uid: u32) -> Result<PathBuf, Pr
 
     /// The write permission of the group and of each user.
     const WRITE_BY_OTHERS: u32 = 0o022;
+    /// The write permission of each user.
+    const WRITE_BY_EACH_USER: u32 = 0o002;
+    /// The sticky bit: only the owner of an entry can rename or remove it.
+    const STICKY: u32 = 0o1000;
     /// The execute permission of the owner.
     const EXECUTE_BY_OWNER: u32 = 0o100;
 
@@ -86,7 +90,20 @@ pub(crate) fn examined_agent_program(own: &Path, uid: u32) -> Result<PathBuf, Pr
     let trusted = |metadata: &std::fs::Metadata| {
         (metadata.uid() == uid || metadata.uid() == 0) && metadata.mode() & WRITE_BY_OTHERS == 0
     };
-    if trusted(&file) && trusted(&directory) {
+    // A directory above can be renamed by a user who can write its
+    // parent. Each one must have this user or the superuser as owner, and
+    // each user can write it only when it has the sticky bit. The write
+    // permission of a group is accepted there: the system gives it to
+    // directories such as `/Applications`.
+    let ancestors_trusted = || {
+        program.ancestors().skip(2).all(|ancestor| {
+            ancestor.symlink_metadata().is_ok_and(|metadata| {
+                (metadata.uid() == uid || metadata.uid() == 0)
+                    && (metadata.mode() & WRITE_BY_EACH_USER == 0 || metadata.mode() & STICKY != 0)
+            })
+        })
+    };
+    if trusted(&file) && trusted(&directory) && ancestors_trusted() {
         Ok(program)
     } else {
         Err(ProgramProblem::NotTrusted)
@@ -563,6 +580,18 @@ mod tests {
             Err(ProgramProblem::NotTrusted)
         );
         set_mode(&bin, 0o755);
+
+        // Each user can write a directory above, so each user can put a
+        // different directory in the place of the examined one.
+        set_mode(directory.path(), 0o777);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotTrusted)
+        );
+        // With the sticky bit, only the owner can rename the entry.
+        set_mode(directory.path(), 0o1777);
+        assert!(examined_agent_program(&own, uid).is_ok());
+        set_mode(directory.path(), 0o755);
 
         // The owner is a different user.
         assert_eq!(

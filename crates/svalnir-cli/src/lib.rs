@@ -106,7 +106,16 @@ where
         Err(CommandFailure::Output(error)) => finish(Err(error), ExitStatus::Success, stderr),
         // The result of an operation has its own status. A closed pipe
         // does not change it.
-        Err(CommandFailure::OutputAfter { error, status }) => finish(Err(error), status, stderr),
+        Err(CommandFailure::OutputAfter { error, status }) => {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                // No other stream is available if this write fails.
+                drop(writeln!(
+                    stderr,
+                    "error: cannot write the result: {error}; the exit status is that of the operation"
+                ));
+            }
+            status
+        }
         Err(CommandFailure::Rejected(error)) => {
             let status: ExitStatus = error.exit_status();
             let written = report_error(

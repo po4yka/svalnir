@@ -339,13 +339,6 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
     let start = start_coordinator(input.environment, &database, &epoch, dependencies)?;
     match start {
         Start::Coordinating(mut coordinator) => {
-            // The operations of an earlier executor lifetime are
-            // reconciled before a new admission.
-            let mut steps: u32 = 0;
-            while coordinator.reconciliation_pending() && steps < MAX_RECONCILIATION_STEPS {
-                steps = steps.saturating_add(1);
-                coordinator.step();
-            }
             // The client read the authority record before the approval
             // question, and a different client can change the record
             // while the question waits. The admission uses the record
@@ -358,6 +351,13 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
                         return Err(error);
                     }
                 };
+            // The operations of an earlier executor lifetime are
+            // reconciled before a new admission.
+            let mut steps: u32 = 0;
+            while coordinator.reconciliation_pending() && steps < MAX_RECONCILIATION_STEPS {
+                steps = steps.saturating_add(1);
+                coordinator.step();
+            }
             let outcome: ApplyOutcome = coordinator.apply(ApplyRequest {
                 approval,
                 principal,
@@ -407,9 +407,14 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
     }
 }
 
-/// The longest time in which a transient coordinator continues with an
-/// authority record that it cannot read again.
+/// The longest time in which a transient coordinator waits for an
+/// authority record that it cannot read again. It runs no step in that
+/// time, and after it the coordinator has no authority.
 const AUTHORITY_READ_GRACE: Duration = Duration::from_secs(2);
+
+/// The time before a transient coordinator reads the authority record
+/// again after a read that failed.
+const AUTHORITY_READ_RETRY: Duration = Duration::from_millis(50);
 
 /// Reads the authority record of the journal into the records of the
 /// coordinator and returns the revision of the record.
@@ -434,9 +439,10 @@ fn read_authority_record(
         }
         None => {
             authority.records().state = None;
-            journal
-                .agent_record_revision(AgentRecord::Authority)
-                .map_err(|error| journal_error(&error))
+            // A journal with no record has the revision 0, so the first
+            // record that a client writes changes the revision and is
+            // read.
+            Ok(0)
         }
     }
 }
@@ -488,9 +494,12 @@ impl Running {
     /// Does one unit of work and waits for the next one when there is
     /// none now.
     fn advance(&mut self) {
-        // The record is read before the step, so a step never uses a
-        // record that is older than the step before it.
-        self.refresh_authority();
+        // The record is read before the step. A step does not run with a
+        // record that this read did not confirm.
+        if !self.refresh_authority() {
+            std::thread::sleep(AUTHORITY_READ_RETRY);
+            return;
+        }
         let progress: Progress = self.coordinator.step();
         if !progress.worked {
             ThreadIdle::new(Arc::clone(&self.clock)).idle(progress.wake_at);
@@ -504,7 +513,10 @@ impl Running {
     /// A record that cannot be read is not authority. After
     /// [`AUTHORITY_READ_GRACE`] with no read, the coordinator has no
     /// record and refuses each later step, until a read has a result.
-    fn refresh_authority(&mut self) {
+    ///
+    /// Returns false when the record was not read and the coordinator
+    /// still has an earlier record: the caller then runs no step.
+    fn refresh_authority(&mut self) -> bool {
         let journal: &OperationJournal = self.coordinator.journal();
         let read: Result<(), ErrorBody> = journal
             .agent_record_revision(AgentRecord::Authority)
@@ -518,13 +530,17 @@ impl Running {
                 })
             });
         match read {
-            Ok(()) => self.authority_read_at = Instant::now(),
+            Ok(()) => {
+                self.authority_read_at = Instant::now();
+                true
+            }
             Err(_) if self.authority_read_at.elapsed() >= AUTHORITY_READ_GRACE => {
                 self.authority.records().state = None;
                 // The next read that has a result sets the record again.
                 self.authority_revision = u64::MAX;
+                true
             }
-            Err(_) => {}
+            Err(_) => false,
         }
     }
 
@@ -572,7 +588,10 @@ impl Running {
         // that work before it stops: an operation that it leaves is never
         // dispatched again.
         while started.elapsed() < MAX_COMPLETION_TIME {
-            self.refresh_authority();
+            if !self.refresh_authority() {
+                std::thread::sleep(AUTHORITY_READ_RETRY);
+                continue;
+            }
             let progress: Progress = self.coordinator.step();
             if !progress.worked && progress.wake_at.is_none() {
                 break;

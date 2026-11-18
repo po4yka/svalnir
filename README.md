@@ -555,7 +555,7 @@ GPUI is actively developed and documents breaking changes before 1.0. The implem
 | `svalnir-cli` | Argument parsing, rendering, structured output, and calls into the shared application services |
 | `svalnir-gui` | GPUI views, interaction, notifications, and client state |
 
-The workspace contains these five crates under `crates/`. Only the CLI argument and output contract is implemented; the table gives the intended responsibility of each crate. macOS-specific bindings initially live behind internal platform modules; they can become a separate crate when the boundary is useful. Optional system extensions remain separate deployable components.
+The workspace contains these five crates under `crates/`. The table gives the intended responsibility of each crate; [Development and validation](#development-and-validation) states what the Milestone 2 build has, and that build is not packaged and not validated. macOS-specific bindings initially live behind internal platform modules; they can become a separate crate when the boundary is useful. Optional system extensions remain separate deployable components.
 
 ```mermaid
 flowchart TD

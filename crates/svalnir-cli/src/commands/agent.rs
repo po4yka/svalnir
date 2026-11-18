@@ -120,11 +120,18 @@ impl AgentSummary {
                     Some("the status record of the agent is not readable by this build".to_owned()),
                 ),
             };
-        let lifecycle = journal
-            .agent_record::<LifecycleRecord>(AgentRecord::Lifecycle)
-            .ok()
-            .flatten()
-            .map(|stored| stored.record);
+        // A record that cannot be read is not an absent record: the view
+        // names each one.
+        let mut problems: Vec<String> = status_problem.into_iter().collect();
+        let lifecycle = if let Ok(stored) =
+            journal.agent_record::<LifecycleRecord>(AgentRecord::Lifecycle)
+        {
+            stored.map(|stored| stored.record)
+        } else {
+            problems
+                .push("the lifecycle record of the agent is not readable by this build".to_owned());
+            None
+        };
         // The lock holder is the agent when the registration of the
         // journal is that of the status record.
         let holder_is_agent: bool = match (&registration, &status) {
@@ -152,13 +159,14 @@ impl AgentSummary {
             ),
         };
         let now: Option<Now> = Host::open().ok().and_then(|host| Now::read(&host).ok());
-        let (authority, problem) = match session::read_authority(&journal) {
-            Ok(stored) => (
-                Some(AuthorityView::new(&stored.state, now.as_ref())),
-                status_problem,
-            ),
-            Err(error) => (None, Some(error.message)),
+        let authority = match session::read_authority(&journal) {
+            Ok(stored) => Some(AuthorityView::new(&stored.state, now.as_ref())),
+            Err(error) => {
+                problems.push(error.message);
+                None
+            }
         };
+        let problem: Option<String> = (!problems.is_empty()).then(|| problems.join("; "));
         Ok(Self {
             journal: "present",
             coordinator,

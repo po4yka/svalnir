@@ -5,6 +5,7 @@
 mod coordination;
 mod durable;
 mod failure;
+mod review;
 mod volatile;
 
 use std::path::PathBuf;

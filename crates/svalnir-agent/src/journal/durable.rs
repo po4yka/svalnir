@@ -412,6 +412,35 @@ impl OperationJournal {
         let intent: String = encode(envelope)?;
         let digest: ContentDigest =
             ContentDigest::of_json(envelope).map_err(OperationJournalError::Encode)?;
+        // The plan with the identity and the content digest of the
+        // envelope. The closure below compares the same two values with
+        // the operation, so this plan is the plan of the operation.
+        let plan: Plan = match self.plan_cache.take() {
+            Some(plan)
+                if plan.plan_id == correlation.plan_id
+                    && plan.digest() == &correlation.plan_digest =>
+            {
+                plan
+            }
+            _ => self
+                .try_plan(&correlation.plan_id)?
+                .filter(|plan| plan.digest() == &correlation.plan_digest)
+                .ok_or(OperationJournalError::Conflict)?,
+        };
+        // An envelope is not proof that the coordinator made it from the
+        // plan: each field that the plan fixes must be the field of the
+        // plan. The first intent of a step then fixes the other content.
+        let bound: bool = plan.target(&envelope.target.target_id) == Some(&envelope.target)
+            && envelope.principal == plan.principal
+            && envelope.trigger == plan.trigger
+            && envelope.authority == plan.authority
+            && envelope.executor == plan.executor
+            && envelope.limits.escalation == plan.limits.escalation
+            && envelope.limits.grace == plan.limits.grace;
+        self.plan_cache = Some(plan);
+        if !bound {
+            return Err(OperationJournalError::Conflict);
+        }
         self.mutate(
             &correlation.operation_id,
             |connection, stored, operation| {

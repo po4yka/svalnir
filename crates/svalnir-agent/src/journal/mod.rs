@@ -256,6 +256,9 @@ pub struct OperationJournal {
     options: JournalOptions,
     limits: SizeLimits,
     cache: Option<CachedOperation>,
+    /// The plan of the latest intent. A plan is found by its identity and
+    /// its content digest, so a cached value is never stale.
+    plan_cache: Option<svalnir_core::action::Plan>,
     commit_fault: CommitFault,
 }
 
@@ -438,6 +441,7 @@ impl OperationJournal {
                 max_wal_bytes: options.max_wal_size.get(),
             },
             cache: None,
+            plan_cache: None,
             commit_fault: CommitFault::default(),
         })
     }

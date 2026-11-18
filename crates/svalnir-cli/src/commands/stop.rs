@@ -46,6 +46,9 @@ use crate::environment::Environment;
 use crate::host::Host;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, NextAction, Warning};
 
+/// The wait for the lock file of a stop request when `--timeout` is absent.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// The grace period when `--grace` is not given.
 const DEFAULT_GRACE: Duration = Duration::from_secs(10);
 
@@ -373,7 +376,11 @@ pub(crate) fn stop(
 
     // One client at a time reads the stop record of a process generation
     // and makes its plan, so two requests make one plan.
-    let lock = plan_store::lock_stop(environment, &target)?;
+    let lock = plan_store::lock_stop(
+        environment,
+        &target,
+        invocation.timeout.unwrap_or(LOCK_WAIT),
+    )?;
     // An earlier request for the same process generation has the plan.
     // The process of an applied plan can be gone, so this lookup is before
     // the inventory.

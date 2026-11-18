@@ -292,12 +292,17 @@ pub(crate) struct StopLock {
     _file: std::fs::File,
 }
 
-/// Takes the lock of the stop requests of `target`, and waits for a
-/// different client that holds it. Two requests for one process
-/// generation then make one plan.
+/// The time between two tries to take a lock.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Takes the lock of the stop requests of `target`, and waits at most
+/// `limit` for a different client that holds it. Two requests for one
+/// process generation then make one plan. A holder that does not release
+/// the lock gives an error and not an endless wait.
 pub(crate) fn lock_stop(
     environment: &Environment,
     target: &ProcessGenerationId,
+    limit: Duration,
 ) -> Result<StopLock, ErrorBody> {
     environment.create_state_directory()?;
     let directory: PathBuf = plan_directory(environment)?;
@@ -315,11 +320,28 @@ pub(crate) fn lock_stop(
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: the descriptor is that of `file`, which is open for the
-        // whole call. `flock` reads no memory of this process.
-        let locked: libc::c_int = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if locked != 0 {
-            return Err(store_error("has a lock that cannot be taken"));
+        let start: std::time::Instant = std::time::Instant::now();
+        loop {
+            // SAFETY: the descriptor is that of `file`, which is open for
+            // the whole call. `flock` reads no memory of this process.
+            let locked: libc::c_int =
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if locked == 0 {
+                break;
+            }
+            let error: std::io::Error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock if start.elapsed() < limit => {
+                    std::thread::sleep(LOCK_POLL.min(limit.saturating_sub(start.elapsed())));
+                }
+                std::io::ErrorKind::WouldBlock => {
+                    return Err(store_error(
+                        "has a lock that a different request holds; send the command again",
+                    ));
+                }
+                _ => return Err(store_error("has a lock that cannot be taken")),
+            }
         }
     }
     Ok(StopLock { _file: file })
@@ -358,5 +380,32 @@ pub(crate) fn prune(environment: &Environment) {
         if is_document && is_old {
             drop(std::fs::remove_file(path));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use svalnir_core::id::ProcessGenerationId;
+
+    use super::lock_stop;
+    use crate::test_support::environment;
+
+    #[test]
+    fn a_second_stop_request_does_not_wait_without_a_bound_for_the_lock() {
+        let (environment, _directory) = environment();
+        let target = ProcessGenerationId::new("pg-4242-1").unwrap();
+        let first = lock_stop(&environment, &target, Duration::from_secs(10)).unwrap();
+
+        let start = Instant::now();
+        let refused = lock_stop(&environment, &target, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(&*refused.code, "plan_document_unavailable");
+        assert!(refused.message.contains("send the command again"));
+        assert!(start.elapsed() >= Duration::from_millis(200));
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        drop(first);
+        lock_stop(&environment, &target, Duration::from_millis(200)).unwrap();
     }
 }

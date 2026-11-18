@@ -378,6 +378,27 @@ pub(crate) fn memory_grant_revoked(state: &AuthorityState) -> AuthorityState {
         .state
 }
 
+/// `state` with the grant of the disk guard revoked.
+pub(crate) fn disk_grant_revoked(state: &AuthorityState) -> AuthorityState {
+    let request = RevokeRequest {
+        principal: user(),
+        grant_id: ActionGrantId::new("grant_disk").unwrap(),
+    };
+    revoke(state, &request)
+        .unwrap()
+        .acknowledge(&InstanceInhibition::default(), Persistence::Durable)
+        .state
+}
+
+/// `candidate` with the foreground status `status`.
+pub(crate) fn with_foreground(
+    mut candidate: ApplicationCandidate,
+    status: ForegroundStatus,
+) -> ApplicationCandidate {
+    candidate.foreground = status;
+    candidate
+}
+
 // Observations.
 
 /// The sample of a measurement that started at `at`.

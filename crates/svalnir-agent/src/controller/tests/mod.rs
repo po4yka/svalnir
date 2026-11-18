@@ -7,14 +7,14 @@ use svalnir_core::action::{ActionClass, Escalation, Plan, TargetBinding, Trigger
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::grant::{AuthorityState, InstanceInhibition};
 use svalnir_core::id::{ExecutorEpochId, OperationId, PlanId};
-use svalnir_core::policy::ApplicationCandidate;
+use svalnir_core::policy::{ApplicationCandidate, ForegroundStatus};
 use svalnir_core::quantity::ByteDelta;
 use svalnir_core::state::PressureState;
 
 use self::support::{
-    CandidateSpec, GIBIBYTE, RULE, Registry, SECOND, candidate_set, config, config_text, enabled,
-    epoch, job, memory, memory_grant_revoked, observations, paused, paused_for, proposed_registry,
-    resumed, rule, time, user, validated_registry,
+    CandidateSpec, GIBIBYTE, RULE, Registry, SECOND, candidate_set, config, config_text,
+    disk_grant_revoked, enabled, epoch, job, memory, memory_grant_revoked, observations, paused,
+    paused_for, proposed_registry, resumed, rule, time, user, validated_registry,
 };
 use super::{
     ApplyReport, AutomaticApply, BlockedReason, ControllerState, Guard, GuardPhase, GuardStatus,
@@ -1404,4 +1404,248 @@ fn with_both_guards_critical_and_no_candidate_set_no_discovery_starts() {
         bench.advance(SAMPLE);
     }
     assert!(!modes.contains(&PreparationMode::Refresh), "{modes:?}");
+}
+
+/// The report of a plan that completed with the capacity gain `gain`.
+fn completed_with_gain(plan_id: PlanId, gain: i128) -> ApplyReport {
+    ApplyReport::Finished {
+        plan_id,
+        result: OperationResult {
+            state: "Completed".to_owned(),
+            completed: true,
+            possibly_submitted: true,
+            unknown_outcome: false,
+            capacity_gain: Some(ByteDelta::new(gain).unwrap()),
+            pressure_after: None,
+            cooldown_until: None,
+        },
+    }
+}
+
+/// One background job whose foreground status is `status`.
+fn one_job(status: ForegroundStatus) -> impl Fn(u64) -> Vec<ApplicationCandidate> {
+    move |at| {
+        vec![support::with_foreground(
+            job("alpha", 4_001, 3 * GIBIBYTE, at),
+            status,
+        )]
+    }
+}
+
+#[test]
+fn a_pause_and_a_resume_on_the_disk_path_inhibit_the_plan_and_need_a_fresh_measurement() {
+    let mut bench = Bench::new();
+    let all = specs();
+    let active: AuthorityState = bench.authority.clone().unwrap();
+    bench.authority = Some(paused(&active, bench.now));
+    let output = bench.run(40 * SECOND, disk(5 * GIBIBYTE, &all));
+    assert!(output.status.paused);
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(applies(&output).len(), 0);
+    assert_eq!(
+        guard(&output, Guard::Disk).blocked,
+        vec![BlockedReason::Paused]
+    );
+    // The pause does not reset the incident.
+    assert_eq!(bench.state.disk_incidents.len(), 1);
+
+    // The resume. The sample is from before it, so it supports no action.
+    let before = disk(5 * GIBIBYTE, &all)(bench.now);
+    bench.advance(SECOND);
+    bench.authority = Some(resumed(&bench.authority.clone().unwrap(), bench.now));
+    let output = bench.step(&before, &[]);
+    assert!(!output.status.paused);
+    assert_eq!(applies(&output).len(), 0);
+    assert_eq!(
+        guard(&output, Guard::Disk).blocked,
+        vec![BlockedReason::AwaitingFreshMeasurement]
+    );
+    assert!(bench.state.measurement_floor.is_some());
+
+    // A measurement after the resume supports the plan.
+    bench.advance(SAMPLE - SECOND);
+    let output = bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[]);
+    assert_eq!(the_apply(&output).guard, Guard::Disk);
+}
+
+#[test]
+fn a_revoked_disk_grant_stops_the_incident_with_a_specific_reason() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let plan_id: PlanId = bench.state.outstanding.clone().unwrap().plan_id;
+    bench.advance(SAMPLE);
+    let report = completed_with_gain(plan_id, 3_000);
+    bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+    assert_eq!(
+        bench.state.policy.disk.incidents[0]
+            .usage
+            .consumed_bytes
+            .get(),
+        3_000
+    );
+
+    // The user revokes the grant during the incident. The candidate set
+    // has a candidate that is eligible, so only the grant is the cause.
+    bench.authority = Some(disk_grant_revoked(&bench.authority.clone().unwrap()));
+    let third = [CandidateSpec::synthetic("third", 13, 4_000)];
+    let output = bench.run(120 * SECOND, disk(5 * GIBIBYTE, &third));
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(applies(&output).len(), 0);
+    let blocked = &guard(&output, Guard::Disk).blocked;
+    assert!(
+        matches!(
+            blocked.as_slice(),
+            [BlockedReason::GuardNotActive { standing }] if standing.contains("revoked")
+        ),
+        "{blocked:?}"
+    );
+    assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Blocked);
+    // The incident and its usage stay.
+    let incident = &bench.state.policy.disk.incidents[0];
+    assert_eq!(incident.usage.consumed_bytes.get(), 3_000);
+    assert_eq!(incident.usage.reserved_bytes.get(), 0);
+}
+
+#[test]
+fn a_clean_restart_keeps_the_cooldown_of_an_open_disk_incident() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let plan_id: PlanId = bench.state.outstanding.clone().unwrap().plan_id;
+    bench.advance(SAMPLE);
+    let reported_at: u64 = bench.now;
+    // The removal completed and the capacity did not increase: a backoff.
+    let report = completed_with_gain(plan_id, 0);
+    bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+    let stored_cooldown = bench.state.policy.disk.incidents[0].cooldown.clone();
+    assert_eq!(
+        stored_cooldown.as_ref().unwrap().until.get(),
+        reported_at + 900 * SECOND
+    );
+
+    let mut view: ControllerState = bench.state.durable_view();
+    view.clean_stop = true;
+    let stored: String = serde_json::to_string(&view).unwrap();
+    bench.state = ControllerState::restore(PriorState::Recorded(Box::new(
+        serde_json::from_str(&stored).unwrap(),
+    )));
+    bench.epoch = epoch("epoch_2");
+    assert!(bench.state.disk_incidents[0].established);
+    let incident = &bench.state.policy.disk.incidents[0];
+    assert_eq!(incident.cooldown, stored_cooldown);
+
+    // Before the end of the stored cooldown, no plan is made, although the
+    // candidates are eligible.
+    let output = bench.run(600 * SECOND, disk(5 * GIBIBYTE, &all));
+    assert_eq!(applies(&output).len(), 0);
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Cooldown);
+    // After it, the same incident makes its next plan.
+    bench.run(320 * SECOND, disk(5 * GIBIBYTE, &all));
+    assert!(bench.state.outstanding.is_some());
+}
+
+#[test]
+fn an_interrupted_disk_plan_after_an_unclean_restart_keeps_its_charge_and_blocks_the_incident() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let outstanding = bench.state.outstanding.clone().unwrap();
+    let before = &bench.state.policy.disk.incidents[0].usage;
+    assert_eq!(before.reserved_bytes.get(), 3_000);
+    assert_eq!(before.consumed_bytes.get(), 0);
+
+    // The agent stops with the plan in progress, with no clean stop.
+    let stored: String = serde_json::to_string(&bench.state.durable_view()).unwrap();
+    let recorded: ControllerState = serde_json::from_str(&stored).unwrap();
+    bench.state = ControllerState::restore(PriorState::Recorded(Box::new(recorded)));
+    bench.epoch = epoch("epoch_2");
+    assert!(bench.state.outstanding.is_none());
+    let record = bench.state.disk_incidents[0].clone();
+    assert_eq!(record.incident_id, outstanding.incident_id);
+    assert!(!record.established);
+    assert!(record.unknown_outcome);
+    // The reservation of the interrupted plan is a charge now.
+    let usage = &bench.state.policy.disk.incidents[0].usage;
+    assert_eq!(usage.reserved_bytes.get(), 0);
+    assert_eq!(usage.consumed_bytes.get(), 3_000);
+
+    // The pressure continues with eligible candidates, and the incident
+    // permits no automatic work.
+    bench.advance(30 * SECOND);
+    let third = [CandidateSpec::synthetic("third", 13, 4_000)];
+    let output = bench.run(40 * SECOND, disk(5 * GIBIBYTE, &third));
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(applies(&output).len(), 0);
+    assert_eq!(
+        guard(&output, Guard::Disk).blocked,
+        vec![BlockedReason::IncidentStateNotEstablished]
+    );
+    assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Exhausted);
+}
+
+#[test]
+fn a_foreground_application_and_an_unknown_foreground_state_are_not_stopped() {
+    // Control: the same state with a background application gives a plan.
+    let mut control = Bench::new();
+    let limit: u64 = control.now + 120 * SECOND;
+    let background = critical(one_job(ForegroundStatus::Background));
+    while applies(&control.peek(&background(control.now), &[])).is_empty() {
+        assert!(control.now < limit, "no plan in the time of the test");
+        control.step(&background(control.now), &[]);
+        control.advance(SAMPLE);
+    }
+    assert_eq!(
+        the_apply(&control.peek(&background(control.now), &[])).guard,
+        Guard::Memory
+    );
+
+    // The same state and time, with the application in the foreground, and
+    // then with no foreground evidence: no plan, and the guard says why.
+    for status in [ForegroundStatus::Foreground, ForegroundStatus::Unknown] {
+        let mut bench = Bench::new();
+        bench.state = control.state.clone();
+        bench.now = control.now;
+        let output = bench.run(40 * SECOND, critical(one_job(status)));
+        assert_eq!(applies(&output).len(), 0, "{status:?}");
+        assert!(bench.state.outstanding.is_none(), "{status:?}");
+        assert_eq!(
+            guard(&output, Guard::Memory).blocked,
+            vec![BlockedReason::NoEligibleTarget],
+            "{status:?}"
+        );
+    }
+}
+
+#[test]
+fn the_next_batch_waits_for_the_end_of_the_observation_window_and_starts_at_its_end() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let plan_id: PlanId = bench.state.outstanding.clone().unwrap().plan_id;
+    bench.advance(SAMPLE);
+    let report = completed_with_gain(plan_id, 3_000);
+    bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+    let until: u64 = bench.state.disk_incidents[0]
+        .observe_until
+        .clone()
+        .unwrap()
+        .until
+        .get();
+    assert!(until > bench.now);
+
+    // The incident has a slot left and a new candidate is eligible.
+    let third = [CandidateSpec::synthetic("third", 13, 4_000)];
+    let at_end = |now: u64| disk(5 * GIBIBYTE, &third)(now);
+    bench.now = until - 1;
+    let output = bench.peek(&at_end(bench.now), &[]);
+    assert_eq!(applies(&output).len(), 0);
+    assert_eq!(
+        guard(&output, Guard::Disk).blocked,
+        vec![BlockedReason::ObservingOutcome]
+    );
+    bench.now = until;
+    let output = bench.step(&at_end(bench.now), &[]);
+    assert_eq!(the_apply(&output).guard, Guard::Disk);
 }

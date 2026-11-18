@@ -64,8 +64,8 @@ use crate::executor::process::{
 };
 use crate::journal::{
     ClaimedRequest, CoordinationStart, CoordinatorLock, IncidentUsage, JournalOptions,
-    OperationJournal, OperationJournalError, QueuedRequest, RecoveryRecord, RequestBody,
-    RequestCompletion, VolatilePersistReport, VolatileRecord,
+    OperationJournal, OperationJournalError, QueuedRequest, RecoveryPosition, RecoveryRecord,
+    RequestBody, RequestCompletion, VolatilePersistReport, VolatileRecord,
 };
 use crate::platform::process::{
     DarwinProcessSource, ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication,
@@ -1113,6 +1113,10 @@ pub(super) enum FailPoint {
     CompleteRequest,
     PersistVolatile,
     RecordEffects,
+    /// `recovery_records` gives each consumed dispatch with no outcome
+    /// the position `Submitted`, so that the result of the evidence does
+    /// not agree with the step: the state machine refuses it.
+    RecoveryAsSubmitted,
 }
 
 /// A function that a test runs inside a journal call.
@@ -1264,7 +1268,23 @@ impl CoordinatorJournal for FailingJournal {
     }
 
     fn recovery_records(&self, limit: usize) -> Result<Vec<RecoveryRecord>, OperationJournalError> {
-        self.inner.recovery_records(limit)
+        let mut records: Vec<RecoveryRecord> = self.inner.recovery_records(limit)?;
+        if self
+            .failing
+            .lock()
+            .unwrap()
+            .contains(&FailPoint::RecoveryAsSubmitted)
+        {
+            for step in records
+                .iter_mut()
+                .flat_map(|record| &mut record.unsettled_steps)
+            {
+                if step.position == RecoveryPosition::DispatchConsumed {
+                    step.position = RecoveryPosition::Submitted;
+                }
+            }
+        }
+        Ok(records)
     }
 
     fn incident_usage(

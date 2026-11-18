@@ -15,6 +15,7 @@
 //! | [`outcome`] | Target results, aggregation, and resource effects | 9 |
 //! | [`error`] | The error and retry taxonomy | 10 |
 //! | [`journal`] | The journal interface and the recording rule | 11, 12 |
+//! | [`reconciliation`] | The result of the reconciliation of one step | 12 |
 //! | [`checked`] | Records that passed a consistency check | |
 
 pub mod budget;
@@ -26,6 +27,7 @@ pub mod journal;
 pub mod operation;
 pub mod outcome;
 pub mod plan;
+pub mod reconciliation;
 pub mod state;
 
 #[cfg(test)]
@@ -61,6 +63,7 @@ pub use plan::{
     PlanApproval, PlanContent, PlanError, PlanLimits, PlanTarget, PlannedStep, Principal,
     ProcessBinding, TargetBinding, Trigger, Validity,
 };
+pub use reconciliation::StepReconciliation;
 pub use state::{
     DispatchState, Durability, OperationState, PlanState, StepProgress, StepState, TransitionError,
 };

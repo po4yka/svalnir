@@ -262,6 +262,43 @@ fn a_crash_after_a_consumed_dispatch_is_unknown_and_is_never_replayed() {
 }
 
 #[test]
+fn a_result_that_the_state_machine_refuses_records_the_step_as_unknown() {
+    let (mut bench, mut coordinator, operation_id) = admitted_cleanup();
+    bench.fail(FailPoint::RecordStep);
+    bench.fail(FailPoint::RecordOperation);
+    coordinator.step();
+    drop(coordinator);
+    bench.heal();
+    assert!(!exists(&bench, "a"));
+    // The evidence gives a result that the state machine refuses for the
+    // consumed step: a submitted call with no `Verifying` record.
+    bench.fail(FailPoint::RecoveryAsSubmitted);
+    let mut coordinator = bench.start();
+    coordinator.step();
+    // Not settled, inspected: the reconciliation is complete, and the
+    // consumed step is not left with no outcome.
+    assert!(!coordinator.reconciliation_pending());
+    let stored = open_journal(&bench.tree.database)
+        .operation(&operation_id)
+        .unwrap()
+        .unwrap();
+    let first = &stored.steps()[0];
+    assert_eq!(first.progress().state(), &StepState::UnknownOutcome);
+    assert_eq!(
+        first.progress().dispatch(),
+        &DispatchState::SubmissionUncertain
+    );
+    assert_eq!(first.results()[0].effect, TargetEffect::UnknownOutcome);
+    assert_eq!(
+        first.results()[0].failure.as_ref().unwrap().code.as_str(),
+        code::EFFECT_NOT_ESTABLISHED
+    );
+    // The step that did not start is not run.
+    assert!(exists(&bench, "b"));
+    assert_eq!(bench.intents(), 1);
+}
+
+#[test]
 fn a_consumed_dispatch_with_no_evidence_stays_unknown() {
     for probe in [
         FileProbe::PlannedObject,

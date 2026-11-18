@@ -11,8 +11,8 @@
 
 use svalnir_core::action::{
     ActionError, ActionStage, Attribution, Checked, DispatchState, Durability, EffectEvidence,
-    ErrorFamily, FileObjectType, NativeResult, Operation, OperationState, Plan, StopReason,
-    TargetBinding, TargetEffect, TargetResult, TargetResultRecord,
+    ErrorFamily, FileObjectType, NativeResult, Operation, OperationState, Plan, StepReconciliation,
+    StepState, StopReason, TargetBinding, TargetEffect, TargetResult, TargetResultRecord,
 };
 use svalnir_core::id::{OperationId, ProcessGenerationId, StepId, TargetId};
 
@@ -179,7 +179,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let plan: Option<Plan> = self.journal.plan(operation.plan_id()).ok().flatten();
         let mut written: bool = true;
         for recovery in unsettled_steps {
-            written &= self.reconcile_step(&mut operation, plan.as_ref(), stop_fence, &recovery);
+            written &= self
+                .reconcile_step(&mut operation, plan.as_ref(), stop_fence, &recovery)
+                .is_complete();
         }
         let each_has_result: bool = operation
             .steps()
@@ -295,19 +297,25 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         writes
     }
 
-    /// Settles one step of an earlier lifetime. Returns false when a
-    /// write of the journal failed.
+    /// Settles one step of an earlier lifetime with what the evidence
+    /// establishes.
+    ///
+    /// A result that the result check or the state machine refuses gives
+    /// [`StepReconciliation::Inspected`]: the step is recorded as
+    /// `UnknownOutcome` when its dispatch was consumed, and it stays as
+    /// the journal has it when no call was possible.
     fn reconcile_step(
         &mut self,
         operation: &mut Operation,
         plan: Option<&Plan>,
         stop_fence: bool,
         recovery: &StepRecovery,
-    ) -> bool {
+    ) -> StepReconciliation {
         let operation_id: OperationId = operation.operation_id().clone();
         let step_id: StepId = recovery.step.step_id().clone();
         let durability: Durability = recovery.step.progress().durability().clone();
         for results in self.step_writes(operation, plan, stop_fence, recovery) {
+            let given: usize = results.len();
             let mut next: Operation = operation.clone();
             let results: Vec<TargetResult> = results
                 .into_iter()
@@ -319,23 +327,85 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     .ok()
                 })
                 .collect();
-            if next
-                .settle_step(&step_id, results, durability.clone())
-                .is_err()
+            if results.len() != given
+                || next
+                    .settle_step(&step_id, results, durability.clone())
+                    .is_err()
             {
-                // The state machine does not permit the result. The step
-                // stays as the journal has it.
-                return true;
+                return self.record_inspected(operation, &step_id, recovery.dispatch_consumed);
             }
             let saved: bool = next
                 .step(&step_id)
                 .is_some_and(|step| self.journal.record_step(&operation_id, step).is_ok());
             if !saved {
-                return false;
+                return StepReconciliation::NotRecorded;
             }
             *operation = next;
         }
-        true
+        StepReconciliation::Recorded
+    }
+
+    /// Records a step whose result was refused: not settled, inspected.
+    /// A step whose dispatch was consumed gets the state `UnknownOutcome`,
+    /// so that the record does not show a consumed step with no outcome.
+    /// A step that is `UnknownOutcome`, and a step that issued no call,
+    /// keep their record.
+    fn record_inspected(
+        &mut self,
+        operation: &mut Operation,
+        step_id: &StepId,
+        dispatch_consumed: bool,
+    ) -> StepReconciliation {
+        let Some(step) = operation.step(step_id) else {
+            return StepReconciliation::Inspected;
+        };
+        if !dispatch_consumed || matches!(step.progress().state(), StepState::UnknownOutcome) {
+            return StepReconciliation::Inspected;
+        }
+        // A consumed dispatch with no recorded submission possibly issued
+        // a call.
+        let dispatch: DispatchState = match step.progress().dispatch() {
+            DispatchState::NotSubmitted => DispatchState::SubmissionUncertain,
+            other => other.clone(),
+        };
+        let durability: Durability = step.progress().durability().clone();
+        let failure: ActionError = action_error_with(
+            code::EFFECT_NOT_ESTABLISHED,
+            ErrorFamily::Outcome,
+            ActionStage::Reconciliation,
+            dispatch.clone(),
+            Some(operation.plan_id()),
+            Some(operation.operation_id()),
+            Some(step_id),
+        );
+        let result: Option<TargetResult> = unknown_outcome(step.target_id(), dispatch, failure)
+            .ok()
+            .and_then(|result| {
+                Checked::new(TargetResultRecord {
+                    durability: durability.clone(),
+                    ..result.into_inner()
+                })
+                .ok()
+            });
+        let mut next: Operation = operation.clone();
+        let Some(result) = result else {
+            return StepReconciliation::Inspected;
+        };
+        if next.settle_step(step_id, vec![result], durability).is_err() {
+            // The state machine refuses `UnknownOutcome` also. The step
+            // stays as the journal has it.
+            return StepReconciliation::Inspected;
+        }
+        let saved: bool = next.step(step_id).is_some_and(|step| {
+            self.journal
+                .record_step(operation.operation_id(), step)
+                .is_ok()
+        });
+        if !saved {
+            return StepReconciliation::NotRecorded;
+        }
+        *operation = next;
+        StepReconciliation::Inspected
     }
 }
 

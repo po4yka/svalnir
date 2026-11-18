@@ -413,6 +413,14 @@ The journal keeps one usage record for each incident: the number of operations w
 
 Reconciliation is observational. A same-path replacement or reused PID is a different target. Never delete or terminate it merely to complete an old operation. Preserve unknown attribution and incomplete history when available evidence cannot settle them.
 
+One reconciliation attempt of a step has one of three results:
+
+| Result | Meaning | Reconciliation of the step |
+| --- | --- | --- |
+| Recorded | The journal has what the evidence establishes, which can be `UnknownOutcome` | Complete |
+| Not recorded | A write of the journal failed, and the record is as it was | Pending: a later attempt reads the step again |
+| Not settled, inspected | The result check or the state machine refused the result that the evidence gave. A step whose dispatch was consumed is recorded as `UnknownOutcome`; a step that issued no call keeps its record | Complete: a later write cannot change a record that the state machine refuses |
+
 ## 13. Required acceptance scenarios
 
 | Scenario | Required result |

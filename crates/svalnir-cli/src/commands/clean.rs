@@ -264,36 +264,42 @@ fn root_id_of(
 /// sealed plan. The check keeps a changed document out of the view and out
 /// of the volumes of the capacity observations.
 fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
-    let roots_agree = || {
-        let bindings = || {
-            plan.targets
-                .iter()
-                .filter_map(|target| match &target.binding {
-                    TargetBinding::File(binding) => Some(binding),
-                    TargetBinding::Application(_) | TargetBinding::Process(_) => None,
-                })
-        };
-        let bound: BTreeSet<&RootId> = bindings().map(|binding| &binding.root_id).collect();
-        let named: BTreeSet<&RootId> = document.roots.iter().map(|root| &root.root_id).collect();
-        // The sealed plan binds the path and the object of the root of
-        // each target. The root of the document must be that root.
-        let bound_root_agrees = bindings().all(|binding| {
-            document.roots.iter().any(|root| {
-                root.root_id == binding.root_id
-                    && root.path == binding.root_path
-                    && root.object == binding.root_object
-            })
-        });
-        named == bound
-            && bound_root_agrees
-            && named.len() == document.roots.len()
-            && document.roots.iter().all(|root| {
-                root_id_of(&root.path, root.object, &root.volume).as_ref() == Some(&root.root_id)
+    let bindings = || {
+        plan.targets
+            .iter()
+            .filter_map(|target| match &target.binding {
+                TargetBinding::File(binding) => Some(binding),
+                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
             })
     };
-    &document.digest == plan.digest()
+    let bound: BTreeSet<&RootId> = bindings().map(|binding| &binding.root_id).collect();
+    let named: BTreeSet<&RootId> = document.roots.iter().map(|root| &root.root_id).collect();
+    let bound_roots: Vec<(&RootId, &LosslessPath, &FileObjectEvidence)> = bindings()
+        .map(|binding| (&binding.root_id, &binding.root_path, &binding.root_object))
+        .collect();
+    named == bound
+        && roots_agree(&document.roots, &bound_roots)
+        && named.len() == document.roots.len()
+        && document.roots.iter().all(|root| {
+            root_id_of(&root.path, root.object, &root.volume).as_ref() == Some(&root.root_id)
+        })
+        && &document.digest == plan.digest()
         && document.outcome.plan.as_ref() == Some(plan)
-        && roots_agree()
+}
+
+/// Whether each root that a sealed plan binds has, in `roots`, a record with
+/// the same identity, the same path, and the same object. The sealed plan
+/// binds the path and the object of the root of each target, so the root of
+/// a document must be that root.
+fn roots_agree(
+    roots: &[RootRecord],
+    bound: &[(&RootId, &LosslessPath, &FileObjectEvidence)],
+) -> bool {
+    bound.iter().all(|(root_id, path, object)| {
+        roots
+            .iter()
+            .any(|root| &root.root_id == *root_id && &root.path == *path && &root.object == *object)
+    })
 }
 
 /// The display path of each file target of a stored plan: the path of its
@@ -330,13 +336,17 @@ fn bound_path(binding: &svalnir_core::action::FileBinding) -> Option<LosslessPat
 ///
 /// The catalog compares path text, so each path has no symbolic link, as
 /// `canonicalize` gives it.
-fn file_protection(path: &Path, home: Option<&Path>, state_directory: &Path) -> ProtectionFact {
+fn file_protection(
+    path: &Path,
+    home: Option<&Path>,
+    state_directory: Option<&Path>,
+) -> ProtectionFact {
     let lossless = |path: &Path| LosslessPath::from_path(path).ok();
     let Some(path) = lossless(path) else {
         return ProtectionFact::Unknown;
     };
     let home: Option<LosslessPath> = home.and_then(lossless);
-    let state_directory: Option<LosslessPath> = lossless(state_directory);
+    let state_directory: Option<LosslessPath> = state_directory.and_then(lossless);
     file_hard_protection(
         &path,
         &FileProtectionContext {
@@ -346,12 +356,21 @@ fn file_protection(path: &Path, home: Option<&Path>, state_directory: &Path) -> 
     )
 }
 
-/// The hard protection of the entry at `path`, with its symbolic links
-/// resolved. An entry whose path does not resolve has an unknown
-/// protection.
-fn entry_protection(path: &Path, home: Option<&Path>, state_directory: &Path) -> ProtectionFact {
-    std::fs::canonicalize(path).map_or(ProtectionFact::Unknown, |canonical| {
-        file_protection(&canonical, home, state_directory)
+/// The hard protection of the entry at `path`: the directory of the entry
+/// with its symbolic links resolved, and the name of the entry. The entry
+/// itself is not resolved, so a link has the protection of its own place and
+/// not that of its target. An entry whose directory does not resolve has an
+/// unknown protection.
+fn entry_protection(
+    path: &Path,
+    home: Option<&Path>,
+    state_directory: Option<&Path>,
+) -> ProtectionFact {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return ProtectionFact::Unknown;
+    };
+    std::fs::canonicalize(parent).map_or(ProtectionFact::Unknown, |directory| {
+        file_protection(&directory.join(name), home, state_directory)
     })
 }
 
@@ -407,9 +426,10 @@ fn select(
         .home
         .as_ref()
         .and_then(|home| std::fs::canonicalize(home).ok());
-    let state_directory: PathBuf = environment.state_directory()?;
-    let state_directory: PathBuf =
-        std::fs::canonicalize(&state_directory).unwrap_or(state_directory);
+    // A state directory that does not resolve gives no state directory, so
+    // an entry that no other rule protects has an unknown protection.
+    let state_directory: Option<PathBuf> =
+        std::fs::canonicalize(environment.state_directory()?).ok();
     let mut prefix: Vec<u8> = scan.root.as_bytes().to_vec();
     if prefix.last() != Some(&b'/') {
         prefix.push(b'/');
@@ -502,7 +522,7 @@ fn select(
                 // storage can make the reclaimed size smaller.
                 estimated_reclaimable_bytes: (mode != CleanMode::Trash).then_some(entry.allocated),
             },
-            hard_protection: entry_protection(&path, home.as_deref(), &state_directory),
+            hard_protection: entry_protection(&path, home.as_deref(), state_directory.as_deref()),
             rule: None,
         });
     }
@@ -961,7 +981,82 @@ mod tests {
 
     use svalnir_core::policy::ProtectionFact;
 
-    use super::{file_protection, refuse_root_without_component};
+    use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
+    use svalnir_core::id::RootId;
+
+    use super::{
+        entry_protection, file_protection, refuse_root_without_component, root_id_of, roots_agree,
+    };
+    use crate::commands::plan_store::RootRecord;
+    use crate::test_support::{TempDirectory, volume_capacity};
+
+    #[test]
+    fn a_document_root_must_have_the_path_and_the_object_that_the_plan_binds() {
+        let path = |text: &str| LosslessPath::from_bytes(text).unwrap();
+        let object = |inode: u64| FileObjectEvidence {
+            device: DeviceNumber::new(16_777_233),
+            inode: InodeNumber::new(inode),
+        };
+        let (volume, _capacity, _foundation) = volume_capacity();
+        let (a, b) = (path("/work/a"), path("/work/b"));
+        let root_id: RootId = root_id_of(&a, object(2), &volume).unwrap();
+        let roots = [RootRecord {
+            root_id: root_id.clone(),
+            path: a.clone(),
+            object: object(2),
+            volume,
+        }];
+        let (same, other) = (object(2), object(3));
+        assert!(roots_agree(&roots, &[(&root_id, &a, &same)]));
+        // The identity is the one of the root in both cases, so only the
+        // comparison of the path and of the object refuses them.
+        assert!(!roots_agree(&roots, &[(&root_id, &b, &same)]));
+        assert!(!roots_agree(&roots, &[(&root_id, &a, &other)]));
+    }
+
+    #[test]
+    fn a_link_entry_has_the_protection_of_its_own_location() {
+        let directory = TempDirectory::new();
+        let base = std::fs::canonicalize(directory.path()).unwrap();
+        let (state, outside, work, home) = (
+            base.join("state"),
+            base.join("outside"),
+            base.join("work"),
+            base.join("home"),
+        );
+        for path in [&state, &outside, &work, &home] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(outside.join("file"), b"x").unwrap();
+        std::fs::write(state.join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), state.join("link")).unwrap();
+        std::os::unix::fs::symlink(state.join("file"), work.join("link")).unwrap();
+        let protection =
+            |path: &Path| entry_protection(path, Some(home.as_path()), Some(state.as_path()));
+        // A link in the state directory is protected, also when it points out.
+        assert_eq!(protection(&state.join("link")), ProtectionFact::Protected);
+        // A link outside is not protected, also when it points into the
+        // state directory: the link is removed and not its target.
+        assert_eq!(protection(&work.join("link")), ProtectionFact::NotProtected);
+    }
+
+    #[test]
+    fn an_entry_with_no_resolved_state_directory_has_an_unknown_protection() {
+        let directory = TempDirectory::new();
+        let base = std::fs::canonicalize(directory.path()).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        assert_eq!(
+            entry_protection(&base.join("file"), Some(home.as_path()), None),
+            ProtectionFact::Unknown
+        );
+        // An entry whose directory does not resolve is unknown too.
+        assert_eq!(
+            entry_protection(&base.join("absent/file"), Some(home.as_path()), Some(&home)),
+            ProtectionFact::Unknown
+        );
+    }
 
     #[test]
     fn the_path_of_the_file_system_root_is_refused_as_a_cleanup_root() {
@@ -975,7 +1070,7 @@ mod tests {
     fn the_home_directory_its_ancestors_and_the_state_directory_are_protected() {
         let home = Path::new("/Users/test");
         let state = Path::new("/Users/test/Library/Application Support/Svalnir");
-        let protection = |path: &str| file_protection(Path::new(path), Some(home), state);
+        let protection = |path: &str| file_protection(Path::new(path), Some(home), Some(state));
         assert_eq!(protection("/Users/test"), ProtectionFact::Protected);
         assert_eq!(protection("/Users"), ProtectionFact::Protected);
         assert_eq!(
@@ -988,7 +1083,7 @@ mod tests {
             ProtectionFact::NotProtected
         );
         assert_eq!(
-            file_protection(Path::new("/tmp/x"), None, state),
+            file_protection(Path::new("/tmp/x"), None, Some(state)),
             ProtectionFact::Unknown
         );
         // The catalog of the core crate also has the storage of the

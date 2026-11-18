@@ -530,17 +530,24 @@ fn a_forged_identity_field_in_the_body_is_rejected() {
         value.pointer_mut(pointer).unwrap()["uid"] = json!(0);
         assert_eq!(decode(&value), Err(DecodeError::Malformed), "{pointer}");
     }
-    // In a record of `svalnir-core` that does not reject unknown fields
-    // itself.
-    for pointer in [
-        "/operation/evict_entries/grant",
-        "/operation/evict_entries/rule",
-        "/operation/evict_entries/entries/0/charge",
-        "/operation/evict_entries/entries/0/object",
+    // In a record of `svalnir-core`. The grant reference and the charge
+    // reject an unknown field in their own decoding. The rule and the
+    // object evidence accept it, and the exactness check rejects it.
+    for (pointer, error) in [
+        ("/operation/evict_entries/grant", DecodeError::Malformed),
+        ("/operation/evict_entries/rule", DecodeError::NotExact),
+        (
+            "/operation/evict_entries/entries/0/charge",
+            DecodeError::Malformed,
+        ),
+        (
+            "/operation/evict_entries/entries/0/object",
+            DecodeError::NotExact,
+        ),
     ] {
         let mut value: Value = encode(&request("step-1"));
         value.pointer_mut(pointer).unwrap()["principal"] = json!(0);
-        assert!(decode(&value).is_err(), "{pointer}");
+        assert_eq!(decode(&value), Err(error), "{pointer}");
     }
 }
 
@@ -1110,6 +1117,113 @@ fn a_repeated_step_gets_its_state_also_after_its_grant_was_revoked() {
     assert_eq!(
         refused(&state, &self::request("step-2")),
         RefusalReason::GrantRevoked
+    );
+}
+
+/// Admits `step-1`, applies `change` to the state, and asks `still_covers`
+/// at `at`.
+fn coverage_after(
+    change: impl FnOnce(&mut HelperState),
+    at: &HelperClock,
+) -> Result<(), RefusalReason> {
+    let mut state: HelperState = state();
+    let Admission::Dispatch(dispatch) = admit(&mut state, &request("step-1")) else {
+        panic!("the request is not accepted");
+    };
+    assert_eq!(state.still_covers(&dispatch, &clock()), Ok(()));
+    change(&mut state);
+    state.still_covers(&dispatch, at)
+}
+
+#[test]
+fn a_step_in_work_is_not_covered_after_its_grant_changed() {
+    // Directly after the admission, and while the request is valid, the
+    // grant covers the step. The deadline of the request is `NOW + 100`.
+    assert_eq!(coverage_after(|_| {}, &clock()), Ok(()));
+    assert_eq!(coverage_after(|_| {}, &clock_at(NOW + 99)), Ok(()));
+    let verifying = |state: &mut HelperState| {
+        state
+            .record_progress(&key("step-1"), StepState::Verifying)
+            .unwrap();
+    };
+    assert_eq!(coverage_after(verifying, &clock()), Ok(()));
+
+    // A revocation applies at the next call.
+    assert_eq!(
+        coverage_after(|state| state.grants[0].grant.revoked = true, &clock()),
+        Err(RefusalReason::GrantRevoked)
+    );
+    // A later generation does not cover the step of an earlier one.
+    assert_eq!(
+        coverage_after(
+            |state| state.grants[0].grant.generation = Generation::new(4),
+            &clock()
+        ),
+        Err(RefusalReason::GrantGenerationStale)
+    );
+    // The clock at the deadline, and after it.
+    assert_eq!(
+        coverage_after(|_| {}, &clock_at(NOW + 100)),
+        Err(RefusalReason::RequestExpired)
+    );
+    assert_eq!(
+        coverage_after(|_| {}, &clock_at(NOW + 101)),
+        Err(RefusalReason::RequestExpired)
+    );
+    // A wall-clock time after the expiry of the grant.
+    let late: HelperClock = HelperClock {
+        wall: wall(GRANT_EXPIRY + 1),
+        ..clock()
+    };
+    assert_eq!(
+        coverage_after(|_| {}, &late),
+        Err(RefusalReason::GrantExpired)
+    );
+    // A clock of a different boot is not comparable.
+    let other_boot: HelperClock = HelperClock {
+        boot_id: BootId::new("boot-2").unwrap(),
+        ..clock()
+    };
+    assert_eq!(
+        coverage_after(|_| {}, &other_boot),
+        Err(RefusalReason::ClockNotComparable)
+    );
+    // A step that settled has no work to cover.
+    let settled = |state: &mut HelperState| {
+        state
+            .record_progress(&key("step-1"), StepState::NoAction)
+            .unwrap();
+    };
+    assert_eq!(
+        coverage_after(settled, &clock()),
+        Err(RefusalReason::StepNotRecorded)
+    );
+    // The grant of a different user, and a changed root.
+    assert_eq!(
+        coverage_after(
+            |state| state.grants[0].grant.principal = Uid::new(OTHER_USER),
+            &clock()
+        ),
+        Err(RefusalReason::GrantUnknown)
+    );
+    assert_eq!(
+        coverage_after(
+            |state| {
+                state.grants[0].roots[0] = root("root-a", "/Library/Application Support/Other");
+            },
+            &clock()
+        ),
+        Err(RefusalReason::RootNotGranted)
+    );
+
+    // A state with no record of the step does not cover it.
+    let mut admitting: HelperState = state();
+    let Admission::Dispatch(dispatch) = admit(&mut admitting, &request("step-1")) else {
+        panic!("the request is not accepted");
+    };
+    assert_eq!(
+        state().still_covers(&dispatch, &clock()),
+        Err(RefusalReason::StepNotRecorded)
     );
 }
 
@@ -1874,21 +1988,24 @@ fn an_unknown_operation_is_rejected() {
 
 #[test]
 fn an_unknown_field_is_rejected_at_each_level() {
-    let pointers: [&str; 9] = [
-        "",
-        "/protocol",
-        "/correlation",
-        "/validity",
-        "/operation/evict_entries",
-        "/operation/evict_entries/entries/0",
-        "/operation/evict_entries/entries/0/relative_entry",
-        "/operation/evict_entries/grant",
-        "/operation/evict_entries/rule",
+    let pointers: [(&str, DecodeError); 9] = [
+        ("", DecodeError::Malformed),
+        ("/protocol", DecodeError::Malformed),
+        ("/correlation", DecodeError::Malformed),
+        ("/validity", DecodeError::Malformed),
+        ("/operation/evict_entries", DecodeError::Malformed),
+        ("/operation/evict_entries/entries/0", DecodeError::Malformed),
+        (
+            "/operation/evict_entries/entries/0/relative_entry",
+            DecodeError::Malformed,
+        ),
+        ("/operation/evict_entries/grant", DecodeError::Malformed),
+        ("/operation/evict_entries/rule", DecodeError::NotExact),
     ];
-    for pointer in pointers {
+    for (pointer, error) in pointers {
         let mut value: Value = encode(&request("step-1"));
         value.pointer_mut(pointer).unwrap()["approved"] = json!(true);
-        assert!(decode(&value).is_err(), "{pointer:?}");
+        assert_eq!(decode(&value), Err(error), "{pointer:?}");
     }
     // A field in the status query, which has none.
     let mut value: Value = encode(&query("step-1"));
@@ -1957,7 +2074,13 @@ fn an_unknown_authority_bearing_value_is_rejected() {
     ] {
         let mut value: Value = encode(&self::request("step-1"));
         *value.pointer_mut(pointer).unwrap() = replacement.clone();
-        assert!(decode(&value).is_err(), "{pointer} = {replacement}");
+        // The preamble and the strict decoding fail first, also for the
+        // protocol version.
+        assert_eq!(
+            decode(&value),
+            Err(DecodeError::Malformed),
+            "{pointer} = {replacement}"
+        );
     }
 }
 
@@ -2104,8 +2227,13 @@ fn evidence_of_the_caller_cannot_raise_a_limit() {
         }
     }
 
-    // A reference to a later generation does not give its ceilings.
+    // A reference to a later generation does not give its ceilings. The
+    // charge is over the ceiling of the recorded generation. With the
+    // generation of the record, the same entry fails on the ceiling; with a
+    // later generation, it fails on the generation before any ceiling. The
+    // two results together show that the reference selects no ceiling.
     let mut request: HelperRequest = request_with("step-1", vec![entry("a", CEILING_BYTES + 1, 1)]);
+    assert_eq!(refused(&state(), &request), RefusalReason::BytesCeiling);
     eviction_mut(&mut request).grant.generation = Generation::new(99);
     assert_eq!(
         refused(&state(), &request),

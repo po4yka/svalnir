@@ -62,8 +62,8 @@ pub struct BoundedEviction {
     /// The monotonic time after which the executor submits no call: the
     /// expiry of the request. The helper accepted the request only because
     /// the grant applies until this time. A revocation after the
-    /// acceptance is not in this value: the executor asks the state again
-    /// before each call.
+    /// acceptance is not in this value: the executor calls
+    /// [`HelperState::still_covers`] before each call.
     pub deadline: MonotonicNanos,
 }
 
@@ -236,6 +236,77 @@ impl HelperState {
             Ok(Evaluation::Known(status)) => Admission::Known(status),
             Err(reason) => Admission::Refused(refusal(reason, request)),
         }
+    }
+
+    /// Answers whether the record still covers a step in work, at the
+    /// clock of the helper.
+    ///
+    /// The executor asks this before each call. A revocation of the grant
+    /// applies at this boundary, as `docs/ACTION_CONTRACTS.md` section 11
+    /// states. The function is pure: it reads no clock and no file, and it
+    /// changes nothing. The checks, in sequence:
+    ///
+    /// 1. The record has the step, and the step is `DispatchConsumed` or
+    ///    `Verifying`.
+    /// 2. The clock is on the timeline of the record, and it is before the
+    ///    deadline of the operation.
+    /// 3. The grant is known for the user of the step, it has the
+    ///    generation of the operation, it is not revoked, and it is in
+    ///    effect at the wall-clock time.
+    /// 4. The record has the root of the operation, as it was accepted, and
+    ///    the root has the rule of the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RefusalReason`] of the first check that fails. The
+    /// executor records this reason and submits no call.
+    pub fn still_covers(
+        &self,
+        dispatch: &Dispatch,
+        clock: &HelperClock,
+    ) -> Result<(), RefusalReason> {
+        let BoundedOperation::EvictEntries(eviction) = dispatch.operation();
+        let key: &StepKey = dispatch.key();
+        let recorded: &ConsumedRequest = self
+            .consumed
+            .find(key)
+            .ok_or(RefusalReason::StepNotRecorded)?;
+        if !matches!(
+            recorded.state,
+            StepState::DispatchConsumed | StepState::Verifying
+        ) {
+            return Err(RefusalReason::StepNotRecorded);
+        }
+        if recorded.clock_domain != clock.clock_domain || recorded.boot_id != clock.boot_id {
+            return Err(RefusalReason::ClockNotComparable);
+        }
+        if clock.monotonic >= eviction.deadline {
+            return Err(RefusalReason::RequestExpired);
+        }
+        let record: &HelperGrant = self
+            .grant(&eviction.grant.grant_id)
+            .ok_or(RefusalReason::GrantUnknown)?;
+        let grant: &PrivilegeGrant = record.grant();
+        if grant.principal != key.principal {
+            return Err(RefusalReason::GrantUnknown);
+        }
+        if !grant.matches(&eviction.grant) {
+            return Err(RefusalReason::GrantGenerationStale);
+        }
+        if grant.revoked {
+            return Err(RefusalReason::GrantRevoked);
+        }
+        if !grant.is_in_effect(clock.wall) {
+            return Err(RefusalReason::GrantExpired);
+        }
+        let root: &ApprovedRoot = record
+            .root(eviction.root.root_id())
+            .filter(|root: &&ApprovedRoot| **root == eviction.root)
+            .ok_or(RefusalReason::RootNotGranted)?;
+        if !root.rules().contains(&eviction.rule) {
+            return Err(RefusalReason::RuleNotSupported);
+        }
+        Ok(())
     }
 
     /// Records the next state of a consumed step: `Verifying` when the

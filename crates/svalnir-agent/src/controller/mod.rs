@@ -51,7 +51,14 @@
 //! - A restart keeps the usage and the cooldowns. A plan that was in
 //!   progress is charged in full, and its incident permits no automatic
 //!   work until it closes or a person rearms it. A record that is not
-//!   readable holds each guard until an evaluation shows no pressure.
+//!   readable holds each guard until this lifetime observed a sustained
+//!   recovery: no open incident, and each trigger normal for the recovery
+//!   time of the guard. A warning state is not a recovery.
+//! - A plan that the coordinator refused is not made again at a constant
+//!   rate: the wait before the next plan doubles with each refusal in
+//!   sequence, to a maximum, and an admission resets it.
+//! - A pause that started and expired between two steps gives the same
+//!   measurement floor as a pause that a step saw.
 
 mod authority;
 mod model;
@@ -66,7 +73,7 @@ pub use self::model::{
     Guard, GuardPhase, GuardStatus, Health, IncidentStatus, Intent, MAX_APPLICATION_COOLDOWNS,
     MAX_PREPARED_CANDIDATES, MAX_REPORTS, MAX_STATUS_REASONS, MemoryIncidentRecord, MonotonicMark,
     Notification, Observations, OperationResult, Outstanding, PreparationMode, PreparedCandidate,
-    PriorState, ReduceReason, ReportedCondition, RuleUsage, StepInput, StepOutput, Summary,
-    TriggerKey, TriggerRecord,
+    PriorState, QuietMark, ReduceReason, ReportedCondition, RuleUsage, StepInput, StepOutput,
+    Summary, TriggerKey, TriggerRecord,
 };
 pub use self::step::step;

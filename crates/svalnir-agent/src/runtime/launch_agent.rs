@@ -58,6 +58,8 @@ fn xml_text(path: &Path) -> Result<String, LaunchAgentError> {
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&apos;"),
             control if control.is_control() => return Err(LaunchAgentError::PathText),
+            // The two noncharacters that XML 1.0 does not permit.
+            '\u{FFFE}' | '\u{FFFF}' => return Err(LaunchAgentError::PathText),
             other => escaped.push(other),
         }
     }
@@ -250,5 +252,17 @@ mod tests {
         let read: String = std::fs::read_to_string(&path).unwrap();
         assert!(read.starts_with("<?xml"));
         assert!(read.ends_with("</plist>\n"));
+    }
+
+    #[test]
+    fn a_path_with_a_character_that_xml_does_not_permit_is_refused() {
+        for text in [
+            "/opt/svalnir/bin/agent\u{FFFE}",
+            "/opt/svalnir/bin/agent\u{FFFF}",
+        ] {
+            let mut definition = definition();
+            definition.program = PathBuf::from(text);
+            assert_eq!(render(&definition), Err(LaunchAgentError::PathText));
+        }
     }
 }

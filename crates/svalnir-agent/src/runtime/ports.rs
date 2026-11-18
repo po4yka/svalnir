@@ -26,6 +26,18 @@ pub trait AgentClock: Debug + Send + Sync {
     /// qualification window starts again and each earlier sample is not
     /// usable.
     fn mark_discontinuity(&self);
+
+    /// Reads whether the host slept after the call before this one. When
+    /// it did, or when the clock cannot tell, the clock records a
+    /// discontinuity as [`AgentClock::mark_discontinuity`] does and
+    /// returns `true`. The driver calls it at each tick, so a sleep is
+    /// known before the next collection.
+    ///
+    /// The default is a clock with no record of the sleep time: it
+    /// returns `false`, and only a sample reports a wake.
+    fn observe_continuity(&self) -> bool {
+        false
+    }
 }
 
 /// The clock of the agent as the clock of the coordinator.

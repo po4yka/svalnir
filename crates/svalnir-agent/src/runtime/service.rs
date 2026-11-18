@@ -57,6 +57,20 @@ impl Shared {
     }
 }
 
+/// Stops the service when the value is dropped, also when the thread that
+/// has it ends with a panic. With no collector thread the agent has no
+/// observation, and with no driver thread nothing reads one: the other
+/// thread must not continue alone.
+struct StopOnExit<'a>(&'a Shared);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.stop.store(true, Ordering::SeqCst);
+        let _slot = self.0.slot();
+        self.0.wake.notify_all();
+    }
+}
+
 /// The stop request of the service. Each copy is the same request.
 #[derive(Debug, Clone, Default)]
 pub struct StopHandle(Arc<Shared>);
@@ -134,11 +148,18 @@ fn collect_loop<E>(
     collector: &mut dyn Collector,
     events: &Receiver<E>,
     settings: &ServiceSettings,
+    clock: &dyn AgentClock,
 ) {
+    let agent_now = || clock.now().map(|time| time.clock.now);
     let mut connected: bool = true;
     while !shared.stop.load(Ordering::SeqCst) {
         let sample: Sample = collector.collect();
         let collected_at: Instant = Instant::now();
+        // `Instant` does not count the time of a sleep of the host, and
+        // the clock of the agent does. The larger of the two is the time
+        // after the collection, so the first collection after a wake is
+        // not later than one check of the stop request.
+        let collected_on_clock: Option<MonotonicNanos> = agent_now();
         {
             // A sample that the driver did not take is replaced. Its wake
             // and its degraded collectors are not lost with it.
@@ -163,7 +184,11 @@ fn collect_loop<E>(
         };
         // Wait in bounded parts, so that a stop request is read soon.
         while !shared.stop.load(Ordering::SeqCst) {
-            let elapsed: Duration = collected_at.elapsed();
+            let on_clock: Duration = agent_now()
+                .zip(collected_on_clock)
+                .and_then(|(now, then)| now.checked_duration_since(then))
+                .map_or(Duration::ZERO, Duration::from);
+            let elapsed: Duration = collected_at.elapsed().max(on_clock);
             if elapsed >= interval {
                 break;
             }
@@ -208,11 +233,24 @@ pub fn run<E: Send>(
     clock: Arc<dyn AgentClock>,
 ) -> ShutdownReport {
     let shared: &Shared = &stop.0;
+    let collector_clock: Arc<dyn AgentClock> = Arc::clone(&clock);
     std::thread::scope(|scope| {
+        // A panic in a tick stops the collector thread, so that the scope
+        // ends and the caller sees the failure. Without it the process
+        // would keep the coordinator lock and serve nothing.
+        let _stop_collector = StopOnExit(shared);
         let spawned = std::thread::Builder::new()
             .name("svalnir-collector".to_owned())
             .spawn_scoped(scope, move || {
-                collect_loop(shared, collector.as_mut(), &events, &settings);
+                // A panic in a collection stops the driver loop.
+                let _stop_driver = StopOnExit(shared);
+                collect_loop(
+                    shared,
+                    collector.as_mut(),
+                    &events,
+                    &settings,
+                    collector_clock.as_ref(),
+                );
             });
         if spawned.is_err() {
             // With no collector thread the agent has no observation. It
@@ -247,9 +285,13 @@ pub fn run<E: Send>(
         }
         let mut idle: ThreadIdle = ThreadIdle::new(clock);
         let report: ShutdownReport = driver.shutdown(&mut idle);
+        // The stop flag is set, so the collector thread ends after its
+        // collection in progress. A panic of that thread is a failure of
+        // the service and not a panic of this one.
+        let collector_ended: bool = spawned.is_ok_and(|thread| thread.join().is_ok());
         // A service that stopped with no request did not stop cleanly.
         ShutdownReport {
-            clean: report.clean && shared.requested.load(Ordering::SeqCst),
+            clean: report.clean && collector_ended && shared.requested.load(Ordering::SeqCst),
         }
     })
 }

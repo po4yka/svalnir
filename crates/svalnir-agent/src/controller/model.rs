@@ -132,6 +132,11 @@ pub struct DiskIncidentRecord {
     /// The error code of the latest plan that the coordinator refused.
     /// The next admitted plan removes it.
     pub last_refusal: Option<String>,
+    /// The number of plans in sequence that the coordinator refused. The
+    /// wait before the next plan doubles with each one, to a maximum. The
+    /// next admitted plan sets it to zero.
+    #[serde(default)]
+    pub refusals: u32,
 }
 
 /// The charge of one rule in the pass in progress.
@@ -165,6 +170,9 @@ pub struct MemoryIncidentRecord {
     /// The error code of the latest plan that the coordinator refused.
     /// The next admitted plan removes it.
     pub last_refusal: Option<String>,
+    /// See [`DiskIncidentRecord::refusals`].
+    #[serde(default)]
+    pub refusals: u32,
 }
 
 /// The automatic plan that the controller gave to the runtime and whose
@@ -213,6 +221,12 @@ pub struct ControllerState {
     /// no open incident and no pressure: the state before a restart was
     /// not readable.
     pub held_until_recovery: Vec<Guard>,
+    /// For each held guard, the time from which each evaluation of this
+    /// lifetime showed no pressure and no incident. The hold ends when
+    /// that time is as long as the recovery time of the guard. It is not
+    /// stored: a restart is not evidence of a recovery.
+    #[serde(skip)]
+    pub quiet_since: Vec<QuietMark>,
     /// Whether the latest step found a pause in effect.
     pub paused: bool,
     /// The time of the latest end of a pause that this controller saw.
@@ -238,6 +252,19 @@ pub struct MonotonicMark {
     pub boot_id: svalnir_core::id::BootId,
 }
 
+/// The start of a continuous time with no pressure and no incident of a
+/// guard that waits for recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuietMark {
+    /// The guard.
+    pub guard: Guard,
+    /// The time of the first evaluation of the sequence.
+    pub since: MonotonicMark,
+    /// The continuity generation of the clock at that time. A time of a
+    /// different generation is not comparable: the host slept.
+    pub continuity: svalnir_core::policy::ContinuityGeneration,
+}
+
 /// The condition of a guard that the latest step reported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportedCondition {
@@ -259,6 +286,7 @@ impl Default for ControllerState {
             outstanding: None,
             sequence: 0,
             held_until_recovery: Vec::new(),
+            quiet_since: Vec::new(),
             paused: false,
             measurement_floor: None,
             reported: Vec::new(),
@@ -297,6 +325,7 @@ impl ControllerState {
             budget.recovery_window = QualificationWindow::Idle;
         }
         view.reported.clear();
+        view.quiet_since.clear();
         view
     }
 
@@ -387,8 +416,28 @@ impl ControllerState {
     /// Replaces the budget record of an incident after an authorized rearm
     /// (`svalnir_core::grant::rearm`). The new generation starts in the
     /// lifetime `epoch` with no usage; each cooldown stays. Returns `false`
-    /// when no open incident has the identity of `budget`.
+    /// when no open incident has the identity of `budget`, when a plan of
+    /// that incident is in progress, or when the generation of `budget` is
+    /// not newer than the recorded one. A plan in progress keeps its
+    /// reservation, and one rearm gives one new generation: the same
+    /// record applied again replenishes nothing.
     pub fn apply_rearm(&mut self, budget: IncidentBudget, epoch: &ExecutorEpochId) -> bool {
+        if self
+            .outstanding
+            .as_ref()
+            .is_some_and(|plan| plan.incident_id == budget.incident_id)
+        {
+            return false;
+        }
+        let recorded: Option<&IncidentBudget> = self
+            .disk_incidents
+            .iter()
+            .map(|record| &record.budget)
+            .chain(self.memory_incident.iter().map(|record| &record.budget))
+            .find(|recorded| recorded.incident_id == budget.incident_id);
+        if recorded.is_some_and(|recorded| budget.generation <= recorded.generation) {
+            return false;
+        }
         if let Some(index) = self
             .disk_incidents
             .iter()

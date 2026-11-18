@@ -335,6 +335,24 @@ pub(crate) fn paused(state: &AuthorityState, now: u64) -> AuthorityState {
         .state
 }
 
+/// `state` with a durable pause of all automation that starts at `now` and
+/// has the length `duration`.
+pub(crate) fn paused_for(state: &AuthorityState, now: u64, duration: u64) -> AuthorityState {
+    let reading: TimeReading = time(now);
+    let control = ControlClock {
+        clock: &reading.clock,
+        wall: reading.wall,
+    };
+    let request = PauseRequest {
+        principal: user(),
+        duration: Some(Nanoseconds::new(duration)),
+    };
+    pause(state, &request, &control)
+        .unwrap()
+        .acknowledge(&InstanceInhibition::default(), Persistence::Durable)
+        .state
+}
+
 /// `state` after a durable resume.
 pub(crate) fn resumed(state: &AuthorityState, now: u64) -> AuthorityState {
     let reading: TimeReading = time(now);

@@ -39,8 +39,8 @@ use super::model::{
     ControllerState, ControllerStatus, DiskIncidentRecord, Guard, GuardPhase, GuardStatus,
     IncidentStatus, Intent, MAX_APPLICATION_COOLDOWNS, MAX_PREPARED_CANDIDATES, MAX_REPORTS,
     MAX_STATUS_REASONS, MemoryIncidentRecord, MonotonicMark, Notification, OperationResult,
-    Outstanding, PreparationMode, PreparedCandidate, ReduceReason, ReportedCondition, RuleUsage,
-    StepInput, StepOutput, Summary, TriggerKey, TriggerRecord, stamp,
+    Outstanding, PreparationMode, PreparedCandidate, QuietMark, ReduceReason, ReportedCondition,
+    RuleUsage, StepInput, StepOutput, Summary, TriggerKey, TriggerRecord, stamp,
 };
 use crate::coordinator::{IncidentAllowance, Pacing, TriggerStanding};
 
@@ -205,15 +205,42 @@ impl<'a> Run<'a> {
         // that has no end, the status shows none.
         let mut in_effect: bool = false;
         let mut no_end: bool = false;
+        // The expiry of a pause that ended between two steps. No step saw
+        // that pause in effect, so the change of `paused` does not show it.
+        let mut expiry: Option<MonotonicNanos> = None;
         for pause in pauses {
-            if let PauseStatus::Paused { until, .. } = pause_status(pause, &control) {
-                in_effect = true;
-                no_end |= until.is_none();
-                self.paused_until = self.paused_until.max(until);
+            match pause_status(pause, &control) {
+                PauseStatus::Paused { until, .. } => {
+                    in_effect = true;
+                    no_end |= until.is_none();
+                    self.paused_until = self.paused_until.max(until);
+                }
+                PauseStatus::Expired { floor, .. } => expiry = expiry.max(floor),
+                PauseStatus::NotPaused => {}
             }
         }
         if no_end {
             self.paused_until = None;
+        }
+        if let Some(expiry) = expiry {
+            // Expiry only allows reevaluation: evidence from before it
+            // supports no automatic action.
+            let known: Option<MonotonicNanos> = self
+                .state
+                .measurement_floor
+                .as_ref()
+                .filter(|mark| {
+                    mark.clock_domain == self.input.time.clock.clock_domain
+                        && mark.boot_id == self.input.time.clock.boot_id
+                })
+                .map(|mark| mark.at);
+            if known.is_none_or(|known| known < expiry) {
+                self.state.measurement_floor = Some(MonotonicMark {
+                    at: expiry,
+                    clock_domain: self.input.time.clock.clock_domain.clone(),
+                    boot_id: self.input.time.clock.boot_id.clone(),
+                });
+            }
         }
         if self.state.paused && !in_effect {
             // A resume takes a fresh measurement first: evidence from
@@ -261,6 +288,11 @@ impl<'a> Run<'a> {
 
     fn reports(&mut self) {
         let reports: &[ApplyReport] = self.input.reports;
+        if reports.len() > MAX_REPORTS {
+            // A report that is not read is not a normal state: its plan
+            // stays in progress.
+            self.degraded.push("reports_dropped".to_owned());
+        }
         for report in reports.iter().take(MAX_REPORTS) {
             let plan_id: &PlanId = match report {
                 ApplyReport::Admitted { plan_id, .. }
@@ -284,17 +316,35 @@ impl<'a> Run<'a> {
                 }
                 ApplyReport::Refused { code, .. } => {
                     self.settle(&outstanding, false);
-                    self.set_refusal(&outstanding, Some(code.clone()));
+                    let refusals: u32 = self.set_refusal(&outstanding, Some(code.clone()));
                     // The next plan waits for one observation window, so
-                    // that a refusal does not make a loop of plans.
-                    self.observe(&outstanding);
+                    // that a refusal does not make a loop of plans. The
+                    // wait doubles with each refusal in sequence, to a
+                    // maximum: an action that is not permitted is not
+                    // tried again at a constant rate.
+                    let doublings: u32 = refusals.saturating_sub(1).min(16);
+                    let factor: u64 = 1_u64
+                        .checked_shl(doublings)
+                        .unwrap_or(MAX_BACKOFF_FACTOR)
+                        .min(MAX_BACKOFF_FACTOR);
+                    self.observe(&outstanding, factor);
                 }
                 ApplyReport::Finished { result, .. } => self.finished(&outstanding, result),
             }
         }
     }
 
-    fn set_refusal(&mut self, outstanding: &Outstanding, code: Option<String>) {
+    /// Records the refusal code of the latest plan of an incident, or
+    /// removes it after an admission. Returns the number of refusals in
+    /// sequence.
+    fn set_refusal(&mut self, outstanding: &Outstanding, code: Option<String>) -> u32 {
+        let count = |refusals: u32| {
+            if code.is_some() {
+                refusals.saturating_add(1)
+            } else {
+                0
+            }
+        };
         match outstanding.guard {
             Guard::Disk => {
                 if let Some(record) = self
@@ -303,27 +353,34 @@ impl<'a> Run<'a> {
                     .iter_mut()
                     .find(|record| record.incident_id == outstanding.incident_id)
                 {
+                    record.refusals = count(record.refusals);
                     record.last_refusal = code;
+                    return record.refusals;
                 }
             }
             Guard::Memory => {
                 if let Some(record) = &mut self.state.memory_incident {
+                    record.refusals = count(record.refusals);
                     record.last_refusal = code;
+                    return record.refusals;
                 }
             }
         }
+        0
     }
 
     /// Starts the observation window after an action of the incident of
-    /// `outstanding`.
-    fn observe(&mut self, outstanding: &Outstanding) {
+    /// `outstanding`. The window is `factor` times the configured time.
+    fn observe(&mut self, outstanding: &Outstanding, factor: u64) {
         let guard_wait: Duration = match outstanding.guard {
             Guard::Disk => self.input.config.disk_guard().observe_after_action,
             Guard::Memory => self.input.config.memory_guard().observe_after_action,
         };
+        let wait: Nanoseconds =
+            Nanoseconds::new(nanoseconds(guard_wait).get().saturating_mul(factor));
         let until: Cooldown = cooldown(
             CooldownCause::PassPacing,
-            after(self.now(), nanoseconds(guard_wait)),
+            after(self.now(), wait),
             self.input,
         );
         match outstanding.guard {
@@ -500,7 +557,17 @@ impl<'a> Run<'a> {
             let cooldowns = &mut self.state.policy.memory.cooldowns;
             cooldowns.retain(|entry| !entry.application.eq_ignore_ascii_case(application));
             if cooldowns.len() >= MAX_APPLICATION_COOLDOWNS {
-                cooldowns.remove(0);
+                // Each kept cooldown is in effect. The one that ends first
+                // is removed, so that no later cooldown outlives a longer
+                // one that was removed.
+                let first_to_end: Option<usize> = cooldowns
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.cooldown.until)
+                    .map(|(index, _)| index);
+                if let Some(index) = first_to_end {
+                    cooldowns.remove(index);
+                }
             }
             cooldowns.push(ApplicationCooldown {
                 application: application.clone(),
@@ -530,7 +597,7 @@ impl<'a> Run<'a> {
 
     fn finished(&mut self, outstanding: &Outstanding, result: &OperationResult) {
         self.settle(outstanding, result.possibly_submitted);
-        self.observe(outstanding);
+        self.observe(outstanding, 1);
         let low_benefit: bool = match outstanding.guard {
             Guard::Disk => self.finished_disk(outstanding, result),
             Guard::Memory => self.finished_memory(outstanding, result),
@@ -721,6 +788,7 @@ impl<'a> Run<'a> {
                 rule_usage: Vec::new(),
                 observe_until: None,
                 last_refusal: None,
+                refusals: 0,
             });
         }
     }
@@ -762,6 +830,7 @@ impl<'a> Run<'a> {
                         observe_until: None,
                         backoff: None,
                         last_refusal: None,
+                        refusals: 0,
                     });
                 }
                 None => self.degraded.push("incident_identity".to_owned()),
@@ -1714,16 +1783,71 @@ impl<'a> Run<'a> {
                 .chain(evaluation.budgets.iter().map(|budget| budget.state))
                 .collect()
         });
-        // A guard that waited for recovery is free when an evaluation
-        // shows no incident and no pressure.
-        let disk_quiet: bool =
-            is_quiet(disk_states.as_deref()) && self.state.disk_incidents.is_empty();
-        let memory_quiet: bool =
-            is_quiet(memory_states.as_deref()) && self.state.memory_incident.is_none();
-        self.state.held_until_recovery.retain(|guard| match guard {
-            Guard::Disk => !disk_quiet,
-            Guard::Memory => !memory_quiet,
-        });
+        // A guard that waited for recovery is free after a sustained
+        // recovery that this lifetime observed: each evaluation shows
+        // each trigger normal for the recovery time of the guard, and no
+        // incident is open at its end. A warning state does not satisfy
+        // recovery, and a restart must not replenish a budget during
+        // continuing pressure.
+        let disk_quiet: bool = is_quiet(disk_states.as_deref());
+        let memory_quiet: bool = is_quiet(memory_states.as_deref());
+        let disk_open: bool = !self.state.disk_incidents.is_empty();
+        let memory_open: bool = self.state.memory_incident.is_some();
+        let clock = &self.input.time.clock;
+        let now: MonotonicNanos = clock.now;
+        let mut marks: Vec<QuietMark> = Vec::new();
+        let mut released: Vec<Guard> = Vec::new();
+        for guard in &self.state.held_until_recovery {
+            let (quiet, open, stable_for): (bool, bool, Duration) = match guard {
+                Guard::Disk => (
+                    disk_quiet,
+                    disk_open,
+                    self.input.config.disk_guard().recovery_stable_for,
+                ),
+                Guard::Memory => (
+                    memory_quiet,
+                    memory_open,
+                    self.input.config.memory_guard().recovery_stable_for,
+                ),
+            };
+            if !quiet {
+                continue;
+            }
+            // A mark of a different boot, clock domain, or continuity
+            // generation is not comparable: the sequence starts again.
+            let mark: QuietMark = self
+                .state
+                .quiet_since
+                .iter()
+                .find(|mark| {
+                    mark.guard == *guard
+                        && mark.continuity == clock.continuity
+                        && mark.since.clock_domain == clock.clock_domain
+                        && mark.since.boot_id == clock.boot_id
+                })
+                .cloned()
+                .unwrap_or_else(|| QuietMark {
+                    guard: *guard,
+                    since: MonotonicMark {
+                        at: now,
+                        clock_domain: clock.clock_domain.clone(),
+                        boot_id: clock.boot_id.clone(),
+                    },
+                    continuity: clock.continuity,
+                });
+            let stable: bool = now
+                .checked_duration_since(mark.since.at)
+                .is_some_and(|quiet_for| quiet_for >= nanoseconds(stable_for));
+            if stable && !open {
+                released.push(*guard);
+            } else {
+                marks.push(mark);
+            }
+        }
+        self.state.quiet_since = marks;
+        self.state
+            .held_until_recovery
+            .retain(|guard| !released.contains(guard));
         let disk_triggers: Vec<String> = disk.map_or_else(Vec::new, |view| {
             view.evaluation
                 .volumes
@@ -1990,12 +2114,15 @@ fn unreserve(usage: &mut WorkUsage, charge: WorkCharge, consumed: bool) {
     }
 }
 
-/// True when each trigger of an evaluation is normal or advisory.
+/// True when an evaluation has one trigger or more and each one is
+/// normal. An advisory state is not a recovery, and an evaluation with no
+/// trigger shows nothing.
 fn is_quiet(states: Option<&[TriggerState]>) -> bool {
     states.is_some_and(|states| {
-        states
-            .iter()
-            .all(|state| matches!(state, TriggerState::Normal | TriggerState::Advisory))
+        !states.is_empty()
+            && states
+                .iter()
+                .all(|state| matches!(state, TriggerState::Normal))
     })
 }
 

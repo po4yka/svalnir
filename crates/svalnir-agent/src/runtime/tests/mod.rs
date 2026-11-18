@@ -14,7 +14,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,8 +48,8 @@ use super::{
 };
 use crate::controller::tests::support::{
     CandidateSpec, GIBIBYTE, MOUNT, ROOT_ID, Registry, SECOND, VOLUME, application, boot, capacity,
-    clock_domain, config, config_text, enabled, memory, prepared, pressure, proposed_registry,
-    rule, user, validated_registry, volume, wall,
+    clock_domain, config, config_text, enabled, memory, paused, prepared, pressure,
+    proposed_registry, rule, user, validated_registry, volume, wall,
 };
 use crate::controller::{
     BlockedReason, CandidateSet, ControllerState, Guard, GuardPhase, Notification, Observations,
@@ -195,6 +195,8 @@ struct TestClock {
     host: bool,
     offset: Arc<AtomicU64>,
     discontinuities: Arc<AtomicU64>,
+    /// True when the next reading of the continuity finds a sleep.
+    slept: Arc<AtomicBool>,
 }
 
 impl TestClock {
@@ -203,6 +205,7 @@ impl TestClock {
             host: false,
             offset: Arc::new(AtomicU64::new(0)),
             discontinuities: Arc::new(AtomicU64::new(0)),
+            slept: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -249,6 +252,14 @@ impl AgentClock for TestClock {
 
     fn mark_discontinuity(&self) {
         self.discontinuities.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn observe_continuity(&self) -> bool {
+        let slept: bool = self.slept.swap(false, Ordering::SeqCst);
+        if slept {
+            self.mark_discontinuity();
+        }
+        slept
     }
 }
 
@@ -1127,6 +1138,15 @@ fn a_second_agent_on_the_same_journal_is_busy_and_changes_nothing() {
     drop(driver);
 }
 
+/// Requests the stop of a service when a test ends, also with a panic.
+struct StopAtEnd(StopHandle);
+
+impl Drop for StopAtEnd {
+    fn drop(&mut self) {
+        self.0.request_stop();
+    }
+}
+
 /// A collector that gives quiet samples at the time of the clock.
 struct QuietCollector {
     clock: TestClock,
@@ -1229,6 +1249,9 @@ fn a_client_request_through_the_queue_is_served_while_the_loop_runs() {
     };
     let service_stop: StopHandle = stop.clone();
     let clock: Arc<dyn AgentClock> = Arc::new(bench.clock.clone());
+    // A failed assertion stops the service, so that its thread does not
+    // use the temporary directory after the bench removed it.
+    let _stop_at_end = StopAtEnd(stop.clone());
     let service = std::thread::spawn(move || {
         run(driver, collector, receiver, settings, &service_stop, clock)
     });
@@ -1313,4 +1336,201 @@ fn the_disk_guard_policy_of_the_fixture_names_the_test_rule() {
             .rules(PolicyId::DiskGuard)
             .contains(&rule(svalnir_core::rule::LifecycleState::Proposed).reference)
     );
+}
+
+/// Ticks with a low-capacity sample each five seconds to the last sample
+/// before the entry window of 30 seconds is complete.
+fn run_to_the_end_of_the_window(bench: &Bench, driver: &mut Driver) {
+    for _ in 0..6 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(phase(driver, Guard::Disk), GuardPhase::Qualifying);
+    assert_eq!(bench.modes.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn the_first_sample_after_a_wake_does_not_complete_a_window() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("a");
+    let mut driver = bench.start();
+    run_to_the_end_of_the_window(&bench, &mut driver);
+    // This sample would complete the window. The host slept before it:
+    // the evaluation of the same tick has the new continuity generation,
+    // and the trigger is not ready.
+    let mut woke: Sample = bench.sample(5 * GIBIBYTE, PressureState::Normal, Vec::new());
+    woke.woke = true;
+    driver.tick(Some(woke));
+    assert_eq!(bench.clock.discontinuities.load(Ordering::SeqCst), 1);
+    assert_eq!(phase(&driver, Guard::Disk), GuardPhase::Qualifying);
+    assert_eq!(bench.modes.lock().unwrap().len(), 0);
+    assert!(driver.controller_state().outstanding.is_none());
+    assert!(file.exists());
+}
+
+#[test]
+fn a_sleep_that_the_clock_finds_between_two_samples_starts_each_window_again() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("a");
+    let mut driver = bench.start();
+    run_to_the_end_of_the_window(&bench, &mut driver);
+    // The clock finds the sleep at the tick. The collector did not report
+    // it: its sample is from before its next reading of the sleep time.
+    bench.clock.slept.store(true, Ordering::SeqCst);
+    driver.tick(Some(bench.sample(
+        5 * GIBIBYTE,
+        PressureState::Normal,
+        Vec::new(),
+    )));
+    assert_eq!(bench.clock.discontinuities.load(Ordering::SeqCst), 1);
+    assert_eq!(phase(&driver, Guard::Disk), GuardPhase::Qualifying);
+    assert_eq!(bench.modes.lock().unwrap().len(), 0);
+    assert!(driver.controller_state().outstanding.is_none());
+    assert!(file.exists());
+}
+
+#[test]
+fn a_pause_in_the_journal_applies_before_the_coordinator_dispatches_the_next_step() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    let active: AuthorityState = bench.seed_authority();
+    let mut child = spawn_child(true);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let mut driver = bench.start();
+    let operation_id: OperationId = run_to_operation(&bench, &mut driver, &member);
+    bench.clock.advance(SECOND);
+    driver.tick(None);
+    assert!(child.is_running());
+
+    // The user pauses the automation in the grace period. The grace
+    // period then ends before the next tick.
+    bench.write_authority(&paused(&active, bench.clock.now()));
+    bench.clock.advance(15 * SECOND);
+    for _ in 0..3 {
+        driver.tick(None);
+        bench.clock.advance(SECOND);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The force step was not dispatched with the authority of before the
+    // pause: the child of the test is alive.
+    assert!(child.is_running());
+    let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
+    let force = operation
+        .steps()
+        .iter()
+        .find(|step| step.action_class() == &ActionClass::ForceApplicationExit)
+        .unwrap();
+    assert!(!force.progress().dispatch().is_possibly_submitted());
+    assert!(driver.controller_status().unwrap().paused);
+    let _report: ShutdownReport = driver.shutdown(&mut TestIdle(bench.clock.clone()));
+}
+
+#[test]
+fn a_lifecycle_record_that_is_not_readable_gives_the_longest_restart_backoff() {
+    for record in [
+        // A record with a field that this build does not know.
+        serde_json::json!({ "schema_version": 1, "of_a_later_build": true }),
+        // A record of a different schema version that says "clean".
+        serde_json::json!({
+            "schema_version": 99,
+            "last_start": null,
+            "last_stop": null,
+            "stopped_cleanly": true,
+            "unclean_stops": 0,
+            "degraded_reason": null,
+        }),
+    ] {
+        let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+        bench.seed_authority();
+        bench
+            .journal()
+            .put_agent_record(
+                AgentRecord::Lifecycle,
+                &record,
+                None,
+                wall(bench.clock.now()),
+            )
+            .unwrap();
+        let mut driver = bench.start();
+        let lifecycle: LifecycleRecord = bench.lifecycle();
+        assert!(!lifecycle.stopped_cleanly);
+        assert_eq!(
+            super::restart_backoff(lifecycle.unclean_stops),
+            super::RESTART_BACKOFF_MAX
+        );
+        // The backoff of one stop that was not clean is 10 seconds. One
+        // minute later the backoff of this start is still in effect.
+        bench.clock.advance(60 * SECOND);
+        let mut sample: Sample = bench.sample(100 * GIBIBYTE, PressureState::Normal, Vec::new());
+        // The names of the collectors do not push the condition of the
+        // runtime out of the bounded list.
+        sample.degraded = (0..super::MAX_DEGRADED_REASONS)
+            .map(|index| format!("collector_{index}"))
+            .collect();
+        driver.tick(Some(sample));
+        let status: AgentStatus = bench.status();
+        assert!(status.restart_backoff);
+        assert_eq!(status.degraded.len(), super::MAX_DEGRADED_REASONS);
+        let reason: String = bench.lifecycle().degraded_reason.unwrap();
+        assert_eq!(status.degraded.first(), Some(&reason));
+    }
+}
+
+/// A collector whose second collection ends with a panic.
+struct FailingCollector {
+    quiet: QuietCollector,
+}
+
+impl Collector for FailingCollector {
+    fn collect(&mut self) -> Sample {
+        assert!(
+            self.quiet.collections.load(Ordering::SeqCst) == 0,
+            "the collector of the test fails"
+        );
+        self.quiet.collect()
+    }
+}
+
+#[test]
+fn a_panic_of_the_collector_thread_stops_the_service_and_the_stop_is_not_clean() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    let driver = bench.start();
+    let stop: StopHandle = StopHandle::new();
+    let _stop_at_end = StopAtEnd(stop.clone());
+    let collector = Box::new(FailingCollector {
+        quiet: QuietCollector {
+            clock: bench.clock.clone(),
+            collections: Arc::new(AtomicU64::new(0)),
+        },
+    });
+    let (_events, receiver) = std::sync::mpsc::sync_channel::<()>(1);
+    let settings = ServiceSettings {
+        sample_interval: Duration::from_millis(50),
+        pressure_sample_interval: Duration::from_millis(50),
+        idle_interval: Duration::from_millis(20),
+    };
+    let service_stop: StopHandle = stop.clone();
+    let clock: Arc<dyn AgentClock> = Arc::new(bench.clock.clone());
+    let (done, result) = std::sync::mpsc::channel::<ShutdownReport>();
+    let service = std::thread::spawn(move || {
+        let report: ShutdownReport =
+            run(driver, collector, receiver, settings, &service_stop, clock);
+        let _sent = done.send(report);
+    });
+    // The service ends with no stop request. Without the stop of the
+    // driver loop it would run with no observation until a signal.
+    let report: ShutdownReport = result
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the service did not end after the panic of its collector");
+    service.join().unwrap();
+    assert!(!report.clean);
+    assert!(stop.is_stopped());
+    assert!(!stop.was_requested());
+    // The driver released the coordinator lock: a new lifetime starts.
+    drop(bench.start());
 }

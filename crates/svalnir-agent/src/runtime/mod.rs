@@ -91,9 +91,15 @@
 //!   gets a new continuity generation, so each window starts again and
 //!   each earlier sample is not usable, and the candidate set is
 //!   discarded. Each collection reads the volume identity and the process
-//!   inventory again, so no baseline of before the sleep stays.
+//!   inventory again, so no baseline of before the sleep stays. The
+//!   driver also asks the clock at each tick
+//!   ([`AgentClock::observe_continuity`]), so a sleep is known before the
+//!   next collection, and the collector measures its wait with the clock
+//!   of the agent, which counts the time of a sleep. The evaluation of a
+//!   tick that found a wake uses a clock reading from after it.
 //! - **Pause.** A pause is in the authority record, so it survives a
-//!   restart. The agent reads the record again at each tick.
+//!   restart. The agent reads the record again at the start of each tick,
+//!   before the coordinator dispatches a step.
 //! - **Stop.** `SIGTERM` or `SIGINT` ends the main run loop. The driver
 //!   ends its tick, makes no new automatic plan, gives the operation in
 //!   progress a stop request so that its current step ends at its safe
@@ -103,7 +109,11 @@
 //! - **Restart backoff.** A lifetime that wrote no clean stop is counted
 //!   in the lifecycle record. After such a stop, automatic work waits for
 //!   [`restart_backoff`], which doubles to a maximum. Observation and
-//!   client requests do not wait.
+//!   client requests do not wait. A lifecycle record that is not readable
+//!   gives the longest backoff.
+//! - **Thread failure.** A panic of the collector thread or of the driver
+//!   thread stops the other one. The stop is then not clean, and the main
+//!   run loop ends.
 //! - **Power.** The agent takes no power assertion and has no timer that
 //!   wakes the host.
 

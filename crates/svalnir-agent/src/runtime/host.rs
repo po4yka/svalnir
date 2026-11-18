@@ -76,6 +76,20 @@ pub enum HostError {
     Identity,
 }
 
+impl HostError {
+    /// A fixed name of the cause, for a log. The text of the error can
+    /// have a path of the user; this name has none.
+    #[must_use]
+    pub const fn cause(&self) -> &'static str {
+        match self {
+            Self::Context(_) => "collection_context",
+            Self::Registry(_) => "rule_registry",
+            Self::Executor(_) => "filesystem_executor",
+            Self::Identity => "identity",
+        }
+    }
+}
+
 /// The clock of the agent on the running system.
 pub struct SystemAgentClock {
     clock: Arc<dyn HostClock>,
@@ -83,6 +97,16 @@ pub struct SystemAgentClock {
     boot_id: BootId,
     continuity: AtomicU64,
     last_discontinuity: Mutex<Option<MonotonicNanos>>,
+    /// The source of the sleep time and its latest value, for
+    /// [`AgentClock::observe_continuity`]. `None`: the clock does not
+    /// read the sleep time.
+    sleep: Option<SleepWatch>,
+}
+
+/// The cumulative sleep time of the host as the clock read it last.
+struct SleepWatch {
+    context: Arc<CollectionContext>,
+    last: Mutex<Reading<Nanoseconds>>,
 }
 
 impl fmt::Debug for SystemAgentClock {
@@ -106,6 +130,21 @@ impl SystemAgentClock {
             boot_id: identity.boot_id.clone(),
             continuity: AtomicU64::new(0),
             last_discontinuity: Mutex::new(None),
+            sleep: None,
+        }
+    }
+
+    /// The clock of `context` that also reads the cumulative sleep time
+    /// of the host, so that [`AgentClock::observe_continuity`] finds a
+    /// sleep between two readings.
+    #[must_use]
+    pub fn watching_sleep(context: &Arc<CollectionContext>) -> Self {
+        Self {
+            sleep: Some(SleepWatch {
+                context: Arc::clone(context),
+                last: Mutex::new(context.sleep_time()),
+            }),
+            ..Self::new(context)
         }
     }
 }
@@ -140,6 +179,25 @@ impl AgentClock for SystemAgentClock {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(now);
         }
+    }
+
+    fn observe_continuity(&self) -> bool {
+        let Some(watch) = &self.sleep else {
+            return false;
+        };
+        let now: Reading<Nanoseconds> = watch.context.sleep_time();
+        let slept: bool = {
+            let mut last = watch.last.lock().unwrap_or_else(PoisonError::into_inner);
+            // A sleep time that is not available gives no evidence that
+            // the host did not sleep.
+            let slept: bool = sleep_between(&last, &now).is_err();
+            *last = now;
+            slept
+        };
+        if slept {
+            self.mark_discontinuity();
+        }
+        slept
     }
 }
 
@@ -579,7 +637,7 @@ pub fn system_parts(
         CollectionContext::for_current_process()
             .map_err(|error| HostError::Context(error.to_string()))?,
     );
-    let clock: Arc<SystemAgentClock> = Arc::new(SystemAgentClock::new(&context));
+    let clock: Arc<SystemAgentClock> = Arc::new(SystemAgentClock::watching_sleep(&context));
     let registry: ReviewedRules =
         ReviewedRules::new().map_err(|error| HostError::Registry(error.to_string()))?;
     let candidates: ReviewedCandidateSource = ReviewedCandidateSource::new(&registry);

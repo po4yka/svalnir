@@ -13,8 +13,8 @@ use svalnir_core::state::PressureState;
 
 use self::support::{
     CandidateSpec, GIBIBYTE, RULE, Registry, SECOND, candidate_set, config, config_text, enabled,
-    epoch, job, memory, memory_grant_revoked, observations, paused, proposed_registry, resumed,
-    rule, time, user, validated_registry,
+    epoch, job, memory, memory_grant_revoked, observations, paused, paused_for, proposed_registry,
+    resumed, rule, time, user, validated_registry,
 };
 use super::{
     ApplyReport, AutomaticApply, BlockedReason, ControllerState, Guard, GuardPhase, GuardStatus,
@@ -683,11 +683,19 @@ fn a_record_that_is_not_readable_holds_each_guard_until_recovery() {
         vec![BlockedReason::HeldUntilRecovery]
     );
     assert_eq!(guard(&output, Guard::Memory).phase, GuardPhase::Exhausted);
-    // The disk guard had no pressure, so its hold ended at once.
-    assert_eq!(bench.state.held_until_recovery, vec![Guard::Memory]);
+    // The disk guard had no pressure for 40 seconds. Its hold ends after
+    // the recovery time of 60 seconds, not at the first quiet sample.
+    assert_eq!(
+        bench.state.held_until_recovery,
+        vec![Guard::Memory, Guard::Disk]
+    );
 
     let normal = |at: u64| observations(Some(100 * GIBIBYTE), Some(PressureState::Normal), at);
+    // The incident closes after its recovery time, and the hold ends
+    // after one more recovery time with each trigger normal.
     bench.run(90 * SECOND, normal);
+    assert_eq!(bench.state.held_until_recovery, vec![Guard::Memory]);
+    bench.run(60 * SECOND, normal);
     assert_eq!(bench.state.held_until_recovery.len(), 0);
     bench.run(20 * SECOND, critical(two_jobs));
     assert!(bench.state.outstanding.is_some());
@@ -1067,5 +1075,262 @@ fn no_discovery_starts_while_an_incident_is_open() {
         bench.advance(SAMPLE);
     }
     assert_eq!(bench.state.disk_incidents.len(), 1);
+    assert!(!modes.contains(&PreparationMode::Refresh), "{modes:?}");
+}
+
+#[test]
+fn a_hold_after_an_unreadable_record_needs_a_sustained_recovery_and_not_a_warning() {
+    let mut bench = Bench::new();
+    bench.state = ControllerState::restore(PriorState::Unreadable);
+    // The pressure is at the warning level, as in an incident that was
+    // open before the restart. A warning does not satisfy recovery.
+    let warning = |at: u64| observations(Some(100 * GIBIBYTE), Some(PressureState::Warning), at);
+    bench.run(120 * SECOND, warning);
+    assert!(bench.state.held_until_recovery.contains(&Guard::Memory));
+    // The disk had no pressure for the recovery time: its hold ended.
+    assert!(!bench.state.held_until_recovery.contains(&Guard::Disk));
+
+    // A normal state that is shorter than the recovery time does not end
+    // the hold, and a pressure state starts the time again.
+    let normal = |at: u64| observations(Some(100 * GIBIBYTE), Some(PressureState::Normal), at);
+    bench.run(30 * SECOND, normal);
+    assert!(bench.state.held_until_recovery.contains(&Guard::Memory));
+    bench.advance(SAMPLE);
+    bench.run(10 * SECOND, warning);
+    bench.advance(SAMPLE);
+    bench.run(40 * SECOND, normal);
+    assert!(bench.state.held_until_recovery.contains(&Guard::Memory));
+
+    // The pressure is critical again: the budget that the restart lost
+    // does not come back.
+    bench.advance(SAMPLE);
+    let output = bench.run(40 * SECOND, critical(two_jobs));
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(applies(&output).len(), 0);
+    assert_eq!(
+        guard(&output, Guard::Memory).blocked,
+        vec![BlockedReason::HeldUntilRecovery]
+    );
+    // The time with no pressure is not a part of the stored record.
+    assert_eq!(bench.state.durable_view().quiet_since.len(), 0);
+}
+
+#[test]
+fn a_pause_that_expired_between_two_steps_needs_a_measurement_after_its_expiry() {
+    let mut bench = Bench::new();
+    let active: AuthorityState = bench.authority.clone().unwrap();
+    // The critical window starts and is not qualified at 10 seconds.
+    let output = bench.run(10 * SECOND, critical(two_jobs));
+    assert_eq!(applies(&output).len(), 0);
+    // A pause from 11 seconds to 17 seconds. No step runs in it. The
+    // sample of 16 seconds is from the pause.
+    let during = critical(two_jobs)(START + 16 * SECOND);
+    bench.authority = Some(paused_for(&active, START + 11 * SECOND, 6 * SECOND));
+    bench.advance(8 * SECOND);
+    let output = bench.step(&during, &[]);
+    assert!(!output.status.paused);
+    assert_eq!(applies(&output).len(), 0, "{:?}", output.status);
+    assert_eq!(
+        guard(&output, Guard::Memory).blocked,
+        vec![BlockedReason::AwaitingFreshMeasurement]
+    );
+    assert!(bench.state.outstanding.is_none());
+
+    // A measurement after the expiry supports the plan.
+    bench.advance(2 * SECOND);
+    let output = bench.step(&critical(two_jobs)(bench.now), &[]);
+    assert_eq!(the_apply(&output).guard, Guard::Memory);
+}
+
+#[test]
+fn the_wait_after_a_refusal_doubles_to_a_maximum_and_an_admission_resets_it() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let mut waits: Vec<u64> = Vec::new();
+    for _ in 0..5 {
+        let outstanding = bench.state.outstanding.clone().unwrap();
+        let refused_at: u64 = bench.now;
+        let report = ApplyReport::Refused {
+            plan_id: outstanding.plan_id,
+            code: "lease_conflict".to_owned(),
+        };
+        bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+        assert!(bench.state.outstanding.is_none());
+        while bench.state.outstanding.is_none() {
+            assert!(bench.now - refused_at < 100 * SECOND, "{waits:?}");
+            bench.advance(SECOND);
+            bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[]);
+        }
+        waits.push((bench.now - refused_at) / SECOND);
+    }
+    // The observation window of the disk guard is 5 seconds.
+    assert!(waits[0] <= 6, "{waits:?}");
+    assert!(waits[1] >= 10, "{waits:?}");
+    assert!(waits[2] >= 20, "{waits:?}");
+    assert!(waits[3] >= 40, "{waits:?}");
+    assert!(waits[4] <= 41, "{waits:?}");
+    assert_eq!(bench.state.disk_incidents[0].refusals, 5);
+
+    let plan = bench.state.outstanding.clone().unwrap().plan_id;
+    let report = ApplyReport::Admitted {
+        plan_id: plan,
+        operation_id: OperationId::new("operation-1").unwrap(),
+    };
+    bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+    assert_eq!(bench.state.disk_incidents[0].refusals, 0);
+    assert_eq!(bench.state.disk_incidents[0].last_refusal, None);
+}
+
+#[test]
+fn a_rearm_does_not_release_a_plan_in_progress_and_is_not_applied_two_times() {
+    let mut bench = Bench::new();
+    bench.run(20 * SECOND, critical(two_jobs));
+    let outstanding = bench.state.outstanding.clone().unwrap();
+    let recorded = bench.state.memory_incident.clone().unwrap().budget;
+    let mut newer = recorded.clone();
+    newer.generation = recorded.generation.next().unwrap();
+    // A plan of the incident is in progress: its reservation stays.
+    assert!(!bench.state.apply_rearm(newer.clone(), &epoch("epoch_1")));
+    assert_eq!(
+        bench.state.policy.memory.incident.unwrap().reserved_slots,
+        1
+    );
+
+    bench.advance(SAMPLE);
+    let report = ApplyReport::Finished {
+        plan_id: outstanding.plan_id,
+        result: OperationResult {
+            state: "Completed".to_owned(),
+            completed: true,
+            possibly_submitted: true,
+            unknown_outcome: false,
+            capacity_gain: None,
+            pressure_after: Some(PressureState::Critical),
+            cooldown_until: None,
+        },
+    };
+    bench.step(&critical(two_jobs)(bench.now), &[report]);
+    assert_eq!(
+        bench.state.policy.memory.incident.unwrap().consumed_slots,
+        1
+    );
+    // The recorded generation gives no new budget.
+    assert!(!bench.state.apply_rearm(recorded, &epoch("epoch_1")));
+    assert_eq!(
+        bench.state.policy.memory.incident.unwrap().consumed_slots,
+        1
+    );
+    // A newer generation does, one time.
+    assert!(bench.state.apply_rearm(newer.clone(), &epoch("epoch_1")));
+    assert_eq!(
+        bench.state.policy.memory.incident.unwrap().consumed_slots,
+        0
+    );
+    bench
+        .state
+        .policy
+        .memory
+        .incident
+        .as_mut()
+        .unwrap()
+        .consumed_slots = 1;
+    assert!(!bench.state.apply_rearm(newer, &epoch("epoch_1")));
+    assert_eq!(
+        bench.state.policy.memory.incident.unwrap().consumed_slots,
+        1
+    );
+}
+
+#[test]
+fn a_full_cooldown_list_drops_the_cooldown_that_ends_first() {
+    use svalnir_core::policy::{ApplicationCooldown, Cooldown, CooldownCause};
+
+    let mut bench = Bench::new();
+    bench.run(20 * SECOND, critical(two_jobs));
+    let outstanding = bench.state.outstanding.clone().unwrap();
+    // The list is full of cooldowns in effect. The first entry is the
+    // longest one.
+    let reading = time(bench.now);
+    for index in 0..super::MAX_APPLICATION_COOLDOWNS {
+        let seconds: u64 = if index == 0 {
+            9_000
+        } else {
+            600 + index as u64
+        };
+        bench
+            .state
+            .policy
+            .memory
+            .cooldowns
+            .push(ApplicationCooldown {
+                application: format!("com.example.filler-{index}"),
+                cooldown: Cooldown {
+                    cause: CooldownCause::ApplicationRelaunch,
+                    until: svalnir_core::time::MonotonicNanos::new(bench.now + seconds * SECOND),
+                    clock_domain: reading.clock.clock_domain.clone(),
+                    boot_id: reading.clock.boot_id.clone(),
+                },
+            });
+    }
+    bench.advance(SAMPLE);
+    let report = ApplyReport::Finished {
+        plan_id: outstanding.plan_id,
+        result: OperationResult {
+            state: "Completed".to_owned(),
+            completed: true,
+            possibly_submitted: true,
+            unknown_outcome: false,
+            capacity_gain: None,
+            pressure_after: Some(PressureState::Warning),
+            cooldown_until: None,
+        },
+    };
+    bench.step(&critical(two_jobs)(bench.now), &[report]);
+    let cooldowns = &bench.state.policy.memory.cooldowns;
+    assert_eq!(cooldowns.len(), super::MAX_APPLICATION_COOLDOWNS);
+    let has = |name: &str| cooldowns.iter().any(|entry| entry.application == name);
+    assert!(has("com.example.filler-0"));
+    assert!(!has("com.example.filler-1"));
+    assert!(has("com.example.alpha"));
+}
+
+#[test]
+fn reports_above_the_bound_are_a_degraded_state() {
+    let mut bench = Bench::new();
+    let reports: Vec<ApplyReport> = (0..=super::MAX_REPORTS)
+        .map(|index| ApplyReport::Refused {
+            plan_id: PlanId::new(format!("plan-{index}")).unwrap(),
+            code: "none".to_owned(),
+        })
+        .collect();
+    let normal = observations(Some(100 * GIBIBYTE), Some(PressureState::Normal), bench.now);
+    let output = bench.step(&normal, &reports);
+    assert!(
+        output
+            .status
+            .degraded
+            .contains(&"reports_dropped".to_owned())
+    );
+    assert_eq!(output.status.summary, Summary::Degraded);
+}
+
+#[test]
+fn with_both_guards_critical_and_no_candidate_set_no_discovery_starts() {
+    let mut bench = Bench::new();
+    // The runtime has no candidate set, so the disk guard must ask for
+    // one. In the emergency it asks only for the known candidates.
+    let both = |at: u64| {
+        let mut made: Observations =
+            observations(Some(5 * GIBIBYTE), Some(PressureState::Critical), at);
+        made.memory = memory(Some(PressureState::Critical), at, two_jobs(at));
+        made
+    };
+    let mut modes: Vec<PreparationMode> = Vec::new();
+    for _ in 0..12 {
+        let output = bench.step(&both(bench.now), &[]);
+        modes.extend(preparations(&output));
+        bench.advance(SAMPLE);
+    }
     assert!(!modes.contains(&PreparationMode::Refresh), "{modes:?}");
 }

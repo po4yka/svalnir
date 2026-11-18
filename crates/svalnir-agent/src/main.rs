@@ -138,7 +138,7 @@ mod agent {
 
 #[cfg(target_os = "macos")]
 mod agent {
-    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
     use std::path::Path;
     use std::process::ExitCode;
     use std::sync::Arc;
@@ -177,7 +177,7 @@ mod agent {
 
     /// The configuration that the agent evaluates with no policy revision
     /// in effect: the file of `--config`, or the template values.
-    fn proposal(path: Option<&Path>) -> Result<ValidatedConfig, String> {
+    pub(super) fn proposal(path: Option<&Path>) -> Result<ValidatedConfig, String> {
         let text: String = match path {
             None => "schema_version = 1\n".to_owned(),
             Some(path) => {
@@ -188,8 +188,19 @@ mod agent {
                     .unwrap_or(u64::MAX)
                     .saturating_add(1);
                 let mut text: String = String::new();
-                std::fs::File::open(path)
-                    .and_then(|file| file.take(limit).read_to_string(&mut text))
+                // The open does not wait for the writer of a named pipe,
+                // and only a regular file is read.
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                    .and_then(|file| {
+                        if file.metadata()?.is_file() {
+                            file.take(limit).read_to_string(&mut text)
+                        } else {
+                            Err(std::io::ErrorKind::InvalidInput.into())
+                        }
+                    })
                     .map_err(|_| "the configuration file is not readable")?;
                 if text.len() > MAX_DOCUMENT_BYTES {
                     return Err("the configuration file is too large".to_owned());
@@ -204,15 +215,31 @@ mod agent {
     }
 
     /// Makes the state directory when it does not exist, for this user
-    /// only.
-    fn state_directory(path: &Path) -> std::io::Result<()> {
-        if path.is_dir() {
-            return Ok(());
+    /// only. A path that exists must be a directory of this user that no
+    /// other user can read or write, and not a symbolic link: the journal
+    /// has the targets of the plans and the history.
+    pub(super) fn state_directory(path: &Path) -> std::io::Result<()> {
+        let refused = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                // SAFETY: `geteuid` has no argument, changes nothing, and
+                // does not fail.
+                let user: u32 = unsafe { libc::geteuid() };
+                // The permission bits of the group and of each other user.
+                let shared: u32 = u32::from(libc::S_IRWXG | libc::S_IRWXO);
+                let private: bool = metadata.file_type().is_dir()
+                    && metadata.uid() == user
+                    && metadata.mode() & shared == 0;
+                if private { Ok(()) } else { Err(refused()) }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(path)
+            }
+            Err(error) => Err(error),
         }
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
     }
 
     /// The home directory of the user, from the environment of the
@@ -305,7 +332,8 @@ mod agent {
         .map_err(|_| tracing::warn!("the catalog store is not usable"))
         .ok();
         let parts: SystemParts =
-            system_parts(&epoch, principal, &home, store).map_err(|error| error.to_string())?;
+            // The text of the error can have a path of the user.
+            system_parts(&epoch, principal, &home, store).map_err(|error| error.cause())?;
         let service: ServiceSettings = ServiceSettings {
             sample_interval: config.agent().sample_interval,
             pressure_sample_interval: config.agent().pressure_sample_interval,
@@ -319,6 +347,22 @@ mod agent {
             service,
             settings,
         })
+    }
+
+    /// Ends the main run loop when the driver thread ends with no stop
+    /// request: the service failed, or a thread of it had a panic.
+    struct EndRunLoop(StopHandle);
+
+    impl Drop for EndRunLoop {
+        fn drop(&mut self) {
+            if !self.0.was_requested() {
+                // The main run loop ends at a stop signal of this
+                // process.
+                // SAFETY: `raise` sends one signal to the calling
+                // process, which has a signal source for it.
+                unsafe { libc::raise(libc::SIGTERM) };
+            }
+        }
     }
 
     pub(super) fn run(options: &Options) -> ExitCode {
@@ -378,6 +422,9 @@ mod agent {
         let thread = std::thread::Builder::new()
             .name("svalnir-driver".to_owned())
             .spawn(move || {
+                // Also when the service ends with a panic, the main run
+                // loop must end.
+                let _end_run_loop = EndRunLoop(service_stop.clone());
                 let report: ShutdownReport = run_service(
                     driver,
                     collector,
@@ -386,13 +433,6 @@ mod agent {
                     &service_stop,
                     service_clock,
                 );
-                if !service_stop.was_requested() {
-                    // The service ended with no stop request. The main
-                    // run loop ends at a stop signal of this process.
-                    // SAFETY: `raise` sends one signal to the calling
-                    // process, which has a signal source for it.
-                    unsafe { libc::raise(libc::SIGTERM) };
-                }
                 report
             });
         let Ok(thread) = thread else {
@@ -420,6 +460,64 @@ mod agent {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod host_tests {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use super::agent::{proposal, state_directory};
+
+    #[test]
+    fn a_new_state_directory_is_for_this_user_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested").join("state");
+        state_directory(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+        // The directory that the agent made is accepted again.
+        state_directory(&path).unwrap();
+    }
+
+    #[test]
+    fn a_state_directory_that_other_users_can_read_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(state_directory(&path).is_err());
+        // The agent does not change a directory that it did not make.
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn a_state_directory_that_is_a_symbolic_link_or_a_file_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(state_directory(&link).is_err());
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(state_directory(&file).is_err());
+    }
+
+    #[test]
+    fn a_configuration_path_that_is_a_named_pipe_is_refused_and_does_not_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipe = temp.path().join("pipe");
+        let name = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid C string for the time of the call, and
+        // the call makes one named pipe in the temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // No process writes to the pipe. A blocking open would not return.
+        assert!(proposal(Some(&pipe)).is_err());
+        assert!(proposal(Some(temp.path())).is_err());
+        let file = temp.path().join("config.toml");
+        std::fs::write(&file, "schema_version = 1\n").unwrap();
+        assert!(proposal(Some(&file)).is_ok());
     }
 }
 

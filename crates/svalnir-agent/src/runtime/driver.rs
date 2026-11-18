@@ -26,8 +26,8 @@ use thiserror::Error;
 
 use super::ports::{AgentClock, CandidateSource, ClockHandle, Notifier, Sample, SelfFootprint};
 use super::record::{
-    AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, LifecycleRecord, MAX_DEGRADED_REASONS,
-    PolicySource, RunState, SelfLimits, restart_backoff,
+    AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, LIFECYCLE_VERSION, LifecycleRecord,
+    MAX_DEGRADED_REASONS, PolicySource, RunState, SelfLimits, restart_backoff,
 };
 use crate::controller::{
     ApplyReport, AuthorityRecords, AutomaticApply, ControllerState, ControllerStatus, Guard,
@@ -248,17 +248,17 @@ impl Restored {
     /// Reads the lifecycle record and the state of the controller, and
     /// writes the two records of the new lifetime.
     fn read(records: &mut OperationJournal, time: &TimeReading) -> Self {
-        // A record that is not readable is not the record of a clean
-        // stop: it counts as one stop that was not clean.
-        let earlier: LifecycleRecord =
-            match records.agent_record::<LifecycleRecord>(AgentRecord::Lifecycle) {
-                Ok(None) => LifecycleRecord::default(),
-                Ok(Some(stored)) => stored.record,
-                Err(_) => LifecycleRecord {
-                    stopped_cleanly: false,
-                    ..LifecycleRecord::default()
-                },
-            };
+        // A record that is not readable, or that has a different schema
+        // version, is not the record of a clean stop, and its count of
+        // stops is not known: the restart backoff is then the longest
+        // one. A lost record must not make a crash loop faster.
+        let earlier: LifecycleRecord = match records
+            .agent_record::<LifecycleRecord>(AgentRecord::Lifecycle)
+        {
+            Ok(None) => LifecycleRecord::default(),
+            Ok(Some(stored)) if stored.record.schema_version == LIFECYCLE_VERSION => stored.record,
+            Ok(Some(_)) | Err(_) => LifecycleRecord::unreadable(),
+        };
         let lifecycle: LifecycleRecord = earlier.started(time.wall);
         let mut journal_unavailable: bool = records
             .put_agent_record(AgentRecord::Lifecycle, &lifecycle, None, time.wall)
@@ -704,8 +704,11 @@ impl Driver {
     }
 
     /// Takes a new sample: the observations replace the earlier ones, and
-    /// a wake discards what the time before the sleep supported.
-    fn take_sample(&mut self, sample: Sample, time: &TimeReading) {
+    /// a wake discards what the time before the sleep supported. Returns
+    /// whether the sample reported a wake: a clock reading from before
+    /// this call then has the continuity generation of before the sleep.
+    fn take_sample(&mut self, sample: Sample, time: &TimeReading) -> bool {
+        let woke: bool = sample.woke;
         self.last_sample_at = Some(time.clock.now);
         if sample.woke {
             // The windows start again, and a candidate set from before
@@ -720,13 +723,16 @@ impl Driver {
         self.has_sample = true;
         self.authority.records().control_plane = sample.control_plane;
         self.retain_sample();
+        woke
     }
 
     /// Writes the pressure and capacity observations of the sample to the
     /// catalog store. Retained samples are optional work: they are dropped
     /// before an action record.
     fn retain_sample(&mut self) {
-        if self.optional_reduced {
+        // The footprint of this tick counts at once, and not only after
+        // the next evaluation.
+        if self.optional_reduced || self.over_budget {
             return;
         }
         let Some(store) = &mut self.store else {
@@ -755,21 +761,41 @@ impl Driver {
     /// the latest observations again: an observation that got old is then
     /// not usable, which inhibits each action that depends on it.
     pub fn tick(&mut self, sample: Option<Sample>) -> TickReport {
-        let Some(time) = self.clock.now() else {
-            return TickReport {
-                worked: false,
-                wake_at: None,
-                fast_sampling: false,
-            };
+        const NOTHING: TickReport = TickReport {
+            worked: false,
+            wake_at: None,
+            fast_sampling: false,
         };
-        let (mut worked, mut wake_at) = self.run_coordinator();
-        self.collect_finished(&time);
+        // A sleep of the host that the clock finds between two ticks is
+        // known before the next collection reports it.
+        let mut discontinuity: bool = self.clock.observe_continuity();
+        if discontinuity {
+            self.observations.candidates = None;
+        }
+        let Some(mut time) = self.clock.now() else {
+            return NOTHING;
+        };
+        // The authority record is read before the coordinator dispatches
+        // a step: a pause, a disabled guard, or a revoked grant that is in
+        // the journal applies to the work of this tick.
         let authority_changed: bool = self.load_authority();
+        self.measure_self();
         let has_new_sample: bool = sample.is_some();
         if let Some(sample) = sample {
-            self.take_sample(sample, &time);
+            discontinuity |= self.take_sample(sample, &time);
         }
-        self.measure_self();
+        if discontinuity {
+            // The reading of before the discontinuity has the earlier
+            // continuity generation. The evaluation and the coordinator
+            // of this tick must not use it: each window starts again
+            // with the first sample after a wake.
+            let Some(after) = self.clock.now() else {
+                return NOTHING;
+            };
+            time = after;
+        }
+        let (mut worked, mut wake_at) = self.run_coordinator();
+        self.collect_finished(&time);
 
         // The controller evaluates a new sample, a report, a plan in
         // progress, a change of the authority, and a sample that got old.
@@ -921,16 +947,19 @@ impl Driver {
         if !(changed || due || state != RunState::Running) {
             return;
         }
-        let mut degraded: Vec<String> = self.sample_degraded.clone();
-        if !self.has_sample && state == RunState::Running {
-            degraded.push("no_sample".to_owned());
-        }
+        // The conditions of the runtime are first, so that the bound
+        // drops a name of a collector and not one of them.
+        let mut degraded: Vec<String> = Vec::new();
         if self.journal_unavailable {
             degraded.push("journal_unavailable".to_owned());
         }
         if let Some(reason) = &self.lifecycle.degraded_reason {
             degraded.push(reason.clone());
         }
+        if !self.has_sample && state == RunState::Running {
+            degraded.push("no_sample".to_owned());
+        }
+        degraded.extend(self.sample_degraded.iter().cloned());
         degraded.truncate(MAX_DEGRADED_REASONS);
         let record: AgentStatus = AgentStatus {
             schema_version: AGENT_STATUS_VERSION,
@@ -971,7 +1000,7 @@ impl Driver {
     /// does not run while the agent reduces its work, so no compaction or
     /// large delete runs in an incident.
     fn maintain(&mut self, time: &TimeReading) {
-        if self.optional_reduced || self.stopping {
+        if self.optional_reduced || self.over_budget || self.stopping {
             return;
         }
         let due: bool = self.last_maintenance_at.is_none_or(|at| {

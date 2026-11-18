@@ -148,6 +148,26 @@ impl Default for LifecycleRecord {
 }
 
 impl LifecycleRecord {
+    /// The record that stands for a stored record that this build cannot
+    /// read: a decode error, a storage error, or a different schema
+    /// version. The number of stops that were not clean is not known, so
+    /// it is the smallest number that gives the longest restart backoff.
+    /// A record that is not readable never makes the backoff shorter.
+    #[must_use]
+    pub fn unreadable() -> Self {
+        let mut unclean_stops: u32 = 0;
+        while restart_backoff(unclean_stops.saturating_add(1)) < RESTART_BACKOFF_MAX
+            && unclean_stops < 64
+        {
+            unclean_stops = unclean_stops.saturating_add(1);
+        }
+        Self {
+            stopped_cleanly: false,
+            unclean_stops,
+            ..Self::default()
+        }
+    }
+
     /// The record at the start of a new lifetime. A lifetime before this
     /// one that did not write a clean stop adds one to the count.
     #[must_use]
@@ -242,5 +262,17 @@ mod tests {
         let fourth: LifecycleRecord = stopped.started(wall(50));
         assert_eq!(fourth.unclean_stops, 0);
         assert_eq!(fourth.last_stop, Some(wall(40)));
+    }
+
+    #[test]
+    fn a_record_that_is_not_readable_gives_the_longest_backoff() {
+        let started: LifecycleRecord = LifecycleRecord::unreadable().started(wall(10));
+        assert!(!started.stopped_cleanly);
+        assert_eq!(restart_backoff(started.unclean_stops), RESTART_BACKOFF_MAX);
+        // The count is the smallest one with that backoff, so the status
+        // shows a number of the same size as a real count.
+        assert!(restart_backoff(started.unclean_stops - 1) < RESTART_BACKOFF_MAX);
+        // A clean stop still resets it.
+        assert_eq!(started.stopped(wall(20)).started(wall(30)).unclean_stops, 0);
     }
 }

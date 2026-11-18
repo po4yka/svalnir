@@ -298,23 +298,20 @@ impl EnvelopeContent {
         Ok(())
     }
 
-    /// Whether a lease of the envelope is for the conflict domain of the
-    /// target.
+    /// Whether the leases of the envelope are for the conflict domain of
+    /// the target.
     fn holds_target_domain(&self) -> bool {
         // A lease is for the conflict domain of the target: the cleanup
-        // root of a file target, a member generation of an application
+        // root of a file target, each member generation of an application
         // target, or the generation of a process target. A lease on a
-        // different domain coordinates nothing for this step.
-        //
-        // TODO(npochaev): require a lease for each member generation. The
-        // coordinator acquires one for each member; the envelope fixtures
-        // of the process executor and of the journal have one for the
-        // first member only.
+        // different domain coordinates nothing for this step, and a lease
+        // for one member does not stop a second operation on a different
+        // member of the same application.
         let holds =
             |resource: &LeaseResource| self.leases.iter().any(|lease| &lease.resource == resource);
         match &self.target.binding {
             TargetBinding::File(file) => holds(&LeaseResource::CleanupRoot(file.root_id.clone())),
-            TargetBinding::Application(application) => application.members.iter().any(|member| {
+            TargetBinding::Application(application) => application.members.iter().all(|member| {
                 holds(&LeaseResource::ProcessGeneration(
                     member.generation_id.clone(),
                 ))

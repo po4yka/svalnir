@@ -314,19 +314,19 @@ fn envelope_content(plan: &Plan, operation: &Operation, step: &str) -> EnvelopeC
         .unwrap();
     let target = plan.target(&planned.target_id).unwrap().clone();
     let is_application = planned.action_class.is_application_intervention();
-    let lease = |resource: LeaseResource| ResourceLease {
-        lease_id: LeaseId::new("lease_1").unwrap(),
+    let lease = |index: usize, resource: LeaseResource| ResourceLease {
+        lease_id: LeaseId::new(format!("lease_{index}")).unwrap(),
         resource,
         owner: operation.operation_id().clone(),
         executor_epoch: operation.executor_epoch().clone(),
         expires_at: MonotonicNanos::new(5_000),
     };
-    let (reservation, resource, adapter, recording) = match &target.binding {
+    let (reservation, resources, adapter, recording) = match &target.binding {
         TargetBinding::File(file) => (
             Reservation::Work {
                 charge: file.charge,
             },
-            LeaseResource::CleanupRoot(file.root_id.clone()),
+            vec![LeaseResource::CleanupRoot(file.root_id.clone())],
             "svalnir.expired-temporary",
             RecordingMode::Durable,
         ),
@@ -334,7 +334,13 @@ fn envelope_content(plan: &Plan, operation: &Operation, step: &str) -> EnvelopeC
             Reservation::ApplicationSlot {
                 incident_id: plan.trigger.incident_id.clone(),
             },
-            LeaseResource::ProcessGeneration(application.members[0].generation_id.clone()),
+            // One lease for each member generation, as the coordinator
+            // takes.
+            application
+                .members
+                .iter()
+                .map(|member| LeaseResource::ProcessGeneration(member.generation_id.clone()))
+                .collect(),
             "macos.appkit",
             if matches!(plan.trigger.class, TriggerClass::GlobalCriticalMemory) {
                 RecordingMode::VolatileCriticalException
@@ -378,7 +384,11 @@ fn envelope_content(plan: &Plan, operation: &Operation, step: &str) -> EnvelopeC
             verification_window: Nanoseconds::new(5_000_000_000),
             escalation: plan.limits.escalation.clone(),
         },
-        leases: vec![lease(resource)],
+        leases: resources
+            .into_iter()
+            .enumerate()
+            .map(|(index, resource)| lease(index, resource))
+            .collect(),
         recording,
     }
 }

@@ -365,8 +365,16 @@ fn a_lease_of_an_envelope_is_for_the_conflict_domain_of_its_target() {
         envelope.leases = vec![lease(resource)];
         assert_eq!(envelope_error(envelope), EnvelopeError::Lease);
     }
+    // A lease for one member only does not hold the application: a
+    // second operation with a lease for the other member would not
+    // conflict with this one.
+    for member in ["proc_1", "proc_2"] {
+        let mut envelope = critical();
+        envelope.leases = vec![lease(generation(member))];
+        assert_eq!(envelope_error(envelope), EnvelopeError::Lease);
+    }
     let mut envelope = critical();
-    envelope.leases = vec![lease(generation("proc_2"))];
+    envelope.leases = vec![lease(generation("proc_1")), lease(generation("proc_2"))];
     assert!(Checked::new(envelope).is_ok());
 }
 

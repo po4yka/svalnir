@@ -2159,9 +2159,15 @@ fn application_envelope(trigger: TriggerClass, recording: RecordingMode) -> Enve
             },
             ..file_envelope().limits
         },
-        leases: vec![lease(LeaseResource::ProcessGeneration(
-            ProcessGenerationId::new("proc_1").unwrap(),
-        ))],
+        leases: ["proc_1", "proc_2"]
+            .into_iter()
+            .map(|generation| ResourceLease {
+                lease_id: LeaseId::new(format!("lease_{generation}")).unwrap(),
+                ..lease(LeaseResource::ProcessGeneration(
+                    ProcessGenerationId::new(generation).unwrap(),
+                ))
+            })
+            .collect(),
         recording,
         ..file_envelope()
     }

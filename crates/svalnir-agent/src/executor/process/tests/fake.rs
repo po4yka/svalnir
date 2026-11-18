@@ -434,13 +434,18 @@ pub(super) fn content(
     let epoch: ExecutorEpochId = ExecutorEpochId::new("epoch_1").unwrap();
     let grace: Option<Nanoseconds> =
         matches!(escalation, Escalation::ForceAfterGrace).then_some(Nanoseconds::new(GRACE));
-    let lease: ResourceLease = ResourceLease {
-        lease_id: LeaseId::new("lease_1").unwrap(),
-        resource: LeaseResource::ProcessGeneration(members[0].generation_id.clone()),
-        owner: operation.clone(),
-        executor_epoch: epoch.clone(),
-        expires_at: MonotonicNanos::new(1_000_000_000),
-    };
+    // One lease for each member generation, as the coordinator takes.
+    let leases: Vec<ResourceLease> = members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| ResourceLease {
+            lease_id: LeaseId::new(format!("lease_{index}")).unwrap(),
+            resource: LeaseResource::ProcessGeneration(member.generation_id.clone()),
+            owner: operation.clone(),
+            executor_epoch: epoch.clone(),
+            expires_at: MonotonicNanos::new(1_000_000_000),
+        })
+        .collect();
     EnvelopeContent {
         schema_version: PLAN_SCHEMA_VERSION,
         action_class: class,
@@ -486,7 +491,7 @@ pub(super) fn content(
             verification_window: Nanoseconds::new(WINDOW),
             escalation,
         },
-        leases: vec![lease],
+        leases,
         recording: RecordingMode::Durable,
     }
 }

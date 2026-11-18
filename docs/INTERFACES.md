@@ -205,8 +205,8 @@ A refusal of the coordinator or of the authorization keeps its own code and fami
 
 These points are open in this build:
 
-- An agent has no approved cleanup root. A cleanup plan that goes through the request queue to an agent is admitted, and the filesystem executor of the agent then refuses each target, because the journal does not record the path of a cleanup root. A manual cleanup needs the transient coordinator until the journal or the request carries the roots.
-- `svalnir-core` has no catalog of protected file locations. The protection of a file entry is the decision of the client in the table above.
+- An agent has no approved cleanup root. A cleanup plan that goes through the request queue to an agent is admitted, and the filesystem executor of the agent then refuses each target, because the journal has no record of the approved cleanup roots. The sealed plan now binds the path and the object of the root of each file target, and no code makes the approved roots of an executor from it. A manual cleanup needs the transient coordinator until the journal or the request carries the roots.
+- The catalog of protected file locations of `svalnir-core` has the locations that `docs/CLEANUP_RULES.md` section 5 lists. It does not have each directory of OS-managed storage, for example the system databases below `/private/var/db`. A location that is not in the catalog has the protection of the `[protections]` table and of the filesystem executor only.
 - The location of the `svalnir-agent` executable has no packaging contract. The service commands accept only an executable beside the `svalnir` executable.
 - A request that a transient coordinator finds in the queue, and that is not its own, is executed by it with the cleanup roots of its own plan only: the file targets of such a request are refused by the filesystem executor.
 - A status query reads the coordinator lock by taking it for an instant. A client that starts in that instant tries the lock again three times before it writes its request to the queue; a request that no process serves is reported with `coordinator_stopped`.

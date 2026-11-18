@@ -100,7 +100,8 @@ pub struct CleanupEntry {
     /// The identity of the step that removes the entry.
     pub step_id: StepId,
     /// The absolute path of the entry, for the exclusion lists and for
-    /// display. The plan does not have it.
+    /// display. The plan does not have it; the plan has the root path and
+    /// the relative entry.
     pub path: LosslessPath,
     /// The approved root.
     pub root_id: RootId,

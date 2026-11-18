@@ -208,10 +208,10 @@ fn root_record(scan: &ScanResult) -> Result<RootRecord, ErrorBody> {
 /// The identity of a cleanup root: a digest of its path, its device and
 /// inode, its volume, and its mount generation.
 ///
-/// The sealed plan binds the root identity of each target and not the
-/// path of the root. With this identity, a plan document whose root has a
-/// different path or a different object does not agree with the sealed
-/// plan, and the client does not use it.
+/// The sealed plan binds this identity, the root path, and the root object
+/// of each target. A plan document whose root has a different path or a
+/// different object does not agree with the sealed plan, and the client
+/// does not use it.
 fn root_id_of(
     path: &LosslessPath,
     object: FileObjectEvidence,

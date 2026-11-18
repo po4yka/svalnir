@@ -23,7 +23,11 @@ use crate::{
     viz::{
         breakdown::{DEFAULT_SEGMENTS, Segment, breakdown},
         capacity_grid::CapacityGrid,
-        cell_band::CellBand,
+        led::{LedChart, LedField, TileLabel},
+        storage_layouts::{
+            BAND_ROWS, CHART_ROWS, ChartItem, STRIP_ROWS, StorageLayout, apply_focus,
+            bytes_per_cell, chart_label, layout_field, scale_caption,
+        },
     },
 };
 use gpui_kit::{
@@ -43,9 +47,13 @@ use gpui_kit::{
 };
 use std::{
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::SystemTime,
 };
+
+/// Opens the folder of a chart item.
+type OpenFn = Rc<dyn Fn(usize, &mut gpui_kit::App)>;
 
 /// The width that the viewport gives to the cards, less than the viewport.
 const CHROME_WIDTH: f32 = 340.0;
@@ -79,6 +87,7 @@ fn last_component(root: &Path) -> String {
 pub struct StorageScreen {
     model: Entity<AppModel>,
     metric: SizeMetric,
+    layout: StorageLayout,
     focused: Option<usize>,
     path_stack: Vec<PathBuf>,
 }
@@ -90,6 +99,7 @@ impl StorageScreen {
         Self {
             model,
             metric: SizeMetric::Allocated,
+            layout: StorageLayout::Tiles,
             focused: None,
             path_stack: Vec::new(),
         }
@@ -143,7 +153,12 @@ fn card(header: ShellHeader, body: impl IntoElement) -> AnyElement {
         .into_any_element()
 }
 
-fn volume_card(host: &Loadable<HostSnapshot>, tokens: &Tokens) -> AnyElement {
+fn volume_card(
+    host: &Loadable<HostSnapshot>,
+    tokens: &Tokens,
+    width: f32,
+    dark: bool,
+) -> AnyElement {
     let mut header: ShellHeader = ShellHeader::new(IconName::HardDrive, "Startup volume");
     let body: AnyElement = match host {
         Loadable::Loading => Skeleton::new().w(px(140.0)).h(px(30.0)).into_any_element(),
@@ -178,7 +193,7 @@ fn volume_card(host: &Loadable<HostSnapshot>, tokens: &Tokens) -> AnyElement {
             v_flex()
                 .gap(px(12.0))
                 .child(value)
-                .child(CapacityGrid::new(used, snapshot.disk_total.clone()).id("volume-grid"))
+                .child(volume_strip(&used, &snapshot.disk_total, width, dark))
                 .children(stale.then(|| {
                     caption(
                         "volume-stale",
@@ -202,6 +217,49 @@ fn volume_card(host: &Loadable<HostSnapshot>, tokens: &Tokens) -> AnyElement {
         }
     };
     card(header, body)
+}
+
+/// The LED strip of the volume: used space, then the free region.
+fn volume_strip(used: &Measured<u64>, total: &Measured<u64>, width: f32, dark: bool) -> AnyElement {
+    let (Measured::Value(used), Measured::Value(total)) = (used, total) else {
+        return CapacityGrid::new(used.clone(), total.clone())
+            .id("volume-grid")
+            .into_any_element();
+    };
+    let items: Vec<ChartItem> = vec![ChartItem {
+        label: "Used".to_owned(),
+        bytes: *used,
+        color: Hsla::from(palette::category_color(0, dark)),
+        activatable: false,
+        inert: false,
+    }];
+    let free: u64 = total.saturating_sub(*used);
+    let (field, labels) = layout_field(
+        &items,
+        *used,
+        Some(free),
+        StorageLayout::Band,
+        lattice_columns(width),
+        STRIP_ROWS,
+    );
+    let (used_text, used_unit) = format_bytes(*used);
+    let (total_text, total_unit) = format_bytes(*total);
+    LedChart::new(
+        field,
+        labels,
+        "volume-grid",
+        format!("Used {used_text} {used_unit} of {total_text} {total_unit}"),
+    )
+    .into_any_element()
+}
+
+/// The columns of a chart that fits `width` pixels.
+fn lattice_columns(width: f32) -> u16 {
+    let columns: f32 = (width / 6.0).clamp(20.0, 400.0).floor();
+    (0..=400_u16)
+        .rev()
+        .find(|&n| f32::from(n) <= columns)
+        .unwrap_or(20)
 }
 
 fn size_value(bytes: u64, id: &'static str) -> DisplayValue {
@@ -259,6 +317,28 @@ impl StorageScreen {
                 self,
                 cx,
             ))
+            .into_any_element()
+    }
+
+    fn layout_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let button =
+            |id: &'static str, layout: StorageLayout, this: &Self, cx: &mut Context<Self>| {
+                let base = Button::new(id).label(layout.name()).small();
+                let base = if this.layout == layout {
+                    base.primary()
+                } else {
+                    base.outline()
+                };
+                base.on_click(cx.listener(move |screen, _, _, cx| {
+                    screen.layout = layout;
+                    cx.notify();
+                }))
+            };
+        h_flex()
+            .gap(px(4.0))
+            .child(button("layout-tiles", StorageLayout::Tiles, self, cx))
+            .child(button("layout-band", StorageLayout::Band, self, cx))
+            .child(button("layout-columns", StorageLayout::Columns, self, cx))
             .into_any_element()
     }
 
@@ -374,6 +454,7 @@ impl StorageScreen {
             .into_any_element()
     }
 
+    #[expect(clippy::too_many_lines, reason = "one build of the done view")]
     fn done_body(
         &self,
         summary: &Arc<ScanSummary>,
@@ -384,7 +465,7 @@ impl StorageScreen {
     ) -> AnyElement {
         let segments: Vec<Segment> = breakdown(&summary.children, self.metric, DEFAULT_SEGMENTS);
         let mut color_index: usize = 0;
-        let rows: Vec<LegendRow> = segments
+        let mut items: Vec<ChartItem> = segments
             .iter()
             .map(|segment| {
                 let color: Hsla = if segment.is_other {
@@ -394,14 +475,51 @@ impl StorageScreen {
                     color_index += 1;
                     c
                 };
-                let (text, unit) = format_bytes(segment.bytes);
-                LegendRow {
-                    name: segment.label.clone().into(),
-                    size: format!("{text} {unit}").into(),
+                ChartItem {
+                    label: segment.label.clone(),
+                    bytes: segment.bytes,
                     color,
                     activatable: segment
                         .source_index
                         .is_some_and(|i| summary.children[i].is_directory),
+                    inert: false,
+                }
+            })
+            .collect();
+        // Free space and "Not scanned" only for the default root, with a
+        // measured volume.
+        let mut free_bytes: Option<u64> = None;
+        let at_default_root: bool =
+            self.model.read(cx).default_scan_root().as_deref() == Some(summary.root.as_path());
+        if at_default_root && self.path_stack.is_empty() {
+            let host: Loadable<HostSnapshot> = self.model.read(cx).host.clone();
+            if let Loadable::Ready(snapshot) | Loadable::Stale(snapshot) = host
+                && let (Measured::Value(total), Measured::Value(available)) =
+                    (&snapshot.disk_total, &snapshot.disk_available)
+            {
+                free_bytes = Some(*available);
+                let used: u64 = total.saturating_sub(*available);
+                let unscanned: u64 = used.saturating_sub(summary.total(self.metric));
+                if unscanned > 0 {
+                    items.push(ChartItem {
+                        label: "Not scanned".to_owned(),
+                        bytes: unscanned,
+                        color: Hsla::from(palette::neutral_color(dark)),
+                        activatable: false,
+                        inert: true,
+                    });
+                }
+            }
+        }
+        let rows: Vec<LegendRow> = items
+            .iter()
+            .map(|item| {
+                let (text, unit) = format_bytes(item.bytes);
+                LegendRow {
+                    name: item.label.clone().into(),
+                    size: format!("{text} {unit}").into(),
+                    color: item.color,
+                    activatable: item.activatable,
                 }
             })
             .collect();
@@ -409,22 +527,24 @@ impl StorageScreen {
         let select_this: Entity<Self> = this.clone();
         let select_summary: Arc<ScanSummary> = Arc::clone(summary);
         let select_segments: Vec<Segment> = segments.clone();
+        let open: OpenFn = Rc::new(move |index, app| {
+            let Some(segment) = select_segments.get(index) else {
+                return;
+            };
+            let Some(child) = segment
+                .source_index
+                .and_then(|i| select_summary.children.get(i))
+            else {
+                return;
+            };
+            if child.is_directory {
+                let path: PathBuf = child.path.clone();
+                select_this.update(app, |screen, cx| screen.push(path, cx));
+            }
+        });
+        let legend_open = Rc::clone(&open);
         let legend: Legend = Legend::new(rows, width, "storage-legend")
-            .on_select(move |index, _, app| {
-                let Some(segment) = select_segments.get(index) else {
-                    return;
-                };
-                let Some(child) = segment
-                    .source_index
-                    .and_then(|i| select_summary.children.get(i))
-                else {
-                    return;
-                };
-                if child.is_directory {
-                    let path: PathBuf = child.path.clone();
-                    select_this.update(app, |screen, cx| screen.push(path, cx));
-                }
-            })
+            .on_select(move |index, _, app| legend_open(index, app))
             .on_hover(move |index, _, app| {
                 this.update(app, |screen, cx| {
                     if screen.focused != index {
@@ -433,6 +553,41 @@ impl StorageScreen {
                     }
                 });
             });
+        let total_items: u64 = items.iter().map(|i| i.bytes).fold(0, u64::saturating_add);
+        let chart_rows: u16 = if self.layout == StorageLayout::Band {
+            BAND_ROWS
+        } else {
+            CHART_ROWS
+        };
+        let chart: AnyElement = if total_items == 0 {
+            caption("storage-band-scale", scale_caption(0, 0), tokens)
+        } else {
+            let (mut field, labels): (LedField, Vec<TileLabel>) = layout_field(
+                &items,
+                total_items,
+                free_bytes,
+                self.layout,
+                lattice_columns(width),
+                chart_rows,
+            );
+            let per_cell: u64 = bytes_per_cell(&items, &field);
+            apply_focus(&mut field, self.focused);
+            let label: String =
+                chart_label(self.layout, &summary.root.display().to_string(), &items);
+            let chart_open = Rc::clone(&open);
+            v_flex()
+                .gap(px(8.0))
+                .child(
+                    LedChart::new(field, labels, "storage-band", label)
+                        .on_select(move |index, _, app| chart_open(index, app)),
+                )
+                .child(caption(
+                    "storage-band-scale",
+                    scale_caption(per_cell, total_items),
+                    tokens,
+                ))
+                .into_any_element()
+        };
         let mut col = v_flex()
             .gap(px(12.0))
             .child(size_value(summary.total(self.metric), "scan-total"));
@@ -465,10 +620,7 @@ impl StorageScreen {
             }
         }
         col.children(self.breadcrumb(cx))
-            .child(
-                CellBand::new(segments, summary.root.display().to_string(), "storage-band")
-                    .dimmed_except(self.focused),
-            )
+            .child(chart)
             .child(legend)
             .child(caption("scan-footer", done_footer(summary), tokens))
             .child(
@@ -541,7 +693,12 @@ impl Render for StorageScreen {
         };
         let header: ShellHeader = ShellHeader::new(IconName::Folder, "Folder sizes")
             .subtitle(shown_root)
-            .aside(self.metric_control(cx));
+            .aside(
+                h_flex()
+                    .gap(px(12.0))
+                    .child(self.layout_control(cx))
+                    .child(self.metric_control(cx)),
+            );
         let metric_caption: AnyElement = caption("scan-metric", self.metric.caption(), tokens);
         let title: &'static str = "Storage";
         div()
@@ -558,7 +715,7 @@ impl Render for StorageScreen {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(volume_card(&host, tokens))
+            .child(volume_card(&host, tokens, width, dark))
             .child(card(
                 header,
                 v_flex()

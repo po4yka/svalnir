@@ -234,23 +234,35 @@ fn root_id_of(
 
 /// Whether a plan document agrees with the sealed plan of the journal:
 /// the same digest, the same plan, and cleanup roots that are exactly
-/// those that the file targets of the plan bind, each with the identity
+/// those that the file targets of the plan bind, each with the path and
+/// the object that the sealed plan binds for it and with the identity
 /// that its values give.
 ///
 /// A root that no target binds is refused: the approved roots of the
 /// executor are then never wider than the plan.
 fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
     let roots_agree = || {
-        let bound: BTreeSet<&RootId> = plan
-            .targets
-            .iter()
-            .filter_map(|target| match &target.binding {
-                TargetBinding::File(binding) => Some(&binding.root_id),
-                TargetBinding::Application(_) => None,
-            })
-            .collect();
+        let bindings = || {
+            plan.targets
+                .iter()
+                .filter_map(|target| match &target.binding {
+                    TargetBinding::File(binding) => Some(binding),
+                    TargetBinding::Application(_) => None,
+                })
+        };
+        let bound: BTreeSet<&RootId> = bindings().map(|binding| &binding.root_id).collect();
         let named: BTreeSet<&RootId> = document.roots.iter().map(|root| &root.root_id).collect();
+        // The sealed plan binds the path and the object of the root of
+        // each target. The root of the document must be that root.
+        let bound_root_agrees = bindings().all(|binding| {
+            document.roots.iter().any(|root| {
+                root.root_id == binding.root_id
+                    && root.path == binding.root_path
+                    && root.object == binding.root_object
+            })
+        });
         named == bound
+            && bound_root_agrees
             && named.len() == document.roots.len()
             && document.roots.iter().all(|root| {
                 root_id_of(&root.path, root.object, &root.volume).as_ref() == Some(&root.root_id)
@@ -444,6 +456,7 @@ fn select(
             path: entry.path.clone(),
             root_id: root.root_id.clone(),
             root_path: root.path.clone(),
+            root_object: root.object,
             relative_entry: relative,
             volume_id: root.volume.volume_id.clone(),
             mount_id: root.volume.mount_id.clone(),

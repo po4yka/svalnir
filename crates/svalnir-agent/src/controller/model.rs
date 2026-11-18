@@ -514,6 +514,9 @@ pub struct PreparedCandidate {
     pub root_id: RootId,
     /// The path of the approved root.
     pub root_path: LosslessPath,
+    /// The native identifiers of the root directory. The plan binds them
+    /// with the root path.
+    pub root_object: FileObjectEvidence,
     /// The entry below the root.
     pub relative_entry: LosslessPath,
     /// The mount generation of the volume.

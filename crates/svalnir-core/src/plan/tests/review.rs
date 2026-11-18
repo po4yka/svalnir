@@ -5,11 +5,12 @@ use super::{
     BUILT_AT, Fixture, charge, clock_at, declaration, entry, manual_validated, path, planned,
     request, rule, trash,
 };
-use crate::action::Checked;
+use crate::action::{Checked, FileBinding, TargetBinding};
+use crate::file::InodeNumber;
 use crate::id::{RootId, VolumeId};
 use crate::plan::{
-    CleanupEntry, ModeSelection, OmissionReason, PlanExplanation, PlanOutcome, TargetExplanation,
-    build_cleanup_plan, explain,
+    CleanupEntry, ModeSelection, OmissionReason, PlanBuildError, PlanExplanation, PlanOutcome,
+    TargetExplanation, build_cleanup_plan, explain,
 };
 use crate::policy::ProtectionFact;
 use crate::quantity::Bytes;
@@ -183,5 +184,49 @@ fn a_target_of_a_trash_plan_has_no_estimate_of_reclaimable_bytes() {
     assert_eq!(
         reclaimable(ModeSelection::Evict { rule: Ok(&rule) }),
         Some(Bytes::new(50))
+    );
+}
+
+/// The file binding of the first target of the plan of an outcome.
+fn first_binding(outcome: &PlanOutcome) -> FileBinding {
+    match &outcome.plan.as_ref().unwrap().targets[0].binding {
+        TargetBinding::File(file) => file.clone(),
+        TargetBinding::Application(_) => panic!("the target is a file target"),
+    }
+}
+
+#[test]
+fn the_plan_binds_the_root_and_the_rule_layout_of_each_entry() {
+    let fixture: Fixture = Fixture::new();
+    let rule: Rule = rule();
+    let entries: [CleanupEntry; 1] = [entry("a", 100)];
+    let evidence = entries[0].rule.clone().unwrap();
+
+    // The `evict` mode binds the rule revision and the layout that the rule
+    // found for the entry.
+    let selection = ModeSelection::Evict { rule: Ok(&rule) };
+    let outcome: PlanOutcome =
+        build_cleanup_plan(&fixture.context(), &request(selection, &entries)).unwrap();
+    let file: FileBinding = first_binding(&outcome);
+    assert_eq!(file.root_path, entries[0].root_path);
+    assert_eq!(file.root_object, entries[0].root_object);
+    assert_eq!(file.rule, Some(evidence.rule));
+    assert_eq!(file.layout, Some(evidence.layout));
+
+    // A mode with no rule binds the root, no rule, and no layout.
+    let file: FileBinding = first_binding(&trash(&entries));
+    assert_eq!(file.root_path, entries[0].root_path);
+    assert_eq!(file.root_object, entries[0].root_object);
+    assert_eq!(file.rule, None);
+    assert_eq!(file.layout, None);
+
+    // One root identity has one root object.
+    let mut other: CleanupEntry = entry("b", 100);
+    other.root_object.inode = InodeNumber::new(9);
+    let entries: [CleanupEntry; 2] = [entry("a", 100), other];
+    assert_eq!(
+        build_cleanup_plan(&fixture.context(), &request(ModeSelection::Trash, &entries))
+            .unwrap_err(),
+        PlanBuildError::RootPath
     );
 }

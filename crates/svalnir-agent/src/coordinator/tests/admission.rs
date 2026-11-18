@@ -15,7 +15,9 @@ use super::support::{
     principal, queued, refusal, run, stop_content, stop_plan, stored_request,
 };
 use crate::journal::{RequestBody, RequestCompletion, RequestStatus};
-use crate::rules::{EXPIRED_TEMPORARY_REVISION, EXPIRED_TEMPORARY_RULE_ID, ReviewedRules};
+use crate::rules::{
+    EXPIRED_TEMPORARY_LAYOUT, EXPIRED_TEMPORARY_REVISION, EXPIRED_TEMPORARY_RULE_ID, ReviewedRules,
+};
 
 /// A bench with one file `a` and a stored permanent-removal plan for it.
 fn bench_with_plan() -> (Bench, Plan, std::path::PathBuf) {
@@ -173,6 +175,7 @@ fn a_manual_eviction_with_a_proposed_rule_is_refused_and_the_trash_mode_is_not()
                 id: RuleId::new(EXPIRED_TEMPORARY_RULE_ID).unwrap(),
                 revision: RuleRevisionId::new(EXPIRED_TEMPORARY_REVISION).unwrap(),
             });
+            binding.layout = Some(EXPIRED_TEMPORARY_LAYOUT.to_owned());
         }
     }
     let evict = Plan::seal(content).unwrap();

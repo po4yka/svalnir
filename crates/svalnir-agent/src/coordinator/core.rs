@@ -716,7 +716,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     ) -> Result<(), Box<ActionError>> {
         let (incident, evidence) = self.automatic_evidence(plan, stage, time)?;
         for step in &plan.steps {
-            let layout: Option<String> = self.authority.layout(plan, &step.target_id);
             let request = ActionRequest {
                 principal: principal.uid,
                 plan,
@@ -724,7 +723,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 stage: stage.clone(),
                 approval: Some(approval),
                 recording,
-                layout: layout.as_deref(),
                 incident: incident.as_ref(),
                 evidence: evidence.as_ref(),
             };

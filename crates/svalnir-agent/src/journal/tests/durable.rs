@@ -863,11 +863,13 @@ fn a_stored_record_that_is_not_consistent_is_reported_as_corrupt() {
     );
     assert_eq!(journal.set_stop_fence(&id), Ok(()));
 
-    // A plan whose content does not agree with its digest.
+    // A plan whose content does not agree with its digest. The number is
+    // that of the first plan schema: a stored plan of that version is not
+    // decoded.
     journal
         .connection
         .execute(
-            "UPDATE plan SET content = json_set(content, '$.content.schema_version', 2)",
+            "UPDATE plan SET content = json_set(content, '$.content.schema_version', 1)",
             [],
         )
         .unwrap();

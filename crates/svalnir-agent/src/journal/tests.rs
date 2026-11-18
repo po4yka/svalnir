@@ -120,6 +120,11 @@ fn file_target(id: &str) -> PlanTarget {
         target_id: target_id(id),
         binding: TargetBinding::File(FileBinding {
             root_id: RootId::new("root_1").unwrap(),
+            root_path: LosslessPath::from_bytes("/Users/a/Library/Caches").unwrap(),
+            root_object: FileObjectEvidence {
+                device: DeviceNumber::new(16_777_234),
+                inode: InodeNumber::new(2),
+            },
             relative_entry: LosslessPath::from_bytes(id).unwrap(),
             volume_id: VolumeId::new("volume_1").unwrap(),
             mount_id: MountId::new("mount_1").unwrap(),
@@ -133,6 +138,7 @@ fn file_target(id: &str) -> PlanTarget {
                 id: RuleId::new("svalnir.expired-temporary").unwrap(),
                 revision: RuleRevisionId::new("r1").unwrap(),
             }),
+            layout: Some("layout-v1".to_owned()),
             charge: charge(10, 1),
         }),
     }

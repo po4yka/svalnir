@@ -414,7 +414,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 .as_ref()
                 .and_then(|incident_id| self.authority.incident(incident_id));
         }
-        let layout: Option<String> = self.authority.layout(&active.plan, &step.target_id);
         let recording = active.recording();
         let request = ActionRequest {
             principal: active.principal.uid,
@@ -423,7 +422,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             stage: stage.clone(),
             approval: Some(&active.approval),
             recording: &recording,
-            layout: layout.as_deref(),
             incident: incident.as_ref(),
             evidence: evidence.as_ref(),
         };

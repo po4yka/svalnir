@@ -13,7 +13,7 @@
 //!
 //! The builder of a plan is in [`crate::plan`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use super::budget::WorkCharge;
 use super::checked::{Check, Checked};
 use super::class::{ActionClass, TriggerClass};
 use super::state::PlanState;
-use crate::authority::AuthorityBinding;
+use crate::authority::{AuthorityBinding, required_option};
 use crate::digest::ContentDigest;
 use crate::encoding::wire_enum;
 use crate::file::{FileObjectEvidence, LosslessPath};
@@ -40,7 +40,13 @@ use crate::rule::RuleRef;
 use crate::time::{MonotonicNanos, WallTime};
 
 /// The schema version of a plan and of a request envelope.
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added the root path, the root object, and the rule layout to
+/// [`FileBinding`]. A plan or an envelope of version 1 is refused: it does
+/// not have these values, and this build does not make them from a
+/// default. A plan is valid for a short time in one boot, so there is no
+/// migration.
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// The largest number of targets and of steps in one plan.
 pub const MAX_PLAN_TARGETS: usize = 4096;
@@ -168,13 +174,25 @@ impl Validity {
 
 /// The binding of a file target.
 ///
-/// A display path is not in the binding: the entry is relative to an
-/// approved root that the agent holds the identity evidence of.
+/// A display path of the entry is not in the binding: the entry is
+/// relative to an approved root. The binding has the path and the native
+/// identifiers of that root, so the digest of the plan covers the place
+/// that the approval is for. The root record that an executor acts under
+/// must have the same path and the same object.
+///
+/// JSON has each field. A field with no value is `null`: a binding with
+/// a key that is absent is not decoded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileBinding {
     /// The approved root.
     pub root_id: RootId,
+    /// The absolute path of the approved root, with no `.` and no `..`
+    /// component. Each target of one root has the same root path.
+    pub root_path: LosslessPath,
+    /// The native identifiers of the root directory. Each target of one
+    /// root has the same root object.
+    pub root_object: FileObjectEvidence,
     /// The entry, relative to the root.
     pub relative_entry: LosslessPath,
     /// The volume of the entry.
@@ -187,12 +205,40 @@ pub struct FileBinding {
     pub owner: Uid,
     /// The native identifiers of the object. `None` means that the
     /// evidence is absent; the adapter decides whether it can act.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub object: Option<FileObjectEvidence>,
     /// The rule revision that selected the entry. `EvictRegenerableData`
     /// needs it.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub rule: Option<RuleRef>,
+    /// The producer layout that the rule found for the entry. A target
+    /// with a rule has it, and a target with no rule has none. The
+    /// lifecycle state of a rule is for one layout, so the authorization
+    /// reads the layout from here and not from its caller.
+    #[serde(deserialize_with = "required_option::deserialize")]
+    pub layout: Option<String>,
     /// The known conservative charge of the entry.
     pub charge: WorkCharge,
+}
+
+impl FileBinding {
+    /// Whether `other` names the same approved root with the same
+    /// evidence: the path and the object. The volume and the mount
+    /// generation are those of the entry, and an entry can be on a
+    /// different volume than a second entry of its root.
+    fn has_same_root(&self, other: &Self) -> bool {
+        self.root_path == other.root_path && self.root_object == other.root_object
+    }
+}
+
+/// True when `path` is absolute and has no `.` or `..` component. This is
+/// the rule of the plan builder for a root path.
+fn is_absolute_root(path: &LosslessPath) -> bool {
+    let bytes: &[u8] = path.as_bytes();
+    bytes.first() == Some(&b'/')
+        && bytes
+            .split(|byte| *byte == b'/')
+            .all(|component| component != b"." && component != b"..")
 }
 
 /// The binding of an application target: one verified application
@@ -287,6 +333,11 @@ impl ApplicationBinding {
 /// not executable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a plan has file targets only or application targets only, so a list does not mix \
+              the two sizes, and a box would add one allocation for each file target"
+)]
 pub enum TargetBinding {
     /// A file object.
     File(FileBinding),
@@ -388,8 +439,10 @@ pub enum PlanError {
     #[error("the steps do not agree with each other or with the force strategy")]
     Steps,
     /// The binding of a target does not agree with the action class of its
-    /// step, with the principal, or with its own evidence, or the charge
-    /// of a file target has no item.
+    /// step, with the principal, or with its own evidence, the charge of a
+    /// file target has no item, a rule target has no layout, the root path
+    /// of a file target is not absolute, or one root identity has two
+    /// roots.
     #[error("a target binding does not agree with its step or its evidence")]
     Binding,
     /// The limits are missing, are not finite, or are smaller than the sum
@@ -437,13 +490,28 @@ pub(super) fn check_file_binding(
     }
     let rule_agrees: bool =
         !matches!(class, ActionClass::EvictRegenerableData) || file.rule.is_some();
+    // The lifecycle state of a rule is for one layout. A rule target with
+    // no layout would get its layout from the caller of the authorization,
+    // and a layout with no rule has no meaning.
+    let layout_agrees: bool = match (&file.rule, &file.layout) {
+        (Some(_), Some(layout)) => !layout.is_empty(),
+        (None, None) => true,
+        _ => false,
+    };
+    let root_agrees: bool = is_absolute_root(&file.root_path);
     // The executor of the owning user changes only the objects of that
     // user.
     let owner_agrees: bool = !matches!(executor, ExecutorRole::User) || file.owner == principal;
     // An entry is a minimum of one item. A charge of no items would use
     // no part of an item limit, and it fits in an exhausted allowance.
     let charge_agrees: bool = file.charge.items != EntryCount::ZERO;
-    if class.is_filesystem() && rule_agrees && owner_agrees && charge_agrees {
+    if class.is_filesystem()
+        && rule_agrees
+        && layout_agrees
+        && root_agrees
+        && owner_agrees
+        && charge_agrees
+    {
         Ok(())
     } else {
         Err(PlanError::Binding)
@@ -519,6 +587,22 @@ impl PlanContent {
         self.targets
             .iter()
             .find(|target| &target.target_id == target_id)
+    }
+
+    /// Checks that one root identity has one root: each file target that
+    /// names it has the same root path and the same root object. With
+    /// two, the identity would not say which place the approval is for.
+    fn check_roots(&self) -> Result<(), PlanError> {
+        let mut roots: BTreeMap<&RootId, &FileBinding> = BTreeMap::new();
+        for target in &self.targets {
+            if let TargetBinding::File(file) = &target.binding {
+                let first: &FileBinding = roots.entry(&file.root_id).or_insert(file);
+                if !first.has_same_root(file) {
+                    return Err(PlanError::Binding);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Checks that no two targets bind the same object: the same entry of
@@ -670,6 +754,7 @@ impl Check for PlanContent {
             }
         }
         self.check_distinct_objects()?;
+        self.check_roots()?;
         let mut step_ids: BTreeSet<&StepId> = BTreeSet::new();
         for step in &self.steps {
             if !step_ids.insert(&step.step_id) {

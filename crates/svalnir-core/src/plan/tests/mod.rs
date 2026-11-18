@@ -223,6 +223,10 @@ fn entry(name: &str, bytes: u64) -> CleanupEntry {
         path: path(&format!("/Users/a/Library/Caches/{name}")),
         root_id: RootId::new("root_caches").unwrap(),
         root_path: path("/Users/a/Library/Caches"),
+        root_object: FileObjectEvidence {
+            device: DeviceNumber::new(1),
+            inode: InodeNumber::new(2),
+        },
         relative_entry: path(name),
         volume_id: VolumeId::new("volume_data").unwrap(),
         mount_id: MountId::new("mount_1").unwrap(),

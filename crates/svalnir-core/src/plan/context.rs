@@ -71,8 +71,9 @@ pub enum PlanBuildError {
     /// identity, or two steps of one target have the same identity.
     #[error("two entries have the same target identity or step identity")]
     DuplicateIdentity,
-    /// Two entries of one root identity have different root paths.
-    #[error("two entries of one root identity have different root paths")]
+    /// Two entries of one root identity have different root paths or
+    /// different root objects.
+    #[error("two entries of one root identity have different root paths or root objects")]
     RootPath,
     /// The `evict` mode has no exact rule revision: the registry refused
     /// the lookup. No generic cleaner takes the place of the rule.

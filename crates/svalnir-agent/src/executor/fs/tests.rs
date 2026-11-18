@@ -175,7 +175,12 @@ impl Fixture {
     /// The binding of the entry `relative` as it is now.
     fn binding(&self, relative: &str) -> FileBinding {
         let path: PathBuf = self.root.join(relative);
-        binding_with(relative.as_bytes(), kind_of(&path), Some(object_of(&path)))
+        binding_with(
+            self,
+            relative.as_bytes(),
+            kind_of(&path),
+            Some(object_of(&path)),
+        )
     }
 
     fn envelope(&self, class: ActionClass, relative: &str) -> RequestEnvelope {
@@ -183,17 +188,28 @@ impl Fixture {
     }
 }
 
+/// The binding with the root path and the root object of `root`: the plan
+/// and the root record then name the same root.
+fn under(root: &ApprovedRoot, mut binding: FileBinding) -> FileBinding {
+    binding.root_path = root.path.clone();
+    binding.root_object = root.object;
+    binding
+}
+
 fn uid() -> Uid {
     Uid::new(native::effective_uid())
 }
 
 fn binding_with(
+    fixture: &Fixture,
     relative: &[u8],
     object_type: FileObjectType,
     object: Option<FileObjectEvidence>,
 ) -> FileBinding {
     FileBinding {
         root_id: RootId::new(ROOT_ID).unwrap(),
+        root_path: LosslessPath::from_path(&fixture.root).unwrap(),
+        root_object: object_of(&fixture.root),
         relative_entry: LosslessPath::from_bytes(relative).unwrap(),
         volume_id: VolumeId::new("volume_1").unwrap(),
         mount_id: MountId::new("mount_1").unwrap(),
@@ -204,6 +220,7 @@ fn binding_with(
             id: RuleId::new("svalnir.expired-temporary").unwrap(),
             revision: RuleRevisionId::new("rule_rev_1").unwrap(),
         }),
+        layout: Some("layout-v1".to_owned()),
         charge: WorkCharge::new(Bytes::new(1), EntryCount::new(1)),
     }
 }
@@ -1192,7 +1209,12 @@ fn a_binding_on_another_device_than_its_root_is_refused() {
         device: DeviceNumber::new(object.device.get().wrapping_add(1)),
         inode: object.inode,
     };
-    let binding = binding_with(b"data.bin", FileObjectType::RegularFile, Some(other));
+    let binding = binding_with(
+        &fixture,
+        b"data.bin",
+        FileObjectType::RegularFile,
+        Some(other),
+    );
     let envelope = envelope_of(ActionClass::EvictRegenerableData, "data", binding);
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
@@ -1710,6 +1732,7 @@ fn an_entry_with_a_name_that_is_not_utf8_is_removed() {
     fs::write(tree.join(OsStr::from_bytes(b"\xfe\xfd")), b"data").unwrap();
 
     let binding = binding_with(
+        &fixture,
         b"n\xff.bin",
         FileObjectType::RegularFile,
         Some(object_of(&file)),
@@ -1759,7 +1782,7 @@ fn a_relative_entry_that_is_not_normalized_is_refused() {
         .filter(ActionClass::is_filesystem)
     {
         for entry in entries {
-            let binding = binding_with(entry, FileObjectType::RegularFile, object);
+            let binding = binding_with(&fixture, entry, FileObjectType::RegularFile, object);
             let envelope = envelope_of(class.clone(), "entry", binding);
 
             let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
@@ -1897,7 +1920,7 @@ fn the_home_directory_is_refused_under_another_name() {
     let mut root: ApprovedRoot = fixture.approved_root();
     root.path = LosslessPath::from_path(&fixture.base).unwrap();
     root.object = object_of(&fixture.base);
-    let roots = ApprovedRoots::new(vec![root]).unwrap();
+    let roots = ApprovedRoots::new(vec![root.clone()]).unwrap();
     let home_object: FileObjectEvidence = object_of(&fixture.home);
     fs::write(fixture.home.join("letter.txt"), b"letter").unwrap();
     let executor = fixture.executor();
@@ -1908,7 +1931,15 @@ fn the_home_directory_is_refused_under_another_name() {
     {
         // A name that is not the home path, with the identity of the home
         // directory in the binding.
-        let binding = binding_with(b"outside", FileObjectType::Directory, Some(home_object));
+        let binding = under(
+            &root,
+            binding_with(
+                &fixture,
+                b"outside",
+                FileObjectType::Directory,
+                Some(home_object),
+            ),
+        );
         let envelope = envelope_of(class.clone(), "alias", binding);
         let outcome = run(&executor, &roots, &envelope);
         assert_skipped(
@@ -1922,7 +1953,15 @@ fn the_home_directory_is_refused_under_another_name() {
         let same_directory: bool = fs::symlink_metadata(fixture.base.join("HOME"))
             .is_ok_and(|metadata| metadata.ino() == u64::from(home_object.inode));
         if same_directory {
-            let binding = binding_with(b"HOME", FileObjectType::Directory, Some(home_object));
+            let binding = under(
+                &root,
+                binding_with(
+                    &fixture,
+                    b"HOME",
+                    FileObjectType::Directory,
+                    Some(home_object),
+                ),
+            );
             let envelope = envelope_of(class, "upper", binding);
             let outcome = run(&executor, &roots, &envelope);
             assert_skipped(
@@ -1973,6 +2012,58 @@ fn a_target_whose_root_is_not_approved_is_refused() {
 }
 
 #[test]
+fn an_approved_root_that_is_not_the_root_of_the_plan_is_refused() {
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("data.bin");
+    fs::write(&file, b"data").unwrap();
+    let executor = fixture.executor();
+    let roots = fixture.roots();
+    // A second directory with the same entry name. A root record with the
+    // identity of the plan root and this place would send the step there.
+    let other: PathBuf = fixture.root.parent().unwrap().join("other-root");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("data.bin"), b"data").unwrap();
+
+    // The plan binds a different root path.
+    let mut binding = fixture.binding("data.bin");
+    binding.root_path = LosslessPath::from_path(&other).unwrap();
+    let envelope = envelope_of(ActionClass::EvictRegenerableData, "data", binding);
+    let outcome = run(&executor, &roots, &envelope);
+    assert_skipped(
+        &outcome,
+        &ErrorFamily::Evidence,
+        code::APPROVED_ROOT_MISMATCH,
+    );
+
+    // The plan binds a different root object.
+    let mut binding = fixture.binding("data.bin");
+    binding.root_object = object_of(&other);
+    let envelope = envelope_of(ActionClass::EvictRegenerableData, "data", binding);
+    let outcome = run(&executor, &roots, &envelope);
+    assert_skipped(
+        &outcome,
+        &ErrorFamily::Evidence,
+        code::APPROVED_ROOT_MISMATCH,
+    );
+
+    // The root record names the second directory under the identity of
+    // the plan root.
+    let mut moved: ApprovedRoot = fixture.approved_root();
+    moved.path = LosslessPath::from_path(&other).unwrap();
+    moved.object = object_of(&other);
+    let moved = ApprovedRoots::new(vec![moved]).unwrap();
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "data.bin");
+    let outcome = run(&executor, &moved, &envelope);
+    assert_skipped(
+        &outcome,
+        &ErrorFamily::Evidence,
+        code::APPROVED_ROOT_MISMATCH,
+    );
+    assert!(file.exists());
+    assert!(other.join("data.bin").exists());
+}
+
+#[test]
 fn the_approved_root_itself_is_refused() {
     for class in ActionClass::ALL
         .into_iter()
@@ -1984,6 +2075,7 @@ fn the_approved_root_itself_is_refused() {
         // has a minimum of one component. This binding has the identity of
         // the root.
         let binding = binding_with(
+            &fixture,
             b"data.bin",
             FileObjectType::Directory,
             Some(object_of(&fixture.root)),
@@ -2007,7 +2099,7 @@ fn a_binding_without_identity_evidence_is_refused() {
     let fixture = Fixture::new();
     let file: PathBuf = fixture.root.join("data.bin");
     fs::write(&file, b"data").unwrap();
-    let binding = binding_with(b"data.bin", FileObjectType::RegularFile, None);
+    let binding = binding_with(&fixture, b"data.bin", FileObjectType::RegularFile, None);
     let envelope = envelope_of(ActionClass::EvictRegenerableData, "data", binding);
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
@@ -2044,12 +2136,21 @@ fn a_root_whose_identity_changed_is_refused() {
     let fixture = Fixture::new();
     let file: PathBuf = fixture.root.join("data.bin");
     fs::write(&file, b"data").unwrap();
-    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "data.bin");
     let executor = fixture.executor();
+    // The plan binds the root of each record: the refusal is then for the
+    // root on the disk, and not for a record that the plan does not name.
+    let envelope_under = |root: &ApprovedRoot| {
+        envelope_of(
+            ActionClass::EvictRegenerableData,
+            "data",
+            under(root, fixture.binding("data.bin")),
+        )
+    };
 
     // The evidence of the root names another inode.
     let mut stale: ApprovedRoot = fixture.approved_root();
     stale.object = object_of(&fixture.outside);
+    let envelope = envelope_under(&stale);
     let roots = ApprovedRoots::new(vec![stale]).unwrap();
     let outcome = run(&executor, &roots, &envelope);
     assert_skipped(
@@ -2063,6 +2164,7 @@ fn a_root_whose_identity_changed_is_refused() {
     symlink(&fixture.root, &link).unwrap();
     let mut through_link: ApprovedRoot = fixture.approved_root();
     through_link.path = LosslessPath::from_path(&link).unwrap();
+    let envelope = envelope_under(&through_link);
     let roots = ApprovedRoots::new(vec![through_link]).unwrap();
     let outcome = run(&executor, &roots, &envelope);
     assert_skipped(
@@ -2074,6 +2176,7 @@ fn a_root_whose_identity_changed_is_refused() {
     // The root is absent.
     let mut absent: ApprovedRoot = fixture.approved_root();
     absent.path = LosslessPath::from_path(&fixture.base.join("no-such-root")).unwrap();
+    let envelope = envelope_under(&absent);
     let roots = ApprovedRoots::new(vec![absent]).unwrap();
     let outcome = run(&executor, &roots, &envelope);
     assert_skipped(&outcome, &ErrorFamily::Evidence, code::ROOT_UNAVAILABLE);

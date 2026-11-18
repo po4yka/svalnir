@@ -10,9 +10,7 @@ use std::fmt::Debug;
 use svalnir_core::action::{ApplicationBinding, Journal, Plan, StopFence, TargetBinding};
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
-use svalnir_core::id::{
-    ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, TargetId, VolumeId,
-};
+use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
 use svalnir_core::observation::Observation;
 use svalnir_core::plan::PlanMode;
 use svalnir_core::policy::{EvaluationClock, ProtectionFact};
@@ -97,10 +95,6 @@ pub trait AuthoritySource: Debug {
 
     /// The revisions in effect, for a plan of `mode`.
     fn revisions(&self, mode: PlanMode, time: &TimeReading) -> RevisionSnapshot;
-
-    /// The producer layout of a target that a rule selected. The plan
-    /// does not contain it.
-    fn layout(&self, plan: &Plan, target_id: &TargetId) -> Option<String>;
 
     /// The budget record of an incident.
     fn incident(&self, incident_id: &IncidentId) -> Option<IncidentBudget>;

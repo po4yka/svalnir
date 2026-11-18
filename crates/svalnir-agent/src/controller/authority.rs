@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use svalnir_core::action::{ApplicationBinding, Plan, TargetBinding};
+use svalnir_core::action::{ApplicationBinding, Plan};
 use svalnir_core::authority::ActionGrant;
 use svalnir_core::grant::{
     ActionRequest, AuthorityState, Authorization, AuthorizationContext, ControlClock,
     IncidentBudget, InstanceInhibition, Refusal, authorize,
 };
-use svalnir_core::id::{IncidentId, PlanId, TargetId};
+use svalnir_core::id::{IncidentId, PlanId};
 use svalnir_core::plan::{CleanupMode, PlanMode};
 use svalnir_core::policy::{ControlPlaneProcess, ProtectionContext, ProtectionFact};
 use svalnir_core::process::Uid;
@@ -166,22 +166,6 @@ impl AuthoritySource for SharedAuthority {
                 .map(ActionGrant::reference)
                 .collect(),
             rules,
-        }
-    }
-
-    fn layout(&self, plan: &Plan, target_id: &TargetId) -> Option<String> {
-        let records = self.records();
-        let target = plan.target(target_id)?;
-        let TargetBinding::File(file) = &target.binding else {
-            return None;
-        };
-        let rule = records.registry.rule(file.rule.as_ref()?)?;
-        // A plan does not have the layout of its target. A rule with one
-        // layout names it; a rule with more than one gives no answer,
-        // which the authorization refuses.
-        match rule.layouts.as_slice() {
-            [one] => Some(one.layout.clone()),
-            _ => None,
         }
     }
 

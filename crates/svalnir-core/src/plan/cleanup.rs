@@ -105,8 +105,12 @@ pub struct CleanupEntry {
     /// The approved root.
     pub root_id: RootId,
     /// The absolute path of the approved root, as the caller resolved it.
-    /// Each entry of one root has the same root path.
+    /// Each entry of one root has the same root path. The plan binds it.
     pub root_path: LosslessPath,
+    /// The native identifiers of the root directory, as the caller
+    /// measured them. Each entry of one root has the same root object. The
+    /// plan binds it.
+    pub root_object: FileObjectEvidence,
     /// The entry, relative to the root. `path` is exactly `root_path` and
     /// then this entry.
     pub relative_entry: LosslessPath,
@@ -363,11 +367,13 @@ fn check_request(request: &CleanupRequest<'_>) -> Result<(), PlanBuildError> {
             return Err(PlanBuildError::DuplicateIdentity);
         }
     }
-    // One root identity has one path. With two paths, the exclusion check
-    // of one entry would not be for the object that the plan binds.
-    let mut roots: BTreeMap<&RootId, &LosslessPath> = BTreeMap::new();
+    // One root identity has one path and one object. With two paths, the
+    // exclusion check of one entry would not be for the object that the
+    // plan binds.
+    let mut roots: BTreeMap<&RootId, (&LosslessPath, &FileObjectEvidence)> = BTreeMap::new();
     for entry in request.entries {
-        if *roots.entry(&entry.root_id).or_insert(&entry.root_path) != &entry.root_path {
+        let root = (&entry.root_path, &entry.root_object);
+        if *roots.entry(&entry.root_id).or_insert(root) != root {
             return Err(PlanBuildError::RootPath);
         }
     }
@@ -438,7 +444,8 @@ fn rule_checks<'a>(mode: &ModeSelection<'a>) -> Result<Option<RuleChecks<'a>>, P
 /// # Errors
 ///
 /// Returns a [`PlanBuildError`] when the selection is too large, two
-/// entries have one identity, one root identity has two root paths, a duration is zero, the lifetime is zero or
+/// entries have one identity, one root identity has two root paths or two
+/// root objects, a duration is zero, the lifetime is zero or
 /// overflows, the authority names a privilege grant or one grant two
 /// times, the registry refused the rule of the `evict` mode, the rule
 /// needs the helper executor, or the check of the foundation rejects the
@@ -567,6 +574,8 @@ fn plan_parts(
             target_id: entry.target_id.clone(),
             binding: TargetBinding::File(FileBinding {
                 root_id: entry.root_id.clone(),
+                root_path: entry.root_path.clone(),
+                root_object: entry.root_object,
                 relative_entry: entry.relative_entry.clone(),
                 volume_id: entry.volume_id.clone(),
                 mount_id: entry.mount_id.clone(),
@@ -574,6 +583,12 @@ fn plan_parts(
                 owner: *owner,
                 object: entry.object,
                 rule: rule.cloned(),
+                // The layout of the rule evidence of the entry. The plan
+                // binds a rule only for the `evict` mode, and each entry of
+                // that mode has the evidence of that rule.
+                layout: rule
+                    .and(entry.rule.as_ref())
+                    .map(|evidence| evidence.layout.clone()),
                 charge: *charge,
             }),
         });

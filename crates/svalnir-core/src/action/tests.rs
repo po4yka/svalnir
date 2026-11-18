@@ -65,6 +65,11 @@ fn rule() -> RuleRef {
 fn file_binding(entry: &str, bytes: u64) -> FileBinding {
     FileBinding {
         root_id: RootId::new("root_1").unwrap(),
+        root_path: LosslessPath::from_bytes("/Users/a/Library/Caches").unwrap(),
+        root_object: FileObjectEvidence {
+            device: DeviceNumber::new(16_777_234),
+            inode: InodeNumber::new(2),
+        },
         relative_entry: LosslessPath::from_bytes(entry).unwrap(),
         volume_id: VolumeId::new("volume_1").unwrap(),
         mount_id: MountId::new("mount_1").unwrap(),
@@ -75,6 +80,7 @@ fn file_binding(entry: &str, bytes: u64) -> FileBinding {
             inode: InodeNumber::new(991),
         }),
         rule: Some(rule()),
+        layout: Some("layout-v1".to_owned()),
         charge: charge(bytes, 1),
     }
 }
@@ -398,6 +404,7 @@ fn a_plan_of_each_filesystem_class_seals() {
         target_id: target_id("a"),
         binding: TargetBinding::File(FileBinding {
             rule: None,
+            layout: None,
             object: None,
             ..file_binding("a", 60)
         }),
@@ -498,7 +505,7 @@ fn a_plan_round_trips_and_a_changed_plan_is_rejected() {
         let plan = seal(content);
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["digest"], json!(plan.digest().as_str()));
-        assert_eq!(value["content"]["schema_version"], json!(1));
+        assert_eq!(value["content"]["schema_version"], json!(2));
         assert_eq!(serde_json::from_value::<Plan>(value).unwrap(), plan);
     }
 
@@ -561,7 +568,8 @@ fn a_filesystem_plan_that_does_not_agree_with_itself_is_rejected() {
     use ActionClass::{DeleteSelectedFiles, EvictRegenerableData, MoveToTrash};
     let base = || file_content(&EvictRegenerableData);
     let cases: Vec<(PlanError, PlanChange)> = vec![
-        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 2)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 1)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 3)),
         (PlanError::Count, Box::new(|c| c.targets.clear())),
         (PlanError::Count, Box::new(|c| c.steps.clear())),
         (
@@ -650,6 +658,7 @@ fn a_filesystem_plan_that_does_not_agree_with_itself_is_rejected() {
             Box::new(|c| {
                 c.targets[0].binding = TargetBinding::File(FileBinding {
                     rule: None,
+                    layout: None,
                     ..file_binding("a", 60)
                 });
             }),
@@ -2365,6 +2374,7 @@ fn an_envelope_that_does_not_agree_with_itself_is_rejected() {
             Box::new(|e| {
                 e.target.binding = TargetBinding::File(FileBinding {
                     rule: None,
+                    layout: None,
                     ..file_binding("a", 60)
                 });
             }),

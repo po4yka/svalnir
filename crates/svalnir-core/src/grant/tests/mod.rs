@@ -22,7 +22,7 @@ use crate::action::{
 use crate::authority::{ActionGrant, ActionGrantRef, AuthorityBinding};
 use crate::config::{ValidatedConfig, parse_and_validate};
 use crate::digest::ContentDigest;
-use crate::file::LosslessPath;
+use crate::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use crate::id::{
     ActionGrantId, ApplicationInstanceId, BootId, ClockDomainId, DecisionId, IncidentId,
     MembershipSnapshotId, MountId, PlanId, PolicyRevisionId, ProcessGenerationId, RootId, RuleId,
@@ -399,6 +399,13 @@ fn automatic_trigger(class: TriggerClass) -> Trigger {
 fn file_binding(rule: Option<RuleRef>) -> FileBinding {
     FileBinding {
         root_id: RootId::new("root_1").unwrap(),
+        root_path: LosslessPath::from_bytes("/Users/a/Library/Caches").unwrap(),
+        root_object: FileObjectEvidence {
+            device: DeviceNumber::new(1),
+            inode: InodeNumber::new(2),
+        },
+        // A target of a rule has the layout that the rule found.
+        layout: rule.as_ref().map(|_| LAYOUT.to_owned()),
         relative_entry: LosslessPath::from_bytes("entry").unwrap(),
         volume_id: VolumeId::new("volume_1").unwrap(),
         mount_id: MountId::new("mount_1").unwrap(),
@@ -527,11 +534,20 @@ fn as_automatic(
 /// The automatic eviction plan of the disk guard, with a target of the
 /// rule `svalnir.expired-temporary` revision `r1`.
 fn eviction_plan(state: &AuthorityState) -> Plan {
-    let content = file_content(
+    eviction_plan_of_layout(state, LAYOUT)
+}
+
+/// The automatic eviction plan of the disk guard, with a target that the
+/// rule found in `layout`.
+fn eviction_plan_of_layout(state: &AuthorityState, layout: &str) -> Plan {
+    let mut content = file_content(
         state,
         &ActionClass::EvictRegenerableData,
         Some(rule_ref(TEMPORARY, "r1")),
     );
+    if let TargetBinding::File(file) = &mut content.targets[0].binding {
+        file.layout = Some(layout.to_owned());
+    }
     seal(as_automatic(
         state,
         content,

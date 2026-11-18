@@ -71,7 +71,7 @@ use crate::platform::process::{
     DarwinProcessSource, ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication,
     Timebase,
 };
-use crate::rules::{EXPIRED_TEMPORARY_LAYOUT, ReviewedRules};
+use crate::rules::ReviewedRules;
 
 pub(super) const SECOND: u64 = 1_000_000_000;
 /// The time of the test clock at the start of a test.
@@ -386,10 +386,6 @@ impl AuthoritySource for TestAuthority {
                 .map(|rule| rule.reference.clone())
                 .collect(),
         }
-    }
-
-    fn layout(&self, _plan: &Plan, _target_id: &TargetId) -> Option<String> {
-        Some(EXPIRED_TEMPORARY_LAYOUT.to_owned())
     }
 
     fn incident(&self, incident_id: &IncidentId) -> Option<IncidentBudget> {
@@ -869,6 +865,8 @@ impl Tree {
         let file_type = fs::symlink_metadata(&path).unwrap().file_type();
         FileBinding {
             root_id: RootId::new(ROOT_ID).unwrap(),
+            root_path: LosslessPath::from_path(&self.root).unwrap(),
+            root_object: object_of(&self.root),
             relative_entry: LosslessPath::from_bytes(name.as_bytes()).unwrap(),
             volume_id: VolumeId::new(VOLUME).unwrap(),
             mount_id: MountId::new("mount_1").unwrap(),
@@ -880,6 +878,7 @@ impl Tree {
             owner: user(),
             object: Some(object_of(&path)),
             rule: None,
+            layout: None,
             charge: WorkCharge::new(Bytes::new(10), EntryCount::new(1)),
         }
     }

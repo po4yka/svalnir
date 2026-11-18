@@ -1487,6 +1487,7 @@ impl<'a> Run<'a> {
                 path: candidate.path.clone(),
                 root_id: prepared.root_id.clone(),
                 root_path: prepared.root_path.clone(),
+                root_object: prepared.root_object,
                 relative_entry: prepared.relative_entry.clone(),
                 volume_id: candidate.volume_id.clone(),
                 mount_id: prepared.mount_id.clone(),

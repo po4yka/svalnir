@@ -40,7 +40,7 @@ IDs use a stable producer/category namespace, such as `svalnir.expired-temporary
 | Disabled | No new dispatch; inspect only if the reason for disabling still permits it |
 | Retired | Existing history remains interpretable; new plans are rejected |
 
-Promotion requires recorded evidence, not merely changing a registry flag. An implementation can support different lifecycle states for different owner versions or layouts.
+Promotion requires recorded evidence, not merely changing a registry flag. An implementation can support different lifecycle states for different owner versions or layouts. The sealed plan binds the layout that the rule found for each of its targets ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 3), and the lifecycle state that permits a step is the state of that layout. A target of a `proposed` layout is thus not removed under a validated layout of the same rule revision.
 
 The serialized lifecycle states are `proposed`, `inspection_validated`, `manual_action_validated`, `automatic_eviction_validated`, `disabled`, and `retired`. A declaration gives one state for each supported layout. Each validated state has a reference to its validation record under [VALIDATION.md](VALIDATION.md); a validated state with no reference is not a valid declaration. A `disabled` state says whether inspection stays permitted. A state that the reader does not recognize permits no mode.
 

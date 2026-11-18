@@ -5,13 +5,13 @@ use serde_json::json;
 
 use super::{
     admit, application_binding, application_content, application_envelope,
-    automatic_application_content, charge, failure, file_content, file_envelope, lease, member,
-    record, result, seal, step, step_id, submit, target_id,
+    automatic_application_content, charge, failure, file_binding, file_content, file_envelope,
+    lease, member, record, result, seal, step, step_id, submit, target_id,
 };
 use crate::action::{
     ActionClass, BudgetScope, Checked, ClientRole, DispatchState, Durability, EnvelopeContent,
     EnvelopeError, ErrorFamily, Escalation, LeaseResource, NativeResult, Operation, OperationError,
-    OutcomeError, PlanContent, PlanError, PlanTarget, RecordingMode, ResourceLease,
+    OutcomeError, Plan, PlanContent, PlanError, PlanTarget, RecordingMode, ResourceLease,
     ScopedAllowance, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
     TargetResultRecord, TriggerClass, WorkAllowance,
 };
@@ -20,7 +20,7 @@ use crate::process::ProcessAssociation;
 use crate::time::WallTime;
 
 fn sealed_error(content: PlanContent) -> PlanError {
-    crate::action::Plan::seal(content).unwrap_err()
+    Plan::seal(content).unwrap_err()
 }
 
 fn envelope_error(content: EnvelopeContent) -> EnvelopeError {
@@ -260,7 +260,7 @@ fn two_targets_do_not_bind_one_object() {
     };
     second.relative_entry = entry;
     second.root_id = RootId::new("root_2").unwrap();
-    assert!(crate::action::Plan::seal(content).is_ok());
+    assert!(Plan::seal(content).is_ok());
 
     // One application instance with two target identities.
     let two_targets = |binding| {
@@ -297,7 +297,7 @@ fn two_targets_do_not_bind_one_object() {
     let mut binding = application_binding();
     binding.instance_id = other_instance.clone();
     binding.members = vec![in_other("proc_9", 4250)];
-    assert!(crate::action::Plan::seal(two_targets(binding)).is_ok());
+    assert!(Plan::seal(two_targets(binding)).is_ok());
 }
 
 fn first_entry(target: &PlanTarget) -> crate::file::LosslessPath {
@@ -571,4 +571,158 @@ fn a_covered_member_is_a_submitted_member_result_and_is_not_a_native_call() {
             .unwrap(),
         NativeResult::Unrecognized
     );
+}
+
+/// Changes the file binding of the first target of an eviction plan and
+/// seals the plan.
+fn sealed_with(change: impl FnOnce(&mut crate::action::FileBinding)) -> Result<Plan, PlanError> {
+    let mut content = file_content(&ActionClass::EvictRegenerableData);
+    let TargetBinding::File(file) = &mut content.targets[0].binding else {
+        panic!("the first target is a file target");
+    };
+    change(file);
+    Plan::seal(content)
+}
+
+#[test]
+fn a_rule_target_binds_its_layout_and_a_target_with_no_rule_binds_none() {
+    // The layout is in the sealed plan, so the caller of the authorization
+    // cannot name the validated layout of a rule for a target of a
+    // proposed layout.
+    assert_eq!(
+        sealed_with(|file| file.layout = None).unwrap_err(),
+        PlanError::Binding
+    );
+    assert_eq!(
+        sealed_with(|file| file.layout = Some(String::new())).unwrap_err(),
+        PlanError::Binding
+    );
+    let mut content = file_content(&ActionClass::MoveToTrash);
+    content.targets[0].binding = TargetBinding::File(crate::action::FileBinding {
+        rule: None,
+        ..file_binding("a", 60)
+    });
+    assert_eq!(sealed_error(content), PlanError::Binding);
+
+    // The envelope of a step has the same rule.
+    let mut envelope = file_envelope();
+    let TargetBinding::File(file) = &mut envelope.target.binding else {
+        panic!("the target is a file target");
+    };
+    file.layout = None;
+    assert_eq!(envelope_error(envelope), EnvelopeError::Target);
+
+    // The digest covers the layout.
+    let first = sealed_with(|_| {}).unwrap();
+    let other = sealed_with(|file| file.layout = Some("layout-v2".to_owned())).unwrap();
+    assert_ne!(first.digest(), other.digest());
+}
+
+#[test]
+fn a_file_target_binds_the_path_and_the_object_of_its_root() {
+    use crate::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
+    let path = |text: &str| LosslessPath::from_bytes(text).unwrap();
+    let first = seal(file_content(&ActionClass::EvictRegenerableData));
+
+    // The digest covers the root path and the root object: an approval of
+    // the plan is for that place.
+    let moved = {
+        let mut content = file_content(&ActionClass::EvictRegenerableData);
+        for target in &mut content.targets {
+            if let TargetBinding::File(file) = &mut target.binding {
+                file.root_path = path("/Users/a/Documents");
+            }
+        }
+        seal(content)
+    };
+    assert_ne!(first.digest(), moved.digest());
+    let replaced = {
+        let mut content = file_content(&ActionClass::EvictRegenerableData);
+        for target in &mut content.targets {
+            if let TargetBinding::File(file) = &mut target.binding {
+                file.root_object = FileObjectEvidence {
+                    device: DeviceNumber::new(16_777_234),
+                    inode: InodeNumber::new(3),
+                };
+            }
+        }
+        seal(content)
+    };
+    assert_ne!(first.digest(), replaced.digest());
+
+    // One root identity has one root. The second target keeps the root of
+    // the fixture.
+    assert_eq!(
+        sealed_with(|file| file.root_path = path("/Users/a/Documents")).unwrap_err(),
+        PlanError::Binding
+    );
+    assert_eq!(
+        sealed_with(|file| file.root_object.inode = InodeNumber::new(3)).unwrap_err(),
+        PlanError::Binding
+    );
+    // With its own root identity, a target can have its own root.
+    sealed_with(|file| {
+        file.root_id = RootId::new("root_2").unwrap();
+        file.root_path = path("/Users/a/Documents");
+    })
+    .unwrap();
+
+    // A root path is absolute and has no `.` and no `..` component.
+    for text in ["Users/a/Library/Caches", "/Users/a/../b", "/Users/./a"] {
+        let mut content = file_content(&ActionClass::EvictRegenerableData);
+        for target in &mut content.targets {
+            if let TargetBinding::File(file) = &mut target.binding {
+                file.root_path = path(text);
+            }
+        }
+        assert_eq!(sealed_error(content), PlanError::Binding, "{text}");
+    }
+}
+
+#[test]
+fn a_plan_of_the_first_schema_version_is_refused_and_no_field_gets_a_default() {
+    let plan = seal(file_content(&ActionClass::EvictRegenerableData));
+    let value = serde_json::to_value(&plan).unwrap();
+    assert_eq!(value["content"]["schema_version"], json!(2));
+    assert_eq!(
+        value["content"]["targets"][0]["binding"]["layout"],
+        json!("layout-v1")
+    );
+
+    // The exact form of version 1: no root path, no root object, and no
+    // layout. The plan is not decoded.
+    let mut first_version = value.clone();
+    first_version["content"]["schema_version"] = json!(1);
+    for index in 0..2 {
+        let object = first_version["content"]["targets"][index]["binding"]
+            .as_object_mut()
+            .unwrap();
+        for key in ["root_path", "root_object", "layout"] {
+            assert!(object.remove(key).is_some(), "{key}");
+        }
+    }
+    assert!(serde_json::from_value::<Plan>(first_version.clone()).is_err());
+    // The same form with the number of this version is not decoded: a
+    // field that is absent does not get a default.
+    first_version["content"]["schema_version"] = json!(2);
+    assert!(serde_json::from_value::<Plan>(first_version).is_err());
+
+    // Each new key alone, and each key that has no value, must be present.
+    for key in ["root_path", "root_object", "layout", "rule", "object"] {
+        let mut changed = value.clone();
+        changed["content"]["targets"][0]["binding"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(serde_json::from_value::<Plan>(changed).is_err(), "{key}");
+    }
+
+    // The form of this version with the number of version 1 is refused by
+    // its number.
+    let mut content = file_content(&ActionClass::EvictRegenerableData);
+    content.schema_version = 1;
+    assert_eq!(sealed_error(content), PlanError::SchemaVersion);
+    let mut envelope = file_envelope();
+    envelope.schema_version = 1;
+    assert!(Checked::new(envelope).is_err());
 }

@@ -586,6 +586,7 @@ fn satisfied() -> CandidateEligibility {
 pub(crate) struct CandidateSpec {
     pub(crate) name: String,
     pub(crate) root_path: LosslessPath,
+    pub(crate) root_object: FileObjectEvidence,
     pub(crate) object: FileObjectEvidence,
     pub(crate) object_type: FileObjectType,
     pub(crate) work_bytes: u64,
@@ -597,6 +598,10 @@ impl CandidateSpec {
         Self {
             name: name.to_owned(),
             root_path: LosslessPath::from_bytes("/cache/root").unwrap(),
+            root_object: FileObjectEvidence {
+                device: DeviceNumber::new(1),
+                inode: 2.into(),
+            },
             object: FileObjectEvidence {
                 device: DeviceNumber::new(1),
                 inode: inode.into(),
@@ -656,6 +661,7 @@ pub(crate) fn prepared(rule: &Rule, spec: &CandidateSpec) -> PreparedCandidate {
         candidate: RuleCandidate::new(rule, record).unwrap(),
         root_id: RootId::new(ROOT_ID).unwrap(),
         root_path: spec.root_path.clone(),
+        root_object: spec.root_object,
         relative_entry: LosslessPath::from_bytes(spec.name.as_bytes()).unwrap(),
         mount_id: MountId::new(MOUNT).unwrap(),
         object_type: spec.object_type.clone(),

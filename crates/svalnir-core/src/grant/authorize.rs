@@ -70,9 +70,9 @@ pub struct EvidenceStamp {
 
 /// One step of a plan that admission or dispatch asks about.
 ///
-/// The action class, the target, the trigger, the force strategy, and the
-/// bound revisions come from the sealed plan, so the caller cannot state
-/// them differently.
+/// The action class, the target, the layout of a rule target, the trigger,
+/// the force strategy, and the bound revisions come from the sealed plan,
+/// so the caller cannot state them differently.
 #[derive(Debug, Clone)]
 pub struct ActionRequest<'a> {
     /// The authenticated user of the request. The transport gives it.
@@ -88,8 +88,6 @@ pub struct ActionRequest<'a> {
     pub approval: Option<&'a PlanApproval>,
     /// The recording that the step will have.
     pub recording: &'a RecordingMode,
-    /// The producer layout of a target that a rule selected.
-    pub layout: Option<&'a str>,
     /// The budget record of the incident of an automatic plan.
     pub incident: Option<&'a IncidentBudget>,
     /// The newest measurement that supports the trigger of an automatic
@@ -106,8 +104,9 @@ pub enum RefusalReason {
     /// not recognize, or the plan does not agree with itself. A sealed plan
     /// has neither condition; only the recording of the request can.
     UnsupportedValue,
-    /// The request does not name the layout of a target that a rule
-    /// selected.
+    /// The plan does not bind the layout of a target that a rule
+    /// selected. A sealed plan binds it; the reason stays for a binding
+    /// that does not.
     LayoutMissing,
     /// The budget record is of a different incident or guard than the plan.
     IncidentMismatch,
@@ -411,9 +410,15 @@ fn rule_refusal(refusal: RuleRefusal) -> RefusalReason {
 
 impl StepCheck<'_> {
     /// Checks that the lifecycle state of `rule` permits `mode` for the
-    /// layout of the request.
+    /// layout that the sealed plan binds for the target.
     fn check_rule_mode(&self, rule: &RuleRef, mode: &RuleMode) -> Result<(), RefusalReason> {
-        let layout: &str = self.request.layout.ok_or(RefusalReason::LayoutMissing)?;
+        let TargetBinding::File(FileBinding {
+            layout: Some(layout),
+            ..
+        }) = self.binding
+        else {
+            return Err(RefusalReason::LayoutMissing);
+        };
         self.context
             .registry
             .resolve(rule, layout, mode)

@@ -1,9 +1,12 @@
-//! `operations show`, `operations wait`, and `operations cancel`.
+//! `operations show`, `operations wait`, `operations cancel`, and
+//! `operations acknowledge`.
 //!
 //! Each command reads the operation record of the journal. `show` and
 //! `wait` change nothing. `cancel` sets the stop fence of the operation in
 //! the journal: the executor dispatches no further step after it reads the
-//! fence. A call that the executor issued is not recalled.
+//! fence. A call that the executor issued is not recalled. `acknowledge`
+//! records that the user accepts the unknown outcome of an operation: the
+//! coordinator releases its leases, and the result stays `UnknownOutcome`.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +16,7 @@ use svalnir_core::action::{Operation, OperationState};
 use svalnir_core::id::OperationId;
 
 use super::apply::{ApplyView, target_paths};
+use super::execution::{self, Executor};
 use super::operation_view::OperationReport;
 use super::session::{self, CoordinatorPresence, coordinator_presence, journal_error};
 use super::{CommandFailure, Invocation};
@@ -165,7 +169,7 @@ pub(crate) fn wait(
             // to it. The wait changes nothing, so a repeat is safe.
             Err(error)
                 if &*error.code == "journal_busy"
-                    && busy_reads < super::execution::BUSY_READS
+                    && busy_reads < execution::BUSY_READS
                     && !environment.interrupt.is_requested()
                     && timeout.is_none_or(|timeout| started.elapsed() < timeout) =>
             {
@@ -322,5 +326,94 @@ pub(crate) fn cancel(
         notes,
     };
     invocation.emit(Kind::Operation, &view, CancelView::render)?;
+    Ok(ExitStatus::Success)
+}
+
+/// The result of `operations acknowledge`.
+#[derive(Debug, Clone, Serialize)]
+struct AcknowledgeView {
+    operation_id: OperationId,
+    /// The time of the acknowledgment that the journal has.
+    acknowledged_at: svalnir_core::time::WallTime,
+    /// True when an earlier request recorded the acknowledgment. This
+    /// request then changed nothing.
+    repeated: bool,
+    executor: Executor,
+    operation: OperationReport,
+    notes: Vec<&'static str>,
+}
+
+const ACKNOWLEDGE_NOTE: &str = "The acknowledgment releases the leases of the operation, so a later plan for the same targets can be admitted. It does not change the recorded result: the outcome stays unknown, and no call was issued for it.";
+
+impl AcknowledgeView {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        put_line!(
+            out,
+            "Acknowledgment of operation {}: {}",
+            self.operation_id,
+            if self.repeated {
+                "recorded before; this request changed nothing"
+            } else {
+                "recorded; the leases are released"
+            }
+        );
+        self.operation.render(&mut out);
+        for note in &self.notes {
+            put_line!(out, "  Note: {note}");
+        }
+        out
+    }
+}
+
+fn not_unknown_outcome(operation_id: &OperationId) -> ErrorBody {
+    ErrorBody::new(
+        "operation_not_unknown_outcome",
+        ErrorFamily::Request,
+        ErrorStage::Admission,
+        "the operation is not in the state UnknownOutcome, so it has no unknown outcome to acknowledge; the command made no change",
+    )
+    .with_fields(&["operation"])
+    .with_operation(operation_id.as_str())
+    .with_next_action(NextAction::CorrectRequest)
+}
+
+pub(crate) fn acknowledge(
+    arguments: &OperationRef,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let operation_id: OperationId = parse(&arguments.operation)?;
+    let environment: &Environment = invocation.environment;
+    let journal: OperationJournal = open(environment, &operation_id)?;
+    let operation: Operation = read(&journal, &operation_id)?;
+    if operation.state() != &OperationState::UnknownOutcome {
+        return Err(not_unknown_outcome(&operation_id).into());
+    }
+    let outcome = execution::acknowledge(
+        environment,
+        &operation_id,
+        invocation.request_id,
+        invocation.timeout,
+    )?;
+    let (acknowledged_at, repeated, executor) = match outcome {
+        execution::Acknowledgment::Recorded {
+            acknowledged_at,
+            repeated,
+            executor,
+        } => (acknowledged_at, repeated, executor),
+        execution::Acknowledgment::Refused(error) => {
+            return Err(session::action_error(&error, "the acknowledgment").into());
+        }
+    };
+    let operation: Operation = read(&journal, &operation_id)?;
+    let view = AcknowledgeView {
+        operation_id,
+        acknowledged_at,
+        repeated,
+        executor,
+        operation: report(&journal, environment, &operation),
+        notes: vec![ACKNOWLEDGE_NOTE],
+    };
+    invocation.emit(Kind::Operation, &view, AcknowledgeView::render)?;
     Ok(ExitStatus::Success)
 }

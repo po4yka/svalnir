@@ -49,6 +49,9 @@ pub enum SequenceViolation {
     /// The request is not claimed by the executor lifetime.
     #[error("the request is not claimed by the executor lifetime")]
     Claim,
+    /// An acknowledgment names an operation that is not `UnknownOutcome`.
+    #[error("the operation is not in the state UnknownOutcome")]
+    NotUnknownOutcome,
 }
 
 /// A failure of an operation-journal call.

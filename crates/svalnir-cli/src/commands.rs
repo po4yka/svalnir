@@ -11,7 +11,7 @@
 //! | `authority` | `config apply`, `policy enable`, `policy disable`, `policy rearm`, `agent pause`, and `agent resume` |
 //! | `clean`, `stop` | `clean plan`, `clean show`, `clean apply`, and `processes stop` |
 //! | `apply`, `execution` | The apply flow: the approval, the transient coordinator or the request queue, and the wait |
-//! | `operations`, `history` | `operations show`, `operations wait`, `operations cancel`, and `history` |
+//! | `operations`, `history` | `operations show`, `operations wait`, `operations cancel`, `operations acknowledge`, and `history` |
 //! | `agent` | `agent status`, `agent install`, and `agent uninstall` |
 //! | `session`, `plan_store`, `plan_view`, `operation_view` | The journal connection and the authority record, the plan documents, and the shared views |
 //!
@@ -318,6 +318,9 @@ fn dispatch(cli: &Cli, invocation: &mut Invocation<'_>) -> Result<ExitStatus, Co
         Command::Operations {
             command: OperationsCommand::Cancel(arguments),
         } => operations::cancel(arguments, invocation),
+        Command::Operations {
+            command: OperationsCommand::Acknowledge(arguments),
+        } => operations::acknowledge(arguments, invocation),
         Command::History(arguments) => history::history(arguments, invocation),
         Command::Agent {
             command: AgentCommand::Status,
@@ -347,7 +350,7 @@ fn waits_for_an_operation(command: &Command) -> bool {
         Command::Clean {
             command: CleanCommand::Apply(_)
         } | Command::Operations {
-            command: OperationsCommand::Wait(_)
+            command: OperationsCommand::Wait(_) | OperationsCommand::Acknowledge(_)
         } | Command::Processes {
             command: ProcessesCommand::Stop(_)
         }

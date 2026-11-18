@@ -143,6 +143,11 @@ const EMPTY_STATE_COMMANDS: &[(&[&str], u8, Option<&str>)] = &[
         Some("operation_not_found"),
     ),
     (
+        &["operations", "acknowledge", "--operation", "OPERATION_ID"],
+        5,
+        Some("operation_not_found"),
+    ),
+    (
         &[
             "processes",
             "stop",

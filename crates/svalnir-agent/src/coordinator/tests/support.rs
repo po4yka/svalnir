@@ -64,9 +64,10 @@ use crate::executor::process::{
     StepClock,
 };
 use crate::journal::{
-    ClaimedRequest, CoordinationStart, CoordinatorLock, IncidentUsage, JournalOptions,
-    OperationJournal, OperationJournalError, QueuedRequest, RecoveryPosition, RecoveryRecord,
-    RequestBody, RequestCompletion, VolatilePersistReport, VolatileRecord,
+    Acknowledged, Acknowledgment, ClaimedRequest, CoordinationStart, CoordinatorLock,
+    IncidentUsage, JournalOptions, OperationJournal, OperationJournalError, QueuedRequest,
+    RecoveryPosition, RecoveryRecord, RequestBody, RequestCompletion, VolatilePersistReport,
+    VolatileRecord,
 };
 use crate::platform::process::{
     DarwinProcessSource, ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication,
@@ -1324,6 +1325,24 @@ impl CoordinatorJournal for FailingJournal {
         incident_id: &IncidentId,
     ) -> Result<Option<IncidentUsage>, OperationJournalError> {
         self.inner.incident_usage(incident_id)
+    }
+
+    fn acknowledge_unknown_outcome(
+        &mut self,
+        operation_id: &OperationId,
+        principal: &Principal,
+        at: WallTime,
+        epoch: &ExecutorEpochId,
+    ) -> Result<Acknowledged, OperationJournalError> {
+        self.inner
+            .acknowledge_unknown_outcome(operation_id, principal, at, epoch)
+    }
+
+    fn acknowledgment(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<Acknowledgment>, OperationJournalError> {
+        self.inner.acknowledgment(operation_id)
     }
 
     fn record_resource_effects(

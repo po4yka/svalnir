@@ -15,9 +15,11 @@ use svalnir_core::action::{
     StepState, StopReason, TargetBinding, TargetEffect, TargetResult, TargetResultRecord,
 };
 use svalnir_core::id::{OperationId, ProcessGenerationId, StepId, TargetId};
+use svalnir_core::quantity::Nanoseconds;
+use svalnir_core::time::MonotonicNanos;
 
 use super::board::{OperationView, Phase, StopAcknowledgement, StopView, WorkTotals};
-use super::core::Coordinator;
+use super::core::{Coordinator, lease_resources_of};
 use super::dispatch::{Fault, skipped, unknown_outcome};
 use super::error::{action_error, action_error_with, code};
 use super::ports::{CoordinatorJournal, FileProbe};
@@ -26,6 +28,11 @@ use crate::journal::{RecoveryPosition, RecoveryRecord, StepRecovery};
 
 /// The largest number of operations that one reconciliation reads.
 pub const MAX_RECONCILED_OPERATIONS: usize = 4096;
+
+/// The time between two reconciliations of the `UnknownOutcome`
+/// operations of an earlier lifetime whose leases the coordinator holds:
+/// 60 seconds.
+pub const HELD_RECONCILIATION_INTERVAL: Nanoseconds = Nanoseconds::new(60_000_000_000);
 
 /// A result that the current condition of a target establishes.
 fn observed(
@@ -91,6 +98,85 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
         self.start.reconciliation_pending = false;
         self.reconciliation_pending = false;
+    }
+
+    /// Holds the resources of an `UnknownOutcome` operation of an earlier
+    /// lifetime, so that a conflicting plan is refused as for a live
+    /// lease, until a reconciliation settles the operation or a user
+    /// acknowledges it. An acknowledged operation holds nothing. A read
+    /// of the acknowledgment that fails holds the resources.
+    fn hold_unknown(
+        &mut self,
+        operation: &Operation,
+        plan: Option<&Plan>,
+        unsettled_steps: &[StepRecovery],
+    ) {
+        let operation_id: &OperationId = operation.operation_id();
+        if matches!(self.journal.acknowledgment(operation_id), Ok(Some(_))) {
+            self.ledger.release_unknown(operation_id);
+            return;
+        }
+        // The plan has each target. With no plan, the intents of the
+        // steps have the targets that a call can have changed.
+        let resources = match plan {
+            Some(plan) => lease_resources_of(plan.targets.iter().map(|target| &target.binding)),
+            None => lease_resources_of(
+                unsettled_steps
+                    .iter()
+                    .filter_map(|step| step.intent.as_ref())
+                    .map(|intent| &intent.target.binding),
+            ),
+        };
+        self.ledger.hold_unknown(operation_id, resources);
+    }
+
+    /// Reconciles again the `UnknownOutcome` operations whose resources
+    /// the ledger holds, when [`HELD_RECONCILIATION_INTERVAL`] passed
+    /// since the last time. A reconciliation that settles an operation
+    /// releases its resources. The call reads the journal one time; it
+    /// issues no executor call.
+    pub(super) fn reconcile_held(&mut self, now: MonotonicNanos) {
+        if self.ledger.held_unknown().next().is_none() {
+            self.held_reconciliation_at = None;
+            return;
+        }
+        let next: MonotonicNanos = now
+            .checked_add(HELD_RECONCILIATION_INTERVAL)
+            .unwrap_or(MonotonicNanos::new(u64::MAX));
+        match self.held_reconciliation_at {
+            Some(at) if now >= at => {}
+            Some(_) => return,
+            None => {
+                self.held_reconciliation_at = Some(next);
+                return;
+            }
+        }
+        self.held_reconciliation_at = Some(next);
+        let held: std::collections::BTreeSet<OperationId> =
+            self.ledger.held_unknown().cloned().collect();
+        let Ok(count) = self.journal.unsettled_operation_count() else {
+            return;
+        };
+        let limit: usize = usize::try_from(count)
+            .unwrap_or(MAX_RECONCILED_OPERATIONS)
+            .clamp(1, MAX_RECONCILED_OPERATIONS);
+        let Ok(records) = self.journal.recovery_records(limit) else {
+            return;
+        };
+        let complete: bool = usize::try_from(count).is_ok_and(|count| count <= records.len());
+        let mut found: std::collections::BTreeSet<OperationId> = std::collections::BTreeSet::new();
+        for record in records {
+            if held.contains(record.operation.operation_id()) {
+                found.insert(record.operation.operation_id().clone());
+                self.reconcile_record(record);
+            }
+        }
+        // An operation that is not in a complete list is settled.
+        if complete {
+            for operation_id in held.difference(&found) {
+                self.ledger.release_unknown(operation_id);
+            }
+        }
     }
 
     fn is_of_this_lifetime(&self, operation_id: &OperationId) -> bool {
@@ -178,9 +264,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         } = record;
         let plan: Option<Plan> = self.journal.plan(operation.plan_id()).ok().flatten();
         let mut written: bool = true;
-        for recovery in unsettled_steps {
+        for recovery in &unsettled_steps {
             written &= self
-                .reconcile_step(&mut operation, plan.as_ref(), stop_fence, &recovery)
+                .reconcile_step(&mut operation, plan.as_ref(), stop_fence, recovery)
                 .is_complete();
         }
         let each_has_result: bool = operation
@@ -200,6 +286,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             }
         }
         let finished: bool = operation.state().is_settled();
+        if operation.state() == &OperationState::UnknownOutcome {
+            self.hold_unknown(&operation, plan.as_ref(), &unsettled_steps);
+        } else if finished {
+            self.ledger.release_unknown(operation.operation_id());
+        }
         self.board.publish(OperationView {
             stop: stop_fence.then_some(StopView {
                 reason: StopReason::Canceled,

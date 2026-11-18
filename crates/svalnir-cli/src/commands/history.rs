@@ -80,6 +80,9 @@ pub(crate) struct HistoryRecord {
     /// The before and after observations, from the journal or from the
     /// plan document of this client. `None` when neither has a record.
     pub(crate) resource_effects: Option<Vec<ResourceEffect>>,
+    /// The time at which a user acknowledged the `UnknownOutcome` result.
+    /// The state stays `UnknownOutcome`.
+    pub(crate) acknowledged_at: Option<WallTime>,
 }
 
 impl HistoryRecord {
@@ -105,6 +108,7 @@ impl HistoryRecord {
             work: measurements.map(|measurements| measurements.work),
             resource_effects: recorded
                 .or_else(|| measurements.map(|measurements| measurements.resource_effects.clone())),
+            acknowledged_at: None,
         }
     }
 
@@ -116,12 +120,18 @@ impl HistoryRecord {
     ) -> Self {
         // A document is used only when it agrees with the stored plan.
         let stored = super::clean::load_for_report(journal, environment, operation.plan_id());
-        Self::new(
-            operation,
-            stored.as_ref().and_then(|stored| mode_of(&stored.plan)),
-            stored.as_ref().and_then(|stored| stored.document.as_ref()),
-            super::operation_view::recorded_effects(journal, operation.operation_id()),
-        )
+        Self {
+            acknowledged_at: super::operation_view::acknowledged_at(
+                journal,
+                operation.operation_id(),
+            ),
+            ..Self::new(
+                operation,
+                stored.as_ref().and_then(|stored| mode_of(&stored.plan)),
+                stored.as_ref().and_then(|stored| stored.document.as_ref()),
+                super::operation_view::recorded_effects(journal, operation.operation_id()),
+            )
+        }
     }
 
     fn is_trash(&self) -> bool {
@@ -140,6 +150,9 @@ impl HistoryRecord {
             ),
             self.operation_id
         );
+        if let Some(at) = self.acknowledged_at {
+            put_line!(out, "    Acknowledged: {at}; the outcome stays unknown");
+        }
         put_line!(out, "    Observed results: {}", self.effects.summary());
         if let Some(estimate) = &self.estimate {
             put_line!(

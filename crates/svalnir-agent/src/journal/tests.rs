@@ -2,6 +2,7 @@
 //! temporary directory. No test changes a file outside that directory, and
 //! no test signals a process.
 
+mod acknowledgment;
 mod coordination;
 mod durable;
 mod failure;

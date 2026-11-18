@@ -137,6 +137,7 @@
 //! [`Journal::admit`]: svalnir_core::action::Journal::admit
 //! [`Journal::record_rejection`]: svalnir_core::action::Journal::record_rejection
 
+mod acknowledgment;
 mod coordination;
 mod durable;
 mod effects;
@@ -164,6 +165,7 @@ use serde::de::DeserializeOwned;
 use svalnir_core::action::Operation;
 use svalnir_core::quantity::Bytes;
 
+pub use self::acknowledgment::{Acknowledged, Acknowledgment};
 pub use self::coordination::{
     CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRecord, CoordinatorRole,
     LockState, coordinator_lock_path,

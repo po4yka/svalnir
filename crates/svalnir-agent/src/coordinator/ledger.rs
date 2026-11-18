@@ -4,9 +4,9 @@
 //! 11 and 14 own the rules. The ledger is in memory and belongs to one
 //! executor lifetime. It never gives an incident more allowance than the
 //! journal and the earlier calls show: a counter of consumed work only
-//! increases, a restart reads the consumed dispatches of the journal, and
-//! a restart that possibly lost volatile counts starts with the slots of
-//! the incident exhausted.
+//! increases, a restart reads the usage row of the incident in the
+//! journal, and a restart that possibly lost volatile counts starts with
+//! the slots of the incident exhausted.
 
 use std::collections::BTreeMap;
 
@@ -176,6 +176,10 @@ pub(super) struct Ledger {
     started_at: MonotonicNanos,
     incidents: BTreeMap<IncidentId, IncidentEntry>,
     leases: BTreeMap<LeaseResource, ResourceLease>,
+    /// The resources of each `UnknownOutcome` operation of an earlier
+    /// lifetime that is not acknowledged. They conflict as a lease does,
+    /// and two such operations can name one resource.
+    held: BTreeMap<OperationId, Vec<LeaseResource>>,
 }
 
 /// Moves a consumed charge back to the reservation of an allowance.
@@ -238,6 +242,7 @@ impl Ledger {
             started_at,
             incidents: BTreeMap::new(),
             leases: BTreeMap::new(),
+            held: BTreeMap::new(),
         }
     }
 
@@ -659,6 +664,10 @@ impl Ledger {
             self.leases
                 .get(resource)
                 .is_some_and(|lease| &lease.owner != owner)
+                || self
+                    .held
+                    .iter()
+                    .any(|(holder, held)| holder != owner && held.contains(resource))
         }) {
             return Err(LedgerRefusal::new(code::LEASE_UNAVAILABLE));
         }
@@ -687,6 +696,26 @@ impl Ledger {
     /// Releases each lease of `owner`.
     pub(super) fn release_leases(&mut self, owner: &OperationId) {
         self.leases.retain(|_, lease| &lease.owner != owner);
+    }
+
+    /// Holds the resources of an `UnknownOutcome` operation of an earlier
+    /// lifetime until a reconciliation settles it or a user acknowledges
+    /// it (`docs/ACTION_CONTRACTS.md` section 12). A second call replaces
+    /// the resources of the first.
+    pub(super) fn hold_unknown(&mut self, owner: &OperationId, resources: Vec<LeaseResource>) {
+        self.held.insert(owner.clone(), resources);
+    }
+
+    /// Releases the resources that [`Ledger::hold_unknown`] holds for
+    /// `owner`. Returns true when it held some.
+    pub(super) fn release_unknown(&mut self, owner: &OperationId) -> bool {
+        self.held.remove(owner).is_some()
+    }
+
+    /// The `UnknownOutcome` operations of an earlier lifetime whose
+    /// resources the ledger holds.
+    pub(super) fn held_unknown(&self) -> impl Iterator<Item = &OperationId> {
+        self.held.keys()
     }
 
     /// Whether `owner` holds each of `leases` at `now`.

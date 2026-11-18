@@ -300,6 +300,9 @@ pub struct Coordinator<J: CoordinatorJournal> {
     /// True after [`Coordinator::stop_claims`]: this lifetime claims and
     /// executes no further request of the journal queue.
     pub(super) claims_stopped: bool,
+    /// The time of the next reconciliation of the `UnknownOutcome`
+    /// operations of an earlier lifetime whose resources the ledger holds.
+    pub(super) held_reconciliation_at: Option<MonotonicNanos>,
 }
 
 fn refused(error: ActionError) -> ApplyOutcome {
@@ -408,9 +411,17 @@ pub fn approved_roots_of(
 /// application target, and each cleanup root and each volume of a file
 /// target.
 fn lease_resources(plan: &Plan) -> Vec<LeaseResource> {
+    lease_resources_of(plan.targets.iter().map(|target| &target.binding))
+}
+
+/// The conflict domains of the target bindings `bindings`. See
+/// [`lease_resources`].
+pub(super) fn lease_resources_of<'a>(
+    bindings: impl Iterator<Item = &'a TargetBinding>,
+) -> Vec<LeaseResource> {
     let mut resources: BTreeSet<LeaseResource> = BTreeSet::new();
-    for target in &plan.targets {
-        match &target.binding {
+    for binding in bindings {
+        match binding {
             TargetBinding::File(file) => {
                 resources.insert(LeaseResource::CleanupRoot(file.root_id.clone()));
                 resources.insert(LeaseResource::Volume(file.volume_id.clone()));
@@ -522,6 +533,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             held_request: None,
             unwritten_completion: None,
             claims_stopped: false,
+            held_reconciliation_at: None,
         })))
     }
 
@@ -1316,6 +1328,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 wake_at: None,
             };
         }
+        self.reconcile_held(time.clock.now);
         if !self.parked.is_empty() {
             self.retry_parked(&time);
         }
@@ -1344,6 +1357,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
         if self.active.is_none() && !self.waiting.is_empty() {
             worked = true;
+        }
+        if let Some(at) = self.held_reconciliation_at {
+            wake_at = Some(wake_at.map_or(at, |wake| wake.min(at)));
         }
         Progress { worked, wake_at }
     }
@@ -1415,6 +1431,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             RequestBody::Cancel { operation_id } => {
                 self.cancel_for(&operation_id, &claimed.request.principal)
             }
+            RequestBody::Acknowledge { operation_id } => {
+                match self.acknowledge(&operation_id, &claimed.request.principal) {
+                    Ok(acknowledged) => RequestCompletion::Acknowledged {
+                        acknowledged_at: acknowledged.acknowledgment.acknowledged_at,
+                        repeated: acknowledged.repeated,
+                    },
+                    Err(error) => RequestCompletion::Rejected { error: *error },
+                }
+            }
         };
         // A completion that a storage failure stopped is written again
         // before the next claim. If this lifetime ends first, a later
@@ -1431,7 +1456,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     }
 
     /// The user of the apply of an operation that this lifetime admitted.
-    fn applicant(&self, operation_id: &OperationId) -> Option<&Principal> {
+    pub(super) fn applicant(&self, operation_id: &OperationId) -> Option<&Principal> {
         self.active
             .iter()
             .chain(self.waiting.iter())

@@ -182,7 +182,24 @@ pub(crate) struct OperationReport {
     pub(crate) resource_effects: Option<Vec<ResourceEffect>>,
     /// True when a record of the operation is not in the durable journal.
     pub(crate) degraded_recording: Option<bool>,
+    /// The time at which a user acknowledged the `UnknownOutcome` result
+    /// (`operations acknowledge`). The acknowledgment released the leases
+    /// of the operation and did not change its result.
+    pub(crate) acknowledged_at: Option<WallTime>,
     pub(crate) notes: Vec<&'static str>,
+}
+
+/// The time of the acknowledgment that the journal has for an operation.
+/// `None` when it has none, or when the record cannot be read.
+pub(crate) fn acknowledged_at(
+    journal: &OperationJournal,
+    operation_id: &OperationId,
+) -> Option<WallTime> {
+    journal
+        .acknowledgment(operation_id)
+        .ok()
+        .flatten()
+        .map(|acknowledgment| acknowledgment.acknowledged_at)
 }
 
 /// The resource observations that the journal has for an operation.
@@ -229,6 +246,7 @@ impl OperationReport {
             work: None,
             resource_effects: None,
             degraded_recording: None,
+            acknowledged_at: None,
             notes: Vec::new(),
         }
         .with_notes()
@@ -254,6 +272,7 @@ impl OperationReport {
         if self.resource_effects.is_none() {
             self.resource_effects = recorded_effects(journal, &self.operation_id);
         }
+        self.acknowledged_at = acknowledged_at(journal, &self.operation_id);
         self.with_notes()
     }
 
@@ -349,6 +368,12 @@ impl OperationReport {
             && stop.durable_stop_fence
         {
             out.push_str("  Stop fence: durable; the executor dispatches no further step\n");
+        }
+        if let Some(at) = self.acknowledged_at {
+            put_line!(
+                out,
+                "  Acknowledged: {at}; the leases are released, and the outcome stays unknown"
+            );
         }
         put_line!(out, "  Results: {}", self.effects.summary());
         if let Some(work) = &self.work {

@@ -47,6 +47,11 @@ pub enum RequestBody {
         /// The operation.
         operation_id: OperationId,
     },
+    /// Acknowledge an `UnknownOutcome` operation and release its leases.
+    Acknowledge {
+        /// The operation.
+        operation_id: OperationId,
+    },
 }
 
 /// One request of a client.
@@ -87,6 +92,14 @@ pub enum RequestCompletion {
     Stopped {
         /// How the stop was recorded.
         fence: StopFence,
+    },
+    /// The journal has the acknowledgment of the operation, and its
+    /// leases are released.
+    Acknowledged {
+        /// The time of the acknowledgment.
+        acknowledged_at: WallTime,
+        /// True when an earlier request recorded the acknowledgment.
+        repeated: bool,
     },
 }
 

@@ -202,8 +202,28 @@ fn home_directory(environment: &Environment) -> Result<LosslessPath, ErrorBody> 
         })
 }
 
+/// The dependencies of a transient coordinator for the plan of `input`.
 fn dependencies(
     input: &ExecutionInput<'_>,
+    epoch: &ExecutorEpochId,
+) -> Result<(Dependencies, Arc<dyn AgentClock>, SharedAuthority), ErrorBody> {
+    coordinator_dependencies(
+        input.environment,
+        &input.authority,
+        input.control_plane.as_deref(),
+        observed_volumes(input.plan),
+        epoch,
+    )
+}
+
+/// The dependencies of a transient coordinator with the authority record
+/// `authority`, the processes that it must not stop, and the volumes
+/// that it measures.
+fn coordinator_dependencies(
+    environment: &Environment,
+    authority: &AuthorityState,
+    control_plane: Option<&[ControlPlaneProcess]>,
+    volumes: Vec<VolumeIdentity>,
     epoch: &ExecutorEpochId,
 ) -> Result<(Dependencies, Arc<dyn AgentClock>, SharedAuthority), ErrorBody> {
     let context: Arc<CollectionContext> = Arc::new(
@@ -224,10 +244,10 @@ fn dependencies(
     let roots: ApprovedRoots = ApprovedRoots::default();
     let filesystem: FsExecutor = FsExecutor::new(
         &FsExecutorConfig {
-            home_directory: home_directory(input.environment)?,
+            home_directory: home_directory(environment)?,
             limits: ExecutorLimits::default(),
         },
-        input.environment.seams.trash_backend(),
+        environment.seams.trash_backend(),
     )
     .map_err(|_| {
         execution_error(
@@ -249,10 +269,9 @@ fn dependencies(
     );
     let mut records: AuthorityRecords =
         AuthorityRecords::new(session::current_uid(), Box::new(registry));
-    records.state = Some(input.authority.clone());
-    records.control_plane.clone_from(&input.control_plane);
+    records.state = Some(authority.clone());
+    records.control_plane = control_plane.map(<[ControlPlaneProcess]>::to_vec);
     let authority: SharedAuthority = SharedAuthority::new(records);
-    let volumes: Vec<VolumeIdentity> = observed_volumes(input.plan);
     Ok((
         Dependencies {
             clock: Box::new(ClockHandle(Arc::clone(&clock))),
@@ -407,6 +426,161 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
                 }))),
             }
         }
+    }
+}
+
+/// The result of an acknowledgment request.
+pub(crate) enum Acknowledgment {
+    /// The journal has the acknowledgment, and the leases of the
+    /// operation are released.
+    Recorded {
+        /// The time of the acknowledgment.
+        acknowledged_at: svalnir_core::time::WallTime,
+        /// True when an earlier request recorded it.
+        repeated: bool,
+        /// What executed the request.
+        executor: Executor,
+    },
+    /// The coordinator refused the request. Nothing changed.
+    Refused(ActionError),
+}
+
+/// The longest wait for the coordinator that serves a queued
+/// acknowledgment, when the command has no `--timeout`.
+const ACKNOWLEDGE_WAIT: Duration = Duration::from_secs(30);
+
+/// Acknowledges the `UnknownOutcome` operation `operation_id`. When no
+/// process holds the coordinator lock, this process records it as a
+/// transient coordinator, after the reconciliation of the operations of
+/// an earlier lifetime. Else the request goes to the queue of the
+/// journal, and this process waits for its completion.
+///
+/// # Errors
+///
+/// Returns an error when the journal, the clocks, or the coordinator of
+/// this process are not usable, when the process that holds the lock
+/// stops before it serves the request (`coordinator_stopped`), and when
+/// the wait ends first (`acknowledgment_pending`).
+pub(crate) fn acknowledge(
+    environment: &Environment,
+    operation_id: &OperationId,
+    request_id: &RequestId,
+    timeout: Option<Duration>,
+) -> Result<Acknowledgment, ErrorBody> {
+    let principal = session::principal();
+    let epoch: ExecutorEpochId =
+        ExecutorEpochId::new(session::new_id("client")).map_err(|_| session::identity_error())?;
+    // The acknowledgment needs no grant: the coordinator admits no plan
+    // for it.
+    let (dependencies, _clock, _authority) = coordinator_dependencies(
+        environment,
+        &AuthorityState::new(session::current_uid()),
+        None,
+        Vec::new(),
+        &epoch,
+    )?;
+    let database = environment.journal_path()?;
+    match start_coordinator(environment, &database, &epoch, dependencies)? {
+        Start::Coordinating(mut coordinator) => {
+            let mut steps: u32 = 0;
+            while coordinator.reconciliation_pending() && steps < MAX_RECONCILIATION_STEPS {
+                steps = steps.saturating_add(1);
+                coordinator.step();
+            }
+            let result = coordinator.acknowledge(operation_id, &principal);
+            release(coordinator);
+            Ok(match result {
+                Ok(acknowledged) => Acknowledgment::Recorded {
+                    acknowledged_at: acknowledged.acknowledgment.acknowledged_at,
+                    repeated: acknowledged.repeated,
+                    executor: Executor::TransientCoordinator,
+                },
+                Err(error) => Acknowledgment::Refused(*error),
+            })
+        }
+        Start::Busy { mut journal, .. } => {
+            let request = QueuedRequest {
+                request_id: request_id.clone(),
+                principal,
+                body: RequestBody::Acknowledge {
+                    operation_id: operation_id.clone(),
+                },
+                enqueued_at: session::wall_now(),
+            };
+            journal
+                .enqueue_request(&request)
+                .map_err(|error| journal_error(&error))?;
+            wait_for_acknowledgment(
+                &journal,
+                &database,
+                request_id,
+                timeout.unwrap_or(ACKNOWLEDGE_WAIT),
+            )
+        }
+    }
+}
+
+/// Reads the queue until the coordinator completes the acknowledgment
+/// request `request_id`.
+fn wait_for_acknowledgment(
+    journal: &OperationJournal,
+    database: &std::path::Path,
+    request_id: &RequestId,
+    timeout: Duration,
+) -> Result<Acknowledgment, ErrorBody> {
+    let started: Instant = Instant::now();
+    let mut reads: u32 = 0;
+    let mut failed_reads: u32 = 0;
+    loop {
+        reads = reads.wrapping_add(1);
+        match journal.request_status(request_id) {
+            Ok(Some(RequestStatus::Completed {
+                completion:
+                    RequestCompletion::Acknowledged {
+                        acknowledged_at,
+                        repeated,
+                    },
+            })) => {
+                return Ok(Acknowledgment::Recorded {
+                    acknowledged_at,
+                    repeated,
+                    executor: Executor::QueuedForCoordinator,
+                });
+            }
+            Ok(Some(RequestStatus::Completed {
+                completion: RequestCompletion::Rejected { error },
+            })) => return Ok(Acknowledgment::Refused(error)),
+            Ok(_) => failed_reads = 0,
+            // A busy journal is read again: a different process writes to
+            // it.
+            Err(svalnir_agent::journal::OperationJournalError::Busy(_))
+                if failed_reads < BUSY_READS =>
+            {
+                failed_reads = failed_reads.saturating_add(1);
+            }
+            Err(error) => return Err(journal_error(&error)),
+        }
+        if reads.is_multiple_of(PRESENCE_CHECK_INTERVAL)
+            && session::coordinator_presence(database) == session::CoordinatorPresence::NotRunning
+        {
+            return Err(ErrorBody::new(
+                "coordinator_stopped",
+                ErrorFamily::Evidence,
+                ErrorStage::Dispatch,
+                "the process that held the coordinator lock stopped before it served the acknowledgment; the request is in the queue and the next coordinator serves it",
+            )
+            .with_next_action(NextAction::RefreshObservation));
+        }
+        if started.elapsed() >= timeout {
+            return Err(ErrorBody::new(
+                "acknowledgment_pending",
+                ErrorFamily::Limits,
+                ErrorStage::Dispatch,
+                "the coordinator did not serve the acknowledgment before the end of the wait; the request stays in the queue; query the operation again with `svalnir operations show`",
+            )
+            .with_next_action(NextAction::RefreshObservation));
+        }
+        std::thread::sleep(QUEUE_POLL);
     }
 }
 

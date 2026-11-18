@@ -2256,3 +2256,155 @@ fn a_force_quit_after_a_settled_graceful_request_is_a_new_plan() {
     let history = json(&world.environment, &["history"]);
     assert_eq!(history.result()["records"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn an_acknowledgment_releases_the_leases_of_an_unknown_operation_and_keeps_its_result() {
+    let (mut world, tree, plan) = World::with_plan("trash");
+    // The Trash gives no result: the outcome of the move is not known.
+    world.environment.seams.test.trash_gives_no_result = true;
+    let apply = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    let operation: String = apply.result()["operation"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        apply.result()["operation"]["state"],
+        "UnknownOutcome",
+        "{}",
+        apply.stdout
+    );
+    world.environment.seams.test.trash_gives_no_result = false;
+
+    // A new plan for the same tree is refused while the unknown operation
+    // holds its leases.
+    let scan: String = world.scan(&tree);
+    let second: String = world.plan(&scan, "trash");
+    let refused = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &second, "--yes"],
+    );
+    assert_eq!(
+        refused.error_code(),
+        "lease_unavailable",
+        "{}",
+        refused.stdout
+    );
+
+    // The acknowledgment, in this process as a transient coordinator.
+    let first = json(
+        &world.environment,
+        &["operations", "acknowledge", "--operation", &operation],
+    );
+    assert_eq!(first.status, ExitStatus::Success, "{}", first.stdout);
+    let result = first.result();
+    assert_eq!(result["repeated"], false);
+    assert_eq!(result["executor"], "transient_coordinator");
+    assert_eq!(result["operation"]["state"], "UnknownOutcome");
+    assert!(!result["acknowledged_at"].is_null());
+    // A repeated acknowledgment is the first one.
+    let again = json(
+        &world.environment,
+        &["operations", "acknowledge", "--operation", &operation],
+    );
+    assert_eq!(again.result()["repeated"], true);
+    assert_eq!(again.result()["acknowledged_at"], result["acknowledged_at"]);
+    // The history keeps the unknown result, with the acknowledgment.
+    let show = json(
+        &world.environment,
+        &["operations", "show", "--operation", &operation],
+    );
+    assert_eq!(show.result()["operation"]["state"], "UnknownOutcome");
+    assert_eq!(
+        show.result()["operation"]["acknowledged_at"],
+        result["acknowledged_at"]
+    );
+    let history = json(&world.environment, &["history"]);
+    let record = history.result()["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["operation_id"] == operation.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(record["state"], "UnknownOutcome");
+    assert_eq!(record["acknowledged_at"], result["acknowledged_at"]);
+    let text = run(
+        &world.environment,
+        &["operations", "show", "--operation", &operation],
+    );
+    assert!(text.stdout.contains("Acknowledged: "), "{}", text.stdout);
+
+    // The leases are released: the new plan is admitted.
+    let admitted = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &second, "--yes"],
+    );
+    assert_eq!(admitted.status, ExitStatus::Success, "{}", admitted.stdout);
+    let settled: String = admitted.result()["operation"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // An operation that is not `UnknownOutcome` and an operation that
+    // the journal does not have are refused with their codes.
+    let not_unknown = json(
+        &world.environment,
+        &["operations", "acknowledge", "--operation", &settled],
+    );
+    assert_eq!(not_unknown.status, ExitStatus::Usage);
+    assert_eq!(not_unknown.error_code(), "operation_not_unknown_outcome");
+    let absent = json(
+        &world.environment,
+        &["operations", "acknowledge", "--operation", "operation_none"],
+    );
+    assert_eq!(absent.error_code(), "operation_not_found");
+}
+
+#[test]
+fn a_held_coordinator_lock_sends_the_acknowledgment_to_the_queue() {
+    let (mut world, _tree, plan) = World::with_plan("trash");
+    world.environment.seams.test.trash_gives_no_result = true;
+    let apply = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    let operation: String = apply.result()["operation"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let journal: PathBuf = world.path("state").join("operations.sqlite");
+    // A holder of the lock that serves no request, in place of an agent.
+    let lock =
+        CoordinatorLock::try_acquire(&journal, svalnir_agent::journal::CoordinatorRole::Agent)
+            .unwrap();
+    let pending = json(
+        &world.environment,
+        &[
+            "operations",
+            "acknowledge",
+            "--operation",
+            &operation,
+            "--timeout",
+            "1s",
+        ],
+    );
+    assert_eq!(
+        pending.error_code(),
+        "acknowledgment_pending",
+        "{}",
+        pending.stdout
+    );
+    assert_eq!(pending.envelope()["warnings"], serde_json::json!([]));
+    drop(lock);
+    // The request stays in the queue; with no holder, the client records
+    // the acknowledgment itself.
+    let recorded = json(
+        &world.environment,
+        &["operations", "acknowledge", "--operation", &operation],
+    );
+    assert_eq!(recorded.result()["executor"], "transient_coordinator");
+    assert_eq!(recorded.result()["operation"]["state"], "UnknownOutcome");
+}

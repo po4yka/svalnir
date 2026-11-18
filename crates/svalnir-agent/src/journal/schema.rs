@@ -58,6 +58,10 @@ pub(super) const APPLICATION_ID: i64 = 0x5356_4C4A;
 ///   the authority state, the state of the controller, the status of the
 ///   agent, and its lifecycle record. One row for each name; a write
 ///   replaces the row and increases its `revision`.
+/// - `operation_acknowledgment`: the acknowledgment of an `UnknownOutcome`
+///   operation by a user, with its time. It releases the leases of the
+///   operation and does not change its state. The row goes with its
+///   operation (`ON DELETE CASCADE`).
 /// - `operation_effect`: the resource observations of an operation (the
 ///   available capacity and the memory pressure before and after it), as
 ///   the JSON list of the `ResourceEffect` values of `svalnir-core`. One
@@ -156,6 +160,12 @@ CREATE TABLE agent_record (
     revision INTEGER NOT NULL CHECK (revision >= 1),
     updated_unix_s INTEGER NOT NULL,
     content TEXT NOT NULL CHECK (json_valid(content))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE operation_acknowledgment (
+    operation_seq INTEGER NOT NULL PRIMARY KEY
+        REFERENCES operation (seq) ON DELETE CASCADE,
+    principal TEXT NOT NULL CHECK (json_valid(principal)),
+    acknowledged_unix_s INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE operation_effect (
     operation_seq INTEGER NOT NULL PRIMARY KEY

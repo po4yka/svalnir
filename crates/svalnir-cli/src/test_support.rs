@@ -613,3 +613,17 @@ impl svalnir_agent::executor::fs::TrashBackend for DirectoryTrash {
         }
     }
 }
+
+/// A Trash operation that gives no result and moves nothing: the backend
+/// stopped before its reply, so the effect of the move is not known.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SilentTrash;
+
+impl svalnir_agent::executor::fs::TrashBackend for SilentTrash {
+    fn move_to_trash(
+        &self,
+        _request: &svalnir_agent::executor::fs::TrashRequest<'_>,
+    ) -> svalnir_agent::executor::fs::TrashReply {
+        svalnir_agent::executor::fs::TrashReply::Unknown
+    }
+}

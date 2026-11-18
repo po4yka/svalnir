@@ -415,6 +415,8 @@ The journal keeps one usage record for each incident: the number of operations w
 
 Reconciliation is observational. A same-path replacement or reused PID is a different target. Never delete or terminate it merely to complete an old operation. Preserve unknown attribution and incomplete history when available evidence cannot settle them.
 
+An operation that stays `UnknownOutcome` after the reconciliation of a restart holds the leases of its targets (section 5): the coordinator restores them from the stored plan, so a conflicting plan is refused or waits as for a live lease. The coordinator reconciles such an operation again at a bounded interval, from fresh evidence and with no executor call. A reconciliation that settles the operation releases the leases. For a target that no evidence can settle, the user acknowledges the operation (`svalnir operations acknowledge`). The acknowledgment is accepted only for an `UnknownOutcome` operation; it is a durable record with its time and its principal, it releases the leases, and it does not change the recorded result: the history shows `UnknownOutcome` with the acknowledgment. A repeated acknowledgment returns the first one and changes nothing. A restart does not restore the leases of an acknowledged operation. An `UnknownOutcome` operation of the current executor lifetime keeps its leases in the same way, and an acknowledgment releases them.
+
 One reconciliation attempt of a step has one of three results:
 
 | Result | Meaning | Reconciliation of the step |

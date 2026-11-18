@@ -21,10 +21,11 @@
 //! | --- | --- |
 //! | [`Coordinator::start`] | Takes the coordinator lock and registers the executor lifetime. [`Start::Busy`] tells the caller to write its request to the queue of the journal. |
 //! | [`Coordinator::apply`] | Admits a plan as one operation, or returns the operation of an earlier apply, or a refusal. A refusal changes nothing. |
-//! | [`Coordinator::step`] | Does one bounded unit of work: a pending reconciliation, the stop requests, one request of the journal queue, and one unit of the active operation. |
+//! | [`Coordinator::step`] | Does one bounded unit of work: a pending reconciliation, the reconciliation at an interval of the `UnknownOutcome` operations that hold leases, the stop requests, one request of the journal queue, and one unit of the active operation. |
 //! | [`Coordinator::serve_queue`] | Claims and executes one request of the journal queue. `step` calls it. |
 //! | [`Coordinator::operation`] | Reads an operation with its phase, its stop request, and its measurements. |
 //! | [`Coordinator::cancel`] | Stops the further dispatch of an operation and returns the acknowledgement level. |
+//! | [`Coordinator::acknowledge`] | Records the acknowledgment of an `UnknownOutcome` operation and releases its leases. The result of the operation does not change. |
 //! | [`Coordinator::run_until_finished`] | Calls `step` until an operation is finished or the time of the caller ends. The end of the time cancels nothing. |
 //! | [`Coordinator::shutdown`] | Releases the registration when each operation is settled. |
 //! | [`CoordinatorHandle`] | The same query, cancel, and wait calls for a different thread. |
@@ -93,6 +94,7 @@
 //!   permanent mode binds no rule, so the state of a rule does not
 //!   change it.
 
+mod acknowledge;
 mod board;
 mod core;
 mod dispatch;
@@ -119,4 +121,4 @@ pub use self::ports::{
     IdSource, Measurements, RevisionSnapshot, SystemProbe, TargetProbe, TimeReading,
     TriggerStanding,
 };
-pub use self::recovery::MAX_RECONCILED_OPERATIONS;
+pub use self::recovery::{HELD_RECONCILIATION_INTERVAL, MAX_RECONCILED_OPERATIONS};

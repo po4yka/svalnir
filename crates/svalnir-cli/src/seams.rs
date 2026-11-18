@@ -298,6 +298,9 @@ pub(crate) struct TestSeams {
     pub(crate) while_asked: Option<WhileAsked>,
     /// The service host.
     pub(crate) service_host: Option<Arc<dyn ServiceHost>>,
+    /// The Trash gives no result and moves nothing, so the effect of a
+    /// move is not known.
+    pub(crate) trash_gives_no_result: bool,
 }
 
 /// The service host of a test that set none: it has no agent executable
@@ -382,6 +385,9 @@ impl Seams {
         // A test build never has the Trash of the system.
         #[cfg(test)]
         {
+            if self.test.trash_gives_no_result {
+                return Box::new(crate::test_support::SilentTrash);
+            }
             match &self.test.trash_directory {
                 Some(directory) => {
                     Box::new(crate::test_support::DirectoryTrash::new(directory.clone()))

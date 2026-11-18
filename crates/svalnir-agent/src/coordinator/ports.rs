@@ -7,7 +7,7 @@
 
 use std::fmt::Debug;
 
-use svalnir_core::action::{Journal, Plan, ResourceEffect, StopFence, TargetBinding};
+use svalnir_core::action::{Journal, Plan, Principal, ResourceEffect, StopFence, TargetBinding};
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
 use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
@@ -25,9 +25,9 @@ use crate::executor::process::{
     ProcessExecutor, StepClock, StepInput, StepRun, StopRequest,
 };
 use crate::journal::{
-    ClaimedRequest, CoordinationStart, CoordinatorLock, IncidentUsage, OperationJournal,
-    OperationJournalError, RecoveryRecord, RequestCompletion, VolatilePersistReport,
-    VolatileRecord,
+    Acknowledged, Acknowledgment, ClaimedRequest, CoordinationStart, CoordinatorLock,
+    IncidentUsage, OperationJournal, OperationJournalError, RecoveryRecord, RequestCompletion,
+    VolatilePersistReport, VolatileRecord,
 };
 use crate::platform::process::ProcessSource;
 
@@ -385,6 +385,31 @@ pub trait CoordinatorJournal: Journal {
         incident_id: &IncidentId,
     ) -> Result<Option<IncidentUsage>, OperationJournalError>;
 
+    /// Records the acknowledgment of an `UnknownOutcome` operation. See
+    /// [`OperationJournal::acknowledge_unknown_outcome`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn acknowledge_unknown_outcome(
+        &mut self,
+        operation_id: &OperationId,
+        principal: &Principal,
+        at: WallTime,
+        epoch: &ExecutorEpochId,
+    ) -> Result<Acknowledged, OperationJournalError>;
+
+    /// The acknowledgment of an operation. See
+    /// [`OperationJournal::acknowledgment`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn acknowledgment(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<Acknowledgment>, OperationJournalError>;
+
     /// Claims the oldest queued request.
     ///
     /// # Errors
@@ -499,6 +524,23 @@ impl CoordinatorJournal for OperationJournal {
         incident_id: &IncidentId,
     ) -> Result<Option<IncidentUsage>, OperationJournalError> {
         Self::incident_usage(self, incident_id)
+    }
+
+    fn acknowledge_unknown_outcome(
+        &mut self,
+        operation_id: &OperationId,
+        principal: &Principal,
+        at: WallTime,
+        epoch: &ExecutorEpochId,
+    ) -> Result<Acknowledged, OperationJournalError> {
+        Self::acknowledge_unknown_outcome(self, operation_id, principal, at, epoch)
+    }
+
+    fn acknowledgment(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<Acknowledgment>, OperationJournalError> {
+        Self::acknowledgment(self, operation_id)
     }
 
     fn claim_next_request(

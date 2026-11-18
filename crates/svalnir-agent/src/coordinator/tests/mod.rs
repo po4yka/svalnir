@@ -6,6 +6,7 @@
 //! tests use a synthetic process host, and the tests of `children` signal
 //! only a child process that the test started.
 
+mod acknowledge;
 mod admission;
 mod application;
 mod budget;

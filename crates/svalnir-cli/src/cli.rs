@@ -95,7 +95,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ProcessesCommand,
     },
-    /// Query, await, or cancel an admitted operation.
+    /// Query, await, cancel, or acknowledge an admitted operation.
     Operations {
         #[command(subcommand)]
         command: OperationsCommand,
@@ -153,6 +153,7 @@ impl Command {
                 OperationsCommand::Show(_) => "operations show",
                 OperationsCommand::Wait(_) => "operations wait",
                 OperationsCommand::Cancel(_) => "operations cancel",
+                OperationsCommand::Acknowledge(_) => "operations acknowledge",
             },
             Self::Agent { command } => match command {
                 AgentCommand::Install(_) => "agent install",
@@ -366,6 +367,8 @@ pub enum OperationsCommand {
     Wait(OperationRef),
     /// Stop the later steps of an operation.
     Cancel(OperationRef),
+    /// Accept that the outcome of an operation stays unknown, and release its leases.
+    Acknowledge(OperationRef),
 }
 
 #[derive(Debug, Args)]

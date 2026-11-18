@@ -89,6 +89,10 @@ pub mod code {
     pub const IDENTITY_UNAVAILABLE: &str = "identity_unavailable";
     /// A reconciliation is pending and is not complete.
     pub const RECONCILIATION_PENDING: &str = "reconciliation_pending";
+    /// An acknowledgment names an operation that is not `UnknownOutcome`.
+    pub const OPERATION_NOT_UNKNOWN_OUTCOME: &str = "operation_not_unknown_outcome";
+    /// The journal did not record the acknowledgment.
+    pub const ACKNOWLEDGMENT_NOT_RECORDED: &str = "acknowledgment_not_recorded";
 }
 
 /// The reason the coordinator did not start.

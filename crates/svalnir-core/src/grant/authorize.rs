@@ -527,7 +527,10 @@ impl StepCheck<'_> {
                 let escalation: &Escalation = &self.request.plan.limits.escalation;
                 // A force step belongs to a force strategy. A plan with
                 // no force strategy cannot use the force class of the
-                // grant for one of its steps.
+                // grant for one of its steps. This is a second check:
+                // `Plan::seal` refuses such a plan, so no sealed plan
+                // reaches this branch. The branch stays, and it fails
+                // closed.
                 let force_without_strategy: bool = self.step.action_class
                     == ActionClass::ForceApplicationExit
                     && matches!(escalation, Escalation::None);

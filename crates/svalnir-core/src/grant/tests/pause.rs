@@ -1,14 +1,14 @@
 //! Tests of pause and resume.
 
 use super::super::{
-    AcknowledgementLevel, AuthorityState, InstanceInhibition, MeasurementFloor, Pause, PauseBasis,
-    PauseRefusal, PauseRequest, PauseStatus, Persistence, ResumeRefusal, ResumeRequest,
-    measurement_floor, pause, pause_status, resume,
+    AcknowledgementLevel, AuthorityState, ControlClock, InstanceInhibition, MeasurementFloor,
+    Pause, PauseBasis, PauseRefusal, PauseRequest, PauseStatus, Persistence, ResumeRefusal,
+    ResumeRequest, measurement_floor, pause, pause_status, resume,
 };
 use super::{SECOND, USER, clock, clock_in, control, durable, enabled_state, monotonic, wall};
 use crate::process::Uid;
 use crate::quantity::Nanoseconds;
-use crate::time::MonotonicNanos;
+use crate::time::{MonotonicNanos, WallTime};
 
 const HOUR: u64 = 3_600;
 
@@ -237,6 +237,16 @@ fn a_pause_request_is_checked() {
     };
     assert_eq!(
         pause(&state, &endless, &now).unwrap_err(),
+        PauseRefusal::DeadlineOutOfRange
+    );
+    // The monotonic sum is in range, and the wall-clock sum is not: the
+    // wall clock is at the last second that `WallTime` holds.
+    let wall_limit = ControlClock {
+        clock: &at,
+        wall: WallTime::from_unix(253_402_300_799, 0).unwrap(),
+    };
+    assert_eq!(
+        pause(&state, &pause_for(Some(60)), &wall_limit).unwrap_err(),
         PauseRefusal::DeadlineOutOfRange
     );
     // A new pause replaces the earlier one.

@@ -205,7 +205,17 @@ fn a_rearm_does_not_end_a_cooldown() {
         boot_id: BootId::new("boot_0").unwrap(),
         ..cooldown(CooldownCause::NoEffectBackoff, 100)
     };
-    let cooldowns = [active.clone(), elapsed, other_boot.clone()];
+    // A cooldown that ends exactly at `now` has no time left. One that
+    // ends a second later has.
+    let ends_now = cooldown(CooldownCause::PassPacing, 600);
+    let ends_next = cooldown(CooldownCause::PassPacing, 601);
+    let cooldowns = [
+        active.clone(),
+        elapsed,
+        ends_now,
+        ends_next.clone(),
+        other_boot.clone(),
+    ];
     let condition = IncidentCondition {
         cooldowns: &cooldowns,
         ..settled(memory_usage(3, 0))
@@ -214,7 +224,7 @@ fn a_rearm_does_not_end_a_cooldown() {
     assert_eq!(result.new_generation, Generation::new(2));
     // The cooldown that is not complete, and the one whose end is not
     // known, stay in force with the values that the caller gave.
-    assert_eq!(result.cooldowns_in_force, [active, other_boot]);
+    assert_eq!(result.cooldowns_in_force, [active, ends_next, other_boot]);
 }
 
 #[test]
@@ -355,6 +365,25 @@ fn a_disk_incident_keeps_its_work_usage() {
             &state,
             &budget,
             &settled(reserved),
+            &disk_request,
+            &at,
+            wall(600)
+        ),
+        Err(RearmRefusal::OperationUnsettled)
+    );
+    // The same for reserved bytes with no reserved item.
+    let reserved_bytes = IncidentUsage::Disk {
+        usage: WorkUsage {
+            reserved_bytes: Bytes::new(1),
+            ..WorkUsage::default()
+        },
+        passes_started: 1,
+    };
+    assert_eq!(
+        rearm(
+            &state,
+            &budget,
+            &settled(reserved_bytes),
             &disk_request,
             &at,
             wall(600)

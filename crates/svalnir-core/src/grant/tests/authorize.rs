@@ -17,7 +17,7 @@ use super::{
 };
 use crate::action::{
     ActionClass, ActionStage, Checked, DispatchState, ErrorFamily, Escalation, PermittedNextStep,
-    Plan, PlanApproval, RecordingMode, TriggerClass,
+    Plan, PlanApproval, PlanError, RecordingMode, TriggerClass,
 };
 use crate::authority::{ActionGrantRef, Generation};
 use crate::digest::ContentDigest;
@@ -1056,7 +1056,7 @@ fn a_manual_step_of_a_class_with_no_rule_mode_cannot_bind_a_rule() {
 }
 
 #[test]
-fn a_force_step_of_an_automatic_plan_with_no_force_strategy_is_refused() {
+fn the_plan_contract_refuses_a_force_step_with_no_force_strategy() {
     let state = enabled_state();
     let mut content = as_automatic(
         &state,
@@ -1066,12 +1066,9 @@ fn a_force_step_of_an_automatic_plan_with_no_force_strategy_is_refused() {
     );
     // The plan has a force step and names no force strategy.
     content.limits.escalation = Escalation::None;
-    let Ok(plan) = Plan::seal(content) else {
-        // The plan contract refuses the plan before the authorization.
-        return;
-    };
-    let ask = Ask::new(state, plan, "force");
-    assert_eq!(ask.reason(), RefusalReason::EscalationNotGranted);
+    // The plan contract refuses the plan, so the authorization never sees
+    // a force step with no force strategy.
+    assert!(matches!(Plan::seal(content), Err(PlanError::Steps)));
 }
 
 #[test]

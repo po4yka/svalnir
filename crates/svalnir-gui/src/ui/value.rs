@@ -13,6 +13,28 @@ use gpui_kit::{
     px,
 };
 
+/// The text size of the value.
+const VALUE_SIZE: f32 = 30.0;
+/// The line height of the value. The rolling number uses the same height:
+/// 1.25 of the size, rounded.
+const VALUE_LINE: f32 = 38.0;
+/// The text size of the unit and the context.
+const UNIT_SIZE: f32 = 12.0;
+/// The line height of the unit and the context.
+const UNIT_LINE: f32 = 16.0;
+
+/// The distance from the baseline of a text line to the bottom of its box,
+/// for the UI font at `weight` and `size` in a line of `line` px.
+fn below_baseline(window: &Window, weight: FontWeight, size: f32, line: f32) -> f32 {
+    let mut font = window.text_style().font();
+    font.weight = weight;
+    let system = window.text_system();
+    let id = system.resolve_font(&font);
+    let ascent: f32 = f32::from(system.ascent(id, px(size))).abs();
+    let descent: f32 = f32::from(system.descent(id, px(size))).abs();
+    (line - (ascent + descent)) / 2.0 + descent
+}
+
 /// A value at 30 px with a muted unit and context, baseline-aligned.
 #[derive(IntoElement)]
 pub struct DisplayValue {
@@ -84,8 +106,14 @@ impl DisplayValue {
 }
 
 impl RenderOnce for DisplayValue {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        // The row puts the bottoms of the two text boxes on one line, so the
+        // unit gets a bottom padding that puts its baseline on the baseline
+        // of the number.
+        let lift: f32 = (below_baseline(window, FontWeight::MEDIUM, VALUE_SIZE, VALUE_LINE)
+            - below_baseline(window, FontWeight::NORMAL, UNIT_SIZE, UNIT_LINE))
+        .max(0.0);
         let muted = to_hsla(tokens.muted_foreground);
         let value_color = if self.muted || self.reason.is_some() {
             muted
@@ -101,7 +129,7 @@ impl RenderOnce for DisplayValue {
             (Some(rolling), true) => {
                 let text: SharedString = self.value.clone();
                 rolling.update(cx, |number, cx| {
-                    number.set_style(30.0, FontWeight::MEDIUM, value_color);
+                    number.set_style(VALUE_SIZE, FontWeight::MEDIUM, value_color);
                     number.set_text(text, cx);
                 });
                 rolling.clone().into_any_element()
@@ -112,19 +140,28 @@ impl RenderOnce for DisplayValue {
             .gap(tokens::SPACE_1)
             .child(
                 h_flex()
-                    .items_baseline()
+                    .items_end()
                     .gap(tokens::SPACE_1)
                     .child(
                         div()
                             .id(self.id.clone())
                             .test_support()
                             .aria_label(self.value.clone())
-                            .text_size(px(30.0))
+                            .text_size(px(VALUE_SIZE))
+                            .line_height(px(VALUE_LINE))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(value_color)
                             .child(shown),
                     )
-                    .child(div().text_size(px(12.0)).text_color(muted).child(suffix)),
+                    .child(
+                        div()
+                            // Not a layout step: the offset of two baselines.
+                            .pb(px(lift))
+                            .text_size(px(UNIT_SIZE))
+                            .line_height(px(UNIT_LINE))
+                            .text_color(muted)
+                            .child(suffix),
+                    ),
             )
             .children(self.reason.map(|reason| {
                 div()

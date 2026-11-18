@@ -150,6 +150,57 @@ pub(super) fn unknown_outcome(
     .map_err(|_| Fault)
 }
 
+/// The result `UnknownOutcome` for a result whose submission is not
+/// certain. The member, the evidence, and the durability stay; a result
+/// with a different submission state, or that is `UnknownOutcome`, stays
+/// as it is.
+fn uncertain_as_unknown(
+    active: &Active,
+    step: &PlannedStep,
+    result: TargetResult,
+) -> Result<TargetResult, Fault> {
+    if !matches!(result.dispatch, DispatchState::SubmissionUncertain)
+        || matches!(result.effect, TargetEffect::UnknownOutcome)
+    {
+        return Ok(result);
+    }
+    let record: TargetResultRecord = result.into_inner();
+    let failure: ActionError = record.failure.clone().unwrap_or_else(|| {
+        action_error_with(
+            code::EFFECT_NOT_ESTABLISHED,
+            ErrorFamily::Outcome,
+            ActionStage::Verification,
+            DispatchState::SubmissionUncertain,
+            Some(&active.plan.plan_id),
+            Some(active.operation.operation_id()),
+            Some(&step.step_id),
+        )
+    });
+    Checked::new(TargetResultRecord {
+        effect: TargetEffect::UnknownOutcome,
+        attribution: Attribution::Possible,
+        stop_reason: StopReason::Failed,
+        failure: Some(failure.clone()),
+        ..record.clone()
+    })
+    .or_else(|_| {
+        // The evidence does not agree with an unknown effect: the result
+        // keeps the target and the member only.
+        Checked::new(TargetResultRecord {
+            evidence: EffectEvidence {
+                native: NativeResult::Unavailable,
+                ..EffectEvidence::none()
+            },
+            effect: TargetEffect::UnknownOutcome,
+            attribution: Attribution::Possible,
+            stop_reason: StopReason::Failed,
+            failure: Some(failure),
+            ..record
+        })
+    })
+    .map_err(|_| Fault)
+}
+
 /// A result for a force step that is not necessary: each member is in
 /// its final condition after the graceful step.
 fn already_exited(target_id: &TargetId) -> Result<TargetResult, Fault> {
@@ -813,6 +864,18 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         if possibly && let (Some(unused), Some(charge)) = (active.unused, charge) {
             active.unused = unused.checked_sub(charge);
         }
+        // With no recorded submission the step has no `Verifying` record,
+        // and an effect that the executor saw is not the known effect of a
+        // call: a result whose submission is not certain is
+        // `UnknownOutcome` (`docs/ACTION_CONTRACTS.md` section 6).
+        let results: Vec<TargetResult> = if possibly && !submitted && !verifying {
+            results
+                .into_iter()
+                .map(|result| uncertain_as_unknown(active, step, result))
+                .collect::<Result<_, _>>()?
+        } else {
+            results
+        };
         if submitted && !verifying {
             self.record(
                 active,

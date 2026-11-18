@@ -175,6 +175,8 @@ After recording intent and before the external call, consume the step and its ap
 
 An open incident does not alone authorize the next step. A latched disk incident may continue bounded eviction toward its recovery threshold while its fresh continuation predicate holds. Memory steps, including force escalation, require the current qualified critical-pressure or application-stop predicate; remaining in an incident's hysteresis band is insufficient. Evidence gaps or wake require requalification without resetting consumed budgets. Plan expiry or a deadline blocks a later step; waiting for graceful exit does not extend either.
 
+An executor result whose dispatch state is `submission_uncertain` has no recorded submission, so its step has no `Verifying` record. The coordinator records such a result as `UnknownOutcome` (`effect_not_established`), also when the executor observed a final condition, for example an absent entry. The step goes from `DispatchConsumed` to `UnknownOutcome`, the operation settles to `UnknownOutcome`, and reconciliation can later establish the result.
+
 If that final check fails, record that no external call was issued. The consumed step remains consumed; releasing a provably unused budget reservation does not reactivate it.
 
 Never hold scheduling locks while awaiting an application, native callback, or storage transaction. Collectors, pause/revoke handling, and operation queries must remain responsive.

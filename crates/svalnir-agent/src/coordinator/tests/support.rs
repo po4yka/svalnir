@@ -15,10 +15,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{Value, json};
 use svalnir_core::action::SlotAllowance;
 use svalnir_core::action::{
-    ActionClass, ActionError, Admission, ApplicationBinding, ClientRole, DispatchReceipt,
-    Escalation, ExecutorRole, FileBinding, FileObjectType, Journal, JournalError, Operation,
-    PLAN_SCHEMA_VERSION, Plan, PlanApproval, PlanContent, PlanLimits, PlanTarget, PlannedStep,
-    Principal, RequestEnvelope, Step, TargetBinding, Trigger, TriggerClass, Validity, WorkCharge,
+    ActionClass, ActionError, Admission, ApplicationBinding, Checked, ClientRole, DispatchReceipt,
+    DispatchState, Escalation, ExecutorRole, FileBinding, FileObjectType, Journal, JournalError,
+    Operation, PLAN_SCHEMA_VERSION, Plan, PlanApproval, PlanContent, PlanLimits, PlanTarget,
+    PlannedStep, Principal, RequestEnvelope, Step, TargetBinding, Trigger, TriggerClass, Validity,
+    WorkCharge,
 };
 use svalnir_core::authority::{ActionGrantRef, AuthorityBinding, Generation};
 use svalnir_core::config::{ValidatedConfig, parse_and_validate};
@@ -785,6 +786,37 @@ pub(super) enum TrashMode {
     Fail,
 }
 
+/// A filesystem executor that reports each removal as a call whose
+/// submission is not certain and after which the entry is absent: a
+/// final effect with no recorded submission.
+#[derive(Debug)]
+pub(super) struct UncertainSubmission(pub(super) FsExecutor);
+
+impl super::super::FilesystemExecutor for UncertainSubmission {
+    fn execute(
+        &self,
+        roots: &ApprovedRoots,
+        step: crate::executor::fs::AdmittedStep<'_>,
+        signal: &dyn crate::executor::fs::StopSignal,
+    ) -> crate::executor::fs::StepOutcome {
+        self.0
+            .execute_step_until(roots, step, signal)
+            .map(|mut outcome| {
+                let record = outcome.result.clone().into_inner();
+                if matches!(record.effect, svalnir_core::action::TargetEffect::Removed) {
+                    outcome.result = Checked::new(svalnir_core::action::TargetResultRecord {
+                        dispatch: DispatchState::SubmissionUncertain,
+                        effect: svalnir_core::action::TargetEffect::AlreadyAbsent,
+                        attribution: svalnir_core::action::Attribution::Possible,
+                        ..record
+                    })
+                    .unwrap();
+                }
+                outcome
+            })
+    }
+}
+
 /// A Trash backend that moves an entry to a directory of the fixture. It
 /// refuses each path outside the temporary directory.
 #[derive(Debug)]
@@ -1374,6 +1406,8 @@ pub(super) struct Bench {
     pub(super) intents: Arc<AtomicU64>,
     pub(super) after_consume: Arc<Mutex<Hook>>,
     pub(super) trash_mode: TrashMode,
+    /// The filesystem executor reports each submission as not certain.
+    pub(super) uncertain_submission: bool,
     lifetimes: u32,
 }
 
@@ -1405,6 +1439,7 @@ impl Bench {
             intents: Arc::new(AtomicU64::new(0)),
             after_consume: Arc::new(Mutex::new(Hook::default())),
             trash_mode,
+            uncertain_submission: false,
             lifetimes: 0,
         }
     }
@@ -1437,7 +1472,11 @@ impl Bench {
             authority: Box::new(self.authority.clone()),
             measurements: Box::new(self.measurements.clone()),
             ids: Box::new(TestIds::new(prefix)),
-            filesystem: Box::new(self.tree.executor(self.trash_mode)),
+            filesystem: if self.uncertain_submission {
+                Box::new(UncertainSubmission(self.tree.executor(self.trash_mode)))
+            } else {
+                Box::new(self.tree.executor(self.trash_mode))
+            },
             roots: self.tree.roots(),
             application: Box::new(ProcessExecutor::new(
                 self.host.clone(),

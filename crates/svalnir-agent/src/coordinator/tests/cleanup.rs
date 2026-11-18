@@ -1,12 +1,13 @@
 //! Manual cleanup operations: the Trash mode and the permanent mode.
 
 use svalnir_core::action::{
-    ActionClass, DispatchState, Durability, OperationState, ResourceEffect, StepState, TargetEffect,
+    ActionClass, DispatchState, Durability, Journal as _, OperationState, ResourceEffect,
+    StepState, TargetEffect,
 };
 use svalnir_core::quantity::{ByteDelta, EntryCount};
 
 use super::super::{OperationView, Phase};
-use super::support::{Bench, TrashMode, admitted, cleanup_plan, run, stored_request};
+use super::support::{Bench, TrashMode, admitted, cleanup_plan, open_journal, run, stored_request};
 
 fn capacity_delta(view: &OperationView) -> Option<ByteDelta> {
     match view.resource_effects.as_slice() {
@@ -436,7 +437,7 @@ fn the_capacity_observations_of_an_operation_are_in_the_journal_for_each_client(
     assert_eq!(capacity_delta(&view), ByteDelta::new(400).ok());
     assert!(!view.degraded_recording);
     // A different process reads the same observations from the journal.
-    let client = super::support::open_journal(&bench.tree.database);
+    let client = open_journal(&bench.tree.database);
     assert_eq!(
         client.resource_effects(&operation_id).unwrap(),
         view.resource_effects
@@ -469,6 +470,42 @@ fn observations_that_the_journal_did_not_take_do_not_change_the_outcome() {
     assert_eq!(view.operation.state(), &OperationState::Completed);
     assert!(!file.exists());
     assert!(view.degraded_recording);
-    let client = super::support::open_journal(&bench.tree.database);
+    let client = open_journal(&bench.tree.database);
     assert_eq!(client.resource_effects(&operation_id).unwrap(), Vec::new());
+}
+
+#[test]
+fn a_result_with_an_uncertain_submission_and_a_final_effect_is_unknown() {
+    let mut bench = Bench::new();
+    bench.uncertain_submission = true;
+    let file = bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    // The entry is removed, and the submission of the call is not
+    // certain. The step has no `Verifying` record, so the effect is not
+    // established: the step and the operation are `UnknownOutcome`, and
+    // the operation is not parked until a restart.
+    assert!(!file.exists());
+    let step = &view.operation.steps()[0];
+    assert_eq!(step.progress().state(), &StepState::UnknownOutcome);
+    assert_eq!(
+        step.progress().dispatch(),
+        &DispatchState::SubmissionUncertain
+    );
+    assert_eq!(step.results()[0].effect, TargetEffect::UnknownOutcome);
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+    let stored = open_journal(&bench.tree.database)
+        .operation(&operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, view.operation);
 }

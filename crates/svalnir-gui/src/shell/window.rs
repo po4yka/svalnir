@@ -6,7 +6,7 @@ use crate::{
         model::{AgentState, Loadable},
         store::AppModel,
     },
-    screens::{overview::OverviewScreen, placeholder::Placeholder},
+    screens::{overview::OverviewScreen, placeholder::Placeholder, storage::StorageScreen},
     theme::tokens::{self, Tokens, to_hsla},
     ui::data_state::format_age,
 };
@@ -42,6 +42,10 @@ impl MainWindow {
                 if screen == Screen::Overview {
                     let view: Entity<OverviewScreen> =
                         cx.new(|cx| OverviewScreen::new(model.clone(), cx));
+                    AnyView::from(view)
+                } else if screen == Screen::Storage {
+                    let view: Entity<StorageScreen> =
+                        cx.new(|cx| StorageScreen::new(model.clone(), cx));
                     AnyView::from(view)
                 } else {
                     let view: Entity<Placeholder> = cx.new(|_| Placeholder::new(screen));
@@ -132,6 +136,12 @@ impl MainWindow {
             .child(Icon::new(IconName::TriangleAlert).size_4())
             .child(text)
             .into_any_element()
+    }
+
+    /// The model that the window reads.
+    #[must_use]
+    pub fn model(&self) -> &Entity<AppModel> {
+        &self.model
     }
 
     /// The active screen.

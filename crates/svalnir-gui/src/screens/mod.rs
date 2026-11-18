@@ -2,3 +2,4 @@
 
 pub mod overview;
 pub mod placeholder;
+pub mod storage;

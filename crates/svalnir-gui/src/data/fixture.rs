@@ -3,11 +3,16 @@
 use super::{
     DataSource,
     model::{
-        AgentSnapshot, AgentState, GuardRow, HostSnapshot, Measured, OperationPhase, OperationRow,
-        PressureLevel, ServiceSnapshot,
+        AgentSnapshot, AgentState, ChildSize, GapRow, GuardRow, HostSnapshot, Measured,
+        OperationPhase, OperationRow, PressureLevel, ScanEnd, ScanProgress, ScanSummary,
+        ServiceSnapshot,
     },
 };
-use std::time::{Duration, SystemTime};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
+use svalnir_agent::scan::CancellationToken;
 use svalnir_core::{grant::GuardStanding, policy::PolicyId};
 
 const GB: u64 = 1_000_000_000;
@@ -186,6 +191,72 @@ impl DataSource for FixtureSource {
             FixtureScenario::AgentAbsent => {}
         }
         snapshot
+    }
+
+    fn scan(
+        &self,
+        root: &Path,
+        _cancel: &CancellationToken,
+        progress: &dyn Fn(ScanProgress),
+    ) -> Result<ScanSummary, String> {
+        if self.scenario == FixtureScenario::Unavailable {
+            return Err("the scan root is not readable in this fixture".to_owned());
+        }
+        for step in 1..=3_u64 {
+            progress(ScanProgress {
+                entries: step * 40_000,
+                current_path: Some(root.join("Library").join("Caches")),
+                logical: step * 60 * GB,
+                allocated: step * 62 * GB,
+            });
+        }
+        let big: [(&str, bool, u64); 7] = [
+            ("Library", true, 614),
+            ("Developer", true, 482),
+            ("Pictures", true, 729),
+            ("Documents", true, 273),
+            ("Movies", true, 316),
+            ("Music", true, 98),
+            (".Trash", true, 141),
+        ];
+        let mut children: Vec<ChildSize> = big
+            .iter()
+            .map(|(name, is_directory, tenth_gb)| ChildSize {
+                name: (*name).to_owned(),
+                is_directory: *is_directory,
+                logical: tenth_gb * GB / 10,
+                allocated: tenth_gb * GB / 10 + GB / 100,
+            })
+            .collect();
+        for index in 0..12_u64 {
+            children.push(ChildSize {
+                name: format!("item-{index:02}"),
+                is_directory: index % 2 == 0,
+                logical: 50_000_000 + index * 1_000_000,
+                allocated: 52_000_000 + index * 1_000_000,
+            });
+        }
+        let total_logical: u64 = children.iter().map(|child| child.logical).sum();
+        let total_allocated: u64 = children.iter().map(|child| child.allocated).sum();
+        Ok(ScanSummary {
+            root: root.to_path_buf(),
+            children,
+            total_logical,
+            total_allocated,
+            entries_examined: 120_000,
+            complete: false,
+            ended: ScanEnd::Finished,
+            gaps: vec![GapRow {
+                cause_text: "permission denied".to_owned(),
+                count: 3,
+            }],
+            elapsed: Some(Duration::from_secs(41)),
+            finished_at: SystemTime::now(),
+        })
+    }
+
+    fn default_scan_root(&self) -> Option<PathBuf> {
+        Some(PathBuf::from("/Users/fixture"))
     }
 
     fn label(&self) -> &'static str {

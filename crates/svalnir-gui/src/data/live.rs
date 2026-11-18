@@ -3,21 +3,30 @@
 use super::{
     DataSource,
     model::{
-        AgentSnapshot, AgentState, GuardRow, HostSnapshot, Measured, OperationPhase, OperationRow,
-        PressureLevel, ServiceSnapshot,
+        AgentSnapshot, AgentState, ChildSize, GapRow, GuardRow, HostSnapshot, Measured,
+        OperationPhase, OperationRow, PressureLevel, ScanEnd, ScanProgress, ScanSummary,
+        ServiceSnapshot,
     },
 };
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use svalnir_agent::{
     journal::JournalOptions,
     observe::{self, CoordinatorPresence, DiskReading, Host},
+    platform::volume,
     runtime::journal_path,
+    scan::{
+        CancellationToken, DirectoryRecord, EntryKind, EntryRecord, RegionCause, ScanCompletion,
+        ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, WallScanClock, run_scan,
+    },
 };
-use svalnir_core::{grant::AuthorityState, time::WallTime};
+use svalnir_core::{
+    file::LosslessPath, grant::AuthorityState, id::ScanId, observation::Coverage, time::WallTime,
+};
 use svalnir_core::{observation::Observation, quantity::Bytes, state::PressureState};
 
 /// The state directory override variable; the same as the CLI reads.
@@ -220,8 +229,212 @@ impl DataSource for LiveSource {
         snapshot
     }
 
+    fn scan(
+        &self,
+        root: &Path,
+        cancel: &CancellationToken,
+        progress: &dyn Fn(ScanProgress),
+    ) -> Result<ScanSummary, String> {
+        let lossless: LosslessPath = LosslessPath::from_path(root)
+            .map_err(|error| format!("the root is not valid: {error}"))?;
+        let nanoseconds: u128 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let scan_id: ScanId = ScanId::new(format!("scan_{nanoseconds:x}_{:x}", std::process::id()))
+            .map_err(|_| "the scan identity cannot be made".to_owned())?;
+        let mut request = ScanRequest {
+            scan_id,
+            root: lossless,
+            limits: ScanLimits::default(),
+            volume: volume::volume_at(root).ok().map(|mounted| mounted.identity),
+        };
+        let mut observer = ChildObserver::new(root, progress);
+        let result: ScanResult = match run_scan(&request, cancel, &WallScanClock, &mut observer) {
+            // The identity is evidence, not a requirement: scan without it.
+            Err(ScanError::VolumeMismatch) => {
+                request.volume = None;
+                observer = ChildObserver::new(root, progress);
+                run_scan(&request, cancel, &WallScanClock, &mut observer)
+            }
+            other => other,
+        }
+        .map_err(|error| format!("the scan did not run: {error}"))?;
+        Ok(summarize(root, &result, observer.into_children()))
+    }
+
+    fn default_scan_root(&self) -> Option<PathBuf> {
+        let home: PathBuf = PathBuf::from(std::env::var_os("HOME")?);
+        (home.is_absolute() && home.is_dir()).then_some(home)
+    }
+
     fn label(&self) -> &'static str {
         "in-process collection"
+    }
+}
+
+/// The shortest interval between two progress calls.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sums the sizes of the direct children of the root and reports progress.
+struct ChildObserver<'a> {
+    root: PathBuf,
+    children: HashMap<String, ChildSize>,
+    entries: u64,
+    logical: u64,
+    allocated: u64,
+    current: Option<PathBuf>,
+    last_report: Option<Instant>,
+    progress: &'a dyn Fn(ScanProgress),
+}
+
+impl<'a> ChildObserver<'a> {
+    fn new(root: &Path, progress: &'a dyn Fn(ScanProgress)) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            children: HashMap::new(),
+            entries: 0,
+            logical: 0,
+            allocated: 0,
+            current: None,
+            last_report: None,
+            progress,
+        }
+    }
+
+    fn into_children(self) -> Vec<ChildSize> {
+        self.children.into_values().collect()
+    }
+
+    fn child_name(&self, path: &Path) -> Option<String> {
+        (path.parent() == Some(self.root.as_path()))
+            .then(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .flatten()
+    }
+
+    fn report(&mut self) {
+        let due: bool = self
+            .last_report
+            .is_none_or(|last| last.elapsed() >= PROGRESS_INTERVAL);
+        if due {
+            self.last_report = Some(Instant::now());
+            (self.progress)(ScanProgress {
+                entries: self.entries,
+                current_path: self.current.clone(),
+                logical: self.logical,
+                allocated: self.allocated,
+            });
+        }
+    }
+}
+
+impl ScanObserver for ChildObserver<'_> {
+    fn directory_opened(&mut self, path: &Path) {
+        self.current = Some(path.to_path_buf());
+        self.report();
+    }
+
+    fn entry_listed(&mut self, _path: &Path) {
+        self.entries = self.entries.saturating_add(1);
+        self.report();
+    }
+
+    fn entry_measured(&mut self, entry: &EntryRecord<'_>) {
+        if !entry.counted_in_totals {
+            return;
+        }
+        let logical: u64 = entry.logical_bytes.map_or(0, Bytes::get);
+        let allocated: u64 = entry.allocated_bytes.map_or(0, Bytes::get);
+        self.logical = self.logical.saturating_add(logical);
+        self.allocated = self.allocated.saturating_add(allocated);
+        if entry.kind != EntryKind::Directory
+            && let Some(name) = self.child_name(entry.path)
+        {
+            self.children.insert(
+                name.clone(),
+                ChildSize {
+                    name,
+                    is_directory: false,
+                    logical,
+                    allocated,
+                },
+            );
+        }
+        self.report();
+    }
+
+    fn directory_finished(&mut self, directory: &DirectoryRecord<'_>) {
+        if let Some(name) = self.child_name(directory.path) {
+            self.children.insert(
+                name.clone(),
+                ChildSize {
+                    name,
+                    is_directory: true,
+                    logical: directory.logical_bytes.get(),
+                    allocated: directory.allocated_bytes.get(),
+                },
+            );
+        }
+    }
+}
+
+const fn cause_text(cause: RegionCause) -> &'static str {
+    match cause {
+        RegionCause::PermissionDenied => "permission denied",
+        RegionCause::ReadFailed => "read failed",
+        RegionCause::ResourceLimit => "resource limit",
+        RegionCause::NotHydrated => "not downloaded",
+        RegionCause::Disappeared => "disappeared",
+        RegionCause::IdentityChanged => "replaced during the scan",
+        RegionCause::InconsistentMetadata => "inconsistent metadata",
+        RegionCause::DepthLimit => "below the depth limit",
+        RegionCause::EntryLimit => "entry limit reached",
+        RegionCause::Cancelled => "cancelled",
+        RegionCause::HardLinkLimit => "hard-link limit",
+        RegionCause::Overflow => "total too large",
+    }
+}
+
+fn summarize(root: &Path, result: &ScanResult, children: Vec<ChildSize>) -> ScanSummary {
+    let mut counts: Vec<(RegionCause, usize)> = Vec::new();
+    for region in &result.regions {
+        match counts.iter_mut().find(|(cause, _)| *cause == region.cause) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((region.cause, 1)),
+        }
+    }
+    let mut gaps: Vec<GapRow> = counts
+        .into_iter()
+        .map(|(cause, count)| GapRow {
+            cause_text: cause_text(cause).to_owned(),
+            count,
+        })
+        .collect();
+    let omitted: u64 = result.regions_omitted.get();
+    if omitted > 0 {
+        gaps.push(GapRow {
+            cause_text: "other regions not listed".to_owned(),
+            count: usize::try_from(omitted).unwrap_or(usize::MAX),
+        });
+    }
+    let ended: ScanEnd = match result.completion {
+        ScanCompletion::Finished => ScanEnd::Finished,
+        ScanCompletion::Cancelled => ScanEnd::Cancelled,
+        ScanCompletion::EntryLimitReached => ScanEnd::LimitReached,
+    };
+    ScanSummary {
+        root: root.to_path_buf(),
+        children,
+        total_logical: result.totals.logical_bytes.get(),
+        total_allocated: result.totals.allocated_bytes.get(),
+        entries_examined: result.entries_examined.get(),
+        complete: result.coverage == Coverage::Complete && ended == ScanEnd::Finished,
+        ended,
+        gaps,
+        elapsed: result.elapsed.map(Duration::from),
+        finished_at: SystemTime::now(),
     }
 }
 

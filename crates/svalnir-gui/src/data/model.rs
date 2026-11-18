@@ -3,7 +3,11 @@
 //! The types hold no GPUI types. A failed query is never a zero: it is
 //! [`Measured::Unavailable`] with a reason.
 
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use svalnir_core::{action::OperationState, grant::GuardStanding};
 
@@ -264,6 +268,145 @@ pub struct ServiceSnapshot {
     pub problems: Vec<String>,
     /// When the snapshot was read.
     pub captured_at: SystemTime,
+}
+
+/// Which size of an entry a chart shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeMetric {
+    /// The allocated size on disk (`st_blocks * 512`).
+    Allocated,
+    /// The logical size (`st_size`).
+    Logical,
+}
+
+impl SizeMetric {
+    /// The caption that names the metric.
+    #[must_use]
+    pub const fn caption(self) -> &'static str {
+        match self {
+            Self::Allocated => "Allocated size on disk",
+            Self::Logical => "Logical size",
+        }
+    }
+}
+
+/// The size of one direct child of the scan root. Of the sizes that the
+/// scanner records, only the logical and the allocated size are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSize {
+    /// The name of the child.
+    pub name: String,
+    /// Whether the child is a directory.
+    pub is_directory: bool,
+    /// The logical size in bytes.
+    pub logical: u64,
+    /// The allocated size in bytes.
+    pub allocated: u64,
+}
+
+impl ChildSize {
+    /// The size in `metric`.
+    #[must_use]
+    pub const fn size(&self, metric: SizeMetric) -> u64 {
+        match metric {
+            SizeMetric::Allocated => self.allocated,
+            SizeMetric::Logical => self.logical,
+        }
+    }
+}
+
+/// How a scan ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanEnd {
+    /// The scan examined each directory that it could open.
+    Finished,
+    /// The caller cancelled the scan.
+    Cancelled,
+    /// The scan stopped at the entry limit.
+    LimitReached,
+}
+
+/// One group of regions that the totals do not cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapRow {
+    /// The cause, as text.
+    pub cause_text: String,
+    /// The number of regions with this cause.
+    pub count: usize,
+}
+
+/// The result of one scan, as the views read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSummary {
+    /// The scan root.
+    pub root: PathBuf,
+    /// The direct children of the root, unsorted.
+    pub children: Vec<ChildSize>,
+    /// The logical total in bytes.
+    pub total_logical: u64,
+    /// The allocated total in bytes.
+    pub total_allocated: u64,
+    /// The number of names that the scan examined.
+    pub entries_examined: u64,
+    /// Whether the coverage is complete and the scan finished.
+    pub complete: bool,
+    /// How the scan ended.
+    pub ended: ScanEnd,
+    /// The regions that the totals do not cover, grouped by cause.
+    pub gaps: Vec<GapRow>,
+    /// The duration of the scan.
+    pub elapsed: Option<Duration>,
+    /// When the scan finished.
+    pub finished_at: SystemTime,
+}
+
+impl ScanSummary {
+    /// The total in `metric`.
+    #[must_use]
+    pub const fn total(&self, metric: SizeMetric) -> u64 {
+        match metric {
+            SizeMetric::Allocated => self.total_allocated,
+            SizeMetric::Logical => self.total_logical,
+        }
+    }
+}
+
+/// The running totals of a scan that has not ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// The number of entries that the scan listed.
+    pub entries: u64,
+    /// The path that the scan reads now.
+    pub current_path: Option<PathBuf>,
+    /// The logical bytes measured so far.
+    pub logical: u64,
+    /// The allocated bytes measured so far.
+    pub allocated: u64,
+}
+
+/// The state of the scan of the Storage screen.
+#[derive(Debug, Clone)]
+pub enum ScanState {
+    /// No scan has started.
+    Idle,
+    /// A scan runs.
+    Running {
+        /// The scan root.
+        root: PathBuf,
+        /// The latest progress.
+        progress: ScanProgress,
+        /// When the scan started.
+        started: Instant,
+    },
+    /// A scan ended.
+    Done(Arc<ScanSummary>),
+    /// The scan did not run or failed.
+    Failed {
+        /// The scan root.
+        root: PathBuf,
+        /// The reason.
+        reason: String,
+    },
 }
 
 #[cfg(test)]

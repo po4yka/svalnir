@@ -2,13 +2,38 @@
 
 use super::{
     DataSource,
-    model::{AgentSnapshot, HostSnapshot, Loadable, ServiceSnapshot},
+    model::{
+        AgentSnapshot, HostSnapshot, Loadable, Measured, PressureLevel, ScanProgress, ScanState,
+        ServiceSnapshot,
+    },
 };
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant, SystemTime},
 };
+use svalnir_agent::scan::CancellationToken;
+
+/// How often the model copies the scan progress.
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
+/// The reason that a scan does not start under memory pressure.
+const PRESSURE_REFUSAL: &str = "A scan does not start while memory pressure is not normal.";
+
+/// Whether a scan may start. A scan does not start while the memory
+/// pressure is Warning or Critical; an unavailable pressure does not block.
+///
+/// # Errors
+///
+/// Returns the sentence for the user when the scan is refused.
+pub fn scan_allowed(host: &Loadable<HostSnapshot>) -> Result<(), &'static str> {
+    match host.value().map(|snapshot| &snapshot.pressure) {
+        Some(Measured::Value(PressureLevel::Warning | PressureLevel::Critical)) => {
+            Err(PRESSURE_REFUSAL)
+        }
+        _ => Ok(()),
+    }
+}
 
 /// The poll interval while the window is active.
 pub const ACTIVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -53,6 +78,11 @@ pub struct AppModel {
     pub agent: Loadable<AgentSnapshot>,
     /// The guards and the latest operation.
     pub service: Loadable<ServiceSnapshot>,
+    /// The state of the scan of the Storage screen.
+    pub scan: ScanState,
+    scan_cancel: Option<CancellationToken>,
+    scan_task: Option<Task<()>>,
+    scan_ticker: Option<Task<()>>,
     source_label: &'static str,
     fixture_name: Option<&'static str>,
     last_refresh: Option<SystemTime>,
@@ -89,6 +119,10 @@ impl AppModel {
             host: Loadable::Loading,
             agent: Loadable::Loading,
             service: Loadable::Loading,
+            scan: ScanState::Idle,
+            scan_cancel: None,
+            scan_task: None,
+            scan_ticker: None,
             last_refresh: None,
             active: true,
             in_flight: InFlight::default(),
@@ -96,6 +130,97 @@ impl AppModel {
         };
         model.refresh(cx);
         model
+    }
+
+    /// The root that the Storage screen offers first.
+    #[must_use]
+    pub fn default_scan_root(&self) -> Option<PathBuf> {
+        self.source.default_scan_root()
+    }
+
+    /// Starts a scan of `root`. A request while a scan runs is ignored. A
+    /// scan under memory pressure is refused.
+    pub fn start_scan(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if matches!(self.scan, ScanState::Running { .. }) {
+            return;
+        }
+        if let Err(reason) = scan_allowed(&self.host) {
+            self.scan = ScanState::Failed {
+                root: root.to_path_buf(),
+                reason: reason.to_owned(),
+            };
+            cx.notify();
+            return;
+        }
+        let cancel: CancellationToken = CancellationToken::new();
+        self.scan_cancel = Some(cancel.clone());
+        self.scan = ScanState::Running {
+            root: root.to_path_buf(),
+            progress: ScanProgress::default(),
+            started: Instant::now(),
+        };
+        let slot: Arc<Mutex<Option<ScanProgress>>> = Arc::new(Mutex::new(None));
+        let source: Arc<dyn DataSource> = Arc::clone(&self.source);
+        let scan_root: PathBuf = root.to_path_buf();
+        let worker_slot: Arc<Mutex<Option<ScanProgress>>> = Arc::clone(&slot);
+        let job = cx.background_spawn(async move {
+            let publish = |progress: ScanProgress| {
+                *worker_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(progress);
+            };
+            source.scan(&scan_root, &cancel, &publish)
+        });
+        let failed_root: PathBuf = root.to_path_buf();
+        self.scan_task = Some(cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = job.await;
+            if this
+                .update(cx, |model, cx| {
+                    model.scan_cancel = None;
+                    model.scan_ticker = None;
+                    model.scan = match result {
+                        Ok(summary) => ScanState::Done(Arc::new(summary)),
+                        Err(reason) => ScanState::Failed {
+                            root: failed_root,
+                            reason,
+                        },
+                    };
+                    cx.notify();
+                })
+                .is_err()
+            {
+                tracing::debug!("the model closed before the scan finished");
+            }
+        }));
+        // The latest value wins: the ticker copies the slot into the model.
+        self.scan_ticker = Some(cx.spawn(async move |this, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(PROGRESS_TICK).await;
+                let latest: Option<ScanProgress> =
+                    slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let alive: bool = this
+                    .update(cx, |model, cx| {
+                        if let ScanState::Running { progress, .. } = &mut model.scan {
+                            if let Some(latest) = latest {
+                                *progress = latest;
+                            }
+                            // The elapsed time changes at every tick.
+                            cx.notify();
+                        }
+                        matches!(model.scan, ScanState::Running { .. })
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Asks the running scan to stop. The scan returns the part that it read.
+    pub fn cancel_scan(&mut self) {
+        if let Some(cancel) = &self.scan_cancel {
+            cancel.cancel();
+        }
     }
 
     /// The label of the source.
@@ -221,6 +346,29 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_allowed_by_pressure() {
+        let snapshot = |pressure: Measured<PressureLevel>| -> Loadable<HostSnapshot> {
+            Loadable::Ready(Arc::new(HostSnapshot {
+                captured_at: SystemTime::UNIX_EPOCH,
+                volume_name: None,
+                disk_total: Measured::Unavailable(String::new()),
+                disk_available: Measured::Unavailable(String::new()),
+                disk_free: Measured::Unavailable(String::new()),
+                pressure,
+                memory_total: Measured::Unavailable(String::new()),
+                swap_used: Measured::Unavailable(String::new()),
+                swap_total: Measured::Unavailable(String::new()),
+                source: "test",
+            }))
+        };
+        assert!(scan_allowed(&snapshot(Measured::Value(PressureLevel::Normal))).is_ok());
+        assert!(scan_allowed(&snapshot(Measured::Unavailable("x".into()))).is_ok());
+        assert!(scan_allowed(&snapshot(Measured::Value(PressureLevel::Warning))).is_err());
+        assert!(scan_allowed(&snapshot(Measured::Value(PressureLevel::Critical))).is_err());
+        assert!(scan_allowed(&Loadable::Loading).is_ok());
+    }
 
     #[test]
     fn interval_follows_activity() {

@@ -89,6 +89,8 @@ impl RenderOnce for StatusPill {
             .gap(px(4.0))
             .items_center()
             .flex_shrink_0()
+            // A pill keeps its own width in a column that stretches its children.
+            .self_start()
             .rounded_full()
             .bg(color.opacity(0.15))
             .text_color(color)

@@ -7,7 +7,10 @@ use crate::{
         live::LiveSource,
         store::AppModel,
     },
-    shell::{nav, window::MainWindow},
+    shell::{
+        nav::{self, Screen},
+        window::MainWindow,
+    },
     theme::{apply, fonts},
 };
 use gpui_kit::{
@@ -17,7 +20,7 @@ use gpui_kit::{
     component::TitleBar,
     px, size,
 };
-use std::{process::ExitCode, sync::Arc};
+use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 /// The usage text of `--help`.
 pub const USAGE: &str = "Usage: svalnir-gui [OPTIONS]
@@ -27,6 +30,11 @@ Options:
                        (healthy, pressure, unavailable, stale, agent-absent)
   --appearance MODE    Force the theme: light or dark
   --reduce-motion      Force Reduce Motion on
+  --screen NAME        Open on a screen (overview, storage, memory,
+                       applications, automation, history, diagnostics)
+  --size WxH           Set the window size in points, for example 1120x720
+  --scan PATH          Start a size scan of the directory PATH at launch.
+                       The scan reads sizes only
   --help               Print this text
 ";
 
@@ -51,7 +59,7 @@ impl ForcedAppearance {
 }
 
 /// The options of one launch.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchOptions {
     /// The fixture scenario; `None` selects the live source.
     pub fixture: Option<FixtureScenario>,
@@ -59,6 +67,12 @@ pub struct LaunchOptions {
     pub appearance: Option<ForcedAppearance>,
     /// Whether Reduce Motion is forced on.
     pub reduce_motion: bool,
+    /// The screen that the window opens on; `None` is the Overview.
+    pub screen: Option<Screen>,
+    /// The directory of a scan that starts at launch.
+    pub scan: Option<PathBuf>,
+    /// The window size in points; `None` is the default size.
+    pub size: Option<(u16, u16)>,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -99,6 +113,42 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                 });
             }
             "--reduce-motion" => options.reduce_motion = true,
+            "--screen" => {
+                let name: String = args
+                    .next()
+                    .ok_or_else(|| "`--screen` needs a name".to_owned())?;
+                options.screen = Some(
+                    Screen::ALL
+                        .into_iter()
+                        .find(|screen| screen.title().eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| format!("unknown screen `{name}`"))?,
+                );
+            }
+            "--size" => {
+                let text: String = args
+                    .next()
+                    .ok_or_else(|| "`--size` needs a value such as 1120x720".to_owned())?;
+                let parsed: Option<(u16, u16)> = text
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)));
+                options.size = Some(
+                    parsed
+                        .filter(|(w, h)| f32::from(*w) >= MIN_SIZE.0 && f32::from(*h) >= MIN_SIZE.1)
+                        .ok_or_else(|| {
+                            format!("`--size` needs WxH of 720x480 or more, not `{text}`")
+                        })?,
+                );
+            }
+            "--scan" => {
+                let path: PathBuf = args
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "`--scan` needs a directory".to_owned())?;
+                if !path.is_absolute() {
+                    return Err("`--scan` needs an absolute path".to_owned());
+                }
+                options.scan = Some(path);
+            }
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -133,7 +183,7 @@ pub fn open_main_window(
             Some(forced) => apply::install_fixed(forced.window_appearance(), cx),
             None => apply::install(window, cx),
         }
-        let model = cx.new(|cx| AppModel::new(source, cx));
+        let model: Entity<AppModel> = cx.new(|cx| AppModel::new(source, cx));
         cx.new(|cx| MainWindow::new(model, window, cx))
     })
 }
@@ -173,11 +223,24 @@ pub fn run() -> ExitCode {
             })
             .detach();
 
-            let bounds = Bounds::centered(None, size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx);
-            if let Err(error) = open_main_window(bounds, source, options.appearance, cx) {
-                tracing::error!(%error, "cannot open the main window");
-                cx.quit();
-                return;
+            let (width, height): (f32, f32) = options
+                .size
+                .map_or(DEFAULT_SIZE, |(w, h)| (f32::from(w), f32::from(h)));
+            let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+            let view = match open_main_window(bounds, source, options.appearance, cx) {
+                Ok((_, view)) => view,
+                Err(error) => {
+                    tracing::error!(%error, "cannot open the main window");
+                    cx.quit();
+                    return;
+                }
+            };
+            if let Some(screen) = options.screen {
+                view.update(cx, |view, cx| view.select(screen, cx));
+            }
+            if let Some(root) = &options.scan {
+                let model: Entity<AppModel> = view.read(cx).model().clone();
+                model.update(cx, |model, cx| model.start_scan(root, cx));
             }
             // A window that is not in front gets no frame, so its values stay
             // at the first paint.
@@ -207,6 +270,12 @@ mod tests {
             "--appearance",
             "light",
             "--reduce-motion",
+            "--screen",
+            "storage",
+            "--scan",
+            "/tmp/a",
+            "--size",
+            "1200x900",
             "--help",
         ]);
         assert_eq!(
@@ -215,6 +284,9 @@ mod tests {
                 fixture: Some(FixtureScenario::Pressure),
                 appearance: Some(ForcedAppearance::Light),
                 reduce_motion: true,
+                screen: Some(Screen::Storage),
+                scan: Some(PathBuf::from("/tmp/a")),
+                size: Some((1200, 900)),
                 help: true,
             })
         );
@@ -228,5 +300,10 @@ mod tests {
         assert!(parse(&["--appearance", "blue"]).is_err());
         assert!(parse(&["--appearance"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+        assert!(parse(&["--screen", "nowhere"]).is_err());
+        assert!(parse(&["--scan", "relative/path"]).is_err());
+        assert!(parse(&["--scan"]).is_err());
+        assert!(parse(&["--size", "100x100"]).is_err());
+        assert!(parse(&["--size", "wide"]).is_err());
     }
 }

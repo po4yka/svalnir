@@ -93,8 +93,8 @@ pub struct LedSegment {
     pub fill: f32,
     /// The direction of the fill.
     pub axis: FillAxis,
-    /// The top rows that are forced dim, for a label.
-    pub label_rows: u16,
+    /// The cells under the label text block, forced dim.
+    pub label_rect: Option<CellRect>,
     /// Whether the segment is de-emphasized: dim cells, half outline, no glow.
     pub dimmed: bool,
 }
@@ -109,7 +109,7 @@ impl LedSegment {
             seed,
             fill: 1.0,
             axis: FillAxis::Horizontal,
-            label_rows: 0,
+            label_rect: None,
             dimmed: false,
         }
     }
@@ -367,7 +367,7 @@ pub fn paint_led_field(
                 if !owned[usize::from(y) * columns + usize::from(x)] {
                     continue;
                 }
-                let in_label: bool = y - r.y < segment.label_rows;
+                let in_label: bool = segment.label_rect.is_some_and(|b| b.contains(x, y));
                 let tone: CellTone = if segment.dimmed || in_label {
                     CellTone::Dim
                 } else {
@@ -422,6 +422,39 @@ pub fn paint_led_field(
             BorderStyle::Dashed,
         ));
     }
+}
+
+/// Pixel offset of the label text from the left of its tile.
+const LABEL_LEFT_PX: f32 = 10.0;
+/// Pixel offset of the label text from the top of its tile.
+const LABEL_TOP_PX: f32 = 8.0;
+/// Estimated height of the two text lines.
+const LABEL_HEIGHT_PX: f32 = 36.0;
+/// Estimated width of one label character.
+const LABEL_CHAR_PX: f32 = 7.5;
+
+/// The cells under a label text block of two lines at the top left of `rect`,
+/// with one cell of padding, clipped to `rect`. Cell coordinates are absolute.
+#[must_use]
+pub fn label_block(rect: CellRect, name: &str, size: &str, pitch: f32) -> CellRect {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a label is far shorter than 2^24"
+    )]
+    let chars: f32 = name.chars().count().max(size.chars().count()) as f32;
+    let max_w: f32 = (f32::from(rect.w) * pitch - 20.0).max(0.0);
+    let text_w: f32 = (chars * LABEL_CHAR_PX).min(max_w);
+    let cells = |px: f32| -> u16 { to_cells((px / pitch).ceil()) };
+    let x0: u16 = to_cells((LABEL_LEFT_PX / pitch).floor()).saturating_sub(1);
+    let y0: u16 = to_cells((LABEL_TOP_PX / pitch).floor()).saturating_sub(1);
+    let x1: u16 = (cells(LABEL_LEFT_PX + text_w) + 1).min(rect.w);
+    let y1: u16 = (cells(LABEL_TOP_PX + LABEL_HEIGHT_PX) + 1).min(rect.h);
+    CellRect::new(
+        rect.x + x0,
+        rect.y + y0,
+        x1.saturating_sub(x0),
+        y1.saturating_sub(y0),
+    )
 }
 
 /// Where a label sits.
@@ -611,6 +644,25 @@ impl RenderOnce for LedChart {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_label_block_covers_the_text_and_one_cell_of_padding_only() {
+        let tile = CellRect::new(10, 4, 40, 20);
+        let block = label_block(tile, "Pictures", "12.3 GB", 6.0);
+        // 8 characters at 7.5 px, plus the 10 px offset: 70 px, 12 cells, +1.
+        assert_eq!((block.x, block.y), (10, 4));
+        assert_eq!(block.w, 13);
+        assert_eq!(block.h, 9);
+        assert!(block.w < tile.w && block.h < tile.h);
+        // A narrow tile clips the block to the tile.
+        let narrow = label_block(
+            CellRect::new(0, 0, 16, 9),
+            "A very long folder name",
+            "1 GB",
+            6.0,
+        );
+        assert!(narrow.w <= 16 && narrow.h <= 9);
+    }
 
     #[test]
     fn the_tone_is_stable() {

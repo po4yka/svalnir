@@ -9,7 +9,10 @@ use crate::{
         },
         store::AppModel,
     },
-    theme::tokens::{self, Tokens, to_hsla},
+    theme::{
+        motion,
+        tokens::{self, Tokens, to_hsla},
+    },
     ui::{
         data_state::{format_age, format_bytes, used_capacity},
         entry::card_entry,
@@ -37,7 +40,10 @@ use gpui_kit::{
     prelude::*,
     px,
 };
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
 
 const MIN_CARD_WIDTH: f32 = 320.0;
 /// The sidebar width at full size and collapsed, and the content padding.
@@ -76,13 +82,13 @@ pub fn agent_summary(state: &AgentState, now: SystemTime) -> (&'static str, Tone
         AgentState::Reporting { since } => (
             "Reporting",
             Tone::Brand,
-            format!("The agent wrote its status {} ago.", age(*since)),
+            format!("The agent wrote its status {}.", age(*since)),
         ),
         AgentState::Silent { last } => (
             "Not reporting",
             Tone::Warning,
             format!(
-                "The last status of the agent is {} old. It is not known whether an agent runs.",
+                "The agent wrote its last status {}. It is not known whether an agent runs.",
                 age(*last)
             ),
         ),
@@ -122,6 +128,9 @@ pub struct OverviewScreen {
     roll_disk: Entity<RollingNumber>,
     roll_swap: Entity<RollingNumber>,
     activation: u64,
+    phase: f32,
+    last_render: Instant,
+    twinkle: Option<gpui_kit::Task<()>>,
 }
 
 impl OverviewScreen {
@@ -133,7 +142,37 @@ impl OverviewScreen {
             roll_disk: RollingNumber::new("disk-value-roll", cx),
             roll_swap: RollingNumber::new("swap-value-roll", cx),
             activation: 1,
+            phase: 0.0,
+            last_render: Instant::now(),
+            twinkle: None,
         }
+    }
+
+    /// Runs the twinkle timer at about 12 Hz while the screen renders; the
+    /// timer ends when the screen stops rendering.
+    fn start_twinkle(&mut self, cx: &mut Context<Self>) {
+        if self.twinkle.is_some() {
+            return;
+        }
+        self.twinkle = Some(cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| {
+            loop {
+                cx.background_executor().timer(motion::TWINKLE_TICK).await;
+                let alive: bool = this
+                    .update(cx, |screen, cx| {
+                        if screen.last_render.elapsed() > motion::TWINKLE_TICK * 6 {
+                            screen.twinkle = None;
+                            return false;
+                        }
+                        screen.phase = (screen.phase + motion::TWINKLE_TICK.as_secs_f32()) % 600.0;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Marks a new activation of the screen: the cards enter again.
@@ -232,6 +271,7 @@ fn hero_field(
 }
 
 fn hero_card(
+    phase: Option<f32>,
     view: &View,
     roll: &Entity<RollingNumber>,
     tokens: &Tokens,
@@ -286,7 +326,8 @@ fn hero_card(
                 let cells: u16 = (inner / 6.0).floor().clamp(20.0, 200.0) as u16;
                 cells
             };
-            let field: LedField = hero_field(&used, &host.disk_total, columns, tokens);
+            let mut field: LedField = hero_field(&used, &host.disk_total, columns, tokens);
+            field.phase = phase;
             let scale: Option<String> = match &host.disk_total {
                 Measured::Value(total) if *total > 0 => {
                     let (v, unit) = format_bytes(*total / u64::from(columns));
@@ -460,7 +501,17 @@ fn agent_card(agent: &Loadable<AgentSnapshot>, tokens: &Tokens) -> AnyElement {
             let stale: bool = matches!(agent, Loadable::Stale(_));
             v_flex()
                 .gap(px(8.0))
-                .child(caption("agent-sentence", sentence, tokens))
+                .child(inset_row(
+                    h_flex()
+                        .gap(px(10.0))
+                        .items_center()
+                        .child(guard_led(
+                            matches!(snapshot.state, AgentState::Reporting { .. }),
+                            tokens,
+                        ))
+                        .child(caption("agent-sentence", sentence, tokens)),
+                    tokens,
+                ))
                 .children(stale.then(|| {
                     caption(
                         "agent-stale",
@@ -586,6 +637,17 @@ fn policies_card(
     card(header, body)
 }
 
+/// A compact row: an inset block with the tint of `DESIGN.md` section 4.
+fn inset_row(content: impl IntoElement, tokens: &Tokens) -> AnyElement {
+    div()
+        .rounded(tokens::INSET_RADIUS)
+        .bg(to_hsla(tokens.inset_tint))
+        .px(px(12.0))
+        .py(px(10.0))
+        .child(content)
+        .into_any_element()
+}
+
 fn intervention_card(
     service: &Loadable<ServiceSnapshot>,
     mono: &SharedString,
@@ -604,21 +666,29 @@ fn intervention_card(
                         .duration_since(operation.admitted_at)
                         .unwrap_or_default(),
                 );
-                v_flex()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .id("operation-id")
-                            .font_family(mono.clone())
-                            .child(operation.operation_id.clone()),
-                    )
-                    .child(caption(
-                        "operation-trigger",
-                        format!("Trigger: {}", operation.trigger),
-                        tokens,
-                    ))
-                    .child(caption("operation-age", age, tokens))
-                    .into_any_element()
+                inset_row(
+                    v_flex()
+                        .gap(px(4.0))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("operation-id")
+                                        .font_family(mono.clone())
+                                        .text_size(px(12.0))
+                                        .child(operation.operation_id.clone()),
+                                )
+                                .child(caption("operation-age", age, tokens)),
+                        )
+                        .child(caption(
+                            "operation-trigger",
+                            format!("Trigger: {}", operation.trigger),
+                            tokens,
+                        )),
+                    tokens,
+                )
             } else {
                 let text: &str = if snapshot.journal_present {
                     "No operation is in the journal."
@@ -651,6 +721,20 @@ impl Render for OverviewScreen {
         let history: Vec<HostSample> = model.history.iter().cloned().collect();
         let agent: Loadable<AgentSnapshot> = model.agent.clone();
         let service: Loadable<ServiceSnapshot> = model.service.clone();
+        self.last_render = Instant::now();
+        let gate: motion::Gate = motion::Gate {
+            reduce_motion: cx.reduce_motion(),
+            window_active: window.is_window_active(),
+            pressure_normal: !matches!(&view, View::Data { host, .. }
+                if matches!(host.pressure, Measured::Value(p) if p != PressureLevel::Normal)),
+        };
+        let phase: Option<f32> = if gate.continuous() {
+            self.start_twinkle(cx);
+            Some(self.phase)
+        } else {
+            self.twinkle = None;
+            None
+        };
         let mono: SharedString = cx.theme().mono_font_family.clone();
 
         let viewport: f32 = window.viewport_size().width.into();
@@ -669,6 +753,7 @@ impl Render for OverviewScreen {
         let full_width: Pixels = px(content.max(MIN_CARD_WIDTH));
         let cards: Vec<AnyElement> = vec![
             hero_card(
+                phase,
                 &view,
                 &self.roll_disk,
                 tokens,

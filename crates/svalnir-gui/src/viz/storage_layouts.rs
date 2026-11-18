@@ -5,8 +5,8 @@ use crate::{
     viz::{
         alloc::allocate_cells,
         led::{
-            FillAxis, LABEL_MIN_COLUMNS, LABEL_MIN_ROWS, LABEL_ROWS, LabelPlace, LedField,
-            LedSegment, MAX_CELLS, TileLabel,
+            FillAxis, LABEL_MIN_COLUMNS, LABEL_MIN_ROWS, LabelPlace, LedField, LedSegment,
+            MAX_CELLS, TileLabel, label_block,
         },
         treemap::{CellRect, squarify},
     },
@@ -155,7 +155,7 @@ pub fn layout_field(
         }
         let big: bool = rect.w >= LABEL_MIN_COLUMNS && rect.h >= LABEL_MIN_ROWS;
         if layout == StorageLayout::Tiles && big {
-            segment.label_rows = LABEL_ROWS;
+            segment.label_rect = Some(label_block(*rect, &item.label, &size_text(item.bytes), 6.0));
         }
         segments.push(segment);
         if rect.is_empty() {
@@ -346,7 +346,7 @@ mod tests {
         let items = items(&[900_000, 90_000, 10]);
         let (field, labels) =
             layout_field(&items, total(&items), None, StorageLayout::Tiles, 100, 50);
-        assert_eq!(field.segments[0].label_rows, LABEL_ROWS);
+        assert!(field.segments[0].label_rect.is_some());
         assert!(labels[0].show_text);
         let tiny = labels
             .iter()

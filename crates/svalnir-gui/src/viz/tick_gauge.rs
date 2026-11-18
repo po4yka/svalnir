@@ -3,22 +3,21 @@
 use crate::{
     data::model::{Measured, PressureLevel},
     theme::tokens::{Tokens, to_hsla},
-    viz::{
-        alloc::{CellState, count_f32},
-        cells::{Cell, CellLayout, CellStrip},
-    },
+    viz::alloc::count_f32,
 };
 use gpui_kit::{
-    App, Hsla, IntoElement, ParentElement as _, Pixels, RenderOnce, SharedString, Styled as _,
-    Window,
-    component::{ActiveTheme as _, v_flex},
-    div, px,
+    App, BoxShadow, Hsla, IntoElement, ParentElement as _, Pixels, RenderOnce, Role, SharedString,
+    Styled as _, TestSupportExt as _, Window,
+    component::{ActiveTheme as _, h_flex, v_flex},
+    div, point,
+    prelude::*,
+    px,
 };
 
 /// The tick count of the pressure gauge.
-pub const PRESSURE_TICKS: usize = 40;
+pub const PRESSURE_TICKS: usize = 48;
 const TICK_WIDTH: f32 = 4.0;
-const TICK_HEIGHT: f32 = 24.0;
+const TICK_HEIGHT: f32 = 28.0;
 const TICK_GAP: f32 = 3.0;
 
 /// Which tone fills the ticks of a pressure level.
@@ -44,6 +43,18 @@ pub fn pressure_gauge(
         Measured::Value(PressureLevel::Critical) => Some((ticks, PressureTone::Negative)),
         Measured::Unavailable(_) => None,
     }
+}
+
+/// `color` mixed `amount` toward white.
+fn mix_white(color: Hsla, amount: f32) -> Hsla {
+    let c = color.to_rgb();
+    let blend = |a: f32| a + (1.0 - a) * amount;
+    Hsla::from(gpui_kit::Rgba {
+        r: blend(c.r),
+        g: blend(c.g),
+        b: blend(c.b),
+        a: color.a,
+    })
 }
 
 /// A line of ticks.
@@ -112,29 +123,38 @@ impl RenderOnce for TickGauge {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let muted: Hsla = to_hsla(tokens.muted_foreground);
-        let layout: CellLayout = CellLayout::Ticks {
-            width: px(TICK_WIDTH),
-            height: px(TICK_HEIGHT),
-            gap: px(TICK_GAP),
-        };
         let color: Hsla = self.tone.unwrap_or(muted);
         let filled: usize = if self.tone.is_some() {
             self.level.unwrap_or(0)
         } else {
             0
         };
-        let cells: Vec<Cell> = (0..self.ticks)
-            .map(|index| Cell {
-                state: if index < filled {
-                    CellState::Filled
-                } else {
-                    CellState::Empty
-                },
-                color,
-            })
-            .collect();
+        let empty: Hsla = to_hsla(tokens.border);
+        let mut ticks_row = h_flex().gap(px(TICK_GAP));
+        for index in 0..self.ticks {
+            let tick = div().w(px(TICK_WIDTH)).h(px(TICK_HEIGHT)).rounded(px(1.0));
+            ticks_row = ticks_row.child(if index >= filled {
+                tick.bg(empty)
+            } else if index + 1 == filled {
+                tick.bg(mix_white(color, 0.5)).shadow(vec![BoxShadow {
+                    color: color.opacity(0.6),
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(10.0),
+                    spread_radius: px(0.0),
+                    inset: false,
+                }])
+            } else {
+                tick.bg(color)
+            });
+        }
+        let strip = div()
+            .id(self.id)
+            .role(Role::Image)
+            .test_support()
+            .aria_label(self.label)
+            .child(ticks_row);
         let pitch: Pixels = px(TICK_WIDTH + TICK_GAP);
-        let (width, _): (Pixels, Pixels) = layout.size_for(self.ticks);
+        let width: Pixels = px((TICK_WIDTH + TICK_GAP) * count_f32(self.ticks) - TICK_GAP);
         let markers = self.thresholds.into_iter().map(|(index, text)| {
             div()
                 .absolute()
@@ -147,7 +167,7 @@ impl RenderOnce for TickGauge {
         });
         v_flex()
             .child(div().relative().w(width).h(px(28.0)).children(markers))
-            .child(CellStrip::new(cells, layout, self.id, self.label).radius(px(1.0)))
+            .child(strip)
     }
 }
 

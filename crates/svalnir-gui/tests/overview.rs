@@ -146,6 +146,17 @@ fn unavailable_hero_has_a_dash_and_the_track_counts_no_normal_sample(cx: &mut Te
 }
 
 #[gpui_kit::test]
+fn two_refreshes_give_two_warning_samples(cx: &mut TestAppContext) {
+    // The first refresh is the load when the window opens; cmd-r is the second.
+    let handle = open(FixtureScenario::Pressure, cx);
+    cx.update_window(handle, |_, window, cx| window.press("cmd-r", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let track = label(handle, "pressure-track", cx).expect("tick track");
+    assert!(track.contains("2 warning"), "{track}");
+}
+
+#[gpui_kit::test]
 fn the_tick_track_counts_a_sample_per_refresh(cx: &mut TestAppContext) {
     let handle = open(FixtureScenario::Pressure, cx);
     let first = label(handle, "pressure-track", cx).expect("tick track");

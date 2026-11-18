@@ -208,7 +208,15 @@ impl RenderOnce for ActionButton {
         } else {
             base = base.cursor_pointer();
             if let Some(handler) = handler {
-                base = base.on_click(move |event, window, cx| handler(event, window, cx));
+                let key_handler: ClickHandler = Rc::clone(&handler);
+                base = base
+                    .on_key_down(move |event, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            key_handler(&ClickEvent::default(), window, cx);
+                            cx.stop_propagation();
+                        }
+                    })
+                    .on_click(move |event, window, cx| handler(event, window, cx));
             }
         }
         base.children(self.icon.map(|icon| Icon::new(icon).size_4()))

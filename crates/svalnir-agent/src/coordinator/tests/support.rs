@@ -1361,6 +1361,7 @@ impl Bench {
             batch_targets: 2,
             poll_interval: Nanoseconds::new(SECOND),
             volatile_capacity: 8,
+            role: crate::journal::CoordinatorRole::Client,
         }
     }
 

@@ -146,7 +146,7 @@ mod agent {
     use std::time::Duration;
 
     use svalnir_agent::coordinator::CoordinatorConfig;
-    use svalnir_agent::journal::JournalOptions;
+    use svalnir_agent::journal::{CoordinatorRole, JournalOptions};
     use svalnir_agent::platform::memory::{PressureEvent, PressureSubscription};
     use svalnir_agent::platform::run_loop::run_main_run_loop_until_stop;
     use svalnir_agent::runtime::host::{SystemParts, system_parts};
@@ -267,6 +267,7 @@ mod agent {
                 batch_targets: 8,
                 poll_interval: Nanoseconds::new(500_000_000),
                 volatile_capacity: 16,
+                role: CoordinatorRole::Agent,
             },
             journal: JournalOptions::default(),
             status_interval: Nanoseconds::new(30_000_000_000),
@@ -392,11 +393,25 @@ mod agent {
             driver_parts,
         ) {
             Ok(DriverStart::Running(driver)) => driver,
-            Ok(DriverStart::Busy) => {
-                // A different coordinator has the lock. This is not a
-                // failure: `launchd` does not start the agent again.
-                tracing::info!("a different coordinator runs; this process changed nothing");
+            Ok(DriverStart::Busy {
+                holder: CoordinatorRole::Agent,
+            }) => {
+                // An agent has the lock. This is not a failure: `launchd`
+                // does not start a second agent again.
+                tracing::info!("an agent runs already; this process changed nothing");
                 return ExitCode::SUCCESS;
+            }
+            Ok(DriverStart::Busy {
+                holder: CoordinatorRole::Client,
+            }) => {
+                // A client executes a request and releases the lock after
+                // it, or the kind of the holder is not known. The failure
+                // status makes `launchd` start the agent again after its
+                // throttle interval, so the guards do not stay stopped.
+                tracing::warn!(
+                    "a client holds the coordinator lock; this process changed nothing and ends with a failure so that it is started again"
+                );
+                return ExitCode::FAILURE;
             }
             Err(error) => {
                 // The text of a journal error can have a path.

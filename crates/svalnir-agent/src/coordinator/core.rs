@@ -36,8 +36,8 @@ use super::ports::{
 use crate::executor::fs::ApprovedRoots;
 use crate::executor::process::{NextStep, Observation as ExitObservation};
 use crate::journal::{
-    ClaimedRequest, CoordinationStart, CoordinatorLock, CoordinatorLockError, RequestBody,
-    RequestCompletion, VolatileRecord,
+    ClaimedRequest, CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRole,
+    RequestBody, RequestCompletion, VolatileRecord,
 };
 
 /// The largest number of admitted operations that wait for the active
@@ -70,6 +70,9 @@ pub struct CoordinatorConfig {
     /// The capacity of the volatile record of the critical-memory
     /// exception, in steps.
     pub volatile_capacity: usize,
+    /// The kind of this process, for a process that finds the
+    /// coordinator lock held.
+    pub role: CoordinatorRole,
 }
 
 /// The collaborators of a coordinator.
@@ -106,6 +109,11 @@ pub enum Start<J: CoordinatorJournal> {
         journal: J,
         /// The collaborators, which the coordinator did not take.
         dependencies: Box<Dependencies>,
+        /// The kind of the process that holds the lock, from the lock
+        /// file. [`CoordinatorRole::Client`] when the role cannot be
+        /// read: a client holder releases the lock after its request, so
+        /// an agent that gets this value tries again.
+        holder: CoordinatorRole,
     },
 }
 
@@ -387,12 +395,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         config: CoordinatorConfig,
         dependencies: Dependencies,
     ) -> Result<Start<J>, StartError> {
-        let lock: CoordinatorLock = match CoordinatorLock::try_acquire(database) {
+        let lock: CoordinatorLock = match CoordinatorLock::try_acquire(database, config.role) {
             Ok(lock) => lock,
             Err(CoordinatorLockError::Held) => {
                 return Ok(Start::Busy {
                     journal,
                     dependencies: Box::new(dependencies),
+                    holder: CoordinatorLock::holder_role(database),
                 });
             }
             Err(error) => return Err(error.into()),

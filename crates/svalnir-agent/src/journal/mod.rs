@@ -162,8 +162,8 @@ use svalnir_core::action::Operation;
 use svalnir_core::quantity::Bytes;
 
 pub use self::coordination::{
-    CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRecord,
-    coordinator_lock_path,
+    CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRecord, CoordinatorRole,
+    LockState, coordinator_lock_path,
 };
 pub use self::error::{AdmissionStop, OperationJournalError, SequenceViolation};
 pub use self::migration::JOURNAL_VERSION;

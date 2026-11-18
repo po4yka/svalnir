@@ -8,9 +8,10 @@ use svalnir_core::action::{
 use svalnir_core::id::RequestId;
 
 use super::super::{
-    ClaimedRequest, CoordinatorLock, CoordinatorLockError, Enqueued, MAX_OPEN_REQUESTS,
-    OperationJournal, OperationJournalError, QueuedRequest, REQUEST_NOT_DECODABLE, RequestBody,
-    RequestCompletion, RequestStatus, SequenceViolation, coordinator_lock_path,
+    ClaimedRequest, CoordinatorLock, CoordinatorLockError, CoordinatorRole, Enqueued, LockState,
+    MAX_OPEN_REQUESTS, OperationJournal, OperationJournalError, QueuedRequest,
+    REQUEST_NOT_DECODABLE, RequestBody, RequestCompletion, RequestStatus, SequenceViolation,
+    coordinator_lock_path,
 };
 use super::{
     Fixture, admit, approval, dispatch, envelope, epoch, failure, file_plan, new_operation,
@@ -39,10 +40,56 @@ fn is_sequence(error: &OperationJournalError, expected: &SequenceViolation) -> b
 // The lock.
 
 #[test]
+fn a_reading_of_the_lock_takes_no_lock_and_gives_the_role_of_the_holder() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    // No coordinator ran: the reading makes no lock file.
+    assert_eq!(CoordinatorLock::probe(&path).unwrap(), LockState::Free);
+    assert!(!coordinator_lock_path(&path).exists());
+
+    let agent = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            CoordinatorLock::probe(&path).unwrap(),
+            LockState::Held(CoordinatorRole::Agent)
+        );
+    }
+    assert_eq!(CoordinatorLock::holder_role(&path), CoordinatorRole::Agent);
+    drop(agent);
+    // The reading took no lock: a coordinator takes it at once after
+    // each reading, and the role of the earlier holder is gone.
+    assert_eq!(CoordinatorLock::probe(&path).unwrap(), LockState::Free);
+    assert_eq!(CoordinatorLock::holder_role(&path), CoordinatorRole::Client);
+    let client = CoordinatorLock::try_acquire(&path, CoordinatorRole::Client).unwrap();
+    assert_eq!(
+        CoordinatorLock::probe(&path).unwrap(),
+        LockState::Held(CoordinatorRole::Client)
+    );
+    drop(client);
+}
+
+#[test]
+fn a_lock_file_with_a_text_that_is_not_the_agent_role_is_read_as_a_client() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent).unwrap();
+    // A holder of an earlier build, or a damaged file.
+    for text in ["", "agent\n", "agents", "AGENT", "client"] {
+        std::fs::write(coordinator_lock_path(&path), text).unwrap();
+        assert_eq!(
+            CoordinatorLock::probe(&path).unwrap(),
+            LockState::Held(CoordinatorRole::Client),
+            "{text:?}"
+        );
+    }
+    drop(lock);
+}
+
+#[test]
 fn a_second_coordinator_cannot_take_the_lock_while_the_first_holds_it() {
     let fixture = Fixture::new();
     let path = fixture.path();
-    let first = CoordinatorLock::try_acquire(&path).unwrap();
+    let first = CoordinatorLock::try_acquire(&path, CoordinatorRole::Client).unwrap();
     let directory = std::fs::canonicalize(fixture.directory.path()).unwrap();
     assert_eq!(first.database(), directory.join("operations.sqlite"));
     assert!(coordinator_lock_path(&path).exists());
@@ -55,24 +102,24 @@ fn a_second_coordinator_cannot_take_the_lock_while_the_first_holds_it() {
     // Two open files of the lock, as two processes have.
     for _ in 0..2 {
         assert!(matches!(
-            CoordinatorLock::try_acquire(&path),
+            CoordinatorLock::try_acquire(&path, CoordinatorRole::Client),
             Err(CoordinatorLockError::Held)
         ));
     }
     // The holder goes away, as on a stop of its process. The lock is free,
     // and the lock file stays.
     drop(first);
-    let second = CoordinatorLock::try_acquire(&path).unwrap();
+    let second = CoordinatorLock::try_acquire(&path, CoordinatorRole::Client).unwrap();
     assert!(matches!(
-        CoordinatorLock::try_acquire(&path),
+        CoordinatorLock::try_acquire(&path, CoordinatorRole::Client),
         Err(CoordinatorLockError::Held)
     ));
     drop(second);
 
     // The lock of a different database is not the lock of this one.
     let other = Fixture::new();
-    let _other_lock = CoordinatorLock::try_acquire(&other.path()).unwrap();
-    let _lock = CoordinatorLock::try_acquire(&path).unwrap();
+    let _other_lock = CoordinatorLock::try_acquire(&other.path(), CoordinatorRole::Client).unwrap();
+    let _lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Client).unwrap();
 }
 
 #[cfg(unix)]
@@ -83,7 +130,7 @@ fn a_lock_path_that_is_a_symbolic_link_is_refused() {
     std::fs::write(&target, b"").unwrap();
     std::os::unix::fs::symlink(&target, coordinator_lock_path(&fixture.path())).unwrap();
     assert!(matches!(
-        CoordinatorLock::try_acquire(&fixture.path()),
+        CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client),
         Err(CoordinatorLockError::Io(_))
     ));
 }
@@ -93,7 +140,7 @@ fn a_clean_stop_needs_no_reconciliation() {
     let fixture = Fixture::new();
     let mut journal = fixture.open();
     assert_eq!(journal.coordination().unwrap(), None);
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     let start = journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
         .unwrap();
@@ -112,7 +159,7 @@ fn a_clean_stop_needs_no_reconciliation() {
     ));
     // The lock of a different journal registers no coordinator here.
     let other = Fixture::new();
-    let other_lock = CoordinatorLock::try_acquire(&other.path()).unwrap();
+    let other_lock = CoordinatorLock::try_acquire(&other.path(), CoordinatorRole::Client).unwrap();
     assert!(matches!(
         journal.begin_coordination(&other_lock, &epoch("epoch_2"), wall(1)),
         Err(OperationJournalError::LockMismatch)
@@ -139,7 +186,7 @@ fn a_clean_stop_needs_no_reconciliation() {
     drop((journal, lock));
 
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     let start = journal
         .begin_coordination(&lock, &epoch("epoch_2"), wall(2))
         .unwrap();
@@ -187,9 +234,9 @@ fn the_first_registration_finds_work_that_was_written_with_no_coordinator() {
     let mut journal = fixture.open();
     // A different spelling of the database path gives the same lock.
     let spelled = fixture.directory.path().join(".").join("operations.sqlite");
-    let lock = CoordinatorLock::try_acquire(&spelled).unwrap();
+    let lock = CoordinatorLock::try_acquire(&spelled, CoordinatorRole::Client).unwrap();
     assert!(matches!(
-        CoordinatorLock::try_acquire(&fixture.path()),
+        CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client),
         Err(CoordinatorLockError::Held)
     ));
     let start = journal
@@ -207,7 +254,7 @@ fn the_first_registration_finds_work_that_was_written_with_no_coordinator() {
 fn an_unclean_stop_needs_reconciliation_before_new_admission_and_dispatch() {
     let fixture = Fixture::new();
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
         .unwrap();
@@ -233,7 +280,7 @@ fn an_unclean_stop_needs_reconciliation_before_new_admission_and_dispatch() {
     // lock; the registration stays.
     drop((journal, lock));
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     let start = journal
         .begin_coordination(&lock, &epoch("epoch_2"), wall(5))
         .unwrap();
@@ -289,7 +336,7 @@ fn an_unclean_stop_needs_reconciliation_before_new_admission_and_dispatch() {
     journal.end_coordination(&epoch("epoch_2")).unwrap();
     drop((journal, lock));
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     let start = journal
         .begin_coordination(&lock, &epoch("epoch_3"), wall(9))
         .unwrap();
@@ -374,7 +421,7 @@ fn a_request_is_enqueued_one_time_and_claimed_by_one_claimer() {
     let mut agent = fixture.open();
     let error = agent.claim_next_request(&epoch("epoch_1")).unwrap_err();
     assert!(is_sequence(&error, &SequenceViolation::ExecutorEpoch));
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     agent
         .begin_coordination(&lock, &epoch("epoch_1"), wall(2))
         .unwrap();
@@ -461,7 +508,7 @@ fn a_request_is_enqueued_one_time_and_claimed_by_one_claimer() {
 fn a_request_that_a_stopped_coordinator_claimed_is_delivered_again() {
     let fixture = Fixture::new();
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
         .unwrap();
@@ -491,7 +538,7 @@ fn a_request_that_a_stopped_coordinator_claimed_is_delivered_again() {
     // The coordinator stops with the first request claimed.
     drop((journal, lock));
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     let start = journal
         .begin_coordination(&lock, &epoch("epoch_2"), wall(5))
         .unwrap();
@@ -555,7 +602,7 @@ fn the_queue_has_a_bounded_number_of_open_requests() {
     );
 
     // A completed request makes a place. A claimed request does not.
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
         .unwrap();
@@ -605,7 +652,7 @@ fn a_prune_keeps_a_plan_that_an_open_request_names() {
 fn a_clean_stop_with_each_operation_settled_needs_no_reconciliation() {
     let fixture = Fixture::new();
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
         .unwrap();
@@ -626,7 +673,7 @@ fn a_clean_stop_with_each_operation_settled_needs_no_reconciliation() {
 fn a_request_that_cannot_be_decoded_is_rejected_and_the_next_one_is_claimed() {
     let fixture = Fixture::new();
     let mut journal = fixture.open();
-    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
     journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
         .unwrap();

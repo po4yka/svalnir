@@ -152,6 +152,7 @@ fn coordinator_config() -> Result<CoordinatorConfig, ErrorBody> {
         batch_targets: 8,
         poll_interval: Nanoseconds::new(250_000_000),
         volatile_capacity: 16,
+        role: svalnir_agent::journal::CoordinatorRole::Client,
     })
 }
 
@@ -302,6 +303,7 @@ fn start_coordinator(
             Start::Busy {
                 journal,
                 dependencies,
+                holder: _,
             } => {
                 std::thread::sleep(LOCK_RETRY_INTERVAL);
                 start = Coordinator::start(

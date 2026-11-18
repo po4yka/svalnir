@@ -64,6 +64,51 @@ pub enum CoordinatorLockError {
     Io(#[source] std::io::Error),
 }
 
+/// The kind of process that holds the coordinator lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoordinatorRole {
+    /// The persistent agent.
+    Agent,
+    /// A client that executes a request as a transient coordinator.
+    Client,
+}
+
+impl CoordinatorRole {
+    /// The text of the role in the lock file.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Client => "client",
+        }
+    }
+
+    /// The role of the lock file content `text`. Each content that is not
+    /// exactly the text of the agent role is the client role: a second
+    /// agent then ends with a failure and is started again, and does not
+    /// stay stopped while no agent runs.
+    fn of_lock_content(text: &[u8]) -> Self {
+        if text == Self::Agent.as_str().as_bytes() {
+            Self::Agent
+        } else {
+            Self::Client
+        }
+    }
+}
+
+/// What a reading of the coordinator lock shows. The reading takes no
+/// lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    /// No process holds the lock, or the lock file does not exist.
+    Free,
+    /// A process holds the lock. The role is the content of the lock
+    /// file; see [`CoordinatorLock::holder_role`] for its limits.
+    Held(CoordinatorRole),
+}
+
+/// The largest number of bytes of the lock file that a reader takes.
+const MAX_ROLE_BYTES: u64 = 16;
+
 /// The exclusive lock of the one coordinator of a journal.
 ///
 /// The lock is held while this value exists. The operating system releases
@@ -72,11 +117,37 @@ pub enum CoordinatorLockError {
 /// The lock is advisory: it stops a second coordinator, and it does not
 /// stop a write to the database. A filesystem that does not support
 /// `flock` (some network volumes) gives [`CoordinatorLockError::Io`].
+///
+/// The content of the lock file is the role of the holder, as text. The
+/// holder writes it immediately after it takes the lock and removes it
+/// when the value is dropped. The content is a hint for a process that
+/// found the lock held; it is not evidence that a process runs.
 #[derive(Debug)]
 pub struct CoordinatorLock {
-    // The lock belongs to this open file. It is not read or written.
-    _file: File,
+    // The lock belongs to this open file.
+    file: File,
     database: PathBuf,
+}
+
+impl Drop for CoordinatorLock {
+    fn drop(&mut self) {
+        // The role of a holder that stopped is not the role of the next
+        // one. A failure leaves the old text, which the next holder
+        // replaces.
+        let _cleared: std::io::Result<()> = self.file.set_len(0);
+    }
+}
+
+fn lock_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A symbolic link at the path is refused.
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
 }
 
 impl CoordinatorLock {
@@ -89,30 +160,114 @@ impl CoordinatorLock {
     /// in this process or in a different one, holds the lock, and
     /// [`CoordinatorLockError::Io`] when the file cannot be opened or
     /// locked, which includes a lock path that is a symbolic link.
-    pub fn try_acquire(database: &Path) -> Result<Self, CoordinatorLockError> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+    pub fn try_acquire(
+        database: &Path,
+        role: CoordinatorRole,
+    ) -> Result<Self, CoordinatorLockError> {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let mut options = lock_file_options();
+        options.write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // The file has no content. Only the owner opens it, and a
-            // symbolic link at the path is refused.
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            // Only the owner opens the file.
+            options.mode(0o600);
         }
         // One resolution of the path: the recorded database path is the
         // one whose lock file is locked.
         let database: PathBuf = canonical_path(database);
-        let file: File = options
+        let mut file: File = options
             .open(coordinator_lock_path(&database))
             .map_err(CoordinatorLockError::Io)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self {
-                _file: file,
-                database,
-            }),
-            Err(TryLockError::WouldBlock) => Err(CoordinatorLockError::Held),
-            Err(TryLockError::Error(error)) => Err(CoordinatorLockError::Io(error)),
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(CoordinatorLockError::Held),
+            Err(TryLockError::Error(error)) => return Err(CoordinatorLockError::Io(error)),
         }
+        // The role is written under the lock. A holder with no role text
+        // is read as a client, so a failure here is an error of the lock:
+        // an agent must not be read as a client for its lifetime.
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)))
+            .and_then(|_| file.write_all(role.as_str().as_bytes()))
+            .map_err(CoordinatorLockError::Io)?;
+        Ok(Self { file, database })
+    }
+
+    /// Reads the role text of the lock file of the journal at `database`,
+    /// for a caller that found the lock held.
+    ///
+    /// The text is that of the last process that took the lock and did
+    /// not drop it in the ordinary way. In the instant between the lock
+    /// and the write of a new holder, and after a holder that could not
+    /// clear its text, the text is that of an earlier holder. A text that
+    /// cannot be read, and each text that is not the agent role, is
+    /// [`CoordinatorRole::Client`].
+    pub fn holder_role(database: &Path) -> CoordinatorRole {
+        use std::io::Read as _;
+
+        let path: PathBuf = coordinator_lock_path(&canonical_path(database));
+        let mut text: Vec<u8> = Vec::new();
+        let read: std::io::Result<usize> = lock_file_options()
+            .open(path)
+            .and_then(|file| file.take(MAX_ROLE_BYTES).read_to_end(&mut text));
+        match read {
+            Ok(_) => CoordinatorRole::of_lock_content(&text),
+            Err(_) => CoordinatorRole::Client,
+        }
+    }
+
+    /// Reads whether a process holds the coordinator lock of the journal
+    /// at `database`. The call takes no lock, makes no file, and does not
+    /// wait, so a coordinator that starts at the same time is not refused
+    /// by this reading.
+    ///
+    /// The reading uses `fcntl(F_GETLK)`. On macOS an `flock` lock and an
+    /// `fcntl` lock of one file are in one list of the kernel, so the
+    /// query reports the `flock` lock of a coordinator. A system where
+    /// the two kinds are separate reports [`LockState::Free`] for a held
+    /// lock; a caller that then tries to take the lock gets
+    /// [`CoordinatorLockError::Held`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorLockError::Io`] when the lock file exists and
+    /// cannot be opened or queried, which includes a lock path that is a
+    /// symbolic link.
+    pub fn probe(database: &Path) -> Result<LockState, CoordinatorLockError> {
+        use std::os::fd::AsRawFd as _;
+
+        let path: PathBuf = coordinator_lock_path(&canonical_path(database));
+        let file: File = match lock_file_options().open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LockState::Free);
+            }
+            Err(error) => return Err(CoordinatorLockError::Io(error)),
+        };
+        // The query for a write lock on the full file: each lock of a
+        // different owner conflicts with it.
+        let mut query = libc::flock {
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+            l_type: libc::F_WRLCK,
+            // `SEEK_SET`: the range starts at the start of the file.
+            l_whence: 0,
+        };
+        // SAFETY: `file` is an open descriptor for the duration of the
+        // call, and `query` is a valid, initialized `flock` structure that
+        // the kernel reads and writes in place. `F_GETLK` changes no lock.
+        let status: libc::c_int =
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut query) };
+        if status == -1 {
+            return Err(CoordinatorLockError::Io(std::io::Error::last_os_error()));
+        }
+        if query.l_type == libc::F_UNLCK {
+            return Ok(LockState::Free);
+        }
+        Ok(LockState::Held(Self::holder_role(database)))
     }
 
     /// The database path that the lock was taken for, with each symbolic

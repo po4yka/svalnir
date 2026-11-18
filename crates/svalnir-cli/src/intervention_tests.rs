@@ -524,7 +524,9 @@ fn a_held_coordinator_lock_sends_the_request_to_the_queue() {
     let (world, tree, plan) = World::with_plan("permanent");
     let journal: PathBuf = world.path("state").join("operations.sqlite");
     // A holder of the lock that serves no request, in place of an agent.
-    let lock = CoordinatorLock::try_acquire(&journal).unwrap();
+    let lock =
+        CoordinatorLock::try_acquire(&journal, svalnir_agent::journal::CoordinatorRole::Agent)
+            .unwrap();
     let accepted = json(
         &world.environment,
         &[

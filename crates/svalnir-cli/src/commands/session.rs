@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use svalnir_agent::journal::{
-    AgentRecord, CoordinatorLock, CoordinatorLockError, JournalOptions, OperationJournal,
+    AgentRecord, CoordinatorLock, JournalOptions, LockState, OperationJournal,
     OperationJournalError,
 };
 use svalnir_core::action::{ActionError, ClientRole, Principal};
@@ -244,25 +244,14 @@ pub(crate) enum CoordinatorPresence {
 }
 
 /// Reads the coordinator lock of the journal at `journal_path`. The
-/// function takes the lock for an instant and releases it; it registers no
-/// coordinator. The journal file must exist.
+/// function takes no lock, makes no file, and registers no coordinator, so
+/// a coordinator that starts at the same time is not refused by the
+/// reading. With no lock file, no coordinator ran on this journal.
 pub(crate) fn coordinator_presence(journal_path: &Path) -> CoordinatorPresence {
-    // With no lock file, no coordinator ran on this journal. A query does
-    // not make the file.
-    let lock_path = svalnir_agent::journal::coordinator_lock_path(journal_path);
-    if matches!(
-        std::fs::symlink_metadata(&lock_path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    ) {
-        return CoordinatorPresence::NotRunning;
-    }
-    match CoordinatorLock::try_acquire(journal_path) {
-        Ok(lock) => {
-            drop(lock);
-            CoordinatorPresence::NotRunning
-        }
-        Err(CoordinatorLockError::Held) => CoordinatorPresence::Running,
-        Err(CoordinatorLockError::Io(_)) => CoordinatorPresence::Unknown,
+    match CoordinatorLock::probe(journal_path) {
+        Ok(LockState::Free) => CoordinatorPresence::NotRunning,
+        Ok(LockState::Held(_)) => CoordinatorPresence::Running,
+        Err(_) => CoordinatorPresence::Unknown,
     }
 }
 

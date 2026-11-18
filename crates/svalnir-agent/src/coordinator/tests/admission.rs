@@ -210,9 +210,15 @@ fn a_second_coordinator_is_told_to_enqueue_and_the_first_one_serves_the_request(
     let (mut bench, plan, file) = bench_with_plan();
     let mut first = bench.start();
     // The second process does not get the lock.
-    let Start::Busy { journal, .. } = bench.try_start() else {
+    let Start::Busy {
+        journal, holder, ..
+    } = bench.try_start()
+    else {
         panic!("two coordinators hold the lock");
     };
+    // The holder is a coordinator of the bench, which has the client
+    // role.
+    assert_eq!(holder, crate::journal::CoordinatorRole::Client);
     let mut client = journal.inner;
     let request = queued(
         "request_1",

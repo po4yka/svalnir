@@ -66,8 +66,8 @@ use crate::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, StepClock,
 };
 use crate::journal::{
-    AgentRecord, JournalOptions, OperationJournal, QueuedRequest, RequestBody, RequestCompletion,
-    RequestStatus,
+    AgentRecord, CoordinatorLock, CoordinatorRole, JournalOptions, OperationJournal, QueuedRequest,
+    RequestBody, RequestCompletion, RequestStatus,
 };
 use crate::platform::process::{DarwinProcessSource, ProcessSource, QueryFailure, generation_id};
 
@@ -514,6 +514,7 @@ impl Bench {
                 batch_targets: 2,
                 poll_interval: Nanoseconds::new(SECOND),
                 volatile_capacity: 8,
+                role: CoordinatorRole::Agent,
             },
             journal: JournalOptions {
                 full_fsync: false,
@@ -589,7 +590,7 @@ impl Bench {
     fn start(&mut self) -> Box<Driver> {
         match self.try_start() {
             DriverStart::Running(driver) => driver,
-            DriverStart::Busy => panic!("a different coordinator holds the lock"),
+            DriverStart::Busy { .. } => panic!("a different coordinator holds the lock"),
         }
     }
 
@@ -1134,8 +1135,31 @@ fn a_start_after_a_crash_reconciles_and_does_not_act_again() {
 fn a_second_agent_on_the_same_journal_is_busy_and_changes_nothing() {
     let mut bench = Bench::new(TestClock::fixed(), validated_registry());
     let driver = bench.start();
-    assert!(matches!(bench.try_start(), DriverStart::Busy));
+    assert!(matches!(
+        bench.try_start(),
+        DriverStart::Busy {
+            holder: CoordinatorRole::Agent
+        }
+    ));
     assert_eq!(bench.status().executor_epoch.as_str(), "epoch_1");
+    drop(driver);
+}
+
+#[test]
+fn an_agent_that_finds_the_lock_of_a_client_is_busy_with_a_client_holder() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    // A client holds the lock as a transient coordinator.
+    let client =
+        CoordinatorLock::try_acquire(&journal_path(&bench.state), CoordinatorRole::Client).unwrap();
+    assert!(matches!(
+        bench.try_start(),
+        DriverStart::Busy {
+            holder: CoordinatorRole::Client
+        }
+    ));
+    // The client releases the lock, and the agent then starts.
+    drop(client);
+    let driver = bench.start();
     drop(driver);
 }
 

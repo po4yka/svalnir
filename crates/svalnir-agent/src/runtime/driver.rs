@@ -40,7 +40,9 @@ use crate::coordinator::{
     TargetProbe, TimeReading,
 };
 use crate::executor::fs::ApprovedRoots;
-use crate::journal::{AgentRecord, JournalOptions, OperationJournal, OperationJournalError};
+use crate::journal::{
+    AgentRecord, CoordinatorRole, JournalOptions, OperationJournal, OperationJournalError,
+};
 use crate::store::{EncodedSample, RetentionPolicy, Store};
 
 /// The file name of the operation journal in the state directory.
@@ -150,9 +152,16 @@ pub enum DriverError {
 pub enum DriverStart {
     /// This process is the agent.
     Running(Box<Driver>),
-    /// A different coordinator holds the lock: an agent runs already, or
-    /// a client executes a request. This process changed nothing.
-    Busy,
+    /// A different coordinator holds the lock. This process changed
+    /// nothing.
+    Busy {
+        /// The kind of the holder. With [`CoordinatorRole::Agent`], an
+        /// agent runs already and this process is not necessary. With
+        /// [`CoordinatorRole::Client`], a client executes a request and
+        /// releases the lock after it, or the role is not known: the
+        /// agent must start again.
+        holder: CoordinatorRole,
+    },
 }
 
 /// What a tick did.
@@ -351,7 +360,7 @@ impl Driver {
         .map_err(DriverError::Coordinator)?
         {
             Start::Coordinating(coordinator) => coordinator,
-            Start::Busy { .. } => return Ok(DriverStart::Busy),
+            Start::Busy { holder, .. } => return Ok(DriverStart::Busy { holder }),
         };
 
         // Reconcile before anything else. A step does the pending

@@ -1122,6 +1122,9 @@ fn apply_rejection(eligibility: &mut CandidateEligibility, reasons: &BTreeSet<Sk
     for reason in reasons {
         match reason {
             SkipReason::ProtectedData => eligibility.no_exclusion_overlap = Fact::NotSatisfied,
+            SkipReason::UnsupportedLayout => {
+                eligibility.rule_supports_layout = Fact::NotSatisfied;
+            }
             SkipReason::SymbolicLink
             | SkipReason::UnsupportedObject
             | SkipReason::MountCrossing => {

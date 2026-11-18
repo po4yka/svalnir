@@ -78,6 +78,7 @@ pub use overlap::{
 pub use registry::{ClaimError, RegistryError, ReviewedRules, RuleStatus};
 #[cfg(unix)]
 pub use xcode::{
+    BUILD_CONFIGURATIONS, INDEX_CHILDREN, INTERMEDIATES_CHILDREN, PLATFORM_SUFFIXES,
     ProducerProcesses, SHARED_ROOT_ENTRIES, UNIT_PATHS, XCODE_DERIVED_DATA_LAYOUT,
     XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_PRODUCER_EXECUTABLES,
     XcodeDerivedDataRule, XcodeEvidence,

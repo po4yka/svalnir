@@ -277,7 +277,18 @@ The evidence that no producer process runs is a process inventory of the caller,
 
 The project that owns a unit comes from the `WorkspacePath` value of the `info.plist` file of its DerivedData directory. The user can write that file, so the value is attribution evidence of the same user and not a protected record: a same-user process that changes it can change which project the rule examines. It cannot move a unit out of the verified root, and it gives no access to the data of a different user.
 
-The children of a unit that the rule accepts are not decided. The rule preserves the names of the candidate paragraph where it recognizes them, and it has no reviewed list of the content that a unit of a supported layout can have: a configuration name below `Build/Products` is free text, and the content of the intermediates and of the index differs between producer versions. A unit with content of the user that the rule does not recognize would thus be removed whole. This is an open decision of the project owner, to be made with promotion evidence from a real producer installation; the layout stays `proposed` until then, so no eviction uses it.
+Each child of a unit must be on a fixed allow-list of the children that the build system makes. A unit with a child that the list does not accept is skipped whole with the reason `unsupported_layout`: no part of it is a candidate, and nothing in it is removed. The comparison is exact, so a name in another case or another spelling is not accepted. The list of this revision is:
+
+| Unit | Accepted children |
+| --- | --- |
+| `Build/Products` | A directory `CONFIGURATION` or `CONFIGURATION-PLATFORM`, where `CONFIGURATION` is `Debug` or `Release` and `-PLATFORM` is one of `-iphoneos`, `-iphonesimulator`, `-appletvos`, `-appletvsimulator`, `-watchos`, `-watchsimulator`, `-xros`, `-xrsimulator`, `-maccatalyst`, or `-driverkit` |
+| `Build/Intermediates.noindex` | A directory `NAME.build` with a name that is not empty; the directories `XCBuildData`, `PrecompiledHeaders`, `ExplicitPrecompiledModules`, and `SwiftExplicitPrecompiledModules`; a directory `GeneratedModuleMaps` or `GeneratedModuleMaps-PLATFORM` with a suffix of the first row |
+| `Index.noindex` | The directories `DataStore`, `Build`, and `PrecompiledHeaders` |
+| Each unit | The regular file `.DS_Store`, the view settings that Finder writes in a directory that a person opened |
+
+The deny-list of the candidate paragraph is a second check. It applies to each entry at each depth, also below an accepted child, and its reason is `protected_data`. The allow-list examines the children of a unit only, so a file that a person puts below an accepted child with a name that the deny-list does not have stays a residual risk of the revision.
+
+This list is a first list from the public knowledge of the Xcode build output. It is not verified. A configuration name is free text in a project, so a project with another configuration, or a producer version with another child, has units that the rule skips; that is the safe failure. Promotion evidence from real Xcode installations of each supported producer version must confirm the list, or change it in a new revision, before the layout leaves `proposed` (section 15).
 
 **Action and charge:** User-scope bounded eviction of the fixed eligible set, never a root override. Use conservative per-object `work_bytes` and entry limits; large indivisible outputs do not bypass batch limits.
 
@@ -372,6 +383,8 @@ Each promoted revision needs a review record containing its sources, supported p
 | Persistence | Full journal volume, intent/dispatch/result crashes, partial effects, safe reconciliation |
 | Outcomes | Trash versus eviction, open-file retention, no observed reclaim, rapid regrowth |
 | Privacy and presentation | Sensitive names, control characters, redacted exports, no content collection by default |
+
+A rule with a content allow-list, such as the children of a unit of `xcode.inactive-derived-data` (section 11), records in its promotion evidence the children that each supported producer version makes on real installations, and the list of the promoted revision agrees with that record. A list that was written without that record keeps the layout `proposed`.
 
 Use disposable fixtures and controlled writers on the supported macOS matrix. Do not validate rules by deleting real developer caches. Fixtures must exercise what can go wrong, not merely demonstrate that a directory disappears.
 

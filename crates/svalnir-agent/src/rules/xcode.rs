@@ -32,9 +32,23 @@
 //! never a unit. The module, symbol, and compilation caches at the root
 //! are shared between projects and are never a unit.
 //!
+//! Each child of a unit must be on a fixed allow-list of the children that
+//! the build system makes for that unit. Below `Build/Products`, that is a
+//! directory of a configuration of [`BUILD_CONFIGURATIONS`] with a suffix of
+//! [`PLATFORM_SUFFIXES`]; below `Build/Intermediates.noindex`, a directory
+//! of [`INTERMEDIATES_CHILDREN`], a directory `NAME.build`, or a directory
+//! `GeneratedModuleMaps` with a platform suffix; below `Index.noindex`, a
+//! directory of [`INDEX_CHILDREN`]. Each unit also accepts the Finder file
+//! `.DS_Store`. A unit with a child that the list does not
+//! accept is skipped as a whole with the reason `unsupported_layout`: no
+//! part of it is a candidate. The list is a first list from the public
+//! knowledge of the Xcode build output. Promotion evidence from real Xcode
+//! installations must confirm it before the layout leaves `proposed`.
+//!
 //! A unit with a debug-symbol bundle, an archive, archive intermediates,
 //! a test result bundle, signing material, or a database is skipped as a
-//! whole. The one database that the rule accepts is the build database
+//! whole. This deny-list applies at each depth, also below an accepted
+//! child. The one database that the rule accepts is the build database
 //! `XCBuildData/build.db` of the build system.
 //!
 //! # What the rule can and cannot establish
@@ -42,10 +56,12 @@
 //! The rule establishes the identity and the owner of a unit, that the
 //! project of `WorkspacePath` is present, the newest of the examined
 //! times, that no other process holds an advisory lock on a build
-//! database, and the complete charge. The caller gives the evidence of
+//! database, that each child of the unit has a name and a type of the
+//! allow-list, and the complete charge. The caller gives the evidence of
 //! the producer processes. The rule cannot see a writer that takes no
 //! lock, an open file of another process, a build in a directory that it
-//! did not examine, or a file that a person put in a unit.
+//! did not examine, or a file that a person put below an accepted child
+//! with a name that the deny-list does not have.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -93,6 +109,51 @@ pub const UNIT_PATHS: [&str; 3] = [
     "Build/Products",
     "Index.noindex",
 ];
+
+/// The configurations whose directories the rule accepts below
+/// `Build/Products`: the two configurations of a new Xcode project. A
+/// configuration name is free text in a project, so each other name is
+/// not known to be build output.
+pub const BUILD_CONFIGURATIONS: [&str; 2] = ["Debug", "Release"];
+
+/// The values of the build setting `EFFECTIVE_PLATFORM_NAME` that the rule
+/// accepts as the suffix of a configuration directory. A macOS build has
+/// no suffix.
+pub const PLATFORM_SUFFIXES: [&str; 11] = [
+    "",
+    "-iphoneos",
+    "-iphonesimulator",
+    "-appletvos",
+    "-appletvsimulator",
+    "-watchos",
+    "-watchsimulator",
+    "-xros",
+    "-xrsimulator",
+    "-maccatalyst",
+    "-driverkit",
+];
+
+/// The fixed directory names of `Build/Intermediates.noindex`. The rule also
+/// accepts a directory `NAME.build` (the intermediates of one project) and
+/// `GeneratedModuleMaps` with a suffix of [`PLATFORM_SUFFIXES`].
+pub const INTERMEDIATES_CHILDREN: [&str; 4] = [
+    "XCBuildData",
+    "PrecompiledHeaders",
+    "ExplicitPrecompiledModules",
+    "SwiftExplicitPrecompiledModules",
+];
+
+/// The directory names of `Index.noindex`: the index store, the build of
+/// the indexer, and its precompiled headers.
+pub const INDEX_CHILDREN: [&str; 3] = ["DataStore", "Build", "PrecompiledHeaders"];
+
+/// The one file that the rule accepts as a child of each unit: the view
+/// settings that Finder writes in a directory that a person opened. It has
+/// no content of the user.
+const FINDER_METADATA: &str = ".DS_Store";
+
+/// The prefix of the module map directories of `Build/Intermediates.noindex`.
+const GENERATED_MODULE_MAPS: &str = "GeneratedModuleMaps";
 
 /// The entries of a `DerivedData` root that more than one project uses. No
 /// one of them is a unit.
@@ -315,10 +376,46 @@ fn is_build_database(unit: &Path, relative: &Path) -> bool {
         })
 }
 
-/// The reason an entry below a unit prevents a candidate, from its name.
-/// A name is a rejection hint only: an entry with no such name is not
-/// shown to be disposable.
-fn classify_entry(unit: &Path, relative: &Path) -> Option<SkipReason> {
+/// Whether `name` is one of `prefixes` followed by a suffix of
+/// [`PLATFORM_SUFFIXES`].
+fn has_platform_form(name: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| PLATFORM_SUFFIXES.contains(&suffix))
+    })
+}
+
+/// Whether the allow-list of the unit `unit` accepts the child `name` of
+/// the type `kind`. The comparison is exact: another case or another
+/// spelling is not a name that the build system makes.
+fn is_known_child(unit: &Path, name: &str, kind: EntryKind) -> bool {
+    if name == FINDER_METADATA {
+        return kind == EntryKind::File;
+    }
+    if kind != EntryKind::Directory {
+        return false;
+    }
+    match unit.to_str() {
+        Some("Build/Products") => has_platform_form(name, &BUILD_CONFIGURATIONS),
+        Some("Build/Intermediates.noindex") => {
+            INTERMEDIATES_CHILDREN.contains(&name)
+                || has_platform_form(name, &[GENERATED_MODULE_MAPS])
+                || name
+                    .strip_suffix(".build")
+                    .is_some_and(|stem| !stem.is_empty())
+        }
+        Some("Index.noindex") => INDEX_CHILDREN.contains(&name),
+        _ => false,
+    }
+}
+
+/// The reason an entry below a unit prevents a candidate.
+///
+/// A child of the unit must be on the allow-list of [`is_known_child`]:
+/// another child gives `unsupported_layout`. Each entry, at each depth, is
+/// then compared with a deny-list of names. A name is a rejection hint
+/// only: an entry with no such name is not shown to be disposable.
+fn classify_entry(unit: &Path, relative: &Path, kind: EntryKind) -> Option<SkipReason> {
     const PRESERVED_SUFFIXES: [&str; 17] = [
         ".dsym",
         ".xcarchive",
@@ -361,7 +458,15 @@ fn classify_entry(unit: &Path, relative: &Path) -> Option<SkipReason> {
     let is_preserved: bool = has_suffix(&PRESERVED_SUFFIXES)
         || name == "archiveintermediates"
         || (has_suffix(&DATABASE_SUFFIXES) && !is_build_database(unit, relative));
-    is_preserved.then_some(SkipReason::ProtectedData)
+    if is_preserved {
+        return Some(SkipReason::ProtectedData);
+    }
+    // A child of the unit, which is a path of one component.
+    let is_child: bool = relative.parent() == Some(Path::new(""));
+    let is_known: bool = relative
+        .to_str()
+        .is_some_and(|child| is_known_child(unit, child, kind));
+    (is_child && !is_known).then_some(SkipReason::UnsupportedLayout)
 }
 
 /// The lock state of the build databases of one project directory.
@@ -921,7 +1026,7 @@ impl UnitContext<'_> {
             },
             &self.rule.rule,
             &mut collector.bounds,
-            &mut |relative: &Path, _: EntryKind| classify_entry(unit, relative),
+            &mut |relative: &Path, kind: EntryKind| classify_entry(unit, relative, kind),
         )?;
         if let Some(stopped) = stopped {
             return Ok(Outcome::Stopped(stopped));

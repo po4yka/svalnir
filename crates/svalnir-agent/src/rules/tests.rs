@@ -1338,8 +1338,9 @@ fn add_project(fixture: &Fixture, name: &str, workspace: &Path) -> PathBuf {
     let build_data = project.join("Build/Intermediates.noindex/XCBuildData");
     fs::create_dir_all(&build_data).unwrap();
     fs::write(build_data.join("build.db"), vec![0_u8; 2_048]).unwrap();
+    fs::create_dir_all(project.join("Build/Intermediates.noindex/App.build")).unwrap();
     fs::write(
-        project.join("Build/Intermediates.noindex/App.o"),
+        project.join("Build/Intermediates.noindex/App.build/App.o"),
         vec![1_u8; 3_000],
     )
     .unwrap();
@@ -1450,8 +1451,8 @@ fn the_fixed_units_of_a_recognized_project_are_candidates() {
         FileObjectType::Directory
     );
     // The build database of the build system is part of the unit:
-    // `XCBuildData`, `build.db`, `App.o`, and the unit.
-    assert_eq!(intermediates.measurement.charge.items, EntryCount::new(4));
+    // `XCBuildData`, `build.db`, `App.build`, `App.o`, and the unit.
+    assert_eq!(intermediates.measurement.charge.items, EntryCount::new(5));
     assert_eq!(intermediates.blockers.len(), 0);
     assert_eq!(intermediates.lifecycle, LifecycleState::Proposed);
     let record: &RuleCandidateRecord = &intermediates.candidate;
@@ -1610,9 +1611,130 @@ fn a_unit_with_content_that_the_rule_preserves_is_skipped_as_a_whole() {
 }
 
 #[test]
+fn a_unit_with_only_children_of_the_allow_list_is_a_candidate() {
+    let (fixture, project) = xcode_fixture();
+    let directories: [&str; 17] = [
+        "Build/Products/Release",
+        "Build/Products/Debug-iphonesimulator",
+        "Build/Products/Release-iphoneos",
+        "Build/Products/Debug-maccatalyst",
+        "Build/Products/Release-xrsimulator",
+        "Build/Intermediates.noindex/Pods.build",
+        "Build/Intermediates.noindex/PrecompiledHeaders",
+        "Build/Intermediates.noindex/ExplicitPrecompiledModules",
+        "Build/Intermediates.noindex/SwiftExplicitPrecompiledModules",
+        "Build/Intermediates.noindex/GeneratedModuleMaps",
+        "Build/Intermediates.noindex/GeneratedModuleMaps-iphonesimulator",
+        "Index.noindex/Build/Products",
+        "Index.noindex/PrecompiledHeaders",
+        // Below an accepted child, a name of the deny-list only is a
+        // reason to skip.
+        "Build/Products/Release/Notes",
+        "Build/Intermediates.noindex/Pods.build/Backup",
+        "Index.noindex/DataStore/v5/units",
+        "Build/Products/Debug-iphonesimulator/App.app",
+    ];
+    for directory in directories {
+        fs::create_dir_all(project.join(directory)).unwrap();
+    }
+    for unit_name in [
+        "Build/Products",
+        "Build/Intermediates.noindex",
+        "Index.noindex",
+    ] {
+        fs::write(project.join(unit_name).join(".DS_Store"), b"finder").unwrap();
+    }
+
+    let discovery = discover_xcode(&fixture);
+    assert_eq!(discovery.skipped.len(), 0, "{:?}", discovery.skipped);
+    assert_eq!(discovery.candidates.len(), 3);
+    for unit_name in [
+        "Build/Products",
+        "Build/Intermediates.noindex",
+        "Index.noindex",
+    ] {
+        let candidate = candidate_of(&discovery, &unit(unit_name));
+        assert_eq!(
+            candidate.candidate.eligibility.rule_supports_layout,
+            Fact::Satisfied
+        );
+    }
+}
+
+#[test]
+fn a_unit_with_a_child_that_the_allow_list_does_not_have_is_skipped_as_a_whole() {
+    /// The kind of the child that a case makes.
+    enum Child {
+        File(&'static [u8]),
+        Directory,
+    }
+    let cases: [(&str, &str, Child); 8] = [
+        ("Build/Products", "Notes.txt", Child::File(b"notes")),
+        // A directory that a person copied, with content.
+        ("Build/Products", "Backup", Child::Directory),
+        // A database with no suffix.
+        (
+            "Build/Intermediates.noindex",
+            "cache",
+            Child::File(b"SQLite format 3\0"),
+        ),
+        // A configuration of a project that the list does not have.
+        ("Build/Products", "Staging-iphoneos", Child::Directory),
+        // A known name of the wrong type, and a name that the first list
+        // does not have.
+        ("Build/Products", "Debug-iphoneos", Child::File(b"x")),
+        ("Build/Intermediates.noindex", "Previews", Child::Directory),
+        // A name of one unit in another unit.
+        ("Index.noindex", "XCBuildData", Child::Directory),
+        ("Build/Intermediates.noindex", ".build", Child::Directory),
+    ];
+    for (unit_name, child, kind) in cases {
+        let (fixture, project) = xcode_fixture();
+        let path: PathBuf = project.join(unit_name).join(child);
+        match kind {
+            Child::File(bytes) => fs::write(&path, bytes).unwrap(),
+            Child::Directory => {
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("copy.txt"), b"copy").unwrap();
+            }
+        }
+
+        let discovery = discover_xcode(&fixture);
+        let skipped = skip_of(&discovery, &unit(unit_name));
+        assert_eq!(skipped.reasons, [SkipReason::UnsupportedLayout], "{child}");
+        assert_eq!(
+            skipped.eligibility.rule_supports_layout,
+            Fact::NotSatisfied,
+            "{child}"
+        );
+        // The unit is refused whole: no part of it is a candidate.
+        assert!(
+            discovery.candidates.iter().all(|candidate| !candidate
+                .evidence
+                .relative_entry
+                .as_utf8()
+                .is_some_and(|entry| entry.starts_with(&unit(unit_name)))),
+            "{child}"
+        );
+        assert_eq!(discovery.candidates.len(), 2, "{child}");
+        assert!(path.exists());
+    }
+
+    // The deny-list is a second check: a child that it has is preserved
+    // data, also when the allow-list does not have the child.
+    let (fixture, project) = xcode_fixture();
+    fs::create_dir(project.join("Build/Products/App.xcarchive")).unwrap();
+    let discovery = discover_xcode(&fixture);
+    assert_eq!(
+        skip_of(&discovery, &unit("Build/Products")).reasons,
+        [SkipReason::ProtectedData]
+    );
+}
+
+#[test]
 fn a_unit_with_a_special_file_or_a_hard_link_is_skipped() {
     let (fixture, project) = xcode_fixture();
-    let object = project.join("Build/Intermediates.noindex/App.o");
+    let object = project.join("Build/Intermediates.noindex/App.build/App.o");
     fs::hard_link(&object, project.join("Build/Products/Debug/App.o")).unwrap();
     let discovery = discover_xcode(&fixture);
     // The two units have one name each of the same object.

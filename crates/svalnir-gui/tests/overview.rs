@@ -555,3 +555,31 @@ fn the_cards_sit_in_the_window_near_their_marks(cx: &mut TestAppContext) {
         "{card:?} {chart:?}"
     );
 }
+
+#[gpui_kit::test]
+fn the_disk_card_shows_the_runway_of_the_detail_panel(cx: &mut TestAppContext) {
+    launch_focus(FocusTarget::Dial, cx);
+    let handle = open_drift(100, cx);
+    let card = label(handle, "headroom-dial-tip", cx).expect("dial card");
+    assert!(card.contains("Runway: \u{2248} "), "{card}");
+    let detail = label(handle, "dial-detail", cx).expect("detail panel");
+    let text = card
+        .split("Runway: ")
+        .nth(1)
+        .and_then(|t| t.split(". ").next())
+        .expect("runway text");
+    assert!(
+        detail.contains(&format!("Runway {text}")),
+        "{card} / {detail}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_first_frame_after_a_launch_focus_shows_the_card_at_its_real_place(cx: &mut TestAppContext) {
+    launch_focus(FocusTarget::Session, cx);
+    let handle = open_drift(100, cx);
+    let chart = bounds_of(handle, "session-chart", cx).expect("chart");
+    let card = bounds_of(handle, "session-tip", cx).expect("card");
+    // The card is not placed as for a chart at the window corner.
+    assert!(card.origin.x > chart.origin.x, "{card:?} {chart:?}");
+}

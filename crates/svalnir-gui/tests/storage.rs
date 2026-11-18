@@ -771,3 +771,48 @@ fn the_storage_card_sits_in_the_window_near_the_chart(cx: &mut TestAppContext) {
         "{card:?} {chart:?}"
     );
 }
+
+#[gpui_kit::test]
+fn the_card_of_a_folder_shows_its_density(cx: &mut TestAppContext) {
+    let handle = scanned(None, cx);
+    press(handle, "right", cx);
+    let card = label_of(handle, "storage-band-tip", cx).expect("card of the second folder");
+    assert!(card.contains("Density: 80%"), "{card}");
+}
+
+#[gpui_kit::test]
+fn the_card_of_a_changed_folder_shows_the_signed_difference(cx: &mut TestAppContext) {
+    cx.update(|cx| request_launch_focus(FocusTarget::Folders, cx));
+    cx.update(gpui_kit::init);
+    cx.update(nav::bind_keys);
+    let (handle, view) = cx.update(|cx| {
+        open_main_window(
+            Bounds::new(Point::default(), size(px(1120.0), px(720.0))),
+            Arc::new(FixtureSource::new(FixtureScenario::Healthy)),
+            None,
+            cx,
+        )
+        .expect("open test window")
+    });
+    cx.run_until_parked();
+    press(handle, "cmd-2", cx);
+    let model = cx.read(|cx| view.read(cx).model().clone());
+    let root = cx
+        .read(|cx| model.read(cx).default_scan_root())
+        .expect("root");
+    model.update(cx, |model, cx| {
+        model.set_rescan_once(true);
+        model.start_scan(&root, cx);
+    });
+    cx.run_until_parked();
+    let mut changes: Vec<String> = Vec::new();
+    for _ in 0..8 {
+        if let Some(card) = label_of(handle, "storage-band-tip", cx)
+            && let Some(text) = card.split("Change: ").nth(1)
+        {
+            changes.push(text.split(". ").next().unwrap_or_default().to_owned());
+        }
+        press(handle, "right", cx);
+    }
+    assert!(changes.contains(&"+2.1 GB".to_owned()), "{changes:?}");
+}

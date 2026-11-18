@@ -242,7 +242,8 @@ impl ChartTip {
     /// positioned from its top-left corner, so the position is right on the
     /// first frame. `origin` is the last known position of the chart in the
     /// window; it only decides the side of the card, and the window edge
-    /// clamp uses the real bounds. With `animate` false (Reduce Motion) the
+    /// clamp uses the real bounds. A zero origin means that the chart has not
+    /// painted yet: the card shows nothing and asks for one more frame. With `animate` false (Reduce Motion) the
     /// card appears at once.
     pub fn new(
         id: impl Into<SharedString>,
@@ -264,6 +265,14 @@ impl ChartTip {
 impl RenderOnce for ChartTip {
     #[expect(clippy::too_many_lines, reason = "one build of the card")]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // The chart sets its origin when it paints. A zero origin means that
+        // the chart has not painted yet, for example at a launch focus, so the
+        // side of the card would be chosen as if the chart were at the corner
+        // of the window. Show the card from the next frame.
+        if self.origin == Point::default() {
+            window.request_animation_frame();
+            return div().into_any_element();
+        }
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let mono: SharedString = cx.theme().mono_font_family.clone();
         let foreground: Hsla = to_hsla(tokens.foreground);
@@ -382,6 +391,7 @@ impl RenderOnce for ChartTip {
                 .child(shown),
         )
         .with_priority(1)
+        .into_any_element()
     }
 }
 

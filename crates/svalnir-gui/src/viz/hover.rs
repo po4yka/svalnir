@@ -3,7 +3,10 @@
 
 use crate::{
     theme::motion::{self, FAST},
-    ui::{chart_tip::TipContent, data_state::format_bytes},
+    ui::{
+        chart_tip::TipContent,
+        data_state::{UNAVAILABLE_TEXT, format_bytes},
+    },
     viz::{dial::share_percent_text, led::LedField},
 };
 use gpui_kit::{App, Bounds, Global, Pixels, point, px, size};
@@ -233,11 +236,13 @@ impl Tween {
     }
 }
 
-/// The share of `part` in `whole` as the text of a card: "27%" or "<1%".
+/// The share of `part` in `whole` as the text of a card: "27%" or "<1%". A
+/// whole of zero gives the em dash.
 #[must_use]
 pub fn share_text(part: u64, whole: u64) -> String {
     if whole == 0 {
-        return "0%".to_owned();
+        // A share of nothing is not a measured value.
+        return UNAVAILABLE_TEXT.to_owned();
     }
     let ppm: u128 = u128::from(part) * 1_000_000 / u128::from(whole);
     share_percent_text(u64::try_from(ppm).unwrap_or(1_000_000))
@@ -299,7 +304,8 @@ pub fn volume_tips(used: u64, total: u64) -> (TipContent, TipContent) {
     )
 }
 
-/// The note of a folder: the last two parts of its path, as "…/Developer".
+/// The note of a folder: the name of the folder after "…/", as "…/Developer".
+/// A path with no name, such as the root, is shown whole.
 #[must_use]
 pub fn path_note(path: &std::path::Path) -> String {
     let name: String = path.file_name().map_or_else(
@@ -396,7 +402,18 @@ mod tests {
         assert_eq!(share_text(1, 1000), "<1%");
         assert_eq!(share_text(270, 1000), "27%");
         assert_eq!(share_text(1000, 1000), "100%");
-        assert_eq!(share_text(0, 0), "0%");
+        assert_eq!(share_text(0, 0), "\u{2014}");
+    }
+
+    #[test]
+    fn a_share_of_a_whole_of_zero_is_the_em_dash_not_zero_percent() {
+        assert_eq!(share_text(5, 0), "\u{2014}");
+    }
+
+    #[test]
+    fn the_path_note_is_the_name_after_dots_and_a_root_is_shown_whole() {
+        assert_eq!(path_note(std::path::Path::new("/a/b/Library")), "…/Library");
+        assert_eq!(path_note(std::path::Path::new("/")), "/");
     }
 
     #[test]

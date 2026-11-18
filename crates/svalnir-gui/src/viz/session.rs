@@ -939,6 +939,55 @@ impl SessionMark {
     }
 }
 
+/// A mark that keeps its reading when new readings arrive. It stores the time
+/// of the reading, not the index of its column, because the columns shift left
+/// when the chart takes a new reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedMark {
+    /// The time of the reading that the mark stands at.
+    at: SystemTime,
+    /// For an event, its place among the events of that reading.
+    event: Option<usize>,
+}
+
+impl PinnedMark {
+    /// Pins `mark` of `model` to the time of its reading. `None` when the mark
+    /// is not in the model.
+    #[must_use]
+    pub fn pin(model: &SessionModel, mark: SessionMark) -> Option<Self> {
+        let column: usize = mark.column(model)?;
+        let at: SystemTime = model.columns.get(column)?.at;
+        let event: Option<usize> = match mark {
+            SessionMark::Column(_) => None,
+            SessionMark::Event(index) => Some(
+                model
+                    .events
+                    .iter()
+                    .take(index)
+                    .filter(|event| event.column == column)
+                    .count(),
+            ),
+        };
+        Some(Self { at, event })
+    }
+
+    /// The mark in `model`, or `None` when its reading is no longer on screen.
+    #[must_use]
+    pub fn resolve(self, model: &SessionModel) -> Option<SessionMark> {
+        let column: usize = model.columns.iter().position(|c| c.at == self.at)?;
+        match self.event {
+            None => Some(SessionMark::Column(column)),
+            Some(place) => model
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.column == column)
+                .nth(place)
+                .map(|(index, _)| SessionMark::Event(index)),
+        }
+    }
+}
+
 /// The mark under the point `(x, y)`, in pixels from the top-left corner of the
 /// chart. An event marker within `MARKER_REACH` wins over a column. A column is
 /// the whole height of the lattice at one reading. The gutters, a slot with no
@@ -1400,7 +1449,7 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
 /// The hover state that the chart keeps between frames.
 struct SessionHover {
     /// The mark under the pointer or under the keyboard.
-    mark: Option<SessionMark>,
+    mark: Option<PinnedMark>,
     /// Whether the keyboard set the mark.
     keyboard: bool,
     /// The hover amount of each event marker.
@@ -1414,7 +1463,7 @@ struct SessionHover {
 /// Sets the mark of the chart. It redraws the chart only when the mark changes.
 fn set_session_mark(
     state: &Entity<SessionHover>,
-    mark: Option<SessionMark>,
+    mark: Option<PinnedMark>,
     keyboard: bool,
     app: &mut App,
 ) {
@@ -1557,7 +1606,9 @@ impl RenderOnce for SessionChart {
                 .launch
                 .is_some_and(|target| take_launch_focus(target, cx))
         {
-            set_session_mark(&state, newest, true, cx);
+            let pinned: Option<PinnedMark> =
+                newest.and_then(|mark| PinnedMark::pin(&self.model, mark));
+            set_session_mark(&state, pinned, true, cx);
             let to_focus: FocusHandle = handle.clone();
             window.defer(cx, move |window, cx| window.focus(&to_focus, cx));
             // The focus follows after this frame; keep the mark meanwhile.
@@ -1565,7 +1616,6 @@ impl RenderOnce for SessionChart {
         }
         let now: Instant = Instant::now();
         let event_count: usize = self.model.events.len();
-        let columns_count: usize = self.model.columns.len();
         // One pass: the mark, and the eased hover amounts of the markers.
         let (mark, markers, running): (Option<SessionMark>, Vec<f32>, bool) =
             state.update(cx, |s, _| {
@@ -1573,19 +1623,21 @@ impl RenderOnce for SessionChart {
                     s.mark = None;
                     s.keyboard = false;
                 }
-                // A mark of an older model can point past the readings now.
-                s.mark = s.mark.filter(|mark| match mark {
-                    SessionMark::Column(index) => *index < columns_count,
-                    SessionMark::Event(index) => *index < event_count,
-                });
+                // The mark finds its reading again; it is cleared when that
+                // reading is no longer on screen.
+                let found: Option<SessionMark> = s.mark.and_then(|pin| pin.resolve(&self.model));
+                if found.is_none() {
+                    s.mark = None;
+                    s.keyboard = false;
+                }
                 let target: Vec<f32> = (0..event_count)
-                    .map(|index| f32::from(u8::from(s.mark == Some(SessionMark::Event(index)))))
+                    .map(|index| f32::from(u8::from(found == Some(SessionMark::Event(index)))))
                     .collect();
                 let tween: &mut Tween = s
                     .tween
                     .get_or_insert_with(|| Tween::new(target.clone(), now));
                 tween.retarget(target, now, animate);
-                (s.mark, tween.value_at(now), tween.running(now))
+                (found, tween.value_at(now), tween.running(now))
             });
         if running {
             window.request_animation_frame();
@@ -1643,8 +1695,10 @@ impl RenderOnce for SessionChart {
             Some(SessionMark::Event(index)) => self.model.chip_of(index),
             _ => self.model.chip(),
         };
-        if let Some(chip) = chip {
-            let tone: Hsla = event_color(self.model.events[chip.event].kind, &colors, brand);
+        if let Some(chip) = chip
+            && let Some(event) = self.model.events.get(chip.event)
+        {
+            let tone: Hsla = event_color(event.kind, &colors, brand);
             texts.push(
                 div()
                     .id("session-chip")
@@ -1807,7 +1861,8 @@ impl RenderOnce for SessionChart {
                 let at: Point<Pixels> = event.position - move_origin.get();
                 let mark: Option<SessionMark> =
                     session_mark_at(&move_hit, &layout, at.x.into(), at.y.into());
-                set_session_mark(&move_state, mark, false, app);
+                let pinned: Option<PinnedMark> = mark.and_then(|m| PinnedMark::pin(&move_hit, m));
+                set_session_mark(&move_state, pinned, false, app);
             })
             .on_hover(move |hovered, _, app| {
                 let from_pointer: bool = !leave_state.read(app).keyboard;
@@ -1816,7 +1871,10 @@ impl RenderOnce for SessionChart {
                 }
             })
             .on_key_down(move |event, _, app| {
-                let current: Option<SessionMark> = key_state.read(app).mark;
+                let current: Option<SessionMark> = key_state
+                    .read(app)
+                    .mark
+                    .and_then(|pin| pin.resolve(&key_hit));
                 let next: Option<Option<SessionMark>> = match event.keystroke.key.as_str() {
                     "right" => Some(step_session_mark(&key_hit, current, 1)),
                     "left" => Some(step_session_mark(&key_hit, current, -1)),
@@ -1826,7 +1884,9 @@ impl RenderOnce for SessionChart {
                     _ => None,
                 };
                 if let Some(mark) = next {
-                    set_session_mark(&key_state, mark, true, app);
+                    let pinned: Option<PinnedMark> =
+                        mark.and_then(|m| PinnedMark::pin(&key_hit, m));
+                    set_session_mark(&key_state, pinned, true, app);
                     app.stop_propagation();
                 }
             })
@@ -2423,6 +2483,64 @@ mod tests {
             })
             .collect();
         session_model(&samples, None, 20)
+    }
+
+    /// Readings `first..first + 10` in 10 slots: the pressure turns Warning at
+    /// the reading with number 6 of the run.
+    fn shifted_model(first: u64) -> SessionModel {
+        let samples: Vec<HostSample> = (first..first + 10)
+            .map(|n| {
+                let level = if n < 6 {
+                    PressureLevel::Normal
+                } else {
+                    PressureLevel::Warning
+                };
+                sample(n * 60, Some(100 + n), Some(level), 0)
+            })
+            .collect();
+        session_model(&samples, None, 10)
+    }
+
+    #[test]
+    fn a_pinned_mark_follows_its_reading_when_the_columns_shift() {
+        let before = shifted_model(0);
+        let pin = PinnedMark::pin(&before, SessionMark::Column(4)).expect("pin");
+        assert_eq!(pin.resolve(&before), Some(SessionMark::Column(4)));
+        // One new reading: the oldest leaves, every column moves left by one.
+        let after = shifted_model(1);
+        assert_eq!(pin.resolve(&after), Some(SessionMark::Column(3)));
+    }
+
+    #[test]
+    fn a_pinned_mark_is_cleared_when_its_reading_leaves_the_screen() {
+        let before = shifted_model(0);
+        let pin = PinnedMark::pin(&before, SessionMark::Column(0)).expect("pin");
+        assert_eq!(pin.resolve(&shifted_model(1)), None);
+    }
+
+    #[test]
+    fn a_pinned_event_follows_its_column() {
+        let before = shifted_model(0);
+        assert_eq!(before.events.len(), 1);
+        let pin = PinnedMark::pin(&before, SessionMark::Event(0)).expect("pin");
+        let after = shifted_model(1);
+        assert_eq!(pin.resolve(&after), Some(SessionMark::Event(0)));
+        assert_eq!(
+            SessionMark::Event(0).column(&after),
+            before.events[0].column.checked_sub(1)
+        );
+    }
+
+    #[test]
+    fn a_keyboard_step_starts_at_the_position_of_the_pinned_reading() {
+        let before = shifted_model(0);
+        let pin = PinnedMark::pin(&before, SessionMark::Column(4)).expect("pin");
+        let after = shifted_model(1);
+        let current = pin.resolve(&after);
+        assert_eq!(
+            step_session_mark(&after, current, 1),
+            Some(SessionMark::Column(4))
+        );
     }
 
     #[test]

@@ -127,6 +127,35 @@ fn clock_nanoseconds(clock: libc::clockid_t) -> Option<u64> {
     seconds.checked_mul(1_000_000_000)?.checked_add(nanoseconds)
 }
 
+/// The sleep time from one read of the continuous clock, the uptime clock,
+/// and the continuous clock again, in that order.
+///
+/// `None` means that the two continuous reads are more than
+/// [`MAX_READ_WINDOW`] apart, so the caller reads the clocks again.
+///
+/// The sleep time is `after` minus `uptime`. The continuous clock is never
+/// behind the uptime clock, and `after` is read later than `uptime`, so the
+/// difference is not negative on a host that did not sleep in the current
+/// boot. `before` minus `uptime` is negative on such a host, by the time
+/// between the two reads.
+#[cfg(target_os = "macos")]
+fn sleep_time_from_reads(
+    before: u64,
+    uptime: u64,
+    after: u64,
+) -> Option<Result<Nanoseconds, UnavailableReason>> {
+    let window: u64 = after.checked_sub(before)?;
+    if window > MAX_READ_WINDOW {
+        return None;
+    }
+    Some(
+        after
+            .checked_sub(uptime)
+            .map(Nanoseconds::new)
+            .ok_or(UnavailableReason::InconsistentData),
+    )
+}
+
 /// The cumulative time that the host slept in the current boot.
 ///
 /// The function reads the continuous clock, the uptime clock, and the
@@ -137,8 +166,8 @@ fn clock_nanoseconds(clock: libc::clockid_t) -> Option<u64> {
 /// # Errors
 ///
 /// Returns `inconsistent_data` when a clock gives no value, the uptime is
-/// larger than the continuous time, or each attempt was interrupted for
-/// longer than the permitted window.
+/// larger than the continuous time that was read after it, or each attempt
+/// was interrupted for longer than the permitted window.
 #[cfg(target_os = "macos")]
 pub(crate) fn native_sleep_time() -> Result<Nanoseconds, UnavailableReason> {
     for _ in 0..READ_ATTEMPTS {
@@ -150,14 +179,8 @@ pub(crate) fn native_sleep_time() -> Result<Nanoseconds, UnavailableReason> {
             ))
         };
         let (before, uptime, after) = read().ok_or(UnavailableReason::InconsistentData)?;
-        if after
-            .checked_sub(before)
-            .is_some_and(|window| window <= MAX_READ_WINDOW)
-        {
-            return before
-                .checked_sub(uptime)
-                .map(Nanoseconds::new)
-                .ok_or(UnavailableReason::InconsistentData);
+        if let Some(result) = sleep_time_from_reads(before, uptime, after) {
+            return result;
         }
     }
     Err(UnavailableReason::InconsistentData)
@@ -241,6 +264,35 @@ mod tests {
             ),
             Reading::Unavailable(UnavailableReason::Unsupported)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_host_that_did_not_sleep_has_a_sleep_time() {
+        use super::{MAX_READ_WINDOW, sleep_time_from_reads};
+
+        // The two clocks are equal on a host that did not sleep, so the
+        // uptime read is between the two continuous reads.
+        assert_eq!(
+            sleep_time_from_reads(1_000, 1_040, 1_090),
+            Some(Ok(Nanoseconds::new(50)))
+        );
+        // The host slept for seven seconds before the reads.
+        assert_eq!(
+            sleep_time_from_reads(7_000_001_000, 1_040, 7_000_001_090),
+            Some(Ok(Nanoseconds::new(7_000_000_050)))
+        );
+        // The uptime is larger than the continuous time read after it.
+        assert_eq!(
+            sleep_time_from_reads(1_000, 1_100, 1_090),
+            Some(Err(UnavailableReason::InconsistentData))
+        );
+        // The reads are too far apart, or the continuous clock went back.
+        assert_eq!(
+            sleep_time_from_reads(1_000, 1_040, 1_001 + MAX_READ_WINDOW),
+            None
+        );
+        assert_eq!(sleep_time_from_reads(1_090, 1_040, 1_000), None);
     }
 
     #[cfg(target_os = "macos")]

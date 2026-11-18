@@ -134,13 +134,16 @@ pub fn turn_main_run_loop() -> bool {
     false
 }
 
-/// The signal that stopped [`run_main_run_loop_until_stop`].
+/// What stopped [`run_main_run_loop_until_stop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopSignal {
     /// `SIGINT`.
     Interrupt,
     /// `SIGTERM`.
     Terminate,
+    /// A call of [`request_main_run_loop_stop`] in this process. No signal
+    /// arrived.
+    Requested,
 }
 
 /// The reason the main run loop did not run until a stop signal.
@@ -157,9 +160,56 @@ pub enum RunLoopError {
     Unsupported,
 }
 
-/// The stop signal that a signal source received, or zero.
+/// The stop signal that a signal source received, [`STOP_REQUESTED`], or
+/// zero.
 #[cfg(target_os = "macos")]
 static STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// The value of [`STOP_SIGNAL`] for a stop that this process requested. No
+/// signal has a negative number.
+#[cfg(target_os = "macos")]
+const STOP_REQUESTED: i32 = -1;
+
+/// The stop that a value of [`STOP_SIGNAL`] records.
+#[cfg(target_os = "macos")]
+const fn stop_of(recorded: i32) -> Option<StopSignal> {
+    match recorded {
+        0 => None,
+        STOP_REQUESTED => Some(StopSignal::Requested),
+        libc::SIGINT => Some(StopSignal::Interrupt),
+        _ => Some(StopSignal::Terminate),
+    }
+}
+
+/// Records the stop request of this process. A signal that a source
+/// recorded before stays: it is the cause of the stop.
+#[cfg(target_os = "macos")]
+fn record_stop_request() {
+    // The result says only which of the two came first.
+    let _earlier: Result<i32, i32> =
+        STOP_SIGNAL.compare_exchange(0, STOP_REQUESTED, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// Asks [`run_main_run_loop_until_stop`] to return, from each thread and
+/// with no signal.
+///
+/// The request is recorded at once, so a run loop that starts after the
+/// call returns before its first wait. A run loop that waits is woken by
+/// a function on the main Dispatch queue, which the main run loop
+/// services as it services the signal sources. The call sends no signal,
+/// so it has the same effect before the signal sources of the run loop
+/// exist: the default action of a signal does not end the process.
+#[cfg(target_os = "macos")]
+pub fn request_main_run_loop_stop() {
+    record_stop_request();
+    // The function does no work: its service by the run loop makes the
+    // loop read the recorded stop.
+    DispatchQueue::main().exec_async(record_stop_request);
+}
+
+/// This host has no main run loop that Svalnir uses.
+#[cfg(not(target_os = "macos"))]
+pub fn request_main_run_loop_stop() {}
 
 /// The event handler of a signal source. The context is the signal number.
 #[cfg(target_os = "macos")]
@@ -208,7 +258,8 @@ fn stop_source(signal: libc::c_int) -> DispatchRetained<DispatchSource> {
     source
 }
 
-/// Runs the main run loop until the process gets `SIGINT` or `SIGTERM`.
+/// Runs the main run loop until the process gets `SIGINT` or `SIGTERM`, or
+/// until a call of [`request_main_run_loop_stop`].
 ///
 /// The loop waits for input and does not poll. A signal arrives as an event
 /// of a Dispatch source on the main queue, which the run loop services. The
@@ -226,10 +277,8 @@ pub fn run_main_run_loop_until_stop() -> Result<StopSignal, RunLoopError> {
     let sources: [DispatchRetained<DispatchSource>; 2] =
         [stop_source(libc::SIGINT), stop_source(libc::SIGTERM)];
     let result: Result<StopSignal, RunLoopError> = loop {
-        match STOP_SIGNAL.load(Ordering::SeqCst) {
-            0 => {}
-            libc::SIGINT => break Ok(StopSignal::Interrupt),
-            _ => break Ok(StopSignal::Terminate),
+        if let Some(stop) = stop_of(STOP_SIGNAL.load(Ordering::SeqCst)) {
+            break Ok(stop);
         }
         let ran: bool = autoreleasepool(|_| {
             // SAFETY: the static is a constant string object of Foundation
@@ -261,7 +310,10 @@ pub fn run_main_run_loop_until_stop() -> Result<StopSignal, RunLoopError> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{RunLoopError, run_main_run_loop_until_stop, turn_main_run_loop};
+    use super::{
+        RunLoopError, STOP_REQUESTED, StopSignal, run_main_run_loop_until_stop, stop_of,
+        turn_main_run_loop,
+    };
 
     /// The test harness does not run the main run loop, and a test is not on
     /// the main thread.
@@ -272,6 +324,16 @@ mod tests {
         // A second call waits for the block of the first call.
         assert!(!turn_main_run_loop());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_recorded_stop_is_a_signal_or_the_request_of_this_process() {
+        assert_eq!(stop_of(0), None);
+        assert_eq!(stop_of(libc::SIGINT), Some(StopSignal::Interrupt));
+        assert_eq!(stop_of(libc::SIGTERM), Some(StopSignal::Terminate));
+        // The request of the process is not read as a signal.
+        assert_eq!(stop_of(STOP_REQUESTED), Some(StopSignal::Requested));
+        assert!(STOP_REQUESTED != libc::SIGINT && STOP_REQUESTED != libc::SIGTERM);
     }
 
     #[test]

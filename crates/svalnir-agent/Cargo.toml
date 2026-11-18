@@ -16,6 +16,13 @@ path = "src/lib.rs"
 name = "svalnir-agent"
 path = "src/main.rs"
 
+# A test program with its own `main`: the main run loop runs only on the
+# main thread of a process, which the test harness uses for itself.
+[[test]]
+name = "run_loop_stop"
+path = "tests/run_loop_stop.rs"
+harness = false
+
 # The dependencies of the Milestone 1 modules, which are also those of the
 # declared Milestone 2 modules. No rendering crate is permitted in this graph.
 [dependencies]

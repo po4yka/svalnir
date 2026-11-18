@@ -148,7 +148,9 @@ mod agent {
     use svalnir_agent::coordinator::CoordinatorConfig;
     use svalnir_agent::journal::{CoordinatorRole, JournalOptions};
     use svalnir_agent::platform::memory::{PressureEvent, PressureSubscription};
-    use svalnir_agent::platform::run_loop::run_main_run_loop_until_stop;
+    use svalnir_agent::platform::run_loop::{
+        StopSignal, request_main_run_loop_stop, run_main_run_loop_until_stop,
+    };
     use svalnir_agent::runtime::host::{SystemParts, system_parts};
     use svalnir_agent::runtime::{
         AgentClock, Driver, DriverSettings, DriverStart, ServiceSettings, ShutdownReport,
@@ -357,11 +359,11 @@ mod agent {
     impl Drop for EndRunLoop {
         fn drop(&mut self) {
             if !self.0.was_requested() {
-                // The main run loop ends at a stop signal of this
-                // process.
-                // SAFETY: `raise` sends one signal to the calling
-                // process, which has a signal source for it.
-                unsafe { libc::raise(libc::SIGTERM) };
+                // The request is not a signal: when the service ends
+                // before the main thread made its signal sources, a
+                // signal would have its default action and end the
+                // process before the report of the stop.
+                request_main_run_loop_stop();
             }
         }
     }
@@ -461,14 +463,20 @@ mod agent {
         drop(subscription);
         let report: Option<ShutdownReport> = thread.join().ok();
         match (signal, report) {
-            (Ok(signal), Some(report)) if report.clean => {
+            (Ok(signal @ (StopSignal::Interrupt | StopSignal::Terminate)), Some(report))
+                if report.clean =>
+            {
                 tracing::info!(?signal, "svalnir-agent stopped");
                 ExitCode::SUCCESS
             }
             (signal, report) => {
-                // The next start reconciles what this lifetime left.
+                // The service ended with no stop signal, or the stop was
+                // not clean. The failure status makes `launchd` start the
+                // agent again, and the next start reconciles what this
+                // lifetime left.
                 tracing::error!(
                     run_loop_error = signal.is_err(),
+                    service_ended_first = matches!(signal, Ok(StopSignal::Requested)),
                     clean = report.is_some_and(|report| report.clean),
                     "svalnir-agent stopped, and the stop was not clean"
                 );

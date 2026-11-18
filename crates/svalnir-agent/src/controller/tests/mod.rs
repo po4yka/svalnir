@@ -36,6 +36,8 @@ struct Bench {
     epoch: ExecutorEpochId,
     now: u64,
     health: Health,
+    /// The inhibition of the agent instance.
+    inhibition: InstanceInhibition,
 }
 
 impl Bench {
@@ -54,6 +56,7 @@ impl Bench {
             epoch: epoch("epoch_1"),
             now: START,
             health: Health::default(),
+            inhibition: InstanceInhibition::default(),
         }
     }
 
@@ -72,7 +75,7 @@ impl Bench {
             home_directory: None,
             config: &self.config,
             authority: self.authority.as_ref(),
-            inhibition: &InstanceInhibition::default(),
+            inhibition: &self.inhibition,
             registry: &self.registry,
             observations,
             reports,
@@ -512,6 +515,7 @@ fn the_plan_of_a_memory_incident_has_the_configured_strategy_and_grace_period() 
         epoch: epoch("epoch_1"),
         now: START,
         health: Health::default(),
+        inhibition: InstanceInhibition::default(),
     };
     let mut plan: Option<Plan> = None;
     for _ in 0..6 {
@@ -733,6 +737,41 @@ fn a_pause_inhibits_each_plan_and_a_resume_needs_a_fresh_measurement() {
     bench.advance(SAMPLE - SECOND);
     let output = bench.step(&critical(two_jobs)(bench.now), &[]);
     assert_eq!(the_apply(&output).guard, Guard::Memory);
+}
+
+#[test]
+fn the_resume_floor_of_the_instance_is_a_floor_only_in_its_boot_and_clock_domain() {
+    use svalnir_core::grant::MeasurementFloor;
+    use svalnir_core::id::{BootId, ClockDomainId};
+    use svalnir_core::time::MonotonicNanos;
+    let floor = |boot: &str, domain: &str| MeasurementFloor {
+        // Later than each sample of the test.
+        at: MonotonicNanos::new(START + 3_600 * SECOND),
+        clock_domain: ClockDomainId::new(domain).unwrap(),
+        boot_id: BootId::new(boot).unwrap(),
+    };
+    // A floor of a different boot or of a different clock domain is not a
+    // time of this timeline: each measurement of the current boot is
+    // newer, as the rule of the authorization says.
+    for (boot, domain) in [("boot_0", "clock_main"), ("boot_1", "clock_other")] {
+        let mut bench = Bench::new();
+        bench.inhibition.measurement_floor = Some(floor(boot, domain));
+        bench.run(30 * SECOND, critical(two_jobs));
+        // A step of the run made the plan of the memory guard.
+        assert!(bench.state.outstanding.is_some(), "{boot} {domain}");
+        assert!(bench.state.measurement_floor.is_none());
+    }
+    // The floor of this boot and this clock domain: no sample is newer,
+    // so no plan is made.
+    let mut bench = Bench::new();
+    bench.inhibition.measurement_floor = Some(floor("boot_1", "clock_main"));
+    let output = bench.run(30 * SECOND, critical(two_jobs));
+    assert_eq!(applies(&output).len(), 0);
+    assert_eq!(
+        guard(&output, Guard::Memory).blocked,
+        vec![BlockedReason::AwaitingFreshMeasurement]
+    );
+    assert!(bench.state.outstanding.is_none());
 }
 
 #[test]

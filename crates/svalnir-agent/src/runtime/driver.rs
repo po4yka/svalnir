@@ -244,12 +244,21 @@ pub struct Driver {
     /// revision.
     effective: Option<ValidatedConfig>,
     authority_revision: Option<u64>,
+    /// The authority record was not read, or was not usable, at the
+    /// latest read.
+    authority_unread: bool,
+    /// A read of the authority record found that this instance did not
+    /// see each state of the record. The tick makes the floor from it.
+    authority_states_unseen: bool,
+    /// The time of the latest tick that found states of the authority
+    /// record that this instance did not see.
+    unseen_change_floor: Option<MeasurementFloor>,
     policy: PolicySource,
 
     lifecycle: LifecycleRecord,
     started_at: WallTime,
     automation_not_before: Option<MonotonicNanos>,
-    journal_unavailable: bool,
+    record_health: RecordHealth,
     optional_reduced: bool,
     stopping: bool,
     last_status: Option<ControllerStatus>,
@@ -266,6 +275,47 @@ impl std::fmt::Debug for Driver {
             .field("epoch", &self.epoch)
             .field("stopping", &self.stopping)
             .finish_non_exhaustive()
+    }
+}
+
+/// Whether the journal has the two records that the driver writes in each
+/// tick: the state of the controller and the status.
+///
+/// Each record has its own flag. A status write that succeeds says
+/// nothing about the controller record, so it does not clear a failed
+/// write of that record: the step of the next tick must still see that
+/// the journal does not have the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RecordHealth {
+    controller_unrecorded: bool,
+    status_unrecorded: bool,
+}
+
+impl RecordHealth {
+    /// The health after the writes of a start. `unavailable` is true when
+    /// the journal did not take the lifecycle record or the controller
+    /// record.
+    const fn at_start(unavailable: bool) -> Self {
+        Self {
+            controller_unrecorded: unavailable,
+            status_unrecorded: false,
+        }
+    }
+
+    /// Records whether the journal has the present state of the
+    /// controller.
+    const fn controller_written(&mut self, written: bool) {
+        self.controller_unrecorded = !written;
+    }
+
+    /// Records the result of a write of the status record.
+    const fn status_written(&mut self, written: bool) {
+        self.status_unrecorded = !written;
+    }
+
+    /// True when the journal did not take one of the two records.
+    const fn unavailable(self) -> bool {
+        self.controller_unrecorded || self.status_unrecorded
     }
 }
 
@@ -436,6 +486,9 @@ impl Driver {
             fast_sampling: false,
             effective: None,
             authority_revision: None,
+            authority_unread: false,
+            authority_states_unseen: false,
+            unseen_change_floor: None,
             policy: PolicySource {
                 revision: None,
                 problem: None,
@@ -443,7 +496,7 @@ impl Driver {
             lifecycle,
             started_at: time.wall,
             automation_not_before,
-            journal_unavailable,
+            record_health: RecordHealth::at_start(journal_unavailable),
             optional_reduced: false,
             stopping: false,
             last_status: None,
@@ -496,6 +549,21 @@ impl Driver {
         if revision.is_some() && revision == self.authority_revision {
             return false;
         }
+        // Each write of the record adds one to its revision counter. A
+        // counter that is more than one above the counter of the latest
+        // read shows a state of the record that this instance did not
+        // see, for example a pause and its resume between two ticks. The
+        // same is true for the first read after a read that failed. The
+        // controller saw no pause then, so it makes no floor for the
+        // resume; the tick makes one in its place.
+        let skipped: bool = match (self.authority_revision, revision) {
+            (Some(seen), Some(now)) => now > seen.saturating_add(1),
+            _ => false,
+        };
+        if skipped || (self.authority_unread && revision.is_some()) {
+            self.authority_states_unseen = true;
+        }
+        self.authority_unread = revision.is_none();
         self.authority_revision = revision;
         let (state, effective, problem): (
             Option<AuthorityState>,
@@ -545,27 +613,45 @@ impl Driver {
             Some("authority_record_not_readable" | "policy_revision_source_not_usable")
         ) {
             self.authority_revision = None;
+            self.authority_unread = true;
         }
         self.effective = effective;
         self.authority.records().state = state;
         true
     }
 
-    /// The inhibition of this instance: the end of the latest pause that
-    /// the controller saw.
+    /// The inhibition of this instance: the later of the end of the
+    /// latest pause that the controller saw and the time of the latest
+    /// tick that found control changes that this instance did not see.
     fn inhibition(&self) -> InstanceInhibition {
-        InstanceInhibition {
-            guards: Vec::new(),
-            pause: None,
-            measurement_floor: self
-                .state
+        let seen: Option<MeasurementFloor> =
+            self.state
                 .measurement_floor
                 .as_ref()
                 .map(|mark| MeasurementFloor {
                     at: mark.at,
                     clock_domain: mark.clock_domain.clone(),
                     boot_id: mark.boot_id.clone(),
-                }),
+                });
+        // The controller compares the boot and the clock domain of a
+        // floor. A floor of a different timeline is not later.
+        let measurement_floor: Option<MeasurementFloor> =
+            match (seen, self.unseen_change_floor.clone()) {
+                (Some(seen), Some(unseen)) => {
+                    let same_timeline: bool =
+                        seen.clock_domain == unseen.clock_domain && seen.boot_id == unseen.boot_id;
+                    Some(if same_timeline && seen.at > unseen.at {
+                        seen
+                    } else {
+                        unseen
+                    })
+                }
+                (seen, unseen) => unseen.or(seen),
+            };
+        InstanceInhibition {
+            guards: Vec::new(),
+            pause: None,
+            measurement_floor,
         }
     }
 
@@ -646,6 +732,7 @@ impl Driver {
     fn persist(&mut self, time: &TimeReading) -> bool {
         let view: ControllerState = self.state.durable_view();
         if self.stored.as_ref() == Some(&view) {
+            self.record_health.controller_written(true);
             return true;
         }
         let written: bool = self
@@ -655,7 +742,7 @@ impl Driver {
         if written {
             self.stored = Some(view);
         }
-        self.journal_unavailable = !written;
+        self.record_health.controller_written(written);
         written
     }
 
@@ -813,6 +900,15 @@ impl Driver {
         // a step: a pause, a disabled guard, or a revoked grant that is in
         // the journal applies to the work of this tick.
         let authority_changed: bool = self.load_authority();
+        if std::mem::take(&mut self.authority_states_unseen) {
+            // "Resuming always refreshes measurements": a sample of
+            // before this tick supports no automatic action.
+            self.unseen_change_floor = Some(MeasurementFloor {
+                at: time.clock.now,
+                clock_domain: time.clock.clock_domain.clone(),
+                boot_id: time.clock.boot_id.clone(),
+            });
+        }
         self.measure_self();
         let has_new_sample: bool = sample.is_some();
         if let Some(sample) = sample {
@@ -896,7 +992,7 @@ impl Driver {
                 observations: &self.observations,
                 reports: &reports,
                 health: Health {
-                    journal_unavailable: self.journal_unavailable,
+                    journal_unavailable: self.record_health.unavailable(),
                     self_over_budget: self.over_budget,
                     stopping: self.stopping,
                     restart_backoff,
@@ -984,7 +1080,7 @@ impl Driver {
         // The conditions of the runtime are first, so that the bound
         // drops a name of a collector and not one of them.
         let mut degraded: Vec<String> = Vec::new();
-        if self.journal_unavailable {
+        if self.record_health.unavailable() {
             degraded.push("journal_unavailable".to_owned());
         }
         if let Some(reason) = &self.lifecycle.degraded_reason {
@@ -1023,9 +1119,9 @@ impl Driver {
         {
             Ok(_) => {
                 self.last_status_at = Some(time.clock.now);
-                self.journal_unavailable = false;
+                self.record_health.status_written(true);
             }
-            Err(_) => self.journal_unavailable = true,
+            Err(_) => self.record_health.status_written(false),
         }
     }
 
@@ -1188,5 +1284,38 @@ impl Driver {
         ShutdownReport {
             clean: clean && written,
         }
+    }
+}
+
+#[cfg(test)]
+mod record_health_tests {
+    use super::RecordHealth;
+
+    #[test]
+    fn a_status_write_does_not_clear_a_failed_controller_write() {
+        let mut health = RecordHealth::default();
+        assert!(!health.unavailable());
+        // The journal did not take the state of the controller, and then
+        // it took the status record of the same tick.
+        health.controller_written(false);
+        health.status_written(true);
+        assert!(health.unavailable());
+        // Only a write of the controller record clears its flag.
+        health.status_written(true);
+        assert!(health.unavailable());
+        health.controller_written(true);
+        assert!(!health.unavailable());
+        // A failed status write is its own cause.
+        health.status_written(false);
+        assert!(health.unavailable());
+        health.controller_written(true);
+        assert!(health.unavailable());
+        health.status_written(true);
+        assert!(!health.unavailable());
+        // A failed write at the start stays until the controller record
+        // is written.
+        let mut started = RecordHealth::at_start(true);
+        started.status_written(true);
+        assert!(started.unavailable());
     }
 }

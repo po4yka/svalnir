@@ -14,7 +14,7 @@ use svalnir_core::action::{
 use svalnir_core::authority::{ActionGrant, AuthorityBinding};
 use svalnir_core::grant::{
     AuthorityState, ControlClock, GuardStanding, IncidentBudget, PauseStatus, guard_standing,
-    pause_status,
+    measurement_floor, pause_status,
 };
 use svalnir_core::id::{DecisionId, IncidentId, PlanId, RuleId, StepId, TargetId, VolumeId};
 use svalnir_core::plan::{
@@ -205,24 +205,31 @@ impl<'a> Run<'a> {
         // that has no end, the status shows none.
         let mut in_effect: bool = false;
         let mut no_end: bool = false;
-        // The expiry of a pause that ended between two steps. No step saw
-        // that pause in effect, so the change of `paused` does not show it.
-        let mut expiry: Option<MonotonicNanos> = None;
         for pause in pauses {
-            match pause_status(pause, &control) {
-                PauseStatus::Paused { until, .. } => {
-                    in_effect = true;
-                    no_end |= until.is_none();
-                    self.paused_until = self.paused_until.max(until);
-                }
-                PauseStatus::Expired { floor, .. } => expiry = expiry.max(floor),
-                PauseStatus::NotPaused => {}
+            if let PauseStatus::Paused { until, .. } = pause_status(pause, &control) {
+                in_effect = true;
+                no_end |= until.is_none();
+                self.paused_until = self.paused_until.max(until);
             }
         }
         if no_end {
             self.paused_until = None;
         }
-        if let Some(expiry) = expiry {
+        // The floor of the shared rule of the grant module: the latest of
+        // the resume of the instance and the expiry of each expired
+        // pause, in the boot and the clock domain of this step. The
+        // authorization uses the same rule, so the controller makes no
+        // plan from evidence that the authorization then refuses. A pause
+        // that ended between two steps is in it: no step saw that pause
+        // in effect, so the change of `paused` does not show it. The
+        // state keeps the floor, because the pause record can go away.
+        let no_authority: AuthorityState = AuthorityState::new(self.input.principal);
+        let shared: Option<MonotonicNanos> = measurement_floor(
+            self.input.authority.unwrap_or(&no_authority),
+            self.input.inhibition,
+            &control,
+        );
+        if let Some(expiry) = shared {
             // Expiry only allows reevaluation: evidence from before it
             // supports no automatic action.
             let known: Option<MonotonicNanos> = self
@@ -254,24 +261,20 @@ impl<'a> Run<'a> {
         self.state.paused = in_effect;
     }
 
-    /// The end of the latest pause, when it is a time of this boot.
+    /// The end of the latest pause, when it is a time of this boot and of
+    /// this clock domain. [`Run::pause`] puts the floor of the shared rule
+    /// in the state before each use, so the state value has the resume of
+    /// the instance and each expired pause. A floor of a different boot
+    /// is not a floor: each measurement of the current boot is newer.
     fn floor(&self) -> Option<MonotonicNanos> {
-        let own: Option<MonotonicNanos> = self
-            .state
+        self.state
             .measurement_floor
             .as_ref()
             .filter(|mark| {
                 mark.clock_domain == self.input.time.clock.clock_domain
                     && mark.boot_id == self.input.time.clock.boot_id
             })
-            .map(|mark| mark.at);
-        let instance: Option<MonotonicNanos> = self
-            .input
-            .inhibition
-            .measurement_floor
-            .as_ref()
-            .map(|floor| floor.at);
-        own.max(instance)
+            .map(|mark| mark.at)
     }
 
     /// True when a measurement at `sampled_at` is newer than the end of

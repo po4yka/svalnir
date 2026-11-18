@@ -1572,6 +1572,42 @@ fn a_pause_in_the_journal_applies_before_the_coordinator_dispatches_the_next_ste
 }
 
 #[test]
+fn a_pause_and_a_resume_between_two_ticks_need_a_measurement_after_them() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    let active: AuthorityState = bench.seed_authority();
+    let mut child = spawn_child(false);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let mut driver = bench.start();
+    // Before each tick the user pauses and resumes the automation. The
+    // agent reads the record one time for each tick, so the controller
+    // sees no pause. The sample of the tick is from before the resume.
+    // More ticks than `run_to_operation` needs for an admission.
+    for _ in 0..45 {
+        let before: Sample = child_sample(&bench, &member);
+        bench.clock.advance(SECOND);
+        bench.write_authority(&paused(&active, bench.clock.now()));
+        bench.write_authority(&active);
+        driver.tick(Some(before));
+        assert!(
+            driver.controller_state().outstanding.is_none(),
+            "a sample from before the resume supported a plan"
+        );
+        bench.clock.advance(SAMPLE - SECOND);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(child.is_running());
+    assert!(!driver.controller_status().unwrap().paused);
+    assert_eq!(
+        blocked(&driver, Guard::Memory),
+        vec![BlockedReason::AwaitingFreshMeasurement]
+    );
+    // With no further control change, the measurements after the resume
+    // support the plan.
+    let _operation: OperationId = run_to_operation(&bench, &mut driver, &member);
+    let _report: ShutdownReport = driver.shutdown(&mut TestIdle(bench.clock.clone()));
+}
+
+#[test]
 fn a_lifecycle_record_that_is_not_readable_gives_the_longest_restart_backoff() {
     for record in [
         // A record with a field that this build does not know.

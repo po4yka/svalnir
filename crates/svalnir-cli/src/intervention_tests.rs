@@ -2453,3 +2453,160 @@ fn a_held_coordinator_lock_sends_the_acknowledgment_to_the_queue() {
     assert_eq!(recorded.result()["executor"], "transient_coordinator");
     assert_eq!(recorded.result()["operation"]["state"], "UnknownOutcome");
 }
+
+/// The arguments of a rearm of the memory incident `incident_1`.
+const REARM: [&str; 7] = [
+    "policy",
+    "rearm",
+    "memory-guard",
+    "--incident",
+    "incident_1",
+    "--generation",
+    "1",
+];
+
+/// A process of the test in the place of an agent: it holds the
+/// coordinator lock with the role of an agent, claims one request of the
+/// queue, and completes it with `completion`. It changes only the journal
+/// of the test.
+fn serve_one_rearm(
+    journal: PathBuf,
+    completion: svalnir_agent::journal::RequestCompletion,
+) -> (
+    std::sync::mpsc::Receiver<svalnir_agent::journal::QueuedRequest>,
+    std::thread::JoinHandle<()>,
+) {
+    use svalnir_agent::journal::{CoordinatorRole, JournalOptions, OperationJournal};
+
+    let (ready_send, ready) = std::sync::mpsc::channel::<()>();
+    let (claimed_send, claimed) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let lock = CoordinatorLock::try_acquire(&journal, CoordinatorRole::Agent).unwrap();
+        let mut database = OperationJournal::open(&journal, &JournalOptions::default()).unwrap();
+        let epoch = svalnir_core::id::ExecutorEpochId::new("epoch_test_agent").unwrap();
+        database
+            .begin_coordination(
+                &lock,
+                &epoch,
+                svalnir_core::time::WallTime::from_unix(1_000_000_000, 0).unwrap(),
+            )
+            .unwrap();
+        ready_send.send(()).unwrap();
+        let limit = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < limit, "no request reached the queue");
+            if let Some(request) = database.claim_next_request(&epoch).unwrap() {
+                database
+                    .complete_request(&request.request.request_id, &epoch, &completion)
+                    .unwrap();
+                claimed_send.send(request.request).unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(lock);
+    });
+    ready.recv().unwrap();
+    (claimed, handle)
+}
+
+#[test]
+fn a_rearm_with_no_agent_is_refused_and_changes_nothing() {
+    let world = World::new();
+    let refused = json(&world.environment, &REARM);
+    assert_eq!(
+        refused.error_code(),
+        "agent_not_running",
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.status.code(), 5);
+    // A client that holds the lock is not an agent.
+    world.activate("schema_version = 1\n", "none");
+    let journal: PathBuf = world.path("state").join("operations.sqlite");
+    let lock =
+        CoordinatorLock::try_acquire(&journal, svalnir_agent::journal::CoordinatorRole::Client)
+            .unwrap();
+    let refused = json(&world.environment, &REARM);
+    assert_eq!(
+        refused.error_code(),
+        "agent_not_running",
+        "{}",
+        refused.stdout
+    );
+    drop(lock);
+}
+
+#[test]
+fn a_rearm_that_the_agent_does_not_serve_in_time_stays_in_the_queue() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let journal: PathBuf = world.path("state").join("operations.sqlite");
+    // A holder of the lock that serves no request, in place of an agent.
+    let lock =
+        CoordinatorLock::try_acquire(&journal, svalnir_agent::journal::CoordinatorRole::Agent)
+            .unwrap();
+    let mut arguments: Vec<&str> = REARM.to_vec();
+    arguments.extend(["--timeout", "1s"]);
+    let pending = json(&world.environment, &arguments);
+    assert_eq!(pending.error_code(), "rearm_pending", "{}", pending.stdout);
+    // `--timeout` applies to the command.
+    assert_eq!(pending.envelope()["warnings"], serde_json::json!([]));
+    drop(lock);
+}
+
+#[test]
+fn a_rearm_that_the_agent_accepts_reports_the_new_generation() {
+    use svalnir_core::authority::Generation;
+    use svalnir_core::id::IncidentId;
+
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let journal: PathBuf = world.path("state").join("operations.sqlite");
+    let (claimed, agent) = serve_one_rearm(
+        journal,
+        svalnir_agent::journal::RequestCompletion::Rearmed {
+            incident_id: IncidentId::new("incident_1").unwrap(),
+            previous_generation: Generation::new(1),
+            new_generation: Generation::new(2),
+        },
+    );
+    let accepted = json(&world.environment, &REARM);
+    agent.join().unwrap();
+    assert_eq!(accepted.status, ExitStatus::Success, "{}", accepted.stdout);
+    let result = accepted.result();
+    assert_eq!(result["previous_generation"], "1");
+    assert_eq!(result["new_generation"], "2");
+    assert_eq!(result["executor"], "queued_for_coordinator");
+    // The queued request named the guard, the incident, and the
+    // generation of the command.
+    let request = claimed.recv().unwrap();
+    assert_eq!(
+        request.body,
+        svalnir_agent::journal::RequestBody::Rearm {
+            policy: svalnir_core::policy::PolicyId::MemoryGuard,
+            incident_id: IncidentId::new("incident_1").unwrap(),
+            generation: Generation::new(1),
+        }
+    );
+}
+
+#[test]
+fn a_rearm_that_the_agent_refuses_reports_the_reason_of_the_standing() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let journal: PathBuf = world.path("state").join("operations.sqlite");
+    let (_claimed, agent) = serve_one_rearm(
+        journal,
+        svalnir_agent::journal::RequestCompletion::Rejected {
+            error: svalnir_agent::coordinator::rearm_rejection(
+                "guard_disabled",
+                svalnir_core::action::ErrorFamily::Authority,
+            ),
+        },
+    );
+    let refused = json(&world.environment, &REARM);
+    agent.join().unwrap();
+    assert_eq!(refused.error_code(), "guard_disabled", "{}", refused.stdout);
+    assert_eq!(refused.status.code(), 3);
+}

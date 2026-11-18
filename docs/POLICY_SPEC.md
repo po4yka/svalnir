@@ -248,6 +248,10 @@ The controller summary in the README (normal, warning, acting, recovering, degra
 
 An incident closes only after its latched episodes meet their recovery conditions and no conflicting outstanding effect remains unresolved. Explicit rearm creates a separately authorized, recorded budget generation; it is not a profile toggle, policy reload, or automatic response to exhaustion. Rearm cannot recall a syscall, erase usage history, or expand helper limits.
 
+A rearm is refused while the guard has no standing: the guard is disabled, its grant is revoked or absent, or the guard has a different reason of no standing, for example an expired grant. A rearm is also refused while a pause of automation is in effect, and a retained pause of an earlier boot (section 14) is such a pause. Each refusal has its own stable code. A generation that a rearm recorded in these conditions would become usable at the next enable or resume with no new decision of the user.
+
+The budget generation is state of the controller of the agent, so only that controller records a rearm. When no agent runs, a rearm is refused: a client does not change the stored controller record, because a record of an earlier lifetime is not evidence that the incident is still open, and the agent applies its own restart rules to that record.
+
 ## 9. Disk guard
 
 ### Entry and continuation

@@ -1,20 +1,48 @@
 //! Tests of the budget generation of an incident and of its rearm.
 
 use super::super::{
-    Acceptance, GenerationBasis, IncidentBudget, IncidentCondition, IncidentUsage,
-    InstanceInhibition, MAX_BUDGET_GENERATIONS, RearmRefusal, RearmRequest, rearm,
+    Acceptance, AuthorityState, ControlClock, DisableRequest, GenerationBasis, IncidentBudget,
+    IncidentCondition, IncidentUsage, InhibitedGuard, InhibitionCause, InstanceInhibition,
+    MAX_BUDGET_GENERATIONS, PauseRequest, Rearm, RearmRefusal, RearmRequest, RefusalReason,
+    RevokeRequest, disable, pause, rearm as rearm_with, revoke,
 };
 use super::{
-    USER, active_state, clock, config, enabled, enabled_state, incident_id, monotonic, wall,
+    USER, active_state, clock, clock_in, config, control, durable, enabled, enabled_state,
+    grant_id, incident_id, monotonic, wall,
 };
+use crate::action::ErrorFamily;
 use crate::authority::Generation;
 use crate::id::{BootId, ClockDomainId, IncidentId};
-use crate::policy::{Cooldown, CooldownCause, PolicyId, WorkUsage};
+use crate::policy::{Cooldown, CooldownCause, EvaluationClock, PolicyId, WorkUsage};
 use crate::process::Uid;
-use crate::quantity::{Bytes, EntryCount};
+use crate::quantity::{Bytes, EntryCount, Nanoseconds};
+use crate::time::WallTime;
 
 const DISK: PolicyId = PolicyId::DiskGuard;
 const MEMORY: PolicyId = PolicyId::MemoryGuard;
+
+/// A rearm in an instance with no inhibition, at the monotonic time `at`
+/// and the wall-clock time `now`.
+fn rearm(
+    state: &AuthorityState,
+    budget: &IncidentBudget,
+    condition: &IncidentCondition<'_>,
+    request: &RearmRequest,
+    at: &EvaluationClock,
+    now: WallTime,
+) -> Result<Rearm, RearmRefusal> {
+    rearm_with(
+        state,
+        &InstanceInhibition::default(),
+        budget,
+        condition,
+        request,
+        &ControlClock {
+            clock: at,
+            wall: now,
+        },
+    )
+}
 
 fn memory_budget() -> IncidentBudget {
     IncidentBudget::open(
@@ -467,4 +495,184 @@ fn a_record_with_an_erased_history_is_not_rearmed() {
     let next = rearm(&state, &granted, &condition, &request(4), &at, wall(600)).unwrap();
     assert!(next.budget.volatile_exception_at_open);
     assert_eq!(next.budget.history.len(), 5);
+}
+
+/// The refusal of a rearm of the memory incident in `state` and
+/// `inhibition` at second 600 of `at`.
+fn standing_refusal(
+    state: &AuthorityState,
+    inhibition: &InstanceInhibition,
+    at: &EvaluationClock,
+) -> RearmRefusal {
+    rearm_with(
+        state,
+        inhibition,
+        &memory_budget(),
+        &settled(memory_usage(3, 0)),
+        &request(1),
+        &control(at, 600),
+    )
+    .unwrap_err()
+}
+
+#[test]
+fn a_rearm_of_a_disabled_guard_is_refused() {
+    let disabled = durable(
+        disable(
+            &enabled_state(),
+            &DisableRequest {
+                principal: USER,
+                policy: MEMORY,
+            },
+        )
+        .unwrap(),
+    )
+    .state;
+    let refusal = standing_refusal(&disabled, &InstanceInhibition::default(), &clock(600));
+    assert_eq!(
+        refusal,
+        RearmRefusal::NotAuthorized(RefusalReason::GuardDisabled)
+    );
+    assert_eq!(refusal.code(), "guard_disabled");
+    assert_eq!(refusal.family(), ErrorFamily::Authority);
+    // A disable that the running instance keeps after a failed write.
+    let inhibited = InstanceInhibition {
+        guards: vec![InhibitedGuard {
+            policy: MEMORY,
+            cause: InhibitionCause::Disable,
+        }],
+        ..InstanceInhibition::default()
+    };
+    assert_eq!(
+        standing_refusal(&enabled_state(), &inhibited, &clock(600)).code(),
+        "guard_inhibited"
+    );
+}
+
+#[test]
+fn a_rearm_of_a_guard_whose_grant_is_revoked_or_absent_is_refused() {
+    let revoked = durable(
+        revoke(
+            &enabled_state(),
+            &RevokeRequest {
+                principal: USER,
+                grant_id: grant_id("grant_memory"),
+            },
+        )
+        .unwrap(),
+    )
+    .state;
+    let refusal = standing_refusal(&revoked, &InstanceInhibition::default(), &clock(600));
+    assert_eq!(
+        refusal,
+        RearmRefusal::NotAuthorized(RefusalReason::ActionGrantRevoked)
+    );
+    assert_eq!(refusal.code(), "action_grant_revoked");
+    // The revision is in effect, and the memory guard was never enabled.
+    let no_grant = enabled(
+        &active_state(&super::base_config()),
+        DISK,
+        &[Acceptance::PermanentEviction],
+    );
+    let refusal = standing_refusal(&no_grant, &InstanceInhibition::default(), &clock(600));
+    assert_eq!(refusal.code(), "guard_disabled");
+    // A guard entry that is enabled and has no grant.
+    let mut granted_none = enabled_state();
+    for guard in &mut granted_none.guards {
+        if guard.policy == MEMORY {
+            guard.grant = None;
+        }
+    }
+    assert_eq!(
+        standing_refusal(&granted_none, &InstanceInhibition::default(), &clock(600)),
+        RearmRefusal::NotAuthorized(RefusalReason::ActionGrantMissing)
+    );
+    // No record at all.
+    assert_eq!(
+        standing_refusal(
+            &AuthorityState::new(USER),
+            &InstanceInhibition::default(),
+            &clock(600)
+        )
+        .code(),
+        "no_active_policy_revision"
+    );
+}
+
+#[test]
+fn a_rearm_while_a_pause_is_in_effect_is_refused() {
+    let at = clock(100);
+    let paused = durable(
+        pause(
+            &enabled_state(),
+            &PauseRequest {
+                principal: USER,
+                duration: Some(Nanoseconds::new(3_600 * super::SECOND)),
+            },
+            &control(&at, 100),
+        )
+        .unwrap(),
+    )
+    .state;
+    let expected = RearmRefusal::NotAuthorized(RefusalReason::AutomationPaused);
+    let refusal = standing_refusal(&paused, &InstanceInhibition::default(), &clock(600));
+    assert_eq!(refusal, expected);
+    assert_eq!(refusal.code(), "automation_paused");
+    assert_eq!(refusal.family(), ErrorFamily::Authority);
+    // The retained pause of an earlier boot: the wall clock at second 600
+    // is before its recorded expiry, and a later wall clock does not end
+    // it either.
+    let rebooted = clock_in("boot_2", 600);
+    assert_eq!(
+        rearm_with(
+            &paused,
+            &InstanceInhibition::default(),
+            &memory_budget(),
+            &settled(memory_usage(3, 0)),
+            &request(1),
+            &control(&rebooted, 100 + 10 * 3_600),
+        )
+        .unwrap_err(),
+        expected
+    );
+    // A pause that only the running instance has.
+    let volatile = InstanceInhibition {
+        pause: paused.pause.clone(),
+        ..InstanceInhibition::default()
+    };
+    assert_eq!(
+        standing_refusal(&enabled_state(), &volatile, &clock(600)),
+        expected
+    );
+    // After the expiry, in the boot of the pause, the rearm is accepted.
+    let after = clock(100 + 3_600);
+    let accepted = rearm_with(
+        &paused,
+        &InstanceInhibition::default(),
+        &memory_budget(),
+        &settled(memory_usage(3, 0)),
+        &request(1),
+        &control(&after, 100 + 3_600),
+    )
+    .unwrap();
+    assert_eq!(accepted.new_generation, Generation::new(2));
+}
+
+#[test]
+fn a_rearm_of_an_active_guard_is_accepted_and_changes_no_record() {
+    let state = enabled_state();
+    let budget = memory_budget();
+    let result = rearm_with(
+        &state,
+        &InstanceInhibition::default(),
+        &budget,
+        &settled(memory_usage(3, 0)),
+        &request(1),
+        &control(&clock(600), 600),
+    )
+    .unwrap();
+    assert_eq!(result.previous_generation, Generation::new(1));
+    assert_eq!(result.new_generation, Generation::new(2));
+    assert_eq!(result.budget.history[1].started_at, wall(600));
+    assert_eq!(state, enabled_state());
 }

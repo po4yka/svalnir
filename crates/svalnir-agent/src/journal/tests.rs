@@ -7,6 +7,7 @@ mod coordination;
 mod durable;
 mod failure;
 mod incident;
+mod rearm;
 mod review;
 mod volatile;
 

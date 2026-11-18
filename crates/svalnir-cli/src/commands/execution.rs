@@ -19,15 +19,15 @@ use std::time::{Duration, Instant};
 use svalnir_agent::controller::{AuthorityRecords, SharedAuthority};
 use svalnir_agent::coordinator::{
     ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies, Idle, Phase,
-    Progress, Start, SystemProbe,
+    Progress, Start, SystemProbe, code,
 };
 use svalnir_agent::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
 use svalnir_agent::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
 use svalnir_agent::journal::{
-    AgentRecord, Enqueued, OperationJournal, QueuedRequest, RequestBody, RequestCompletion,
-    RequestStatus,
+    AgentRecord, CoordinatorLock, CoordinatorRole, Enqueued, LockState, OperationJournal,
+    QueuedRequest, RequestBody, RequestCompletion, RequestStatus,
 };
 use svalnir_agent::platform::memory::CollectionContext;
 use svalnir_agent::platform::process::DarwinProcessSource;
@@ -38,8 +38,9 @@ use svalnir_agent::runtime::{AgentClock, ClockHandle, ThreadIdle};
 use svalnir_core::action::{
     ActionError, Operation, OperationState, Plan, PlanApproval, TargetBinding,
 };
+use svalnir_core::authority::Generation;
 use svalnir_core::file::LosslessPath;
-use svalnir_core::grant::AuthorityState;
+use svalnir_core::grant::{AuthorityState, RearmRequest};
 use svalnir_core::id::{AdapterId, ExecutorEpochId, OperationId, RequestId};
 use svalnir_core::policy::ControlPlaneProcess;
 use svalnir_core::quantity::Nanoseconds;
@@ -150,7 +151,7 @@ fn coordinator_config() -> Result<CoordinatorConfig, ErrorBody> {
         batch_targets: 8,
         poll_interval: Nanoseconds::new(250_000_000),
         volatile_capacity: 16,
-        role: svalnir_agent::journal::CoordinatorRole::Client,
+        role: CoordinatorRole::Client,
     })
 }
 
@@ -510,46 +511,72 @@ pub(crate) fn acknowledge(
             journal
                 .enqueue_request(&request)
                 .map_err(|error| journal_error(&error))?;
-            wait_for_acknowledgment(
+            let pending = Pending {
+                code: "acknowledgment_pending",
+                served: "the acknowledgment",
+                message: "the coordinator did not serve the acknowledgment before the end of the wait; the request stays in the queue; query the operation again with `svalnir operations show`",
+            };
+            match wait_for_completion(
                 &journal,
                 &database,
                 request_id,
                 timeout.unwrap_or(ACKNOWLEDGE_WAIT),
-            )
+                &pending,
+            )? {
+                RequestCompletion::Acknowledged {
+                    acknowledged_at,
+                    repeated,
+                } => Ok(Acknowledgment::Recorded {
+                    acknowledged_at,
+                    repeated,
+                    executor: Executor::QueuedForCoordinator,
+                }),
+                RequestCompletion::Rejected { error } => Ok(Acknowledgment::Refused(error)),
+                _ => Err(unexpected_completion()),
+            }
         }
     }
 }
 
-/// Reads the queue until the coordinator completes the acknowledgment
-/// request `request_id`.
-fn wait_for_acknowledgment(
+/// The end of a wait for a queued request that the coordinator did not
+/// serve in time.
+struct Pending {
+    /// The error code.
+    code: &'static str,
+    /// The request, for the message of a stopped coordinator.
+    served: &'static str,
+    /// The message.
+    message: &'static str,
+}
+
+/// The error for a completion of a different kind than the request: the
+/// request identity names a different request.
+fn unexpected_completion() -> ErrorBody {
+    ErrorBody::new(
+        "journal_conflict",
+        ErrorFamily::Evidence,
+        ErrorStage::Dispatch,
+        "the request queue has a completion of a different kind for this request identity; the command made no change",
+    )
+    .with_next_action(NextAction::RefreshObservation)
+}
+
+/// Reads the queue until the coordinator completes the request
+/// `request_id`, and returns its completion.
+fn wait_for_completion(
     journal: &OperationJournal,
     database: &std::path::Path,
     request_id: &RequestId,
     timeout: Duration,
-) -> Result<Acknowledgment, ErrorBody> {
+    pending: &Pending,
+) -> Result<RequestCompletion, ErrorBody> {
     let started: Instant = Instant::now();
     let mut reads: u32 = 0;
     let mut failed_reads: u32 = 0;
     loop {
         reads = reads.wrapping_add(1);
         match journal.request_status(request_id) {
-            Ok(Some(RequestStatus::Completed {
-                completion:
-                    RequestCompletion::Acknowledged {
-                        acknowledged_at,
-                        repeated,
-                    },
-            })) => {
-                return Ok(Acknowledgment::Recorded {
-                    acknowledged_at,
-                    repeated,
-                    executor: Executor::QueuedForCoordinator,
-                });
-            }
-            Ok(Some(RequestStatus::Completed {
-                completion: RequestCompletion::Rejected { error },
-            })) => return Ok(Acknowledgment::Refused(error)),
+            Ok(Some(RequestStatus::Completed { completion })) => return Ok(completion),
             Ok(_) => failed_reads = 0,
             // A busy journal is read again: a different process writes to
             // it.
@@ -567,20 +594,112 @@ fn wait_for_acknowledgment(
                 "coordinator_stopped",
                 ErrorFamily::Evidence,
                 ErrorStage::Dispatch,
-                "the process that held the coordinator lock stopped before it served the acknowledgment; the request is in the queue and the next coordinator serves it",
+                format!(
+                    "the process that held the coordinator lock stopped before it served {}; the request is in the queue and the next coordinator serves it",
+                    pending.served
+                ),
             )
             .with_next_action(NextAction::RefreshObservation));
         }
         if started.elapsed() >= timeout {
             return Err(ErrorBody::new(
-                "acknowledgment_pending",
+                pending.code,
                 ErrorFamily::Limits,
                 ErrorStage::Dispatch,
-                "the coordinator did not serve the acknowledgment before the end of the wait; the request stays in the queue; query the operation again with `svalnir operations show`",
+                pending.message,
             )
             .with_next_action(NextAction::RefreshObservation));
         }
         std::thread::sleep(QUEUE_POLL);
+    }
+}
+
+/// The longest wait for the agent that serves a queued rearm, when the
+/// command has no `--timeout`.
+const REARM_WAIT: Duration = Duration::from_secs(30);
+
+/// The result of a rearm request that the agent decided.
+pub(crate) enum RearmResult {
+    /// The controller of the agent recorded the new budget generation.
+    Rearmed {
+        /// The generation that the rearm ended.
+        previous_generation: Generation,
+        /// The generation that the rearm authorized.
+        new_generation: Generation,
+    },
+    /// The agent refused the rearm. Nothing changed.
+    Refused(ActionError),
+}
+
+/// Sends a rearm request to the agent through the queue of the journal and
+/// waits for its completion.
+///
+/// The budget generation of an incident is state of the controller of the
+/// agent. With no agent that holds the coordinator lock, no process can
+/// give the agent a generation, so the command is refused with
+/// `agent_not_running` and the client makes no state directory, no
+/// journal, and no request.
+///
+/// # Errors
+///
+/// Returns `agent_not_running` when no agent holds the coordinator lock,
+/// a journal error, `coordinator_stopped` when the agent stops before it
+/// serves the request, and `rearm_pending` when the wait ends first.
+pub(crate) fn rearm(
+    environment: &Environment,
+    request: &RearmRequest,
+    request_id: &RequestId,
+    timeout: Option<Duration>,
+) -> Result<RearmResult, ErrorBody> {
+    let database = environment.journal_path()?;
+    if !matches!(
+        CoordinatorLock::probe(&database),
+        Ok(LockState::Held(CoordinatorRole::Agent))
+    ) {
+        return Err(ErrorBody::new(
+            code::AGENT_NOT_RUNNING,
+            ErrorFamily::Evidence,
+            ErrorStage::Dispatch,
+            "no agent holds the coordinator lock; the budget generation of an incident is in the controller record of the agent, so only a running agent can rearm it; start the agent with `svalnir agent install` and run the command again; the command made no change",
+        )
+        .with_next_action(NextAction::RefreshObservation));
+    }
+    let mut journal: OperationJournal = open_journal(environment)?;
+    let queued = QueuedRequest {
+        request_id: request_id.clone(),
+        principal: session::principal(),
+        body: RequestBody::Rearm {
+            policy: request.policy,
+            incident_id: request.incident_id.clone(),
+            generation: request.generation,
+        },
+        enqueued_at: session::wall_now(),
+    };
+    journal
+        .enqueue_request(&queued)
+        .map_err(|error| journal_error(&error))?;
+    let pending = Pending {
+        code: "rearm_pending",
+        served: "the rearm",
+        message: "the agent did not serve the rearm before the end of the wait; the request stays in the queue, and the agent decides it at a later tick; read the incident again with `svalnir agent status`",
+    };
+    match wait_for_completion(
+        &journal,
+        &database,
+        request_id,
+        timeout.unwrap_or(REARM_WAIT),
+        &pending,
+    )? {
+        RequestCompletion::Rearmed {
+            previous_generation,
+            new_generation,
+            ..
+        } => Ok(RearmResult::Rearmed {
+            previous_generation,
+            new_generation,
+        }),
+        RequestCompletion::Rejected { error } => Ok(RearmResult::Refused(error)),
+        _ => Err(unexpected_completion()),
     }
 }
 

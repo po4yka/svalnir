@@ -62,6 +62,7 @@
 
 mod authority;
 mod model;
+mod rearm;
 mod step;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -76,4 +77,5 @@ pub use self::model::{
     PriorState, QuietMark, ReduceReason, ReportedCondition, RuleUsage, StepInput, StepOutput,
     Summary, TriggerKey, TriggerRecord,
 };
+pub use self::rearm::RearmFailure;
 pub use self::step::step;

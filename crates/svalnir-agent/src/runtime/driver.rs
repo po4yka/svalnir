@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use svalnir_core::action::{OperationState, PlanApproval, ResourceEffect};
+use svalnir_core::action::{ErrorFamily, OperationState, PlanApproval, ResourceEffect};
 use svalnir_core::config::{ValidatedConfig, parse_and_validate};
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::file::LosslessPath;
-use svalnir_core::grant::{AuthorityState, InstanceInhibition, MeasurementFloor};
+use svalnir_core::grant::{AuthorityState, ControlClock, InstanceInhibition, MeasurementFloor};
 use svalnir_core::id::{ExecutorEpochId, OperationId};
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{ByteDelta, Bytes, Nanoseconds};
@@ -37,11 +37,12 @@ use crate::controller::{
 use crate::coordinator::{
     ApplicationExecutor, ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies,
     FilesystemExecutor, IdSource, Idle, Measurements, OperationView, Phase, Start, StartError,
-    TargetProbe, TimeReading,
+    TargetProbe, TimeReading, code, rearm_rejection,
 };
 use crate::executor::fs::ApprovedRoots;
 use crate::journal::{
     AgentRecord, CoordinatorRole, JournalOptions, OperationJournal, OperationJournalError,
+    RequestCompletion,
 };
 use crate::store::{EncodedSample, RetentionPolicy, Store};
 
@@ -793,6 +794,63 @@ impl Driver {
         (worked, wake_at)
     }
 
+    /// Decides the rearm request that the coordinator claimed, when it has
+    /// one, and records its completion. Returns `true` when a request was
+    /// decided.
+    ///
+    /// The controller checks the request against the authority record of
+    /// this tick and the inhibition of this instance. An accepted rearm is
+    /// in effect only when the journal recorded the controller state with
+    /// the new generation: when that write fails, the earlier state stays,
+    /// and the request is rejected with `rearm_not_recorded`.
+    fn serve_rearm(&mut self, time: &TimeReading) -> bool {
+        let Some(pending) = self
+            .coordinator
+            .as_mut()
+            .and_then(|coordinator| coordinator.take_rearm())
+        else {
+            return false;
+        };
+        let authority: AuthorityState = self
+            .authority
+            .records()
+            .state
+            .clone()
+            .unwrap_or_else(|| AuthorityState::new(self.settings.principal));
+        let inhibition: InstanceInhibition = self.inhibition();
+        let control: ControlClock<'_> = ControlClock {
+            clock: &time.clock,
+            wall: time.wall,
+        };
+        let before: ControllerState = self.state.clone();
+        let completion: RequestCompletion = match self.state.rearm(
+            &authority,
+            &inhibition,
+            &pending.request,
+            &control,
+            &self.epoch,
+        ) {
+            Ok(rearm) if self.persist(time) => RequestCompletion::Rearmed {
+                incident_id: pending.request.incident_id.clone(),
+                previous_generation: rearm.previous_generation,
+                new_generation: rearm.new_generation,
+            },
+            Ok(_) => {
+                self.state = before;
+                RequestCompletion::Rejected {
+                    error: rearm_rejection(code::REARM_NOT_RECORDED, ErrorFamily::Recording),
+                }
+            }
+            Err(failure) => RequestCompletion::Rejected {
+                error: rearm_rejection(failure.code(), failure.family()),
+            },
+        };
+        if let Some(coordinator) = self.coordinator.as_mut() {
+            coordinator.complete_rearm(pending.request_id, completion);
+        }
+        true
+    }
+
     /// Measures the footprint of the agent against its budget.
     fn measure_self(&mut self) {
         self.last_footprint = self.footprint.footprint();
@@ -916,6 +974,8 @@ impl Driver {
             time = after;
         }
         let (mut worked, mut wake_at) = self.run_coordinator();
+        let rearmed: bool = self.serve_rearm(&time);
+        worked |= rearmed;
         self.collect_finished(&time);
 
         // The controller evaluates a new sample, a report, a plan in
@@ -931,6 +991,7 @@ impl Driver {
         });
         let evaluate: bool = has_new_sample
             || authority_changed
+            || rearmed
             || stale
             || self.stopping
             || self.last_status.is_none()

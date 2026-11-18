@@ -101,6 +101,7 @@ mod dispatch;
 mod error;
 mod ledger;
 mod ports;
+mod rearm;
 mod recovery;
 #[cfg(test)]
 mod tests;
@@ -114,11 +115,12 @@ pub use self::core::{
     MAX_KNOWN_PLANS, MAX_MEASURED_VOLUMES, MAX_WAITING_OPERATIONS, Progress, Start,
     approved_roots_of,
 };
-pub use self::error::{CoordinatorError, StartError, code};
+pub use self::error::{CoordinatorError, StartError, code, rearm_rejection};
 pub use self::ledger::{IncidentAllowance, MAX_INCIDENTS, MAX_LEASES, Pacing};
 pub use self::ports::{
     ApplicationExecutor, AuthoritySource, Clock, CoordinatorJournal, FileProbe, FilesystemExecutor,
     IdSource, Measurements, RevisionSnapshot, SystemProbe, TargetProbe, TimeReading,
     TriggerStanding,
 };
+pub use self::rearm::PendingRearm;
 pub use self::recovery::{HELD_RECONCILIATION_INTERVAL, MAX_RECONCILED_OPERATIONS};

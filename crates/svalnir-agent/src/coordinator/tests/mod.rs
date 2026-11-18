@@ -13,6 +13,7 @@ mod budget;
 mod children;
 mod cleanup;
 mod queue;
+mod rearm;
 mod recording;
 mod review;
 mod stop;

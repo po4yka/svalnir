@@ -93,6 +93,20 @@ pub mod code {
     pub const OPERATION_NOT_UNKNOWN_OUTCOME: &str = "operation_not_unknown_outcome";
     /// The journal did not record the acknowledgment.
     pub const ACKNOWLEDGMENT_NOT_RECORDED: &str = "acknowledgment_not_recorded";
+    /// A rearm request reached a coordinator that is not an agent: only
+    /// the controller of the agent has the budget generation of an
+    /// incident.
+    pub const AGENT_NOT_RUNNING: &str = "agent_not_running";
+    /// The journal did not record the controller state with the new
+    /// budget generation, so the rearm is not in effect.
+    pub const REARM_NOT_RECORDED: &str = "rearm_not_recorded";
+}
+
+/// The rejection of a queued rearm request, for
+/// [`super::Coordinator::complete_rearm`]. It names no plan and no
+/// operation.
+pub fn rearm_rejection(code: &str, family: ErrorFamily) -> ActionError {
+    action_error(code, family, ActionStage::Admission, None, None, None)
 }
 
 /// The reason the coordinator did not start.

@@ -67,7 +67,7 @@ pub(super) const fn check_count(
 }
 
 /// A standing policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum PolicyId {

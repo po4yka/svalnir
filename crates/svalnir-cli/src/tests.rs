@@ -195,8 +195,8 @@ const EMPTY_STATE_COMMANDS: &[(&[&str], u8, Option<&str>)] = &[
             "--generation",
             "2",
         ],
-        3,
-        Some("rearm_not_available"),
+        5,
+        Some("agent_not_running"),
     ),
     (
         &[

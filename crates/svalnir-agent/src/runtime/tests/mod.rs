@@ -9,6 +9,9 @@
 //! the state directory, the home directory, or the Trash of the user.
 
 #![cfg(target_os = "macos")]
+
+mod rearm;
+
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;

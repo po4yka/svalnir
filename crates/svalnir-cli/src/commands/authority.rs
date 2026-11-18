@@ -13,15 +13,15 @@ use std::time::Duration;
 use serde::Serialize;
 use svalnir_agent::journal::{AgentRecord, OperationJournal, OperationJournalError};
 use svalnir_core::action::ActionClass;
-use svalnir_core::authority::ActionGrantRef;
+use svalnir_core::authority::{ActionGrantRef, Generation};
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::grant::{
     Acceptance, Acknowledged, AcknowledgementLevel, ActivationRefusal, ActivationReport,
     ActivationRequest, AuthorityState, Change, ControlRefusal, DisableRequest, EnableRefusal,
     EnableReport, EnableRequest, GuardStanding, InstanceInhibition, PauseBasis, PauseReport,
-    PauseRequest, PauseStatus, Persistence, RestrictionReport, ResumeReport, ResumeRequest,
-    activate, disable, enable, guard_standing, pause, pause_status, resume,
+    PauseRequest, PauseStatus, Persistence, RearmRequest, RestrictionReport, ResumeReport,
+    ResumeRequest, activate, disable, enable, guard_standing, pause, pause_status, resume,
 };
 use svalnir_core::id::{ActionGrantId, IncidentId, PolicyRevisionId};
 use svalnir_core::policy::PolicyId;
@@ -545,17 +545,50 @@ pub(crate) fn policy_disable(
     emit_control("policy disable", acknowledged, record_changed, invocation)
 }
 
-/// `policy rearm`: this build has no channel that gives a new budget
-/// generation to the controller of the agent, so the command validates its
-/// arguments and reports the missing capability.
+/// The report of `policy rearm`.
+#[derive(Debug, Clone, Serialize)]
+struct RearmView {
+    command: &'static str,
+    policy: &'static str,
+    incident_id: IncidentId,
+    previous_generation: Generation,
+    new_generation: Generation,
+    executor: super::execution::Executor,
+    note: &'static str,
+}
+
+const REARM_NOTE: &str = "The controller of the agent recorded the new budget generation. The usage of each earlier generation stays in the history. A rearm does not end a cooldown, does not settle an operation, and does not resolve an unknown outcome.";
+
+impl RearmView {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        put_line!(out, "svalnir {}: rearmed", self.command);
+        put_line!(
+            out,
+            "Incident {} of {}: generation {} replaces generation {}",
+            self.incident_id,
+            self.policy,
+            self.new_generation,
+            self.previous_generation
+        );
+        put_line!(out, "\n{}", escape(self.note));
+        out
+    }
+}
+
+/// `policy rearm`: sends the rearm to the controller of the agent through
+/// the request queue of the journal. The agent checks the standing of the
+/// guard, the pause, the generation, and the condition of the incident,
+/// and records the new budget generation. With no agent, the command is
+/// refused with `agent_not_running`.
 pub(crate) fn policy_rearm(
     arguments: &PolicyRearmArgs,
-    _invocation: &mut Invocation<'_>,
+    invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    IncidentId::new(arguments.incident.as_str()).map_err(|_| {
+    let incident_id: IncidentId = IncidentId::new(arguments.incident.as_str()).map_err(|_| {
         session::invalid_identifier("invalid_incident", "incident ID", &["incident"])
     })?;
-    arguments.generation.parse::<u64>().map_err(|_| {
+    let generation: u64 = arguments.generation.parse::<u64>().map_err(|_| {
         ErrorBody::new(
             "invalid_generation",
             ErrorFamily::Request,
@@ -564,17 +597,39 @@ pub(crate) fn policy_rearm(
         )
         .with_fields(&["generation"])
     })?;
-    Err(ErrorBody::new(
-        "rearm_not_available",
-        ErrorFamily::Native,
-        ErrorStage::Dispatch,
-        format!(
-            "`svalnir policy rearm {}` is not available in this build: the incident budgets are in the controller record of the agent, and this build has no request that gives the agent a new budget generation; the command made no change",
-            policy_id(arguments.policy.policy).as_str()
-        ),
-    )
-    .with_next_action(NextAction::None)
-    .into())
+    let policy: PolicyId = policy_id(arguments.policy.policy);
+    let request = RearmRequest {
+        principal: session::current_uid(),
+        policy,
+        incident_id: incident_id.clone(),
+        generation: Generation::new(generation),
+    };
+    let result = super::execution::rearm(
+        invocation.environment,
+        &request,
+        invocation.request_id,
+        invocation.timeout,
+    )?;
+    let (previous_generation, new_generation) = match result {
+        super::execution::RearmResult::Rearmed {
+            previous_generation,
+            new_generation,
+        } => (previous_generation, new_generation),
+        super::execution::RearmResult::Refused(error) => {
+            return Err(session::action_error(&error, "the rearm").into());
+        }
+    };
+    let view = RearmView {
+        command: "policy rearm",
+        policy: policy.as_str(),
+        incident_id,
+        previous_generation,
+        new_generation,
+        executor: super::execution::Executor::QueuedForCoordinator,
+        note: REARM_NOTE,
+    };
+    invocation.emit(Kind::Report, &view, RearmView::render)?;
+    Ok(ExitStatus::Success)
 }
 
 /// The report of `agent pause`.

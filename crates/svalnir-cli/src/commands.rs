@@ -353,6 +353,8 @@ fn waits_for_an_operation(command: &Command) -> bool {
             command: OperationsCommand::Wait(_) | OperationsCommand::Acknowledge(_)
         } | Command::Processes {
             command: ProcessesCommand::Stop(_)
+        } | Command::Policy {
+            command: PolicyCommand::Rearm(_)
         }
     )
 }

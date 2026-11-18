@@ -5,16 +5,21 @@
 //! new authorized budget generation and keeps the usage of each earlier
 //! generation. It does not end a cooldown, it does not settle an operation,
 //! it does not resolve an unknown outcome, and it does not change a helper
-//! limit.
+//! limit. A rearm is separately authorized: it is refused while the guard
+//! has no standing (disabled, a revoked or absent grant) and while a pause
+//! is in effect.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::authorize::{RefusalReason, standing_refusal};
 use super::guard::{GuardStanding, guard_standing};
+use super::pause::{ControlClock, pause_status};
 use super::state::{AuthorityState, InstanceInhibition, policy_id};
+use crate::action::ErrorFamily;
 use crate::authority::Generation;
 use crate::id::IncidentId;
-use crate::policy::{Cooldown, CooldownStatus, EvaluationClock, PolicyId, WorkUsage};
+use crate::policy::{Cooldown, CooldownStatus, PolicyId, WorkUsage};
 use crate::process::Uid;
 use crate::time::WallTime;
 
@@ -193,6 +198,15 @@ pub enum RearmRefusal {
     /// The request names a different incident or guard than the record.
     #[error("the request does not name the incident of the record")]
     UnknownIncident,
+    /// The guard has no automatic authority, or a pause is in effect. The
+    /// reason is that of the authorization:
+    /// [`RefusalReason::GuardDisabled`], [`RefusalReason::ActionGrantRevoked`],
+    /// [`RefusalReason::ActionGrantMissing`],
+    /// [`RefusalReason::AutomationPaused`], or a different reason of a guard
+    /// with no standing. A generation that the rearm recorded now would be
+    /// usable at the next enable or resume with no new decision of the user.
+    #[error("the guard has no standing for a rearm: {0}")]
+    NotAuthorized(RefusalReason),
     /// The request names a budget generation that is not the current one.
     /// The user must look at the incident again.
     #[error("the budget generation {requested} is not the current generation {current}")]
@@ -220,6 +234,38 @@ pub enum RearmRefusal {
     /// become larger.
     #[error("the budget record of the incident is not usable")]
     RecordNotUsable,
+}
+
+impl RearmRefusal {
+    /// The stable error code of the refusal. A refusal of the standing has
+    /// the code of its authorization reason.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::WrongPrincipal => "wrong_principal",
+            Self::UnknownIncident => "incident_not_found",
+            Self::NotAuthorized(reason) => reason.code(),
+            Self::GenerationConflict { .. } => "generation_conflict",
+            Self::OperationUnsettled => "incident_operation_unsettled",
+            Self::UnknownOutcome => "incident_outcome_unknown",
+            Self::UsageMismatch | Self::RecordNotUsable => "incident_record_not_usable",
+            Self::HistoryFull => "budget_generations_exhausted",
+        }
+    }
+
+    /// The error family of the refusal (`docs/ACTION_CONTRACTS.md`
+    /// section 10).
+    pub const fn family(&self) -> ErrorFamily {
+        match self {
+            Self::WrongPrincipal => ErrorFamily::Authority,
+            Self::NotAuthorized(reason) => reason.family(),
+            Self::UnknownIncident
+            | Self::GenerationConflict { .. }
+            | Self::UsageMismatch
+            | Self::RecordNotUsable => ErrorFamily::Evidence,
+            Self::OperationUnsettled | Self::HistoryFull => ErrorFamily::Limits,
+            Self::UnknownOutcome => ErrorFamily::Outcome,
+        }
+    }
 }
 
 /// The result of a rearm.
@@ -269,22 +315,38 @@ fn history_is_complete(budget: &IncidentBudget) -> bool {
 /// it uses the new generation; when the write fails, the earlier record
 /// applies.
 ///
+/// The rearm is separately authorized (`docs/POLICY_SPEC.md` section 8).
+/// The guard must have the standing [`GuardStanding::Active`] in `state`
+/// less `inhibition` at the wall-clock time of `clock`, and no pause of
+/// the record or of the instance may be in effect at `clock`, a retained
+/// pause of an earlier boot included.
+///
 /// # Errors
 ///
 /// Returns a [`RearmRefusal`] with the first condition that is not true.
 pub fn rearm(
     state: &AuthorityState,
+    inhibition: &InstanceInhibition,
     budget: &IncidentBudget,
     condition: &IncidentCondition<'_>,
     request: &RearmRequest,
-    clock: &EvaluationClock,
-    now: WallTime,
+    clock: &ControlClock<'_>,
 ) -> Result<Rearm, RearmRefusal> {
     if request.principal != state.principal {
         return Err(RearmRefusal::WrongPrincipal);
     }
     if request.incident_id != budget.incident_id || request.policy != budget.policy {
         return Err(RearmRefusal::UnknownIncident);
+    }
+    let standing: GuardStanding = guard_standing(state, inhibition, request.policy, clock.wall);
+    if let Some(reason) = standing_refusal(standing) {
+        return Err(RearmRefusal::NotAuthorized(reason));
+    }
+    let paused: bool = [state.pause.as_ref(), inhibition.pause.as_ref()]
+        .into_iter()
+        .any(|pause| pause_status(pause, clock).is_paused());
+    if paused {
+        return Err(RearmRefusal::NotAuthorized(RefusalReason::AutomationPaused));
     }
     if request.generation != budget.generation {
         return Err(RearmRefusal::GenerationConflict {
@@ -329,14 +391,14 @@ pub fn rearm(
         generation: new_generation,
         basis: GenerationBasis::Rearmed,
         authorized_by: Some(request.principal),
-        started_at: now,
+        started_at: clock.wall,
         final_usage: None,
     });
     next.generation = new_generation;
     let cooldowns_in_force: Vec<Cooldown> = condition
         .cooldowns
         .iter()
-        .filter(|cooldown| cooldown.status(clock) != CooldownStatus::Elapsed)
+        .filter(|cooldown| cooldown.status(clock.clock) != CooldownStatus::Elapsed)
         .cloned()
         .collect();
     Ok(Rearm {

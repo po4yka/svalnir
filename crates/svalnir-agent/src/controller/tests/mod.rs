@@ -1,6 +1,7 @@
 //! Tests of the controller step with injected observations. No test
 //! reads a clock, a file, or a process, and no test changes the host.
 
+mod rearm;
 pub(crate) mod support;
 
 use svalnir_core::action::{ActionClass, Escalation, Plan, TargetBinding, TriggerClass};

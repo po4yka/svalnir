@@ -19,8 +19,10 @@ use svalnir_core::action::{
     ActionError, ActionStage, DispatchState, ErrorCode, ErrorFamily, PlanApproval, Principal,
     StopFence,
 };
+use svalnir_core::authority::Generation;
 use svalnir_core::digest::ContentDigest;
-use svalnir_core::id::{ExecutorEpochId, OperationId, RequestId};
+use svalnir_core::id::{ExecutorEpochId, IncidentId, OperationId, RequestId};
+use svalnir_core::policy::PolicyId;
 use svalnir_core::time::WallTime;
 
 use super::error::{OperationJournalError, SequenceViolation};
@@ -51,6 +53,16 @@ pub enum RequestBody {
     Acknowledge {
         /// The operation.
         operation_id: OperationId,
+    },
+    /// Rearm an incident of a guard: record a new budget generation
+    /// (`policy rearm`). Only the controller of an agent serves it.
+    Rearm {
+        /// The guard.
+        policy: PolicyId,
+        /// The incident.
+        incident_id: IncidentId,
+        /// The budget generation that the user saw.
+        generation: Generation,
     },
 }
 
@@ -100,6 +112,16 @@ pub enum RequestCompletion {
         acknowledged_at: WallTime,
         /// True when an earlier request recorded the acknowledgment.
         repeated: bool,
+    },
+    /// The controller of the agent recorded a new budget generation of the
+    /// incident.
+    Rearmed {
+        /// The incident.
+        incident_id: IncidentId,
+        /// The generation that the rearm ended.
+        previous_generation: Generation,
+        /// The generation that the rearm authorized.
+        new_generation: Generation,
     },
 }
 

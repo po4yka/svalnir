@@ -400,6 +400,24 @@ struct StepCheck<'a> {
     active: &'a ActiveRevision,
 }
 
+/// The refusal reason of a guard that has no automatic authority. `None`
+/// for [`GuardStanding::Active`]. The authorization and the rearm use this
+/// one mapping.
+pub(super) const fn standing_refusal(standing: GuardStanding) -> Option<RefusalReason> {
+    match standing {
+        GuardStanding::Active => None,
+        GuardStanding::NoActiveRevision => Some(RefusalReason::NoActivePolicyRevision),
+        GuardStanding::Inhibited => Some(RefusalReason::GuardInhibited),
+        GuardStanding::NotRequested => Some(RefusalReason::GuardNotRequested),
+        GuardStanding::ObserveProfile => Some(RefusalReason::ObserveProfile),
+        GuardStanding::Disabled => Some(RefusalReason::GuardDisabled),
+        GuardStanding::NoGrant => Some(RefusalReason::ActionGrantMissing),
+        GuardStanding::GrantRevoked => Some(RefusalReason::ActionGrantRevoked),
+        GuardStanding::GrantExpired => Some(RefusalReason::ActionGrantExpired),
+        GuardStanding::AcceptanceRequired => Some(RefusalReason::AcceptanceRequired),
+    }
+}
+
 fn rule_refusal(refusal: RuleRefusal) -> RefusalReason {
     match refusal {
         RuleRefusal::UnknownRule | RuleRefusal::UnknownRevision => RefusalReason::RuleNotRegistered,
@@ -478,29 +496,18 @@ impl StepCheck<'_> {
             policy,
             self.context.clock.wall,
         );
-        let reason: RefusalReason = match standing {
-            GuardStanding::Active => {
-                let grant: &ActionGrant = state
-                    .guard(policy)
-                    .and_then(|guard| guard.grant.as_ref())
-                    .ok_or(RefusalReason::ActionGrantMissing)?;
-                let named = &self.request.plan.authority.action_grants;
-                if named.is_empty() || !named.iter().all(|reference| grant.matches(reference)) {
-                    return Err(RefusalReason::ActionGrantMismatch);
-                }
-                return Ok(grant);
-            }
-            GuardStanding::NoActiveRevision => RefusalReason::NoActivePolicyRevision,
-            GuardStanding::Inhibited => RefusalReason::GuardInhibited,
-            GuardStanding::NotRequested => RefusalReason::GuardNotRequested,
-            GuardStanding::ObserveProfile => RefusalReason::ObserveProfile,
-            GuardStanding::Disabled => RefusalReason::GuardDisabled,
-            GuardStanding::NoGrant => RefusalReason::ActionGrantMissing,
-            GuardStanding::GrantRevoked => RefusalReason::ActionGrantRevoked,
-            GuardStanding::GrantExpired => RefusalReason::ActionGrantExpired,
-            GuardStanding::AcceptanceRequired => RefusalReason::AcceptanceRequired,
-        };
-        Err(reason)
+        if let Some(reason) = standing_refusal(standing) {
+            return Err(reason);
+        }
+        let grant: &ActionGrant = state
+            .guard(policy)
+            .and_then(|guard| guard.grant.as_ref())
+            .ok_or(RefusalReason::ActionGrantMissing)?;
+        let named = &self.request.plan.authority.action_grants;
+        if named.is_empty() || !named.iter().all(|reference| grant.matches(reference)) {
+            return Err(RefusalReason::ActionGrantMismatch);
+        }
+        Ok(grant)
     }
 
     /// Checks that the grant covers the action class and the scope of the

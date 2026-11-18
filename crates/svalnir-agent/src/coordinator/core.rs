@@ -303,6 +303,10 @@ pub struct Coordinator<J: CoordinatorJournal> {
     /// The time of the next reconciliation of the `UnknownOutcome`
     /// operations of an earlier lifetime whose resources the ledger holds.
     pub(super) held_reconciliation_at: Option<MonotonicNanos>,
+    /// A claimed rearm request that waits for the controller of the agent
+    /// ([`Coordinator::take_rearm`]). No further request is claimed while
+    /// it waits.
+    pub(super) pending_rearm: Option<ClaimedRequest>,
 }
 
 fn refused(error: ActionError) -> ApplyOutcome {
@@ -534,6 +538,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             unwritten_completion: None,
             claims_stopped: false,
             held_reconciliation_at: None,
+            pending_rearm: None,
         })))
     }
 
@@ -1390,7 +1395,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         // `stop_claims`, a request stays in the queue for the next
         // coordinator. A request that this lifetime claimed and holds is
         // not executed: the next coordinator puts it in the queue again.
-        if self.reconciliation_pending || self.claims_stopped {
+        if self.reconciliation_pending || self.claims_stopped || self.pending_rearm.is_some() {
             return false;
         }
         let claimed: ClaimedRequest = match self.held_request.take() {
@@ -1440,11 +1445,33 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     Err(error) => RequestCompletion::Rejected { error: *error },
                 }
             }
+            // The budget generation is state of the controller of the
+            // agent. The agent takes the request with `take_rearm`; a
+            // client coordinator has no controller.
+            RequestBody::Rearm { .. } if self.config.role == CoordinatorRole::Agent => {
+                self.pending_rearm = Some(claimed);
+                return true;
+            }
+            RequestBody::Rearm { .. } => RequestCompletion::Rejected {
+                error: super::error::rearm_rejection(
+                    code::AGENT_NOT_RUNNING,
+                    ErrorFamily::Evidence,
+                ),
+            },
         };
-        // A completion that a storage failure stopped is written again
-        // before the next claim. If this lifetime ends first, a later
-        // lifetime gets the request again, and the journal then returns
-        // the operation of this apply.
+        self.record_completion(request_id, completion);
+        true
+    }
+
+    /// Writes the completion of a claimed request. A completion that a
+    /// storage failure stopped is written again before the next claim. If
+    /// this lifetime ends first, a later lifetime gets the request again,
+    /// and the journal then returns the operation of an apply.
+    pub(super) fn record_completion(
+        &mut self,
+        request_id: RequestId,
+        completion: RequestCompletion,
+    ) {
         if let Err(error) = self
             .journal
             .complete_request(&request_id, &self.epoch, &completion)
@@ -1452,7 +1479,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         {
             self.unwritten_completion = Some((request_id, completion));
         }
-        true
     }
 
     /// The user of the apply of an operation that this lifetime admitted.

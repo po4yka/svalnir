@@ -303,8 +303,11 @@ impl SizeMetric {
 /// scanner records, only the logical and the allocated size are kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildSize {
-    /// The name of the child.
+    /// The name of the child, for display only. It is lossy for a name that
+    /// is not valid UTF-8.
     pub name: String,
+    /// The path of the child as the scanner reported it. Navigate with this.
+    pub path: PathBuf,
     /// Whether the child is a directory.
     pub is_directory: bool,
     /// The logical size in bytes.

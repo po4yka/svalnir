@@ -20,7 +20,8 @@ pub const DEFAULT_SEGMENTS: usize = 8;
 
 /// Sorts the children by `metric` (largest first, ties by name), keeps the
 /// `max_segments - 1` largest, and sums the rest into "Other (N items)".
-/// A child of zero bytes is not a segment; it counts in the N of "Other".
+/// A child of zero bytes is not a segment of its own; it counts in the N of
+/// "Other". When only zero-byte children remain, "Other" has 0 bytes.
 #[must_use]
 pub fn breakdown(children: &[ChildSize], metric: SizeMetric, max_segments: usize) -> Vec<Segment> {
     let mut order: Vec<usize> = (0..children.len())
@@ -52,7 +53,7 @@ pub fn breakdown(children: &[ChildSize], metric: SizeMetric, max_segments: usize
         .iter()
         .map(|&index| children[index].size(metric))
         .fold(0_u64, u64::saturating_add);
-    if rest_bytes > 0 {
+    if rest_bytes > 0 || zero_count > 0 {
         segments.push(Segment {
             label: format!("Other ({} items)", rest.len() + zero_count),
             bytes: rest_bytes,
@@ -70,10 +71,21 @@ mod tests {
     fn child(name: &str, allocated: u64) -> ChildSize {
         ChildSize {
             name: name.to_owned(),
+            path: std::path::PathBuf::from(name),
             is_directory: true,
             logical: allocated / 2,
             allocated,
         }
+    }
+
+    #[test]
+    fn zero_byte_children_do_not_vanish() {
+        let children = vec![child("a", 100), child("z1", 0), child("z2", 0)];
+        let segments = breakdown(&children, SizeMetric::Allocated, DEFAULT_SEGMENTS);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].label, "Other (2 items)");
+        assert_eq!(segments[1].bytes, 0);
+        assert!(segments[1].is_other);
     }
 
     #[test]
@@ -104,9 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn all_zero_is_empty() {
+    fn all_zero_is_one_empty_other_segment() {
         let children = [child("a", 0), child("b", 0)];
-        assert_eq!(breakdown(&children, SizeMetric::Allocated, 8), Vec::new());
+        let segments = breakdown(&children, SizeMetric::Allocated, 8);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].label, "Other (2 items)");
+        assert_eq!(segments[0].bytes, 0);
     }
 
     #[test]

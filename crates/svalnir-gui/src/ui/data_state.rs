@@ -9,23 +9,47 @@ pub const UNAVAILABLE_TEXT: &str = "\u{2014}";
 const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
 
 /// Splits `bytes` into a value with one fraction digit and a decimal unit.
+/// The unit is chosen after rounding: 999,950 B is "1.0 MB", not "1000.0 KB".
 #[must_use]
 pub fn format_bytes(bytes: u64) -> (String, &'static str) {
-    // Tenths of the unit, computed with integers to avoid float rounding.
+    let bytes: u128 = u128::from(bytes);
     let mut unit: usize = 0;
     let mut divisor: u128 = 1;
-    let bytes: u128 = u128::from(bytes);
-    while unit + 1 < UNITS.len() && bytes >= divisor * 1000 {
+    loop {
+        // Tenths of the unit, computed with integers to avoid float rounding.
+        let tenths: u128 = (bytes * 10 + divisor / 2) / divisor;
+        let at_top: bool = unit + 1 >= UNITS.len();
+        if unit == 0 && bytes < 1000 {
+            return (bytes.to_string(), "B");
+        }
+        if at_top || tenths < 10_000 {
+            let text: String = format!("{}.{}", tenths / 10, tenths % 10);
+            return (text, UNITS.get(unit).copied().unwrap_or("B"));
+        }
         divisor *= 1000;
         unit += 1;
     }
-    let tenths: u128 = (bytes * 10 + divisor / 2) / divisor;
-    let text: String = if unit == 0 {
-        bytes.to_string()
-    } else {
-        format!("{}.{}", tenths / 10, tenths % 10)
-    };
-    (text, UNITS.get(unit).copied().unwrap_or("B"))
+}
+
+/// The used capacity: total minus available. An available capacity larger
+/// than the total is a contradiction and is reported as unavailable.
+#[must_use]
+pub fn used_capacity(total: &Measured<u64>, available: &Measured<u64>) -> Measured<u64> {
+    match (total, available) {
+        (Measured::Value(total), Measured::Value(available)) => {
+            total.checked_sub(*available).map_or_else(
+                || {
+                    Measured::Unavailable(
+                        "the available capacity is larger than the total capacity".to_owned(),
+                    )
+                },
+                Measured::Value,
+            )
+        }
+        (Measured::Unavailable(reason), _) | (_, Measured::Unavailable(reason)) => {
+            Measured::Unavailable(reason.clone())
+        }
+    }
 }
 
 /// The age as "just now", "N s ago", or "N min ago" (hours as minutes).
@@ -65,6 +89,30 @@ mod tests {
         assert_eq!(format_bytes(1_000), ("1.0".to_owned(), "KB"));
         assert_eq!(format_bytes(512_000_000_000), ("512.0".to_owned(), "GB"));
         assert_eq!(format_bytes(u64::MAX).1, "PB");
+    }
+
+    #[test]
+    fn unit_is_chosen_after_rounding() {
+        assert_eq!(format_bytes(999_950_000), ("1.0".to_owned(), "GB"));
+        assert_eq!(format_bytes(999_950), ("1.0".to_owned(), "MB"));
+        assert_eq!(format_bytes(999_949), ("999.9".to_owned(), "KB"));
+        assert_eq!(format_bytes(999_949_999), ("999.9".to_owned(), "MB"));
+    }
+
+    #[test]
+    fn used_is_unavailable_when_available_exceeds_total() {
+        assert_eq!(
+            used_capacity(&Measured::Value(10), &Measured::Value(4)),
+            Measured::Value(6)
+        );
+        assert!(matches!(
+            used_capacity(&Measured::Value(10), &Measured::Value(11)),
+            Measured::Unavailable(_)
+        ));
+        assert!(matches!(
+            used_capacity(&Measured::Unavailable("x".into()), &Measured::Value(1)),
+            Measured::Unavailable(_)
+        ));
     }
 
     #[test]

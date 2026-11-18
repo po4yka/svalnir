@@ -225,6 +225,7 @@ impl DataSource for FixtureSource {
             .iter()
             .map(|(name, is_directory, tenth_gb)| ChildSize {
                 name: (*name).to_owned(),
+                path: root.join(name),
                 is_directory: *is_directory,
                 logical: tenth_gb * GB / 10,
                 allocated: tenth_gb * GB / 10 + GB / 100,
@@ -233,6 +234,7 @@ impl DataSource for FixtureSource {
         for index in 0..12_u64 {
             children.push(ChildSize {
                 name: format!("item-{index:02}"),
+                path: root.join(format!("item-{index:02}")),
                 is_directory: index % 2 == 0,
                 logical: 50_000_000 + index * 1_000_000,
                 allocated: 52_000_000 + index * 1_000_000,

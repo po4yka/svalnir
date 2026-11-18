@@ -28,11 +28,20 @@ pub const BAND_ROWS: usize = 4;
 /// Cells of the band.
 pub const BAND_CELLS: usize = BAND_COLUMNS * BAND_ROWS;
 
-/// The caption of the scale.
+/// The caption of the scale. The size of one cell is rounded to the nearest
+/// byte; below one byte it reads "1 cell < 1 B". A total of 0 reads
+/// "Nothing was measured."
 #[must_use]
 pub fn scale_caption(total: u64) -> String {
-    let per_cell: u64 = total / u64::try_from(BAND_CELLS).unwrap_or(1);
-    let (text, unit) = format_bytes(per_cell);
+    if total == 0 {
+        return "Nothing was measured.".to_owned();
+    }
+    let cells: u128 = u128::try_from(BAND_CELLS).unwrap_or(1);
+    let per_cell: u128 = (u128::from(total) + cells / 2) / cells;
+    if per_cell == 0 {
+        return "1 cell < 1 B".to_owned();
+    }
+    let (text, unit) = format_bytes(u64::try_from(per_cell).unwrap_or(u64::MAX));
     format!("1 cell = {text} {unit}")
 }
 
@@ -100,6 +109,17 @@ impl RenderOnce for CellBand {
             .map(|s| s.bytes)
             .fold(0, u64::saturating_add);
         let total: u64 = used.saturating_add(self.free.unwrap_or(0));
+        if total == 0 {
+            let note: String = scale_caption(0);
+            return div()
+                .id(SharedString::from(format!("{}-scale", self.id)))
+                .test_support()
+                .aria_label(note.clone())
+                .text_size(px(12.0))
+                .text_color(to_hsla(tokens.muted_foreground))
+                .child(note)
+                .into_any_element();
+        }
         let parts: Vec<u64> = self.segments.iter().map(|s| s.bytes).collect();
         let counts: Vec<usize> = allocate_cells(&parts, total, BAND_CELLS);
         let mut cells: Vec<Cell> = Vec::with_capacity(BAND_CELLS);
@@ -133,7 +153,7 @@ impl RenderOnce for CellBand {
         let label: String = band_label(&self.root, &self.segments);
         let scale: String = scale_caption(total);
         let muted: Hsla = to_hsla(tokens.muted_foreground);
-        v_flex()
+        let band = v_flex()
             .gap(px(8.0))
             .child(CellStrip::new(cells, layout, self.id.clone(), label))
             .children(
@@ -148,6 +168,21 @@ impl RenderOnce for CellBand {
                     .text_size(px(12.0))
                     .text_color(muted)
                     .child(scale),
-            )
+            );
+        band.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn scale_caption_rounds_and_never_says_zero_bytes() {
+        assert_eq!(scale_caption(0), "Nothing was measured.");
+        assert_eq!(scale_caption(100), "1 cell < 1 B");
+        assert_eq!(scale_caption(120), "1 cell = 1 B");
+        assert_eq!(scale_caption(239), "1 cell = 1 B");
+        assert_eq!(scale_caption(360), "1 cell = 2 B");
     }
 }

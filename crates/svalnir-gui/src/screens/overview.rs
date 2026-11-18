@@ -11,7 +11,7 @@ use crate::{
     },
     theme::tokens::{self, Tokens, to_hsla},
     ui::{
-        data_state::{format_age, format_bytes},
+        data_state::{format_age, format_bytes, used_capacity},
         pill::{StatusPill, Tone},
         provenance::ProvenanceLine,
         surface::{Panel, Shell, ShellHeader},
@@ -188,14 +188,7 @@ fn disk_card(view: &View, tokens: &Tokens) -> AnyElement {
             if let Some(name) = &host.volume_name {
                 header = header.subtitle(name.clone());
             }
-            let used: Measured<u64> = match (&host.disk_total, &host.disk_available) {
-                (Measured::Value(total), Measured::Value(available)) => {
-                    Measured::Value(total.saturating_sub(*available))
-                }
-                (Measured::Unavailable(reason), _) | (_, Measured::Unavailable(reason)) => {
-                    Measured::Unavailable(reason.clone())
-                }
-            };
+            let used: Measured<u64> = used_capacity(&host.disk_total, &host.disk_available);
             let value: DisplayValue = match &host.disk_available {
                 Measured::Value(available) => {
                     let (text, unit) = format_bytes(*available);

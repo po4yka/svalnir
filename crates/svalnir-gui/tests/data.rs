@@ -127,3 +127,21 @@ fn live_reads_a_zero_byte_journal_without_creating_a_file() {
         0
     );
 }
+
+#[test]
+fn live_reads_a_real_journal_without_changing_it_or_taking_a_lock() {
+    use svalnir_agent::journal::{JournalOptions, OperationJournal};
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("operations.sqlite");
+    drop(OperationJournal::open(&path, &JournalOptions::default()).expect("open journal"));
+    let before = std::fs::read(&path).unwrap();
+    let source = LiveSource::new(Some(directory.path().to_path_buf()));
+    let _agent = source.agent();
+    let service = source.service();
+    assert!(service.problems.is_empty(), "{:?}", service.problems);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    for entry in std::fs::read_dir(directory.path()).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.contains("lock"), "unexpected file {name}");
+    }
+}

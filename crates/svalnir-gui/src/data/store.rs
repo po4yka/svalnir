@@ -100,6 +100,9 @@ pub struct AppModel {
     pub scan: ScanState,
     /// A refusal that does not replace a finished result.
     pub scan_notice: Option<String>,
+    /// The root that the Storage screen offers first. A background probe
+    /// fills it once, so that `render` never touches the file system.
+    default_root: Option<PathBuf>,
     pending_scan: Option<PathBuf>,
     scan_cancel: Option<CancellationToken>,
     scan_task: Option<Task<()>>,
@@ -142,6 +145,7 @@ impl AppModel {
             service: Loadable::Loading,
             scan: ScanState::Idle,
             scan_notice: None,
+            default_root: None,
             pending_scan: None,
             scan_cancel: None,
             scan_task: None,
@@ -152,13 +156,28 @@ impl AppModel {
             _poll: poll,
         };
         model.refresh(cx);
+        let probe: Arc<dyn DataSource> = Arc::clone(&model.source);
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let root: Option<PathBuf> = cx
+                .background_executor()
+                .spawn(async move { probe.default_scan_root() })
+                .await;
+            // The model can be gone before the probe ends; nothing to do then.
+            let _alive: bool = this
+                .update(cx, |model, cx| {
+                    model.default_root = root;
+                    cx.notify();
+                })
+                .is_ok();
+        })
+        .detach();
         model
     }
 
     /// The root that the Storage screen offers first.
     #[must_use]
     pub fn default_scan_root(&self) -> Option<PathBuf> {
-        self.source.default_scan_root()
+        self.default_root.clone()
     }
 
     /// Starts a scan of `root`. A request while a scan runs is ignored. A

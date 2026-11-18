@@ -13,7 +13,7 @@ use crate::{
         tokens::{self, Tokens, to_hsla},
     },
     ui::{
-        data_state::{format_age, format_bytes},
+        data_state::{format_age, format_bytes, used_capacity},
         legend::{Legend, LegendRow},
         pill::{StatusPill, Tone},
         provenance::ProvenanceLine,
@@ -111,13 +111,14 @@ impl StorageScreen {
         }
     }
 
-    fn push(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Opens the folder `path` below the current root and scans it.
+    pub fn push(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.path_stack.push(path);
         self.start(cx);
     }
 
-    /// Pops to `level` (0 is the default root).
-    fn pop_to(&mut self, level: usize, cx: &mut Context<Self>) {
+    /// Pops to `level` (0 is the default root) and scans that folder.
+    pub fn pop_to(&mut self, level: usize, cx: &mut Context<Self>) {
         self.path_stack.truncate(level);
         self.start(cx);
     }
@@ -160,14 +161,7 @@ fn volume_card(host: &Loadable<HostSnapshot>, tokens: &Tokens) -> AnyElement {
             if let Some(name) = &snapshot.volume_name {
                 header = header.subtitle(name.clone());
             }
-            let used: Measured<u64> = match (&snapshot.disk_total, &snapshot.disk_available) {
-                (Measured::Value(total), Measured::Value(available)) => {
-                    Measured::Value(total.saturating_sub(*available))
-                }
-                (Measured::Unavailable(reason), _) | (_, Measured::Unavailable(reason)) => {
-                    Measured::Unavailable(reason.clone())
-                }
-            };
+            let used: Measured<u64> = used_capacity(&snapshot.disk_total, &snapshot.disk_available);
             let value: DisplayValue = match (&used, &snapshot.disk_total) {
                 (Measured::Value(used), Measured::Value(total)) => {
                     let (used_text, used_unit) = format_bytes(*used);
@@ -427,7 +421,7 @@ impl StorageScreen {
                     return;
                 };
                 if child.is_directory {
-                    let path: PathBuf = select_summary.root.join(&child.name);
+                    let path: PathBuf = child.path.clone();
                     select_this.update(app, |screen, cx| screen.push(path, cx));
                 }
             })
@@ -513,6 +507,10 @@ impl Render for StorageScreen {
                 .as_ref()
                 .map_or_else(|| "no folder".to_owned(), |p| p.display().to_string()),
         };
+        let crumb: Option<AnyElement> = match &scan {
+            ScanState::Running { .. } | ScanState::Failed { .. } => self.breadcrumb(cx),
+            ScanState::Idle | ScanState::Done(_) => None,
+        };
         let body: AnyElement = match &scan {
             ScanState::Idle => match &root {
                 Some(root) => Self::idle_body(root, cx, "scan-idle"),
@@ -567,6 +565,7 @@ impl Render for StorageScreen {
                     .gap(px(12.0))
                     .children(notice.map(|text| caption("scan-notice", text, tokens)))
                     .child(metric_caption)
+                    .children(crumb)
                     .child(body),
             ))
     }

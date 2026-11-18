@@ -10,6 +10,7 @@ use super::{
 };
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -277,7 +278,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Sums the sizes of the direct children of the root and reports progress.
 struct ChildObserver<'a> {
     root: PathBuf,
-    children: HashMap<String, ChildSize>,
+    children: HashMap<OsString, ChildSize>,
     entries: u64,
     logical: u64,
     allocated: u64,
@@ -308,12 +309,10 @@ impl<'a> ChildObserver<'a> {
         (self.children.into_values().collect(), self.unsized_children)
     }
 
-    fn child_name(&self, path: &Path) -> Option<String> {
+    /// The direct child that `path` names, keyed by its exact name.
+    fn child_key(&self, path: &Path) -> Option<OsString> {
         (path.parent() == Some(self.root.as_path()))
-            .then(|| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
+            .then(|| path.file_name().map(OsStr::to_os_string))
             .flatten()
     }
 
@@ -353,7 +352,7 @@ impl ScanObserver for ChildObserver<'_> {
         self.logical = self.logical.saturating_add(logical);
         self.allocated = self.allocated.saturating_add(allocated);
         if entry.kind != EntryKind::Directory
-            && let Some(name) = self.child_name(entry.path)
+            && let Some(key) = self.child_key(entry.path)
         {
             // A child with no size (a socket, a FIFO) is not a zero-byte
             // child: it is counted as a gap.
@@ -363,9 +362,10 @@ impl ScanObserver for ChildObserver<'_> {
                 return;
             }
             self.children.insert(
-                name.clone(),
+                key.clone(),
                 ChildSize {
-                    name,
+                    name: key.to_string_lossy().into_owned(),
+                    path: entry.path.to_path_buf(),
                     is_directory: false,
                     logical,
                     allocated,
@@ -376,11 +376,12 @@ impl ScanObserver for ChildObserver<'_> {
     }
 
     fn directory_finished(&mut self, directory: &DirectoryRecord<'_>) {
-        if let Some(name) = self.child_name(directory.path) {
+        if let Some(key) = self.child_key(directory.path) {
             self.children.insert(
-                name.clone(),
+                key.clone(),
                 ChildSize {
-                    name,
+                    name: key.to_string_lossy().into_owned(),
+                    path: directory.path.to_path_buf(),
                     is_directory: true,
                     logical: directory.logical_bytes.get(),
                     allocated: directory.allocated_bytes.get(),
@@ -475,18 +476,23 @@ fn agent_state(journal_file: &Path) -> AgentState {
     match journal.agent_record::<AgentStatus>(AgentRecord::Status) {
         Ok(None) => AgentState::NoRecord,
         Ok(Some(stored)) => {
-            let written: SystemTime = system_time(stored.record.written_at);
-            let fresh: bool = SystemTime::now()
-                .duration_since(written)
-                .is_ok_and(|age| age < STATUS_FRESH)
-                || written > SystemTime::now();
-            if fresh {
-                AgentState::Reporting { since: written }
-            } else {
-                AgentState::Silent { last: written }
-            }
+            agent_state_from_status(system_time(stored.record.written_at), SystemTime::now())
         }
         Err(error) => AgentState::Unknown(format!("the status record cannot be read: {error}")),
+    }
+}
+
+/// Classifies the age of the status record. A record dated ahead of `now`
+/// by at most `STATUS_FRESH` is clock skew and counts as fresh; a record
+/// dated further ahead is not trusted.
+fn agent_state_from_status(written: SystemTime, now: SystemTime) -> AgentState {
+    match now.duration_since(written) {
+        Ok(age) if age < STATUS_FRESH => AgentState::Reporting { since: written },
+        Ok(_) => AgentState::Silent { last: written },
+        Err(ahead) if ahead.duration() <= STATUS_FRESH => AgentState::Reporting { since: written },
+        Err(_) => {
+            AgentState::Unknown("the status record of the agent is dated in the future".to_owned())
+        }
     }
 }
 
@@ -511,6 +517,28 @@ fn system_time(time: WallTime) -> SystemTime {
 mod tests {
     use super::*;
     use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber};
+
+    #[test]
+    fn status_age_classification() {
+        let now: SystemTime = UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let at = |back: u64| now - Duration::from_secs(back);
+        assert!(matches!(
+            agent_state_from_status(at(10), now),
+            AgentState::Reporting { .. }
+        ));
+        assert!(matches!(
+            agent_state_from_status(at(120), now),
+            AgentState::Silent { .. }
+        ));
+        assert!(matches!(
+            agent_state_from_status(now + Duration::from_secs(30), now),
+            AgentState::Reporting { .. }
+        ));
+        assert!(matches!(
+            agent_state_from_status(now + Duration::from_hours(24), now),
+            AgentState::Unknown(_)
+        ));
+    }
 
     fn record(
         path: &Path,

@@ -43,6 +43,16 @@ pub fn capacity_label(used: &Measured<u64>, total: &Measured<u64>) -> String {
     }
 }
 
+/// The measured pair, or `None` when either value is unavailable or the
+/// total is 0 (a grid of 0 bytes has no zones and no filled cells).
+#[must_use]
+pub fn known_capacity(used: &Measured<u64>, total: &Measured<u64>) -> Option<(u64, u64)> {
+    match (used, total) {
+        (Measured::Value(used), Measured::Value(total)) if *total > 0 => Some((*used, *total)),
+        _ => None,
+    }
+}
+
 /// Used space of a volume as a grid of cells.
 #[derive(IntoElement)]
 pub struct CapacityGrid {
@@ -117,10 +127,7 @@ impl RenderOnce for CapacityGrid {
         } else {
             CellLayout::grid()
         };
-        let known: Option<(u64, u64)> = match (&self.used, &self.total) {
-            (Measured::Value(used), Measured::Value(total)) => Some((*used, *total)),
-            _ => None,
-        };
+        let known: Option<(u64, u64)> = known_capacity(&self.used, &self.total);
         let filled: usize = known.map_or(0, |(used, total)| used_cells(used, total, count));
         let warning: Hsla = to_hsla(tokens.warning);
         let negative: Hsla = to_hsla(tokens.negative);
@@ -182,6 +189,21 @@ impl RenderOnce for CapacityGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_total_is_unavailable() {
+        assert_eq!(
+            known_capacity(&Measured::Value(0), &Measured::Value(0)),
+            None
+        );
+        assert_eq!(
+            known_capacity(&Measured::Value(1), &Measured::Value(2)),
+            Some((1, 2))
+        );
+        assert!(
+            capacity_label(&Measured::Value(0), &Measured::Value(0)).contains(UNAVAILABLE_TEXT)
+        );
+    }
 
     #[test]
     fn captions_state_the_scale() {

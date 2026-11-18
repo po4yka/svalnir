@@ -357,6 +357,7 @@ fn new_plan(
     Ok(StoredPlan {
         plan,
         document: Some(document),
+        document_state: super::clean::DocumentState::Used,
     })
 }
 
@@ -414,7 +415,11 @@ pub(crate) fn stop(
     drop(lock);
     let plan: &Plan = &stored.plan;
     let mut summary: String = String::new();
-    plan_view::render(&explain(&outcome_of(&stored)?, &now.clock), &mut summary);
+    plan_view::render_question(
+        &explain(&outcome_of(&stored)?, &now.clock),
+        &[],
+        &mut summary,
+    );
     crate::text::put_line!(
         summary,
         "This request sends {} to process {target}. Unsaved data of the process can be lost.",

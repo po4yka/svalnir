@@ -21,7 +21,7 @@ use svalnir_core::process::Pid;
 use crate::environment::Environment;
 use crate::output::ExitStatus;
 use crate::run_in;
-use crate::seams::{ServiceFailure, ServiceHost};
+use crate::seams::{ProgramProblem, ServiceFailure, ServiceHost};
 use crate::test_support::{TempDirectory, environment};
 
 const CHILD_VARIABLE: &str = "SVALNIR_TEST_CLI_CHILD";
@@ -424,6 +424,43 @@ fn a_plan_of_an_earlier_revision_is_refused() {
     assert_eq!(entries(&tree).len(), 3);
 }
 
+/// A different client changes the policy revision while the approval
+/// question waits. The admission reads the authority record again, so the
+/// approved plan of the earlier revision is refused and no file changes.
+#[test]
+fn a_revision_that_changes_while_the_question_waits_refuses_the_plan() {
+    let (mut world, tree, plan) = World::with_plan("permanent");
+    let revision: String = json(&world.environment, &["config", "show", "--effective"]).result()
+        ["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let config: PathBuf = world.path("later.toml");
+    std::fs::write(&config, BALANCED_CONFIG).unwrap();
+    let other_client: Environment = world.environment.clone();
+    world.environment.seams.test.answers =
+        Some(Arc::new(Mutex::new(VecDeque::from(["yes".to_owned()]))));
+    world.environment.seams.test.while_asked =
+        Some(crate::seams::WhileAsked(Arc::new(move || {
+            let outcome = json(
+                &other_client,
+                &[
+                    "config",
+                    "apply",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--expected-revision",
+                    &revision,
+                ],
+            );
+            assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+        })));
+    let apply = json(&world.environment, &["clean", "apply", "--plan", &plan]);
+    assert_eq!(apply.status, ExitStatus::Unavailable, "{}", apply.stdout);
+    assert_eq!(apply.error_code(), "policy_revision_changed");
+    assert_eq!(entries(&tree).len(), 3);
+}
+
 #[test]
 fn no_wait_gives_the_operation_and_the_queries_read_it() {
     let (world, tree, plan) = World::with_plan("permanent");
@@ -783,16 +820,29 @@ fn a_pause_and_a_resume_are_in_the_authority_record() {
 
 /// A service host that records its calls and changes only a temporary
 /// directory.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RecordingHost {
     program: Option<PathBuf>,
+    /// The problem that the host reports when it has no program.
+    problem: ProgramProblem,
     calls: Mutex<Vec<String>>,
     fail_load: bool,
 }
 
+impl Default for RecordingHost {
+    fn default() -> Self {
+        Self {
+            program: None,
+            problem: ProgramProblem::NotFound,
+            calls: Mutex::new(Vec::new()),
+            fail_load: false,
+        }
+    }
+}
+
 impl ServiceHost for RecordingHost {
-    fn agent_program(&self) -> Option<PathBuf> {
-        self.program.clone()
+    fn agent_program(&self) -> Result<PathBuf, ProgramProblem> {
+        self.program.clone().ok_or(self.problem)
     }
 
     fn definition_exists(&self, path: &Path) -> bool {
@@ -923,6 +973,17 @@ fn an_install_reports_a_missing_program_and_a_refused_load() {
     let missing = json(&world.environment, &["agent", "install", "--yes"]);
     assert_eq!(missing.status, ExitStatus::Unavailable);
     assert_eq!(missing.error_code(), "agent_program_not_found");
+    assert!(host.calls.lock().unwrap().is_empty());
+
+    // A program that a different user can change is refused before each
+    // host effect.
+    let (world, host) = world_with_host(RecordingHost {
+        problem: ProgramProblem::NotTrusted,
+        ..RecordingHost::default()
+    });
+    let untrusted = json(&world.environment, &["agent", "install", "--yes"]);
+    assert_eq!(untrusted.status, ExitStatus::Unavailable);
+    assert_eq!(untrusted.error_code(), "agent_program_not_trusted");
     assert!(host.calls.lock().unwrap().is_empty());
 
     let (world, host) = world_with_host(RecordingHost {
@@ -1493,12 +1554,264 @@ fn a_plan_document_that_names_a_different_root_is_not_used() {
         &["clean", "apply", "--plan", &plan, "--yes"],
     );
     assert_eq!(apply.status, ExitStatus::Conflict, "{}", apply.stdout);
-    assert_eq!(apply.error_code(), "plan_document_missing");
+    assert_eq!(apply.error_code(), "plan_document_not_usable");
     assert_eq!(entries(&tree).len(), 3);
     assert_eq!(entries(&other), ["build"]);
     // The view of the plan does not show the text of the document.
     let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
     assert_eq!(show.result()["has_plan_document"], false);
+    assert_eq!(show.result()["plan_document"], "disagrees_with_plan");
+    assert_eq!(show.result()["cleanup_roots"], serde_json::json!([]));
+}
+
+/// A standard output whose reader closed the pipe.
+struct ClosedPipe;
+
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+/// The exit status of an invocation whose reader closed the pipe.
+fn status_with_a_closed_pipe(environment: &Environment, arguments: &[&str]) -> ExitStatus {
+    let mut stderr: Vec<u8> = Vec::new();
+    let request_id = svalnir_core::id::RequestId::new(format!(
+        "request_test_{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ))
+    .unwrap();
+    run_in(
+        std::iter::once("svalnir").chain(arguments.iter().copied()),
+        request_id,
+        environment,
+        &mut ClosedPipe,
+        &mut stderr,
+    )
+}
+
+/// A reader that closes the pipe does not turn the result of an operation
+/// that did not complete into exit status 0.
+#[test]
+fn a_closed_pipe_keeps_the_exit_status_of_the_operation() {
+    let (world, tree, plan) = World::with_plan("permanent");
+    // One target is a different object than the plan binds, so the
+    // executor refuses it and the operation is not complete.
+    std::fs::remove_dir_all(tree.join("cache")).unwrap();
+    std::fs::create_dir_all(tree.join("cache")).unwrap();
+    let status: ExitStatus = status_with_a_closed_pipe(
+        &world.environment,
+        &[
+            "clean", "apply", "--plan", &plan, "--yes", "--format", "json",
+        ],
+    );
+    // The operation was executed to its end, and the journal has it.
+    let shown = json(&world.environment, &["clean", "apply", "--plan", &plan]);
+    assert_eq!(shown.result()["existing_operation"], true);
+    assert_ne!(shown.status, ExitStatus::Success, "{}", shown.stdout);
+    assert_eq!(status, shown.status);
+    assert_eq!(
+        status_with_a_closed_pipe(&world.environment, &["clean", "apply", "--plan", &plan]),
+        shown.status
+    );
+    let operation: String = shown.result()["operation"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        status_with_a_closed_pipe(
+            &world.environment,
+            &["operations", "wait", "--operation", &operation]
+        ),
+        shown.status
+    );
+    // A query keeps its success status.
+    assert_eq!(
+        status_with_a_closed_pipe(
+            &world.environment,
+            &["operations", "show", "--operation", &operation]
+        ),
+        ExitStatus::Success
+    );
+}
+
+fn document_path(world: &World, plan: &str) -> PathBuf {
+    world
+        .path("state")
+        .join("plans")
+        .join(format!("plan-{plan}.json"))
+}
+
+/// A plan document with a second cleanup root, which no target of the
+/// plan binds, gives the executor no root.
+#[test]
+fn a_plan_document_with_a_root_that_no_target_binds_is_not_used() {
+    let (world, tree, plan) = World::with_plan("permanent");
+    // A second plan of the same client gives a root record whose identity
+    // agrees with its own values.
+    let other: PathBuf = world.path("other");
+    std::fs::create_dir_all(other.join("build")).unwrap();
+    std::fs::write(other.join("build/a.bin"), vec![1_u8; 9_000]).unwrap();
+    let other_plan: String = world.plan(&world.scan(&other), "permanent");
+    let read = |plan: &str| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(document_path(&world, plan)).unwrap())
+            .unwrap()
+    };
+    let extra: Value = read(&other_plan)["roots"][0].clone();
+    let mut document: Value = read(&plan);
+    document["roots"].as_array_mut().unwrap().push(extra);
+    std::fs::write(
+        document_path(&world, &plan),
+        serde_json::to_string(&document).unwrap(),
+    )
+    .unwrap();
+
+    let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
+    assert_eq!(show.result()["plan_document"], "disagrees_with_plan");
+    let apply = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    assert_eq!(apply.status, ExitStatus::Conflict, "{}", apply.stdout);
+    assert_eq!(apply.error_code(), "plan_document_not_usable");
+    assert_eq!(entries(&tree).len(), 3);
+    assert_eq!(entries(&other), ["build"]);
+}
+
+/// The plan view and the approval question name the cleanup root, and the
+/// question has each target, also when the list is long.
+#[test]
+fn the_question_has_the_cleanup_root_and_each_target() {
+    let mut world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let tree: PathBuf = world.path("many");
+    std::fs::create_dir_all(&tree).unwrap();
+    for index in 0..45_usize {
+        std::fs::write(
+            tree.join(format!("file-{index:02}.bin")),
+            vec![7_u8; 1_000 + index],
+        )
+        .unwrap();
+    }
+    let plan: String = world.plan(&world.scan(&tree), "permanent");
+    let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
+    let targets: usize = show.result()["explanation"]["targets"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(
+        targets > crate::commands::plan_view::TEXT_LIST_LIMIT,
+        "{targets}"
+    );
+    assert_eq!(
+        show.result()["cleanup_roots"][0]["value"],
+        std::fs::canonicalize(&tree).unwrap().to_str().unwrap()
+    );
+    let text = run(&world.environment, &["clean", "show", "--plan", &plan]);
+    assert!(text.stdout.contains("Cleanup root:"), "{}", text.stdout);
+    assert!(
+        text.stdout.contains("more; `--format json`"),
+        "{}",
+        text.stdout
+    );
+
+    world.environment.seams.test.answers =
+        Some(Arc::new(Mutex::new(VecDeque::from(["n".to_owned()]))));
+    let declined = json(&world.environment, &["clean", "apply", "--plan", &plan]);
+    assert_eq!(declined.error_code(), "approval_declined");
+    assert!(
+        declined.stderr.contains("Cleanup root:"),
+        "{}",
+        declined.stderr
+    );
+    assert!(
+        !declined.stderr.contains("more; `--format json`"),
+        "{}",
+        declined.stderr
+    );
+    assert_eq!(
+        declined.stderr.matches("file-").count(),
+        targets,
+        "{}",
+        declined.stderr
+    );
+    assert_eq!(entries(&tree).len(), 45);
+}
+
+/// The path of a target in the result is the root and the relative entry
+/// that the stored plan binds, not the path text of the plan document.
+#[test]
+fn the_result_has_the_bound_path_and_not_the_text_of_the_document() {
+    let (world, tree, plan) = World::with_plan("permanent");
+    let path: PathBuf = document_path(&world, &plan);
+    let text: String = std::fs::read_to_string(&path).unwrap();
+    let changed: String = text.replace("/tree/cache\"", "/tree/elsewhere\"");
+    assert_ne!(changed, text);
+    std::fs::write(&path, changed).unwrap();
+    let apply = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    assert_eq!(apply.status, ExitStatus::Success, "{}", apply.stdout);
+    assert!(!apply.stdout.contains("elsewhere"), "{}", apply.stdout);
+    assert!(apply.stdout.contains("/tree/cache\""), "{}", apply.stdout);
+    assert!(!tree.join("cache").exists());
+    for query in [
+        vec!["history"],
+        vec![
+            "operations",
+            "show",
+            "--operation",
+            apply.result()["operation"]["operation_id"]
+                .as_str()
+                .unwrap(),
+        ],
+    ] {
+        let outcome = json(&world.environment, &query);
+        assert!(!outcome.stdout.contains("elsewhere"), "{}", outcome.stdout);
+    }
+}
+
+/// A plan document that cannot be decoded does not hide the plan and the
+/// operation that the journal has.
+#[test]
+fn a_plan_document_that_cannot_be_read_keeps_the_view_and_the_existing_operation() {
+    let (world, tree, plan) = World::with_plan("permanent");
+    let first = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    assert_eq!(first.status, ExitStatus::Success, "{}", first.stdout);
+    std::fs::write(document_path(&world, &plan), b"{ not a document").unwrap();
+
+    let show = json(&world.environment, &["clean", "show", "--plan", &plan]);
+    assert_eq!(show.status, ExitStatus::Success, "{}", show.stdout);
+    assert_eq!(show.result()["plan_document"], "not_readable");
+    assert_eq!(
+        show.result()["operation_id"],
+        first.result()["operation"]["operation_id"]
+    );
+    let again = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &plan, "--yes"],
+    );
+    assert_eq!(again.status, ExitStatus::Success, "{}", again.stdout);
+    assert_eq!(again.result()["existing_operation"], true);
+
+    // A plan that was not applied gets no root from such a document.
+    let other: String = world.plan(&world.scan(&world.tree()), "permanent");
+    std::fs::write(document_path(&world, &other), b"{ not a document").unwrap();
+    let refused = json(
+        &world.environment,
+        &["clean", "apply", "--plan", &other, "--yes"],
+    );
+    assert_eq!(refused.status, ExitStatus::Conflict, "{}", refused.stdout);
+    assert_eq!(refused.error_code(), "plan_document_not_usable");
+    assert_eq!(entries(&tree).len(), 3);
 }
 
 #[test]

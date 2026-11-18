@@ -11,7 +11,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use svalnir_agent::executor::fs::{SystemTrash, TrashBackend};
+#[cfg(not(test))]
+use svalnir_agent::executor::fs::SystemTrash;
+use svalnir_agent::executor::fs::TrashBackend;
 
 /// The answer of the user to a confirmation question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +35,76 @@ pub(crate) struct ServiceFailure {
     pub(crate) detail: String,
 }
 
+/// The reason the `svalnir-agent` executable is not usable for a service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramProblem {
+    /// No executable file is beside the `svalnir` executable.
+    NotFound,
+    /// The executable or its directory has an owner other than this user
+    /// and the superuser, or the group or each user can write it. A
+    /// service that starts at each login must not start a file that a
+    /// different user can replace.
+    NotTrusted,
+}
+
+/// Finds the `svalnir-agent` executable beside `own`, the executable of
+/// this process, and examines its owner and its permissions.
+///
+/// The result has no symbolic link, so the service definition names the
+/// file that was examined and not a link that can get a new destination.
+///
+/// # Errors
+///
+/// Returns a [`ProgramProblem`].
+pub(crate) fn examined_agent_program(own: &Path, uid: u32) -> Result<PathBuf, ProgramProblem> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    /// The write permission of the group and of each user.
+    const WRITE_BY_OTHERS: u32 = 0o022;
+    /// The execute permission of the owner.
+    const EXECUTE_BY_OWNER: u32 = 0o100;
+
+    let own: PathBuf = own.canonicalize().map_err(|_| ProgramProblem::NotFound)?;
+    let beside: PathBuf = own
+        .parent()
+        .ok_or(ProgramProblem::NotFound)?
+        .join(AGENT_PROGRAM_NAME);
+    let program: PathBuf = beside
+        .canonicalize()
+        .map_err(|_| ProgramProblem::NotFound)?;
+    let file = program
+        .symlink_metadata()
+        .map_err(|_| ProgramProblem::NotFound)?;
+    if !file.is_file() || file.mode() & EXECUTE_BY_OWNER == 0 {
+        return Err(ProgramProblem::NotFound);
+    }
+    let directory = program
+        .parent()
+        .ok_or(ProgramProblem::NotFound)?
+        .symlink_metadata()
+        .map_err(|_| ProgramProblem::NotFound)?;
+    let trusted = |metadata: &std::fs::Metadata| {
+        (metadata.uid() == uid || metadata.uid() == 0) && metadata.mode() & WRITE_BY_OTHERS == 0
+    };
+    if trusted(&file) && trusted(&directory) {
+        Ok(program)
+    } else {
+        Err(ProgramProblem::NotTrusted)
+    }
+}
+
 /// Each host effect of `agent install` and `agent uninstall`.
 ///
 /// The commands decide what to do and call these functions; they do no
 /// other write outside the state directory and start no other process.
 pub(crate) trait ServiceHost: Debug + Send + Sync {
-    /// The path of the `svalnir-agent` executable, when it exists.
-    fn agent_program(&self) -> Option<PathBuf>;
+    /// The path of the `svalnir-agent` executable, with no symbolic link.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramProblem`] when the executable does not exist, or
+    /// when a different user can change it.
+    fn agent_program(&self) -> Result<PathBuf, ProgramProblem>;
     /// Whether a definition file exists at `path`.
     fn definition_exists(&self, path: &Path) -> bool;
     /// Writes the definition file. Its directory is made when it does not
@@ -59,15 +124,21 @@ pub(crate) trait ServiceHost: Debug + Send + Sync {
 
 /// The service host of the running system: the file system and
 /// `launchctl`.
+///
+/// A test build does not have this type, so no test can register a
+/// service or write a service definition of the developer.
+#[cfg(not(test))]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SystemServiceHost;
 
 /// The absolute path of the service-manager tool. No search path is used.
+#[cfg(not(test))]
 const LAUNCHCTL: &str = "/bin/launchctl";
 
 /// The file name of the agent executable, beside the `svalnir` executable.
 const AGENT_PROGRAM_NAME: &str = "svalnir-agent";
 
+#[cfg(not(test))]
 impl SystemServiceHost {
     fn launchctl(arguments: &[&std::ffi::OsStr]) -> Result<std::process::ExitStatus, String> {
         std::process::Command::new(LAUNCHCTL)
@@ -80,11 +151,11 @@ impl SystemServiceHost {
     }
 }
 
+#[cfg(not(test))]
 impl ServiceHost for SystemServiceHost {
-    fn agent_program(&self) -> Option<PathBuf> {
-        let own: PathBuf = std::env::current_exe().ok()?.canonicalize().ok()?;
-        let program: PathBuf = own.parent()?.join(AGENT_PROGRAM_NAME);
-        program.is_file().then_some(program)
+    fn agent_program(&self) -> Result<PathBuf, ProgramProblem> {
+        let own: PathBuf = std::env::current_exe().map_err(|_| ProgramProblem::NotFound)?;
+        examined_agent_program(&own, crate::commands::session::current_uid().get())
     }
 
     fn definition_exists(&self, path: &Path) -> bool {
@@ -184,6 +255,18 @@ impl ServiceHost for SystemServiceHost {
     }
 }
 
+/// An action of a test that runs while a question waits.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct WhileAsked(pub(crate) Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl Debug for WhileAsked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WhileAsked")
+    }
+}
+
 /// The values that a test sets in place of the host.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
@@ -193,12 +276,77 @@ pub(crate) struct TestSeams {
     /// The answers of an interactive user, in sequence. `None` is a
     /// session with no terminal.
     pub(crate) answers: Option<Arc<std::sync::Mutex<std::collections::VecDeque<String>>>>,
+    /// An action that runs while the question waits for its answer, in
+    /// the place of what a different client does in that time.
+    pub(crate) while_asked: Option<WhileAsked>,
     /// The service host.
     pub(crate) service_host: Option<Arc<dyn ServiceHost>>,
     /// Gives a target process with no verified membership the membership
     /// of a synthetic application instance. The process inventory of a
     /// test runner does not attribute a child process of the test.
     pub(crate) attribute_target: bool,
+}
+
+/// The service host of a test that set none: it has no agent executable
+/// and refuses each change, so a test cannot reach the service manager or
+/// the service definitions of the developer.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RefusingServiceHost;
+
+#[cfg(test)]
+impl RefusingServiceHost {
+    fn refusal(step: &'static str) -> ServiceFailure {
+        ServiceFailure {
+            step,
+            detail: "the test set no service host".to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ServiceHost for RefusingServiceHost {
+    fn agent_program(&self) -> Result<PathBuf, ProgramProblem> {
+        Err(ProgramProblem::NotFound)
+    }
+
+    fn definition_exists(&self, _path: &Path) -> bool {
+        false
+    }
+
+    fn write_definition(&self, _path: &Path, _text: &str) -> Result<(), ServiceFailure> {
+        Err(Self::refusal("write_definition"))
+    }
+
+    fn remove_definition(&self, _path: &Path) -> Result<(), ServiceFailure> {
+        Err(Self::refusal("remove_definition"))
+    }
+
+    fn load(&self, _uid: u32, _path: &Path) -> Result<(), ServiceFailure> {
+        Err(Self::refusal("load"))
+    }
+
+    fn unload(&self, _uid: u32, _label: &str) -> Result<(), ServiceFailure> {
+        Err(Self::refusal("unload"))
+    }
+}
+
+/// The Trash of a test that set no Trash directory: it moves nothing, so
+/// a test cannot move a file to the Trash of the developer.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RefusingTrash;
+
+#[cfg(test)]
+impl TrashBackend for RefusingTrash {
+    fn move_to_trash(
+        &self,
+        _request: &svalnir_agent::executor::fs::TrashRequest<'_>,
+    ) -> svalnir_agent::executor::fs::TrashReply {
+        svalnir_agent::executor::fs::TrashReply::Failed(
+            svalnir_agent::executor::fs::TrashFailure::Unsupported,
+        )
+    }
 }
 
 /// The host effects of one invocation.
@@ -218,11 +366,20 @@ impl Seams {
         )
     )]
     pub(crate) fn trash_backend(&self) -> Box<dyn TrashBackend> {
+        // A test build never has the Trash of the system.
         #[cfg(test)]
-        if let Some(directory) = &self.test.trash_directory {
-            return Box::new(crate::test_support::DirectoryTrash::new(directory.clone()));
+        {
+            match &self.test.trash_directory {
+                Some(directory) => {
+                    Box::new(crate::test_support::DirectoryTrash::new(directory.clone()))
+                }
+                None => Box::new(RefusingTrash),
+            }
         }
-        Box::new(SystemTrash)
+        #[cfg(not(test))]
+        {
+            Box::new(SystemTrash)
+        }
     }
 
     /// The service host.
@@ -234,11 +391,18 @@ impl Seams {
         )
     )]
     pub(crate) fn service_host(&self) -> Arc<dyn ServiceHost> {
+        // A test build never has the service host of the system.
         #[cfg(test)]
-        if let Some(host) = &self.test.service_host {
-            return Arc::clone(host);
+        {
+            match &self.test.service_host {
+                Some(host) => Arc::clone(host),
+                None => Arc::new(RefusingServiceHost),
+            }
         }
-        Arc::new(SystemServiceHost)
+        #[cfg(not(test))]
+        {
+            Arc::new(SystemServiceHost)
+        }
     }
 
     /// Whether a target process with no verified membership gets a
@@ -278,6 +442,9 @@ impl Seams {
                 return Confirmation::NotInteractive;
             };
             drop(write!(stderr, "{question} [y/N] "));
+            if let Some(action) = &self.test.while_asked {
+                (action.0)();
+            }
             let answer: Option<String> = answers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -321,7 +488,134 @@ fn terminal_is_interactive() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Confirmation, interpret};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        Confirmation, ProgramProblem, RefusingServiceHost, Seams, ServiceHost as _,
+        examined_agent_program, interpret,
+    };
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+    }
+
+    /// A directory with a `svalnir` file and a `svalnir-agent` file.
+    fn programs(directory: &Path) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(directory).expect("directory");
+        set_mode(directory, 0o755);
+        let own: PathBuf = directory.join("svalnir");
+        let agent: PathBuf = directory.join("svalnir-agent");
+        for path in [&own, &agent] {
+            std::fs::write(path, b"#!/bin/sh\n").expect("file");
+            set_mode(path, 0o755);
+        }
+        (own, agent)
+    }
+
+    fn uid_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        path.metadata().expect("metadata").uid()
+    }
+
+    #[test]
+    fn the_agent_program_is_the_examined_file_beside_this_executable() {
+        let directory = crate::test_support::TempDirectory::new();
+        let (own, agent) = programs(&directory.path().join("bin"));
+        let uid: u32 = uid_of(&own);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Ok(agent.canonicalize().expect("canonical"))
+        );
+        std::fs::remove_file(&agent).expect("remove");
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotFound)
+        );
+    }
+
+    #[test]
+    fn an_agent_program_that_a_different_user_can_change_is_refused() {
+        let directory = crate::test_support::TempDirectory::new();
+        let bin: PathBuf = directory.path().join("bin");
+        let (own, agent) = programs(&bin);
+        let uid: u32 = uid_of(&own);
+
+        // Each user can write the file.
+        set_mode(&agent, 0o757);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotTrusted)
+        );
+        // The group can write the file.
+        set_mode(&agent, 0o775);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotTrusted)
+        );
+        set_mode(&agent, 0o755);
+
+        // Each user can write the directory, so each user can replace the
+        // file.
+        set_mode(&bin, 0o777);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotTrusted)
+        );
+        set_mode(&bin, 0o755);
+
+        // The owner is a different user.
+        assert_eq!(
+            examined_agent_program(&own, uid.wrapping_add(1).max(1)),
+            Err(ProgramProblem::NotTrusted)
+        );
+
+        // A file that the owner cannot execute is not a program.
+        set_mode(&agent, 0o644);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_link_to_an_agent_program_is_examined_at_its_destination() {
+        let directory = crate::test_support::TempDirectory::new();
+        let (_, real_agent) = programs(&directory.path().join("real"));
+        let (own, agent) = programs(&directory.path().join("bin"));
+        let uid: u32 = uid_of(&own);
+        std::fs::remove_file(&agent).expect("remove");
+        std::os::unix::fs::symlink(&real_agent, &agent).expect("link");
+
+        // The result names the destination, not the link.
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Ok(real_agent.canonicalize().expect("canonical"))
+        );
+        // The directory of the destination decides, not that of the link.
+        set_mode(&directory.path().join("real"), 0o777);
+        assert_eq!(
+            examined_agent_program(&own, uid),
+            Err(ProgramProblem::NotTrusted)
+        );
+        set_mode(&directory.path().join("real"), 0o755);
+    }
+
+    #[test]
+    fn a_test_with_no_seam_has_no_host_effect() {
+        let seams = Seams::default();
+        let host = seams.service_host();
+        assert_eq!(host.agent_program(), Err(ProgramProblem::NotFound));
+        assert!(host.load(501, Path::new("/nonexistent")).is_err());
+        assert!(host.unload(501, "dev.svalnir.agent").is_err());
+        assert!(
+            host.write_definition(Path::new("/nonexistent"), "")
+                .is_err()
+        );
+        assert!(host.remove_definition(Path::new("/nonexistent")).is_err());
+        assert!(!RefusingServiceHost.definition_exists(Path::new("/")));
+        assert_eq!(format!("{:?}", seams.trash_backend()), "RefusingTrash");
+    }
 
     #[test]
     fn only_an_explicit_yes_approves() {

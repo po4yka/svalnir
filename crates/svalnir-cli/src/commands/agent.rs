@@ -29,7 +29,7 @@ use crate::cli::AgentServiceArgs;
 use crate::environment::Environment;
 use crate::host::Host;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
-use crate::seams::{Confirmation, ServiceFailure, ServiceHost};
+use crate::seams::{Confirmation, ProgramProblem, ServiceFailure, ServiceHost};
 use crate::text::{escape, json_tree, put_line};
 
 /// The directory of the per-user service definitions, below the home
@@ -416,11 +416,15 @@ pub(crate) fn install(
     })?;
     // The location of the agent executable has no packaging contract yet:
     // this build accepts only an executable beside this one.
-    let program: PathBuf = host.agent_program().ok_or_else(|| {
-        service_error(
+    let program: PathBuf = host.agent_program().map_err(|problem| match problem {
+        ProgramProblem::NotFound => service_error(
             "agent_program_not_found",
             "the `svalnir-agent` executable is not beside the `svalnir` executable; this build has no other install location for it; the command made no change",
-        )
+        ),
+        ProgramProblem::NotTrusted => service_error(
+            "agent_program_not_trusted",
+            "a different user can change the `svalnir-agent` executable or its directory: the owner is not this user or the superuser, or the group or each user has write permission; a service must not start such a file at each login; the command made no change",
+        ),
     })?;
     let state_directory: PathBuf = environment.state_directory()?;
     let log: PathBuf = environment.agent_log_path()?;

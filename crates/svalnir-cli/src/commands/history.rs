@@ -16,7 +16,7 @@ use svalnir_core::quantity::Bytes;
 use svalnir_core::time::WallTime;
 
 use super::operation_view::{EffectCounts, WorkView};
-use super::plan_store::{self, PlanDocument};
+use super::plan_store::PlanDocument;
 use super::plan_view;
 use super::session::{self, journal_error};
 use super::{CommandFailure, Invocation};
@@ -112,18 +112,12 @@ impl HistoryRecord {
         environment: &Environment,
         operation: &Operation,
     ) -> Self {
-        let plan = journal.try_plan(operation.plan_id()).ok().flatten();
-        let document = plan_store::load_plan(environment, operation.plan_id())
-            .ok()
-            .flatten()
-            .filter(|document| {
-                plan.as_ref()
-                    .is_some_and(|plan| plan.digest() == &document.digest)
-            });
+        // A document is used only when it agrees with the stored plan.
+        let stored = super::clean::load_for_report(journal, environment, operation.plan_id());
         Self::new(
             operation,
-            plan.as_ref().and_then(|plan| mode_of(plan)),
-            document.as_ref(),
+            stored.as_ref().and_then(|stored| mode_of(&stored.plan)),
+            stored.as_ref().and_then(|stored| stored.document.as_ref()),
         )
     }
 

@@ -14,7 +14,6 @@ use svalnir_core::id::OperationId;
 
 use super::apply::{ApplyView, target_paths};
 use super::operation_view::OperationReport;
-use super::plan_store;
 use super::session::{self, CoordinatorPresence, coordinator_presence, journal_error};
 use super::{CommandFailure, Invocation};
 use crate::cli::OperationRef;
@@ -71,16 +70,18 @@ fn report(
     operation: &Operation,
 ) -> OperationReport {
     let stop_fence: Option<bool> = journal.try_has_stop_fence(operation.operation_id()).ok();
-    let document = plan_store::load_plan(environment, operation.plan_id())
-        .ok()
-        .flatten();
+    // A document is used only when it agrees with the stored plan.
+    let stored = super::clean::load_for_report(journal, environment, operation.plan_id());
+    let document = stored.as_ref().and_then(|stored| stored.document.as_ref());
     OperationReport::of_record(operation, stop_fence)
-        .with_measurements(
-            document
+        .with_measurements(document.and_then(|document| document.measurements.as_ref()))
+        .with_paths(
+            stored
                 .as_ref()
-                .and_then(|document| document.measurements.as_ref()),
+                .map_or_else(std::collections::BTreeMap::new, |stored| {
+                    target_paths(&stored.plan, document)
+                }),
         )
-        .with_paths(target_paths(document.as_ref()))
 }
 
 /// Whether the operation has its last record. An unknown outcome is not
@@ -151,8 +152,32 @@ pub(crate) fn wait(
     environment.interrupt.arm();
     let started: Instant = Instant::now();
     let mut reads: u32 = 0;
+    let mut busy_reads: u32 = 0;
     let (wait, operation, note): (&'static str, Operation, Option<&'static str>) = loop {
-        let operation: Operation = read(&journal, &operation_id)?;
+        let operation: Operation = match read(&journal, &operation_id) {
+            Ok(operation) => {
+                busy_reads = 0;
+                operation
+            }
+            // A busy journal is read again: a different process writes
+            // to it. The wait changes nothing, so a repeat is safe.
+            Err(error)
+                if &*error.code == "journal_busy"
+                    && busy_reads < super::execution::BUSY_READS
+                    && !environment.interrupt.is_requested()
+                    && timeout.is_none_or(|timeout| started.elapsed() < timeout) =>
+            {
+                busy_reads = busy_reads.saturating_add(1);
+                std::thread::sleep(POLL);
+                continue;
+            }
+            Err(error) => {
+                return Err(error
+                    .with_operation(operation_id.as_str())
+                    .with_next_action(NextAction::QueryOperation)
+                    .into());
+            }
+        };
         if is_ended(&operation) {
             break ("finished", operation, None);
         }
@@ -162,7 +187,8 @@ pub(crate) fn wait(
         reads = reads.wrapping_add(1);
         if check_lock && coordinator_presence(&journal_path) == CoordinatorPresence::NotRunning {
             // The operation can have ended between the two reads.
-            let operation: Operation = read(&journal, &operation_id)?;
+            // A read that fails here keeps the state that was read.
+            let operation: Operation = read(&journal, &operation_id).unwrap_or(operation);
             if is_ended(&operation) {
                 break ("finished", operation, None);
             }
@@ -185,8 +211,8 @@ pub(crate) fn wait(
         operation: Some(report(&journal, environment, &operation)),
         notes: note.into_iter().collect(),
     };
-    invocation.emit(Kind::Operation, &view, ApplyView::render)?;
-    Ok(view.status())
+    let status: ExitStatus = view.status();
+    invocation.emit_with_status(Kind::Operation, &view, ApplyView::render, status)
 }
 
 /// The result of `operations cancel`.

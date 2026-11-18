@@ -69,6 +69,15 @@ The notices for imported material are in THIRD_PARTY_NOTICES.md of the source.
 pub(crate) enum CommandFailure {
     /// The output stream rejected a write.
     Output(io::Error),
+    /// The output stream rejected the write of a result whose exit status
+    /// is known. The status reports an operation, so a reader that closed
+    /// the pipe does not change it.
+    OutputAfter {
+        /// The write error.
+        error: io::Error,
+        /// The exit status of the result that was not written.
+        status: ExitStatus,
+    },
     /// The command returned a structured error.
     Rejected(ErrorBody),
     /// The command returned a structured error after the invocation had
@@ -122,6 +131,23 @@ impl Invocation<'_> {
                 self.stdout,
                 &Envelope::result(self.request_id.clone(), kind, view).with_warnings(warnings),
             ),
+        }
+    }
+
+    /// Writes one result whose exit status is `status`, and returns the
+    /// status. A failed write keeps the status: the result reports an
+    /// operation that this command executed or read, and a closed pipe
+    /// must not turn its failure into success.
+    pub(crate) fn emit_with_status<T: Serialize>(
+        &mut self,
+        kind: Kind,
+        view: &T,
+        text: impl FnOnce(&T) -> String,
+        status: ExitStatus,
+    ) -> Result<ExitStatus, CommandFailure> {
+        match self.emit(kind, view, text) {
+            Ok(()) => Ok(status),
+            Err(error) => Err(CommandFailure::OutputAfter { error, status }),
         }
     }
 }

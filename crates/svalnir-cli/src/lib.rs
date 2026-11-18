@@ -104,6 +104,9 @@ where
         Ok(status) => finish(stdout.flush(), status, stderr),
         // A closed pipe keeps the success status; another write error does not.
         Err(CommandFailure::Output(error)) => finish(Err(error), ExitStatus::Success, stderr),
+        // The result of an operation has its own status. A closed pipe
+        // does not change it.
+        Err(CommandFailure::OutputAfter { error, status }) => finish(Err(error), status, stderr),
         Err(CommandFailure::Rejected(error)) => {
             let status: ExitStatus = error.exit_status();
             let written = report_error(

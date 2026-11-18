@@ -860,11 +860,14 @@ impl Driver {
     /// one, and records its completion. Returns `true` when a request was
     /// decided.
     ///
-    /// The controller checks the request against the authority record of
-    /// this tick and the inhibition of this instance. An accepted rearm is
-    /// in effect only when the journal recorded the controller state with
-    /// the new generation: when that write fails, the earlier state stays,
-    /// and the request is rejected with `rearm_not_recorded`.
+    /// The controller checks the request against the present authority
+    /// record and the inhibition of this instance. The record is read
+    /// again after the claim, so that a `policy disable` or an `agent
+    /// pause` that the journal has before the decision applies to it, also
+    /// when it came after the read at the start of the tick. An accepted
+    /// rearm is in effect only when the journal recorded the controller
+    /// state with the new generation: when that write fails, the earlier
+    /// state stays, and the request is rejected with `rearm_not_recorded`.
     fn serve_rearm(&mut self, time: &TimeReading) -> bool {
         let Some(pending) = self
             .coordinator
@@ -873,6 +876,9 @@ impl Driver {
         else {
             return false;
         };
+        if self.load_authority() {
+            self.floor_unseen_states(time);
+        }
         let authority: AuthorityState = self
             .authority
             .records()
@@ -911,6 +917,26 @@ impl Driver {
             coordinator.complete_rearm(pending.request_id, completion);
         }
         true
+    }
+
+    /// Sets the measurement floor of this instance at `time` when a read
+    /// of the authority record found that it missed a state of the record.
+    fn floor_unseen_states(&mut self, time: &TimeReading) {
+        if std::mem::take(&mut self.authority_states_unseen) {
+            // "Resuming always refreshes measurements": a sample of
+            // before this tick supports no automatic action.
+            self.unseen_change_floor = Some(MeasurementFloor {
+                at: time.clock.now,
+                clock_domain: time.clock.clock_domain.clone(),
+                boot_id: time.clock.boot_id.clone(),
+            });
+            // The authorization of the coordinator reads the inhibition
+            // of the records. It gets the floor before the coordinator
+            // dispatches a step in this tick, and not only after the
+            // evaluation of the controller.
+            let inhibition: InstanceInhibition = self.inhibition();
+            self.authority.records().inhibition = inhibition;
+        }
     }
 
     /// Measures the footprint of the agent against its budget.
@@ -1005,21 +1031,7 @@ impl Driver {
         }) {
             self.unseen_change_floor = None;
         }
-        if std::mem::take(&mut self.authority_states_unseen) {
-            // "Resuming always refreshes measurements": a sample of
-            // before this tick supports no automatic action.
-            self.unseen_change_floor = Some(MeasurementFloor {
-                at: time.clock.now,
-                clock_domain: time.clock.clock_domain.clone(),
-                boot_id: time.clock.boot_id.clone(),
-            });
-            // The authorization of the coordinator reads the inhibition
-            // of the records. It gets the floor before the coordinator
-            // dispatches a step in this tick, and not only after the
-            // evaluation of the controller.
-            let inhibition: InstanceInhibition = self.inhibition();
-            self.authority.records().inhibition = inhibition;
-        }
+        self.floor_unseen_states(&time);
         self.measure_self();
         let has_new_sample: bool = sample.is_some();
         if let Some(sample) = sample {

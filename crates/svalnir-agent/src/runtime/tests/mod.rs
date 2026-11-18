@@ -413,11 +413,38 @@ impl Notifier for Notes {
     }
 }
 
+/// The function of a [`Hook`].
+type HookFunction = Box<dyn FnOnce() + Send>;
+
+/// A function that a test runs one time inside a call of the driver.
+#[derive(Clone, Default)]
+struct Hook(Arc<Mutex<Option<HookFunction>>>);
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Hook")
+    }
+}
+
+impl Hook {
+    fn set(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.0.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    fn run(&self) {
+        let hook = self.0.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-struct Footprint(Arc<AtomicU64>);
+struct Footprint(Arc<AtomicU64>, Hook);
 
 impl SelfFootprint for Footprint {
     fn footprint(&mut self) -> Option<Bytes> {
+        self.1.run();
         Some(Bytes::new(self.0.load(Ordering::SeqCst)))
     }
 }
@@ -436,6 +463,10 @@ struct Bench {
     modes: Arc<Mutex<Vec<PreparationMode>>>,
     notes: Notes,
     footprint: Arc<AtomicU64>,
+    /// Runs one time at the next measurement of the footprint of the
+    /// agent: after the tick read the authority record and before the
+    /// coordinator claims a request.
+    footprint_hook: Hook,
     /// The bounded wait of the journal of the driver, when a test sets a
     /// short one.
     busy_timeout: Option<Duration>,
@@ -466,6 +497,7 @@ impl Bench {
             modes: Arc::new(Mutex::new(Vec::new())),
             notes: Notes::default(),
             footprint: Arc::new(AtomicU64::new(10 * 1024 * 1024)),
+            footprint_hook: Hook::default(),
             busy_timeout: None,
             lifetimes: 0,
         }
@@ -579,7 +611,10 @@ impl Bench {
                 modes: Arc::clone(&self.modes),
             }),
             notifier: Box::new(self.notes.clone()),
-            footprint: Box::new(Footprint(Arc::clone(&self.footprint))),
+            footprint: Box::new(Footprint(
+                Arc::clone(&self.footprint),
+                self.footprint_hook.clone(),
+            )),
             store: None,
             capabilities: None,
         }

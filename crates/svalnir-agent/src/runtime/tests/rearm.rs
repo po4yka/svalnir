@@ -6,8 +6,14 @@ use svalnir_core::id::{IncidentId, RequestId};
 use svalnir_core::policy::PolicyId;
 use svalnir_core::state::PressureState;
 
-use super::{Bench, GIBIBYTE, SAMPLE, TestClock, TestIdle, paused, user, validated_registry, wall};
-use crate::journal::{QueuedRequest, RequestBody, RequestCompletion, RequestStatus};
+use super::{
+    Bench, GIBIBYTE, SAMPLE, TestClock, TestIdle, journal_path, paused, user, validated_registry,
+    wall,
+};
+use crate::journal::{
+    AgentRecord, JournalOptions, OperationJournal, QueuedRequest, RequestBody, RequestCompletion,
+    RequestStatus,
+};
 
 fn rearm_request(
     id: &str,
@@ -124,5 +130,73 @@ fn a_queued_rearm_gives_a_new_generation_and_a_refused_one_changes_nothing() {
     }
     assert_eq!(generation(driver.controller_state()), Generation::new(2));
     assert_eq!(generation(&bench.controller_record()), Generation::new(2));
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
+}
+
+#[test]
+fn a_pause_that_the_journal_has_before_the_claim_of_a_rearm_refuses_it() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    let active: AuthorityState = bench.seed_authority();
+    let mut driver = bench.start();
+    for _ in 0..40 {
+        driver.tick(Some(bench.sample(
+            100 * GIBIBYTE,
+            PressureState::Critical,
+            Vec::new(),
+        )));
+        if driver.controller_state().memory_incident.is_some() {
+            break;
+        }
+        bench.clock.advance(SAMPLE);
+    }
+    let record = driver
+        .controller_state()
+        .memory_incident
+        .clone()
+        .expect("a memory incident opened");
+    bench
+        .journal()
+        .enqueue_request(&rearm_request(
+            "request-rearm-1",
+            &record.incident_id,
+            Generation::new(1),
+            bench.clock.now(),
+        ))
+        .unwrap();
+    // A client pauses the agent after the tick read the authority record
+    // and before the coordinator claims the rearm request.
+    let pause: AuthorityState = paused(&active, bench.clock.now());
+    let path = journal_path(&bench.state);
+    let at = wall(bench.clock.now());
+    bench.footprint_hook.set(move || {
+        let options = JournalOptions {
+            full_fsync: false,
+            ..JournalOptions::default()
+        };
+        OperationJournal::open(&path, &options)
+            .unwrap()
+            .put_agent_record(AgentRecord::Authority, &pause, None, at)
+            .unwrap();
+    });
+    bench.clock.advance(SAMPLE);
+    driver.tick(Some(bench.sample(
+        100 * GIBIBYTE,
+        PressureState::Critical,
+        Vec::new(),
+    )));
+    match completion(&bench, "request-rearm-1") {
+        RequestCompletion::Rejected { error } => {
+            assert_eq!(error.code.as_str(), "automation_paused");
+        }
+        other => panic!("{other:?}"),
+    }
+    let generation = driver
+        .controller_state()
+        .memory_incident
+        .as_ref()
+        .unwrap()
+        .budget
+        .generation;
+    assert_eq!(generation, Generation::new(1));
     assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
 }

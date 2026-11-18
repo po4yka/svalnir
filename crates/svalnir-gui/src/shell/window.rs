@@ -144,7 +144,7 @@ impl MainWindow {
     /// card of the section starts below the padding. The card tops of a
     /// screen are known after it paints, so the scroll waits in
     /// `pending_scroll` and `render` retries it for at most
-    /// [`SCROLL_TRIES`] frames.
+    /// `SCROLL_TRIES` frames.
     pub fn scroll_to_section(
         &mut self,
         section: Section,

@@ -1322,6 +1322,41 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Sets a mode and restores the mode when it is dropped, also when an
+/// assertion fails, so that the temporary directory can be deleted.
+struct ModeGuard {
+    path: PathBuf,
+    restore: u32,
+}
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        // The test result does not depend on the restore of the mode.
+        drop(fs::set_permissions(
+            &self.path,
+            fs::Permissions::from_mode(self.restore),
+        ));
+    }
+}
+
+fn lock_mode(path: &Path, mode: u32, restore: u32) -> ModeGuard {
+    set_mode(path, mode);
+    ModeGuard {
+        path: path.to_path_buf(),
+        restore,
+    }
+}
+
+/// Tells that a test did not run, so that the output shows it.
+fn skip_for_superuser() -> bool {
+    // The superuser is not subject to the permission bits.
+    let skip: bool = native::effective_uid() == 0;
+    if skip {
+        eprintln!("skipped: the effective user is root");
+    }
+    skip
+}
+
 #[test]
 fn a_read_only_file_is_removed() {
     let fixture = Fixture::new();
@@ -1340,8 +1375,7 @@ fn a_read_only_file_is_removed() {
 
 #[test]
 fn a_read_only_directory_in_a_tree_gives_a_partial_result() {
-    // The superuser is not subject to the permission bits.
-    if native::effective_uid() == 0 {
+    if skip_for_superuser() {
         return;
     }
     let fixture = Fixture::new();
@@ -1351,10 +1385,10 @@ fn a_read_only_directory_in_a_tree_gives_a_partial_result() {
     fs::write(locked.join("inner.bin"), b"inner").unwrap();
     fs::write(tree.join("free.bin"), b"free").unwrap();
     let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
-    set_mode(&locked, 0o555);
+    let guard = lock_mode(&locked, 0o555, 0o755);
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
-    set_mode(&locked, 0o755);
+    drop(guard);
 
     // `free.bin` was removed, so the result is not `Refused`.
     let result: &TargetResult = &outcome.result;
@@ -1372,7 +1406,7 @@ fn a_read_only_directory_in_a_tree_gives_a_partial_result() {
 
 #[test]
 fn an_unreadable_directory_in_a_tree_refuses_the_tree_as_a_whole() {
-    if native::effective_uid() == 0 {
+    if skip_for_superuser() {
         return;
     }
     let fixture = Fixture::new();
@@ -1382,10 +1416,10 @@ fn an_unreadable_directory_in_a_tree_refuses_the_tree_as_a_whole() {
     fs::write(closed.join("inner.bin"), b"inner").unwrap();
     fs::write(tree.join("free.bin"), b"free").unwrap();
     let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
-    set_mode(&closed, 0o000);
+    let guard = lock_mode(&closed, 0o000, 0o755);
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
-    set_mode(&closed, 0o755);
+    drop(guard);
 
     // The tree cannot be measured, so no entry is removed. A read-only
     // call failed: the stop reason is `FAILED` and no call was submitted.
@@ -1398,7 +1432,7 @@ fn an_unreadable_directory_in_a_tree_refuses_the_tree_as_a_whole() {
 
 #[test]
 fn a_file_in_a_read_only_parent_is_refused_by_the_call() {
-    if native::effective_uid() == 0 {
+    if skip_for_superuser() {
         return;
     }
     let fixture = Fixture::new();
@@ -1407,10 +1441,10 @@ fn a_file_in_a_read_only_parent_is_refused_by_the_call() {
     let file: PathBuf = parent.join("data.bin");
     fs::write(&file, b"data").unwrap();
     let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "parent/data.bin");
-    set_mode(&parent, 0o555);
+    let guard = lock_mode(&parent, 0o555, 0o755);
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
-    set_mode(&parent, 0o755);
+    drop(guard);
 
     let result: &TargetResult = &outcome.result;
     assert_eq!(result.effect, TargetEffect::Refused);
@@ -1969,6 +2003,8 @@ fn the_home_directory_is_refused_under_another_name() {
                 &ErrorFamily::Eligibility,
                 code::HOME_DIRECTORY_PROTECTED,
             );
+        } else {
+            eprintln!("skipped: the volume distinguishes the case of a name");
         }
     }
     assert!(fixture.home.join("letter.txt").exists());

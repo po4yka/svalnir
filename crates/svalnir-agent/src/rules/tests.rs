@@ -599,6 +599,27 @@ fn a_directory_with_no_matching_record_is_not_an_item() {
 }
 
 #[test]
+fn a_name_below_an_item_that_is_not_valid_utf8_is_protected_data() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let fixture = temporary_fixture();
+    let item = add_item(&fixture, "odd", |_| {});
+    // Some volumes refuse a name that is not valid UTF-8; then no entry is
+    // made and the test has nothing to show.
+    if fs::write(item.join(OsStr::from_bytes(b"bad-\xff.bin")), b"x").is_err() {
+        eprintln!("skipped: the volume refuses a name that is not valid UTF-8");
+        return;
+    }
+    let discovery = discover_temporary(&fixture);
+    assert_eq!(discovery.candidates.len(), 0);
+    assert_eq!(
+        skip_of(&discovery, "odd").reasons,
+        [SkipReason::ProtectedData]
+    );
+}
+
+#[test]
 fn an_item_with_content_that_the_rule_preserves_is_skipped() {
     let mut fixture = temporary_fixture();
     add_item(&fixture, "export", |record| {

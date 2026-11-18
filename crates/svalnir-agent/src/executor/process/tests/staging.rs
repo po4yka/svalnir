@@ -1105,6 +1105,7 @@ fn an_observation_ends_when_the_clock_gives_no_value() {
     // The last reading showed the process: it is running, and no exit is
     // reported.
     assert_eq!(report.members[0].result.effect, TargetEffect::StillRunning);
+    assert_eq!(report.members[0].result.stop_reason, StopReason::Completed);
 
     // With no clock value at the start, no call is issued.
     let host: Host = Host::new().with_process(100, 10);
@@ -1190,6 +1191,10 @@ fn each_signal_result_has_its_own_record() {
     let result: &TargetResult = &report.members[0].result;
     assert_eq!(result.effect, TargetEffect::Skipped);
     assert_eq!(code_of(result), code::TARGET_PROTECTED);
+    assert_eq!(result.dispatch, DispatchState::NotSubmitted);
+    assert_eq!(result.evidence.native, NativeResult::NotCalled);
+    // The fake records the call that the native layer refuses.
+    assert_eq!(host.calls().len(), 1);
     assert_eq!(report.submitted_at, None);
 }
 
@@ -1383,6 +1388,12 @@ fn a_helper_gets_no_result_of_a_request_that_was_not_sent() {
         member(102, 10, helper()),
     ];
     let report = finished(begin(&host, &graceful(Escalation::None, members)));
+    // The fake records the request before it answers: one call for the
+    // application, and no call for a helper.
+    assert_eq!(
+        host.calls(),
+        vec![application_call(ApplicationRequest::Terminate)]
+    );
     let running: &TargetResult = &report.members[1].result;
     assert_eq!(running.effect, TargetEffect::Skipped);
     assert_eq!(code_of(running), code::APPLICATION_REQUEST_NOT_SUBMITTED);
@@ -1399,8 +1410,7 @@ fn a_helper_gets_no_result_of_a_request_that_was_not_sent() {
 #[test]
 fn an_envelope_rejects_a_membership_that_is_not_verified() {
     // The envelope check rejects such a member, so the executor cannot get
-    // one in a checked envelope. Its backend selection has no call for it.
-    let host: Host = Host::new().with_process(100, 10);
+    // one in a checked envelope, so the executor does not run.
     let mut planned: ProcessIdentity = member(100, 10, job());
     planned.association = ProcessAssociation::ManagedJob {
         instance_id: instance(),
@@ -1416,7 +1426,6 @@ fn an_envelope_rejects_a_membership_that_is_not_verified() {
         ))
         .is_err()
     );
-    assert_eq!(host.calls(), Vec::new());
 }
 
 // The receipt and the limits.

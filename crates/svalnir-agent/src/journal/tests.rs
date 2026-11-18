@@ -445,6 +445,8 @@ fn result(target: &str, effect: TargetEffect, durability: Durability) -> TargetR
             None,
         ),
     };
+    // A verified effect is an observation: it has a source and a time.
+    let verified: bool = effect.is_verified();
     Checked::new(TargetResultRecord {
         target_id: target_id(target),
         member: None,
@@ -452,6 +454,8 @@ fn result(target: &str, effect: TargetEffect, durability: Durability) -> TargetR
         effect,
         evidence: EffectEvidence {
             native,
+            source: verified.then(|| AdapterId::new("svalnir.expired-temporary").unwrap()),
+            observed_at: verified.then(|| wall(2)),
             ..EffectEvidence::none()
         },
         attribution,

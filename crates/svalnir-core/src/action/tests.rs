@@ -313,6 +313,8 @@ fn record(target: &str, effect: TargetEffect) -> TargetResultRecord {
             None,
         ),
     };
+    // A verified effect is an observation: it has a source and a time.
+    let verified: bool = effect.is_verified();
     TargetResultRecord {
         target_id: target_id(target),
         member: None,
@@ -320,6 +322,8 @@ fn record(target: &str, effect: TargetEffect) -> TargetResultRecord {
         effect,
         evidence: EffectEvidence {
             native,
+            source: verified.then(|| AdapterId::new("example.adapter").unwrap()),
+            observed_at: verified.then(|| WallTime::from_unix(1_794_830_400, 0).unwrap()),
             ..EffectEvidence::none()
         },
         attribution,

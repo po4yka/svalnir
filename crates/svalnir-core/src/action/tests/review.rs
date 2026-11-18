@@ -545,6 +545,8 @@ fn a_covered_member_is_a_submitted_member_result_and_is_not_a_native_call() {
             record.effect = TargetEffect::ExitVerified;
             record.attribution = crate::action::Attribution::Possible;
             record.stop_reason = StopReason::Completed;
+            // The exit of the covered member was observed.
+            record.evidence.source = Some(crate::id::AdapterId::new("example.adapter").unwrap());
         }),
         Ok(())
     );
@@ -1002,4 +1004,39 @@ fn the_envelope_of_a_process_step_repeats_the_checks_of_its_plan() {
         charge: charge(1, 1),
     };
     assert_eq!(envelope_error(work), EnvelopeError::Target);
+}
+
+#[test]
+fn a_verified_effect_needs_an_observation_source() {
+    for effect in [
+        TargetEffect::Trashed,
+        TargetEffect::Removed,
+        TargetEffect::ExitVerified,
+    ] {
+        // The usual record of the effect has a source.
+        let usual = record("t1", effect.clone());
+        assert!(usual.evidence.source.is_some());
+        assert!(Checked::new(usual.clone()).is_ok());
+        // A native call that succeeded, with no observation, is not a
+        // verified effect.
+        let mut unobserved = usual;
+        unobserved.evidence.source = None;
+        unobserved.evidence.observed_at = None;
+        assert_eq!(
+            Checked::new(unobserved).unwrap_err(),
+            OutcomeError::Evidence,
+            "{effect:?}"
+        );
+    }
+    // An effect that is not verified needs no source.
+    for effect in [
+        TargetEffect::Skipped,
+        TargetEffect::Refused,
+        TargetEffect::StillRunning,
+        TargetEffect::UnknownOutcome,
+    ] {
+        let record = record("t1", effect);
+        assert!(record.evidence.source.is_none());
+        assert!(Checked::new(record).is_ok());
+    }
 }

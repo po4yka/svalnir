@@ -344,6 +344,13 @@ impl Check for TargetResultRecord {
         if is_covered && !covered_agrees {
             return Err(OutcomeError::Evidence);
         }
+        // A verified effect is an observation of the target after the
+        // call: a native call that succeeded is not a verified effect. A
+        // record with no observation source states that no observation
+        // was made, so it cannot have a verified effect.
+        if self.effect.is_verified() && self.evidence.source.is_none() {
+            return Err(OutcomeError::Evidence);
+        }
         Ok(())
     }
 }

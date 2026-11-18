@@ -365,6 +365,14 @@ impl RecordBase {
         &self.target_id
     }
 
+    pub(super) const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(super) const fn step_id(&self) -> &StepId {
+        &self.step_id
+    }
+
     /// Makes the checked result of one member.
     pub(super) fn record(
         &self,

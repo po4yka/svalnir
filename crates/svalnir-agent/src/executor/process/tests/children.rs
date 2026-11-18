@@ -281,6 +281,8 @@ fn a_child_that_ignores_term_runs_after_the_grace_period_and_exits_on_kill() {
     let forced_input = StepInput {
         graceful: Some(GracefulRecord {
             submitted_at: report.submitted_at.unwrap(),
+            operation_id: &super::fake::OPERATION,
+            step_id: &super::fake::GRACEFUL_STEP,
             results: &results,
         }),
         ..input(&force, &receipt)

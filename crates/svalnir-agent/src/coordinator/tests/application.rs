@@ -249,3 +249,108 @@ fn the_end_of_a_client_wait_cancels_nothing() {
     assert_eq!(view.operation.state(), &OperationState::Completed);
     assert_eq!(bench.host.calls(), vec![term(4242), kill(4242)]);
 }
+
+/// An application executor whose graceful step ends with an effect that
+/// is not known. It counts the steps that the coordinator starts.
+#[derive(Debug)]
+struct UnknownGraceful {
+    begun: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl super::super::ApplicationExecutor for UnknownGraceful {
+    fn begin(
+        &self,
+        input: crate::executor::process::StepInput<'_>,
+    ) -> Result<crate::executor::process::StepRun, crate::executor::process::ExecutorError> {
+        use svalnir_core::action::{
+            ActionStage, Attribution, Checked, Durability, EffectEvidence, ErrorFamily,
+            NativeResult, TargetBinding, TargetResultRecord,
+        };
+
+        use crate::executor::process::{MemberOutcome, NextStep, StepReport, StepRun};
+
+        self.begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let TargetBinding::Application(binding) = &input.envelope.target.binding else {
+            panic!("the step has no application target");
+        };
+        let correlation = &input.envelope.correlation;
+        let result = Checked::new(TargetResultRecord {
+            target_id: input.envelope.target.target_id.clone(),
+            member: None,
+            dispatch: DispatchState::Submitted,
+            effect: TargetEffect::UnknownOutcome,
+            evidence: EffectEvidence {
+                native: NativeResult::Unavailable,
+                ..EffectEvidence::none()
+            },
+            attribution: Attribution::Possible,
+            durability: Durability::Durable,
+            stop_reason: StopReason::Failed,
+            failure: Some(super::super::error::action_error_with(
+                "effect_not_established",
+                ErrorFamily::Outcome,
+                ActionStage::Verification,
+                DispatchState::Submitted,
+                Some(&correlation.plan_id),
+                Some(&correlation.operation_id),
+                Some(&correlation.step_id),
+            )),
+        })
+        .unwrap();
+        Ok(StepRun::Finished(StepReport {
+            members: vec![MemberOutcome {
+                generation_id: binding.members[0].generation_id.clone(),
+                state: None,
+                result,
+            }],
+            submitted_at: Some(input.envelope.evidence.observed_at),
+            next: NextStep::Reconcile,
+        }))
+    }
+
+    fn poll(
+        &self,
+        _observation: Box<crate::executor::process::Observation>,
+        _stop: Option<crate::executor::process::StopRequest>,
+    ) -> Result<crate::executor::process::StepRun, crate::executor::process::ExecutorError> {
+        panic!("no step of this executor has an observation");
+    }
+}
+
+#[test]
+fn a_graceful_result_that_needs_reconciliation_gives_no_force_dispatch() {
+    let mut bench = Bench::new();
+    let member = bench.host.spawn(4242);
+    let plan = stop_plan(
+        "plan_1",
+        vec![member],
+        Escalation::ForceAfterGrace,
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let begun = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&begun);
+    let started = bench.start_with(|dependencies, _| {
+        dependencies.application = Box::new(UnknownGraceful { begun: counter });
+    });
+    let super::super::Start::Coordinating(mut coordinator) = started else {
+        panic!("a different coordinator holds the lock");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    bench.clock.advance(GRACE + SECOND);
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    // The force step is not given to the executor, and its dispatch is
+    // not consumed: the only intent is that of the graceful step.
+    assert_eq!(begun.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(bench.intents(), 1);
+    let steps = view.operation.steps();
+    assert_eq!(steps[0].results()[0].effect, TargetEffect::UnknownOutcome);
+    let force = &steps[1].results()[0];
+    assert_eq!(force.effect, TargetEffect::Skipped);
+    assert_eq!(force.dispatch, DispatchState::NotSubmitted);
+    assert_eq!(
+        force.failure.as_ref().map(|error| error.code.as_str()),
+        Some("reconcile_before_force")
+    );
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+}

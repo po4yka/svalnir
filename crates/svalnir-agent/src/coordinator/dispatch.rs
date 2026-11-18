@@ -853,9 +853,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             self.end_without_call(active, step, None, charged, reason.clone(), None)?;
             return Ok(StepEnd::Stop(reason, None));
         }
+        // The record is that of the graceful step of this operation: the
+        // map of the operation has it, and the executor compares the two
+        // identities with the envelope of the force step.
+        let operation_id: OperationId = active.operation.operation_id().clone();
         let graceful: Option<GracefulRecord<'_>> = match (&prior, follows_graceful) {
             (Some(prior), true) => prior.submitted_at.map(|submitted_at| GracefulRecord {
                 submitted_at,
+                operation_id: &operation_id,
+                step_id: &prior.step_id,
                 results: &prior.results,
             }),
             _ => None,
@@ -1038,6 +1044,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             active.graceful.insert(
                 step.target_id.clone(),
                 GracefulOutcome {
+                    step_id: step.step_id.clone(),
                     submitted_at: report.submitted_at,
                     results: results.clone(),
                     next: report.next,

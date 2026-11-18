@@ -392,6 +392,8 @@ fn force_input<'a>(
     StepInput {
         graceful: Some(GracefulRecord {
             submitted_at: report.submitted_at.unwrap(),
+            operation_id: &super::fake::OPERATION,
+            step_id: &super::fake::GRACEFUL_STEP,
             results,
         }),
         ..input(envelope, receipt)
@@ -410,6 +412,8 @@ fn a_force_step_needs_the_record_of_its_graceful_step_and_no_other_step_has_one(
     );
     let record = GracefulRecord {
         submitted_at: MonotonicNanos::new(START),
+        operation_id: &super::fake::OPERATION,
+        step_id: &super::fake::GRACEFUL_STEP,
         results: &[],
     };
     for envelope in [
@@ -491,6 +495,50 @@ fn a_force_step_after_the_grace_period_kills_and_verifies() {
     let mut all = results;
     all.extend(forced.results());
     assert_eq!(aggregate_step(&all).unwrap(), StepState::Completed);
+}
+
+#[test]
+fn a_graceful_record_of_a_different_operation_or_of_the_force_step_permits_no_force_step() {
+    let host: Host = Host::new().with_process(100, 10);
+    let members = vec![member(100, 10, job())];
+    let report = graceful_step_to_the_end(&host, members.clone());
+    let results = report.results();
+    let envelope = force(Escalation::ForceAfterGrace, members);
+    let receipt = receipt();
+    let other_operation = svalnir_core::id::OperationId::new("operation_2").unwrap();
+    let force_step = envelope.correlation.step_id.clone();
+    let correct = force_input(&envelope, &receipt, &report, &results);
+    let record = correct.graceful.unwrap();
+    for wrong in [
+        GracefulRecord {
+            operation_id: &other_operation,
+            ..record
+        },
+        GracefulRecord {
+            step_id: &force_step,
+            ..record
+        },
+    ] {
+        let input = StepInput {
+            graceful: Some(wrong),
+            ..correct
+        };
+        assert_eq!(
+            host.executor().begin(input).unwrap_err(),
+            ExecutorError::GracefulRecord
+        );
+    }
+    // No force call was issued for either record.
+    assert_eq!(host.calls(), vec![NativeCall::Signal(100, TERM)]);
+    // The record of the operation of the envelope permits the step.
+    host.executor().begin(correct).unwrap();
+    assert_eq!(
+        host.calls(),
+        vec![
+            NativeCall::Signal(100, TERM),
+            NativeCall::Signal(100, ProcessSignal::Kill)
+        ]
+    );
 }
 
 #[test]

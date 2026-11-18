@@ -409,6 +409,15 @@ pub(super) fn member(
     }
 }
 
+/// The operation of each envelope of [`content`].
+pub(super) static OPERATION: std::sync::LazyLock<OperationId> =
+    std::sync::LazyLock::new(|| OperationId::new("operation_1").unwrap());
+
+/// The graceful step of a [`GracefulRecord`](super::super::GracefulRecord).
+/// Each envelope of [`content`] has the step `step_1`.
+pub(super) static GRACEFUL_STEP: std::sync::LazyLock<StepId> =
+    std::sync::LazyLock::new(|| StepId::new("step_graceful").unwrap());
+
 pub(super) fn target_id() -> TargetId {
     TargetId::new("app").unwrap()
 }

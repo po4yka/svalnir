@@ -167,6 +167,8 @@ pub trait Idle {
 /// The record of the graceful step of one target, for its force step.
 #[derive(Debug, Clone)]
 pub(super) struct GracefulOutcome {
+    /// The graceful step that gave the results.
+    pub(super) step_id: StepId,
     pub(super) submitted_at: Option<MonotonicNanos>,
     pub(super) results: Vec<TargetResult>,
     pub(super) next: NextStep,

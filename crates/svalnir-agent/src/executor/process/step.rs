@@ -15,7 +15,9 @@ use svalnir_core::action::{
     DispatchState, Escalation, ExecutorRole, NativeResult, RequestEnvelope, StopReason,
     TargetBinding, TargetEffect, TargetResult, check_dispatch_recording,
 };
-use svalnir_core::id::{BootId, ClockDomainId, ExecutorEpochId, ProcessGenerationId};
+use svalnir_core::id::{
+    BootId, ClockDomainId, ExecutorEpochId, OperationId, ProcessGenerationId, StepId,
+};
 use svalnir_core::policy::{ProtectionContext, ProtectionFact, hard_protection};
 use svalnir_core::process::{AttributionMethod, Pid, ProcessAssociation, ProcessIdentity, Uid};
 use svalnir_core::quantity::Nanoseconds;
@@ -92,6 +94,14 @@ pub struct GracefulRecord<'a> {
     /// starts at this time. A later query or a reconnection does not
     /// change it.
     pub submitted_at: MonotonicNanos,
+    /// The operation of the graceful step. The force step refuses a
+    /// record of a different operation: a record of another operation on
+    /// the same target identity permits no force step and does not set
+    /// the start of the grace period.
+    pub operation_id: &'a OperationId,
+    /// The graceful step. The force step refuses a record that names the
+    /// force step itself.
+    pub step_id: &'a StepId,
     /// The target results of the graceful step.
     pub results: &'a [TargetResult],
 }
@@ -360,6 +370,12 @@ fn prior_of(
     record: &GracefulRecord<'_>,
     base: &RecordBase,
 ) -> Result<impl Fn(&ProcessGenerationId) -> Prior + use<>, ExecutorError> {
+    // The record is that of an earlier step of the operation of this
+    // envelope. A target result has no operation identity of its own, so
+    // the caller states the pairing and this comparison holds it.
+    if record.operation_id != base.operation_id() || record.step_id == base.step_id() {
+        return Err(ExecutorError::GracefulRecord);
+    }
     let mut whole: Option<&TargetResult> = None;
     let mut members: BTreeMap<&str, &TargetResult> = BTreeMap::new();
     for result in record.results {

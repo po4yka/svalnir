@@ -655,6 +655,33 @@ fn an_item_with_content_that_the_rule_preserves_is_skipped() {
     }
 }
 
+/// Makes a FIFO at `path`.
+fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `name` is a NUL-terminated path that lives through the call,
+    // and `mkfifo` keeps no pointer.
+    let status: libc::c_int = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(status, 0, "{}", io::Error::last_os_error());
+}
+
+#[test]
+fn an_item_with_a_fifo_is_skipped_and_the_fifo_is_not_opened() {
+    let fixture = temporary_fixture();
+    let item = add_item(&fixture, "with-fifo", |_| {});
+    make_fifo(&item.join("nested/pipe"));
+
+    // An open of the FIFO for reading would block this test.
+    let discovery = discover_temporary(&fixture);
+
+    assert_eq!(discovery.candidates.len(), 0);
+    assert_eq!(
+        skip_of(&discovery, "with-fifo").reasons,
+        [SkipReason::UnsupportedObject]
+    );
+}
+
 #[test]
 fn an_item_with_a_link_or_a_special_object_is_skipped() {
     let fixture = temporary_fixture();

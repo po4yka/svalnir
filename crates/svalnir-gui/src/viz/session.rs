@@ -15,6 +15,7 @@ use crate::{
     viz::{
         dial::DialColors,
         led::lit_color,
+        runway::{self, Estimate, Trend},
         tick_track::{TickState, state_of, track_label},
     },
 };
@@ -82,6 +83,13 @@ pub struct Column {
     pub state: TickState,
     /// The dots of the change strip, 0 to 3.
     pub change: u8,
+    /// The row of the trend dot from the bottom, `0..CURVE_ROWS`; `None`
+    /// outside the readings that the trend uses.
+    pub trend: Option<usize>,
+    /// The place of the trend line from the bottom, in thousandths of a
+    /// row: `0..=(CURVE_ROWS - 1) * 1000`. The line is straight, so the
+    /// paint does not put it on the rows of the lattice.
+    pub trend_at: Option<u16>,
 }
 
 /// What an event is.
@@ -145,6 +153,8 @@ pub struct SessionModel {
     pub axis: Vec<AxisLabel>,
     /// Whether the times of the axis are UTC and not local time.
     pub axis_utc: bool,
+    /// The runway estimate of the readings; `None` without enough readings.
+    pub runway: Option<Estimate>,
 }
 
 /// The range of the measured values of `values`.
@@ -157,6 +167,28 @@ fn range_of(values: impl Iterator<Item = Option<u64>>) -> Option<(u64, u64)> {
 
 /// The position of `value` in `range` as a step `0..=steps`, rounded. A range
 /// of one value gives the middle step.
+/// The place of `value` in `range` from the bottom, in thousandths of a
+/// row: `0..=(CURVE_ROWS - 1) * 1000`. A range of one value gives the middle
+/// row, as [`step_in`] does. A value that is not finite gives the lowest row.
+fn trend_place(value: f64, range: (u64, u64)) -> u16 {
+    let top: f64 = f64::from(u16::try_from(CURVE_ROWS - 1).unwrap_or(0));
+    let (low, high): (f64, f64) = (value_f64(range.0), value_f64(range.1));
+    let place: f64 = if high > low && value.is_finite() {
+        ((value - low) / (high - low)).clamp(0.0, 1.0) * top
+    } else if high > low {
+        0.0
+    } else {
+        (top / 2.0).floor()
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the place is clamped to the rows of the curve, at most 9000"
+    )]
+    let thousandths: u16 = (place * 1000.0).round() as u16;
+    thousandths
+}
+
 fn step_in(value: u64, range: (u64, u64), steps: usize) -> usize {
     let (low, high) = range;
     let span: u128 = u128::from(high.saturating_sub(low));
@@ -229,6 +261,8 @@ pub fn session_model(
     let disk: Option<(u64, u64)> = measured(|s| &s.disk_used);
     let swap: Option<(u64, u64)> = measured(|s| &s.swap_used);
     let mut columns: Vec<Column> = Vec::with_capacity(visible.len());
+    let fit: Option<Trend> = runway::trend(samples);
+    let trend_from: usize = samples.len().saturating_sub(runway::WINDOW);
     for (index, sample) in visible.iter().enumerate() {
         let previous: Option<&HostSample> = if index == 0 {
             before
@@ -265,6 +299,21 @@ pub fn session_model(
             },
             state: state_of(&sample.pressure),
             change,
+            trend: fit
+                .as_ref()
+                .zip(available)
+                .filter(|_| start + index >= trend_from)
+                .map(|(line, range)| {
+                    let value: f64 = line
+                        .value_at(sample.at)
+                        .clamp(value_f64(range.0), value_f64(range.1));
+                    step_in(whole_bytes(value), range, CURVE_ROWS - 1)
+                }),
+            trend_at: fit
+                .as_ref()
+                .zip(available)
+                .filter(|_| start + index >= trend_from)
+                .map(|(line, range)| trend_place(line.value_at(sample.at), range)),
             at: sample.at,
             utc_offset: sample.utc_offset,
         });
@@ -351,7 +400,24 @@ pub fn session_model(
         newest,
         axis,
         axis_utc,
+        runway: runway::estimate(samples),
     }
+}
+
+/// A byte count as a float for the trend; the precision is enough to place a dot.
+#[expect(clippy::cast_precision_loss, reason = "the value places a dot")]
+const fn value_f64(bytes: u64) -> f64 {
+    bytes as f64
+}
+
+/// A non-negative float as whole bytes, saturating.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to the range of the readings first"
+)]
+fn whole_bytes(value: f64) -> u64 {
+    value.max(0.0) as u64
 }
 
 fn bytes_text(bytes: u64) -> String {
@@ -402,8 +468,11 @@ impl SessionModel {
         let min: String = self.min.map_or_else(String::new, |min| {
             format!(", min {}", bytes_text(min.value))
         });
+        let runway: String = self
+            .runway_text()
+            .map_or_else(String::new, |text| format!(", runway {text} (an estimate)"));
         format!(
-            "Session chart: {}, {}, pressure {} normal, {} warning, {} critical{min}, {}",
+            "Session chart: {}, {}, pressure {} normal, {} warning, {} critical{min}, {}{runway}",
             readings_text(self.columns.len()),
             range_caption(self.range),
             count(TickState::Normal),
@@ -411,6 +480,13 @@ impl SessionModel {
             count(TickState::Critical),
             events_text(self.events.len()),
         )
+    }
+
+    /// The text of the runway, such as "≈ 3 h" or "steady"; `None` without an
+    /// estimate.
+    #[must_use]
+    pub fn runway_text(&self) -> Option<String> {
+        self.runway.map(|e| e.text())
     }
 
     /// The first slot of the newest reading, from the left.
@@ -629,6 +705,8 @@ pub struct SessionTags {
     pub events: String,
     /// "now STATE".
     pub state: String,
+    /// "runway ≈ 3 h" or "runway steady"; `None` without an estimate.
+    pub runway: Option<String>,
 }
 
 /// "260.0-310.2 GB", or the two values with their units.
@@ -782,6 +860,7 @@ impl SessionModel {
                 self.newest
                     .map_or(UNAVAILABLE_TEXT, |newest| state_word(newest.state))
             ),
+            runway: self.runway_text().map(|text| format!("runway {text}")),
         }
     }
 }
@@ -810,6 +889,9 @@ struct SessionPaint {
     colors: DialColors,
     brand: Hsla,
     muted_ink: Hsla,
+    /// The color of the trend line: the text color, so that the line
+    /// differs from the dots of the curve.
+    trend_ink: Hsla,
     ink: Hsla,
     glow: bool,
     live: Option<f32>,
@@ -947,6 +1029,26 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
                 }
                 None => hollow(window, slot, top + MATRIX_DOTS - 1),
             }
+        }
+    }
+    // The trend line: dots of 2.5 px on a straight line over the columns
+    // that the trend uses. The line is not on the rows of the lattice, so it
+    // does not hide behind the dots of the curve.
+    let top_row: f32 = count_px(CURVE_ROWS - 1);
+    for (index, column) in model.columns.iter().enumerate() {
+        if let Some(place) = column.trend_at {
+            window.paint_quad(
+                fill(
+                    dot_at(
+                        origin,
+                        slot_x(model.offset() + index),
+                        layout.band + (top_row - f32::from(place) / 1000.0) * PITCH,
+                        2.5,
+                    ),
+                    paint.trend_ink.opacity(0.8 * rest),
+                )
+                .corner_radii(Corners::all(px(1.25))),
+            );
         }
     }
     // The dashed line of the lowest value on screen.
@@ -1286,7 +1388,9 @@ impl RenderOnce for SessionChart {
                 axis.text.clone(),
             ));
         }
+        let trend_ink: Hsla = to_hsla(tokens.foreground);
         let paint: SessionPaint = SessionPaint {
+            trend_ink,
             model: self.model,
             layout,
             colors,
@@ -1387,6 +1491,20 @@ impl RenderOnce for SessionChart {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_trend_place_is_not_rounded_to_a_row() {
+        // A quarter of the range is a quarter of the 9 row steps.
+        assert_eq!(trend_place(25.0, (0, 100)), 2250);
+        assert_eq!(trend_place(0.0, (0, 100)), 0);
+        assert_eq!(trend_place(100.0, (0, 100)), 9000);
+        // Outside the range, and a value that is not a number.
+        assert_eq!(trend_place(-5.0, (0, 100)), 0);
+        assert_eq!(trend_place(500.0, (0, 100)), 9000);
+        assert_eq!(trend_place(f64::NAN, (0, 100)), 0);
+        // A range of one value: the middle row, as the curve.
+        assert_eq!(trend_place(7.0, (7, 7)), 4000);
+    }
     use std::time::{Duration, SystemTime};
 
     fn at(seconds: u64) -> SystemTime {

@@ -17,7 +17,10 @@ use crate::{
         ring_center::RingCenter,
         surface::Inset,
     },
-    viz::led::{LedStyle, lit_color},
+    viz::{
+        led::{LedStyle, lit_color},
+        runway::{Estimate, Runway},
+    },
 };
 use gpui_kit::{
     App, Bounds, BoxShadow, Corners, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
@@ -162,6 +165,20 @@ pub struct Ring {
     pub rows: Vec<(&'static str, String)>,
     /// The sentence below the rows of the detail panel.
     pub note: String,
+    /// The runway of the ring; only the disk ring has one.
+    pub runway: Option<RunwayView>,
+}
+
+/// What a ring shows of the runway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunwayView {
+    /// The text: "≈ 3 h", "steady".
+    pub text: String,
+    /// The measured readings behind the estimate.
+    pub readings: usize,
+    /// The dots that the trend takes in the next hour, from the head on. The
+    /// paint caps it at the end of the ring.
+    pub next_hour_dots: usize,
 }
 
 impl Ring {
@@ -191,6 +208,25 @@ impl Ring {
         parts.push(self.note.clone());
         parts.join(". ")
     }
+}
+
+/// A byte count as a float; an estimate needs no exact value.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "an estimate needs no exact bytes"
+)]
+const fn value_as_f64(value: u64) -> f64 {
+    value as f64
+}
+
+/// A rounded, non-negative float as a count of dots, saturating.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to 0 and 1000 first"
+)]
+fn dots_of(value: f64) -> usize {
+    value.clamp(0.0, 1000.0) as usize
 }
 
 fn text_or_dash(value: &Measured<u64>) -> String {
@@ -351,6 +387,7 @@ fn unavailable_ring(kind: RingKind, reason: &str) -> Ring {
         center_caption: format!("{} unavailable", kind.name()),
         rows: Vec::new(),
         note: String::new(),
+        runway: None,
     }
 }
 
@@ -389,6 +426,7 @@ fn disk_ring(host: &HostSnapshot) -> Ring {
         center_caption: "Disk used".to_owned(),
         rows: Vec::new(),
         note: String::new(),
+        runway: None,
     }
 }
 
@@ -418,6 +456,7 @@ fn swap_ring(host: &HostSnapshot) -> Ring {
             center_caption: "No swap space".to_owned(),
             rows: Vec::new(),
             note: String::new(),
+            runway: None,
         };
     }
     if used > total {
@@ -437,6 +476,7 @@ fn swap_ring(host: &HostSnapshot) -> Ring {
         center_caption: "Swap used".to_owned(),
         rows: Vec::new(),
         note: String::new(),
+        runway: None,
     }
 }
 
@@ -454,6 +494,7 @@ fn pressure_ring(host: &HostSnapshot) -> Ring {
             center_caption: "Memory pressure".to_owned(),
             rows: Vec::new(),
             note: String::new(),
+            runway: None,
         },
         Measured::Unavailable(reason) => unavailable_ring(kind, reason),
     }
@@ -495,10 +536,44 @@ fn pick(rings: &[Ring; 3]) -> usize {
 /// The model of the dial for one host reading.
 #[must_use]
 pub fn dial_model(host: &HostSnapshot) -> DialModel {
+    dial_model_with(host, None)
+}
+
+/// Like [`dial_model`], and the disk ring shows the runway of `estimate`: a
+/// row, a note, and the dots of the next hour.
+#[must_use]
+pub fn dial_model_with(host: &HostSnapshot, estimate: Option<&Estimate>) -> DialModel {
     let mut rings: [Ring; 3] = [disk_ring(host), swap_ring(host), pressure_ring(host)];
     for ring in &mut rings {
         ring.rows = detail_rows(ring.kind, host);
         ring.note = detail_note(ring.kind, &ring.rows);
+    }
+    if let (Some(estimate), Some(Measured::Value(total))) = (estimate, Some(&host.disk_total))
+        && let RingState::Used { lit, .. } = rings[0].state
+    {
+        let ring: &mut Ring = &mut rings[0];
+        let text: String = estimate.text();
+        let per_dot: f64 =
+            value_as_f64(*total) / value_as_f64(u64::try_from(ring.dots).unwrap_or(1));
+        let falling: bool = matches!(estimate.runway, Runway::Falling { .. });
+        let wanted: usize = if per_dot > 0.0 && falling {
+            // Below half a dot the ring shows no dot: one dot would state
+            // more space than the trend takes.
+            dots_of((estimate.trend.taken_in_hour() / per_dot).round())
+        } else {
+            0
+        };
+        ring.rows.push(("Runway", text.clone()));
+        ring.note = format!(
+            "{} Runway: estimate from {} readings.",
+            ring.note,
+            estimate.readings()
+        );
+        ring.runway = Some(RunwayView {
+            text,
+            readings: estimate.readings(),
+            next_hour_dots: wanted.min(ring.dots - lit.min(ring.dots)),
+        });
     }
     let picked: usize = pick(&rings);
     DialModel { rings, picked }
@@ -969,6 +1044,29 @@ fn paint_dial(paint: &DialPaint, bounds: Bounds<Pixels>, window: &mut Window) {
                     color,
                 )
                 .corner_radii(Corners::all(px(DOT_PX / 2.0))),
+            );
+        }
+    }
+    // The next hour of the runway: dots of 2 px after the head of the disk
+    // ring, in the ring color. Not during the sweep.
+    if paint.sweep.is_none()
+        && let Some(ring) = paint.model.rings.first()
+        && let Some(view) = &ring.runway
+        && let RingState::Used { lit, .. } = ring.state
+    {
+        let strength: f32 = if paint.picked == 0 {
+            1.0
+        } else {
+            UNPICKED_ALPHA
+        } * rest;
+        let count: usize = view.next_hour_dots.min(ring.dots.saturating_sub(lit));
+        for dot in lit..lit + count {
+            window.paint_quad(
+                fill(
+                    dot_bounds(origin, dot_center(dot, ring.dots, RING_RADII[0]), 2.0),
+                    paint.colors.disk.opacity(strength),
+                )
+                .corner_radii(Corners::all(px(1.0))),
             );
         }
     }

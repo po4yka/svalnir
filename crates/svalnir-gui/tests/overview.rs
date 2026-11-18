@@ -249,7 +249,7 @@ fn drift_readings_fill_the_session_chart_before_the_first_paint(cx: &mut TestApp
     assert!(chart.contains("15 warning"), "{chart}");
     assert!(chart.contains("5 critical"), "{chart}");
     // Three pressure changes and one operation.
-    assert!(chart.ends_with("4 events"), "{chart}");
+    assert!(chart.contains("4 events"), "{chart}");
 }
 
 #[gpui_kit::test]
@@ -407,4 +407,37 @@ fn the_chip_names_the_newest_event_with_its_fact(cx: &mut TestAppContext) {
     );
     let chart = label(handle, "session-chart", cx).expect("chart");
     assert!(chart.contains(", min "), "{chart}");
+}
+
+#[gpui_kit::test]
+fn a_falling_session_shows_a_labeled_runway(cx: &mut TestAppContext) {
+    let handle = open_drift(100, cx);
+    let tag = label(handle, "session-tag-runway", cx).expect("runway tag");
+    assert!(tag.starts_with("runway \u{2248} "), "{tag}");
+    assert!(
+        [" min", " h", " d"].iter().any(|unit| tag.ends_with(unit)),
+        "{tag}"
+    );
+    let chart = label(handle, "session-chart", cx).expect("session chart");
+    assert!(chart.contains("runway \u{2248} "), "{chart}");
+    assert!(chart.contains("an estimate"), "{chart}");
+    let detail = label(handle, "dial-detail", cx).expect("detail panel");
+    assert!(detail.contains("Runway \u{2248} "), "{detail}");
+    assert!(detail.contains("Runway: estimate from "), "{detail}");
+    for text in [&tag, &chart, &detail] {
+        assert!(
+            !text.contains("freed") && !text.contains("reclaimed"),
+            "{text}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_healthy_session_without_a_trend_shows_no_runway(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    assert!(label(handle, "session-tag-runway", cx).is_none());
+    let chart = label(handle, "session-chart", cx);
+    assert!(chart.is_none_or(|c| !c.contains("runway")));
+    let detail = label(handle, "dial-detail", cx).unwrap_or_default();
+    assert!(!detail.contains("Runway"), "{detail}");
 }

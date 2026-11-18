@@ -31,10 +31,12 @@ use crate::{
         capacity_grid::CapacityGrid,
         cell_ring::{CellRing, STEPS},
         dial::sweep_total,
-        led::{FillAxis, LedChart, LedField, LedHead, LedSegment, TileLabel},
+        ghost::{ScanDelta, change_text, gone_text, scan_delta},
+        led::{FillAxis, LedChart, LedField, LedHead, LedSegment, TileLabel, density_swatch},
+        session::clock_text,
         storage_layouts::{
             BAND_ROWS, CHART_ROWS, ChartItem, STRIP_ROWS, StorageLayout, apply_focus,
-            bytes_per_cell, chart_label, layout_field, scale_caption,
+            bytes_per_cell, chart_label, density_of, layout_field, scale_caption,
         },
         treemap::CellRect,
     },
@@ -404,6 +406,8 @@ fn volume_strip(used: &Measured<u64>, total: &Measured<u64>, width: f32, dark: b
         color: Hsla::from(palette::category_color(0, dark)),
         activatable: false,
         inert: false,
+        density: None,
+        change: None,
     }];
     let free: u64 = total.saturating_sub(*used);
     let (field, labels) = layout_field(
@@ -486,6 +490,8 @@ fn running_field(
             color: Hsla::from(palette::category_color(index, dark)),
             activatable: false,
             inert: false,
+            density: None,
+            change: None,
         })
         .filter(|item| item.bytes > 0)
         .collect();
@@ -869,6 +875,14 @@ impl StorageScreen {
     ) -> AnyElement {
         let segments: Vec<Segment> = breakdown(&summary.children, self.metric, DEFAULT_SEGMENTS);
         let mut color_index: usize = 0;
+        // The ghost compares with the scan before this one, only when both
+        // are comparable.
+        let earlier: Option<Arc<ScanSummary>> = self.model.read(cx).earlier_scan(summary);
+        let delta: Option<ScanDelta> = earlier
+            .as_ref()
+            .map(|e| scan_delta(e, summary, self.metric))
+            .filter(|d| d.comparable);
+        let used_sources: Vec<usize> = segments.iter().filter_map(|s| s.source_index).collect();
         let mut items: Vec<ChartItem> = segments
             .iter()
             .map(|segment| {
@@ -887,6 +901,31 @@ impl StorageScreen {
                         .source_index
                         .is_some_and(|i| summary.children[i].is_directory),
                     inert: false,
+                    // A file is not a folder: it keeps the default share.
+                    density: if let Some(i) = segment.source_index {
+                        summary.children[i]
+                            .is_directory
+                            .then(|| {
+                                density_of(
+                                    summary.children[i].allocated,
+                                    summary.children[i].logical,
+                                )
+                            })
+                            .flatten()
+                    } else {
+                        let (allocated, logical) = summary
+                            .children
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !used_sources.contains(i))
+                            .fold((0_u64, 0_u64), |(a, l), (_, c)| {
+                                (a.saturating_add(c.allocated), l.saturating_add(c.logical))
+                            });
+                        density_of(allocated, logical)
+                    },
+                    change: segment
+                        .source_index
+                        .and_then(|i| delta.as_ref().and_then(|d| d.changes.get(i).copied())),
                 }
             })
             .collect();
@@ -911,6 +950,8 @@ impl StorageScreen {
                         color: Hsla::from(palette::neutral_color(dark)),
                         activatable: false,
                         inert: true,
+                        density: None,
+                        change: None,
                     });
                 }
             }
@@ -924,6 +965,14 @@ impl StorageScreen {
                     size: format!("{text} {unit}").into(),
                     color: item.color,
                     activatable: item.activatable,
+                    density: item
+                        .density
+                        .filter(|d| *d < 0.9)
+                        .map(|d| format!("{:.0}% dense", d * 100.0).into()),
+                    delta: item
+                        .change
+                        .and_then(change_text)
+                        .map(|(text, larger)| (text.into(), larger)),
                 }
             })
             .collect();
@@ -1049,6 +1098,29 @@ impl StorageScreen {
                 ))
                 .into_any_element()
         };
+        let has_density: bool = total_items > 0 && items.iter().any(|i| i.density.is_some());
+        let chart: AnyElement = if has_density {
+            let muted: Hsla = to_hsla(tokens.muted_foreground);
+            v_flex()
+                .gap(tokens::SPACE_2)
+                .child(chart)
+                .child(
+                    h_flex()
+                        .id("storage-density-key")
+                        .test_support()
+                        .aria_label("Lit cells: allocated size ÷ logical size")
+                        .gap(tokens::SPACE_2)
+                        .items_center()
+                        .text_size(px(12.0))
+                        .text_color(muted)
+                        .child(density_swatch(0.2, 6, 2, muted, dark))
+                        .child(density_swatch(0.9, 6, 2, muted, dark))
+                        .child("Lit cells: allocated size ÷ logical size"),
+                )
+                .into_any_element()
+        } else {
+            chart
+        };
         let mut value_row = h_flex()
             .items_center()
             .gap(tokens::SPACE_3)
@@ -1110,6 +1182,28 @@ impl StorageScreen {
             );
         } else {
             col = col.child(chart).child(legend);
+        }
+        if let (Some(earlier), Some(delta)) = (&earlier, &delta) {
+            let offset: Option<i32> = self
+                .model
+                .read(cx)
+                .history
+                .back()
+                .and_then(|sample| sample.utc_offset);
+            let utc: &str = if offset.is_some() { "" } else { " UTC" };
+            let mut ghost = v_flex().gap(tokens::SPACE_1);
+            if let Some(text) = gone_text(&delta.gone) {
+                ghost = ghost.child(caption("storage-ghost-gone", text, tokens));
+            }
+            ghost = ghost.child(caption(
+                "storage-ghost-caption",
+                format!(
+                    "Compared with the scan of {}{utc}",
+                    clock_text(earlier.finished_at, offset)
+                ),
+                tokens,
+            ));
+            col = col.child(ghost);
         }
         let (scanned, scanned_unit) = format_bytes(summary.total(self.metric));
         let mut stats: StatRow = StatRow::new("storage-stat-").item(

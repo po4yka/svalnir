@@ -40,6 +40,8 @@ Options:
                        (tiles, band, columns, ring)
   --scan PATH          Start a size scan of the directory PATH at launch.
                        The scan reads sizes only
+  --rescan             With --scan only: when the first scan ends, scan the
+                       same directory once more
   --readings N         With --fixture only: take N readings (1 to 180) at
                        launch, so the session chart has N readings
   --help               Print this text
@@ -78,6 +80,8 @@ pub struct LaunchOptions {
     pub screen: Option<Screen>,
     /// The directory of a scan that starts at launch.
     pub scan: Option<PathBuf>,
+    /// Whether a second scan of the same directory starts when the first ends.
+    pub rescan: bool,
     /// The layout of the folder chart; `None` is the default layout.
     pub layout: Option<StorageLayout>,
     /// The window size in points; `None` is the default size.
@@ -186,6 +190,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                 }
                 options.scan = Some(path);
             }
+            "--rescan" => options.rescan = true,
             "--readings" => {
                 let text: String = args
                     .next()
@@ -205,6 +210,9 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
     }
     if options.readings.is_some() && options.fixture.is_none() {
         return Err("`--readings` is valid only with `--fixture`".to_owned());
+    }
+    if options.rescan && options.scan.is_none() {
+        return Err("`--rescan` is valid only with `--scan`".to_owned());
     }
     Ok(options)
 }
@@ -331,7 +339,11 @@ pub fn run() -> ExitCode {
             }
             if let Some(root) = &options.scan {
                 let model: Entity<AppModel> = view.read(cx).model().clone();
-                model.update(cx, |model, cx| model.start_scan(root, cx));
+                let rescan: bool = options.rescan;
+                model.update(cx, |model, cx| {
+                    model.set_rescan_once(rescan);
+                    model.start_scan(root, cx);
+                });
             }
             // A window that is not in front gets no frame, so its values stay
             // at the first paint.
@@ -369,6 +381,7 @@ mod tests {
             "/tmp/a",
             "--sidebar",
             "narrow",
+            "--rescan",
             "--size",
             "1200x900",
             "--layout",
@@ -383,6 +396,7 @@ mod tests {
                 reduce_motion: true,
                 screen: Some(Screen::Storage),
                 scan: Some(PathBuf::from("/tmp/a")),
+                rescan: true,
                 size: Some((1200, 900)),
                 layout: Some(StorageLayout::Ring),
                 readings: Some(40),
@@ -409,6 +423,8 @@ mod tests {
             parse(&["--sidebar", "wide"]).map(|o| o.sidebar_narrow),
             Ok(Some(false))
         );
+        assert!(parse(&["--rescan"]).is_err(), "needs a scan");
+        assert!(parse(&["--rescan", "--scan", "/tmp/a"]).is_ok());
         assert!(parse(&["--size", "100x100"]).is_err());
         assert!(parse(&["--size", "wide"]).is_err());
         assert!(parse(&["--layout", "spiral"]).is_err());

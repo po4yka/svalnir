@@ -3,8 +3,8 @@
 use super::{
     DataSource,
     model::{
-        AgentSnapshot, HostSnapshot, Loadable, Measured, PressureLevel, ScanProgress, ScanState,
-        ServiceSnapshot,
+        AgentSnapshot, HostSnapshot, Loadable, Measured, PressureLevel, ScanEnd, ScanProgress,
+        ScanState, ScanSummary, ServiceSnapshot,
     },
 };
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
@@ -86,6 +86,36 @@ struct InFlight {
     service: bool,
 }
 
+/// The most scan roots that keep an earlier result.
+pub const SCAN_ROOTS_MAX: usize = 8;
+
+/// The latest finished scan of one root and the one before it.
+#[derive(Debug, Clone)]
+struct ScanRecord {
+    latest: Arc<ScanSummary>,
+    earlier: Option<Arc<ScanSummary>>,
+}
+
+/// Records the finished scan `summary` in `records`: the earlier latest scan
+/// of the same root becomes the earlier result. A cancelled scan changes
+/// nothing. At most [`SCAN_ROOTS_MAX`] roots stay; the oldest goes first.
+fn record_scan(records: &mut Vec<ScanRecord>, summary: &Arc<ScanSummary>) {
+    if summary.ended == ScanEnd::Cancelled {
+        return;
+    }
+    let earlier: Option<Arc<ScanSummary>> = records
+        .iter()
+        .position(|r| r.latest.root == summary.root)
+        .map(|index| records.remove(index).latest);
+    records.push(ScanRecord {
+        latest: Arc::clone(summary),
+        earlier,
+    });
+    while records.len() > SCAN_ROOTS_MAX {
+        records.remove(0);
+    }
+}
+
 /// The latest host and agent snapshots of one source.
 #[derive(Debug)]
 pub struct AppModel {
@@ -106,6 +136,8 @@ pub struct AppModel {
     /// fills it once, so that `render` never touches the file system.
     default_root: Option<PathBuf>,
     pending_scan: Option<PathBuf>,
+    scan_records: Vec<ScanRecord>,
+    rescan_once: bool,
     scan_cancel: Option<CancellationToken>,
     scan_task: Option<Task<()>>,
     scan_ticker: Option<Task<()>>,
@@ -161,6 +193,8 @@ impl AppModel {
             scan_notice: None,
             default_root: None,
             pending_scan: None,
+            scan_records: Vec::new(),
+            rescan_once: false,
             scan_cancel: None,
             scan_task: None,
             scan_ticker: None,
@@ -201,6 +235,23 @@ impl AppModel {
     #[must_use]
     pub fn default_scan_root(&self) -> Option<PathBuf> {
         self.default_root.clone()
+    }
+
+    /// The result that `summary` is compared with: the scan of the same root
+    /// before it. `None` when `summary` is not the latest finished scan of
+    /// its root (a cancelled scan) or when there is no earlier scan.
+    #[must_use]
+    pub fn earlier_scan(&self, summary: &Arc<ScanSummary>) -> Option<Arc<ScanSummary>> {
+        self.scan_records
+            .iter()
+            .find(|r| Arc::ptr_eq(&r.latest, summary))
+            .and_then(|r| r.earlier.clone())
+    }
+
+    /// Asks for one more scan of the same root when the next scan ends with
+    /// a result. The launch option `--rescan` sets it.
+    pub fn set_rescan_once(&mut self, on: bool) {
+        self.rescan_once = on;
     }
 
     /// Starts a scan of `root`. A request while a scan runs is ignored. A
@@ -255,12 +306,27 @@ impl AppModel {
                     model.scan_cancel = None;
                     model.scan_ticker = None;
                     model.scan = match result {
-                        Ok(summary) => ScanState::Done(Arc::new(summary)),
+                        Ok(summary) => {
+                            let summary: Arc<ScanSummary> = Arc::new(summary);
+                            record_scan(&mut model.scan_records, &summary);
+                            ScanState::Done(summary)
+                        }
                         Err(reason) => ScanState::Failed {
-                            root: failed_root,
+                            root: failed_root.clone(),
                             reason,
                         },
                     };
+                    // The model observes its own scan state: a requested
+                    // second scan starts when the first one has a result.
+                    // A scan that the user cancelled does not start it.
+                    let finished: bool = matches!(
+                        &model.scan,
+                        ScanState::Done(summary) if summary.ended != ScanEnd::Cancelled
+                    );
+                    if model.rescan_once && finished {
+                        model.rescan_once = false;
+                        model.start_scan(&failed_root, cx);
+                    }
                     cx.notify();
                 })
                 .is_err()
@@ -444,6 +510,54 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(root: &str, ended: ScanEnd) -> Arc<ScanSummary> {
+        Arc::new(ScanSummary {
+            root: PathBuf::from(root),
+            children: Vec::new(),
+            total_logical: 0,
+            total_allocated: 0,
+            entries_examined: 0,
+            complete: true,
+            ended,
+            gaps: Vec::new(),
+            elapsed: None,
+            finished_at: SystemTime::UNIX_EPOCH,
+        })
+    }
+
+    #[test]
+    fn a_scan_keeps_one_earlier_result_for_each_root() {
+        let mut records: Vec<ScanRecord> = Vec::new();
+        let first = summary("/a", ScanEnd::Finished);
+        record_scan(&mut records, &first);
+        assert!(records[0].earlier.is_none());
+        let second = summary("/a", ScanEnd::Finished);
+        record_scan(&mut records, &second);
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0]
+                .earlier
+                .as_ref()
+                .is_some_and(|e| Arc::ptr_eq(e, &first))
+        );
+        // A cancelled scan replaces nothing.
+        record_scan(&mut records, &summary("/a", ScanEnd::Cancelled));
+        assert!(Arc::ptr_eq(&records[0].latest, &second));
+    }
+
+    #[test]
+    fn at_most_eight_roots_stay() {
+        let mut records: Vec<ScanRecord> = Vec::new();
+        for index in 0..12 {
+            record_scan(
+                &mut records,
+                &summary(&format!("/r{index}"), ScanEnd::Finished),
+            );
+        }
+        assert_eq!(records.len(), SCAN_ROOTS_MAX);
+        assert_eq!(records[0].latest.root, PathBuf::from("/r4"));
+    }
 
     #[test]
     fn scan_allowed_by_pressure() {

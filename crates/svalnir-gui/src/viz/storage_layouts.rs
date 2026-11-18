@@ -1,11 +1,12 @@
 //! The layouts of the Storage chart over the same segments.
 
+use crate::viz::ghost::{Change, growth_cells};
 use crate::{
     ui::data_state::format_bytes,
     viz::{
         alloc::allocate_cells,
         led::{
-            FillAxis, LABEL_MIN_COLUMNS, LABEL_MIN_ROWS, LabelPlace, LedField, LedSegment,
+            EndEdge, FillAxis, LABEL_MIN_COLUMNS, LABEL_MIN_ROWS, LabelPlace, LedField, LedSegment,
             MAX_CELLS, TileLabel, label_block,
         },
         treemap::{CellRect, squarify},
@@ -70,6 +71,27 @@ pub struct ChartItem {
     pub activatable: bool,
     /// Whether the item is always de-emphasized (not scanned).
     pub inert: bool,
+    /// The density `0.0..=1.0` (allocated over logical size); `None` keeps
+    /// the default lit share.
+    pub density: Option<f32>,
+    /// The change since the earlier scan; `None` draws no ghost.
+    pub change: Option<Change>,
+}
+
+/// The density of a folder: allocated over logical size, at most 1. A logical
+/// size of 0 has no density.
+#[must_use]
+pub fn density_of(allocated: u64, logical: u64) -> Option<f32> {
+    if logical == 0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "a density needs no exact bytes, and the ratio is within 0 to 1"
+    )]
+    let ratio: f32 = (allocated as f64 / logical as f64).clamp(0.0, 1.0) as f32;
+    Some(ratio)
 }
 
 fn seed_of(index: usize) -> u32 {
@@ -103,6 +125,7 @@ pub fn clamp_lattice(columns: u16, rows: u16) -> (u16, u16) {
 /// segments of the field have the order of `items`; an item of zero bytes has
 /// an empty rectangle.
 #[must_use]
+#[expect(clippy::too_many_lines, reason = "one layout for each chart type")]
 pub fn layout_field(
     items: &[ChartItem],
     total_bytes: u64,
@@ -157,8 +180,10 @@ pub fn layout_field(
     for (index, (item, rect)) in items.iter().zip(&rects).enumerate() {
         let mut segment: LedSegment = LedSegment::new(*rect, item.color, seed_of(index));
         segment.dimmed = item.inert;
+        segment.density = item.density;
         if layout == StorageLayout::Columns {
             segment.axis = FillAxis::Vertical;
+            segment.end_edge = EndEdge::Top;
         }
         let big: bool = rect.w >= LABEL_MIN_COLUMNS && rect.h >= LABEL_MIN_ROWS;
         if layout == StorageLayout::Tiles && big {
@@ -194,7 +219,7 @@ pub fn layout_field(
             activatable: false,
         });
     }
-    let field: LedField = LedField {
+    let mut field: LedField = LedField {
         columns,
         rows,
         segments,
@@ -202,6 +227,17 @@ pub fn layout_field(
         head: None,
         phase: None,
     };
+    // The scan ghost: a growth is hatched, a shrink has a dashed line.
+    let per_cell: u64 = bytes_per_cell(items, &field);
+    for (item, segment) in items.iter().zip(field.segments.iter_mut()) {
+        match item.change {
+            Some(Change::Larger(diff)) => {
+                segment.growth_cells = growth_cells(diff, per_cell, segment.rect.area());
+            }
+            Some(Change::Smaller(_)) => segment.shrunk = true,
+            _ => {}
+        }
+    }
     (field, labels)
 }
 
@@ -308,8 +344,37 @@ mod tests {
                 color: hsla(0.5, 0.5, 0.5, 1.0),
                 activatable: i % 2 == 0,
                 inert: false,
+                density: None,
+                change: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn density_is_allocated_over_logical_at_most_one() {
+        assert_eq!(density_of(50, 100), Some(0.5));
+        assert_eq!(density_of(300, 100), Some(1.0));
+        assert_eq!(density_of(0, 100), Some(0.0));
+        assert_eq!(density_of(5, 0), None);
+    }
+
+    #[test]
+    fn a_ghost_hatches_growth_and_marks_a_shrink() {
+        let mut list = items(&[4_000, 1_000]);
+        let plain = layout_field(&list, 5_000, None, StorageLayout::Band, 100, 14).0;
+        let per_cell = bytes_per_cell(&list, &plain);
+        list[0].change = Some(Change::Larger(per_cell * 20));
+        list[1].change = Some(Change::Smaller(10));
+        let (field, _) = layout_field(&list, 5_000, None, StorageLayout::Band, 100, 14);
+        assert_eq!(field.segments[0].growth_cells, 20);
+        assert!(!field.segments[0].shrunk);
+        assert_eq!(field.segments[1].growth_cells, 0);
+        assert!(field.segments[1].shrunk);
+        list[0].change = Some(Change::Larger(per_cell / 3));
+        let (field, _) = layout_field(&list, 5_000, None, StorageLayout::Band, 100, 14);
+        assert_eq!(field.segments[0].growth_cells, 0, "below half a cell");
+        let (columns, _) = layout_field(&list, 5_000, None, StorageLayout::Columns, 100, 14);
+        assert_eq!(columns.segments[0].end_edge, EndEdge::Top);
     }
 
     fn total(items: &[ChartItem]) -> u64 {

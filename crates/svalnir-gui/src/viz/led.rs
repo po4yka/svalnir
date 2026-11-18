@@ -55,9 +55,59 @@ pub const fn cell_hash(x: u32, y: u32, seed: u32) -> u32 {
 /// result depends on nothing else: it is the same in each frame and each run.
 #[must_use]
 pub const fn cell_tone(x: u16, y: u16, seed: u32) -> CellTone {
+    cell_tone_at(x, y, seed, DEFAULT_THRESHOLD)
+}
+
+/// The default threshold of [`cell_tone`]: about 45% of the cells are lit.
+const DEFAULT_THRESHOLD: u32 = 472;
+
+/// The lit share of a segment for a density `0.0..=1.0`: 20% plus 70% of the
+/// density. `None` (and a value that is not a number) gives the default 45%.
+#[must_use]
+pub fn lit_share(density: Option<f32>) -> f32 {
+    match density {
+        Some(d) if d.is_finite() => 0.20 + 0.70 * d.clamp(0.0, 1.0),
+        _ => 0.45,
+    }
+}
+
+/// How many of the 65 536 pairs `(block, own)` have `block * 3 + own <= t`.
+fn pairs_up_to(t: u32) -> u32 {
+    (0..256_u32)
+        .filter(|b| t >= b * 3)
+        .map(|b| (t - b * 3 + 1).min(256))
+        .sum()
+}
+
+/// The threshold of the tone sum for a lit `share`: the smallest value whose
+/// part of all sums reaches the share. It grows with the share, so a larger
+/// share adds lit cells and moves none.
+#[must_use]
+pub fn lit_threshold(share: Option<f32>) -> u32 {
+    let Some(share) = share.filter(|s| s.is_finite()) else {
+        return DEFAULT_THRESHOLD;
+    };
+    let share: f64 = f64::from(share.clamp(0.0, 1.0));
+    let target: f64 = share * 65_536.0;
+    let (mut low, mut high): (u32, u32) = (0, 1_021);
+    while low < high {
+        let mid: u32 = u32::midpoint(low, high);
+        if f64::from(pairs_up_to(mid)) >= target {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    // The tone is lit when the sum is below the threshold.
+    low + 1
+}
+
+/// The tone of a cell for a threshold from [`lit_threshold`].
+#[must_use]
+pub const fn cell_tone_at(x: u16, y: u16, seed: u32, threshold: u32) -> CellTone {
     let block: u32 = cell_hash((x / 2) as u32, (y / 2) as u32, seed) >> 24;
     let own: u32 = cell_hash(x as u32, y as u32, seed ^ 0x5bd1_e995) >> 24;
-    if block * 3 + own < 472 {
+    if block * 3 + own < threshold {
         CellTone::Lit
     } else {
         CellTone::Dim
@@ -79,6 +129,30 @@ pub enum FillAxis {
     Vertical,
 }
 
+/// The end of a segment, where the scan ghost marks a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndEdge {
+    /// The right edge; the last cells are the rightmost columns.
+    Right,
+    /// The top edge; the last cells are the top rows.
+    Top,
+}
+
+/// Whether the cell `(x, y)` is among the last `count` cells of `rect` in the
+/// order of `edge`.
+#[must_use]
+pub fn in_last_cells(rect: CellRect, edge: EndEdge, count: u32, x: u16, y: u16) -> bool {
+    if count == 0 || !rect.contains(x, y) {
+        return false;
+    }
+    let (w, h): (u32, u32) = (u32::from(rect.w), u32::from(rect.h));
+    let index: u32 = match edge {
+        EndEdge::Right => u32::from(x - rect.x) * h + u32::from(y - rect.y),
+        EndEdge::Top => u32::from(rect.y + rect.h - 1 - y) * w + u32::from(x - rect.x),
+    };
+    index + count >= w * h
+}
+
 /// One segment of a field.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LedSegment {
@@ -97,6 +171,14 @@ pub struct LedSegment {
     pub label_rect: Option<CellRect>,
     /// Whether the segment is de-emphasized: dim cells, half outline, no glow.
     pub dimmed: bool,
+    /// The density `0.0..=1.0` that sets the lit share; `None` is 45%.
+    pub density: Option<f32>,
+    /// The cells at the end of the segment that the scan ghost hatches.
+    pub growth_cells: u32,
+    /// Whether the scan ghost draws the dashed line of a smaller item.
+    pub shrunk: bool,
+    /// The end of the segment for the ghost.
+    pub end_edge: EndEdge,
 }
 
 impl LedSegment {
@@ -111,6 +193,10 @@ impl LedSegment {
             axis: FillAxis::Horizontal,
             label_rect: None,
             dimmed: false,
+            density: None,
+            growth_cells: 0,
+            shrunk: false,
+            end_edge: EndEdge::Right,
         }
     }
 }
@@ -191,6 +277,10 @@ pub struct LedStyle {
     pub point: Hsla,
     /// The color of the free outline.
     pub free_outline: Hsla,
+    /// The color of the marks of the scan ghost: the lit cells of a hatched
+    /// part and the dashed line of a smaller item. It is the text color, so
+    /// the marks differ from the density texture in each theme.
+    pub ghost_line: Hsla,
 }
 
 impl LedStyle {
@@ -210,6 +300,7 @@ impl LedStyle {
             dim_alpha: if dark { 0.28 } else { 0.22 },
             point: to_hsla(tokens.foreground).opacity(0.8),
             free_outline: to_hsla(tokens.muted_foreground).opacity(0.35),
+            ghost_line: to_hsla(tokens.foreground).opacity(0.85),
         }
     }
 
@@ -365,18 +456,31 @@ pub fn paint_led_field(
         let r: CellRect = segment.rect;
         let lit: Hsla = lit_color(segment.color);
         let dim: Hsla = segment.color.opacity(style.dim_alpha);
+        let threshold: u32 = lit_threshold(segment.density.map(|d| lit_share(Some(d))));
         for y in r.y..r.y.saturating_add(r.h).min(field.rows) {
             for x in r.x..r.x.saturating_add(r.w).min(field.columns) {
                 if !owned[usize::from(y) * columns + usize::from(x)] {
                     continue;
                 }
                 let in_label: bool = segment.label_rect.is_some_and(|b| b.contains(x, y));
+                let hatched: bool = in_last_cells(r, segment.end_edge, segment.growth_cells, x, y);
+                if hatched && (x + y) % 2 == 1 {
+                    // A checkerboard: the odd cells of the growth are empty.
+                    window.paint_quad(
+                        fill(cell_bounds(x, y), style.lattice).corner_radii(cell_radii),
+                    );
+                    continue;
+                }
                 let tone: CellTone = if segment.dimmed || in_label {
                     CellTone::Dim
+                } else if hatched {
+                    CellTone::Lit
                 } else {
-                    cell_tone(x, y, segment.seed)
+                    cell_tone_at(x, y, segment.seed, threshold)
                 };
                 let color: Hsla = match tone {
+                    // A hatched cell is not a cell of the density texture.
+                    CellTone::Lit if hatched && !segment.dimmed && !in_label => style.ghost_line,
                     CellTone::Lit => lit,
                     CellTone::Dim => dim,
                 };
@@ -417,6 +521,44 @@ pub fn paint_led_field(
             BorderStyle::Solid,
         ));
     }
+    // A smaller item: a dashed 1.5 px line along the end edge, in the middle
+    // of the last column or row of cells.
+    for segment in field
+        .segments
+        .iter()
+        .filter(|s| s.shrunk && !s.rect.is_empty())
+    {
+        let b: Bounds<Pixels> = rect_bounds(segment.rect);
+        let horizontal: bool = segment.end_edge == EndEdge::Top;
+        let length: f32 = if horizontal {
+            f32::from(b.size.width)
+        } else {
+            f32::from(b.size.height)
+        };
+        let mut at: f32 = 0.0;
+        while at < length {
+            let dash: f32 = 4.0_f32.min(length - at);
+            let (origin, extent) = if horizontal {
+                (
+                    point(
+                        b.origin.x + px(at),
+                        b.origin.y + px(style.cell / 2.0 - 0.75),
+                    ),
+                    size(px(dash), px(1.5)),
+                )
+            } else {
+                (
+                    point(
+                        b.origin.x + b.size.width - px(style.cell / 2.0 + 0.75),
+                        b.origin.y + px(at),
+                    ),
+                    size(px(1.5), px(dash)),
+                )
+            };
+            window.paint_quad(fill(Bounds::new(origin, extent), style.ghost_line));
+            at += 7.0;
+        }
+    }
     if let Some(free) = field.free.filter(|r| !r.is_empty()) {
         window.paint_quad(quad(
             outline_bounds(free),
@@ -429,6 +571,48 @@ pub fn paint_led_field(
     }
 }
 
+/// A swatch of `columns` by `rows` cells with the lit `share`, painted with
+/// the cell rule of a segment in `color`. The key of the density texture uses
+/// it.
+pub fn density_swatch(
+    share: f32,
+    columns: u16,
+    rows: u16,
+    color: Hsla,
+    dark: bool,
+) -> impl IntoElement {
+    let style: LedStyle = LedStyle::for_dark(dark);
+    let threshold: u32 = lit_threshold(Some(share));
+    let width: f32 = style.span(columns);
+    let height: f32 = style.span(rows);
+    div().w(px(width)).h(px(height)).flex_shrink_0().child(
+        canvas(
+            |_, _, _| (),
+            move |bounds: Bounds<Pixels>, (), window: &mut Window, _: &mut App| {
+                let radii: Corners<Pixels> = Corners::all(px(style.cell_radius));
+                for y in 0..rows {
+                    for x in 0..columns {
+                        let tone: CellTone = cell_tone_at(x, y, 0x51ab, threshold);
+                        let paint: Hsla = match tone {
+                            CellTone::Lit => lit_color(color),
+                            CellTone::Dim => color.opacity(style.dim_alpha),
+                        };
+                        let cell = Bounds::new(
+                            point(
+                                bounds.origin.x + px(f32::from(x) * style.pitch),
+                                bounds.origin.y + px(f32::from(y) * style.pitch),
+                            ),
+                            size(px(style.cell), px(style.cell)),
+                        );
+                        window.paint_quad(fill(cell, paint).corner_radii(radii));
+                    }
+                }
+            },
+        )
+        .size_full(),
+    )
+}
+
 /// Pixel offset of the label text from the left of its tile.
 const LABEL_LEFT_PX: f32 = 10.0;
 /// Pixel offset of the label text from the top of its tile.
@@ -437,6 +621,11 @@ const LABEL_TOP_PX: f32 = 8.0;
 const LABEL_HEIGHT_PX: f32 = 36.0;
 /// Estimated width of one label character.
 const LABEL_CHAR_PX: f32 = 7.5;
+/// The horizontal padding of the plate of a label inside a tile. The plate
+/// is a part of the chart, so its padding is chart geometry.
+const LABEL_PLATE_X: f32 = 6.0;
+/// The vertical padding of the plate of a label inside a tile.
+const LABEL_PLATE_Y: f32 = 4.0;
 
 /// The cells under a label text block of two lines at the top left of `rect`,
 /// with one cell of padding, clipped to `rect`. Cell coordinates are absolute.
@@ -549,6 +738,7 @@ impl RenderOnce for LedChart {
             style.glow_alpha = 0.0;
         }
         let mono: SharedString = cx.theme().mono_font_family.clone();
+        let plate: Hsla = to_hsla(tokens.surface_inset).opacity(0.86);
         let width: f32 = style.span(self.field.columns);
         let height: f32 = style.span(self.field.rows);
         let has_below: bool = self.labels.iter().any(|l| l.place == LabelPlace::Below);
@@ -613,8 +803,11 @@ impl RenderOnce for LedChart {
             let (name_color, size_color): (Hsla, Hsla) = if free {
                 (muted, muted)
             } else {
-                (foreground, foreground.opacity(0.7))
+                (foreground, foreground.opacity(0.8))
             };
+            // A label inside a tile sits on a plate in the color of the
+            // panel, so the text does not sit on the cell pattern.
+            let inside: bool = label.place == LabelPlace::Inside && !free;
             let text = div()
                 .id(SharedString::from(format!("{}-label-{n}", self.id)))
                 .absolute()
@@ -640,8 +833,23 @@ impl RenderOnce for LedChart {
                         .whitespace_nowrap()
                         .child(label.size),
                 );
+            let text = if inside {
+                text.bg(plate)
+                    .rounded(px(6.0))
+                    .px(px(LABEL_PLATE_X))
+                    .py(px(LABEL_PLATE_Y))
+            } else {
+                text
+            };
+            let (pad_x, pad_y): (f32, f32) = if inside {
+                (LABEL_PLATE_X, LABEL_PLATE_Y)
+            } else {
+                (0.0, 0.0)
+            };
             root = root.child(match label.place {
-                LabelPlace::Inside => text.left(px(left + 10.0)).top(px(top + 8.0)),
+                LabelPlace::Inside => text
+                    .left(px(left + 10.0 - pad_x))
+                    .top(px(top + 8.0 - pad_y)),
                 LabelPlace::Below => text.left(px(left)).top(px(height + 6.0)),
             });
         }
@@ -652,6 +860,57 @@ impl RenderOnce for LedChart {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lit_share_follows_the_density() {
+        assert!((lit_share(None) - 0.45).abs() < 1e-6);
+        assert!((lit_share(Some(0.0)) - 0.20).abs() < 1e-6);
+        assert!((lit_share(Some(1.0)) - 0.90).abs() < 1e-6);
+        assert!((lit_share(Some(7.0)) - 0.90).abs() < 1e-6, "clamped");
+        assert!((lit_share(Some(f32::NAN)) - 0.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_larger_share_only_adds_lit_cells() {
+        let count = |share: f32| -> (usize, Vec<bool>) {
+            let t = lit_threshold(Some(share));
+            let lit: Vec<bool> = (0..60_u16)
+                .flat_map(|y| (0..60_u16).map(move |x| (x, y)))
+                .map(|(x, y)| cell_tone_at(x, y, 7, t) == CellTone::Lit)
+                .collect();
+            (lit.iter().filter(|l| **l).count(), lit)
+        };
+        let (low, a) = count(0.2);
+        let (mid, b) = count(0.5);
+        let (high, c) = count(0.9);
+        assert!(low < mid && mid < high);
+        assert!(a.iter().zip(&b).all(|(x, y)| !*x || *y));
+        assert!(b.iter().zip(&c).all(|(x, y)| !*x || *y));
+        // The share is near the asked value.
+        let total = 3_600.0_f32;
+        for (n, want) in [(low, 0.2_f32), (mid, 0.5), (high, 0.9)] {
+            let got = f32::from(u16::try_from(n).unwrap_or(0)) / total;
+            assert!((got - want).abs() < 0.08, "{got} vs {want}");
+        }
+        assert_eq!(lit_threshold(None), 472);
+    }
+
+    #[test]
+    fn the_last_cells_follow_the_end_edge() {
+        let r = CellRect::new(2, 3, 4, 3);
+        let n = |edge| {
+            (0..12_u16)
+                .flat_map(|y| (0..12_u16).map(move |x| (x, y)))
+                .filter(|(x, y)| in_last_cells(r, edge, 5, *x, *y))
+                .count()
+        };
+        assert_eq!(n(EndEdge::Right), 5);
+        assert_eq!(n(EndEdge::Top), 5);
+        assert!(in_last_cells(r, EndEdge::Right, 3, 5, 5), "bottom right");
+        assert!(!in_last_cells(r, EndEdge::Right, 3, 2, 3), "first cell");
+        assert!(in_last_cells(r, EndEdge::Top, 4, 2, 3), "top left");
+        assert!(!in_last_cells(r, EndEdge::Top, 0, 2, 3));
+    }
 
     #[test]
     fn the_label_block_covers_the_text_and_one_cell_of_padding_only() {

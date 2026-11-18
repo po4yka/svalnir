@@ -172,10 +172,30 @@ fn scan_stale(detail: &str) -> ErrorBody {
     .with_next_action(NextAction::RefreshObservation)
 }
 
+/// Refuses the root path `/`. A root path with no component is not an
+/// approved root of the plan rule and of the executor, so a plan under it
+/// could not be applied.
+fn refuse_root_without_component(path: &Path) -> Result<(), ErrorBody> {
+    if path
+        .components()
+        .all(|part| matches!(part, std::path::Component::RootDir))
+    {
+        return Err(ErrorBody::new(
+            "plan_not_buildable",
+            ErrorFamily::Request,
+            ErrorStage::Admission,
+            "the path `/` cannot be a cleanup root; scan a directory below it and clean that scan; the command made no change",
+        )
+        .with_fields(&["scan"]));
+    }
+    Ok(())
+}
+
 /// The cleanup root of a scan: the scan root, with its current identity
 /// and its volume. The root must be the directory that the scan read.
 fn root_record(scan: &ScanResult) -> Result<RootRecord, ErrorBody> {
     let path: PathBuf = scan.root.to_path_buf();
+    refuse_root_without_component(&path)?;
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|_| scan_stale("the scan root is not readable"))?;
     let object: FileObjectEvidence = object_of(&metadata)
@@ -941,7 +961,15 @@ mod tests {
 
     use svalnir_core::policy::ProtectionFact;
 
-    use super::file_protection;
+    use super::{file_protection, refuse_root_without_component};
+
+    #[test]
+    fn the_path_of_the_file_system_root_is_refused_as_a_cleanup_root() {
+        let refused = refuse_root_without_component(Path::new("/")).unwrap_err();
+        assert_eq!(&*refused.code, "plan_not_buildable");
+        assert!(refused.message.contains("scan a directory below it"));
+        refuse_root_without_component(Path::new("/private/tmp")).unwrap();
+    }
 
     #[test]
     fn the_home_directory_its_ancestors_and_the_state_directory_are_protected() {

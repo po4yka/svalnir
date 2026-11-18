@@ -231,14 +231,19 @@ impl FileBinding {
     }
 }
 
-/// True when `path` is absolute and has no `.` or `..` component. This is
-/// the rule of the plan builder for a root path.
+/// True when `path` is absolute, has at least one component, and has no
+/// empty, `.`, or `..` component. This is the rule of the plan builder for a
+/// root path. It is also the rule of the filesystem executor, so a sealed
+/// plan never has a root path that an executor refuses. The path `/` has no
+/// component, and a trailing or repeated `/` gives an empty component.
 fn is_absolute_root(path: &LosslessPath) -> bool {
-    let bytes: &[u8] = path.as_bytes();
-    bytes.first() == Some(&b'/')
-        && bytes
+    let Some(relative) = path.as_bytes().strip_prefix(b"/") else {
+        return false;
+    };
+    !relative.is_empty()
+        && relative
             .split(|byte| *byte == b'/')
-            .all(|component| component != b"." && component != b"..")
+            .all(|component| !component.is_empty() && component != b"." && component != b"..")
 }
 
 /// The binding of an application target: one verified application

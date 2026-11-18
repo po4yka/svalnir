@@ -688,8 +688,17 @@ fn a_file_target_binds_the_path_and_the_object_of_its_root() {
     })
     .unwrap();
 
-    // A root path is absolute and has no `.` and no `..` component.
-    for text in ["Users/a/Library/Caches", "/Users/a/../b", "/Users/./a"] {
+    // A root path is absolute, has a component, and has no empty, `.`, and
+    // `..` component. The root `/`, a last `/`, and `//` are refused: the
+    // filesystem executor refuses them too.
+    for text in [
+        "Users/a/Library/Caches",
+        "/Users/a/../b",
+        "/Users/./a",
+        "/",
+        "/Users/a/",
+        "/Users//a",
+    ] {
         let mut content = file_content(&ActionClass::EvictRegenerableData);
         for target in &mut content.targets {
             if let TargetBinding::File(file) = &mut target.binding {

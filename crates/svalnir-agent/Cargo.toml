@@ -42,9 +42,18 @@ objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
 
+# `test-support`: a build for tests. The account record of the `HOME`
+# check can come from `SVALNIR_TEST_ACCOUNT_HOME`, so that a test starts
+# the binary with a temporary home directory. A build without the feature
+# has no code that reads that variable. No default feature enables it.
+[features]
+test-support = []
+
 # Tests only: disposable directories for the journal, the rules, and the
-# executors.
+# executors. The dependency on this package enables `test-support` for each
+# test target, so `cargo test` needs no feature option.
 [dev-dependencies]
+svalnir-agent = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

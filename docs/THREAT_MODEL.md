@@ -55,6 +55,8 @@ The baseline trusts the supported macOS kernel, code-signing machinery, and auth
 
 An attacker with the same user identity may already be able to destroy that user's writable data. Svalnir cannot make that session trustworthy. Its objective is to avoid amplifying that access into root or additional privacy authority, constrain its own destructive behavior, and accurately report its limitations. Root-owned helper policy remains a separate boundary against an ordinary same-user attacker.
 
+The environment of a process is not evidence of the identity of its user. A wrapper script, an edited service definition, or `sudo -E` can give the agent or the CLI a `HOME` of a different directory tree, and the home directory decides the home protections, the Trash, and the default state directory. The agent, before it starts, and each CLI command that changes state, before it changes anything, compare the canonical path of `HOME` with the canonical path of the home directory in the account record of the effective user (`getpwuid_r`), and refuse a difference, an absent `HOME`, and an absent account record ([INTERFACES.md](INTERFACES.md) section 4). A read-only command does not make the check. Only a test build can replace the account record ([CONTRIBUTING.md](../CONTRIBUTING.md)).
+
 Code identity is not evidence of human intent. A malicious process can launch a legitimate signed CLI. Therefore neither a valid signature nor an accepted CLI flag proves that the human approved a new action. The initial design does not claim a protected human-consent channel against a fully hostile user session.
 
 ## 4. Trust boundaries and authorization
@@ -187,7 +189,7 @@ Volatile intent and dispatch consumption must be recorded together before submis
 
 **Scenario:** An attacker substitutes a journal, state directory, lock file, or migration input, redirecting privileged writes or making stale data appear authoritative.
 
-**Controls:** Verify state-directory ownership and permissions, securely create files, reject unexpected links, and prevent privileged state paths from depending on user-controlled environment variables. Keep user databases separate from helper state. Do not parse an arbitrary user-provided database inside the root helper. Bound migrations and treat malformed or incompatible recovery records as unavailable authority. Keep a local diagnostic path that does not require a successful database write.
+**Controls:** Verify state-directory ownership and permissions, securely create files, reject unexpected links, and prevent privileged state paths from depending on user-controlled environment variables. Accept `HOME` only when it is the home directory of the account record of the effective user (section 3). Keep user databases separate from helper state. Do not parse an arbitrary user-provided database inside the root helper. Bound migrations and treat malformed or incompatible recovery records as unavailable authority. Keep a local diagnostic path that does not require a successful database write.
 
 **Residual risk:** Ordinary user-owned history is not tamper-proof against that same user. It is operational evidence, not a forensic guarantee against root or a compromised session.
 

@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[cfg(not(test))]
 use svalnir_agent::executor::fs::SystemTrash;
 use svalnir_agent::executor::fs::TrashBackend;
+use svalnir_agent::platform::account::AccountSource;
 
 /// The answer of the user to a confirmation question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +302,22 @@ pub(crate) struct TestSeams {
     /// The Trash gives no result and moves nothing, so the effect of a
     /// move is not known.
     pub(crate) trash_gives_no_result: bool,
+    /// The home directory of the account record of the effective user.
+    /// `None`: no account record.
+    pub(crate) account_home: Option<PathBuf>,
+}
+
+/// The account record of a test: a fixed home directory, or none. A test
+/// build never reads the user database of the system.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestAccount(Option<PathBuf>);
+
+#[cfg(test)]
+impl AccountSource for TestAccount {
+    fn home_directory(&self) -> std::io::Result<Option<PathBuf>> {
+        Ok(self.0.clone())
+    }
 }
 
 /// The service host of a test that set none: it has no agent executable
@@ -421,6 +438,26 @@ impl Seams {
         #[cfg(not(test))]
         {
             Arc::new(SystemServiceHost)
+        }
+    }
+
+    /// The source of the account record of the effective user, for the
+    /// `HOME` check of a command that changes state.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "a test build reads the values of the test"
+        )
+    )]
+    pub(crate) fn account_source(&self) -> Box<dyn AccountSource> {
+        #[cfg(test)]
+        {
+            Box::new(TestAccount(self.test.account_home.clone()))
+        }
+        #[cfg(not(test))]
+        {
+            svalnir_agent::platform::account::process_account_source()
         }
     }
 

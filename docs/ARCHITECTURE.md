@@ -320,7 +320,7 @@ Neither client invents successful completion from a dispatched request. History 
 
 A signed bundle uses `SMAppService` for its own background components on macOS 13 or later. An early CLI package may instead install an explicitly managed conventional LaunchAgent. These are packaging alternatives, not two concurrent agents. [Apple's service-management documentation][smappservice] and [launchd guidance][launchd] define the integration.
 
-Start with fresh capabilities, identities, and samples. After wake, reconcile mounts/processes, reset discontinuous counters and sustain windows, and invalidate stale plans. Monitoring does not run continuously during sleep and must not keep the Mac awake merely to poll.
+Before it opens the journal, the agent checks its inputs: the state directory, the configuration, and `HOME`, which must be the home directory of the account record of the effective user ([THREAT_MODEL.md](THREAT_MODEL.md) section 3). Start with fresh capabilities, identities, and samples. After wake, reconcile mounts/processes, reset discontinuous counters and sustain windows, and invalidate stale plans. Monitoring does not run continuously during sleep and must not keep the Mac awake merely to poll.
 
 Respect user-disabled background items. Service failure produces degraded capability and restart backoff; it must not silently re-enable a user-disabled component.
 

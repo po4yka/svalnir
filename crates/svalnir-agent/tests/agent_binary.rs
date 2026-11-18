@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use svalnir_agent::journal::{
     AgentRecord, CoordinatorLock, CoordinatorRole, JournalOptions, OperationJournal,
 };
+use svalnir_agent::platform::account::TEST_ACCOUNT_HOME_VARIABLE;
 use svalnir_agent::runtime::{AgentStatus, RunState};
 
 /// An agent process that is killed and collected when the value is
@@ -79,6 +80,9 @@ impl Directories {
     }
 }
 
+/// The agent with `HOME` and the home directory of its account record at
+/// the temporary home directory. The test build of the binary reads the
+/// account record from `SVALNIR_TEST_ACCOUNT_HOME`.
 fn agent(directories: &Directories) -> Command {
     let mut command: Command = Command::new(env!("CARGO_BIN_EXE_svalnir-agent"));
     command
@@ -86,6 +90,7 @@ fn agent(directories: &Directories) -> Command {
         .arg("--state-dir")
         .arg(&directories.state)
         .env("HOME", &directories.home)
+        .env(TEST_ACCOUNT_HOME_VARIABLE, &directories.home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -262,6 +267,32 @@ fn an_agent_that_finds_the_lock_of_a_client_ends_with_a_failure_and_starts_later
 }
 
 #[test]
+fn an_agent_whose_home_is_not_that_of_its_account_record_does_not_start() {
+    let directories = Directories::new();
+    // A second temporary directory as the home directory of the account
+    // record: `HOME` names a different directory.
+    let account: PathBuf = directories.home.with_file_name("account");
+    std::fs::create_dir(&account).unwrap();
+    let mut refused = Agent(
+        agent(&directories)
+            .env(TEST_ACCOUNT_HOME_VARIABLE, &account)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let status: ExitStatus =
+        wait_with_limit(&mut refused.0, Duration::from_secs(20)).expect("the agent did not end");
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    let mut stderr: String = String::new();
+    std::io::Read::read_to_string(&mut refused.0.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(stderr.contains("home_mismatch"), "{stderr}");
+    // The agent made no journal and wrote nothing in either directory.
+    assert!(!directories.state.join("operations.sqlite").exists());
+    assert_eq!(std::fs::read_dir(&directories.home).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&account).unwrap().count(), 0);
+}
+
+#[test]
 fn the_agent_refuses_to_start_without_its_required_arguments() {
     // A temporary home directory, so that an agent that did start by a
     // defect has no access to the home directory of the user.
@@ -270,6 +301,7 @@ fn the_agent_refuses_to_start_without_its_required_arguments() {
         Command::new(env!("CARGO_BIN_EXE_svalnir-agent"))
             .args(arguments)
             .env("HOME", &directories.home)
+            .env(TEST_ACCOUNT_HOME_VARIABLE, &directories.home)
             .stdin(Stdio::null())
             .output()
             .unwrap()

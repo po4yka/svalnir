@@ -147,6 +147,7 @@ mod agent {
 
     use svalnir_agent::coordinator::CoordinatorConfig;
     use svalnir_agent::journal::{CoordinatorRole, JournalOptions};
+    use svalnir_agent::platform::account::verify_process_home;
     use svalnir_agent::platform::memory::{PressureEvent, PressureSubscription};
     use svalnir_agent::platform::run_loop::{
         StopSignal, request_main_run_loop_stop, run_main_run_loop_until_stop,
@@ -244,12 +245,16 @@ mod agent {
         }
     }
 
-    /// The home directory of the user, from the environment of the
-    /// process, as a canonical path.
-    fn home_directory() -> Option<LosslessPath> {
-        let home = std::env::var_os("HOME")?;
-        let canonical = std::fs::canonicalize(home).ok()?;
-        LosslessPath::from_path(&canonical).ok()
+    /// The home directory of the user as a canonical path: `HOME`, when
+    /// it is the home directory of the account record of the effective
+    /// user.
+    fn home_directory() -> Result<LosslessPath, String> {
+        let home = verify_process_home().map_err(|error| {
+            // The message of the error has no path.
+            format!("{} ({})", error, error.code())
+        })?;
+        LosslessPath::from_path(&home)
+            .map_err(|_| "the home directory is not a usable path".to_owned())
     }
 
     fn settings(
@@ -314,8 +319,7 @@ mod agent {
         let config: ValidatedConfig = proposal(options.config.as_deref())?;
         state_directory(&options.state_directory)
             .map_err(|_| "the state directory is not usable")?;
-        let home: LosslessPath =
-            home_directory().ok_or("the home directory of the user is not known")?;
+        let home: LosslessPath = home_directory()?;
         // SAFETY: `geteuid` has no argument, changes nothing, and does
         // not fail.
         let principal: Uid = Uid::new(unsafe { libc::geteuid() });

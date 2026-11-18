@@ -7,6 +7,7 @@
 //! Owning specification: `docs/RESOURCE_MODEL.md`. `docs/ARCHITECTURE.md`
 //! owns the component boundary.
 
+pub mod account;
 pub mod memory;
 pub mod process;
 pub mod run_loop;

@@ -6209,6 +6209,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "svalnir-agent",
  "svalnir-core",
  "tempfile",
  "thiserror 2.0.21",

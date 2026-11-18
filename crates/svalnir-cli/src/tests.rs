@@ -553,6 +553,44 @@ fn a_read_only_command_does_not_create_the_state_directory() {
 }
 
 #[test]
+fn a_command_that_changes_state_refuses_a_home_that_is_not_that_of_the_account() {
+    let (mut environment, directory) = environment();
+    let config: String = fixture("valid.toml");
+    let apply: [&str; 7] = [
+        "config",
+        "apply",
+        "--config",
+        &config,
+        "--expected-revision",
+        "none",
+        "--format=json",
+    ];
+    let account = directory.path().join("account");
+    std::fs::create_dir(&account).unwrap();
+    let missing = directory.path().join("missing");
+    let cases: [(Option<std::path::PathBuf>, Option<std::path::PathBuf>, &str); 4] = [
+        (environment.home.clone(), Some(account), "home_mismatch"),
+        (environment.home.clone(), None, "home_account_unknown"),
+        (None, environment.home.clone(), "home_not_set"),
+        (Some(missing.clone()), Some(missing), "home_not_resolvable"),
+    ];
+    for (home, account_home, code) in cases {
+        environment.home = home;
+        environment.seams.test.account_home = account_home;
+        let outcome = run_with(&environment, &apply);
+        assert_eq!(outcome.status, ExitStatus::Unavailable, "{code}");
+        let envelope = outcome.envelope();
+        assert_eq!(envelope["error"]["code"], code);
+        assert_eq!(envelope["error"]["family"], "native");
+        // The command made no change: no state directory and no journal.
+        assert!(!state_directory_exists(&directory), "{code}");
+        // A read-only command still runs.
+        let listed = run_with(&environment, &["policy", "list", "--format", "json"]);
+        assert_eq!(listed.status, ExitStatus::Success, "{code}");
+    }
+}
+
+#[test]
 fn a_relative_state_directory_override_is_rejected() {
     let (mut environment, _directory) = environment();
     environment.state_directory_override = Some("relative/state".into());

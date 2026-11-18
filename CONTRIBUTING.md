@@ -266,6 +266,8 @@ Use dedicated temporary roots, disposable child processes, controlled clocks, in
 
 Do not exhaust the developer's host disk or RAM, delete real caches, or terminate unrelated applications to demonstrate a feature. Use the controlled storage and process fixtures defined in the validation plan. Review tests that install services, change permissions, or invoke privileged operations before running them in an explicitly authorized environment.
 
+A test must not read or depend on the real home directory. A test that starts the `svalnir-agent` or `svalnir` binary gives it a temporary `HOME`, and the `HOME` check ([THREAT_MODEL.md](docs/THREAT_MODEL.md) section 3) then needs an account record with the same home directory. The feature `test-support` of `svalnir-agent` reads that home directory from `SVALNIR_TEST_ACCOUNT_HOME`. No default feature enables it: `svalnir-agent` enables it for its own test targets through a dev-dependency on itself, so `cargo test` and `cargo clippy --all-targets` build with it and need no feature option, and `cargo build` and `cargo doc` build without it. A build without the feature has no code that reads the variable. An in-process test of the CLI gives the account record through its test seams and reads no user database.
+
 Signed fixture builds with substituted observations are distinct artifacts from the production build. Record that distinction. Their evidence does not validate native pressure detection, and production must not expose a pressure-injection or authorization bypass for testing convenience.
 
 ### Evidence and performance

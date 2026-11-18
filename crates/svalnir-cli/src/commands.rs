@@ -44,6 +44,7 @@ pub(crate) mod doctor;
 #[cfg(target_os = "macos")]
 pub(crate) mod execution;
 pub(crate) mod history;
+mod home;
 pub(crate) mod monitor;
 pub(crate) mod operation_view;
 pub(crate) mod operations;
@@ -269,6 +270,7 @@ fn dispatch(cli: &Cli, invocation: &mut Invocation<'_>) -> Result<ExitStatus, Co
     if let Some(result) = dispatch_read_only(&cli.command, invocation) {
         return result;
     }
+    home::check(&cli.command, invocation.environment)?;
     match &cli.command {
         Command::Completions(arguments) => completions(arguments, invocation),
         Command::License => {

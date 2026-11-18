@@ -100,13 +100,17 @@ pub(crate) fn environment() -> (Environment, TempDirectory) {
     let home: PathBuf = directory.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let (interrupt, _flag) = Interrupt::manual();
+    let mut seams = crate::seams::Seams::default();
+    // The account record has the same home directory, so the `HOME` check
+    // of a command that changes state passes.
+    seams.test.account_home = Some(home.clone());
     (
         Environment {
             state_directory_override: Some(directory.path().join("state").into_os_string()),
             home: Some(home),
             current_directory: Some(directory.path().to_path_buf()),
             interrupt,
-            seams: crate::seams::Seams::default(),
+            seams,
         },
         directory,
     )

@@ -64,11 +64,14 @@ The tokens of this document are the source. The application sets them on the `gp
 
 ### Categorical palette
 
-Use this order for series and storage categories. The dark values are given; select light values that have a contrast of 3:1 or more against `surface-inset`.
+Use this order for series and storage categories. Each value has a contrast of 3:1 or more against `surface-inset` and against `surface` in its theme.
 
 | Order | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Neutral |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Dark | `#0a84ff` | `#5e5ce6` | `#bf5af2` | `#40c8e0` | `#ff375f` | `#ffd60a` | `#30d158` | `#ff9f0a` | `#98989d` |
+| Light | `#0071e3` | `#4b49c8` | `#9a3fc9` | `#0a7ea4` | `#d81e5b` | `#8f6a00` | `#248a3d` | `#c93400` | `#6e6e73` |
+
+Colors 1, 7, and 8 are equal to `brand`, `positive`, and `warning` in the two themes. Adjacent colors can be close in hue (1 and 2, 2 and 3), so a chart also separates adjacent segments with a gap and names each category in the legend.
 
 Use the neutral color for system-managed and unclassified data. Do not use `negative` as a category color. Inside a category chart, a hue identifies a category only; show a state with a pill, an icon, or text.
 
@@ -115,7 +118,7 @@ Each component is framed by the same three layers.
 | **Panel** | `surface-inset` | Main content |
 | **Inset** | `inset-tint` | Code, paths, payloads, detail one level deeper |
 
-The **shell header** has an icon tile at the left, a title with an optional subtitle, and an aside at the right. The aside holds one item: a status pill, a headline value, or a small action. The **shell footer** holds one suggestion line and at most one action.
+The **shell header** has an icon tile at the left, a title with an optional subtitle, and an aside at the right. The aside holds one item: a status pill, a headline value, or a small action. A card menu (§4) can follow that item as the last element of the header. The **shell footer** holds one suggestion line and at most one action.
 
 Popovers, menus, tooltips, and dialogs use `surface-raised`. They are the only elements that can have a shadow.
 
@@ -135,6 +138,8 @@ Each control has full keyboard behavior.
 | Tabs, disclosure | Sliding indicator; smooth height change |
 | Tooltip | 300 ms delay on the first hover, then immediate while one is warm |
 | Action menu, popover | A destructive group is separated and uses `negative` |
+| Card menu | A `quiet` icon button in the shell header opens an action menu for the card. It holds commands that do not change the system: refresh the data, copy the value, export the data. A view mode stays in a segmented control, and an action that needs approval stays a button |
+| Detail card | A non-interactive card on `surface-raised`, anchored to a chart mark. It opens on hover and on keyboard focus of the mark and closes on Escape. It shows a mono title, the time or the scope, and at most six rows in an inset |
 | Dialog and sheet | Focus trap; Escape and backdrop close it, except during a confirmation that §7 makes explicit |
 | Toast stack | In-window feedback only. A system notification is a separate channel that the agent controls |
 | Skeleton, loader, empty state | See §8 for which one a data state uses |
@@ -157,6 +162,8 @@ Use the `gpui_kit::component` module in the right column for a control. Write a 
 | Tabs, disclosure | `tab`, `collapsible`, `accordion` |
 | Tooltip | `tooltip` |
 | Action menu, popover | `menu`, `popover` |
+| Card menu | `menu` on a `ghost` icon `button` |
+| Detail card | `hover_card` |
 | Dialog and sheet | `dialog`, `sheet` |
 | Toast stack | `notification` |
 | Skeleton, loader, empty state | `skeleton`, `spinner`, `empty` |
@@ -206,6 +213,8 @@ State the scale near the chart or in its accessible label ("1 cell = 1%"). A cha
 | **Tick track** | One row per item with one tick per unit of work. Use it for the steps of an operation and for the candidates of a plan |
 | **Rate graph** | A sparkline in an inset with vertical event markers. Use it for the pressure timeline, with one marker per intervention |
 | **Step timeline** | Two cumulative step lines around a zero axis, a dotted net line, and activity spans below on the same time axis. Use it for bytes written against bytes reclaimed, and for footprint growth against release |
+| **Dot histogram** | One column of dots for each bin of a measured value, symmetric about the axis, with a line at the median and a labeled marker at the limit. Dots past the limit use `negative`. Use it for the footprint samples of one application against its budget, and for the durations of operations |
+| **Dot clock** | A ring of 24 hour sectors with one stack of dots for each sector, and the headline value in the center. Use it for interventions by hour of day in the selected range |
 | **Stat grid** | Overview tiles: a label, a display value, a delta pill, and a thin bar or sparkline |
 | **Legend** | A grid of rows: category icon, name, and a mono size aligned right. Each row is a button |
 
@@ -214,6 +223,8 @@ State the scale near the chart or in its accessible label ("1 cell = 1%"). A cha
 - A chart shows one size metric, and its header names that metric: logical size, allocated size, or estimated reclaimable bytes. A treemap is not a statement that each byte can be reclaimed.
 - Draw free space as an empty region with a dashed outline and a label. Do not draw it as a category.
 - Hover and keyboard focus are linked in both directions. Focus on a legend row dims the other segments, and focus on a segment highlights its row. The status line then shows one sentence about that category.
+- A mark that has more detail than its legend row shows a detail card (§4): for example an intervention marker, an activity span, or a tick of an operation. The same text is the accessible description of the mark. A detail card does not hold a control.
+- One dot is a stated number of samples or events ("1 dot = 2 samples"), with the same scale in each column or sector of a chart.
 - A threshold is a marker with a label on the chart. Do not show a threshold by color only.
 - A failed or stale value is not zero. See §8.
 - The color scale of a tick gauge follows the meaning of the metric. For a usage metric, the high end is `negative`.
@@ -342,8 +353,8 @@ The component base and the icon set were accepted after that date, with the chan
 | Overview | Stat grid, inline capacity grid, tick gauge for memory pressure, last intervention as a phase header |
 | Storage | Cell band or tiles, legend, suggestion footer, approval queue |
 | Memory | Rate graph with intervention markers, tick gauge, data table of application footprints |
-| Applications | Data table, budget meters, protection controls |
+| Applications | Data table, budget meters, protection controls, dot histogram of the footprint samples of the selected application |
 | Automation | Policy forms, range sliders for thresholds, budget meters, pause control |
-| History | Data table, tick track per operation, step timeline |
+| History | Data table, tick track per operation, step timeline, dot clock of interventions by hour |
 | Diagnostics | Status pills for each permission and service, empty states with the fix |
 | Menu bar | Inline capacity grid, pressure pill, pause control |

@@ -1049,13 +1049,16 @@ impl Driver {
 
     /// Stops the agent.
     ///
-    /// No new automatic plan starts. The operation in progress gets a stop
-    /// request, so its current step ends at its safe boundary and no later
-    /// step is dispatched; the driver waits for it at most
-    /// [`DriverSettings::shutdown_bound`]. The state of the controller is
-    /// then written. The stop is clean when each operation is settled and
-    /// the coordinator released its registration. In each other case the
-    /// registration stays, and the next start reconciles.
+    /// No new automatic plan starts, and the coordinator claims no
+    /// further request of the journal queue: a queued request stays there
+    /// for the next coordinator. Each operation in progress, automatic or
+    /// of a client, gets a stop request, so its current step ends at its
+    /// safe boundary and no later step is dispatched; the driver waits
+    /// for them at most [`DriverSettings::shutdown_bound`]. The state of
+    /// the controller is then written. The stop is clean when each
+    /// operation is settled and the coordinator released its
+    /// registration. In each other case the registration stays, and the
+    /// next start reconciles.
     pub fn shutdown(mut self, idle: &mut dyn Idle) -> ShutdownReport {
         self.stopping = true;
         let give_up_at: Option<MonotonicNanos> = self.clock.now().map(|time| {
@@ -1064,48 +1067,66 @@ impl Driver {
                 .checked_add(self.settings.shutdown_bound)
                 .unwrap_or(MonotonicNanos::new(u64::MAX))
         });
-        if let (Some(coordinator), Some(operation_id)) = (
-            self.coordinator.as_mut(),
-            self.state
-                .outstanding
-                .as_ref()
-                .and_then(|outstanding| outstanding.operation_id.clone()),
-        ) {
-            // A refused stop request means that the operation is settled
-            // or not known. The wait below reads which.
-            let _acknowledgement = coordinator.cancel(&operation_id);
+        let outstanding: Option<OperationId> = self
+            .state
+            .outstanding
+            .as_ref()
+            .and_then(|outstanding| outstanding.operation_id.clone());
+        if let Some(coordinator) = self.coordinator.as_mut() {
+            // No new client work: before the first step of the stop.
+            coordinator.stop_claims();
+            let mut stopped: Vec<OperationId> = coordinator.cancel_active();
+            if let Some(operation_id) = outstanding
+                && !stopped.contains(&operation_id)
+            {
+                // A refused stop request means that the operation is
+                // settled or not known. The wait below reads which.
+                let _acknowledgement = coordinator.cancel(&operation_id);
+                stopped.push(operation_id);
+            }
             if let Some(give_up_at) = give_up_at {
-                let _outcome = coordinator.run_until_finished(&operation_id, give_up_at, idle);
+                for operation_id in &stopped {
+                    let _outcome = coordinator.run_until_finished(operation_id, give_up_at, idle);
+                }
             }
         }
         // The bookkeeping of the result, with no new plan.
         self.tick(None);
 
-        // With a plan whose result is not known, the registration stays,
-        // so that the next start reconciles.
+        // A record that the journal did not take is written again while
+        // the bound permits.
+        while self
+            .coordinator
+            .as_ref()
+            .is_some_and(|coordinator| coordinator.has_work_in_progress())
+        {
+            let now: Option<MonotonicNanos> = self.clock.now().map(|time| time.clock.now);
+            let time_left: bool = matches!(
+                (now, give_up_at),
+                (Some(now), Some(give_up_at)) if now < give_up_at
+            );
+            if !time_left {
+                break;
+            }
+            let (worked, wake_at) = self.run_coordinator();
+            if !worked {
+                idle.idle(wake_at);
+            }
+        }
+
+        // One release call. A refusal is a stop without release: an
+        // operation is not settled, a reconciliation is pending, or the
+        // journal did not take the volatile history. A further call
+        // cannot change that in this lifetime. With a plan whose result
+        // is not known, the release is not asked. In each of these cases
+        // the registration stays, so that the next start reconciles.
         let mut released: bool = false;
-        while self.state.outstanding.is_none()
+        if self.state.outstanding.is_none()
             && let Some(coordinator) = self.coordinator.take()
         {
             match coordinator.shutdown() {
-                Ok(_journal) => {
-                    released = true;
-                }
-                Err((coordinator, _error)) => {
-                    let now: Option<MonotonicNanos> = self.clock.now().map(|time| time.clock.now);
-                    let time_left: bool = matches!(
-                        (now, give_up_at),
-                        (Some(now), Some(give_up_at)) if now < give_up_at
-                    );
-                    self.coordinator = Some(coordinator);
-                    if !time_left {
-                        break;
-                    }
-                    let (worked, wake_at) = self.run_coordinator();
-                    if !worked {
-                        idle.idle(wake_at);
-                    }
-                }
+                Ok(_journal) => released = true,
+                Err((coordinator, _error)) => self.coordinator = Some(coordinator),
             }
         }
 

@@ -1197,9 +1197,36 @@ impl Collector for QuietCollector {
 
 /// A manual Trash plan of a client for the entry `name` below the root.
 fn trash_plan(bench: &Bench, name: &str) -> Plan {
+    let mut content: PlanContent = trash_content(bench, name);
+    content.plan_id = PlanId::new("client-plan").unwrap();
+    Plan::seal(content).unwrap()
+}
+
+/// A manual plan that moves the files `names` below the root to Trash,
+/// one step for each file.
+fn trash_plan_of(bench: &Bench, plan: &str, names: &[&str]) -> Plan {
+    let mut content: PlanContent = trash_content(bench, names[0]);
+    content.plan_id = PlanId::new(plan).unwrap();
+    for name in &names[1..] {
+        let mut more: PlanContent = trash_content(bench, name);
+        let target_id = TargetId::new(format!("client-target-{name}")).unwrap();
+        more.targets[0].target_id = target_id.clone();
+        more.steps[0].target_id = target_id;
+        more.steps[0].step_id = StepId::new(format!("client-step-{name}")).unwrap();
+        content.targets.append(&mut more.targets);
+        content.steps.append(&mut more.steps);
+    }
+    content.limits.work = Some(WorkCharge::new(
+        Bytes::new(10 * names.len() as u64),
+        EntryCount::new(names.len() as u64),
+    ));
+    Plan::seal(content).unwrap()
+}
+
+fn trash_content(bench: &Bench, name: &str) -> PlanContent {
     let now: u64 = bench.clock.now();
     let target_id = TargetId::new("client-target").unwrap();
-    Plan::seal(PlanContent {
+    PlanContent {
         schema_version: PLAN_SCHEMA_VERSION,
         plan_id: PlanId::new("client-plan").unwrap(),
         principal: Principal {
@@ -1250,8 +1277,94 @@ fn trash_plan(bench: &Bench, name: &str) -> Plan {
             expires_at: MonotonicNanos::new(now + 120 * SECOND),
             created_wall: wall(now),
         },
-    })
-    .unwrap()
+    }
+}
+
+fn apply_request(plan: &Plan, request: &str, now: u64) -> QueuedRequest {
+    QueuedRequest {
+        request_id: RequestId::new(request).unwrap(),
+        principal: plan.principal.clone(),
+        body: RequestBody::Apply {
+            approval: PlanApproval {
+                plan_id: plan.plan_id.clone(),
+                digest: plan.digest().clone(),
+            },
+        },
+        enqueued_at: wall(now),
+    }
+}
+
+#[test]
+fn a_stop_claims_no_queued_request_and_is_clean() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("client-file");
+    let mut driver = bench.start();
+    driver.tick(None);
+    // A client writes a request while the agent stops.
+    let plan: Plan = trash_plan(&bench, "client-file");
+    let mut client = bench.journal();
+    client.record_plan(&plan).unwrap();
+    let request = apply_request(&plan, "request-1", bench.clock.now());
+    client.enqueue_request(&request).unwrap();
+
+    let report: ShutdownReport = driver.shutdown(&mut TestIdle(bench.clock.clone()));
+    // The request is not claimed and not executed: it stays in the queue
+    // for the next coordinator, and the stop is clean.
+    assert!(report.clean);
+    assert!(file.exists());
+    assert_eq!(
+        client.request_status(&request.request_id).unwrap(),
+        Some(RequestStatus::Queued)
+    );
+    assert_eq!(client.unsettled_operation_count().unwrap(), 0);
+    assert!(bench.lifecycle().stopped_cleanly);
+    // The next agent serves the request.
+    let mut driver = bench.start();
+    driver.tick(None);
+    driver.tick(None);
+    assert!(!file.exists());
+}
+
+#[test]
+fn a_stop_ends_the_operation_of_a_client_before_its_next_step_and_is_clean() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    // More targets than the work units of one tick.
+    let names: Vec<String> = (0..12).map(|index| format!("client-{index:02}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let files: Vec<PathBuf> = names.iter().map(|name| bench.file(name)).collect();
+    let present = |files: &[PathBuf]| files.iter().filter(|file| file.exists()).count();
+    let mut driver = bench.start();
+    let plan: Plan = trash_plan_of(&bench, "client-plan", &names);
+    let mut client = bench.journal();
+    client.record_plan(&plan).unwrap();
+    let request = apply_request(&plan, "request-1", bench.clock.now());
+    client.enqueue_request(&request).unwrap();
+    // One tick claims the request and does a part of the targets.
+    driver.tick(None);
+    let left: usize = present(&files);
+    assert!(left > 0 && left < files.len(), "{left}");
+    let Some(RequestStatus::Completed {
+        completion: RequestCompletion::Operation { operation_id },
+    }) = client.request_status(&request.request_id).unwrap()
+    else {
+        panic!("the request was not admitted");
+    };
+
+    let report: ShutdownReport = driver.shutdown(&mut TestIdle(bench.clock.clone()));
+    // The operation of the client got the stop request: no further step
+    // was dispatched, it is settled, and the stop is clean.
+    assert!(report.clean);
+    assert_eq!(present(&files), left);
+    let operation = client.operation(&operation_id).unwrap().unwrap();
+    assert!(operation.state().is_settled());
+    let last = operation.steps().last().unwrap();
+    assert_eq!(
+        last.results()[0].stop_reason,
+        svalnir_core::action::StopReason::Canceled
+    );
+    assert!(bench.lifecycle().stopped_cleanly);
 }
 
 #[test]

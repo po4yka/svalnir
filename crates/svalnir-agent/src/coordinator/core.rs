@@ -289,6 +289,9 @@ pub struct Coordinator<J: CoordinatorJournal> {
     /// The completion of a claimed request that the journal did not
     /// record.
     pub(super) unwritten_completion: Option<(RequestId, RequestCompletion)>,
+    /// True after [`Coordinator::stop_claims`]: this lifetime claims and
+    /// executes no further request of the journal queue.
+    pub(super) claims_stopped: bool,
 }
 
 fn refused(error: ActionError) -> ApplyOutcome {
@@ -461,6 +464,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             start,
             held_request: None,
             unwritten_completion: None,
+            claims_stopped: false,
         })))
     }
 
@@ -1318,8 +1322,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 return false;
             }
         }
-        // A request that cannot be executed now is not claimed.
-        if self.reconciliation_pending {
+        // A request that cannot be executed now is not claimed. After
+        // `stop_claims`, a request stays in the queue for the next
+        // coordinator. A request that this lifetime claimed and holds is
+        // not executed: the next coordinator puts it in the queue again.
+        if self.reconciliation_pending || self.claims_stopped {
             return false;
         }
         let claimed: ClaimedRequest = match self.held_request.take() {
@@ -1465,6 +1472,54 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 idle.idle(progress.wake_at.map(|wake_at| wake_at.min(give_up_at)));
             }
         }
+    }
+
+    /// Stops the claims of the request queue, for a coordinator that
+    /// stops. After the call, [`Coordinator::serve_queue`] claims and
+    /// executes no request: a queued request stays in the queue of the
+    /// journal for the next coordinator. A completion that the journal
+    /// did not record is still written. The call cannot be undone.
+    pub const fn stop_claims(&mut self) {
+        self.claims_stopped = true;
+    }
+
+    /// Gives the active operation and each waiting operation the stop
+    /// request of [`Coordinator::cancel`], and returns their identities.
+    ///
+    /// A waiting operation is settled at once with no dispatch. The
+    /// active operation ends its step in progress at its safe boundary
+    /// in the later calls of [`Coordinator::step`], and no later step of
+    /// it is dispatched. A parked operation is not in the result: it
+    /// dispatches no further step.
+    pub fn cancel_active(&mut self) -> Vec<OperationId> {
+        let operations: Vec<OperationId> = self
+            .active
+            .iter()
+            .chain(self.waiting.iter())
+            .map(|active| active.operation.operation_id().clone())
+            .collect();
+        for operation_id in &operations {
+            // The result of the stop request is in the view of the
+            // operation.
+            drop(self.cancel(operation_id));
+        }
+        operations
+    }
+
+    /// Whether a further call of [`Coordinator::step`] can settle or
+    /// record work of this lifetime: an operation is active or waits, a
+    /// settled operation has a record that the journal did not take, or
+    /// the completion of a request is not written. An operation whose
+    /// outcome is not known is not such work: no step of this lifetime
+    /// settles it.
+    pub fn has_work_in_progress(&self) -> bool {
+        self.active.is_some()
+            || !self.waiting.is_empty()
+            || self.unwritten_completion.is_some()
+            || self
+                .parked
+                .values()
+                .any(|active| active.unrecorded && !active.volatile)
     }
 
     /// Stops the coordinator cleanly and releases its registration.

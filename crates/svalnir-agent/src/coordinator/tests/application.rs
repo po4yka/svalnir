@@ -96,6 +96,46 @@ fn a_force_step_follows_the_grace_period_when_the_target_runs() {
 }
 
 #[test]
+fn a_grace_period_that_ended_in_a_sleep_starts_again_at_the_wake() {
+    let mut bench = Bench::new();
+    let member = bench.host.spawn(4242);
+    let plan = stop_plan(
+        "plan_1",
+        vec![member],
+        Escalation::ForceAfterGrace,
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    coordinator.step();
+    assert_eq!(bench.host.calls(), vec![term(4242)]);
+    // The host sleeps for longer than the grace period. The clock counts
+    // the sleep, so the first grace period ended while the application
+    // had no time in which it could exit.
+    bench.clock.advance(SECOND);
+    bench.clock.sleep(GRACE + SECOND);
+    let wake: u64 = bench.clock.now();
+    for _ in 0..5 {
+        let progress = coordinator.step();
+        assert_eq!(bench.host.calls(), vec![term(4242)]);
+        if let Some(wake_at) = progress.wake_at {
+            assert!(wake_at.get() <= wake + GRACE);
+        }
+    }
+    // No force call before one full grace period after the wake.
+    bench.clock.set(wake + GRACE - SECOND);
+    for _ in 0..5 {
+        coordinator.step();
+    }
+    assert_eq!(bench.host.calls(), vec![term(4242)]);
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(bench.host.calls(), vec![term(4242), kill(4242)]);
+    assert!(bench.clock.now() >= wake + GRACE);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+}
+
+#[test]
 fn a_force_step_is_not_dispatched_when_the_graceful_request_was_enough() {
     let mut bench = Bench::new();
     let member = bench.host.spawn(4242);

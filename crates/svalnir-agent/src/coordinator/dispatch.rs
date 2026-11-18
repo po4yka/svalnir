@@ -822,6 +822,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         };
         let follows_graceful: bool =
             is_force(step) && matches!(active.plan.limits.escalation, Escalation::ForceAfterGrace);
+        if follows_graceful {
+            Self::restart_grace_after_wake(active, &step.target_id, time);
+        }
         let prior: Option<GracefulOutcome> = active.graceful.get(&step.target_id).cloned();
         if follows_graceful
             && let Some(end) = self.before_force(active, step, prior.as_ref(), time)?
@@ -873,10 +876,49 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             graceful,
             stop: None,
         };
+        active.step_continuity = Some(time.clock.continuity);
         // The executor call. It issues the request and returns; the exit
         // is observed in the later calls of `step`.
         let run: Result<StepRun, ExecutorError> = self.application.begin(input);
         self.after_begin(active, step, run, charged, time)
+    }
+
+    /// Starts the grace period of a target again when the clock had a
+    /// discontinuity after the dispatch of its graceful step.
+    ///
+    /// The monotonic clock of the coordinator counts the time of a sleep.
+    /// A grace period that ended in a sleep gave the application no time
+    /// in which it could exit, so the force step is not due at the first
+    /// call after the wake: it is permitted after one full grace period
+    /// that starts at the discontinuity. A later discontinuity starts the
+    /// period again. The execution deadline of the operation still ends
+    /// the wait.
+    fn restart_grace_after_wake(active: &mut Active, target_id: &TargetId, time: &TimeReading) {
+        let Some(grace) = active.plan.limits.grace else {
+            return;
+        };
+        let Some(graceful) = active.graceful.get_mut(target_id) else {
+            return;
+        };
+        let NextStep::Force { not_before } = graceful.next else {
+            return;
+        };
+        if graceful.continuity == Some(time.clock.continuity) {
+            return;
+        }
+        // With no time of the discontinuity, the period starts now.
+        let awake_since: MonotonicNanos = time
+            .clock
+            .last_discontinuity
+            .map_or(time.clock.now, |at| at.min(time.clock.now));
+        // A time that does not fit the clock is after each deadline.
+        let restarted: MonotonicNanos = awake_since
+            .checked_add(grace)
+            .unwrap_or(MonotonicNanos::new(u64::MAX));
+        graceful.next = NextStep::Force {
+            not_before: not_before.max(restarted),
+        };
+        graceful.continuity = Some(time.clock.continuity);
     }
 
     /// Decides whether the force step of the strategy `force_after_grace`
@@ -1048,6 +1090,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     submitted_at: report.submitted_at,
                     results: results.clone(),
                     next: report.next,
+                    continuity: active.step_continuity,
                 },
             );
         }

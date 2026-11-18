@@ -18,7 +18,7 @@ use svalnir_core::observation::Observation;
 use svalnir_core::plan::{
     ApplyRefusal, CurrentRevisions, PlanMode, RevisionChange, check_apply, mode_of,
 };
-use svalnir_core::policy::ProtectionFact;
+use svalnir_core::policy::{ContinuityGeneration, ProtectionFact};
 use svalnir_core::quantity::{Bytes, Nanoseconds};
 use svalnir_core::state::PressureState;
 use svalnir_core::time::MonotonicNanos;
@@ -180,6 +180,10 @@ pub(super) struct GracefulOutcome {
     pub(super) submitted_at: Option<MonotonicNanos>,
     pub(super) results: Vec<TargetResult>,
     pub(super) next: NextStep,
+    /// The clock continuity at the dispatch of the graceful step, or at
+    /// the latest start of the grace period. A different value at the
+    /// force step shows a sleep in the grace period.
+    pub(super) continuity: Option<ContinuityGeneration>,
 }
 
 /// An exit observation in progress.
@@ -213,6 +217,9 @@ pub(super) struct Active {
     pub(super) next_step: usize,
     pub(super) observing: Option<Observing>,
     pub(super) graceful: BTreeMap<TargetId, GracefulOutcome>,
+    /// The clock continuity at the dispatch of the latest application
+    /// step.
+    pub(super) step_continuity: Option<ContinuityGeneration>,
     pub(super) stop: Option<StopView>,
     pub(super) baseline: Baseline,
     pub(super) effects: Vec<ResourceEffect>,
@@ -920,6 +927,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             next_step: 0,
             observing: None,
             graceful: BTreeMap::new(),
+            step_continuity: None,
             stop: None,
             baseline: Baseline::default(),
             effects: Vec::new(),

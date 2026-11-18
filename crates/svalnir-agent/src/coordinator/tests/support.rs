@@ -152,11 +152,22 @@ pub(super) fn evaluation_clock(now: u64) -> EvaluationClock {
 
 /// The controlled clock. Each copy reads the same time.
 #[derive(Debug, Clone)]
-pub(super) struct TestClock(Arc<AtomicU64>);
+pub(super) struct TestClock(Arc<AtomicU64>, Arc<Mutex<(u64, Option<u64>)>>);
 
 impl TestClock {
     pub(super) fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(START)))
+        Self(
+            Arc::new(AtomicU64::new(START)),
+            Arc::new(Mutex::new((0, None))),
+        )
+    }
+
+    /// A sleep of the host: the clock counts its time, and the wake is a
+    /// clock discontinuity at the new time.
+    pub(super) fn sleep(&self, nanoseconds: u64) {
+        self.advance(nanoseconds);
+        let mut continuity = self.1.lock().unwrap();
+        *continuity = (continuity.0 + 1, Some(self.now()));
     }
 
     pub(super) fn now(&self) -> u64 {
@@ -172,8 +183,13 @@ impl TestClock {
     }
 
     pub(super) fn reading(&self) -> TimeReading {
+        let (generation, last_discontinuity) = *self.1.lock().unwrap();
         TimeReading {
-            clock: evaluation_clock(self.now()),
+            clock: EvaluationClock {
+                continuity: ContinuityGeneration::new(generation),
+                last_discontinuity: last_discontinuity.map(MonotonicNanos::new),
+                ..evaluation_clock(self.now())
+            },
             wall: wall(self.now()),
         }
     }

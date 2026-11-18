@@ -232,6 +232,116 @@ fn evidence_that_does_not_agree_is_skipped_with_its_reason() {
 }
 
 #[test]
+fn a_member_whose_plan_has_a_code_signature_gets_no_call() {
+    // The executor cannot read a signature again, so evidence that it
+    // cannot compare is evidence that is missing.
+    let host: Host = Host::new().with_process(100, 10);
+    let mut planned: ProcessIdentity = member(100, 10, job());
+    planned.executable.as_mut().unwrap().code_signature =
+        Some(svalnir_core::process::CodeSignatureEvidence {
+            signing_identifier: "com.example.job".to_owned(),
+            team_identifier: Some("TEAM123456".to_owned()),
+        });
+    for envelope in [
+        graceful(Escalation::None, vec![planned.clone()]),
+        force(Escalation::ImmediateForce, vec![planned.clone()]),
+    ] {
+        let report = finished(begin(&host, &envelope));
+        assert_all_skipped(
+            &host,
+            &report,
+            code::PROCESS_EVIDENCE_MISSING,
+            &ErrorFamily::Evidence,
+        );
+    }
+}
+
+#[test]
+fn the_grace_period_starts_at_the_request_that_was_sent() {
+    // The call for the first member finds no process. It is not a request
+    // that was sent, so it does not start the grace period.
+    const CALL: u64 = 1_000_000;
+    let host: Host = Host::new().with_process(100, 10).with_process(101, 10);
+    host.change(|world| {
+        world.call_duration = CALL;
+        world
+            .signal_results
+            .insert(100, SignalResult::NoSuchProcess);
+    });
+    let members = vec![member(100, 10, job()), member(101, 10, job())];
+    let envelope = graceful(Escalation::ForceAfterGrace, members);
+    let observation = observing(begin(&host, &envelope));
+    assert_eq!(
+        observation.submitted_at(),
+        Some(MonotonicNanos::new(START + 2 * CALL))
+    );
+    host.advance(GRACE);
+    let report = finished(poll(&host, observation, None));
+    assert_eq!(report.members[0].result.effect, TargetEffect::AlreadyExited);
+    assert_eq!(report.members[1].result.effect, TargetEffect::StillRunning);
+    assert_eq!(
+        report.next,
+        NextStep::Force {
+            not_before: MonotonicNanos::new(START + 2 * CALL + GRACE)
+        }
+    );
+
+    // When no member was possibly running, no time is recorded.
+    let host: Host = Host::new().with_process(100, 10);
+    host.change(|world| {
+        world
+            .signal_results
+            .insert(100, SignalResult::NoSuchProcess);
+    });
+    let envelope = graceful(Escalation::ForceAfterGrace, vec![member(100, 10, job())]);
+    assert_eq!(finished(begin(&host, &envelope)).submitted_at, None);
+}
+
+#[test]
+fn a_helper_that_exits_after_the_application_request_is_a_covered_member() {
+    let host: Host = Host::new().with_process(100, 10).with_process(101, 10);
+    let members = vec![member(101, 10, helper()), member(100, 10, application())];
+    let envelope = graceful(Escalation::ForceAfterGrace, members);
+    let observation = observing(begin(&host, &envelope));
+    host.exit(100);
+    host.exit(101);
+    let report = finished(poll(&host, observation, None));
+    let helper_result: &TargetResult = &report.members[0].result;
+    assert_eq!(helper_result.effect, TargetEffect::ExitVerified);
+    assert_eq!(helper_result.attribution, Attribution::Established);
+    assert_eq!(
+        helper_result.evidence.native,
+        NativeResult::CoveredByApplicationRequest
+    );
+    assert!(helper_result.evidence.source.is_some());
+    assert_eq!(
+        report.members[1].result.evidence.native,
+        NativeResult::Succeeded
+    );
+}
+
+#[test]
+fn a_covered_helper_that_cannot_be_read_at_the_end_is_an_unknown_outcome() {
+    let host: Host = Host::new().with_process(100, 10).with_process(101, 10);
+    let members = vec![member(101, 10, helper()), member(100, 10, application())];
+    let envelope = graceful(Escalation::ForceAfterGrace, members);
+    let observation = observing(begin(&host, &envelope));
+    host.exit(100);
+    host.change(|world| {
+        world.info_failures.insert(101, QueryFailure::Failed(5));
+    });
+    host.advance(GRACE);
+    let report = finished(poll(&host, observation, None));
+    let helper_result: &TargetResult = &report.members[0].result;
+    assert_eq!(helper_result.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(
+        helper_result.evidence.native,
+        NativeResult::CoveredByApplicationRequest
+    );
+    assert_eq!(report.next, NextStep::Reconcile);
+}
+
+#[test]
 fn a_plan_with_no_executable_evidence_gets_no_call() {
     let host: Host = Host::new().with_process(100, 10);
     let mut planned: ProcessIdentity = member(100, 10, job());
@@ -1185,7 +1295,17 @@ fn a_graceful_step_sends_one_request_to_the_application_and_observes_each_member
     let helper_result: &TargetResult = &report.members[0].result;
     assert_eq!(helper_result.effect, TargetEffect::StillRunning);
     assert_eq!(helper_result.dispatch, DispatchState::Submitted);
+    // The helper got no call of its own: the request to the application
+    // covers it. The force step below still follows it.
+    assert_eq!(
+        helper_result.evidence.native,
+        NativeResult::CoveredByApplicationRequest
+    );
     assert_eq!(report.members[1].result.effect, TargetEffect::ExitVerified);
+    assert_eq!(
+        report.members[1].result.evidence.native,
+        NativeResult::Succeeded
+    );
     assert_eq!(
         aggregate_step(&report.results()).unwrap(),
         StepState::Partial
@@ -1461,9 +1581,12 @@ fn a_declined_request_applies_to_each_helper_and_a_force_step_can_follow() {
     let members = vec![member(100, 10, application()), member(101, 10, helper())];
     let envelope = graceful(Escalation::ForceAfterGrace, members.clone());
     let report = finished(begin(&host, &envelope));
-    for outcome in &report.members {
+    for (outcome, native) in report.members.iter().zip([
+        NativeResult::Refused,
+        NativeResult::CoveredByApplicationRequest,
+    ]) {
         assert_eq!(outcome.result.effect, TargetEffect::Refused);
-        assert_eq!(outcome.result.evidence.native, NativeResult::Refused);
+        assert_eq!(outcome.result.evidence.native, native);
         assert_eq!(code_of(&outcome.result), code::APPLICATION_DECLINED_REQUEST);
         assert_eq!(outcome.state, Some(GenerationState::Running));
     }

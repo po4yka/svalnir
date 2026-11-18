@@ -580,6 +580,14 @@ fn a_covered_member_is_a_submitted_member_result_and_is_not_a_native_call() {
         }),
         Err(OutcomeError::Evidence)
     );
+    assert_eq!(
+        covered(&|record| {
+            record.effect = TargetEffect::AlreadyAbsent;
+            record.attribution = crate::action::Attribution::Possible;
+            record.stop_reason = StopReason::Completed;
+        }),
+        Err(OutcomeError::Evidence)
+    );
 
     // The wire name is stable, and a name that this build does not know is
     // not read as this value or as a call.

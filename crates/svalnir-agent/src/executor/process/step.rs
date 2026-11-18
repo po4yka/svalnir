@@ -169,9 +169,11 @@ pub struct StepReport {
     /// One result for each member of the target, in the sequence of the
     /// binding.
     pub members: Vec<MemberOutcome>,
-    /// The monotonic time of a clock reading after the first call of the
-    /// step. `None` when no call was issued, or when the clock gave no
-    /// value after the call; an earlier time is never used in its place.
+    /// The monotonic time of a clock reading after the last call of the
+    /// step that left a member possibly running. A call that found no
+    /// process does not set it. `None` when no such call was issued, or
+    /// when the clock gave no value after the call; an earlier time is
+    /// never used in its place.
     pub submitted_at: Option<MonotonicNanos>,
     /// What the caller can do next.
     pub next: NextStep,
@@ -266,7 +268,22 @@ struct Pending {
     member: ProcessIdentity,
     /// The full check before the call found the planned generation.
     verified: bool,
+    /// The member got no call of its own: the request to the application
+    /// is its request, so its results carry the native value
+    /// `covered_by_application_request`.
+    covered: bool,
     last: GenerationState,
+}
+
+impl Pending {
+    /// The native value of the results of the member.
+    const fn native(&self) -> NativeResult {
+        if self.covered {
+            NativeResult::CoveredByApplicationRequest
+        } else {
+            NativeResult::Succeeded
+        }
+    }
 }
 
 /// The results and the waiting members of one step.
@@ -305,11 +322,12 @@ impl Work {
         Ok(())
     }
 
-    fn wait(&mut self, index: usize, member: &ProcessIdentity, verified: bool) {
+    fn wait(&mut self, index: usize, member: &ProcessIdentity, verified: bool, covered: bool) {
         self.pending.push(Pending {
             index,
             member: member.clone(),
             verified,
+            covered,
             last: GenerationState::Running,
         });
     }
@@ -781,17 +799,17 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
                     Outcome::already_exited(true)
                 }
                 (GenerationState::Running, Acted::Accepted) => {
-                    work.wait(index, member, true);
+                    work.wait(index, member, true, true);
                     continue;
                 }
                 (GenerationState::Unknown(_), Acted::Accepted) => {
-                    work.wait(index, member, false);
+                    work.wait(index, member, false, true);
                     continue;
                 }
                 // The application declined the request for the instance, so
                 // the helper has the same refusal. A force step can follow.
                 (GenerationState::Running, Acted::Declined) => Outcome::refused(
-                    NativeResult::Refused,
+                    NativeResult::CoveredByApplicationRequest,
                     Failure::native(code::APPLICATION_DECLINED_REQUEST),
                 ),
                 (GenerationState::Running, Acted::NotIssued) => Outcome::skipped(
@@ -835,14 +853,20 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
                 Call::NotIssued(outcome) => (GenerationState::Running, outcome),
                 Call::Issued(result) => {
                     // The time of the submission is a reading after the
-                    // call. With no clock value it stays unknown; an
-                    // earlier time is never used in its place.
-                    if work.submitted_at.is_none() {
+                    // last call that left the member possibly running. A
+                    // call that found no process does not set it. With no
+                    // clock value it stays unknown; an earlier time is
+                    // never used in its place.
+                    let found_no_process: bool = matches!(
+                        &result,
+                        Some((_, outcome)) if matches!(outcome.effect, TargetEffect::AlreadyExited)
+                    );
+                    if !found_no_process {
                         work.submitted_at = self.clock.monotonic_now().ok();
                     }
                     match result {
                         None => {
-                            work.wait(index, member, true);
+                            work.wait(index, member, true, false);
                             return Ok(Acted::Accepted);
                         }
                         Some((state, outcome)) => {
@@ -1124,8 +1148,9 @@ impl Observation {
                     continue;
                 }
             };
+            let native: NativeResult = pending.native();
             let outcome: Outcome =
-                Outcome::exit_verified(NativeResult::Succeeded, attribution, StopReason::Completed);
+                Outcome::exit_verified(native, attribution, StopReason::Completed);
             self.work
                 .settle(pending.index, &pending.member, Some(state), outcome)?;
         }
@@ -1149,21 +1174,18 @@ impl Observation {
         }
         let stop_reason: Option<StopReason> = stop.map(StopRequest::reason);
         for pending in waiting {
+            let native: NativeResult = pending.native();
             let outcome: Outcome = match pending.last {
-                GenerationState::Unknown(_) => Outcome::unknown(
-                    NativeResult::Succeeded,
-                    stop_reason.clone(),
-                    code::EXIT_NOT_VERIFIABLE,
-                ),
+                GenerationState::Unknown(_) => {
+                    Outcome::unknown(native, stop_reason.clone(), code::EXIT_NOT_VERIFIABLE)
+                }
                 // A force request that left the process running is a known
                 // failure. A graceful request that an application did not
                 // follow is not one.
                 _ => match (&stop_reason, self.work.kind) {
-                    (None, StepKind::Force) => {
-                        Outcome::still_running_after_force(NativeResult::Succeeded)
-                    }
+                    (None, StepKind::Force) => Outcome::still_running_after_force(native),
                     _ => Outcome::still_running(
-                        NativeResult::Succeeded,
+                        native,
                         stop_reason.clone().unwrap_or(StopReason::Completed),
                     ),
                 },

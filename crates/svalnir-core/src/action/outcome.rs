@@ -340,7 +340,10 @@ impl Check for TargetResultRecord {
         );
         let covered_agrees: bool = self.member.is_some()
             && matches!(self.dispatch, Submitted)
-            && !matches!(self.effect, TargetEffect::Trashed | TargetEffect::Removed);
+            && !matches!(
+                self.effect,
+                TargetEffect::Trashed | TargetEffect::Removed | TargetEffect::AlreadyAbsent
+            );
         if is_covered && !covered_agrees {
             return Err(OutcomeError::Evidence);
         }

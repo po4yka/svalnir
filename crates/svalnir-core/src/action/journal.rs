@@ -263,8 +263,9 @@ pub trait Journal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Conflict`] when the plan has an operation,
-    /// or a storage error.
+    /// Returns [`JournalError::Conflict`] when the plan has an operation
+    /// or when the digest of `approval` is not the digest of the stored
+    /// plan, or a storage error. A refused call records nothing.
     fn record_rejection(
         &mut self,
         approval: &PlanApproval,
@@ -278,7 +279,12 @@ pub trait Journal {
     /// # Errors
     ///
     /// Returns [`JournalError::Conflict`] when the step has an intent with
-    /// different content, or a storage error.
+    /// different content, or when the envelope is not the content of the
+    /// stored plan (the target binding, the principal, the trigger, the
+    /// authority, the executor, the escalation, or the grace period),
+    /// [`JournalError::NotFound`] when the journal does not have the plan
+    /// or the operation, or a storage error. A refused call records
+    /// nothing.
     fn commit_intent(&mut self, envelope: &RequestEnvelope) -> Result<(), JournalError>;
 
     /// Consumes the dispatch of one step and its budget charge in one

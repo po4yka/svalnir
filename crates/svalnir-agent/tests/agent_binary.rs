@@ -237,6 +237,16 @@ fn an_agent_that_finds_the_lock_of_a_client_ends_with_a_failure_and_starts_later
     // The failure status makes a service manager start the agent again:
     // the client releases the lock after its request.
     assert_eq!(status.code(), Some(1), "{status:?}");
+    // The refused agent registered no coordinator and wrote no record of
+    // an agent, and the home directory has no entry.
+    {
+        let journal: OperationJournal = open_journal(&directories.state);
+        assert_eq!(journal.coordination().unwrap(), None);
+        for record in [AgentRecord::Status, AgentRecord::Lifecycle] {
+            assert_eq!(journal.agent_record_revision(record).unwrap(), 0);
+        }
+    }
+    assert_eq!(std::fs::read_dir(&directories.home).unwrap().count(), 0);
     drop(client);
 
     let mut guard = Agent(agent(&directories).spawn().unwrap());

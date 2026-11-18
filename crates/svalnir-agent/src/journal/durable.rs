@@ -422,15 +422,17 @@ impl OperationJournal {
             {
                 plan
             }
+            // A plan that the journal does not have: as for an operation
+            // that it does not have.
             _ => self
                 .try_plan(&correlation.plan_id)?
-                .filter(|plan| plan.digest() == &correlation.plan_digest)
-                .ok_or(OperationJournalError::Conflict)?,
+                .ok_or(OperationJournalError::NotFound)?,
         };
         // An envelope is not proof that the coordinator made it from the
         // plan: each field that the plan fixes must be the field of the
         // plan. The first intent of a step then fixes the other content.
-        let bound: bool = plan.target(&envelope.target.target_id) == Some(&envelope.target)
+        let bound: bool = plan.digest() == &correlation.plan_digest
+            && plan.target(&envelope.target.target_id) == Some(&envelope.target)
             && envelope.principal == plan.principal
             && envelope.trigger == plan.trigger
             && envelope.authority == plan.authority

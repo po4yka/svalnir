@@ -217,7 +217,10 @@ extern "C" fn record_stop(context: *mut c_void) {
     // The context is a number and not a pointer to data: it is not read as
     // memory.
     let signal: i32 = i32::try_from(context as usize).unwrap_or(libc::SIGTERM);
-    STOP_SIGNAL.store(signal, Ordering::SeqCst);
+    // The first cause of the stop stays. A signal after a stop request of
+    // this process does not hide that the service ended first.
+    let _earlier: Result<i32, i32> =
+        STOP_SIGNAL.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
 }
 
 /// The registration handler of a signal source. The context is the signal

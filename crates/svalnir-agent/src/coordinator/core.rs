@@ -465,7 +465,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 return Ok(Start::Busy {
                     journal,
                     dependencies: Box::new(dependencies),
-                    holder: CoordinatorLock::holder_role(database),
+                    holder: CoordinatorLock::confirmed_holder_role(database),
                 });
             }
             Err(error) => return Err(error.into()),

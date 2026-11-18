@@ -86,6 +86,65 @@ fn a_lock_file_with_a_text_that_is_not_the_agent_role_is_read_as_a_client() {
 }
 
 #[test]
+fn a_stale_agent_text_under_the_lock_of_a_client_is_not_confirmed_as_an_agent() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let client = CoordinatorLock::try_acquire(&path, CoordinatorRole::Client).unwrap();
+    assert_eq!(
+        CoordinatorLock::confirmed_holder_role(&path),
+        CoordinatorRole::Client
+    );
+    // The text of an agent that stopped with no ordinary drop, in the
+    // instant before the client writes its role: one reading gives the
+    // agent role. The client then writes its role, and the confirmation
+    // does not give the agent role.
+    std::fs::write(coordinator_lock_path(&path), "agent").unwrap();
+    assert_eq!(CoordinatorLock::holder_role(&path), CoordinatorRole::Agent);
+    let lock_path = coordinator_lock_path(&path);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(lock_path, "client").unwrap();
+    });
+    assert_eq!(
+        CoordinatorLock::confirmed_holder_role(&path),
+        CoordinatorRole::Client
+    );
+    writer.join().unwrap();
+    drop(client);
+    // The text of an agent with no holder is not an agent that runs.
+    std::fs::write(coordinator_lock_path(&path), "agent").unwrap();
+    assert_eq!(
+        CoordinatorLock::confirmed_holder_role(&path),
+        CoordinatorRole::Client
+    );
+    // An agent that holds the lock is confirmed.
+    let agent = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent).unwrap();
+    assert_eq!(
+        CoordinatorLock::confirmed_holder_role(&path),
+        CoordinatorRole::Agent
+    );
+    drop(agent);
+}
+
+#[test]
+fn a_lock_path_that_is_not_a_regular_file_does_not_block_a_reading() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let lock_path =
+        std::ffi::CString::new(coordinator_lock_path(&path).to_str().unwrap().to_owned()).unwrap();
+    // SAFETY: the path is a valid C string below the temporary directory
+    // of the test. The call makes one FIFO there.
+    assert_eq!(unsafe { libc::mkfifo(lock_path.as_ptr(), 0o600) }, 0);
+    // A read-only open of a FIFO with no writer waits with no bound when
+    // the open is a blocking one.
+    assert!(matches!(
+        CoordinatorLock::probe(&path),
+        Err(CoordinatorLockError::Io(_))
+    ));
+    assert_eq!(CoordinatorLock::holder_role(&path), CoordinatorRole::Client);
+}
+
+#[test]
 fn a_second_coordinator_cannot_take_the_lock_while_the_first_holds_it() {
     let fixture = Fixture::new();
     let path = fixture.path();

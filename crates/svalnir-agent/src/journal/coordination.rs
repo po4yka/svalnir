@@ -109,6 +109,12 @@ pub enum LockState {
 /// The largest number of bytes of the lock file that a reader takes.
 const MAX_ROLE_BYTES: u64 = 16;
 
+/// The time between the two readings of
+/// [`CoordinatorLock::confirmed_holder_role`]. A new holder writes its
+/// role in the same call that takes the lock, so the time is much longer
+/// than the instant in which the text of an earlier holder stays.
+const ROLE_CONFIRMATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The exclusive lock of the one coordinator of a journal.
 ///
 /// The lock is held while this value exists. The operating system releases
@@ -144,8 +150,9 @@ fn lock_file_options() -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // A symbolic link at the path is refused.
-        options.custom_flags(libc::O_NOFOLLOW);
+        // A symbolic link at the path is refused. The open does not wait
+        // for the other end of a FIFO that a process put at the path.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     options
 }
@@ -209,12 +216,38 @@ impl CoordinatorLock {
 
         let path: PathBuf = coordinator_lock_path(&canonical_path(database));
         let mut text: Vec<u8> = Vec::new();
-        let read: std::io::Result<usize> = lock_file_options()
-            .open(path)
-            .and_then(|file| file.take(MAX_ROLE_BYTES).read_to_end(&mut text));
+        // Only a regular file has the text of a holder.
+        let read: std::io::Result<usize> = lock_file_options().open(path).and_then(|file| {
+            if file.metadata()?.is_file() {
+                file.take(MAX_ROLE_BYTES).read_to_end(&mut text)
+            } else {
+                Err(std::io::ErrorKind::InvalidInput.into())
+            }
+        });
         match read {
             Ok(_) => CoordinatorRole::of_lock_content(&text),
             Err(_) => CoordinatorRole::Client,
+        }
+    }
+
+    /// The role of the holder for a process that found the lock held and
+    /// that ends with success when an agent holds it.
+    ///
+    /// A text of the agent role can be that of an agent that stopped with
+    /// no ordinary drop, in the instant before a new client holder writes
+    /// its own role. The result is [`CoordinatorRole::Agent`] only when
+    /// two readings with 100 milliseconds between them give
+    /// the agent role and the lock is held at the second one. The call
+    /// waits for that interval only after a first reading of the agent
+    /// role.
+    pub fn confirmed_holder_role(database: &Path) -> CoordinatorRole {
+        if Self::holder_role(database) != CoordinatorRole::Agent {
+            return CoordinatorRole::Client;
+        }
+        std::thread::sleep(ROLE_CONFIRMATION_INTERVAL);
+        match Self::probe(database) {
+            Ok(LockState::Held(CoordinatorRole::Agent)) => CoordinatorRole::Agent,
+            _ => CoordinatorRole::Client,
         }
     }
 
@@ -246,6 +279,13 @@ impl CoordinatorLock {
             }
             Err(error) => return Err(CoordinatorLockError::Io(error)),
         };
+        // A lock file is a regular file.
+        let is_file: bool = file.metadata().map_err(CoordinatorLockError::Io)?.is_file();
+        if !is_file {
+            return Err(CoordinatorLockError::Io(
+                std::io::ErrorKind::InvalidInput.into(),
+            ));
+        }
         // The query for a write lock on the full file: each lock of a
         // different owner conflicts with it.
         let mut query = libc::flock {

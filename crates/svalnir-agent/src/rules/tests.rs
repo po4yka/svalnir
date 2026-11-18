@@ -479,6 +479,47 @@ fn valid_marker(fixture: &Fixture) -> serde_json::Value {
 }
 
 #[test]
+fn an_item_that_is_a_symbolic_link_a_deep_tree_and_a_large_record_are_not_candidates() {
+    let fixture = temporary_fixture();
+    // A unit that is a symbolic link to a valid item outside the root.
+    let outside = fixture.base().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let real = outside.join("real-item");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("part.bin"), b"x").unwrap();
+    symlink(&real, fixture.root().join("linked-item")).unwrap();
+    // A tree that is deeper than `max_depth`.
+    let deep = add_item(&fixture, "deep", |_| {});
+    fs::create_dir_all(deep.join("l1/l2/l3/l4")).unwrap();
+    // A record above the read limit.
+    add_item(&fixture, "large-record", |record| {
+        record.purpose = "p".repeat(20_000);
+    });
+
+    let discovery = discover_temporary_with(
+        &fixture,
+        NO_LEASES,
+        DiscoveryMode::Full,
+        DiscoveryLimits {
+            max_depth: 3,
+            ..limits()
+        },
+        &later_clock(),
+    )
+    .unwrap();
+
+    assert_eq!(discovery.candidates.len(), 0, "{:?}", discovery.candidates);
+    for (name, reason) in [
+        ("linked-item", SkipReason::SymbolicLink),
+        ("deep", SkipReason::MeasurementIncomplete),
+        ("large-record", SkipReason::RecordInvalid),
+    ] {
+        assert_eq!(skip_of(&discovery, name).reasons, [reason], "{name}");
+    }
+    assert_eq!(fs::read(real.join("part.bin")).unwrap(), b"x");
+}
+
+#[test]
 fn a_forged_root_marker_does_not_classify_the_root() {
     // Each marker differs from a valid one in one respect.
     type Forge = fn(&Fixture, &Path);

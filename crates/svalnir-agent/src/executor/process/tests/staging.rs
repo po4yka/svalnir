@@ -1106,6 +1106,7 @@ fn an_observation_ends_when_the_clock_gives_no_value() {
     // reported.
     assert_eq!(report.members[0].result.effect, TargetEffect::StillRunning);
     assert_eq!(report.members[0].result.stop_reason, StopReason::Completed);
+    assert_eq!(report.next, NextStep::ForceNotPermitted);
 
     // With no clock value at the start, no call is issued.
     let host: Host = Host::new().with_process(100, 10);
@@ -1745,6 +1746,32 @@ fn a_graceful_record_with_an_unrecognized_value_permits_no_force_call() {
 
 #[test]
 fn an_exec_between_the_two_identity_readings_is_detected() {
+    // Each identity reading agrees. The path query shows another
+    // executable after the first reading.
+    let host: Host = Host::new().with_process(100, 10);
+    let source = ChangingPath {
+        host: host.clone(),
+        readings: std::cell::Cell::new(0),
+    };
+    let executor = ProcessExecutor::new(
+        source,
+        host.clone(),
+        host.clone(),
+        context(),
+        ExecutorConfig::default(),
+    );
+    let envelope = graceful(Escalation::None, vec![member(100, 10, job())]);
+    let report = finished(executor.begin(input(&envelope, &receipt())).unwrap());
+    assert_eq!(report.members[0].result.effect, TargetEffect::Skipped);
+    assert_eq!(
+        code_of(&report.members[0].result),
+        code::PROCESS_EXECUTABLE_CHANGED
+    );
+    assert_eq!(host.calls(), Vec::new());
+}
+
+#[test]
+fn an_owner_that_changes_between_the_two_identity_readings_is_detected() {
     // The path query shows the planned executable, and the process then
     // gets a different owner before the last identity reading.
     let host: Host = Host::new().with_process(100, 10);
@@ -1785,6 +1812,15 @@ struct ChangingOwner {
 
 macro_rules! delegate_source {
     ($name:ident, |$self:ident, $pid:ident| $info:block) => {
+        delegate_source!($name, |$self, $pid| $info, |$self, $pid| {
+            $self.host.executable_path($pid)
+        });
+    };
+    (
+        $name:ident,
+        |$self:ident, $pid:ident| $info:block,
+        |$pself:ident, $ppid:ident| $path:block
+    ) => {
         impl ProcessSource for $name {
             fn effective_uid(&self) -> Uid {
                 self.host.effective_uid()
@@ -1793,9 +1829,7 @@ macro_rules! delegate_source {
                 self.host.list_pids()
             }
             fn process_info(&$self, $pid: Pid) -> Result<RawProcessInfo, QueryFailure> $info
-            fn executable_path(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
-                self.host.executable_path(pid)
-            }
+            fn executable_path(&$pself, $ppid: Pid) -> Result<LosslessPath, QueryFailure> $path
             fn file_evidence(
                 &self,
                 path: &LosslessPath,
@@ -1838,6 +1872,29 @@ delegate_source!(FailingAfter, |self, pid| {
     self.successes.set(left - 1);
     self.host.process_info(pid)
 });
+
+/// A source whose path query shows another executable once an identity
+/// reading was made, while each identity reading agrees: an exec between
+/// the first identity reading and the path query.
+#[derive(Debug)]
+struct ChangingPath {
+    host: Host,
+    readings: std::cell::Cell<u32>,
+}
+
+delegate_source!(
+    ChangingPath,
+    |self, pid| {
+        self.readings.set(self.readings.get() + 1);
+        self.host.process_info(pid)
+    },
+    |self, pid| {
+        if self.readings.get() > 0 {
+            return Ok(LosslessPath::from_bytes(b"/opt/other".to_vec()).unwrap());
+        }
+        self.host.executable_path(pid)
+    }
+);
 
 delegate_source!(ChangingOwner, |self, pid| {
     let reading: u32 = self.readings.get();

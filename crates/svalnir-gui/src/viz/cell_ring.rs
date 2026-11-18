@@ -169,6 +169,8 @@ struct RingPaint {
     /// The last steps of each span that the scan ghost hatches.
     growth: Vec<usize>,
     dim_alpha: f32,
+    /// The color of a hatched dot of the scan ghost.
+    ghost: Hsla,
     empty: Hsla,
     sweep: Option<f32>,
 }
@@ -216,6 +218,8 @@ fn paint_ring(paint: &RingPaint, bounds: Bounds<Pixels>, window: &mut Window) {
                     )
                 };
                 let fill_color: Hsla = match tone {
+                    // A hatched dot is not a dot of the density texture.
+                    CellTone::Lit if hatched && !paint.dimmed[index] => paint.ghost,
                     CellTone::Lit => lit_color(color),
                     CellTone::Dim => color.opacity(paint.dim_alpha),
                 };
@@ -366,6 +370,7 @@ impl RenderOnce for CellRing {
                 })
                 .collect(),
             dim_alpha: style.dim_alpha,
+            ghost: style.ghost_line,
             empty: style.lattice,
             sweep: self.sweep,
         };

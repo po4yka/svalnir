@@ -277,7 +277,9 @@ pub struct LedStyle {
     pub point: Hsla,
     /// The color of the free outline.
     pub free_outline: Hsla,
-    /// The color of the dashed line of a smaller item.
+    /// The color of the marks of the scan ghost: the lit cells of a hatched
+    /// part and the dashed line of a smaller item. It is the text color, so
+    /// the marks differ from the density texture in each theme.
     pub ghost_line: Hsla,
 }
 
@@ -298,7 +300,7 @@ impl LedStyle {
             dim_alpha: if dark { 0.28 } else { 0.22 },
             point: to_hsla(tokens.foreground).opacity(0.8),
             free_outline: to_hsla(tokens.muted_foreground).opacity(0.35),
-            ghost_line: to_hsla(tokens.muted_foreground),
+            ghost_line: to_hsla(tokens.foreground).opacity(0.85),
         }
     }
 
@@ -477,6 +479,8 @@ pub fn paint_led_field(
                     cell_tone_at(x, y, segment.seed, threshold)
                 };
                 let color: Hsla = match tone {
+                    // A hatched cell is not a cell of the density texture.
+                    CellTone::Lit if hatched && !segment.dimmed && !in_label => style.ghost_line,
                     CellTone::Lit => lit,
                     CellTone::Dim => dim,
                 };
@@ -517,8 +521,8 @@ pub fn paint_led_field(
             BorderStyle::Solid,
         ));
     }
-    // A smaller item: a dashed 1 px line along the end edge, in the middle of
-    // the last column or row of cells.
+    // A smaller item: a dashed 1.5 px line along the end edge, in the middle
+    // of the last column or row of cells.
     for segment in field
         .segments
         .iter()
@@ -533,23 +537,26 @@ pub fn paint_led_field(
         };
         let mut at: f32 = 0.0;
         while at < length {
-            let dash: f32 = 3.0_f32.min(length - at);
+            let dash: f32 = 4.0_f32.min(length - at);
             let (origin, extent) = if horizontal {
                 (
-                    point(b.origin.x + px(at), b.origin.y + px(style.cell / 2.0 - 0.5)),
-                    size(px(dash), px(1.0)),
+                    point(
+                        b.origin.x + px(at),
+                        b.origin.y + px(style.cell / 2.0 - 0.75),
+                    ),
+                    size(px(dash), px(1.5)),
                 )
             } else {
                 (
                     point(
-                        b.origin.x + b.size.width - px(style.cell / 2.0 + 0.5),
+                        b.origin.x + b.size.width - px(style.cell / 2.0 + 0.75),
                         b.origin.y + px(at),
                     ),
-                    size(px(1.0), px(dash)),
+                    size(px(1.5), px(dash)),
                 )
             };
             window.paint_quad(fill(Bounds::new(origin, extent), style.ghost_line));
-            at += 6.0;
+            at += 7.0;
         }
     }
     if let Some(free) = field.free.filter(|r| !r.is_empty()) {
@@ -614,6 +621,11 @@ const LABEL_TOP_PX: f32 = 8.0;
 const LABEL_HEIGHT_PX: f32 = 36.0;
 /// Estimated width of one label character.
 const LABEL_CHAR_PX: f32 = 7.5;
+/// The horizontal padding of the plate of a label inside a tile. The plate
+/// is a part of the chart, so its padding is chart geometry.
+const LABEL_PLATE_X: f32 = 6.0;
+/// The vertical padding of the plate of a label inside a tile.
+const LABEL_PLATE_Y: f32 = 4.0;
 
 /// The cells under a label text block of two lines at the top left of `rect`,
 /// with one cell of padding, clipped to `rect`. Cell coordinates are absolute.
@@ -726,6 +738,7 @@ impl RenderOnce for LedChart {
             style.glow_alpha = 0.0;
         }
         let mono: SharedString = cx.theme().mono_font_family.clone();
+        let plate: Hsla = to_hsla(tokens.surface_inset).opacity(0.86);
         let width: f32 = style.span(self.field.columns);
         let height: f32 = style.span(self.field.rows);
         let has_below: bool = self.labels.iter().any(|l| l.place == LabelPlace::Below);
@@ -790,8 +803,11 @@ impl RenderOnce for LedChart {
             let (name_color, size_color): (Hsla, Hsla) = if free {
                 (muted, muted)
             } else {
-                (foreground, foreground.opacity(0.7))
+                (foreground, foreground.opacity(0.8))
             };
+            // A label inside a tile sits on a plate in the color of the
+            // panel, so the text does not sit on the cell pattern.
+            let inside: bool = label.place == LabelPlace::Inside && !free;
             let text = div()
                 .id(SharedString::from(format!("{}-label-{n}", self.id)))
                 .absolute()
@@ -817,8 +833,23 @@ impl RenderOnce for LedChart {
                         .whitespace_nowrap()
                         .child(label.size),
                 );
+            let text = if inside {
+                text.bg(plate)
+                    .rounded(px(6.0))
+                    .px(px(LABEL_PLATE_X))
+                    .py(px(LABEL_PLATE_Y))
+            } else {
+                text
+            };
+            let (pad_x, pad_y): (f32, f32) = if inside {
+                (LABEL_PLATE_X, LABEL_PLATE_Y)
+            } else {
+                (0.0, 0.0)
+            };
             root = root.child(match label.place {
-                LabelPlace::Inside => text.left(px(left + 10.0)).top(px(top + 8.0)),
+                LabelPlace::Inside => text
+                    .left(px(left + 10.0 - pad_x))
+                    .top(px(top + 8.0 - pad_y)),
                 LabelPlace::Below => text.left(px(left)).top(px(height + 6.0)),
             });
         }

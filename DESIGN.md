@@ -220,7 +220,7 @@ The storage charts and the volume strip are LED matrices. This is the signature 
 - One lattice of small square cells covers the chart: a 4.5 px cell with a 1 px radius and a 1.5 px gap. An empty cell uses `border` at half strength, so the lattice shows in the whole chart.
 - A segment is a rectangle of lattice cells with a 1.5 px outline (radius 6 px) in its color, a fill of the color at 8%, and a glow of the color: blur 14 px, alpha 0.45 in the dark theme and 0.22 in the light theme.
 - In a segment, each cell is lit (the color mixed 15% toward white) or dim (the color at 28%, or 22% in the light theme). A hash of the cell position and of the segment selects the state, so the pattern has clumps and does not change between frames. About 45% of the cells are lit. In a chart of folder sizes the lit share is the density of the folder (see "Density texture"). In each other segment the pattern has no meaning. The area of the segment carries the quantity.
-- A label in a tile dims the cells under its text only.
+- A label in a tile is on a plate: the color of the panel at 86%, with a radius of 6 px and a padding of 4 px by 6 px. The name uses `foreground`, and the size uses `foreground` at 80%. The cells under the plate are dim. Text does not sit on the cell pattern.
 - Free space is a region with a dashed 1 px outline (`muted-foreground` at 35%), a label, and sparse bright points. It is not a segment.
 - A segment that has no focus while a different one has it shows all its cells dim, its outline at 35%, and no glow.
 - The head of a fill is three lattice columns of white at 100%, 60%, and 30% with a white glow.
@@ -242,8 +242,8 @@ These three marks show what the client measures and a size chart does not show: 
 
 **Scan ghost.** After a second scan of one folder, the chart compares each item with the scan before it, in the size metric of the chart. The client keeps one earlier result for each scan root.
 
-- An item that is larger shows the difference as a hatched part at the end of its segment: a checkerboard of lit and empty cells, with an area of the difference. A difference below half a cell has no hatched part.
-- An item that is smaller shows a dashed 1 px line in `muted-foreground` along the end edge of its segment.
+- An item that is larger shows the difference as a hatched part at the end of its segment: a checkerboard of cells in `foreground` at 85% and empty cells, with an area of the difference. The text color makes the part differ from the density texture in the two themes. A difference below half a cell has no hatched part.
+- An item that is smaller shows a dashed 1.5 px line in `foreground` at 85% along the end edge of its segment.
 - The legend row shows the difference in mono text with a sign ("+2.1 GB", "−800.0 MB"), in `foreground` for a larger item and `muted-foreground` for a smaller one. A new item shows "new". The colors `positive` and `negative` are not used: a change of size is not good or bad.
 - An item of the earlier scan that this scan does not have is one line below the legend: "Not in this scan:" with the names and the earlier sizes.
 - A caption states the reference: "Compared with the scan of 12:04". Do not use the words "freed" or "reclaimed" for a difference (§7).
@@ -254,7 +254,7 @@ These three marks show what the client measures and a size chart does not show: 
 - The trend is a least-squares line through the measured readings of the available space among the newest 60 readings. It needs 12 or more measured readings over 60 s or more, with at most one third of the readings unavailable.
 - The runway shows only when the line falls and the fall over the readings is 0.05% of the volume or more. With a level or rising line the text is "steady". Without enough readings no runway text shows.
 - The text uses one unit: "≈ 40 min", "≈ 3 h", "≈ 2 d". Above 7 days the text is "more than 7 d".
-- The session chart draws the trend line as dots of 2 px in `muted-foreground` through the curve, over the columns that the trend uses. The footer has a tag "runway ≈ 3 h".
+- The session chart draws the trend line as dots of 2.5 px in `foreground` at 80%, over the columns that the trend uses. The dots are on a straight line and not on the rows of the lattice, so the line differs from the steps of the curve. The footer has a tag "runway ≈ 3 h".
 - The disk ring of the dial shows the space that the trend takes in the next hour as dots of 2 px in the ring color after the head, at most to the end of the ring. The detail panel of the disk has a row "Runway" with the text and the note "estimate from N readings".
 - A runway value does not roll, does not animate, and is not a headline value (§6 "Limits"). It is not an input of a guard.
 

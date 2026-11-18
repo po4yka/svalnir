@@ -86,6 +86,10 @@ pub struct Column {
     /// The row of the trend dot from the bottom, `0..CURVE_ROWS`; `None`
     /// outside the readings that the trend uses.
     pub trend: Option<usize>,
+    /// The place of the trend line from the bottom, in thousandths of a
+    /// row: `0..=(CURVE_ROWS - 1) * 1000`. The line is straight, so the
+    /// paint does not put it on the rows of the lattice.
+    pub trend_at: Option<u16>,
 }
 
 /// What an event is.
@@ -163,6 +167,28 @@ fn range_of(values: impl Iterator<Item = Option<u64>>) -> Option<(u64, u64)> {
 
 /// The position of `value` in `range` as a step `0..=steps`, rounded. A range
 /// of one value gives the middle step.
+/// The place of `value` in `range` from the bottom, in thousandths of a
+/// row: `0..=(CURVE_ROWS - 1) * 1000`. A range of one value gives the middle
+/// row, as [`step_in`] does. A value that is not finite gives the lowest row.
+fn trend_place(value: f64, range: (u64, u64)) -> u16 {
+    let top: f64 = f64::from(u16::try_from(CURVE_ROWS - 1).unwrap_or(0));
+    let (low, high): (f64, f64) = (value_f64(range.0), value_f64(range.1));
+    let place: f64 = if high > low && value.is_finite() {
+        ((value - low) / (high - low)).clamp(0.0, 1.0) * top
+    } else if high > low {
+        0.0
+    } else {
+        (top / 2.0).floor()
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the place is clamped to the rows of the curve, at most 9000"
+    )]
+    let thousandths: u16 = (place * 1000.0).round() as u16;
+    thousandths
+}
+
 fn step_in(value: u64, range: (u64, u64), steps: usize) -> usize {
     let (low, high) = range;
     let span: u128 = u128::from(high.saturating_sub(low));
@@ -283,6 +309,11 @@ pub fn session_model(
                         .clamp(value_f64(range.0), value_f64(range.1));
                     step_in(whole_bytes(value), range, CURVE_ROWS - 1)
                 }),
+            trend_at: fit
+                .as_ref()
+                .zip(available)
+                .filter(|_| start + index >= trend_from)
+                .map(|(line, range)| trend_place(line.value_at(sample.at), range)),
             at: sample.at,
             utc_offset: sample.utc_offset,
         });
@@ -858,6 +889,9 @@ struct SessionPaint {
     colors: DialColors,
     brand: Hsla,
     muted_ink: Hsla,
+    /// The color of the trend line: the text color, so that the line
+    /// differs from the dots of the curve.
+    trend_ink: Hsla,
     ink: Hsla,
     glow: bool,
     live: Option<f32>,
@@ -997,21 +1031,23 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
             }
         }
     }
-    // The trend line: dots of 2 px through the curve, over the columns that
-    // the trend uses.
+    // The trend line: dots of 2.5 px on a straight line over the columns
+    // that the trend uses. The line is not on the rows of the lattice, so it
+    // does not hide behind the dots of the curve.
+    let top_row: f32 = count_px(CURVE_ROWS - 1);
     for (index, column) in model.columns.iter().enumerate() {
-        if let Some(value) = column.trend {
+        if let Some(place) = column.trend_at {
             window.paint_quad(
                 fill(
                     dot_at(
                         origin,
                         slot_x(model.offset() + index),
-                        row_y(CURVE_ROWS - 1 - value),
-                        2.0,
+                        layout.band + (top_row - f32::from(place) / 1000.0) * PITCH,
+                        2.5,
                     ),
-                    paint.muted_ink.opacity(rest),
+                    paint.trend_ink.opacity(0.8 * rest),
                 )
-                .corner_radii(Corners::all(px(1.0))),
+                .corner_radii(Corners::all(px(1.25))),
             );
         }
     }
@@ -1352,7 +1388,9 @@ impl RenderOnce for SessionChart {
                 axis.text.clone(),
             ));
         }
+        let trend_ink: Hsla = to_hsla(tokens.foreground);
         let paint: SessionPaint = SessionPaint {
+            trend_ink,
             model: self.model,
             layout,
             colors,
@@ -1453,6 +1491,20 @@ impl RenderOnce for SessionChart {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_trend_place_is_not_rounded_to_a_row() {
+        // A quarter of the range is a quarter of the 9 row steps.
+        assert_eq!(trend_place(25.0, (0, 100)), 2250);
+        assert_eq!(trend_place(0.0, (0, 100)), 0);
+        assert_eq!(trend_place(100.0, (0, 100)), 9000);
+        // Outside the range, and a value that is not a number.
+        assert_eq!(trend_place(-5.0, (0, 100)), 0);
+        assert_eq!(trend_place(500.0, (0, 100)), 9000);
+        assert_eq!(trend_place(f64::NAN, (0, 100)), 0);
+        // A range of one value: the middle row, as the curve.
+        assert_eq!(trend_place(7.0, (7, 7)), 4000);
+    }
     use std::time::{Duration, SystemTime};
 
     fn at(seconds: u64) -> SystemTime {

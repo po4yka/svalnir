@@ -356,11 +356,22 @@ fn file_protection(
     )
 }
 
-/// The hard protection of the entry at `path`: the directory of the entry
-/// with its symbolic links resolved, and the name of the entry. The entry
-/// itself is not resolved, so a link has the protection of its own place and
-/// not that of its target. An entry whose directory does not resolve has an
-/// unknown protection.
+/// The hard protection of the entry at `path`, for two forms of its
+/// path:
+///
+/// - Its own location: the directory of the entry with its symbolic links
+///   resolved, and the name of the entry. A link in a protected location
+///   is thus protected, also when it points out of it.
+/// - Its resolved form, with the entry itself resolved. A link whose
+///   target is a protected location is thus protected also: the home
+///   directory and the state directory are compared in their resolved
+///   forms, so a link at the configured path of one of them has the
+///   protection of that directory.
+///
+/// The entry is protected when one form is protected. It is not protected
+/// only when the two forms are not protected. An entry whose directory
+/// does not resolve, or that does not resolve itself (a link with no
+/// target), has an unknown protection.
 fn entry_protection(
     path: &Path,
     home: Option<&Path>,
@@ -369,9 +380,23 @@ fn entry_protection(
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return ProtectionFact::Unknown;
     };
-    std::fs::canonicalize(parent).map_or(ProtectionFact::Unknown, |directory| {
-        file_protection(&directory.join(name), home, state_directory)
-    })
+    let fact_of = |resolved: std::io::Result<PathBuf>| {
+        resolved.map_or(ProtectionFact::Unknown, |form| {
+            file_protection(&form, home, state_directory)
+        })
+    };
+    let own_location: ProtectionFact =
+        fact_of(std::fs::canonicalize(parent).map(|directory| directory.join(name)));
+    let resolved: ProtectionFact = fact_of(std::fs::canonicalize(path));
+    match (own_location, resolved) {
+        (ProtectionFact::Protected, _) | (_, ProtectionFact::Protected) => {
+            ProtectionFact::Protected
+        }
+        (ProtectionFact::NotProtected, ProtectionFact::NotProtected) => {
+            ProtectionFact::NotProtected
+        }
+        _ => ProtectionFact::Unknown,
+    }
 }
 
 /// The type of a file object that a plan can bind.
@@ -1015,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn a_link_entry_has_the_protection_of_its_own_location() {
+    fn a_link_entry_has_the_protection_of_its_own_location_and_of_its_target() {
         let directory = TempDirectory::new();
         let base = std::fs::canonicalize(directory.path()).unwrap();
         let (state, outside, work, home) = (
@@ -1031,13 +1056,36 @@ mod tests {
         std::fs::write(state.join("file"), b"x").unwrap();
         std::os::unix::fs::symlink(outside.join("file"), state.join("link")).unwrap();
         std::os::unix::fs::symlink(state.join("file"), work.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), work.join("out")).unwrap();
+        std::os::unix::fs::symlink(base.join("absent"), work.join("dangling")).unwrap();
+        // The configured path of the state directory is a link to it.
+        std::os::unix::fs::symlink(&state, base.join("state-link")).unwrap();
         let protection =
             |path: &Path| entry_protection(path, Some(home.as_path()), Some(state.as_path()));
         // A link in the state directory is protected, also when it points out.
         assert_eq!(protection(&state.join("link")), ProtectionFact::Protected);
-        // A link outside is not protected, also when it points into the
-        // state directory: the link is removed and not its target.
-        assert_eq!(protection(&work.join("link")), ProtectionFact::NotProtected);
+        // A link whose target is in the state directory, and a link at the
+        // configured path of the state directory, are protected: the
+        // removal of the second one disconnects the journal.
+        assert_eq!(protection(&work.join("link")), ProtectionFact::Protected);
+        assert_eq!(
+            protection(&base.join("state-link")),
+            ProtectionFact::Protected
+        );
+        // A link to the home directory is protected in the same way.
+        std::os::unix::fs::symlink(&home, base.join("home-link")).unwrap();
+        assert_eq!(
+            protection(&base.join("home-link")),
+            ProtectionFact::Protected
+        );
+        // A link with no protected form is not protected, and a link with
+        // no target has an unknown protection.
+        assert_eq!(protection(&work.join("out")), ProtectionFact::NotProtected);
+        assert_eq!(protection(&work.join("dangling")), ProtectionFact::Unknown);
+        assert_eq!(
+            protection(&outside.join("file")),
+            ProtectionFact::NotProtected
+        );
     }
 
     #[test]

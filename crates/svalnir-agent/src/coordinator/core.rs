@@ -12,7 +12,7 @@ use svalnir_core::action::{
 };
 use svalnir_core::grant::{ActionRequest, EvidenceStamp, IncidentBudget};
 use svalnir_core::id::{
-    AdapterId, ExecutorEpochId, OperationId, PlanId, RequestId, StepId, TargetId, VolumeId,
+    AdapterId, ExecutorEpochId, OperationId, PlanId, RequestId, RootId, StepId, TargetId, VolumeId,
 };
 use svalnir_core::observation::Observation;
 use svalnir_core::plan::{
@@ -33,7 +33,7 @@ use super::ports::{
     ApplicationExecutor, AuthoritySource, Clock, CoordinatorJournal, FilesystemExecutor, IdSource,
     Measurements, RevisionSnapshot, TargetProbe, TimeReading, TriggerStanding,
 };
-use crate::executor::fs::ApprovedRoots;
+use crate::executor::fs::{ApprovedRoot, ApprovedRoots, RootError};
 use crate::executor::process::{NextStep, Observation as ExitObservation};
 use crate::journal::{
     ClaimedRequest, CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRole,
@@ -88,7 +88,10 @@ pub struct Dependencies {
     pub ids: Box<dyn IdSource + Send>,
     /// The filesystem executor.
     pub filesystem: Box<dyn FilesystemExecutor + Send>,
-    /// The approved roots of the filesystem executor.
+    /// The approved roots of the filesystem executor that this process
+    /// has from its own configuration. An automatic operation acts only
+    /// under these roots. A manual operation acts under the roots that
+    /// its sealed plan binds; see [`approved_roots_of`].
     pub roots: ApprovedRoots,
     /// The process executor.
     pub application: Box<dyn ApplicationExecutor + Send>,
@@ -212,6 +215,8 @@ pub(super) struct Active {
     pub(super) principal: Principal,
     pub(super) hold: Hold,
     pub(super) leases: Vec<ResourceLease>,
+    /// The approved roots of the filesystem steps of the operation.
+    pub(super) roots: ApprovedRoots,
     pub(super) deadline: MonotonicNanos,
     pub(super) volatile: bool,
     pub(super) next_step: usize,
@@ -352,6 +357,55 @@ fn total_charge(plan: &Plan) -> Result<Option<WorkCharge>, NotChargeable> {
         }
     }
     Ok(total)
+}
+
+/// The approved roots of the filesystem steps of an operation of `plan`.
+///
+/// An automatic plan acts only under the roots that the process has from
+/// its own configuration (`configured`).
+///
+/// A manual plan acts under the roots that its file targets bind. The
+/// sealed plan has the identity, the path, the object, the volume, and
+/// the mount generation of the root of each file target, and the digest
+/// that the user approved covers them. Thus a coordinator that did not
+/// build the plan (an agent that takes the request from the queue of the
+/// journal, or a client that executes a request of a different client)
+/// has the approved roots of the request and no wider set. A configured
+/// root with the identity of a bound root is used in its place, so the
+/// executor compares the two records (`approved_root_mismatch`). The
+/// executor opens each root with no-follow protection and compares its
+/// object as before.
+///
+/// # Errors
+///
+/// Returns a [`RootError`] when the plan binds more roots than a set can
+/// have, or when a root path is not an absolute normalized path.
+pub fn approved_roots_of(
+    plan: &Plan,
+    configured: &ApprovedRoots,
+) -> Result<ApprovedRoots, RootError> {
+    if plan.trigger.class.is_automatic() {
+        return Ok(configured.clone());
+    }
+    let mut roots: BTreeMap<&RootId, ApprovedRoot> = BTreeMap::new();
+    for target in &plan.targets {
+        let TargetBinding::File(file) = &target.binding else {
+            continue;
+        };
+        roots.entry(&file.root_id).or_insert_with(|| {
+            configured
+                .root(&file.root_id)
+                .cloned()
+                .unwrap_or_else(|| ApprovedRoot {
+                    root_id: file.root_id.clone(),
+                    path: file.root_path.clone(),
+                    object: file.root_object,
+                    volume_id: file.volume_id.clone(),
+                    mount_id: file.mount_id.clone(),
+                })
+        });
+    }
+    ApprovedRoots::new(roots.into_values().collect())
 }
 
 /// The conflict domains of a plan: each member generation of an
@@ -884,6 +938,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         if self.waiting.len() >= MAX_WAITING_OPERATIONS {
             return limits(code::QUEUE_FULL);
         }
+        let Ok(roots) = approved_roots_of(&plan, &self.roots) else {
+            return refused(admission_error(
+                code::PLAN_NOT_EXECUTABLE,
+                ErrorFamily::Request,
+                &plan_id,
+            ));
+        };
         let mut hold: Hold = match self.reserve(&plan, &request, total, time) {
             Ok(hold) => hold,
             Err(refusal) => return limits(refusal.code),
@@ -922,6 +983,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             principal: request.principal,
             hold,
             leases,
+            roots,
             deadline,
             volatile,
             next_step: 0,

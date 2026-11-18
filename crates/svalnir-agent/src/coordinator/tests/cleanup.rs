@@ -234,3 +234,185 @@ fn the_work_of_a_target_whose_executor_reported_a_fault_stays_in_the_totals() {
     );
     assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
 }
+
+#[test]
+fn a_manual_operation_acts_under_the_roots_that_its_sealed_plan_binds() {
+    let mut bench = Bench::new();
+    let file = bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    // A coordinator that did not build the plan has no root of its own:
+    // an agent that takes the request from the queue, or a client that
+    // executes the request of a different client.
+    let started = bench.start_with(|dependencies, _| {
+        dependencies.roots = crate::executor::fs::ApprovedRoots::default();
+    });
+    let super::super::Start::Coordinating(mut coordinator) = started else {
+        panic!("a different coordinator holds the lock");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    // The target is not refused as outside the approved roots.
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert_eq!(
+        view.operation.steps()[0].results()[0].effect,
+        TargetEffect::Removed
+    );
+    assert!(!file.exists());
+}
+
+#[test]
+fn a_root_record_of_the_process_that_is_not_the_root_of_the_plan_stops_the_target() {
+    use svalnir_core::file::LosslessPath;
+
+    let mut bench = Bench::new();
+    let file = bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    // The process has a record with the root identity of the plan and a
+    // different directory. The record of the process is used, so the
+    // executor finds the disagreement.
+    let other = bench.tree.root.join("elsewhere");
+    std::fs::create_dir(&other).unwrap();
+    let mut record = bench
+        .tree
+        .roots()
+        .root(&root_id_of(&plan))
+        .cloned()
+        .unwrap();
+    record.path = LosslessPath::from_path(&other).unwrap();
+    record.object = super::support::object_of(&other);
+    let configured = crate::executor::fs::ApprovedRoots::new(vec![record]).unwrap();
+    let started = bench.start_with(|dependencies, _| dependencies.roots = configured);
+    let super::super::Start::Coordinating(mut coordinator) = started else {
+        panic!("a different coordinator holds the lock");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    let result = &view.operation.steps()[0].results()[0];
+    assert_eq!(result.effect, TargetEffect::Skipped);
+    assert_eq!(
+        result.failure.as_ref().map(|error| error.code.as_str()),
+        Some("approved_root_mismatch")
+    );
+    assert!(file.exists());
+}
+
+fn root_id_of(plan: &svalnir_core::action::Plan) -> svalnir_core::id::RootId {
+    let svalnir_core::action::TargetBinding::File(file) = &plan.targets[0].binding else {
+        panic!("the plan has no file target");
+    };
+    file.root_id.clone()
+}
+
+#[test]
+fn an_automatic_plan_gets_no_root_from_its_own_content() {
+    use svalnir_core::action::{ClientRole, Plan, TargetBinding, Trigger, TriggerClass};
+    use svalnir_core::id::{DecisionId, RuleId, RuleRevisionId};
+    use svalnir_core::rule::RuleRef;
+
+    use super::super::approved_roots_of;
+    use super::support::{cleanup_content, incident_id};
+
+    let bench = Bench::new();
+    bench.tree.file("a");
+    let mut content = cleanup_content(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::EvictRegenerableData,
+        &["a"],
+        bench.clock.now(),
+    );
+    for target in &mut content.targets {
+        let TargetBinding::File(file) = &mut target.binding else {
+            panic!("the plan has no file target");
+        };
+        file.rule = Some(RuleRef {
+            id: RuleId::new("svalnir.expired-temporary").unwrap(),
+            revision: RuleRevisionId::new("r1").unwrap(),
+        });
+        file.layout = Some("layout-v1".to_owned());
+    }
+    let manual = Plan::seal(content.clone()).unwrap();
+    content.trigger = Trigger {
+        class: TriggerClass::DiskPressure,
+        incident_id: Some(incident_id("incident_1")),
+        decision_id: Some(DecisionId::new("decision_1").unwrap()),
+    };
+    content.principal.role = ClientRole::Agent;
+    content.authority.action_grants = vec![bench.authority.memory_grant()];
+    let automatic = Plan::seal(content).unwrap();
+
+    let none = crate::executor::fs::ApprovedRoots::default();
+    // The manual plan: the root that its target binds.
+    let roots = approved_roots_of(&manual, &none).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert!(roots.root(&root_id_of(&manual)).is_some());
+    // The automatic plan: only the roots of the process, here none.
+    assert!(approved_roots_of(&automatic, &none).unwrap().is_empty());
+    let configured = bench.tree.roots();
+    assert_eq!(approved_roots_of(&automatic, &configured).unwrap().len(), 1);
+}
+
+#[test]
+fn the_recovery_probe_reads_below_the_root_of_the_plan_and_not_below_a_different_record() {
+    use svalnir_core::action::TargetBinding;
+    use svalnir_core::file::LosslessPath;
+
+    use super::super::{FileProbe, SystemProbe, TargetProbe as _};
+    use crate::executor::fs::ApprovedRoots;
+    use crate::platform::process::DarwinProcessSource;
+
+    let bench = Bench::new();
+    let file = bench.tree.file("a");
+    let target = TargetBinding::File(bench.tree.binding("a"));
+    // A process with no root record of its own reads below the root that
+    // the sealed plan binds.
+    let probe = SystemProbe::new(ApprovedRoots::default(), DarwinProcessSource::new());
+    assert_eq!(probe.file(&target), FileProbe::PlannedObject);
+    // A record with the root identity of the plan and a different
+    // directory gives no conclusion, also when that directory has no
+    // entry with the name.
+    let other = bench.tree.root.join("elsewhere");
+    std::fs::create_dir(&other).unwrap();
+    let mut record = bench
+        .tree
+        .roots()
+        .root(&root_id_of_binding(&target))
+        .cloned()
+        .unwrap();
+    record.path = LosslessPath::from_path(&other).unwrap();
+    record.object = super::support::object_of(&other);
+    let different = SystemProbe::new(
+        ApprovedRoots::new(vec![record]).unwrap(),
+        DarwinProcessSource::new(),
+    );
+    assert_eq!(different.file(&target), FileProbe::Unknown);
+    // The record of the root of the plan gives the same reading as no
+    // record.
+    let same = SystemProbe::new(bench.tree.roots(), DarwinProcessSource::new());
+    assert_eq!(same.file(&target), FileProbe::PlannedObject);
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(probe.file(&target), FileProbe::Absent);
+    assert_eq!(same.file(&target), FileProbe::Absent);
+    assert_eq!(different.file(&target), FileProbe::Unknown);
+}
+
+fn root_id_of_binding(target: &svalnir_core::action::TargetBinding) -> svalnir_core::id::RootId {
+    let svalnir_core::action::TargetBinding::File(file) = target else {
+        panic!("the target is not a file target");
+    };
+    file.root_id.clone()
+}

@@ -252,13 +252,16 @@ impl<S: ProcessSource + Debug> TargetProbe for SystemProbe<S> {
         let TargetBinding::File(file) = target else {
             return FileProbe::Unknown;
         };
-        let Some(root) = self.roots.root(&file.root_id) else {
-            return FileProbe::Unknown;
-        };
-        // A root record that is not the root of the plan gives no
-        // conclusion: the entry name below a different directory is not
-        // the target.
-        if root.path != file.root_path || root.object != file.root_object {
+        // A root record of this process that is not the root of the plan
+        // gives no conclusion: the entry name below a different directory
+        // is not the target. With no record of this process, the reading
+        // uses the root that the sealed plan binds: the reading changes
+        // nothing, and each comparison below is with the plan.
+        if self
+            .roots
+            .root(&file.root_id)
+            .is_some_and(|root| root.path != file.root_path || root.object != file.root_object)
+        {
             return FileProbe::Unknown;
         }
         // `st_dev` is a signed number, and the standard library gives it
@@ -270,9 +273,9 @@ impl<S: ProcessSource + Debug> TargetProbe for SystemProbe<S> {
         // The root must be the approved directory. A root that is absent
         // (a volume that is not mounted) or replaced gives no conclusion
         // about an entry below it.
-        let mut path = root.path.to_path_buf();
+        let mut path = file.root_path.to_path_buf();
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && is_object(&metadata, &root.object) => {}
+            Ok(metadata) if metadata.is_dir() && is_object(&metadata, &file.root_object) => {}
             _ => return FileProbe::Unknown,
         }
         // Each directory between the root and the entry must be a

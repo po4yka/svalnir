@@ -764,7 +764,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 stopped.set(Some(stop.stop_reason()));
                 Some(stop)
             };
-            self.filesystem.execute(&self.roots, admitted, &signal)
+            self.filesystem.execute(&active.roots, admitted, &signal)
         };
         let result: TargetResult = Self::filesystem_result(active, step, outcome)?;
         self.settle_called(active, step, vec![result], charge, charged, false)?;

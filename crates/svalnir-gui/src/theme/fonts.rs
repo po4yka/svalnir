@@ -8,19 +8,18 @@ pub const SANS_FAMILY: &str = "Geist";
 /// Family name of the bundled mono font.
 pub const MONO_FAMILY: &str = "Geist Mono";
 
-// TODO(npochaev): add the Geist and Geist Mono font files (SIL OFL 1.1, with
-// OFL.txt and a THIRD_PARTY_NOTICES.md entry) to `crates/svalnir-gui/assets/fonts/`
-// and list them here with `include_bytes!`, for example
-// `include_bytes!("../../assets/fonts/Geist-Regular.ttf")`. Until then the
-// client uses the system fonts.
-const FONTS: &[&[u8]] = &[];
+/// The bundled font files: Geist v1.9.2 static instances.
+const FONTS: &[&[u8]] = &[
+    include_bytes!("../../assets/fonts/Geist-Regular.ttf"),
+    include_bytes!("../../assets/fonts/Geist-Medium.ttf"),
+    include_bytes!("../../assets/fonts/Geist-SemiBold.ttf"),
+    include_bytes!("../../assets/fonts/GeistMono-Regular.ttf"),
+    include_bytes!("../../assets/fonts/GeistMono-Medium.ttf"),
+];
 
-/// Registers the bundled fonts with the text system. Does nothing while no
-/// font file is bundled.
+/// Registers the bundled fonts with the text system. When the registration
+/// fails, the system fonts apply.
 pub fn register(cx: &mut App) {
-    if FONTS.is_empty() {
-        return;
-    }
     let fonts: Vec<Cow<'static, [u8]>> = FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect();
     if let Err(error) = cx.text_system().add_fonts(fonts) {
         tracing::warn!(%error, "cannot register the bundled fonts; using system fonts");

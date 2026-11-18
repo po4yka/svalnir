@@ -4,7 +4,7 @@
 //! No test uses the Trash of the operating system: [`FakeTrash`] moves an
 //! entry to a directory of the fixture.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::AsFd as _;
@@ -369,6 +369,9 @@ enum TrashMode {
     ClaimMove,
     /// Moves the entry and gives no result.
     MoveAndLoseReply,
+    /// Moves the entry to another name than its own, as the Trash does
+    /// when an item with that name is already there.
+    MoveToAnotherName,
 }
 
 /// A Trash backend that moves an entry to a directory of the test.
@@ -436,6 +439,16 @@ impl TrashBackend for FakeTrash {
             TrashMode::MoveAndLoseReply => {
                 self.move_entry(&source).unwrap();
                 TrashReply::Unknown
+            }
+            TrashMode::MoveToAnotherName => {
+                let mut name: OsString = source.file_name().unwrap().to_os_string();
+                name.push(" 2");
+                let item: PathBuf = self.directory.join(name);
+                fs::rename(&source, &item).unwrap();
+                TrashReply::Moved {
+                    item_object: Some(object_of(&item)),
+                    item: Some(LosslessPath::from_path(&item).unwrap()),
+                }
             }
         }
     }
@@ -612,6 +625,121 @@ fn trash_moves_a_file_and_does_not_report_a_removal() {
     assert_eq!(outcome.work.removed_entries, EntryCount::ZERO);
     assert_eq!(outcome.work.removed_logical_bytes, Bytes::ZERO);
     assert_eq!(outcome.work.removed_allocated_bytes, Bytes::ZERO);
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_file_replaced_by_a_directory_is_skipped() {
+    for class in ActionClass::ALL
+        .into_iter()
+        .filter(ActionClass::is_filesystem)
+    {
+        let fixture = Fixture::new();
+        let file: PathBuf = fixture.root.join("data.bin");
+        fs::write(&file, b"data").unwrap();
+        let envelope = fixture.envelope(class, "data.bin");
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        fs::write(file.join("inner.bin"), b"inner").unwrap();
+
+        let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+        assert_skipped(&outcome, &ErrorFamily::Evidence, code::TARGET_TYPE_CHANGED);
+        assert!(file.join("inner.bin").exists());
+        fixture.assert_outside_unchanged();
+    }
+}
+
+#[test]
+fn a_hard_link_inside_a_tree_loses_one_name_and_keeps_its_content() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    let linked: PathBuf = tree.join("linked.bin");
+    let kept: PathBuf = fixture.root.join("kept.bin");
+    fs::write(&linked, [5_u8; 2048]).unwrap();
+    fs::hard_link(&linked, &kept).unwrap();
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_removed(&outcome);
+    assert!(!tree.exists());
+    assert_eq!(fs::read(&kept).unwrap(), vec![5_u8; 2048]);
+    assert_eq!(outcome.work.multiply_linked_entries, EntryCount::new(1));
+    // The removal of one of two names releases no storage of the file.
+    assert_eq!(outcome.work.removed_allocated_bytes, Bytes::ZERO);
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn trash_moves_a_symbolic_link_and_not_its_target() {
+    let fixture = Fixture::new();
+    let link: PathBuf = fixture.root.join("link");
+    symlink(fixture.outside.join("keep.txt"), &link).unwrap();
+    let envelope = fixture.envelope(ActionClass::MoveToTrash, "link");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_eq!(outcome.result.effect, TargetEffect::Trashed);
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert!(
+        fs::symlink_metadata(fixture.trash.join("link"))
+            .unwrap()
+            .is_symlink()
+    );
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn trash_moves_one_name_of_a_hard_linked_file() {
+    let fixture = Fixture::new();
+    let first: PathBuf = fixture.root.join("first.bin");
+    let second: PathBuf = fixture.root.join("second.bin");
+    fs::write(&first, [3_u8; 100]).unwrap();
+    fs::hard_link(&first, &second).unwrap();
+    let envelope = fixture.envelope(ActionClass::MoveToTrash, "first.bin");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_eq!(outcome.result.effect, TargetEffect::Trashed);
+    assert!(!first.exists());
+    assert_eq!(fs::read(&second).unwrap(), vec![3_u8; 100]);
+    assert_eq!(
+        fs::read(fixture.trash.join("first.bin")).unwrap().len(),
+        100
+    );
+    assert_eq!(outcome.work.removed_entries, EntryCount::ZERO);
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_trash_item_with_another_name_is_reported_with_its_own_path() {
+    let fixture = Fixture::new();
+    fs::write(fixture.trash.join("report.txt"), b"older").unwrap();
+    let file: PathBuf = fixture.root.join("report.txt");
+    fs::write(&file, b"newer").unwrap();
+    let envelope = fixture.envelope(ActionClass::MoveToTrash, "report.txt");
+    let executor = FsExecutor::new(
+        &fixture.config(),
+        Box::new(FakeTrash::new(&fixture.trash, TrashMode::MoveToAnotherName)),
+    )
+    .unwrap();
+
+    let outcome = run(&executor, &fixture.roots(), &envelope);
+
+    let item: PathBuf = fixture.trash.join("report.txt 2");
+    assert_eq!(outcome.result.effect, TargetEffect::Trashed);
+    assert_eq!(
+        outcome.result.evidence.trash_item,
+        Some(LosslessPath::from_path(&item).unwrap())
+    );
+    assert_eq!(fs::read(&item).unwrap(), b"newer");
+    // The item that was in the Trash stays as it was.
+    assert_eq!(
+        fs::read(fixture.trash.join("report.txt")).unwrap(),
+        b"older"
+    );
     fixture.assert_outside_unchanged();
 }
 
@@ -1569,6 +1697,43 @@ fn a_stop_at_the_batch_boundary_starts_no_target() {
         assert_eq!(aggregate(&results).unwrap(), OperationState::NoAction);
         fixture.assert_outside_unchanged();
     }
+}
+
+#[test]
+fn a_refused_target_does_not_stop_the_batch() {
+    if skip_for_superuser() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let parent: PathBuf = fixture.root.join("parent");
+    fs::create_dir(&parent).unwrap();
+    let mut envelopes: Vec<RequestEnvelope> = Vec::new();
+    for name in ["a.bin", "parent/b.bin", "c.bin"] {
+        fs::write(fixture.root.join(name), b"data").unwrap();
+        envelopes.push(fixture.envelope(ActionClass::EvictRegenerableData, name));
+    }
+    let receipt: DispatchReceipt = receipt();
+    let steps: Vec<AdmittedStep<'_>> = envelopes
+        .iter()
+        .map(|envelope| AdmittedStep::new(envelope, &receipt).unwrap())
+        .collect();
+    // The call for the second target is refused by the system.
+    let guard = lock_mode(&parent, 0o555, 0o755);
+
+    let outcome = fixture
+        .executor()
+        .execute_batch(&fixture.roots(), steps, &NeverStop);
+    drop(guard);
+
+    let results: Vec<TargetResult> = results_of(&outcome);
+    assert_eq!(outcome.stopped, None);
+    assert_eq!(results[0].effect, TargetEffect::Removed);
+    assert_eq!(results[1].effect, TargetEffect::Refused);
+    assert_eq!(results[2].effect, TargetEffect::Removed);
+    assert!(parent.join("b.bin").exists());
+    assert!(!fixture.root.join("c.bin").exists());
+    assert_eq!(aggregate(&results).unwrap(), OperationState::Partial);
+    fixture.assert_outside_unchanged();
 }
 
 #[test]

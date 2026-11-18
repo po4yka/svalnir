@@ -8,3 +8,4 @@ pub mod screens;
 pub mod shell;
 pub mod theme;
 pub mod ui;
+pub mod viz;

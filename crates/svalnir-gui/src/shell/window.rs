@@ -6,7 +6,7 @@ use crate::{
         model::{AgentState, Loadable},
         store::AppModel,
     },
-    screens::placeholder::Placeholder,
+    screens::{overview::OverviewScreen, placeholder::Placeholder},
     theme::tokens::{self, Tokens, to_hsla},
     ui::data_state::format_age,
 };
@@ -39,8 +39,14 @@ impl MainWindow {
         let screens: Vec<AnyView> = Screen::ALL
             .iter()
             .map(|&screen| {
-                let view: Entity<Placeholder> = cx.new(|_| Placeholder::new(screen));
-                AnyView::from(view)
+                if screen == Screen::Overview {
+                    let view: Entity<OverviewScreen> =
+                        cx.new(|cx| OverviewScreen::new(model.clone(), cx));
+                    AnyView::from(view)
+                } else {
+                    let view: Entity<Placeholder> = cx.new(|_| Placeholder::new(screen));
+                    AnyView::from(view)
+                }
             })
             .collect();
         let focus: FocusHandle = cx.focus_handle();

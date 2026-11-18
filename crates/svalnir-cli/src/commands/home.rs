@@ -15,26 +15,58 @@ use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 
 /// Whether `command` changes state. `scan` writes a scan record to the
 /// rebuildable catalog store only, and is a read-only command.
+///
+/// The match names each command and has no wildcard, so that a new
+/// command does not compile before it has a classification.
 fn changes_state(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Clean {
-            command: CleanCommand::Plan(_) | CleanCommand::Apply(_),
-        } | Command::Processes {
-            command: crate::cli::ProcessesCommand::Stop(_),
-        } | Command::Operations {
-            command: OperationsCommand::Cancel(_) | OperationsCommand::Acknowledge(_),
-        } | Command::Config {
-            command: crate::cli::ConfigCommand::Apply(_),
-        } | Command::Policy {
-            command: PolicyCommand::Enable(_) | PolicyCommand::Disable(_) | PolicyCommand::Rearm(_),
-        } | Command::Agent {
-            command: AgentCommand::Pause(_)
-                | AgentCommand::Resume
-                | AgentCommand::Install(_)
-                | AgentCommand::Uninstall(_),
-        }
-    )
+    use crate::cli::{ConfigCommand, MemoryCommand, ProcessesCommand, SwapCommand};
+    match command {
+        Command::Clean { command } => match command {
+            CleanCommand::Plan { .. } | CleanCommand::Apply { .. } => true,
+            CleanCommand::Show { .. } => false,
+        },
+        Command::Processes { command } => match command {
+            ProcessesCommand::Stop { .. } => true,
+            ProcessesCommand::Top { .. } | ProcessesCommand::Show { .. } => false,
+        },
+        Command::Operations { command } => match command {
+            OperationsCommand::Cancel { .. } | OperationsCommand::Acknowledge { .. } => true,
+            OperationsCommand::Show { .. } | OperationsCommand::Wait { .. } => false,
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::Apply { .. } => true,
+            ConfigCommand::Validate { .. } | ConfigCommand::Show { .. } => false,
+        },
+        Command::Policy { command } => match command {
+            PolicyCommand::Enable { .. }
+            | PolicyCommand::Disable { .. }
+            | PolicyCommand::Rearm { .. } => true,
+            PolicyCommand::List | PolicyCommand::Show { .. } | PolicyCommand::Simulate { .. } => {
+                false
+            }
+        },
+        Command::Agent { command } => match command {
+            AgentCommand::Pause { .. }
+            | AgentCommand::Resume
+            | AgentCommand::Install { .. }
+            | AgentCommand::Uninstall { .. } => true,
+            AgentCommand::Status => false,
+        },
+        Command::Memory { command } => match command {
+            MemoryCommand::Status => false,
+        },
+        Command::Swap { command } => match command {
+            SwapCommand::Status => false,
+        },
+        Command::Status
+        | Command::Scan { .. }
+        | Command::Report { .. }
+        | Command::Monitor { .. }
+        | Command::History { .. }
+        | Command::Doctor
+        | Command::Completions { .. }
+        | Command::License => false,
+    }
 }
 
 /// Refuses a command that changes state when `HOME` is not the home

@@ -135,7 +135,6 @@ pub struct DiskIncidentRecord {
     /// The number of plans in sequence that the coordinator refused. The
     /// wait before the next plan doubles with each one, to a maximum. The
     /// next admitted plan sets it to zero.
-    #[serde(default)]
     pub refusals: u32,
 }
 
@@ -171,7 +170,6 @@ pub struct MemoryIncidentRecord {
     /// The next admitted plan removes it.
     pub last_refusal: Option<String>,
     /// See [`DiskIncidentRecord::refusals`].
-    #[serde(default)]
     pub refusals: u32,
 }
 

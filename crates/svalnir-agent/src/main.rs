@@ -257,10 +257,19 @@ mod agent {
     /// it is the home directory of the account record of the effective
     /// user.
     fn home_directory() -> Result<LosslessPath, StartFailed> {
-        let home = verify_process_home()
-            .map_err(|error| StartFailed::Permanent(StartFailureReason::of_home(&error)))?;
-        LosslessPath::from_path(&home)
-            .map_err(|_| StartFailed::Transient("the home directory is not a usable path"))
+        let home = verify_process_home().map_err(|error| {
+            StartFailureReason::of_home(&error).map_or(
+                StartFailed::Transient("the account record of the effective user cannot be read"),
+                StartFailed::Permanent,
+            )
+        })?;
+        home_path(&home).map_err(StartFailed::Permanent)
+    }
+
+    /// The canonical home directory as a path of the journal. A path that
+    /// it refuses is refused again at each start with the same `HOME`.
+    pub(super) fn home_path(home: &Path) -> Result<LosslessPath, StartFailureReason> {
+        LosslessPath::from_path(home).map_err(|_| StartFailureReason::HomeNotResolvable)
     }
 
     fn settings(
@@ -562,7 +571,17 @@ mod agent {
 mod host_tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    use super::agent::{proposal, state_directory};
+    use super::agent::{home_path, proposal, state_directory};
+    use svalnir_agent::runtime::start_failure::StartFailureReason;
+
+    #[test]
+    fn a_home_directory_that_is_not_a_journal_path_is_a_permanent_error() {
+        assert_eq!(
+            home_path(std::path::Path::new("")),
+            Err(StartFailureReason::HomeNotResolvable)
+        );
+        assert!(home_path(std::path::Path::new("/Users/someone")).is_ok());
+    }
 
     #[test]
     fn a_new_state_directory_is_for_this_user_only() {

@@ -1759,3 +1759,22 @@ fn the_durable_resume_floor_applies_to_a_controller_that_did_not_see_the_pause()
     bench.run(30 * SECOND, critical(two_jobs));
     assert!(bench.state.outstanding.is_some());
 }
+
+#[test]
+fn a_stored_incident_record_with_no_refusal_count_is_not_read() {
+    // No compatibility default: a record of a different form is not read.
+    let mut bench = Bench::new();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &specs()));
+    let mut disk_value = serde_json::to_value(&bench.state.disk_incidents[0]).unwrap();
+    assert!(serde_json::from_value::<super::DiskIncidentRecord>(disk_value.clone()).is_ok());
+    disk_value.as_object_mut().unwrap().remove("refusals");
+    assert!(serde_json::from_value::<super::DiskIncidentRecord>(disk_value).is_err());
+
+    let mut bench = Bench::new();
+    bench.run(20 * SECOND, critical(two_jobs));
+    let record = bench.state.memory_incident.clone().unwrap();
+    let mut memory_value = serde_json::to_value(&record).unwrap();
+    assert!(serde_json::from_value::<super::MemoryIncidentRecord>(memory_value.clone()).is_ok());
+    memory_value.as_object_mut().unwrap().remove("refusals");
+    assert!(serde_json::from_value::<super::MemoryIncidentRecord>(memory_value).is_err());
+}

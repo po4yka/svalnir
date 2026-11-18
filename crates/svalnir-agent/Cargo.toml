@@ -44,8 +44,9 @@ objc2-foundation.workspace = true
 
 # `test-support`: a build for tests. The account record of the `HOME`
 # check can come from `SVALNIR_TEST_ACCOUNT_HOME`, so that a test starts
-# the binary with a temporary home directory. A build without the feature
-# has no code that reads that variable. No default feature enables it.
+# the binary with a temporary home directory. A build without the feature,
+# and a build with no debug assertions, has no code that reads that
+# variable. No default feature enables it.
 [features]
 test-support = []
 

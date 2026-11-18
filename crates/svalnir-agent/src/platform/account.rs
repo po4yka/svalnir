@@ -15,16 +15,18 @@
 //! volume, are a difference, because the protections use the path.
 //!
 //! [`PasswordDatabase`] reads the record with `getpwuid_r`, which is
-//! thread safe. A build with the feature `test-support` can take the home
-//! directory of the record from [`TEST_ACCOUNT_HOME_VARIABLE`] instead, so
-//! that a test starts the binary with a temporary home directory; a build
-//! without the feature has no code that reads that variable.
+//! thread safe. A debug build with the feature `test-support` can take the
+//! home directory of the record from [`TEST_ACCOUNT_HOME_VARIABLE`]
+//! instead, so that a test starts the binary with a temporary home
+//! directory; a build without the feature, and a build with no debug
+//! assertions (a release build), has no code that reads that variable.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The environment variable that replaces the home directory of the
-/// account record. Only a build with the feature `test-support` reads it.
+/// account record. Only a debug build with the feature `test-support`
+/// reads it.
 pub const TEST_ACCOUNT_HOME_VARIABLE: &str = "SVALNIR_TEST_ACCOUNT_HOME";
 
 /// The largest buffer for one account record, in bytes.
@@ -106,11 +108,11 @@ pub fn verify_home(home: Option<&Path>, account: &dyn AccountSource) -> Result<P
 }
 
 /// The account source of this process: [`PasswordDatabase`], or, in a
-/// build with the feature `test-support`, the path of
+/// debug build with the feature `test-support`, the path of
 /// [`TEST_ACCOUNT_HOME_VARIABLE`] when it is set.
 #[must_use]
 pub fn process_account_source() -> Box<dyn AccountSource> {
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", debug_assertions))]
     {
         if let Some(home) = std::env::var_os(TEST_ACCOUNT_HOME_VARIABLE) {
             return Box::new(FixedAccount(Some(PathBuf::from(home))));

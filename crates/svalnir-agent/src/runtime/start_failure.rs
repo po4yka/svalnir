@@ -132,14 +132,18 @@ impl StartFailureReason {
         }
     }
 
-    /// The reason of a `HOME` error. Each `HOME` error is permanent.
+    /// The reason of a `HOME` error that is permanent. `None`: the error
+    /// is transient. A lookup of the account record that failed, for
+    /// example because the directory service is not ready at login, can
+    /// pass at a later start; an account with no record cannot.
     #[must_use]
-    pub const fn of_home(error: &HomeError) -> Self {
+    pub const fn of_home(error: &HomeError) -> Option<Self> {
         match error {
-            HomeError::NotSet => Self::HomeNotSet,
-            HomeError::NoAccountRecord | HomeError::AccountLookup(_) => Self::HomeAccountUnknown,
-            HomeError::NotResolvable(_) => Self::HomeNotResolvable,
-            HomeError::Mismatch => Self::HomeMismatch,
+            HomeError::NotSet => Some(Self::HomeNotSet),
+            HomeError::NoAccountRecord => Some(Self::HomeAccountUnknown),
+            HomeError::AccountLookup(_) => None,
+            HomeError::NotResolvable(_) => Some(Self::HomeNotResolvable),
+            HomeError::Mismatch => Some(Self::HomeMismatch),
         }
     }
 
@@ -330,23 +334,27 @@ mod tests {
     }
 
     #[test]
-    fn each_home_error_is_permanent() {
+    fn each_home_error_but_a_failed_account_lookup_is_permanent() {
         for (error, code) in [
             (HomeError::NotSet, "home_not_set"),
             (HomeError::NoAccountRecord, "home_account_unknown"),
-            (
-                HomeError::AccountLookup(std::io::ErrorKind::Other.into()),
-                "home_account_unknown",
-            ),
             (
                 HomeError::NotResolvable(std::io::ErrorKind::NotFound.into()),
                 "home_not_resolvable",
             ),
             (HomeError::Mismatch, "home_mismatch"),
         ] {
-            assert_eq!(StartFailureReason::of_home(&error).code(), code);
+            assert_eq!(
+                StartFailureReason::of_home(&error).map(StartFailureReason::code),
+                Some(code)
+            );
             assert_eq!(error.code(), code);
         }
+        // A lookup that failed, for example because the directory service
+        // is not ready at login, can pass at a later start.
+        let lookup = HomeError::AccountLookup(std::io::ErrorKind::Other.into());
+        assert_eq!(StartFailureReason::of_home(&lookup), None);
+        assert_eq!(lookup.code(), "home_account_unknown");
     }
 
     #[test]

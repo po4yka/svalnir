@@ -88,6 +88,30 @@ fn pressure_refuses_the_scan(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_scan_requested_while_loading_ends_in_the_pressure_refusal(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let source = Arc::new(FixtureSource::new(FixtureScenario::Pressure));
+    let model = cx.new(|cx| AppModel::new(source, cx));
+    model.update(cx, |model, cx| {
+        model.start_scan(Path::new("/Users/fixture"), cx);
+    });
+    assert!(matches!(
+        cx.read(|cx| model.read(cx).scan.clone()),
+        ScanState::Idle
+    ));
+    cx.run_until_parked();
+    match cx.read(|cx| model.read(cx).scan.clone()) {
+        ScanState::Failed { reason, .. } => {
+            assert_eq!(
+                reason,
+                "A scan does not start while memory pressure is not normal."
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[gpui_kit::test]
 fn unavailable_shows_the_failure_reason(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let model = model_for(

@@ -163,6 +163,11 @@ pub(crate) fn journal_error(error: &OperationJournalError) -> ErrorBody {
             ErrorFamily::Recording,
             "the operation journal is of a newer build of Svalnir; this build does not change it",
         ),
+        OperationJournalError::SchemaNotCurrent { .. } => (
+            "journal_not_current",
+            ErrorFamily::Recording,
+            "the operation journal is not of the current version; this build does not change it",
+        ),
         OperationJournalError::NotAJournal => (
             "journal_not_recognized",
             ErrorFamily::Recording,

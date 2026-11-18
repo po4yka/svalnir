@@ -61,24 +61,40 @@ pub fn pressure_pill(pressure: &Measured<PressureLevel>) -> (&'static str, Tone)
     }
 }
 
-/// The pill text, tone, and sentence of an agent state.
+/// The pill text, tone, and sentence of an agent state at `now`.
 #[must_use]
-pub fn agent_summary(state: AgentState) -> (&'static str, Tone, &'static str) {
+pub fn agent_summary(state: &AgentState, now: SystemTime) -> (&'static str, Tone, String) {
+    let age =
+        |time: SystemTime| -> String { format_age(now.duration_since(time).unwrap_or_default()) };
     match state {
-        AgentState::Running | AgentState::ClientCoordinator => (
-            "Running",
+        AgentState::Reporting { since } => (
+            "Reporting",
             Tone::Brand,
-            "A coordinator holds the lock on the state directory.",
+            format!("The agent wrote its status {} ago.", age(*since)),
         ),
-        AgentState::NotRunning | AgentState::NoJournal => (
+        AgentState::Silent { last } => (
+            "Not reporting",
+            Tone::Warning,
+            format!(
+                "The last status of the agent is {} old. It is not known whether an agent runs.",
+                age(*last)
+            ),
+        ),
+        AgentState::NoRecord => (
             "Not running",
             Tone::Warning,
-            "No automatic protection is active. This window measures the host itself.",
+            "The journal has no status of an agent. No automatic protection is active.".to_owned(),
         ),
-        AgentState::Unknown => (
+        AgentState::NoJournal => (
+            "Not running",
+            Tone::Warning,
+            "No journal exists. No automatic protection is active. This window measures the host itself."
+                .to_owned(),
+        ),
+        AgentState::Unknown(reason) => (
             "Unknown",
             Tone::Neutral,
-            "The coordinator lock cannot be read.",
+            format!("The status of the agent cannot be read: {reason}."),
         ),
     }
 }
@@ -303,7 +319,7 @@ fn agent_card(agent: &Loadable<AgentSnapshot>, tokens: &Tokens) -> AnyElement {
         Loadable::Loading => skeleton_value(),
         Loadable::Unavailable(reason) => unavailable_body("agent-value", reason, tokens),
         Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => {
-            let (text, tone, sentence) = agent_summary(snapshot.state);
+            let (text, tone, sentence) = agent_summary(&snapshot.state, SystemTime::now());
             header = header.aside(StatusPill::new(text, tone).id("agent-pill"));
             let stale: bool = matches!(agent, Loadable::Stale(_));
             v_flex()
@@ -548,8 +564,21 @@ mod tests {
     }
 
     #[test]
-    fn absent_agent_is_not_running() {
-        assert_eq!(agent_summary(AgentState::NoJournal).0, "Not running");
-        assert_eq!(agent_summary(AgentState::Running).0, "Running");
+    fn agent_summary_names_the_evidence() {
+        let now: SystemTime = SystemTime::now();
+        assert_eq!(agent_summary(&AgentState::NoJournal, now).0, "Not running");
+        assert_eq!(agent_summary(&AgentState::NoRecord, now).0, "Not running");
+        let (text, _, sentence) = agent_summary(&AgentState::Reporting { since: now }, now);
+        assert_eq!(text, "Reporting");
+        assert!(
+            sentence.starts_with("The agent wrote its status "),
+            "{sentence}"
+        );
+        let (text, _, sentence) = agent_summary(&AgentState::Silent { last: now }, now);
+        assert_eq!(text, "Not reporting");
+        assert!(
+            sentence.contains("not known whether an agent runs"),
+            "{sentence}"
+        );
     }
 }

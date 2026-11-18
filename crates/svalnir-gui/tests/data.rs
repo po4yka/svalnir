@@ -58,7 +58,7 @@ fn fixture_shows_status_and_banner(cx: &mut TestAppContext) {
     let (handle, _view) = open(FixtureScenario::Healthy, cx);
     let status = label(handle, "status-line", cx).expect("status line");
     assert!(status.contains("fixture"), "{status}");
-    assert!(status.contains("agent running"), "{status}");
+    assert!(status.contains("agent reporting"), "{status}");
     let banner = label(handle, "data-banner", cx).expect("fixture banner");
     assert!(banner.contains("Fixture data: healthy"), "{banner}");
 }
@@ -99,4 +99,31 @@ fn live_agent_without_journal_is_no_journal() {
     let source = LiveSource::new(Some(directory.path().to_path_buf()));
     assert_eq!(source.agent().state, AgentState::NoJournal);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn live_reads_a_zero_byte_journal_without_creating_a_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    std::fs::write(directory.path().join("operations.sqlite"), b"").expect("journal file");
+    let list = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = list();
+    let source = LiveSource::new(Some(directory.path().to_path_buf()));
+    assert!(matches!(source.agent().state, AgentState::Unknown(_)));
+    let service = source.service();
+    assert_eq!(service.problems.len(), 1);
+    assert!(service.journal_present);
+    assert_eq!(list(), before);
+    assert_eq!(
+        std::fs::metadata(directory.path().join("operations.sqlite"))
+            .unwrap()
+            .len(),
+        0
+    );
 }

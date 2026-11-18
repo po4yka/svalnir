@@ -15,10 +15,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use svalnir_agent::{
-    journal::JournalOptions,
-    observe::{self, CoordinatorPresence, DiskReading, Host},
+    journal::AgentRecord,
+    observe::{self, DiskReading, Host},
     platform::volume,
-    runtime::journal_path,
+    runtime::{AgentStatus, journal_path},
     scan::{
         CancellationToken, DirectoryRecord, EntryKind, EntryRecord, RegionCause, ScanCompletion,
         ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, WallScanClock, run_scan,
@@ -177,9 +177,7 @@ impl DataSource for LiveSource {
         };
         let opened = match &self.state_directory {
             None => Ok(None),
-            Some(directory) => {
-                observe::open_existing_journal(&journal_path(directory), &JournalOptions::default())
-            }
+            Some(directory) => observe::open_existing_journal_read_only(&journal_path(directory)),
         };
         let journal = match opened {
             Ok(Some(journal)) => journal,
@@ -259,7 +257,8 @@ impl DataSource for LiveSource {
             other => other,
         }
         .map_err(|error| format!("the scan did not run: {error}"))?;
-        Ok(summarize(root, &result, observer.into_children()))
+        let (children, unsized_children) = observer.into_children();
+        Ok(summarize(root, &result, children, unsized_children))
     }
 
     fn default_scan_root(&self) -> Option<PathBuf> {
@@ -282,6 +281,8 @@ struct ChildObserver<'a> {
     entries: u64,
     logical: u64,
     allocated: u64,
+    /// Direct children with neither a logical nor an allocated size.
+    unsized_children: u64,
     current: Option<PathBuf>,
     last_report: Option<Instant>,
     progress: &'a dyn Fn(ScanProgress),
@@ -295,14 +296,16 @@ impl<'a> ChildObserver<'a> {
             entries: 0,
             logical: 0,
             allocated: 0,
+            unsized_children: 0,
             current: None,
             last_report: None,
             progress,
         }
     }
 
-    fn into_children(self) -> Vec<ChildSize> {
-        self.children.into_values().collect()
+    /// The sized children and the number of direct children with no size.
+    fn into_children(self) -> (Vec<ChildSize>, u64) {
+        (self.children.into_values().collect(), self.unsized_children)
     }
 
     fn child_name(&self, path: &Path) -> Option<String> {
@@ -352,6 +355,13 @@ impl ScanObserver for ChildObserver<'_> {
         if entry.kind != EntryKind::Directory
             && let Some(name) = self.child_name(entry.path)
         {
+            // A child with no size (a socket, a FIFO) is not a zero-byte
+            // child: it is counted as a gap.
+            if entry.logical_bytes.is_none() && entry.allocated_bytes.is_none() {
+                self.unsized_children = self.unsized_children.saturating_add(1);
+                self.report();
+                return;
+            }
             self.children.insert(
                 name.clone(),
                 ChildSize {
@@ -397,7 +407,12 @@ const fn cause_text(cause: RegionCause) -> &'static str {
     }
 }
 
-fn summarize(root: &Path, result: &ScanResult, children: Vec<ChildSize>) -> ScanSummary {
+fn summarize(
+    root: &Path,
+    result: &ScanResult,
+    children: Vec<ChildSize>,
+    unsized_children: u64,
+) -> ScanSummary {
     let mut counts: Vec<(RegionCause, usize)> = Vec::new();
     for region in &result.regions {
         match counts.iter_mut().find(|(cause, _)| *cause == region.cause) {
@@ -419,6 +434,12 @@ fn summarize(root: &Path, result: &ScanResult, children: Vec<ChildSize>) -> Scan
             count: usize::try_from(omitted).unwrap_or(usize::MAX),
         });
     }
+    if unsized_children > 0 {
+        gaps.push(GapRow {
+            cause_text: "size not known".to_owned(),
+            count: usize::try_from(unsized_children).unwrap_or(usize::MAX),
+        });
+    }
     let ended: ScanEnd = match result.completion {
         ScanCompletion::Finished => ScanEnd::Finished,
         ScanCompletion::Cancelled => ScanEnd::Cancelled,
@@ -438,14 +459,34 @@ fn summarize(root: &Path, result: &ScanResult, children: Vec<ChildSize>) -> Scan
     }
 }
 
-fn agent_state(journal: &Path) -> AgentState {
-    if !journal.exists() {
-        return AgentState::NoJournal;
-    }
-    match observe::coordinator_presence(journal) {
-        CoordinatorPresence::Running => AgentState::Running,
-        CoordinatorPresence::NotRunning => AgentState::NotRunning,
-        CoordinatorPresence::Unknown => AgentState::Unknown,
+/// Three status intervals of the agent (the agent rewrites its status
+/// record at least every 30 s: `status_interval` in `svalnir-agent`
+/// `main.rs`).
+const STATUS_FRESH: Duration = Duration::from_secs(90);
+
+/// Reads the status record of the agent through the read-only journal. The
+/// coordinator lock is not read: a lock probe can make a starting agent exit.
+fn agent_state(journal_file: &Path) -> AgentState {
+    let journal = match observe::open_existing_journal_read_only(journal_file) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return AgentState::NoJournal,
+        Err(error) => return AgentState::Unknown(format!("the journal cannot be read: {error}")),
+    };
+    match journal.agent_record::<AgentStatus>(AgentRecord::Status) {
+        Ok(None) => AgentState::NoRecord,
+        Ok(Some(stored)) => {
+            let written: SystemTime = system_time(stored.record.written_at);
+            let fresh: bool = SystemTime::now()
+                .duration_since(written)
+                .is_ok_and(|age| age < STATUS_FRESH)
+                || written > SystemTime::now();
+            if fresh {
+                AgentState::Reporting { since: written }
+            } else {
+                AgentState::Silent { last: written }
+            }
+        }
+        Err(error) => AgentState::Unknown(format!("the status record cannot be read: {error}")),
     }
 }
 
@@ -463,5 +504,47 @@ fn system_time(time: WallTime) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(seconds.unsigned_abs()) + nanos
     } else {
         UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs()) + nanos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber};
+
+    fn record(
+        path: &Path,
+        kind: EntryKind,
+        logical: Option<u64>,
+        allocated: Option<u64>,
+    ) -> EntryRecord<'_> {
+        EntryRecord {
+            path,
+            kind,
+            depth: 1,
+            logical_bytes: logical.map(Bytes::new),
+            allocated_bytes: allocated.map(Bytes::new),
+            link_count: 1,
+            object: FileObjectEvidence {
+                device: DeviceNumber::new(1),
+                inode: InodeNumber::new(1),
+            },
+            counted_in_totals: true,
+        }
+    }
+
+    #[test]
+    fn a_child_with_no_size_is_a_gap_and_not_a_zero_byte_child() {
+        let progress = |_: ScanProgress| {};
+        let root = Path::new("/r");
+        let mut observer = ChildObserver::new(root, &progress);
+        let socket = PathBuf::from("/r/socket");
+        let file = PathBuf::from("/r/file");
+        observer.entry_measured(&record(&socket, EntryKind::Other, None, None));
+        observer.entry_measured(&record(&file, EntryKind::File, Some(10), Some(4096)));
+        let (children, unsized_children) = observer.into_children();
+        assert_eq!(unsized_children, 1);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "file");
     }
 }

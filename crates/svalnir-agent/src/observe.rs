@@ -251,6 +251,29 @@ pub fn open_existing_journal(
         .map_err(ExistingJournalError::Open)
 }
 
+/// Opens the journal for reads only when its file exists, by the rules of
+/// [`open_existing_journal`]. A file of zero bytes is `NotAJournal`. The
+/// open does not migrate and does not write; see
+/// [`OperationJournal::open_read_only`].
+///
+/// # Errors
+///
+/// Returns [`ExistingJournalError`] when the path is not a regular file or
+/// is empty, cannot be inspected, or cannot be opened as a current journal.
+pub fn open_existing_journal_read_only(
+    path: &Path,
+) -> Result<Option<OperationJournal>, ExistingJournalError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+        Ok(_) => return Err(ExistingJournalError::NotAJournal),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ExistingJournalError::Inspect),
+    }
+    OperationJournal::open_read_only(path)
+        .map(Some)
+        .map_err(ExistingJournalError::Open)
+}
+
 /// The authority record of the journal with its record revision.
 #[derive(Debug, Clone)]
 pub struct StoredAuthority {

@@ -495,9 +495,13 @@ impl Render for StorageScreen {
         let tokens: &Tokens = Tokens::for_dark(dark);
         let mono: SharedString = cx.theme().mono_font_family.clone();
         let width: f32 = (f32::from(window.viewport_size().width) - CHROME_WIDTH).max(0.0);
-        let (host, scan): (Loadable<HostSnapshot>, ScanState) = {
+        let (host, scan, notice): (Loadable<HostSnapshot>, ScanState, Option<String>) = {
             let model: &AppModel = self.model.read(cx);
-            (model.host.clone(), model.scan.clone())
+            (
+                model.host.clone(),
+                model.scan.clone(),
+                model.scan_notice.clone(),
+            )
         };
         let root: Option<PathBuf> = self.root(cx);
         let shown_root: String = match &scan {
@@ -559,7 +563,11 @@ impl Render for StorageScreen {
             .child(volume_card(&host, tokens))
             .child(card(
                 header,
-                v_flex().gap(px(12.0)).child(metric_caption).child(body),
+                v_flex()
+                    .gap(px(12.0))
+                    .children(notice.map(|text| caption("scan-notice", text, tokens)))
+                    .child(metric_caption)
+                    .child(body),
             ))
     }
 }

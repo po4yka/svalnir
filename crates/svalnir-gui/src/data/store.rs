@@ -20,18 +20,36 @@ const PROGRESS_TICK: Duration = Duration::from_millis(100);
 /// The reason that a scan does not start under memory pressure.
 const PRESSURE_REFUSAL: &str = "A scan does not start while memory pressure is not normal.";
 
+/// The refusal while the pressure reading is stale.
+const STALE_REFUSAL: &str = "The memory pressure reading is stale. Refresh, then scan again.";
+
+/// The decision of the scan gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanGate {
+    /// The scan may start now.
+    Start,
+    /// The first host reading is not here; the request waits for it.
+    Wait,
+    /// The scan is refused; the text is the sentence for the user.
+    Refuse(&'static str),
+}
+
 /// Whether a scan may start. A scan does not start while the memory
-/// pressure is Warning or Critical; an unavailable pressure does not block.
-///
-/// # Errors
-///
-/// Returns the sentence for the user when the scan is refused.
-pub fn scan_allowed(host: &Loadable<HostSnapshot>) -> Result<(), &'static str> {
-    match host.value().map(|snapshot| &snapshot.pressure) {
-        Some(Measured::Value(PressureLevel::Warning | PressureLevel::Critical)) => {
-            Err(PRESSURE_REFUSAL)
-        }
-        _ => Ok(()),
+/// pressure is Warning or Critical, or while the reading is `Stale`. While
+/// the host is `Loading` the request waits. An `Unavailable` host and an
+/// unavailable pressure value do not block: a failed query is not a refusal.
+#[must_use]
+pub fn scan_allowed(host: &Loadable<HostSnapshot>) -> ScanGate {
+    match host {
+        Loadable::Loading => ScanGate::Wait,
+        Loadable::Unavailable(_) => ScanGate::Start,
+        Loadable::Stale(_) => ScanGate::Refuse(STALE_REFUSAL),
+        Loadable::Ready(snapshot) => match &snapshot.pressure {
+            Measured::Value(PressureLevel::Warning | PressureLevel::Critical) => {
+                ScanGate::Refuse(PRESSURE_REFUSAL)
+            }
+            _ => ScanGate::Start,
+        },
     }
 }
 
@@ -80,6 +98,9 @@ pub struct AppModel {
     pub service: Loadable<ServiceSnapshot>,
     /// The state of the scan of the Storage screen.
     pub scan: ScanState,
+    /// A refusal that does not replace a finished result.
+    pub scan_notice: Option<String>,
+    pending_scan: Option<PathBuf>,
     scan_cancel: Option<CancellationToken>,
     scan_task: Option<Task<()>>,
     scan_ticker: Option<Task<()>>,
@@ -120,6 +141,8 @@ impl AppModel {
             agent: Loadable::Loading,
             service: Loadable::Loading,
             scan: ScanState::Idle,
+            scan_notice: None,
+            pending_scan: None,
             scan_cancel: None,
             scan_task: None,
             scan_ticker: None,
@@ -144,14 +167,27 @@ impl AppModel {
         if matches!(self.scan, ScanState::Running { .. }) {
             return;
         }
-        if let Err(reason) = scan_allowed(&self.host) {
-            self.scan = ScanState::Failed {
-                root: root.to_path_buf(),
-                reason: reason.to_owned(),
-            };
-            cx.notify();
-            return;
+        match scan_allowed(&self.host) {
+            ScanGate::Start => {}
+            ScanGate::Wait => {
+                self.pending_scan = Some(root.to_path_buf());
+                return;
+            }
+            ScanGate::Refuse(reason) => {
+                if matches!(self.scan, ScanState::Done(_)) {
+                    self.scan_notice = Some(reason.to_owned());
+                } else {
+                    self.scan = ScanState::Failed {
+                        root: root.to_path_buf(),
+                        reason: reason.to_owned(),
+                    };
+                }
+                cx.notify();
+                return;
+            }
         }
+        self.pending_scan = None;
+        self.scan_notice = None;
         let cancel: CancellationToken = CancellationToken::new();
         self.scan_cancel = Some(cancel.clone());
         self.scan = ScanState::Running {
@@ -274,6 +310,9 @@ impl AppModel {
                         };
                         model.last_refresh = Some(SystemTime::now());
                         model.mark_stale();
+                        if let Some(root) = model.pending_scan.take() {
+                            model.start_scan(&root, cx);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -363,11 +402,22 @@ mod tests {
                 source: "test",
             }))
         };
-        assert!(scan_allowed(&snapshot(Measured::Value(PressureLevel::Normal))).is_ok());
-        assert!(scan_allowed(&snapshot(Measured::Unavailable("x".into()))).is_ok());
-        assert!(scan_allowed(&snapshot(Measured::Value(PressureLevel::Warning))).is_err());
-        assert!(scan_allowed(&snapshot(Measured::Value(PressureLevel::Critical))).is_err());
-        assert!(scan_allowed(&Loadable::Loading).is_ok());
+        let start = |host: &Loadable<HostSnapshot>| scan_allowed(host) == ScanGate::Start;
+        let refused =
+            |host: &Loadable<HostSnapshot>| matches!(scan_allowed(host), ScanGate::Refuse(_));
+        assert!(start(&snapshot(Measured::Value(PressureLevel::Normal))));
+        assert!(start(&snapshot(Measured::Unavailable("x".into()))));
+        assert!(refused(&snapshot(Measured::Value(PressureLevel::Warning))));
+        assert!(refused(&snapshot(Measured::Value(PressureLevel::Critical))));
+        assert_eq!(scan_allowed(&Loadable::Loading), ScanGate::Wait);
+        assert!(start(&Loadable::Unavailable("x".into())));
+        let Loadable::Ready(stale) = snapshot(Measured::Value(PressureLevel::Normal)) else {
+            return;
+        };
+        assert_eq!(
+            scan_allowed(&Loadable::Stale(stale)),
+            ScanGate::Refuse(STALE_REFUSAL)
+        );
     }
 
     #[test]

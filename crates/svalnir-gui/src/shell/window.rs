@@ -106,11 +106,11 @@ impl MainWindow {
             Loadable::Ready(snapshot) | Loadable::Stale(snapshot)
                 if matches!(
                     snapshot.state,
-                    AgentState::NotRunning | AgentState::NoJournal
+                    AgentState::NoJournal | AgentState::NoRecord | AgentState::Silent { .. }
                 ) =>
             {
                 Some(
-                    "The agent is not running. Values come from this window's own measurement; no automatic protection is active."
+                    "No recent status of an agent. Values come from this window's own measurement; no automatic protection is known to be active."
                         .to_owned(),
                 )
             }

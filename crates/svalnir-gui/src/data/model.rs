@@ -79,45 +79,54 @@ pub struct HostSnapshot {
     pub source: &'static str,
 }
 
-/// The state of the coordinator, as far as this window can tell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the journal records about the agent.
+///
+/// The GUI does not read the coordinator lock, because a lock probe can make
+/// a starting agent exit. A recent status record is evidence of a recent
+/// agent, not proof that one runs now.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentState {
-    /// A process holds the coordinator lock. The lock does not tell an agent
-    /// from a client that runs a request, so this state is a lower bound on
-    /// "the agent runs".
-    Running,
-    /// A client process runs a request as a transient coordinator.
-    ClientCoordinator,
-    /// No process holds the lock.
-    NotRunning,
-    /// The lock cannot be read.
-    Unknown,
     /// The journal does not exist, so no agent ran on this state directory.
     NoJournal,
+    /// A status record exists and its `written_at` is younger than three
+    /// status intervals of the agent (3 x 30 s).
+    Reporting {
+        /// When the agent wrote the status record.
+        since: SystemTime,
+    },
+    /// A status record exists and is older than three status intervals.
+    Silent {
+        /// When the agent wrote the last status record.
+        last: SystemTime,
+    },
+    /// The journal exists and has no status record.
+    NoRecord,
+    /// The records cannot be read; the text is the reason.
+    Unknown(String),
 }
 
 impl AgentState {
     /// The label for the status line.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
-            Self::Running => "running",
-            Self::ClientCoordinator => "client coordinator",
-            Self::NotRunning => "not running",
-            Self::Unknown => "unknown",
             Self::NoJournal => "no journal",
+            Self::Reporting { .. } => "reporting",
+            Self::Silent { .. } => "silent",
+            Self::NoRecord => "no status",
+            Self::Unknown(_) => "unknown",
         }
     }
 
-    /// Whether the agent is known to be absent.
+    /// Whether the records give no sign of a recent agent.
     #[must_use]
-    pub const fn is_absent(self) -> bool {
-        matches!(self, Self::NotRunning | Self::NoJournal)
+    pub const fn is_absent(&self) -> bool {
+        matches!(self, Self::NoJournal | Self::NoRecord | Self::Silent { .. })
     }
 }
 
 /// The agent state at one time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSnapshot {
     /// The state.
     pub state: AgentState,

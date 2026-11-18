@@ -123,7 +123,9 @@ impl DataSource for FixtureSource {
     fn agent(&self) -> AgentSnapshot {
         let state: AgentState = match self.scenario {
             FixtureScenario::AgentAbsent => AgentState::NoJournal,
-            _ => AgentState::Running,
+            _ => AgentState::Reporting {
+                since: SystemTime::now(),
+            },
         };
         AgentSnapshot {
             state,

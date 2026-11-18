@@ -273,6 +273,12 @@ Apple documents the default DerivedData location as `~/Library/Developer/Xcode/D
 
 **Admission:** The supported activity protocol must cover Xcode, command-line builds, indexing, tests, and relevant shared consumers. An old directory or absent IDE window is insufficient. Shared module or compilation caches are not implicitly owned by one project. Producer versions and concrete generated subsets remain unvalidated until recorded in the adapter's support matrix.
 
+The evidence that no producer process runs is a process inventory of the caller, with the monotonic time of the inventory. The rule compares that time with the time of the assessment of each unit. An inventory that is older than the evidence expiry of the activity protocol, that has a time after the assessment, or that cannot be compared with a monotonic time does not show inactivity: the activity of the unit is unknown, and the unit is not a candidate. Evidence that a producer process runs blocks a unit at each age.
+
+The project that owns a unit comes from the `WorkspacePath` value of the `info.plist` file of its DerivedData directory. The user can write that file, so the value is attribution evidence of the same user and not a protected record: a same-user process that changes it can change which project the rule examines. It cannot move a unit out of the verified root, and it gives no access to the data of a different user.
+
+The children of a unit that the rule accepts are not decided. The rule preserves the names of the candidate paragraph where it recognizes them, and it has no reviewed list of the content that a unit of a supported layout can have: a configuration name below `Build/Products` is free text, and the content of the intermediates and of the index differs between producer versions. A unit with content of the user that the rule does not recognize would thus be removed whole. This is an open decision of the project owner, to be made with promotion evidence from a real producer installation; the layout stays `proposed` until then, so no eviction uses it.
+
 **Action and charge:** User-scope bounded eviction of the fixed eligible set, never a root override. Use conservative per-object `work_bytes` and entry limits; large indivisible outputs do not bypass batch limits.
 
 **Impact:** The user accepts indexing/build latency and possible restoration of dependencies only where the approved subset requires it. Missing sources or uncertain rebuild prerequisites disqualify a candidate. First-release implementation must establish a useful tested subset rather than claim universal DerivedData safety.
@@ -329,6 +335,8 @@ A dry run performs no deletion, Trash movement, producer garbage collection, per
 Prepared plans expire and require fresh execution checks. They do not lock the filesystem. A later scan must not replace a rejected target silently while keeping the original plan ID.
 
 Explain skipped candidates with stable reason categories, not only free-form errors: unsupported version/layout, protected data, unknown ownership, active producer, missing quiescence, unsafe namespace, stale identity, unknown link count, unknown work charge, budget exhaustion, missing access, missing authorization, or unavailable journal.
+
+Two conditions have no category of their own. A lifecycle record or a producer record that is absent, is not a plain file, is too large, or cannot be decoded is in the category unsupported version/layout. A name below a unit that is not valid UTF-8 is in the category protected data: a rule preserves content that it cannot classify, and the unit is skipped. Process evidence that is older than its expiry is in the category missing quiescence.
 
 ## 14. Outcomes, failure, and backoff
 

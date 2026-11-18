@@ -113,6 +113,8 @@ Hard OS and control-plane protections are never overridden. Generic personal-dat
 
 `PolicyRevision` describes behavior; `ActionGrant` authorizes product actions; `PrivilegeGrant` limits helper authority independently. Same-user state is not a protected human-consent channel. The helper must retain its own constraints even when a legitimate signed client submits an undesirable request.
 
+An automatic plan is admitted only with the incident allowance that the controller of the agent holds for the incident of the plan. The allowance is not in the journal and not in a request. Thus an automatic plan that arrives through the request queue of the journal, or that a client applies from a stored plan, has no allowance and is refused with `incident_allowance_missing` (family `limits`). A stored automatic plan gives a client no way to use the standing authorization of a guard.
+
 Failed admission returns reasons and issues no external mutation. Transient failure may justify preparing or admitting a later operation; it never converts an expired plan into current authority.
 
 ## 5. Budgets and resource leases
@@ -129,7 +131,7 @@ Budget consumption and dispatch consumption must be committed consistently withi
 
 Acquire conflict leases for the application generation, cleanup root, and shared capacity domain as appropriate. The host broker coordinates cooperating Svalnir sessions. Leases do not prevent external writers or application relaunch.
 
-A lease names one conflict domain: a process generation of an application, a cleanup root, a shared capacity domain, or a volume with exclusive free space.
+A lease names one conflict domain: a process generation of an application, a cleanup root, a shared capacity domain, or a volume with exclusive free space. A request envelope of an application target has one lease for the process generation of each member; a lease for one member does not cover the envelope.
 
 Budget arithmetic is checked. A reservation, a consumption, or a release that does not fit or that overflows is an error and changes no allowance. A budget change applies at each level (batch, pass, rule, incident, grant, executor) or at no level.
 
@@ -167,6 +169,8 @@ A state is reported with two more values. The dispatch state is `not_submitted`,
 
 A step with a result state has a minimum of one target result, and the state is the aggregate of those results (section 9). No component writes a result state directly.
 
+The journal records an intent only for a request envelope that agrees with the stored plan of the operation: the target binding, the principal, the trigger, the authority, the executor, and the escalation and grace limits. An envelope that differs in one of them is a conflict and records nothing. A rejection is recorded only for the digest of the stored plan.
+
 After recording intent and before the external call, consume the step and its applicable budget charge. Immediately before submission, check cancellation, revisions, grant generation, deadline, target identity, protection state, and trigger continuity again.
 
 An open incident does not alone authorize the next step. A latched disk incident may continue bounded eviction toward its recovery threshold while its fresh continuation predicate holds. Memory steps, including force escalation, require the current qualified critical-pressure or application-stop predicate; remaining in an incident's hysteresis band is insufficient. Evidence gaps or wake require requalification without resetting consumed budgets. Plan expiry or a deadline blocks a later step; waiting for graceful exit does not extend either.
@@ -203,6 +207,8 @@ This manual-only class requires an immutable plan that identifies the exact sele
 
 A selected directory must be represented by a bounded, reviewed enumeration protocol. The selection does not authorize newly appearing entries, traversal outside the selected scope, or indiscriminate recursive deletion. Unsupported application-managed data may still require a dedicated lifecycle adapter. Neither an automatic incident nor a failed Trash operation can select this class.
 
+A file target is one unit: one call removes it, and the executor reads no stop condition during that call. A directory target is one target of the plan and more than one unit of execution: each entry below it is one call. The executor reads the stop conditions (a stop fence, a pause, a changed policy revision or grant, an expired lease or deadline) before each directory below the target and at intervals between the other entries. After a stop it issues no further call. The entries that were removed stay removed, the directory of the target stays, and the result of the target is `UnknownOutcome` with the stop reason of the condition and with the counts of the removed entries and bytes. A stop before the first call of the target gives `Skipped`. The removal of a directory target is thus not atomic, and a stop inside it leaves a part of the tree.
+
 ### EvictRegenerableData
 
 The rule defines the smallest supported candidate and executable unit. A folder candidate is not permission to run an unrestricted recursive deletion that discovers new children during execution.
@@ -211,7 +217,7 @@ Enumerate bounded units under the approved protocol; revalidate before each unit
 
 Record each confirmed removal, skipped item, or uncertain effect. Successful unlink removes a directory entry; storage reclamation can wait for open references. [Apple documents this behavior][unlink]. Capacity measurements remain separate.
 
-Stop before the next unit if the deadline, policy, activity evidence, namespace condition, lease, or budget is invalid. Earlier removals remain performed; the contract provides no transactional rollback.
+Stop before the next unit if the deadline, policy, activity evidence, namespace condition, lease, or budget is invalid. Earlier removals remain performed; the contract provides no transactional rollback. A unit that is a directory is removed entry by entry, with the stop rule of a directory target of `DeleteSelectedFiles`.
 
 ## 8. Application intervention
 
@@ -247,7 +253,9 @@ The normal sequence is:
 
 In the `force_after_grace` strategy, a force step follows only a graceful step that was submitted and that left the target running: the state of the graceful step is `Incomplete`, `Partial`, or `Failed`, and its dispatch state is `submitted`. A graceful step that is `Completed`, `NoAction`, `UnknownOutcome`, not settled, or `Failed` with no submitted call permits no force step.
 
-Reconnection, unrelated events, or repeated queries must not restart the grace period. An immediate-force disposable-job policy skips the graceful step only when that consequence and target are separately authorized.
+Reconnection, unrelated events, or repeated queries must not restart the grace period. A sleep of the host is the one event that starts it again: the time of a sleep gave the application no time to exit, so when the clock continuity changed after the dispatch of the graceful step, the grace period starts at the wake. The force step is thus never earlier than without the sleep. An immediate-force disposable-job policy skips the graceful step only when that consequence and target are separately authorized.
+
+The record of the graceful request that permits a force step is the record of the same operation and of its graceful step. A record of a different operation, or of a different step, on the same target identity permits no force step. A graceful step whose effect is not known needs a reconciliation first: the force step is refused with `reconcile_before_force` and no dispatch is consumed for it.
 
 An application may decline graceful termination or show a save dialog. Neither response authorizes bypassing the current foreground rule or force policy. If global pressure recovers, an application budget is no longer violated, or required evidence becomes unavailable before escalation, stop further automatic steps according to [POLICY_SPEC.md](POLICY_SPEC.md). An already issued graceful request may still complete.
 
@@ -278,9 +286,11 @@ The action-specific effects are `Trashed`, `Removed`, `ExitVerified`, `AlreadyAb
 
 `TARGET_SKIPPED` means that the fresh check before dispatch did not permit this target because of its evidence, its eligibility, or a limit. It is not an execution error. A record with `TARGET_SKIPPED` or `FAILED` has the error of section 10, and no other record has one.
 
-The fields of a record agree with each other. `Trashed`, `Removed`, `ExitVerified`, `Refused`, and `StillRunning` need a `submitted` call. `Skipped` needs `not_submitted`. A verified effect has the attribution `established` or `possible`. `AlreadyAbsent` and `AlreadyExited` have `not_applicable` before a call and `possible` after a submitted or possibly submitted call. `UnknownOutcome` has `possible`. `Skipped`, `Refused`, and `StillRunning` have `not_applicable`. `Refused` has the stop reason `FAILED`. A target in its final condition (a verified effect, `AlreadyAbsent`, or `AlreadyExited`) does not have the stop reason `FAILED` or `TARGET_SKIPPED`. A record that does not agree with these rules is rejected.
+The fields of a record agree with each other. `Trashed`, `Removed`, `ExitVerified`, `Refused`, and `StillRunning` need a `submitted` call. `Skipped` needs `not_submitted`. A verified effect has the attribution `established` or `possible`, and its evidence names the observation source: a verified effect with no observation is rejected. `AlreadyAbsent` and `AlreadyExited` have `not_applicable` before a call and `possible` after a submitted or possibly submitted call. `UnknownOutcome` has `possible`. `Skipped`, `Refused`, and `StillRunning` have `not_applicable`. `Refused` has the stop reason `FAILED`. A target in its final condition (a verified effect, `AlreadyAbsent`, or `AlreadyExited`) does not have the stop reason `FAILED` or `TARGET_SKIPPED`. A record that does not agree with these rules is rejected.
 
 The native result of a record is `not_called`, `succeeded`, `errno` with the error number, `refused`, `unavailable`, or `covered_by_application_request`. A record with `not_submitted` has `not_called`, and each other record has a different value. `covered_by_application_request` is for one member of an application target: no call was issued for that member, because the request to its application covers it. Such a record names its member and has the dispatch state `submitted`. The value states that no native call was issued to the member itself. The request to the application is the graceful request for the member also, so a force step can follow for a covered member that is still running. The value was added after the first form of the record. The record has no schema version of its own: a reader that does not know the value applies the rule for a field value that it does not recognize, and a record with one of the other values is read unchanged.
+
+No effect names a directory target that was removed in part. Such a target has `UnknownOutcome`, the attribution `possible`, and the stop reason of the condition that stopped it (section 7); the entry and byte counts of the removed part are in the work totals of the operation, not in the target record. An effect of its own for a partial removal is not defined: it would be a new value of a serialized field, and a reader that does not know the value reads the record as an indeterminate effect.
 
 A pre-dispatch already-absent/exited result is a no-op. After a crash, finding the target absent may establish current state without establishing who removed or stopped it. Preserve that attribution uncertainty.
 
@@ -336,6 +346,8 @@ Record durable dispatch consumption before normal external submission. Duplicate
 
 Agent and helper maintain their own consumption state. The helper associates a delegated step with its authenticated principal and parent operation. A missing helper reply causes a status query and reconciliation, not a second deletion or signal. When the helper starts again, a delegated step that its earlier lifetime consumed and did not settle has an unknown outcome: the call was possibly submitted, and no executor has the step now. The helper records that state for the step, and its storage layer writes the changed record back. The step stays consumed, so the same request gets the recorded state and no second acceptance. The agent thus expects `unknown_outcome` from a status query after a restart of the helper, and it reconciles the step before it reports a result.
 
+The helper accepts a delegated step only when its privilege grant applies until the expiry of the request. The executor can submit a call until that expiry, so a grant that expires earlier would permit a call after its own end. The helper adds the time that remains of the request to the wall-clock time of its check and refuses the request when the result is after the expiry of the grant. This check covers the expiry of a grant only. A grant that is revoked after the helper accepted a step is not covered by it: the revocation rule of this section applies at the next dispatch boundary of the helper.
+
 ### Cancellation
 
 Cancellation is an operation-scoped request to inhibit future dispatch. The acknowledgement must distinguish:
@@ -383,6 +395,8 @@ The exception never applies to any filesystem mutation, manual process control, 
 Record intent, dispatch consumption, and budget consumption together in bounded volatile state before submission. Duplicates remain consumed within that executor epoch; earlier-epoch requests cannot be replayed.
 
 Mark all resulting history as volatile/degraded, and persist it later when possible. If a restart cannot establish that prior incident and budget state were preserved, treat the affected budget as exhausted until fresh observations establish sustained recovery and a new incident, or the user explicitly rearms it. Restart must not replenish an unknown budget during continuing pressure.
+
+The consumed dispatches of an incident are in the journal as the records of its operations, and a restart reads them to know the usage of the incident. The retention of the journal must thus keep each operation of an open incident. The retention cutoff is not later than the start of the oldest open incident, and with an open incident whose start is not known the retention removes nothing. The cutoff and the admission time of an operation are wall-clock times, so a wall clock that was set back by more than the age of the incident can put an operation of the incident before the cutoff. A record of the incident usage that does not depend on the retention is not defined.
 
 ### Recovery matrix
 

@@ -21,18 +21,18 @@
 //! | [`platform::memory`] | Memory pressure, physical memory, VM statistics, swap usage, counter rates, pressure events, and the collection context |
 //! | [`platform::volume`] | Volume identities, capacity, Foundation planning values, and capacity pools |
 //! | [`platform::process`] | Process inventory, generation identity, footprint and resident size, application attribution, derived growth and CPU use, and ranking |
-//! | [`platform::run_loop`] | The main run loop of the process: the evidence that it ran, and the run until a stop signal |
+//! | [`platform::run_loop`] | The main run loop of the process: the evidence that it ran, and the run until a stop signal or a stop request of this process |
 //! | [`platform::sleep`] | The sleep time of the host and the sleep-boundary check of a rate interval |
 //! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |
-//! | [`journal`] | The operation journal in `operations.sqlite`: plans, operations, revisions and grants, the request queue, the coordinator lock, recovery reads, and the named agent records |
-//! | [`executor::fs`] | The filesystem executor: the Trash move and the descriptor-relative permanent removal of one admitted step |
+//! | [`journal`] | The operation journal in `operations.sqlite`: plans, operations, the resource observations of an operation, revisions and grants, the request queue, the coordinator lock with the role of its holder and a reading that takes no lock, recovery reads, and the named agent records |
+//! | [`executor::fs`] | The filesystem executor: the Trash move and the descriptor-relative permanent removal of one admitted step, with a stop between the entries of a directory target |
 //! | [`executor::process`] | The process executor: the graceful request, the force signal, and the exit observation of one admitted step |
 //! | [`rules`] | The rule registry and the two reviewed rules, each in the `proposed` lifecycle state |
-//! | [`coordinator`] | The operation coordinator: admission, serialization, dispatch records, cancellation, the queue service, and reconciliation |
-//! | [`controller`] | The guard controller: the decisions of the disk guard and the memory guard from the authority record |
-//! | [`runtime`] | The agent process: the driver loop, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |
+//! | [`coordinator`] | The operation coordinator: admission, serialization, dispatch records, the approved roots of a manual operation from its sealed plan, cancellation, the queue service, the stop of new claims at a shutdown, and reconciliation |
+//! | [`controller`] | The guard controller: the decisions of the disk guard and the memory guard from the authority record, and the open incidents that bound the retention of the journal |
+//! | [`runtime`] | The agent process: the driver loop, the agent clock with the sleep continuity of the host, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |
 
 pub mod capability;
 pub mod controller;

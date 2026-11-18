@@ -360,6 +360,8 @@ On restart, reconcile incomplete actions and restore trustworthy consumed/reserv
 
 If previous volatile action or budget state may have been lost, mark the affected budget exhausted until observed sustained recovery and a new incident, or explicit authorized rearm. Restart must not replenish a budget during continuing pressure. Ordinary durable uncertainty also blocks conflicting work until its action contract permits reconciliation.
 
+A controller record that cannot be read at a start is lost budget state for each guard. Each guard is then held: it makes no automatic intervention until the agent observes its recovery. The recovery of a held guard is a continuous time of `recovery_stable_for` in the current lifetime of the agent in which each trigger of the guard is `normal` and the guard has no open incident. An evaluation with no trigger shows nothing, and a trigger at the warning level is not a recovery. A sleep of the host starts the time again, and the time is not stored: a restart is not evidence of a recovery. The time that the agent did not run does not count.
+
 Reservations backed by unresolved dispatch state remain charged conservatively. A journal is not an undo mechanism, and an `UnknownOutcome` is not permission to repeat the operation.
 
 ## 14. Pause, cooldown, and simultaneous pressure

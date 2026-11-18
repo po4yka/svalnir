@@ -2019,6 +2019,31 @@ fn a_force_step_of_one_process_follows_its_graceful_step_and_checks_the_identity
 }
 
 #[test]
+fn a_process_target_with_an_association_is_not_an_envelope_and_gets_no_signal() {
+    use svalnir_core::action::{ProcessBinding, TargetBinding};
+    // A member of a job, an association kind that this build does not
+    // recognize, and an attribution method that it does not recognize:
+    // none is a process with no application or job evidence.
+    let unknown_method = ProcessAssociation::Application {
+        instance_id: instance(),
+        bundle_identifier: BUNDLE.to_owned(),
+        attribution: AttributionMethod::from_wire("parent_process"),
+    };
+    for association in [job(), ProcessAssociation::Unrecognized, unknown_method] {
+        let mut process: ProcessIdentity = member(100, 10, job());
+        let mut content = content(
+            ActionClass::ForceApplicationExit,
+            Escalation::ImmediateForce,
+            vec![process.clone()],
+            USER,
+        );
+        process.association = association;
+        content.target.binding = TargetBinding::Process(ProcessBinding { process });
+        assert!(Checked::new(content).is_err());
+    }
+}
+
+#[test]
 fn the_hard_refusals_apply_to_a_target_of_one_process() {
     type Setup = fn(&Host) -> ProcessIdentity;
     let cases: [(Setup, &str); 5] = [

@@ -232,9 +232,10 @@ fn backend_of(kind: StepKind, subject: Subject, member: &ProcessIdentity) -> Bac
         // The one process of a process target has no application and no
         // job, so it has no application API and no request that applies
         // to it: its call is one signal to its process ID. A process with
-        // a verified membership is a target only through its instance;
-        // the check of the envelope refuses it, and it gets no call here.
-        return if member.association.verified_membership().is_none() {
+        // a membership, or with an association that this build does not
+        // recognize, is not such a process; the check of the envelope
+        // refuses it, and it gets no call here.
+        return if matches!(member.association, ProcessAssociation::Unattributed) {
             Backend::Signal
         } else {
             Backend::Unsupported

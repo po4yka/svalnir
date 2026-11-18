@@ -214,3 +214,82 @@ impl AuthoritySource for SharedAuthority {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use svalnir_core::file::LosslessPath;
+    use svalnir_core::id::{BootId, ProcessGenerationId};
+    use svalnir_core::policy::{ControlPlaneProcess, ProtectionFact};
+    use svalnir_core::process::{
+        ExecutableIdentity, Pid, ProcessAssociation, ProcessIdentity, ProcessStartTime, Uid,
+    };
+    use svalnir_core::rule::{Rule, RuleRegistry};
+
+    use super::{AuthorityRecords, SharedAuthority};
+    use crate::coordinator::AuthoritySource as _;
+
+    #[derive(Debug)]
+    struct NoRules;
+
+    impl RuleRegistry for NoRules {
+        fn rules(&self) -> Vec<&Rule> {
+            Vec::new()
+        }
+    }
+
+    const USER: Uid = Uid::new(501);
+
+    fn process(pid: i32, path: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            generation_id: ProcessGenerationId::new(format!("pg-{pid}")).unwrap(),
+            pid: Pid::new(pid).unwrap(),
+            start_time: ProcessStartTime::new(1_000),
+            uid: USER,
+            boot_id: BootId::new("boot_1").unwrap(),
+            executable: Some(ExecutableIdentity {
+                path: LosslessPath::from_bytes(path).unwrap(),
+                file: None,
+                code_signature: None,
+            }),
+            association: ProcessAssociation::Unattributed,
+        }
+    }
+
+    /// The protection port gives the fact of the catalog for the list of
+    /// processes that it gets, also for the one process of a process
+    /// target: the control plane of the records, the owner, and the
+    /// executable are those of that one process.
+    #[test]
+    fn the_protection_of_one_process_is_the_fact_of_the_catalog_for_that_process() {
+        let authority = SharedAuthority::new(AuthorityRecords::new(USER, Box::new(NoRules)));
+        let tool: ProcessIdentity = process(4_242, "/opt/tools/bin/tool");
+        // With no control plane in the records, the fact is not known.
+        assert_eq!(
+            authority.protection(std::slice::from_ref(&tool)),
+            ProtectionFact::Unknown
+        );
+        authority.records().control_plane = Some(vec![ControlPlaneProcess {
+            pid: Pid::new(900).unwrap(),
+            start_time: ProcessStartTime::new(1_000),
+        }]);
+        assert_eq!(
+            authority.protection(std::slice::from_ref(&tool)),
+            ProtectionFact::NotProtected
+        );
+        // An ancestor of the agent, a process of a different user, and a
+        // system executable are protected, each as the only process.
+        let ancestor: ProcessIdentity = process(900, "/opt/tools/bin/shell");
+        let mut other_user: ProcessIdentity = tool.clone();
+        other_user.uid = Uid::new(502);
+        let system: ProcessIdentity = process(4_243, "/bin/sleep");
+        for protected in [&ancestor, &other_user, &system] {
+            assert_eq!(
+                authority.protection(std::slice::from_ref(protected)),
+                ProtectionFact::Protected,
+                "{protected:?}"
+            );
+        }
+        // No list is not "not protected".
+        assert_ne!(authority.protection(&[]), ProtectionFact::NotProtected);
+    }
+}

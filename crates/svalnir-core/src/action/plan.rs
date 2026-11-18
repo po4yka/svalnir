@@ -34,7 +34,7 @@ use crate::id::{
 use crate::policy::{
     ApplicationCandidate, EvaluationClock, ProtectionContext, ProtectionFact, hard_protection,
 };
-use crate::process::{ProcessIdentity, Uid, VerifiedMembership};
+use crate::process::{ProcessAssociation, ProcessIdentity, Uid, VerifiedMembership};
 use crate::quantity::{EntryCount, Nanoseconds};
 use crate::rule::RuleRef;
 use crate::time::{MonotonicNanos, WallTime};
@@ -616,7 +616,10 @@ const ROOT_UID: u32 = 0;
 /// hard protections applies in addition, at each boundary.
 ///
 /// - The plan is manual, and the executor is the user executor.
-/// - The process has no verified membership.
+/// - No application or job evidence was found for the process
+///   ([`ProcessAssociation::Unattributed`]). An association kind or an
+///   attribution method that this build does not recognize is not that: a
+///   different build can know the process as a member of an instance.
 /// - The process is a process of `principal`, is not a process of root,
 ///   and is not `launchd`.
 /// - The process has executable evidence: an executor cannot show that a
@@ -631,7 +634,7 @@ pub(super) fn check_process_binding(
         return Err(PlanError::Trigger);
     }
     let process: &ProcessIdentity = &binding.process;
-    let is_single: bool = process.association.verified_membership().is_none();
+    let is_single: bool = matches!(process.association, ProcessAssociation::Unattributed);
     let owner_agrees: bool = process.uid == principal && process.uid.get() != ROOT_UID;
     let is_launchd: bool = process.pid.get() == LAUNCHD_PID;
     if matches!(executor, ExecutorRole::User)

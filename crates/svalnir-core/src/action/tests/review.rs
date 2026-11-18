@@ -802,7 +802,7 @@ fn sealed_process(
 
 #[test]
 fn a_process_target_is_one_process_of_the_user_in_a_manual_plan() {
-    use crate::process::{Pid, Uid};
+    use crate::process::{AttributionMethod, Pid, Uid};
     for escalation in [
         Escalation::None,
         Escalation::ForceAfterGrace,
@@ -844,6 +844,23 @@ fn a_process_target_is_one_process_of_the_user_in_a_manual_plan() {
     // A member of an application is a target through its instance only.
     assert_eq!(
         binding(&|process| process.association = member("proc_9", 4_299).association),
+        PlanError::Binding
+    );
+    // An association kind or an attribution method that this build does
+    // not recognize is not "no evidence": a different build can know the
+    // process as a member of an instance.
+    assert_eq!(
+        binding(&|process| process.association = ProcessAssociation::Unrecognized),
+        PlanError::Binding
+    );
+    assert_eq!(
+        binding(&|process| {
+            process.association = ProcessAssociation::Application {
+                instance_id: ApplicationInstanceId::new("app_9").unwrap(),
+                bundle_identifier: "com.example.Nine".to_owned(),
+                attribution: AttributionMethod::from_wire("parent_process"),
+            };
+        }),
         PlanError::Binding
     );
     // The process-control surface has the user executor only.

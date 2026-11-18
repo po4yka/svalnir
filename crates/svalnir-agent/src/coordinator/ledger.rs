@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use svalnir_core::action::{
-    BudgetError, BudgetScope, LeaseResource, ResourceLease, ScopedAllowance, SlotAllowance,
-    WorkAllowance, WorkBudget, WorkCharge,
+    BudgetError, BudgetScope, ErrorFamily, LeaseResource, ResourceLease, ScopedAllowance,
+    SlotAllowance, WorkAllowance, WorkBudget, WorkCharge,
 };
 use svalnir_core::authority::Generation;
 use svalnir_core::id::{ExecutorEpochId, IncidentId, OperationId};
@@ -92,6 +92,16 @@ pub(super) struct LedgerRefusal {
 impl LedgerRefusal {
     const fn new(code: &'static str) -> Self {
         Self { code }
+    }
+
+    /// The error family of the refusal: `recording` for a read of the
+    /// journal that a lock prevented, and `limits` for each other code.
+    pub(super) fn family(self) -> ErrorFamily {
+        if self.code == code::ADMISSION_NOT_RECORDED {
+            ErrorFamily::Recording
+        } else {
+            ErrorFamily::Limits
+        }
     }
 }
 

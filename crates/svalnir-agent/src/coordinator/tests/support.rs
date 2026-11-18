@@ -1151,6 +1151,10 @@ pub(super) enum FailPoint {
     /// the position `Submitted`, so that the result of the evidence does
     /// not agree with the step: the state machine refuses it.
     RecoveryAsSubmitted,
+    /// `incident_usage` finds the journal locked.
+    IncidentUsageBusy,
+    /// The storage of the journal fails in `incident_usage`.
+    IncidentUsageFailed,
 }
 
 /// A function that a test runs inside a journal call.
@@ -1326,6 +1330,17 @@ impl CoordinatorJournal for FailingJournal {
         incident_id: &IncidentId,
         generation: Generation,
     ) -> Result<Option<IncidentUsage>, OperationJournalError> {
+        let failing = self.failing.lock().unwrap();
+        if failing.contains(&FailPoint::IncidentUsageBusy) {
+            return Err(OperationJournalError::Busy(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )));
+        }
+        if failing.contains(&FailPoint::IncidentUsageFailed) {
+            return Err(OperationJournalError::NotFound);
+        }
+        drop(failing);
         self.inner.incident_usage(incident_id, generation)
     }
 

@@ -286,6 +286,16 @@ impl RecordHealth {
         self.controller_unrecorded = !written;
     }
 
+    /// Records the result of a write of the controller record. A locked
+    /// journal is not a storage failure: it changes no flag.
+    const fn controller_persisted(&mut self, persisted: Persisted) {
+        match persisted {
+            Persisted::Written => self.controller_written(true),
+            Persisted::Failed => self.controller_written(false),
+            Persisted::Busy => {}
+        }
+    }
+
     /// Records the result of a write of the status record.
     const fn status_written(&mut self, written: bool) {
         self.status_unrecorded = !written;
@@ -294,6 +304,47 @@ impl RecordHealth {
     /// True when the journal did not take one of the two records.
     const fn unavailable(self) -> bool {
         self.controller_unrecorded || self.status_unrecorded
+    }
+}
+
+/// The result of a write of the controller record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Persisted {
+    /// The journal has the present state of the controller.
+    Written,
+    /// A different process held the lock of the journal for longer than
+    /// the bounded wait. The write recorded nothing, and the next tick
+    /// writes again. This is not a storage failure.
+    Busy,
+    /// The storage of the journal failed.
+    Failed,
+}
+
+impl Persisted {
+    /// The result of a write of an agent record.
+    const fn of(result: &Result<u64, OperationJournalError>) -> Self {
+        match result {
+            Ok(_) => Self::Written,
+            Err(OperationJournalError::Busy(_)) => Self::Busy,
+            Err(_) => Self::Failed,
+        }
+    }
+
+    /// The refusal code of an automatic plan after this write, or `None`
+    /// when the plan goes to the coordinator. `exception` is true when the
+    /// critical-memory exception is authorized for the plan.
+    ///
+    /// A locked journal is a refusal with `admission_not_recorded`: the
+    /// controller plans again at its next evaluation with no pacing wait,
+    /// and the exception does not apply. Only a storage failure permits
+    /// the exception.
+    const fn refusal(self, exception: bool) -> Option<&'static str> {
+        match self {
+            Self::Written => None,
+            Self::Busy => Some(code::ADMISSION_NOT_RECORDED),
+            Self::Failed if exception => None,
+            Self::Failed => Some(CODE_STATE_NOT_RECORDED),
+        }
     }
 }
 
@@ -322,9 +373,13 @@ impl Restored {
             Ok(Some(_)) | Err(_) => LifecycleRecord::unreadable(),
         };
         let lifecycle: LifecycleRecord = earlier.started(time.wall);
-        let mut journal_unavailable: bool = records
-            .put_agent_record(AgentRecord::Lifecycle, &lifecycle, None, time.wall)
-            .is_err();
+        // A locked journal is not a storage failure.
+        let mut journal_unavailable: bool = Persisted::of(&records.put_agent_record(
+            AgentRecord::Lifecycle,
+            &lifecycle,
+            None,
+            time.wall,
+        )) == Persisted::Failed;
         let prior: PriorState =
             match records.agent_record::<ControllerState>(AgentRecord::Controller) {
                 Ok(None) => PriorState::Absent,
@@ -334,11 +389,14 @@ impl Restored {
         let state: ControllerState = ControllerState::restore(prior);
         // The record of a running agent is not the record of a clean stop.
         let view: ControllerState = state.durable_view();
-        let stored: Option<ControllerState> = records
-            .put_agent_record(AgentRecord::Controller, &view, None, time.wall)
-            .is_ok()
-            .then_some(view);
-        journal_unavailable |= stored.is_none();
+        let persisted: Persisted = Persisted::of(&records.put_agent_record(
+            AgentRecord::Controller,
+            &view,
+            None,
+            time.wall,
+        ));
+        journal_unavailable |= persisted == Persisted::Failed;
+        let stored: Option<ControllerState> = (persisted == Persisted::Written).then_some(view);
         Self {
             lifecycle,
             state,
@@ -705,26 +763,29 @@ impl Driver {
         });
     }
 
-    /// Writes the durable view of the controller state when it changed.
-    /// Returns `false` when the journal did not take it.
-    fn persist(&mut self, time: &TimeReading) -> bool {
+    /// Writes the durable view of the controller state when it changed,
+    /// and returns whether the journal has it. A locked journal does not
+    /// mark the journal as unavailable.
+    fn persist(&mut self, time: &TimeReading) -> Persisted {
         let view: ControllerState = self.state.durable_view();
         if self.stored.as_ref() == Some(&view) {
             self.record_health.controller_written(true);
-            return true;
+            return Persisted::Written;
         }
-        let written: bool = self
-            .records
-            .put_agent_record(AgentRecord::Controller, &view, None, time.wall)
-            .is_ok();
-        if written {
+        let persisted: Persisted = Persisted::of(&self.records.put_agent_record(
+            AgentRecord::Controller,
+            &view,
+            None,
+            time.wall,
+        ));
+        if persisted == Persisted::Written {
             self.stored = Some(view);
         }
-        self.record_health.controller_written(written);
-        written
+        self.record_health.controller_persisted(persisted);
+        persisted
     }
 
-    fn apply(&mut self, apply: AutomaticApply, recorded: bool) {
+    fn apply(&mut self, apply: AutomaticApply, persisted: Persisted) {
         let plan_id = apply.plan.plan_id.clone();
         // The usage of the incident must be recorded before a plan uses
         // it. The only action with no durable record is the
@@ -733,10 +794,11 @@ impl Driver {
         let exception: bool = apply.guard == Guard::Memory
             && matches!(apply.trigger, TriggerKey::GlobalMemory)
             && apply.budget.volatile_exception_at_open;
-        let Some(coordinator) = self.coordinator.as_mut().filter(|_| recorded || exception) else {
+        let refusal: Option<&'static str> = persisted.refusal(exception);
+        let Some(coordinator) = self.coordinator.as_mut().filter(|_| refusal.is_none()) else {
             self.reports.push(ApplyReport::Refused {
                 plan_id,
-                code: CODE_STATE_NOT_RECORDED.to_owned(),
+                code: refusal.unwrap_or(CODE_STATE_NOT_RECORDED).to_owned(),
             });
             return;
         };
@@ -830,7 +892,7 @@ impl Driver {
             &control,
             &self.epoch,
         ) {
-            Ok(rearm) if self.persist(time) => RequestCompletion::Rearmed {
+            Ok(rearm) if self.persist(time) == Persisted::Written => RequestCompletion::Rearmed {
                 incident_id: pending.request.incident_id.clone(),
                 previous_generation: rearm.previous_generation,
                 new_generation: rearm.new_generation,
@@ -1060,14 +1122,14 @@ impl Driver {
             records.triggers = output.triggers;
             records.inhibition = self.inhibition();
         }
-        let recorded: bool = self.persist(time);
+        let persisted: Persisted = self.persist(time);
 
         let mut acted: bool = false;
         self.optional_reduced = false;
         for intent in output.intents {
             match intent {
                 Intent::Apply(apply) => {
-                    self.apply(*apply, recorded);
+                    self.apply(*apply, persisted);
                     acted = true;
                 }
                 Intent::PrepareCandidates { volumes, mode } => {
@@ -1173,6 +1235,9 @@ impl Driver {
                 self.last_status_at = Some(time.clock.now);
                 self.record_health.status_written(true);
             }
+            // A locked journal is not a storage failure. The next status
+            // write tries again.
+            Err(OperationJournalError::Busy(_)) => {}
             Err(_) => self.record_health.status_written(false),
         }
     }
@@ -1345,7 +1410,34 @@ impl Driver {
 
 #[cfg(test)]
 mod record_health_tests {
-    use super::RecordHealth;
+    use super::{CODE_STATE_NOT_RECORDED, Persisted, RecordHealth, code};
+
+    #[test]
+    fn a_locked_journal_is_a_refusal_and_only_a_storage_failure_permits_the_exception() {
+        for exception in [false, true] {
+            assert_eq!(Persisted::Written.refusal(exception), None);
+            assert_eq!(
+                Persisted::Busy.refusal(exception),
+                Some(code::ADMISSION_NOT_RECORDED)
+            );
+        }
+        assert_eq!(Persisted::Failed.refusal(true), None);
+        assert_eq!(
+            Persisted::Failed.refusal(false),
+            Some(CODE_STATE_NOT_RECORDED)
+        );
+        // A locked journal does not mark the journal as unavailable, and
+        // it does not clear a storage failure.
+        let mut health = RecordHealth::default();
+        health.controller_persisted(Persisted::Busy);
+        assert!(!health.unavailable());
+        health.controller_persisted(Persisted::Failed);
+        assert!(health.unavailable());
+        health.controller_persisted(Persisted::Busy);
+        assert!(health.unavailable());
+        health.controller_persisted(Persisted::Written);
+        assert!(!health.unavailable());
+    }
 
     #[test]
     fn a_status_write_does_not_clear_a_failed_controller_write() {

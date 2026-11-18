@@ -1320,6 +1320,24 @@ fn an_admission_that_the_journal_did_not_record_is_planned_again_at_the_next_eva
         bench.state.disk_incidents[0].last_refusal.as_deref(),
         Some("admission_not_recorded")
     );
+    // The refusals that recorded nothing are not in the sequence: the
+    // first real refusal after them waits one window, with no doubling.
+    assert_eq!(bench.state.disk_incidents[0].refusals, 0);
+    let outstanding = bench.state.outstanding.clone().unwrap();
+    let refused_at: u64 = bench.now;
+    let report = ApplyReport::Refused {
+        plan_id: outstanding.plan_id,
+        code: "lease_conflict".to_owned(),
+    };
+    bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+    assert_eq!(bench.state.disk_incidents[0].refusals, 1);
+    while bench.state.outstanding.is_none() {
+        assert!(bench.now - refused_at < 100 * SECOND);
+        bench.advance(SECOND);
+        bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[]);
+    }
+    // The observation window of the disk guard is 5 seconds.
+    assert!((bench.now - refused_at) / SECOND <= 6);
 }
 
 #[test]

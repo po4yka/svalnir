@@ -10,6 +10,7 @@
 
 #![cfg(target_os = "macos")]
 
+mod busy;
 mod rearm;
 
 use std::fs;
@@ -435,6 +436,9 @@ struct Bench {
     modes: Arc<Mutex<Vec<PreparationMode>>>,
     notes: Notes,
     footprint: Arc<AtomicU64>,
+    /// The bounded wait of the journal of the driver, when a test sets a
+    /// short one.
+    busy_timeout: Option<Duration>,
     lifetimes: u32,
 }
 
@@ -462,6 +466,7 @@ impl Bench {
             modes: Arc::new(Mutex::new(Vec::new())),
             notes: Notes::default(),
             footprint: Arc::new(AtomicU64::new(10 * 1024 * 1024)),
+            busy_timeout: None,
             lifetimes: 0,
         }
     }
@@ -521,6 +526,9 @@ impl Bench {
             },
             journal: JournalOptions {
                 full_fsync: false,
+                busy_timeout: self
+                    .busy_timeout
+                    .unwrap_or(JournalOptions::default().busy_timeout),
                 ..JournalOptions::default()
             },
             status_interval: Nanoseconds::new(30 * SECOND),

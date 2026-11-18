@@ -5,7 +5,7 @@ use svalnir_core::id::{ExecutorEpochId, IncidentId};
 
 use super::super::code;
 use super::support::{
-    Bench, SECOND, TestCoordinator, TrashMode, admitted, allowance, automatic_request,
+    Bench, FailPoint, SECOND, TestCoordinator, TrashMode, admitted, allowance, automatic_request,
     automatic_stop_plan, incident_id, refusal, run, stop_plan, stored_request,
 };
 
@@ -86,6 +86,43 @@ fn an_exhausted_incident_allowance_refuses_the_next_intervention() {
     let operation_id = admitted(&mut coordinator, stored_request(&manual));
     run(&mut coordinator, &bench.clock, &operation_id);
     assert_eq!(coordinator.remaining_slots(&incident), Some(0));
+}
+
+#[test]
+fn a_usage_read_that_fails_makes_no_ledger_record_and_the_next_request_reads_again() {
+    let mut bench = Bench::new();
+    let incident = incident_id("incident_1");
+    bench.authority.open_incident(&incident, bench.clock.now());
+    bench.measurements.0.lock().unwrap().pressure = ["critical", "normal"].into();
+    let mut coordinator = bench.start();
+    let epoch = coordinator.executor_epoch().clone();
+    let plan = plan_for(&bench, &incident, 4242);
+    let request = || automatic_request(&plan, allowance(&incident, &epoch, 2));
+
+    // A locked journal: the admission is refused, and the controller
+    // tries again. The ledger has no record of the incident.
+    bench.fail(FailPoint::IncidentUsageBusy);
+    let error = refusal(&mut coordinator, request());
+    assert_eq!(error.code.as_str(), code::ADMISSION_NOT_RECORDED);
+    assert_eq!(error.family, ErrorFamily::Recording);
+    assert_eq!(coordinator.remaining_slots(&incident), None);
+    bench.heal();
+
+    // A storage failure: the usage is not known, so the allowance is
+    // refused. The ledger keeps no record of it either.
+    bench.fail(FailPoint::IncidentUsageFailed);
+    let error = refusal(&mut coordinator, request());
+    assert_eq!(error.code.as_str(), code::BUDGET_EXHAUSTED);
+    assert_eq!(error.family, ErrorFamily::Limits);
+    assert_eq!(coordinator.remaining_slots(&incident), None);
+    bench.heal();
+    assert_eq!(bench.host.calls().len(), 0);
+
+    // The next request reads the usage again and is admitted.
+    let operation_id = admitted(&mut coordinator, request());
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert_eq!(coordinator.remaining_slots(&incident), Some(1));
 }
 
 #[test]

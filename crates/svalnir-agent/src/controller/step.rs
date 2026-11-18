@@ -347,13 +347,15 @@ impl<'a> Run<'a> {
     /// Records the refusal code of the latest plan of an incident, or
     /// removes it after an admission. Returns the number of refusals in
     /// sequence.
+    ///
+    /// An admission that the journal did not record is not a decision
+    /// about the action, so it does not count in the sequence: a later
+    /// refusal does not get a longer wait from it.
     fn set_refusal(&mut self, outstanding: &Outstanding, code: Option<String>) -> u32 {
-        let count = |refusals: u32| {
-            if code.is_some() {
-                refusals.saturating_add(1)
-            } else {
-                0
-            }
+        let count = |refusals: u32| match code.as_deref() {
+            None => 0,
+            Some(crate::coordinator::code::ADMISSION_NOT_RECORDED) => refusals,
+            Some(_) => refusals.saturating_add(1),
         };
         match outstanding.guard {
             Guard::Disk => {

@@ -37,7 +37,7 @@ use crate::executor::fs::{ApprovedRoot, ApprovedRoots, RootError};
 use crate::executor::process::{NextStep, Observation as ExitObservation};
 use crate::journal::{
     ClaimedRequest, CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRole,
-    RequestBody, RequestCompletion, VolatileRecord,
+    OperationJournalError, RequestBody, RequestCompletion, VolatileRecord,
 };
 
 /// The largest number of admitted operations that wait for the active
@@ -846,11 +846,12 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             return Err(missing);
         }
         let first_record: bool = !self.ledger.knows(incident_id, given.generation);
-        // A new record reads the consumed dispatches of the journal.
+        // A new record reads the consumed dispatches of the journal. A
+        // read that fails makes no record: the next request reads again.
         let journal: Option<JournalUsage> = if self.ledger.has(incident_id) {
             None
         } else {
-            Some(self.journal_usage(given))
+            Some(self.journal_usage(given)?)
         };
         self.ledger
             .observe_incident(given, journal, time.clock.now)?;
@@ -871,20 +872,31 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     /// consumption of each dispatch changes and which the retention keeps
     /// while the incident is open. The usage of an earlier generation does
     /// not count against the allowance of a rearmed generation.
-    fn journal_usage(&self, given: &IncidentAllowance) -> JournalUsage {
+    ///
+    /// A read that fails is a refusal: a locked journal gives
+    /// `admission_not_recorded`, and the controller tries again at its
+    /// next evaluation. A storage failure gives `budget_exhausted`, as an
+    /// unknown usage does. The ledger then keeps no record of the
+    /// incident, so a later request reads the usage again.
+    fn journal_usage(&self, given: &IncidentAllowance) -> Result<JournalUsage, LedgerRefusal> {
         match self
             .journal
             .incident_usage(&given.incident_id, given.generation)
         {
-            Ok(Some(usage)) => JournalUsage::Known {
+            Ok(Some(usage)) => Ok(JournalUsage::Known {
                 slots: usage.slots,
                 work: usage.work,
-            },
-            Ok(None) => JournalUsage::Known {
+            }),
+            Ok(None) => Ok(JournalUsage::Known {
                 slots: 0,
                 work: WorkCharge::ZERO,
-            },
-            Err(_) => JournalUsage::Unknown,
+            }),
+            Err(OperationJournalError::Busy(_)) => Err(LedgerRefusal {
+                code: code::ADMISSION_NOT_RECORDED,
+            }),
+            Err(_) => Err(LedgerRefusal {
+                code: code::BUDGET_EXHAUSTED,
+            }),
         }
     }
 
@@ -917,7 +929,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         };
         let mut hold: Hold = match self.reserve(&plan, &request, total, time) {
             Ok(hold) => hold,
-            Err(refusal) => return limits(refusal.code),
+            Err(refusal) => {
+                return refused(admission_error(refusal.code, refusal.family(), &plan_id));
+            }
         };
         let leases: Vec<ResourceLease> = match self.ledger.acquire_leases(
             &lease_resources(&plan),

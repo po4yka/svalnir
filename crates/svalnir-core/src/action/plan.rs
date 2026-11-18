@@ -682,12 +682,20 @@ impl PlanContent {
     /// steps and two charges for one irreversible action.
     fn check_distinct_objects(&self) -> Result<(), PlanError> {
         let mut entries: BTreeSet<(&RootId, &[u8])> = BTreeSet::new();
+        // Two root identities can name one root. The root object then
+        // shows that the two entries are one object.
+        let mut placed: BTreeSet<(&FileObjectEvidence, &[u8])> = BTreeSet::new();
         let mut instances: BTreeSet<&ApplicationInstanceId> = BTreeSet::new();
         let mut generations: BTreeSet<&str> = BTreeSet::new();
         for target in &self.targets {
             let is_new: bool = match &target.binding {
                 TargetBinding::File(file) => {
-                    entries.insert((&file.root_id, file.relative_entry.as_bytes()))
+                    let entry: &[u8] = file.relative_entry.as_bytes();
+                    // The two sets get the entry also when the first one
+                    // has it.
+                    let new_in_root: bool = entries.insert((&file.root_id, entry));
+                    let new_in_place: bool = placed.insert((&file.root_object, entry));
+                    new_in_root && new_in_place
                 }
                 TargetBinding::Application(application) => {
                     instances.insert(&application.instance_id)

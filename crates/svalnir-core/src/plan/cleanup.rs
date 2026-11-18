@@ -353,6 +353,8 @@ impl EntryChecks<'_> {
         if checks.descendants.overlaps(&entry.relative_entry) {
             add(Reason::RuleExclusion);
         }
+        // Only a count of one is one name. A count of zero is an object
+        // that was unlinked after the measurement.
         // A hard-linked object has a name that the rule did not find. Its
         // removal frees no storage, and the other name can be outside the
         // root. A directory has one name; its link count is the number of
@@ -360,7 +362,7 @@ impl EntryChecks<'_> {
         if Self::skips_links(checks, entry)
             && entry
                 .link_count
-                .is_some_and(|count| count > EntryCount::new(1))
+                .is_some_and(|count| count != EntryCount::new(1))
         {
             add(Reason::RuleExclusion);
         }

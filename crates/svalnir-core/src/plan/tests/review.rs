@@ -251,12 +251,13 @@ fn the_evict_mode_leaves_out_a_hard_linked_object_of_a_rule_that_skips_them() {
     directory.link_count = Some(EntryCount::new(7));
     let mut unknown_directory: CleanupEntry = entry("e", 100);
     unknown_directory.link_count = None;
-    let entries: [CleanupEntry; 5] = [
+    let entries: [CleanupEntry; 6] = [
         file("a", Some(1)),
         file("b", Some(2)),
         file("c", None),
         directory,
         unknown_directory,
+        file("f", Some(0)),
     ];
     let outcome: PlanOutcome = evict(&rule, &entries);
     // One name, and a directory with each link count: in the plan. The
@@ -266,6 +267,8 @@ fn the_evict_mode_leaves_out_a_hard_linked_object_of_a_rule_that_skips_them() {
     assert_eq!(reasons(&outcome, "b"), [OmissionReason::RuleExclusion]);
     // A number that is not known is not one name.
     assert_eq!(reasons(&outcome, "c"), [OmissionReason::LinkCountUnknown]);
+    // No name: the object was unlinked. Only a count of one is in the plan.
+    assert_eq!(reasons(&outcome, "f"), [OmissionReason::RuleExclusion]);
 
     // A rule with a tested link-accounting contract does not skip them.
     let mut declaration = declaration(manual_validated());

@@ -99,8 +99,12 @@ pub fn file_hard_protection(
         return ProtectionFact::Unknown;
     }
     let entry: Vec<Vec<u8>> = components(path.as_bytes());
+    // The exception removes a protection, so its comparison is exact: the
+    // fail-closed comparison would place `/usr/NAME` in the local directory
+    // for each name that is not ASCII.
     let local: Vec<Vec<u8>> = components(LOCAL_DIRECTORY.as_bytes());
-    let in_local: bool = has_prefix(&entry, &local);
+    let in_local: bool =
+        entry.len() >= local.len() && entry.iter().zip(&local).all(|(a, b)| a == b);
     let system_protected: bool = SYSTEM_DIRECTORIES.iter().any(|directory| {
         let directory: Vec<Vec<u8>> = components(directory.as_bytes());
         // An entry that contains the directory is protected also when the
@@ -180,6 +184,10 @@ mod tests {
         // A parent of a protected location: its removal removes the
         // location.
         for entry in ["/", "/private", "/private/var", "/var", "/Library"] {
+            assert_eq!(protection(entry), ProtectionFact::Protected, "{entry}");
+        }
+        // A name that is not ASCII is not the local directory.
+        for entry in ["/usr/loc\u{e1}l/x", "/usr/\u{df}/y"] {
             assert_eq!(protection(entry), ProtectionFact::Protected, "{entry}");
         }
         // The operating system does not own the local directory.

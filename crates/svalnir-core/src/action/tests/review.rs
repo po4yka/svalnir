@@ -258,9 +258,20 @@ fn two_targets_do_not_bind_one_object() {
     let TargetBinding::File(second) = &mut content.targets[1].binding else {
         panic!("a file target");
     };
+    second.relative_entry = entry.clone();
+    second.root_id = RootId::new("root_2").unwrap();
+    second.root_path = crate::file::LosslessPath::from_bytes("/Users/a/Library/Logs").unwrap();
+    second.root_object.inode = crate::file::InodeNumber::new(3);
+    assert!(Plan::seal(content).is_ok());
+    // A second root identity for the same root object is not a different
+    // root: the entry is the same object.
+    let mut content = file_content(&ActionClass::DeleteSelectedFiles);
+    let TargetBinding::File(second) = &mut content.targets[1].binding else {
+        panic!("a file target");
+    };
     second.relative_entry = entry;
     second.root_id = RootId::new("root_2").unwrap();
-    assert!(Plan::seal(content).is_ok());
+    assert_eq!(sealed_error(content), PlanError::Duplicate);
 
     // One application instance with two target identities.
     let two_targets = |binding| {

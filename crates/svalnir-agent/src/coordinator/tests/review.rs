@@ -114,11 +114,28 @@ fn slots_that_were_exhausted_for_safety_do_not_come_back_with_a_larger_ceiling()
     assert_eq!(error.code.as_str(), code::BUDGET_EXHAUSTED);
     assert_eq!(coordinator.remaining_slots(&incident), Some(0));
     // A rearm makes a new generation, which starts with the given usage.
+    // The record of the incident and the plan have the new generation.
+    let generation = |generation: Generation| {
+        bench
+            .authority
+            .records()
+            .incidents
+            .get_mut(&incident)
+            .unwrap()
+            .generation = generation;
+    };
+    generation(Generation::new(2));
+    let mut content: svalnir_core::action::PlanContent =
+        svalnir_core::action::PlanContent::clone(&plan);
+    content.trigger.budget_generation = Some(Generation::new(2));
+    let rearmed_plan = Plan::seal(content).unwrap();
     let mut rearmed = allowance(&incident, coordinator.executor_epoch(), 5);
     rearmed.generation = Generation::new(2);
-    admitted(&mut coordinator, automatic_request(&plan, rearmed));
+    admitted(&mut coordinator, automatic_request(&rearmed_plan, rearmed));
     assert_eq!(coordinator.remaining_slots(&incident), Some(4));
-    // An allowance of the generation before it is not a rearm.
+    // An allowance of the generation before it is not a rearm, also for
+    // a plan and a record of that generation.
+    generation(Generation::new(1));
     let other = memory_plan(&bench, &incident, 4343);
     let error = refusal(
         &mut coordinator,

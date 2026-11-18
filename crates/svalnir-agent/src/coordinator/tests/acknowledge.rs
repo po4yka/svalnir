@@ -186,3 +186,44 @@ fn a_queued_acknowledgment_is_served_by_the_coordinator() {
     let second = conflicting(&bench, "plan_2", "c");
     admitted(&mut coordinator, stored_request(&second));
 }
+
+#[test]
+fn a_consumed_step_that_the_reconciliation_cannot_settle_holds_its_lease() {
+    let mut bench = Bench::new();
+    bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    bench.fail(FailPoint::RecordStep);
+    bench.fail(FailPoint::RecordOperation);
+    coordinator.step();
+    drop(coordinator);
+    bench.heal();
+    // The record of the consumed step is of a form that this build does
+    // not recognize: the reconciliation writes nothing for the step, and
+    // the operation keeps its state, which is not `UnknownOutcome`.
+    bench.fail(FailPoint::RecoveryUnrecognized);
+    let mut coordinator = bench.start();
+    coordinator.step();
+    assert!(!coordinator.reconciliation_pending());
+    let stored = open_journal(&bench.tree.database)
+        .operation(&operation_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(stored.state(), &OperationState::UnknownOutcome);
+    assert!(!stored.state().is_settled());
+
+    // The step possibly issued a call: a conflicting plan is refused as
+    // for a live lease.
+    let second = conflicting(&bench, "plan_2", "c");
+    let error = refusal(&mut coordinator, stored_request(&second));
+    assert_eq!(error.code.as_str(), code::LEASE_UNAVAILABLE);
+    assert_eq!(error.family, ErrorFamily::Limits);
+}

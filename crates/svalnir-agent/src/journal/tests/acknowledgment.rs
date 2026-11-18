@@ -134,3 +134,32 @@ fn an_acknowledgment_of_an_unknown_operation_or_of_a_different_state_is_refused(
         None
     );
 }
+
+#[test]
+fn an_acknowledged_operation_is_not_read_by_a_reconciliation() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.open();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
+    journal
+        .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
+        .unwrap();
+    let first = unknown_operation(&mut journal, "plan_1", "operation_1");
+    let second = unknown_operation(&mut journal, "plan_2", "operation_2");
+    assert_eq!(journal.unsettled_operation_count().unwrap(), 2);
+    journal
+        .acknowledge_unknown_outcome(
+            first.operation_id(),
+            &principal(),
+            wall(10),
+            &epoch("epoch_1"),
+        )
+        .unwrap();
+    // The acknowledged operation holds nothing, and it does not use the
+    // bound of a reconciliation. The other one is read.
+    assert_eq!(journal.unsettled_operation_count().unwrap(), 1);
+    let records = journal.recovery_records(16).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].operation.operation_id(), second.operation_id());
+    // The record of the acknowledged operation does not change.
+    assert_eq!(journal.operation(first.operation_id()), Ok(Some(first)));
+}

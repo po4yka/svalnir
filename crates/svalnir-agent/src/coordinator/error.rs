@@ -39,6 +39,9 @@ pub mod code {
     pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
     /// The incident of the plan has no allowance record.
     pub const INCIDENT_ALLOWANCE_MISSING: &str = "incident_allowance_missing";
+    /// The allowance of the incident is of a different budget generation
+    /// than the plan.
+    pub const INCIDENT_MISMATCH: &str = "incident_mismatch";
     /// A cooldown or a backoff of the incident is in force.
     pub const COOLDOWN_ACTIVE: &str = "cooldown_active";
     /// A different operation holds a lease on a resource of the plan.

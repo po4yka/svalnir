@@ -845,6 +845,14 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         if &given.incident_id != incident_id {
             return Err(missing);
         }
+        // The allowance of a different budget generation is not the
+        // allowance of the plan: a rearmed generation does not admit a
+        // plan of the earlier one, and the reverse.
+        if plan.trigger.budget_generation != Some(given.generation) {
+            return Err(LedgerRefusal {
+                code: code::INCIDENT_MISMATCH,
+            });
+        }
         let first_record: bool = !self.ledger.knows(incident_id, given.generation);
         // A new record reads the consumed dispatches of the journal. A
         // read that fails makes no record: the next request reads again.

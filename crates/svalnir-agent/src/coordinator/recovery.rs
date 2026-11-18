@@ -286,7 +286,18 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             }
         }
         let finished: bool = operation.state().is_settled();
-        if operation.state() == &OperationState::UnknownOutcome {
+        // A step whose dispatch was consumed and that has no settled
+        // record possibly issued a call, also when the state machine
+        // refused each result for it and the operation stays in an
+        // earlier state. Its resources are held as for `UnknownOutcome`.
+        let consumed_unsettled: bool = !finished
+            && unsettled_steps.iter().any(|recovery| {
+                recovery.dispatch_consumed
+                    && operation
+                        .step(recovery.step.step_id())
+                        .is_none_or(|step| !step.progress().state().is_settled())
+            });
+        if operation.state() == &OperationState::UnknownOutcome || consumed_unsettled {
             self.hold_unknown(&operation, plan.as_ref(), &unsettled_steps);
         } else if finished {
             self.ledger.release_unknown(operation.operation_id());

@@ -818,6 +818,49 @@ impl super::super::FilesystemExecutor for UncertainSubmission {
     }
 }
 
+/// An application executor that reports the second member of a finished
+/// step as a call whose submission is not certain, with the final effect
+/// that the executor saw. The first member keeps its recorded submission.
+#[derive(Debug)]
+pub(super) struct UncertainMember(pub(super) ProcessExecutor<Host, Host, TestClock>);
+
+fn uncertain_second_member(
+    run: crate::executor::process::StepRun,
+) -> crate::executor::process::StepRun {
+    use crate::executor::process::StepRun;
+    let StepRun::Finished(mut report) = run else {
+        return run;
+    };
+    if let Some(member) = report.members.get_mut(1) {
+        let record = member.result.clone().into_inner();
+        member.result = Checked::new(svalnir_core::action::TargetResultRecord {
+            dispatch: DispatchState::SubmissionUncertain,
+            effect: svalnir_core::action::TargetEffect::AlreadyExited,
+            attribution: svalnir_core::action::Attribution::Possible,
+            ..record
+        })
+        .unwrap();
+    }
+    StepRun::Finished(report)
+}
+
+impl super::super::ApplicationExecutor for UncertainMember {
+    fn begin(
+        &self,
+        input: crate::executor::process::StepInput<'_>,
+    ) -> Result<crate::executor::process::StepRun, crate::executor::process::ExecutorError> {
+        self.0.begin(input).map(uncertain_second_member)
+    }
+
+    fn poll(
+        &self,
+        observation: Box<crate::executor::process::Observation>,
+        stop: Option<crate::executor::process::StopRequest>,
+    ) -> Result<crate::executor::process::StepRun, crate::executor::process::ExecutorError> {
+        observation.poll(&self.0, stop).map(uncertain_second_member)
+    }
+}
+
 /// A Trash backend that moves an entry to a directory of the fixture. It
 /// refuses each path outside the temporary directory.
 #[derive(Debug)]
@@ -1151,6 +1194,10 @@ pub(super) enum FailPoint {
     /// the position `Submitted`, so that the result of the evidence does
     /// not agree with the step: the state machine refuses it.
     RecoveryAsSubmitted,
+    /// `recovery_records` gives each consumed dispatch with no outcome
+    /// the position `Unrecognized`: the reconciliation writes nothing for
+    /// the step, and the operation stays in its state.
+    RecoveryUnrecognized,
     /// `incident_usage` finds the journal locked.
     IncidentUsageBusy,
     /// The storage of the journal fails in `incident_usage`.
@@ -1322,6 +1369,21 @@ impl CoordinatorJournal for FailingJournal {
                 }
             }
         }
+        if self
+            .failing
+            .lock()
+            .unwrap()
+            .contains(&FailPoint::RecoveryUnrecognized)
+        {
+            for step in records
+                .iter_mut()
+                .flat_map(|record| &mut record.unsettled_steps)
+            {
+                if step.position == RecoveryPosition::DispatchConsumed {
+                    step.position = RecoveryPosition::Unrecognized;
+                }
+            }
+        }
         Ok(records)
     }
 
@@ -1444,6 +1506,9 @@ pub(super) struct Bench {
     pub(super) trash_mode: TrashMode,
     /// The filesystem executor reports each submission as not certain.
     pub(super) uncertain_submission: bool,
+    /// The application executor reports the submission of the second
+    /// member of each finished step as not certain.
+    pub(super) uncertain_member: bool,
     lifetimes: u32,
 }
 
@@ -1476,6 +1541,7 @@ impl Bench {
             after_consume: Arc::new(Mutex::new(Hook::default())),
             trash_mode,
             uncertain_submission: false,
+            uncertain_member: false,
             lifetimes: 0,
         }
     }
@@ -1514,13 +1580,20 @@ impl Bench {
                 Box::new(self.tree.executor(self.trash_mode))
             },
             roots: self.tree.roots(),
-            application: Box::new(ProcessExecutor::new(
-                self.host.clone(),
-                self.host.clone(),
-                self.clock.clone(),
-                context,
-                ExecutorConfig::default(),
-            )),
+            application: {
+                let executor = ProcessExecutor::new(
+                    self.host.clone(),
+                    self.host.clone(),
+                    self.clock.clone(),
+                    context,
+                    ExecutorConfig::default(),
+                );
+                if self.uncertain_member {
+                    Box::new(UncertainMember(executor))
+                } else {
+                    Box::new(executor)
+                }
+            },
             probe: Box::new(self.host.clone()),
         }
     }

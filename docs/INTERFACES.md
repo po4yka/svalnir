@@ -228,6 +228,7 @@ A refusal of the coordinator or of the authorization keeps its own code and fami
 | `rearm_not_recorded` | `recording` | The agent did not record its controller record with the new budget generation. The earlier generation stays in effect |
 | `agent_not_running` | `evidence` | A coordinator of a client claimed a rearm request. Only the controller of an agent records a budget generation |
 | `incident_allowance_missing` | `limits` | An automatic plan has no incident allowance: it did not come from the controller of the agent |
+| `incident_mismatch` | `request` | The budget record or the incident allowance of an automatic plan is of a different incident or budget generation than the plan. Nothing is reserved |
 | `reconcile_before_force` | `outcome` | The effect of the graceful step is not known, so no force step is dispatched before a reconciliation |
 | `approved_root_mismatch` | `evidence` | A root record of the executing process has the identity of the root of a file target and a different path or object. The target is skipped with no call |
 | `root_not_local` | `eligibility` | From the filesystem executor: the mount table reports the filesystem of the root of a file target as not local (a network filesystem or an automounter map). The target is skipped with no call ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7) |

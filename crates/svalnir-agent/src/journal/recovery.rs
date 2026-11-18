@@ -10,7 +10,7 @@ use svalnir_core::action::{Operation, RequestEnvelope, Step, StepState};
 use svalnir_core::id::{ExecutorEpochId, IncidentId, OperationId, StepId};
 
 use super::error::OperationJournalError;
-use super::{OperationJournal, decode, durable, row};
+use super::{OperationJournal, decode, row};
 
 /// The last trustworthy record of a step that is not settled, as the
 /// recovery matrix of `docs/ACTION_CONTRACTS.md` section 12 names it.
@@ -88,10 +88,36 @@ fn position_of(step: &Step, dispatch_consumed: bool) -> RecoveryPosition {
     }
 }
 
+/// The row identities of the operations that a reconciliation reads, the
+/// oldest first, to a maximum of `limit`: each operation that is not
+/// settled and that no user acknowledged.
+///
+/// An acknowledged operation stays `UnknownOutcome` and holds nothing, so
+/// a reconciliation has no work for it. It is not in the list, so that the
+/// acknowledged operations do not use the bound of a reconciliation.
+fn reconcilable_rows(
+    connection: &rusqlite::Connection,
+    limit: usize,
+) -> Result<Vec<i64>, OperationJournalError> {
+    let limit: i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(
+        "SELECT seq FROM operation WHERE settled = 0 \
+         AND seq NOT IN (SELECT operation_seq FROM operation_acknowledgment) \
+         ORDER BY seq LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| row.get(0))?;
+    let mut sequence: Vec<i64> = Vec::new();
+    for seq in rows {
+        sequence.push(seq?);
+    }
+    Ok(sequence)
+}
+
 impl OperationJournal {
-    /// Reads the operations that are not settled, the oldest first, to a
-    /// maximum of `limit`, each with its stop fence and with the intent
-    /// and the dispatch consumption of each step that is not settled.
+    /// Reads the operations that are not settled and not acknowledged,
+    /// the oldest first, to a maximum of `limit`, each with its stop fence
+    /// and with the intent and the dispatch consumption of each step that
+    /// is not settled.
     ///
     /// # Errors
     ///
@@ -106,7 +132,7 @@ impl OperationJournal {
     ) -> Result<Vec<RecoveryRecord>, OperationJournalError> {
         let transaction = self.read_transaction()?;
         let mut records: Vec<RecoveryRecord> = Vec::new();
-        for seq in durable::unsettled_rows(&transaction, limit)? {
+        for seq in reconcilable_rows(&transaction, limit)? {
             let operation: Operation = row::load_operation(&transaction, seq)?;
             let stop_fence: bool = row::find_operation(&transaction, operation.operation_id())?
                 .ok_or(OperationJournalError::row("operation", "operation_id"))?
@@ -141,16 +167,18 @@ impl OperationJournal {
         Ok(records)
     }
 
-    /// The number of operations that are not settled. A caller compares
-    /// it with the length of a list that it read with a limit, so that a
-    /// list that is not complete is not taken as complete.
+    /// The number of operations that are not settled and not
+    /// acknowledged: the operations of [`OperationJournal::recovery_records`].
+    /// A caller compares it with the length of a list that it read with a
+    /// limit, so that a list that is not complete is not taken as complete.
     ///
     /// # Errors
     ///
     /// Returns a storage error.
     pub fn unsettled_operation_count(&self) -> Result<u64, OperationJournalError> {
         let count: i64 = self.connection.query_row(
-            "SELECT count(*) FROM operation WHERE settled = 0",
+            "SELECT count(*) FROM operation WHERE settled = 0 \
+             AND seq NOT IN (SELECT operation_seq FROM operation_acknowledgment)",
             [],
             |row| row.get(0),
         )?;

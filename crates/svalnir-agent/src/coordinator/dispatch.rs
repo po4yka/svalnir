@@ -864,11 +864,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         if possibly && let (Some(unused), Some(charge)) = (active.unused, charge) {
             active.unused = unused.checked_sub(charge);
         }
-        // With no recorded submission the step has no `Verifying` record,
-        // and an effect that the executor saw is not the known effect of a
-        // call: a result whose submission is not certain is
-        // `UnknownOutcome` (`docs/ACTION_CONTRACTS.md` section 6).
-        let results: Vec<TargetResult> = if possibly && !submitted && !verifying {
+        // An effect that the executor saw after a call whose submission is
+        // not certain is not the known effect of that call: each such
+        // result is `UnknownOutcome` (`docs/ACTION_CONTRACTS.md` section
+        // 6). This is also true for one member of a step whose other
+        // members have a recorded submission; the aggregation of section 9
+        // then gives the step its state.
+        let results: Vec<TargetResult> = if possibly {
             results
                 .into_iter()
                 .map(|result| uncertain_as_unknown(active, step, result))

@@ -394,3 +394,28 @@ fn a_graceful_result_that_needs_reconciliation_gives_no_force_dispatch() {
     );
     assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
 }
+
+#[test]
+fn a_member_with_an_uncertain_submission_and_a_final_effect_is_unknown_in_a_submitted_step() {
+    let mut bench = Bench::new();
+    bench.uncertain_member = true;
+    let members = vec![bench.host.spawn(4242), bench.host.spawn(4343)];
+    for process in [4242, 4343] {
+        bench.host.world().exits_on_term.insert(process);
+    }
+    let plan = stop_plan("plan_1", members, Escalation::None, bench.clock.now());
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+
+    // The first member has a recorded submission, so the step went through
+    // `Verifying`. The second member exited after a call whose submission
+    // is not certain: its exit is not the known effect of that call.
+    let results = view.operation.steps()[0].results();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].dispatch, DispatchState::Submitted);
+    assert_eq!(results[1].dispatch, DispatchState::SubmissionUncertain);
+    assert_eq!(results[1].effect, TargetEffect::UnknownOutcome);
+    assert_ne!(view.operation.state(), &OperationState::Completed);
+}

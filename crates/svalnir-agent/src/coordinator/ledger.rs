@@ -95,12 +95,13 @@ impl LedgerRefusal {
     }
 
     /// The error family of the refusal: `recording` for a read of the
-    /// journal that a lock prevented, and `limits` for each other code.
+    /// journal that a lock prevented, `request` for an allowance of a
+    /// different budget generation, and `limits` for each other code.
     pub(super) fn family(self) -> ErrorFamily {
-        if self.code == code::ADMISSION_NOT_RECORDED {
-            ErrorFamily::Recording
-        } else {
-            ErrorFamily::Limits
+        match self.code {
+            code::ADMISSION_NOT_RECORDED => ErrorFamily::Recording,
+            code::INCIDENT_MISMATCH => ErrorFamily::Request,
+            _ => ErrorFamily::Limits,
         }
     }
 }

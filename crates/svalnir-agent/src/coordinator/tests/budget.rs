@@ -377,6 +377,27 @@ fn a_rearmed_generation_survives_a_restart_with_its_own_allowance_only() {
 }
 
 #[test]
+fn an_allowance_of_a_different_generation_than_the_plan_is_refused() {
+    use svalnir_core::authority::Generation;
+
+    let mut bench = Bench::new();
+    let incident = incident_id("incident_1");
+    bench.authority.open_incident(&incident, bench.clock.now());
+    let mut coordinator = bench.start();
+    let epoch = coordinator.executor_epoch().clone();
+    // The plan and the record of the incident have the first generation.
+    // The allowance names the second one, which has no usage.
+    let plan = plan_for(&bench, &incident, 4242);
+    let mut given = allowance(&incident, &epoch, 1);
+    given.generation = Generation::new(2);
+    let error = refusal(&mut coordinator, automatic_request(&plan, given));
+    assert_eq!(error.code.as_str(), code::INCIDENT_MISMATCH);
+    assert_eq!(error.family, ErrorFamily::Request);
+    assert_eq!(coordinator.remaining_slots(&incident), None);
+    assert_eq!(bench.host.calls().len(), 0);
+}
+
+#[test]
 fn a_plan_of_an_earlier_generation_is_refused_after_a_rearm() {
     use svalnir_core::authority::Generation;
 

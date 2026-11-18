@@ -37,7 +37,7 @@ use super::native::is_locked_by_another_process;
 use super::overlap::{OverlapKind, resolve_overlaps};
 use super::plist::parse_project_info;
 use super::registry::{ClaimError, ReviewedRules};
-use super::unit::entry_owner_and_change;
+use super::unit::entry_change;
 use super::xcode::{
     ProducerProcesses, XCODE_DERIVED_DATA_LAYOUT, XcodeDerivedDataRule, XcodeEvidence,
 };
@@ -2007,33 +2007,55 @@ fn a_file_below_a_unit_that_was_written_in_place_is_the_newest_time_of_the_unit(
 }
 
 #[test]
-fn the_owner_and_the_identity_of_each_entry_below_a_unit_are_examined() {
-    let directory = tempfile::tempdir().unwrap();
-    let file = directory.path().join("object.o");
-    fs::write(&file, b"object").unwrap();
-    let owner = Uid::new(fs::metadata(&file).unwrap().uid());
-    let object = object_of(&file);
-
-    let change = entry_owner_and_change(&file, object, owner).unwrap();
-    assert!(change <= real_now_plus(60));
-    assert!(change >= real_now_plus(-60));
-    // An entry of another owner is not data of the user of the discovery.
-    let other = Uid::new(owner.get().wrapping_add(1));
+fn the_owner_and_the_times_of_an_entry_below_a_unit_come_from_the_record_of_the_scan() {
+    let owner = Uid::new(501);
+    let time = |seconds: i64| WallTime::from_unix(seconds, 0).unwrap();
+    let path = Path::new("/unit/object.o");
+    let entry = crate::scan::EntryRecord {
+        path,
+        kind: crate::scan::EntryKind::File,
+        depth: 1,
+        logical_bytes: Some(svalnir_core::quantity::Bytes::new(6)),
+        allocated_bytes: Some(svalnir_core::quantity::Bytes::new(4096)),
+        link_count: 1,
+        object: FileObjectEvidence {
+            device: DeviceNumber::new(1),
+            inode: InodeNumber::new(7),
+        },
+        counted_in_totals: true,
+        owner,
+        modified: Some(time(1_794_830_400)),
+        changed: Some(time(1_794_830_460)),
+    };
+    // The newer of the two times is the change of the entry. No file has
+    // the path: the function reads the record and not the filesystem.
+    assert_eq!(entry_change(&entry, owner), Ok(time(1_794_830_460)));
+    let modified_later = crate::scan::EntryRecord {
+        modified: Some(time(1_794_830_520)),
+        ..entry
+    };
     assert_eq!(
-        entry_owner_and_change(&file, object, other),
+        entry_change(&modified_later, owner),
+        Ok(time(1_794_830_520))
+    );
+    // An entry of another owner is not data of the user of the discovery.
+    assert_eq!(
+        entry_change(&entry, Uid::new(502)),
         Err(SkipReason::WrongOwner)
     );
-    // Another object at the path is not the object that was measured.
-    let directory_object = object_of(directory.path());
-    assert_eq!(
-        entry_owner_and_change(&file, directory_object, owner),
-        Err(SkipReason::IdentityChanged)
-    );
-    fs::remove_file(&file).unwrap();
-    assert_eq!(
-        entry_owner_and_change(&file, object, owner),
-        Err(SkipReason::Vanished)
-    );
+    // A time that is not valid gives no age.
+    for no_time in [
+        crate::scan::EntryRecord {
+            modified: None,
+            ..entry
+        },
+        crate::scan::EntryRecord {
+            changed: None,
+            ..entry
+        },
+    ] {
+        assert_eq!(entry_change(&no_time, owner), Err(SkipReason::AgeUnknown));
+    }
 }
 
 #[test]

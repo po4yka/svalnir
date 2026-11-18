@@ -14,6 +14,7 @@ use svalnir_core::observation::{
     Coverage, MetricId, MetricIdError, MetricKind, Observation, Reading, Sample, Scope, Source,
     UnavailableReason, Unit,
 };
+use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use svalnir_core::volume::VolumeIdentity;
@@ -212,6 +213,14 @@ pub struct EntryRecord<'a> {
     /// Whether the sizes of this entry are in the totals. This is `false`
     /// for a second or later name of a hard-linked object.
     pub counted_in_totals: bool,
+    /// `st_uid`: the owner of the object.
+    pub owner: Uid,
+    /// `st_mtime`: the time of the last modification. `None` when the
+    /// time is outside the range of [`WallTime`].
+    pub modified: Option<WallTime>,
+    /// `st_ctime`: the time of the last status change. `None` when the
+    /// time is outside the range of [`WallTime`].
+    pub changed: Option<WallTime>,
 }
 
 #[cfg(unix)]

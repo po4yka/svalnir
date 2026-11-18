@@ -106,13 +106,6 @@ impl ObjectSnapshot {
         WallTime::from_unix(self.stamp.modified_seconds, nanoseconds).ok()
     }
 
-    /// The time of the last status change (`st_ctime`). `None` when the
-    /// time is outside the range of [`WallTime`].
-    pub(super) fn changed(&self) -> Option<WallTime> {
-        let nanoseconds: u32 = u32::try_from(self.stamp.changed_nanoseconds).ok()?;
-        WallTime::from_unix(self.stamp.changed_seconds, nanoseconds).ok()
-    }
-
     /// The object type of a plan target. `None` for a kind that no rule
     /// removes.
     pub(super) fn object_type(&self) -> Option<FileObjectType> {
@@ -484,32 +477,23 @@ struct UnitObserver<'a> {
     newest_change: Option<WallTime>,
 }
 
-/// Reads the owner and the times of one measured entry below a unit.
+/// Examines the owner and the times of one measured entry below a unit.
 ///
-/// The record of the scanner has the identity of the entry and neither its
-/// owner nor its times. The read is by path and does not follow a link at
-/// the last component; the identity ties the result to the object that the
-/// scanner measured. Returns the newer of the modification time and the
+/// The values are those of the record of the scanner: one `fstatat` gave
+/// them with the identity and the sizes of the entry, so they are of the
+/// object that the scanner measured, and no second read by path is
+/// necessary. Returns the newer of the modification time and the
 /// status-change time.
 ///
 /// # Errors
 ///
-/// Returns the reason that the unit cannot be a candidate: the entry is
-/// absent or cannot be read, another object has the path, the owner is not
-/// `owner`, or a time is not valid.
-pub(super) fn entry_owner_and_change(
-    path: &Path,
-    object: FileObjectEvidence,
-    owner: Uid,
-) -> Result<WallTime, SkipReason> {
-    let snapshot: ObjectSnapshot = lstat(path).map_err(|error| reason_of(&error))?;
-    if snapshot.object != object {
-        return Err(SkipReason::IdentityChanged);
-    }
-    if snapshot.owner != owner {
+/// Returns the reason that the unit cannot be a candidate: the owner is
+/// not `owner`, or a time is not valid.
+pub(super) fn entry_change(entry: &EntryRecord<'_>, owner: Uid) -> Result<WallTime, SkipReason> {
+    if entry.owner != owner {
         return Err(SkipReason::WrongOwner);
     }
-    match (snapshot.modified(), snapshot.changed()) {
+    match (entry.modified, entry.changed) {
         (Some(modified), Some(changed)) => Ok(modified.max(changed)),
         _ => Err(SkipReason::AgeUnknown),
     }
@@ -548,7 +532,7 @@ impl ScanObserver for UnitObserver<'_> {
             }
             EntryKind::File | EntryKind::Directory | EntryKind::Symlink => {}
         }
-        match entry_owner_and_change(entry.path, entry.object, self.owner) {
+        match entry_change(entry, self.owner) {
             Ok(change) => {
                 self.newest_change = Some(
                     self.newest_change

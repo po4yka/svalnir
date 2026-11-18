@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath, PathError};
 use svalnir_core::observation::Coverage;
+use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
+use svalnir_core::time::WallTime;
 
 use super::control::{CancellationToken, ScanClock, ScanObserver};
 use super::model::{
@@ -399,6 +401,9 @@ impl Walker<'_> {
             link_count: metadata.link_count,
             object,
             counted_in_totals,
+            owner: Uid::new(metadata.owner),
+            modified: wall_time_of(metadata.modified),
+            changed: wall_time_of(metadata.changed),
         });
 
         match (metadata.kind, logical, allocated) {
@@ -602,6 +607,13 @@ fn root_error(error: io::Error) -> ScanError {
     } else {
         ScanError::RootUnavailable(error)
     }
+}
+
+/// The wall-clock time of a `stat` time, as seconds and nanoseconds.
+/// `None` when the nanoseconds are not below one second, or when the time
+/// is outside the range of [`WallTime`].
+fn wall_time_of((seconds, nanoseconds): (i64, i64)) -> Option<WallTime> {
+    WallTime::from_unix(seconds, u32::try_from(nanoseconds).ok()?).ok()
 }
 
 /// Scans one root directory and returns the result.

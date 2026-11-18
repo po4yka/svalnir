@@ -19,6 +19,7 @@ use svalnir_core::id::{
 use svalnir_core::observation::{
     Coverage, Reading, Sample, ScopeKind, Source, UnavailableReason, Unit,
 };
+use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount};
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use svalnir_core::volume::{CapacityDomainMembership, VolumeIdentity};
@@ -330,6 +331,57 @@ impl ScanObserver for Recorder {
             directory.entries.get(),
             directory.coverage.clone(),
         ));
+    }
+}
+
+/// An observer that keeps the owner and the times of each entry.
+#[derive(Default)]
+struct Owners {
+    entries: Vec<(PathBuf, Uid, Option<WallTime>, Option<WallTime>)>,
+}
+
+impl ScanObserver for Owners {
+    fn entry_measured(&mut self, entry: &EntryRecord<'_>) {
+        self.entries.push((
+            entry.path.to_path_buf(),
+            entry.owner,
+            entry.modified,
+            entry.changed,
+        ));
+    }
+}
+
+#[test]
+fn an_entry_record_has_the_owner_and_the_times_of_its_object() {
+    let tree = TempTree::new("owner");
+    tree.file("f.bin", 10);
+    tree.dir("sub");
+    symlink("f.bin", tree.path("link")).unwrap();
+
+    let mut owners = Owners::default();
+    let result: ScanResult = scan_observed(&tree.root, &mut owners);
+    assert_complete(&result);
+    assert_eq!(owners.entries.len(), 3);
+    for (path, owner, modified, changed) in owners.entries {
+        // The values are those of the object itself: a symbolic link is
+        // not followed.
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let time = |seconds: i64, nanoseconds: i64| {
+            WallTime::from_unix(seconds, u32::try_from(nanoseconds).unwrap()).unwrap()
+        };
+        assert_eq!(owner, Uid::new(metadata.uid()), "{}", path.display());
+        assert_eq!(
+            modified,
+            Some(time(metadata.mtime(), metadata.mtime_nsec())),
+            "{}",
+            path.display()
+        );
+        assert_eq!(
+            changed,
+            Some(time(metadata.ctime(), metadata.ctime_nsec())),
+            "{}",
+            path.display()
+        );
     }
 }
 

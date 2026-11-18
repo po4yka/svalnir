@@ -52,6 +52,12 @@ pub(super) struct RawMetadata {
     pub(super) dataless: bool,
     /// Whether the file is compressed by the filesystem (`UF_COMPRESSED`).
     pub(super) compressed: bool,
+    /// `st_uid`.
+    pub(super) owner: u32,
+    /// `st_mtime` and `st_mtime_nsec`. The caller validates the values.
+    pub(super) modified: (i64, i64),
+    /// `st_ctime` and `st_ctime_nsec`. The caller validates the values.
+    pub(super) changed: (i64, i64),
 }
 
 /// `SF_DATALESS` of `<sys/stat.h>` in the macOS SDK. The `libc` crate does
@@ -104,6 +110,9 @@ fn metadata_from(stat: &libc::stat) -> RawMetadata {
         inode: stat.st_ino,
         dataless,
         compressed,
+        owner: stat.st_uid,
+        modified: (stat.st_mtime, stat.st_mtime_nsec),
+        changed: (stat.st_ctime, stat.st_ctime_nsec),
     }
 }
 

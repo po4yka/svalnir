@@ -1784,3 +1784,90 @@ fn a_journal_prune_keeps_the_operations_of_an_open_incident() {
     state.memory_incident = Some(unknown);
     assert_eq!(journal_prune_cutoff(retention_cutoff, &state), None);
 }
+
+/// Ticks with the critical samples of the child `ticks` times, with a wake
+/// at the tick `wake` when that has a value. Returns the driver.
+fn critical_ticks(
+    bench: &mut Bench,
+    member: &ProcessIdentity,
+    ticks: usize,
+    wake: Option<usize>,
+) -> Box<Driver> {
+    let mut driver = bench.start();
+    for index in 0..ticks {
+        let mut made: Sample = child_sample(bench, member);
+        made.woke = wake == Some(index);
+        driver.tick(Some(made));
+        bench.clock.advance(SAMPLE);
+    }
+    driver
+}
+
+#[test]
+fn a_wake_starts_the_window_of_the_memory_guard_again() {
+    // Control: six critical samples with no wake qualify the window of
+    // 15 seconds, and the controller has a plan in progress.
+    let mut control = Bench::new(TestClock::host(), validated_registry());
+    control.seed_authority();
+    let child = spawn_child(true);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let driver = critical_ticks(&mut control, &member, 6, None);
+    assert!(driver.controller_state().outstanding.is_some());
+    drop(driver);
+    drop(child);
+
+    // The same six samples with a wake at the fourth one: the window of
+    // before the sleep does not continue, so no plan is made.
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    bench.seed_authority();
+    let mut child = spawn_child(true);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let driver = critical_ticks(&mut bench, &member, 6, Some(3));
+    assert!(driver.controller_state().outstanding.is_none());
+    assert_eq!(phase(&driver, Guard::Memory), GuardPhase::Qualifying);
+    assert!(child.is_running());
+}
+
+#[test]
+fn a_queued_request_at_a_restart_is_served_only_after_the_reconciliation() {
+    let mut bench = Bench::new(TestClock::host(), validated_registry());
+    bench.seed_authority();
+    let file: PathBuf = bench.file("client-file");
+    let mut child = spawn_child(true);
+    let member: ProcessIdentity = child_identity(child.pid());
+    let mut driver = bench.start();
+    let operation_id: OperationId = run_to_operation(&bench, &mut driver, &member);
+    bench.clock.advance(SECOND);
+    driver.tick(None);
+    // The crash, and a client request that is queued after it.
+    drop(driver);
+    let plan: Plan = trash_plan(&bench, "client-file");
+    let mut client = bench.journal();
+    client.record_plan(&plan).unwrap();
+    let request = apply_request(&plan, "request-1", bench.clock.now());
+    client.enqueue_request(&request).unwrap();
+
+    // The start reconciles the operation of the lifetime before it. The
+    // request is not served in the start.
+    let mut driver = bench.start();
+    let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
+    assert_ne!(operation.state(), &OperationState::Admitted);
+    assert!(file.exists());
+    assert_eq!(
+        client.request_status(&request.request_id).unwrap(),
+        Some(RequestStatus::Queued)
+    );
+    // The next ticks serve it, and the old operation stays settled.
+    for _ in 0..3 {
+        driver.tick(None);
+        bench.clock.advance(SAMPLE);
+    }
+    assert!(!file.exists());
+    assert_ne!(
+        client.request_status(&request.request_id).unwrap(),
+        Some(RequestStatus::Queued)
+    );
+    let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
+    assert_ne!(operation.state(), &OperationState::Admitted);
+    assert!(child.is_running());
+}

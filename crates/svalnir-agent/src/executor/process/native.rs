@@ -124,3 +124,29 @@ impl ProcessControl for DarwinProcessControl {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use svalnir_core::process::Pid;
+
+    use super::DarwinProcessControl;
+    use crate::executor::process::control::{
+        GracefulSignal, ProcessControl as _, ProcessSignal, SignalResult,
+    };
+
+    /// The guard returns before the call to `kill`, so the test signals
+    /// nothing.
+    #[test]
+    fn the_signal_of_process_one_is_refused_before_any_system_call() {
+        let pid: Pid = Pid::new(1).unwrap();
+        for signal in [
+            ProcessSignal::Graceful(GracefulSignal::Terminate),
+            ProcessSignal::Kill,
+        ] {
+            assert_eq!(
+                DarwinProcessControl.signal(pid, signal),
+                SignalResult::InvalidTarget
+            );
+        }
+    }
+}

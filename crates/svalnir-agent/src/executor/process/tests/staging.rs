@@ -672,6 +672,84 @@ fn a_force_step_checks_the_identity_again() {
 }
 
 #[test]
+fn a_force_step_needs_the_protection_fact_and_the_same_owner_and_path() {
+    type Change = fn(&Host);
+    // The protection fact of the caller is necessary for the force step.
+    for (fact, expected, family) in [
+        (
+            ProtectionFact::Protected,
+            code::TARGET_PROTECTED,
+            ErrorFamily::Eligibility,
+        ),
+        (
+            ProtectionFact::Unknown,
+            code::TARGET_PROTECTION_UNKNOWN,
+            ErrorFamily::Eligibility,
+        ),
+    ] {
+        let host: Host = Host::new().with_process(100, 10);
+        let members = vec![member(100, 10, job())];
+        let report = graceful_step_to_the_end(&host, members.clone());
+        let results = report.results();
+        let envelope = force(Escalation::ForceAfterGrace, members);
+        let receipt = receipt();
+        let denied = StepInput {
+            protection: fact,
+            ..force_input(&envelope, &receipt, &report, &results)
+        };
+        let forced = finished(host.executor().begin(denied).unwrap());
+        assert_eq!(forced.members[0].result.effect, TargetEffect::Skipped);
+        assert_eq!(code_of(&forced.members[0].result), expected);
+        assert_eq!(family_of(&forced.members[0].result), &family);
+        assert_eq!(host.calls(), vec![NativeCall::Signal(100, TERM)]);
+    }
+
+    // The owner or the executable changed after the graceful step.
+    let cases: [(Change, &str); 2] = [
+        (
+            |host| host.change(|world| world.processes.get_mut(&100).unwrap().effective_uid = 0),
+            code::PROCESS_OWNER_CHANGED,
+        ),
+        (
+            |host| {
+                host.change(|world| {
+                    world.processes.get_mut(&100).unwrap().path = "/opt/other".to_owned();
+                });
+            },
+            code::PROCESS_EXECUTABLE_CHANGED,
+        ),
+    ];
+    for (change, expected) in cases {
+        let host: Host = Host::new().with_process(100, 10);
+        let members = vec![member(100, 10, job())];
+        let report = graceful_step_to_the_end(&host, members.clone());
+        let results = report.results();
+        change(&host);
+        let envelope = force(Escalation::ForceAfterGrace, members);
+        let receipt = receipt();
+        let forced = finished(
+            host.executor()
+                .begin(force_input(&envelope, &receipt, &report, &results))
+                .unwrap(),
+        );
+        assert_eq!(forced.members[0].result.effect, TargetEffect::Skipped);
+        assert_eq!(code_of(&forced.members[0].result), expected);
+        assert_eq!(host.calls(), vec![NativeCall::Signal(100, TERM)]);
+    }
+}
+
+#[test]
+fn a_zombie_after_the_call_is_an_exit() {
+    let host: Host = Host::new().with_process(100, 10);
+    let envelope = graceful(Escalation::None, vec![member(100, 10, job())]);
+    let observation = observing(begin(&host, &envelope));
+    host.change(|world| world.processes.get_mut(&100).unwrap().zombie = true);
+    let report = finished(poll(&host, observation, None));
+    assert_eq!(report.members[0].result.effect, TargetEffect::ExitVerified);
+    assert_eq!(host.calls(), vec![NativeCall::Signal(100, TERM)]);
+}
+
+#[test]
 fn a_force_step_acts_only_on_a_member_that_a_request_left_running() {
     // 100 exits in the grace period, 101 runs, and 102 was replaced before
     // the graceful request.

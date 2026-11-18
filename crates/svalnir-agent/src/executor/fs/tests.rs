@@ -97,6 +97,7 @@ struct Fixture {
     trash: PathBuf,
     home: PathBuf,
     outside_before: Vec<(PathBuf, u64, u64)>,
+    home_before: Vec<(PathBuf, u64, u64)>,
 }
 
 impl Fixture {
@@ -116,6 +117,7 @@ impl Fixture {
         fs::create_dir(outside.join("dir")).unwrap();
         fs::write(outside.join("dir").join("inner.txt"), b"inner").unwrap();
         let outside_before = listing(&outside);
+        let home_before = listing(&home);
         Self {
             _temp: temp,
             base,
@@ -124,6 +126,7 @@ impl Fixture {
             trash,
             home,
             outside_before,
+            home_before,
         }
     }
 
@@ -135,8 +138,14 @@ impl Fixture {
             fs::read(self.outside.join("keep.txt")).unwrap(),
             b"keep".to_vec()
         );
-        assert!(self.home.is_dir());
+        assert_eq!(listing(&self.home), self.home_before);
         assert!(self.root.is_dir());
+    }
+
+    /// Takes the present content of the home directory as the content that
+    /// the test expects to stay, after the test made its own files there.
+    fn record_home(&mut self) {
+        self.home_before = listing(&self.home);
     }
 
     fn approved_root(&self) -> ApprovedRoot {
@@ -2115,13 +2124,14 @@ fn the_home_directory_and_each_directory_that_contains_it_are_refused() {
 fn the_home_directory_is_refused_under_another_name() {
     // The approved root is the directory that contains the home directory
     // of the fixture.
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let mut root: ApprovedRoot = fixture.approved_root();
     root.path = LosslessPath::from_path(&fixture.base).unwrap();
     root.object = object_of(&fixture.base);
     let roots = ApprovedRoots::new(vec![root.clone()]).unwrap();
     let home_object: FileObjectEvidence = object_of(&fixture.home);
     fs::write(fixture.home.join("letter.txt"), b"letter").unwrap();
+    fixture.record_home();
     let executor = fixture.executor();
 
     for class in ActionClass::ALL

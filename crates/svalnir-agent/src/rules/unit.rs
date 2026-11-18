@@ -320,10 +320,19 @@ pub(super) struct RootView {
 
 /// Each path of `list` as given, and its resolved form when that form is
 /// different. A path that cannot be resolved stays as given.
-fn with_resolved_forms(list: &[PathBuf]) -> Vec<PathBuf> {
+///
+/// Only a path whose text the mount table shows on a local filesystem is
+/// resolved: the resolution calls the filesystem of each component, and a
+/// call on a network filesystem or an automounter map can wait or start
+/// a mount. A path that is not local, or whose locality is not known,
+/// stays as given.
+pub(super) fn with_resolved_forms(list: &[PathBuf], mounts: &MountTable) -> Vec<PathBuf> {
     let mut forms: Vec<PathBuf> = Vec::with_capacity(list.len());
     for path in list {
         forms.push(path.clone());
+        if mounts.path_locality(path) != Locality::Local {
+            continue;
+        }
         if let Ok(resolved) = fs::canonicalize(path)
             && &resolved != path
         {
@@ -373,7 +382,7 @@ impl RootView {
         if fs::canonicalize(path).as_deref().ok() != Some(path) {
             return Err(DiscoveryError::RootPath);
         }
-        let protected: Vec<PathBuf> = with_resolved_forms(scope.protected_paths);
+        let protected: Vec<PathBuf> = with_resolved_forms(scope.protected_paths, mounts);
         if protected.iter().any(|entry| overlaps(path, entry)) {
             return Err(DiscoveryError::RootOverlapsProtected);
         }
@@ -390,7 +399,7 @@ impl RootView {
             path: path.to_path_buf(),
             snapshot,
             protected,
-            excluded: with_resolved_forms(scope.user_exclusions),
+            excluded: with_resolved_forms(scope.user_exclusions, mounts),
         })
     }
 

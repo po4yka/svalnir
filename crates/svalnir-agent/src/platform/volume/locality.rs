@@ -32,7 +32,8 @@ use super::raw::{MOUNT_FLAG_LOCAL, RawMount};
 
 /// The mount point of the data volume of macOS. A firmlink shows each
 /// directory of that volume also at the same path below `/`, so a mount
-/// point below it has a second path.
+/// point below it has a second path, and a mount point below a firmlink
+/// of `/` has a second path below it.
 const DATA_VOLUME: &[u8] = b"/System/Volumes/Data";
 
 /// The filesystem type of the automounter. A lookup below one of its
@@ -104,7 +105,8 @@ impl MountTable {
 
     /// The locality of the mount whose mount point is the longest prefix of
     /// the text of `path`, by whole components. A mount point below the
-    /// data volume is also compared at its firmlink path below `/`. The
+    /// data volume is also compared at its firmlink path below `/`, and a
+    /// mount point below `/` also at its path below the data volume. The
     /// query makes no call on the path.
     ///
     /// The text does not show a symbolic link in the path: the caller also
@@ -117,11 +119,21 @@ impl MountTable {
         // mount is local.
         let mut best: Option<(usize, bool)> = None;
         for raw in &self.mounts {
-            let firmlink: Option<&[u8]> = raw
-                .mount_point
+            let point: &[u8] = raw.mount_point.as_slice();
+            // The firmlinks go in the two directions: a mount point below
+            // the data volume has a second path below `/`, and a mount
+            // point below `/` (for example `/Volumes/NAS`) has a second path
+            // below the data volume.
+            let below_data: Option<&[u8]> = point
                 .strip_prefix(DATA_VOLUME)
                 .filter(|rest| rest.starts_with(b"/"));
-            for point in std::iter::once(raw.mount_point.as_slice()).chain(firmlink) {
+            let in_data: Option<Vec<u8>> = (below_data.is_none()
+                && point.starts_with(b"/")
+                && point != b"/"
+                && point != DATA_VOLUME)
+                .then(|| [DATA_VOLUME, point].concat());
+            let alias: Option<&[u8]> = below_data.or(in_data.as_deref());
+            for point in std::iter::once(point).chain(alias) {
                 let point: &Path = Path::new(OsStr::from_bytes(point));
                 if !point.is_absolute() || !path.starts_with(point) {
                     continue;
@@ -197,6 +209,20 @@ mod tests {
         assert_eq!(locality("/System/Volumes/Data/home/me"), Locality::NotLocal);
         // The firmlink path of a mount point below the data volume.
         assert_eq!(locality("/home/me/App"), Locality::NotLocal);
+        // The data-volume path of a mount point below `/`.
+        assert_eq!(
+            locality("/System/Volumes/Data/Volumes/Share/App"),
+            Locality::NotLocal
+        );
+        assert_eq!(
+            locality("/System/Volumes/Data/net/host/App"),
+            Locality::NotLocal
+        );
+        assert_eq!(
+            locality("/System/Volumes/Data/Volumes/External/App"),
+            Locality::Local
+        );
+        assert_eq!(locality("/System/Volumes/Data/Users/me"), Locality::Local);
         // The later mount at one point is on top.
         assert_eq!(locality("/Volumes/External/Stack/App"), Locality::NotLocal);
         assert_eq!(locality("relative/App"), Locality::Unknown);

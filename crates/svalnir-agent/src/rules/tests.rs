@@ -37,7 +37,7 @@ use super::native::is_locked_by_another_process;
 use super::overlap::{OverlapKind, resolve_overlaps};
 use super::plist::parse_project_info;
 use super::registry::{ClaimError, ReviewedRules};
-use super::unit::entry_change;
+use super::unit::{entry_change, with_resolved_forms};
 use super::xcode::{
     ProducerProcesses, XCODE_DERIVED_DATA_LAYOUT, XcodeDerivedDataRule, XcodeEvidence,
 };
@@ -1743,8 +1743,10 @@ fn a_unit_with_a_child_that_the_allow_list_does_not_have_is_skipped_as_a_whole()
     enum Child {
         File(&'static [u8]),
         Directory,
+        /// A symbolic link to a directory outside the root.
+        Link,
     }
-    let cases: [(&str, &str, Child); 8] = [
+    let cases: [(&str, &str, Child); 11] = [
         ("Build/Products", "Notes.txt", Child::File(b"notes")),
         // A directory that a person copied, with content.
         ("Build/Products", "Backup", Child::Directory),
@@ -1763,6 +1765,11 @@ fn a_unit_with_a_child_that_the_allow_list_does_not_have_is_skipped_as_a_whole()
         // A name of one unit in another unit.
         ("Index.noindex", "XCBuildData", Child::Directory),
         ("Build/Intermediates.noindex", ".build", Child::Directory),
+        // A known name that is a symbolic link, and not a directory.
+        ("Build/Products", "Release", Child::Link),
+        ("Index.noindex", "PrecompiledHeaders", Child::Link),
+        // A known name in another case.
+        ("Build/Products", "release-iphoneos", Child::Directory),
     ];
     for (unit_name, child, kind) in cases {
         let (fixture, project) = xcode_fixture();
@@ -1772,6 +1779,11 @@ fn a_unit_with_a_child_that_the_allow_list_does_not_have_is_skipped_as_a_whole()
             Child::Directory => {
                 fs::create_dir(&path).unwrap();
                 fs::write(path.join("copy.txt"), b"copy").unwrap();
+            }
+            Child::Link => {
+                let outside: PathBuf = fixture.base().join("outside");
+                fs::create_dir_all(&outside).unwrap();
+                symlink(&outside, &path).unwrap();
             }
         }
 
@@ -1875,6 +1887,36 @@ fn a_project_with_no_source_or_with_source_overlap_is_not_a_candidate() {
 }
 
 #[test]
+fn a_workspace_path_with_a_symbolic_link_leaves_the_source_overlap_unknown() {
+    // `WorkspacePath` names the project through a link to its source
+    // directory. The text of the path does not show where the project is.
+    let fixture = Fixture::new("DerivedData");
+    let workspace = add_workspace(&fixture, "App");
+    symlink(
+        fixture.base().join("src"),
+        fixture.base().join("linked-src"),
+    )
+    .unwrap();
+    let linked: PathBuf = fixture
+        .base()
+        .join("linked-src")
+        .join(workspace.strip_prefix(fixture.base().join("src")).unwrap());
+    add_project(&fixture, PROJECT, &linked);
+    let discovery = discover_xcode(&fixture);
+    assert_eq!(discovery.candidates.len(), 0);
+    for name in super::xcode::UNIT_PATHS {
+        let skipped = skip_of(&discovery, &unit(name));
+        assert_eq!(skipped.eligibility.regenerable, Fact::Unknown, "{name}");
+        assert_eq!(
+            skipped.eligibility.no_exclusion_overlap,
+            Fact::Unknown,
+            "{name}"
+        );
+        assert_eq!(skipped.reasons, [SkipReason::RegenerabilityUnknown]);
+    }
+}
+
+#[test]
 fn a_user_exclusion_and_a_link_in_the_unit_path_stop_a_unit() {
     let (mut fixture, project) = xcode_fixture();
     fixture.excluded = vec![project.join("Index.noindex/DataStore")];
@@ -1917,6 +1959,37 @@ fn remote_mount(point: &str, filesystem_type: &str, flags: u32) -> RawMount {
         blocks: 1,
         blocks_free: 1,
         blocks_available: 1,
+    }
+}
+
+#[test]
+fn an_exclusion_whose_text_is_not_local_is_not_resolved() {
+    let directory = tempfile::tempdir().unwrap();
+    let base: PathBuf = fs::canonicalize(directory.path()).unwrap();
+    let real: PathBuf = base.join("real");
+    fs::create_dir(&real).unwrap();
+    let link: PathBuf = base.join("link");
+    symlink(&real, &link).unwrap();
+    let root = || remote_mount("/", "apfs", MOUNT_FLAG_LOCAL);
+    // On a local filesystem the resolved form is added.
+    let local = MountTable::from_mounts(vec![root()]);
+    assert_eq!(
+        with_resolved_forms(std::slice::from_ref(&link), &local),
+        vec![link.clone(), real]
+    );
+    // The table reports the path as a network filesystem, or has no mount
+    // for it: the path is not resolved, so no call reaches its
+    // filesystem.
+    let remote = MountTable::from_mounts(vec![
+        root(),
+        remote_mount(link.to_str().unwrap(), "smbfs", 0),
+    ]);
+    let empty = MountTable::from_mounts(Vec::new());
+    for table in [&remote, &empty] {
+        assert_eq!(
+            with_resolved_forms(std::slice::from_ref(&link), table),
+            vec![link.clone()]
+        );
     }
 }
 

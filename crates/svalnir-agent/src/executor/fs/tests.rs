@@ -2626,6 +2626,40 @@ fn a_dataless_file_target_is_refused_with_no_call() {
 }
 
 #[test]
+fn a_dataless_file_or_directory_is_not_moved_to_the_trash() {
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("placeholder.bin");
+    fs::write(&file, b"data").unwrap();
+    let directory: PathBuf = fixture.root.join("placeholder");
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("inner.bin"), b"data").unwrap();
+    for (name, expected) in [
+        ("placeholder.bin", code::DATALESS_OBJECT),
+        ("placeholder", code::DATALESS_DIRECTORY),
+    ] {
+        let envelope = fixture.envelope(ActionClass::MoveToTrash, name);
+        // The hook gives the measurement of the target the flag
+        // `SF_DATALESS`.
+        let suffix: Vec<u8> = format!("/{name}").into_bytes();
+        let hook: MetadataHook = Box::new(move |path: &[u8], metadata: &mut Metadata| {
+            if path.ends_with(&suffix) {
+                metadata.dataless = true;
+            }
+        });
+        let outcome = run(
+            &fixture.executor_with(metadata_injection(hook)),
+            &fixture.roots(),
+            &envelope,
+        );
+        assert_skipped(&outcome, &ErrorFamily::Eligibility, expected);
+    }
+    assert!(file.exists());
+    assert!(directory.join("inner.bin").exists());
+    assert_eq!(fs::read_dir(&fixture.trash).unwrap().count(), 0);
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
 fn a_tree_file_that_becomes_dataless_after_the_measurement_stays_and_the_removal_is_partial() {
     use std::sync::Arc;
 

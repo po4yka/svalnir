@@ -498,7 +498,9 @@ struct Project {
     /// Predicate 4, with the reason when it is not satisfied.
     regenerable: (Fact, Option<SkipReason>),
     /// Whether the project of `WorkspacePath` and the root overlap.
-    overlaps_source: bool,
+    /// `None`: the path has a symbolic link, so its text does not show
+    /// the location of the project.
+    overlaps_source: Option<bool>,
 }
 
 /// The assessment of one unit, or the bound that stopped it.
@@ -780,11 +782,12 @@ impl UnitContext<'_> {
     /// rule examines it only with [`walk_local`]: the mount table is read
     /// before the first call that uses the path, and no call follows a
     /// symbolic link. A project on a filesystem that is not local, or a
-    /// path with a symbolic link, leaves the predicate unknown.
-    fn workspace_state(&self, workspace: &Path) -> ((Fact, Option<SkipReason>), bool) {
+    /// path with a symbolic link, leaves the predicate unknown. A path
+    /// with a symbolic link also leaves the overlap unknown.
+    fn workspace_state(&self, workspace: &Path) -> ((Fact, Option<SkipReason>), Option<bool>) {
         let unknown = (Fact::Unknown, Some(SkipReason::RegenerabilityUnknown));
         if !is_plain_absolute(workspace) {
-            return (unknown, false);
+            return (unknown, Some(false));
         }
         // A project in the root, or a root in the directory that holds
         // the project, is a root that overlaps source. The source
@@ -806,7 +809,12 @@ impl UnitContext<'_> {
         let has_file = |name: &str| {
             fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
         };
-        let regenerable = match walk_local(workspace, self.mounts) {
+        let walk: Result<ObjectSnapshot, WalkStop> = walk_local(workspace, self.mounts);
+        let linked: bool = match &walk {
+            Ok(snapshot) => snapshot.kind == ObjectKind::SymbolicLink,
+            Err(stop) => matches!(stop, WalkStop::LinkInAncestor),
+        };
+        let regenerable = match walk {
             Err(WalkStop::Absent) => (Fact::NotSatisfied, Some(SkipReason::NotRegenerable)),
             Err(WalkStop::NotLocal | WalkStop::LocalityUnknown) => {
                 (Fact::Unknown, Some(SkipReason::SourceNotLocal))
@@ -828,7 +836,7 @@ impl UnitContext<'_> {
             }
             Ok(_) | Err(WalkStop::LinkInAncestor | WalkStop::Failed(_)) => unknown,
         };
-        (regenerable, overlaps_source)
+        (regenerable, (!linked).then_some(overlaps_source))
     }
 
     /// The snapshot of the unit `unit` of `project`. Each directory from
@@ -1027,11 +1035,15 @@ impl UnitContext<'_> {
         assessment.reasons.extend(regenerable_reason);
 
         // Predicate 7: the exclusions of the caller, and source overlap.
+        // A workspace path with a symbolic link leaves the overlap unknown;
+        // predicate 4 then has its reason.
         let is_excluded: bool =
-            project.overlaps_source || self.root.is_excluded(&assessment.relative);
+            project.overlaps_source == Some(true) || self.root.is_excluded(&assessment.relative);
         assessment.eligibility.no_exclusion_overlap = if is_excluded {
             assessment.reasons.insert(SkipReason::ExclusionOverlap);
             Fact::NotSatisfied
+        } else if project.overlaps_source.is_none() {
+            Fact::Unknown
         } else {
             Fact::Satisfied
         };
@@ -1174,6 +1186,31 @@ impl UnitContext<'_> {
         // result. A check with no result is not a passed check.
         if assessment.eligibility.protocols_valid == Fact::Unknown && !is_unknown {
             assessment.eligibility.protocols_valid = Fact::Satisfied;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    use super::{UNIT_PATHS, classify_entry};
+    use crate::scan::EntryKind;
+
+    /// A volume of macOS refuses a name that is not UTF-8, so a test
+    /// cannot make one. The classification of the name refuses it.
+    #[test]
+    fn a_child_name_that_is_not_utf_8_is_refused() {
+        let name: &Path = Path::new(OsStr::from_bytes(b"Debug\xff"));
+        for unit in UNIT_PATHS {
+            for kind in [EntryKind::Directory, EntryKind::File] {
+                assert!(
+                    classify_entry(Path::new(unit), name, kind).is_some(),
+                    "{unit}"
+                );
+            }
         }
     }
 }

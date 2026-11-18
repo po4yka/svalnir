@@ -1190,7 +1190,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 }),
                 operation,
                 phase: Phase::Finished,
-                resource_effects: Vec::new(),
+                // The observations that the coordinator of the operation
+                // recorded. A record that cannot be read is not reported
+                // as no observation.
+                resource_effects: self
+                    .journal
+                    .resource_effects(operation_id)
+                    .map_err(|error| CoordinatorError::Record(error.to_journal_error()))?,
                 work: WorkTotals::default(),
                 degraded_recording: false,
             }

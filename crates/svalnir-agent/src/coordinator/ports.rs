@@ -7,7 +7,9 @@
 
 use std::fmt::Debug;
 
-use svalnir_core::action::{ApplicationBinding, Journal, Plan, StopFence, TargetBinding};
+use svalnir_core::action::{
+    ApplicationBinding, Journal, Plan, ResourceEffect, StopFence, TargetBinding,
+};
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
 use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
@@ -415,6 +417,29 @@ pub trait CoordinatorJournal: Journal {
         record: &mut VolatileRecord,
     ) -> Result<VolatilePersistReport, OperationJournalError>;
 
+    /// Records the resource observations of an operation. See
+    /// [`OperationJournal::record_resource_effects`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn record_resource_effects(
+        &mut self,
+        operation_id: &OperationId,
+        effects: &[ResourceEffect],
+    ) -> Result<(), OperationJournalError>;
+
+    /// The recorded resource observations of an operation. See
+    /// [`OperationJournal::resource_effects`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn resource_effects(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Vec<ResourceEffect>, OperationJournalError>;
+
     /// Writes the stop fence of an operation. The result says whether the
     /// fence is durable or is a stop of this instance only.
     fn stop_fence(&mut self, operation_id: &OperationId) -> StopFence {
@@ -452,6 +477,21 @@ impl CoordinatorJournal for OperationJournal {
 
     fn recovery_records(&self, limit: usize) -> Result<Vec<RecoveryRecord>, OperationJournalError> {
         Self::recovery_records(self, limit)
+    }
+
+    fn record_resource_effects(
+        &mut self,
+        operation_id: &OperationId,
+        effects: &[ResourceEffect],
+    ) -> Result<(), OperationJournalError> {
+        Self::record_resource_effects(self, operation_id, effects)
+    }
+
+    fn resource_effects(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Vec<ResourceEffect>, OperationJournalError> {
+        Self::resource_effects(self, operation_id)
     }
 
     fn consumed_dispatches(

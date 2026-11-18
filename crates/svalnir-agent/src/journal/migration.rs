@@ -17,7 +17,7 @@ use super::error::OperationJournalError;
 ///
 /// It is independent of the configuration, CLI, IPC, and state-store
 /// versions.
-pub const JOURNAL_VERSION: u32 = 2;
+pub const JOURNAL_VERSION: u32 = 3;
 
 /// The `application_id` of a Svalnir operation journal: the ASCII text
 /// `SVLJ`. The catalog store has a different value, so that one file is
@@ -42,6 +42,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: SCHEMA_V2,
+    },
+    Migration {
+        version: 3,
+        sql: SCHEMA_V3,
     },
 ];
 
@@ -160,6 +164,25 @@ CREATE TABLE agent_record (
         CHECK (name IN ('authority', 'controller', 'status', 'lifecycle')),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     updated_unix_s INTEGER NOT NULL,
+    content TEXT NOT NULL CHECK (json_valid(content))
+) STRICT, WITHOUT ROWID;
+";
+
+/// Version 3.
+///
+/// - `operation_effect`: the resource observations of an operation (the
+///   available capacity and the memory pressure before and after it), as
+///   the JSON list of the `ResourceEffect` values of `svalnir-core`. One
+///   row for each operation that has a record; a write replaces the row.
+///   The row goes with its operation (`ON DELETE CASCADE`).
+///
+/// The step adds one table and changes no row of version 2. A database of
+/// version 2 has no observation for its operations, and a read gives an
+/// empty list for them.
+const SCHEMA_V3: &str = "
+CREATE TABLE operation_effect (
+    operation_seq INTEGER NOT NULL PRIMARY KEY
+        REFERENCES operation (seq) ON DELETE CASCADE,
     content TEXT NOT NULL CHECK (json_valid(content))
 ) STRICT, WITHOUT ROWID;
 ";

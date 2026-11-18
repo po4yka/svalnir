@@ -416,3 +416,59 @@ fn root_id_of_binding(target: &svalnir_core::action::TargetBinding) -> svalnir_c
     };
     file.root_id.clone()
 }
+
+#[test]
+fn the_capacity_observations_of_an_operation_are_in_the_journal_for_each_client() {
+    let mut bench = Bench::new();
+    bench.tree.file("a");
+    bench.measurements.0.lock().unwrap().capacity = [Some(1_000), Some(1_400)].into();
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(capacity_delta(&view), ByteDelta::new(400).ok());
+    assert!(!view.degraded_recording);
+    // A different process reads the same observations from the journal.
+    let client = super::support::open_journal(&bench.tree.database);
+    assert_eq!(
+        client.resource_effects(&operation_id).unwrap(),
+        view.resource_effects
+    );
+    // A coordinator of a later lifetime gives them in its view.
+    drop(coordinator.shutdown().unwrap());
+    let later = bench.start();
+    let stored = later.operation(&operation_id).unwrap().unwrap();
+    assert_eq!(stored.resource_effects, view.resource_effects);
+}
+
+#[test]
+fn observations_that_the_journal_did_not_take_do_not_change_the_outcome() {
+    let mut bench = Bench::new();
+    let file = bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    bench.fail(super::support::FailPoint::RecordEffects);
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    // The operation is settled with its result, and the recording is
+    // reported as degraded.
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert!(!file.exists());
+    assert!(view.degraded_recording);
+    let client = super::support::open_journal(&bench.tree.database);
+    assert_eq!(client.resource_effects(&operation_id).unwrap(), Vec::new());
+}

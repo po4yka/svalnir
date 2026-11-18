@@ -1084,6 +1084,7 @@ pub(super) enum FailPoint {
     SetStopFence,
     CompleteRequest,
     PersistVolatile,
+    RecordEffects,
 }
 
 /// A function that a test runs inside a journal call.
@@ -1235,6 +1236,29 @@ impl CoordinatorJournal for FailingJournal {
         limit: usize,
     ) -> Result<Vec<ConsumedDispatch>, OperationJournalError> {
         self.inner.consumed_dispatches(incident_id, limit)
+    }
+
+    fn record_resource_effects(
+        &mut self,
+        operation_id: &OperationId,
+        effects: &[svalnir_core::action::ResourceEffect],
+    ) -> Result<(), OperationJournalError> {
+        if self
+            .failing
+            .lock()
+            .unwrap()
+            .contains(&FailPoint::RecordEffects)
+        {
+            return Err(OperationJournalError::NotFound);
+        }
+        self.inner.record_resource_effects(operation_id, effects)
+    }
+
+    fn resource_effects(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Vec<svalnir_core::action::ResourceEffect>, OperationJournalError> {
+        self.inner.resource_effects(operation_id)
     }
 
     fn claim_next_request(

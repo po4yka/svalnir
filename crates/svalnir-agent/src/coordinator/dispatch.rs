@@ -1426,6 +1426,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         } else {
             self.flush(&mut active) && self.journal.record_operation(&active.operation).is_ok()
         };
+        if recorded && !active.volatile {
+            self.record_effects(&mut active);
+        }
         let unknown: bool = matches!(active.operation.state(), OperationState::UnknownOutcome);
         if let Some(stop) = &mut active.stop
             && !unknown
@@ -1446,6 +1449,24 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             return;
         }
         self.release(&mut active, time);
+    }
+
+    /// Writes the resource observations of an operation to the journal,
+    /// so that each client reads them and not only this process. The
+    /// observations are not a part of the outcome: a failed write makes
+    /// the recording degraded and changes no state of the operation.
+    fn record_effects(&mut self, active: &mut Active) {
+        if active.effects.is_empty() {
+            return;
+        }
+        let operation_id: OperationId = active.operation.operation_id().clone();
+        if self
+            .journal
+            .record_resource_effects(&operation_id, &active.effects)
+            .is_err()
+        {
+            active.degraded = true;
+        }
     }
 
     /// Releases the leases and the unused reservation of a settled
@@ -1494,6 +1515,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             if saved {
                 active.unrecorded = false;
                 self.board.set_recorded(&operation_id, true);
+                self.record_effects(&mut active);
             }
             if saved && active.operation.state().is_settled() {
                 if let Some(stop) = &mut active.stop {

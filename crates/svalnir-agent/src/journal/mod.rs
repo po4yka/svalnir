@@ -138,6 +138,7 @@
 
 mod coordination;
 mod durable;
+mod effects;
 mod error;
 mod migration;
 mod record;
@@ -165,6 +166,7 @@ pub use self::coordination::{
     CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRecord, CoordinatorRole,
     LockState, coordinator_lock_path,
 };
+pub use self::effects::MAX_RESOURCE_EFFECTS_BYTES;
 pub use self::error::{AdmissionStop, OperationJournalError, SequenceViolation};
 pub use self::migration::JOURNAL_VERSION;
 use self::migration::{MIGRATIONS, Migration};

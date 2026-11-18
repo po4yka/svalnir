@@ -143,3 +143,117 @@ fn a_rejection_for_a_digest_that_is_not_the_stored_digest_records_nothing() {
         Ok(svalnir_core::action::Admission::Admitted)
     );
 }
+
+#[test]
+fn a_journal_of_the_second_version_gets_the_table_of_the_third_and_keeps_its_records() {
+    use super::super::migration::MIGRATIONS;
+    use super::super::{JOURNAL_VERSION, OperationJournal, OperationJournalError};
+    use super::{complete, dispatch, options};
+
+    assert_eq!(JOURNAL_VERSION, 3);
+    let fixture = Fixture::new();
+    let plan = file_plan("plan_1", 1);
+    // A database that a build of version 2 made, with one settled
+    // operation.
+    let operation_id = {
+        let mut old =
+            OperationJournal::open_with_migrations(&fixture.path(), &options(), &MIGRATIONS[..2])
+                .unwrap();
+        assert_eq!(old.version().unwrap(), 2);
+        let mut operation = admit(&mut old, &plan, "operation_1", "epoch_1");
+        dispatch(&mut old, &plan, &mut operation, "s0");
+        complete(&mut old, &mut operation, "s0", "t0");
+        // Version 2 has no table for the observations.
+        assert!(matches!(
+            old.resource_effects(operation.operation_id()),
+            Err(OperationJournalError::Sqlite(_))
+        ));
+        operation.operation_id().clone()
+    };
+
+    // This build migrates the file forward and changes no record.
+    let journal = fixture.open();
+    assert_eq!(journal.version().unwrap(), JOURNAL_VERSION);
+    let stored = journal.operation(&operation_id).unwrap().unwrap();
+    assert_eq!(stored.steps().len(), 1);
+    assert_eq!(journal.plan(&plan.plan_id), Ok(Some(plan)));
+    // An operation of version 2 has no recorded observation.
+    assert_eq!(journal.resource_effects(&operation_id).unwrap(), Vec::new());
+    drop(journal);
+
+    // A build of version 2 refuses the migrated file and does not change
+    // it.
+    let refused =
+        OperationJournal::open_with_migrations(&fixture.path(), &options(), &MIGRATIONS[..2]);
+    assert!(matches!(
+        refused,
+        Err(OperationJournalError::NewerVersion {
+            found: 3,
+            supported: 2
+        })
+    ));
+    assert_eq!(fixture.open().version().unwrap(), JOURNAL_VERSION);
+}
+
+#[test]
+fn the_observations_of_an_operation_are_recorded_and_go_with_it() {
+    use svalnir_core::action::ResourceEffect;
+
+    use super::super::coordination::CoordinatorLock;
+    use super::super::{CoordinatorRole, OperationJournalError, SequenceViolation};
+    use super::{complete, dispatch, epoch, operation_id, wall};
+
+    let fixture = Fixture::new();
+    let mut journal = fixture.open();
+    let lock = CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client).unwrap();
+    journal
+        .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
+        .unwrap();
+    let plan = file_plan("plan_1", 1);
+    let mut operation = admit(&mut journal, &plan, "operation_1", "epoch_1");
+    let id = operation.operation_id().clone();
+    // No record is not a measurement.
+    assert_eq!(journal.resource_effects(&id).unwrap(), Vec::new());
+    assert!(matches!(
+        journal.record_resource_effects(&operation_id("operation_9"), &[]),
+        Err(OperationJournalError::NotFound)
+    ));
+
+    // The coordinator tests record real observations. A value that this
+    // build does not recognize is sufficient for the storage rules.
+    let first = vec![ResourceEffect::Unrecognized];
+    journal.record_resource_effects(&id, &first).unwrap();
+    assert_eq!(journal.resource_effects(&id).unwrap(), first);
+    // The last measurement replaces the record.
+    let second = vec![ResourceEffect::Unrecognized, ResourceEffect::Unrecognized];
+    journal.record_resource_effects(&id, &second).unwrap();
+    assert_eq!(journal.resource_effects(&id).unwrap(), second);
+    // A second connection reads the record, as a different client does.
+    assert_eq!(fixture.open().resource_effects(&id).unwrap(), second);
+
+    dispatch(&mut journal, &plan, &mut operation, "s0");
+    complete(&mut journal, &mut operation, "s0", "t0");
+    operation.settle().unwrap();
+    journal.record_operation(&operation).unwrap();
+    // A coordinator that is not the registered one writes nothing.
+    journal.end_coordination(&epoch("epoch_1")).unwrap();
+    assert!(matches!(
+        journal.record_resource_effects(&id, &first),
+        Err(OperationJournalError::Sequence(
+            SequenceViolation::ExecutorEpoch
+        ))
+    ));
+    assert_eq!(journal.resource_effects(&id).unwrap(), second);
+
+    // The retention removes the record with its operation.
+    let report = journal.prune(wall(1_000_000), 16).unwrap();
+    assert_eq!(report.operations, 1);
+    assert_eq!(journal.resource_effects(&id).unwrap(), Vec::new());
+    let rows: i64 = rusqlite::Connection::open(fixture.path())
+        .unwrap()
+        .query_row("SELECT count(*) FROM operation_effect", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0);
+}

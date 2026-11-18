@@ -3,11 +3,15 @@
 use super::nav::{CloseWindow, KEY_CONTEXT, Refresh, Screen, SelectScreen};
 use crate::{
     data::{
-        model::{AgentState, Loadable},
+        model::{AgentState, Loadable, Measured, PressureLevel},
         store::AppModel,
     },
+    platform::DisplayAccessibility,
     screens::{overview::OverviewScreen, placeholder::Placeholder, storage::StorageScreen},
-    theme::tokens::{self, Tokens, to_hsla},
+    theme::{
+        glow,
+        tokens::{self, Tokens, to_hsla},
+    },
     ui::data_state::format_age,
 };
 use gpui_kit::{
@@ -31,6 +35,8 @@ pub struct MainWindow {
     screens: Vec<AnyView>,
     focus: FocusHandle,
     model: Entity<AppModel>,
+    /// The display settings, read when the window becomes active.
+    display: DisplayAccessibility,
     overview: Entity<OverviewScreen>,
     storage: Entity<StorageScreen>,
 }
@@ -55,20 +61,33 @@ impl MainWindow {
             .collect();
         let focus: FocusHandle = cx.focus_handle();
         window.focus(&focus, cx);
-        cx.observe(&model, |_, _, cx| cx.notify()).detach();
+        cx.observe(&model, |this, _, cx| {
+            this.update_glow(cx);
+            cx.notify();
+        })
+        .detach();
         let active: bool = window.is_window_active();
         model.update(cx, |model, cx| model.set_active(active, cx));
         cx.observe_window_activation(window, |this, window, cx| {
             let active: bool = window.is_window_active();
             this.model
                 .update(cx, |model, cx| model.set_active(active, cx));
+            // The user changes a display setting in a different application,
+            // so the window reads the settings when it becomes active.
+            if active {
+                this.display = DisplayAccessibility::read();
+                this.update_glow(cx);
+            }
         })
         .detach();
+        let display: DisplayAccessibility = DisplayAccessibility::read();
+        glow::set(glow::decide(display, true), cx);
         Self {
             active: Screen::Overview,
             screens,
             focus,
             model,
+            display,
             overview,
             storage,
         }
@@ -138,6 +157,26 @@ impl MainWindow {
             .child(Icon::new(IconName::TriangleAlert).size_4())
             .child(text)
             .into_any_element()
+    }
+
+    /// Decides the glow from the display settings and the memory pressure.
+    fn update_glow(&self, cx: &mut Context<Self>) {
+        let pressure_normal: bool = self.model.read(cx).host.value().is_none_or(|host| {
+            !matches!(
+                host.pressure,
+                Measured::Value(PressureLevel::Warning | PressureLevel::Critical)
+            )
+        });
+        glow::set(glow::decide(self.display, pressure_normal), cx);
+    }
+
+    /// Sets the display settings and decides the glow again. The window
+    /// reads the settings of the host when it becomes active; a test gives
+    /// fixed settings.
+    pub fn set_display(&mut self, display: DisplayAccessibility, cx: &mut Context<Self>) {
+        self.display = display;
+        self.update_glow(cx);
+        cx.notify();
     }
 
     /// The model that the window reads.

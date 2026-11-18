@@ -490,7 +490,7 @@ fn swap_card(
     card(header, body)
 }
 
-fn agent_card(agent: &Loadable<AgentSnapshot>, tokens: &Tokens) -> AnyElement {
+fn agent_card(agent: &Loadable<AgentSnapshot>, glow: bool, tokens: &Tokens) -> AnyElement {
     let mut header: ShellHeader = ShellHeader::new(IconName::Cpu, "Agent");
     let body: AnyElement = match agent {
         Loadable::Loading => skeleton_value(),
@@ -507,6 +507,7 @@ fn agent_card(agent: &Loadable<AgentSnapshot>, tokens: &Tokens) -> AnyElement {
                         .items_center()
                         .child(guard_led(
                             matches!(snapshot.state, AgentState::Reporting { .. }),
+                            glow,
                             tokens,
                         ))
                         .child(caption("agent-sentence", sentence, tokens)),
@@ -544,10 +545,10 @@ pub const fn phase_pill(phase: OperationPhase, state_text: &str) -> (&str, Tone)
 }
 
 /// A 3 by 3 lattice block: lit with a glow for an active guard.
-fn guard_led(active: bool, tokens: &Tokens) -> AnyElement {
+fn guard_led(active: bool, glow: bool, tokens: &Tokens) -> AnyElement {
     let color: Hsla = to_hsla(tokens.positive);
     let mut block = div().flex().flex_col().gap(px(1.0)).flex_shrink_0();
-    if active {
+    if active && glow {
         block = block.shadow(vec![BoxShadow {
             color: color.opacity(0.5),
             offset: point(px(0.0), px(0.0)),
@@ -573,6 +574,7 @@ fn guard_led(active: bool, tokens: &Tokens) -> AnyElement {
 fn policies_card(
     service: &Loadable<ServiceSnapshot>,
     mono: &SharedString,
+    glow: bool,
     tokens: &Tokens,
 ) -> AnyElement {
     let mut header: ShellHeader = ShellHeader::new(IconName::Settings, "Policies");
@@ -597,7 +599,7 @@ fn policies_card(
                             h_flex()
                                 .gap(px(8.0))
                                 .items_center()
-                                .child(guard_led(row.standing == GuardState::Active, tokens))
+                                .child(guard_led(row.standing == GuardState::Active, glow, tokens))
                                 .child(div().font_family(mono.clone()).child(row.name))
                                 .child(
                                     StatusPill::new(text, tone).id(format!("guard-{}", row.name)),
@@ -750,6 +752,7 @@ impl Render for OverviewScreen {
             / count_f32(columns))
         .max(MIN_CARD_WIDTH));
 
+        let glow_on: bool = crate::theme::glow::enabled(cx);
         let full_width: Pixels = px(content.max(MIN_CARD_WIDTH));
         let cards: Vec<AnyElement> = vec![
             hero_card(
@@ -762,8 +765,8 @@ impl Render for OverviewScreen {
             ),
             pressure_card(&view, &history, tokens),
             swap_card(&view, &history, &self.roll_swap, tokens),
-            agent_card(&agent, tokens),
-            policies_card(&service, &mono, tokens),
+            agent_card(&agent, glow_on, tokens),
+            policies_card(&service, &mono, glow_on, tokens),
             intervention_card(&service, &mono, tokens),
         ];
         let reduce: bool = cx.reduce_motion();

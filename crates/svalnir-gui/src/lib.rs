@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod data;
+pub mod platform;
 pub mod screens;
 pub mod shell;
 pub mod theme;

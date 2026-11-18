@@ -182,7 +182,8 @@ pub struct LedStyle {
     pub outline_radius: f32,
     /// The color of an empty cell.
     pub lattice: Hsla,
-    /// The alpha of the glow.
+    /// The alpha of the glow. Zero turns off the glow of the segments and
+    /// of the head.
     pub glow_alpha: f32,
     /// The alpha of a dim cell.
     pub dim_alpha: f32,
@@ -294,10 +295,11 @@ pub fn paint_led_field(
     };
     let radii: Corners<Pixels> = Corners::all(px(style.outline_radius));
     // Glow first: the cells and the outlines cover it.
+    let glow_on: bool = style.glow_alpha > 0.0;
     for segment in field
         .segments
         .iter()
-        .filter(|s| !s.dimmed && !s.rect.is_empty())
+        .filter(|s| glow_on && !s.dimmed && !s.rect.is_empty())
     {
         let shadow: BoxShadow = BoxShadow {
             color: segment.color.opacity(style.glow_alpha),
@@ -390,7 +392,9 @@ pub fn paint_led_field(
             spread_radius: px(0.0),
             inset: false,
         };
-        window.paint_drop_shadows(rect_bounds(r), Corners::all(px(2.0)), &[glow]);
+        if glow_on {
+            window.paint_drop_shadows(rect_bounds(r), Corners::all(px(2.0)), &[glow]);
+        }
         let base: Hsla = lit_color(head.color);
         for y in r.y..r.y.saturating_add(r.h).min(field.rows) {
             for x in r.x..r.x.saturating_add(r.w).min(field.columns) {
@@ -539,7 +543,10 @@ impl RenderOnce for LedChart {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
-        let style: LedStyle = LedStyle::for_dark(dark);
+        let mut style: LedStyle = LedStyle::for_dark(dark);
+        if !crate::theme::glow::enabled(cx) {
+            style.glow_alpha = 0.0;
+        }
         let mono: SharedString = cx.theme().mono_font_family.clone();
         let width: f32 = style.span(self.field.columns);
         let height: f32 = style.span(self.field.rows);

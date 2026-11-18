@@ -105,13 +105,16 @@ impl RenderOnce for TickTrack {
             let mut tick = div().w(px(3.0)).h(px(16.0)).rounded(px(1.0));
             if head {
                 let white: Hsla = hsla(0.0, 0.0, 1.0, 0.5);
-                tick = tick.bg(color).shadow(vec![BoxShadow {
-                    color: color.opacity(0.6),
-                    offset: point(px(0.0), px(0.0)),
-                    blur_radius: px(8.0),
-                    spread_radius: px(0.0),
-                    inset: false,
-                }]);
+                tick = tick.bg(color);
+                if crate::theme::glow::enabled(cx) {
+                    tick = tick.shadow(vec![BoxShadow {
+                        color: color.opacity(0.6),
+                        offset: point(px(0.0), px(0.0)),
+                        blur_radius: px(8.0),
+                        spread_radius: px(0.0),
+                        inset: false,
+                    }]);
+                }
                 tick = tick.child(div().size_full().rounded(px(1.0)).bg(white));
             } else {
                 tick = tick.bg(color);

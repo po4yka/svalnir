@@ -130,11 +130,14 @@ impl RenderOnce for TickGauge {
             0
         };
         let empty: Hsla = to_hsla(tokens.border);
+        let glow_on: bool = crate::theme::glow::enabled(cx);
         let mut ticks_row = h_flex().gap(px(TICK_GAP));
         for index in 0..self.ticks {
             let tick = div().w(px(TICK_WIDTH)).h(px(TICK_HEIGHT)).rounded(px(1.0));
             ticks_row = ticks_row.child(if index >= filled {
                 tick.bg(empty)
+            } else if index + 1 == filled && !glow_on {
+                tick.bg(mix_white(color, 0.5))
             } else if index + 1 == filled {
                 tick.bg(mix_white(color, 0.5)).shadow(vec![BoxShadow {
                     color: color.opacity(0.6),

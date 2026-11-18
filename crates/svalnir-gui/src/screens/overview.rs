@@ -9,6 +9,7 @@ use crate::{
         },
         store::AppModel,
     },
+    shell::nav::{NavLayout, Screen, Section},
     theme::{
         motion,
         tokens::{self, Tokens, to_hsla},
@@ -55,10 +56,6 @@ const DIAL_CARD_WIDTH: f32 = 610.0;
 /// The least content width at which the two cards share a row: the dial card,
 /// the gap, and a session chart of 60 columns with its gutters and padding.
 const PAIR_MIN_WIDTH: f32 = 1150.0;
-/// The sidebar width at full size and collapsed, and the content padding.
-const SIDEBAR_FULL: f32 = 256.0;
-const SIDEBAR_COLLAPSED: f32 = 49.0;
-
 /// The number of grid columns for a content width in pixels.
 #[must_use]
 pub fn columns_for(content_width: f32) -> usize {
@@ -144,6 +141,7 @@ pub struct OverviewScreen {
     phase: f32,
     last_render: Instant,
     twinkle: Option<gpui_kit::Task<()>>,
+    nav: NavLayout,
 }
 
 impl OverviewScreen {
@@ -162,7 +160,14 @@ impl OverviewScreen {
             phase: 0.0,
             last_render: Instant::now(),
             twinkle: None,
+            nav: NavLayout::default(),
         }
+    }
+
+    /// Shares the layout state of the window: the section tops and the
+    /// sidebar width.
+    pub fn set_nav(&mut self, nav: NavLayout) {
+        self.nav = nav;
     }
 
     /// Runs the twinkle timer at about 12 Hz while the screen renders; the
@@ -917,11 +922,7 @@ impl Render for OverviewScreen {
         let this: Entity<Self> = cx.entity();
 
         let viewport: f32 = window.viewport_size().width.into();
-        let sidebar: f32 = if viewport < 900.0 {
-            SIDEBAR_COLLAPSED
-        } else {
-            SIDEBAR_FULL
-        };
+        let sidebar: f32 = self.nav.sidebar_width();
         let content: f32 = (viewport - sidebar - 2.0 * f32::from(tokens::CONTENT_PADDING)).max(0.0);
         let gap: f32 = f32::from(tokens::GRID_GAP);
         let columns: usize = columns_for(content);
@@ -998,7 +999,11 @@ impl Render for OverviewScreen {
             )
             .child(div().flex().flex_wrap().gap(tokens::GRID_GAP).children(
                 cards.into_iter().enumerate().map(|(index, card)| {
+                    let section: Section = Screen::Overview.sections()[index];
                     div()
+                        .id(section.id())
+                        .test_support()
+                        .relative()
                         .flex()
                         .flex_col()
                         .w(match index {
@@ -1009,6 +1014,7 @@ impl Render for OverviewScreen {
                         })
                         .min_w(px(MIN_CARD_WIDTH))
                         .flex_shrink_0()
+                        .child(self.nav.marker(section))
                         .child(card)
                 }),
             ))

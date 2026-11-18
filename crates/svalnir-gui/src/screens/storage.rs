@@ -8,6 +8,7 @@ use crate::{
         },
         store::AppModel,
     },
+    shell::nav::{NavLayout, Section},
     theme::{
         motion, palette,
         tokens::{self, Tokens, to_hsla},
@@ -102,7 +103,7 @@ const HEAD_COLUMNS: u16 = 3;
 type OpenFn = Rc<dyn Fn(usize, &mut gpui_kit::App)>;
 
 /// The width that the viewport gives to the cards, less than the viewport.
-const CHROME_WIDTH: f32 = 340.0;
+const CHROME_WIDTH: f32 = 2.0 * 24.0;
 /// The longest path text before the middle is cut.
 const MAX_PATH_CHARS: usize = 56;
 
@@ -131,6 +132,7 @@ fn last_component(root: &Path) -> String {
 /// The Storage screen entity.
 #[derive(Debug)]
 pub struct StorageScreen {
+    nav: NavLayout,
     model: Entity<AppModel>,
     metric: SizeMetric,
     layout: StorageLayout,
@@ -177,7 +179,27 @@ impl StorageScreen {
             phase: 0.0,
             twinkle: None,
             last_render: Instant::now(),
+            nav: NavLayout::default(),
         }
+    }
+
+    /// Shares the layout state of the window: the section tops and the
+    /// sidebar width.
+    pub fn set_nav(&mut self, nav: NavLayout) {
+        self.nav = nav;
+    }
+
+    /// Wraps a card so that the window knows the top of its section.
+    fn anchored(&self, section: Section, card: AnyElement) -> AnyElement {
+        div()
+            .id(section.id())
+            .test_support()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(self.nav.marker(section))
+            .child(card)
+            .into_any_element()
     }
 
     /// Marks a new activation of the screen: the cards enter again.
@@ -1131,7 +1153,9 @@ impl Render for StorageScreen {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
         let mono: SharedString = cx.theme().mono_font_family.clone();
-        let width: f32 = (f32::from(window.viewport_size().width) - CHROME_WIDTH).max(0.0);
+        let width: f32 =
+            (f32::from(window.viewport_size().width) - self.nav.sidebar_width() - CHROME_WIDTH)
+                .max(0.0);
         let (host, scan, notice): (Loadable<HostSnapshot>, ScanState, Option<String>) = {
             let model: &AppModel = self.model.read(cx);
             (
@@ -1218,25 +1242,33 @@ impl Render for StorageScreen {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(card_entry(
-                volume_card(&host, &self.roll_used, tokens, width, dark),
-                0,
-                self.activation,
-                reduce,
-            ))
-            .child(card_entry(
-                card(
-                    header,
-                    v_flex()
-                        .gap(tokens::SPACE_3)
-                        .children(notice.map(|text| caption("scan-notice", text, tokens)))
-                        .children(metric_caption)
-                        .children(crumb)
-                        .child(body),
+            .child(self.anchored(
+                Section::StorageStartupVolume,
+                card_entry(
+                    volume_card(&host, &self.roll_used, tokens, width, dark),
+                    0,
+                    self.activation,
+                    reduce,
                 ),
-                1,
-                self.activation,
-                reduce,
             ))
+            .child(
+                self.anchored(
+                    Section::FolderSizes,
+                    card_entry(
+                        card(
+                            header,
+                            v_flex()
+                                .gap(tokens::SPACE_3)
+                                .children(notice.map(|text| caption("scan-notice", text, tokens)))
+                                .children(metric_caption)
+                                .children(crumb)
+                                .child(body),
+                        ),
+                        1,
+                        self.activation,
+                        reduce,
+                    ),
+                ),
+            )
     }
 }

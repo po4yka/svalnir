@@ -33,6 +33,8 @@ Options:
   --reduce-motion      Force Reduce Motion on
   --screen NAME        Open on a screen (overview, storage, memory,
                        applications, automation, history, diagnostics)
+  --sidebar WIDTH      Set the choice for the sidebar width: narrow or wide.
+                       Without it, the sidebar is narrow below 900 points
   --size WxH           Set the window size in points, for example 1120x720
   --layout NAME        Open the folder chart of Storage in a layout
                        (tiles, band, columns, ring)
@@ -82,6 +84,8 @@ pub struct LaunchOptions {
     pub size: Option<(u16, u16)>,
     /// The number of readings that a fixture takes at launch, 1 to 180.
     pub readings: Option<usize>,
+    /// The choice for the sidebar width: `Some(true)` is narrow.
+    pub sidebar_narrow: Option<bool>,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -91,6 +95,7 @@ pub struct LaunchOptions {
 /// # Errors
 ///
 /// Returns a message for an unknown option, a missing or invalid value.
+#[expect(clippy::too_many_lines, reason = "one match arm for each option")]
 pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOptions, String> {
     let mut options = LaunchOptions::default();
     while let Some(argument) = args.next() {
@@ -132,6 +137,18 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                         .find(|screen| screen.title().eq_ignore_ascii_case(&name))
                         .ok_or_else(|| format!("unknown screen `{name}`"))?,
                 );
+            }
+            "--sidebar" => {
+                let mode: String = args
+                    .next()
+                    .ok_or_else(|| "`--sidebar` needs `narrow` or `wide`".to_owned())?;
+                options.sidebar_narrow = Some(match mode.as_str() {
+                    "narrow" => true,
+                    "wide" => false,
+                    other => {
+                        return Err(format!("unknown sidebar `{other}`; use `narrow` or `wide`"));
+                    }
+                });
             }
             "--size" => {
                 let text: String = args
@@ -304,6 +321,11 @@ pub fn run() -> ExitCode {
             if let Some(screen) = options.screen {
                 view.update(cx, |view, cx| view.select(screen, cx));
             }
+            if options.sidebar_narrow.is_some() {
+                view.update(cx, |view, cx| {
+                    view.set_sidebar_choice(options.sidebar_narrow, cx);
+                });
+            }
             if let Some(layout) = options.layout {
                 view.update(cx, |view, cx| view.set_storage_layout(layout, cx));
             }
@@ -345,6 +367,8 @@ mod tests {
             "storage",
             "--scan",
             "/tmp/a",
+            "--sidebar",
+            "narrow",
             "--size",
             "1200x900",
             "--layout",
@@ -362,6 +386,7 @@ mod tests {
                 size: Some((1200, 900)),
                 layout: Some(StorageLayout::Ring),
                 readings: Some(40),
+                sidebar_narrow: Some(true),
                 help: true,
             })
         );
@@ -378,6 +403,12 @@ mod tests {
         assert!(parse(&["--screen", "nowhere"]).is_err());
         assert!(parse(&["--scan", "relative/path"]).is_err());
         assert!(parse(&["--scan"]).is_err());
+        assert!(parse(&["--sidebar", "tiny"]).is_err());
+        assert!(parse(&["--sidebar"]).is_err());
+        assert_eq!(
+            parse(&["--sidebar", "wide"]).map(|o| o.sidebar_narrow),
+            Ok(Some(false))
+        );
         assert!(parse(&["--size", "100x100"]).is_err());
         assert!(parse(&["--size", "wide"]).is_err());
         assert!(parse(&["--layout", "spiral"]).is_err());

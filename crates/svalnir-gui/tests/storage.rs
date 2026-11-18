@@ -483,17 +483,26 @@ fn enter_on_the_focused_scan_button_runs_the_scan(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| window.press("cmd-2", cx))
         .unwrap();
     cx.run_until_parked();
-    // Tab moves the focus through the stops; Enter does nothing on the others.
-    for _ in 0..12 {
-        if label_of(handle, "scan-total", cx).is_some() {
+    // Tab moves the focus through the stops. The sidebar has stops before
+    // the content, so the test waits for the scan button to hold the focus.
+    for _ in 0..60 {
+        let mut focused: bool = false;
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            focused = window
+                .try_find("scan-start")
+                .is_some_and(|node| node.focused() == Some(true));
+        })
+        .unwrap();
+        if focused {
             break;
         }
         cx.update_window(handle, |_, window, cx| window.press("tab", cx))
             .unwrap();
-        cx.update_window(handle, |_, window, cx| window.press("enter", cx))
-            .unwrap();
-        cx.run_until_parked();
     }
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    cx.run_until_parked();
     assert_eq!(label_of(handle, "scan-total", cx).as_deref(), Some("266.1"));
 }
 

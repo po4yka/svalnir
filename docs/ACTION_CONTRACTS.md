@@ -387,8 +387,10 @@ The journal interface has this contract. A call of the durable journal returns s
 - The option and applicable action/escalation grant were enabled before the incident.
 - Fresh sustained global critical-memory pressure satisfies the policy.
 - The target remains otherwise eligible and within its budget.
-- Durable recording is unavailable and bounded volatile recording is available.
+- Durable recording is unavailable because the storage of the journal failed, and bounded volatile recording is available.
 - Any participating helper independently permits the same exception within its own ceiling.
+
+A locked journal is not a storage failure. When a different process holds the lock of the journal for longer than the bounded wait of a write, the write records nothing and the admission is refused with `admission_not_recorded`. No volatile record is made, and the controller evaluates again at its next evaluation with no pacing wait. Only a failure of the storage, for example a full volume, a failed synchronization, or a damaged file, permits the exception.
 
 The exception never applies to any filesystem mutation, manual process control, or an operation admitted solely through an application-budget violation. A budget-triggered operation cannot relabel itself critical during execution. Settle the old operation before admitting a fresh critical-trigger plan under the same memory incident; preserve its consumed charge and charge a newly dispatched intervention another slot. Current grants, cooldowns, and the remaining incident allowance still apply.
 

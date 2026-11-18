@@ -320,6 +320,13 @@ impl<'a> Run<'a> {
                 ApplyReport::Refused { code, .. } => {
                     self.settle(&outstanding, false);
                     let refusals: u32 = self.set_refusal(&outstanding, Some(code.clone()));
+                    // The journal did not record the admission, for
+                    // example because a different process held its lock.
+                    // The refusal is not a decision about the action, so
+                    // the next evaluation plans again with no wait.
+                    if code == crate::coordinator::code::ADMISSION_NOT_RECORDED {
+                        continue;
+                    }
                     // The next plan waits for one observation window, so
                     // that a refusal does not make a loop of plans. The
                     // wait doubles with each refusal in sequence, to a

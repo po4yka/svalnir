@@ -151,3 +151,51 @@ fn the_exception_never_applies_to_a_budget_trigger_a_manual_stop_or_a_file() {
     assert!(file.exists());
     assert_eq!(coordinator.remaining_slots(&incident), Some(3));
 }
+
+#[test]
+fn a_locked_journal_is_a_refusal_and_never_the_volatile_exception() {
+    let mut bench = failing_bench(true);
+    let incident = incident_id("incident_1");
+    let member = bench.host.spawn(4242);
+    bench.host.world().exits_on_term.insert(4242);
+    let plan = automatic_stop_plan(
+        "plan_1",
+        &bench.authority,
+        &incident,
+        TriggerClass::GlobalCriticalMemory,
+        vec![member],
+        Escalation::None,
+        bench.clock.now(),
+    );
+    let mut coordinator = bench.start();
+    let epoch = coordinator.executor_epoch().clone();
+    let request = || automatic_request(&plan, allowance(&incident, &epoch, 3));
+
+    // A second connection holds the write lock for longer than the
+    // bounded wait of the journal. The exception is authorized, and the
+    // storage did not fail: the admission is refused.
+    let other = rusqlite::Connection::open(&bench.tree.database).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = refusal(&mut coordinator, request());
+    assert_eq!(error.code.as_str(), code::ADMISSION_NOT_RECORDED);
+    assert_eq!(error.family, ErrorFamily::Recording);
+    assert_eq!(bench.host.calls(), Vec::new());
+    assert_eq!(coordinator.remaining_slots(&incident), Some(3));
+    other.execute_batch("ROLLBACK").unwrap();
+    drop(other);
+
+    // The next attempt records durably. A volatile record of the refused
+    // attempt would return its operation here.
+    let operation_id = admitted(&mut coordinator, request());
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert_eq!(view.operation.durability(), Durability::Durable);
+    assert!(!view.degraded_recording);
+    assert_eq!(bench.host.calls().len(), 1);
+    assert!(
+        open_journal(&bench.tree.database)
+            .operation(&operation_id)
+            .unwrap()
+            .is_some()
+    );
+}

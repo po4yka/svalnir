@@ -97,7 +97,7 @@ fn each_storage_failure_has_its_own_error() {
         (ffi::SQLITE_FULL, JournalError::Full),
         (ffi::SQLITE_IOERR_FSYNC, JournalError::Sync),
         (ffi::SQLITE_CORRUPT, JournalError::Corrupt),
-        (ffi::SQLITE_BUSY, JournalError::Unavailable),
+        (ffi::SQLITE_BUSY, JournalError::Busy),
         (ffi::SQLITE_READONLY, JournalError::Unavailable),
         (ffi::SQLITE_NOMEM, JournalError::Unavailable),
     ] {
@@ -426,8 +426,14 @@ fn a_locked_database_is_reported_as_busy_and_records_nothing() {
         .try_consume_dispatch(&id, &step_id("s0"))
         .unwrap_err();
     assert!(matches!(error, OperationJournalError::Busy(_)), "{error:?}");
-    assert_eq!(error.to_journal_error(), JournalError::Unavailable);
-    assert_eq!(journal.set_stop_fence(&id), Err(JournalError::Unavailable));
+    // A locked database is `Busy` and not a storage failure of the
+    // interface.
+    assert_eq!(error.to_journal_error(), JournalError::Busy);
+    assert_eq!(journal.set_stop_fence(&id), Err(JournalError::Busy));
+    assert_eq!(
+        journal.record_plan(&file_plan("plan_2", 1)),
+        Err(JournalError::Busy)
+    );
     // A read does not wait for the writer.
     assert_eq!(journal.has_stop_fence(&id), Ok(false));
     other.execute_batch("ROLLBACK").unwrap();

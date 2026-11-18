@@ -99,6 +99,13 @@ pub enum JournalError {
     /// The journal cannot be opened or read.
     #[error("the journal is not available")]
     Unavailable,
+    /// A different process held the lock of the journal for longer than
+    /// the bounded wait of the call. The call wrote nothing. The storage
+    /// did not fail: a later attempt can record. A locked journal is a
+    /// refusal of this attempt, and it does not permit the critical-memory
+    /// exception (`docs/ACTION_CONTRACTS.md` section 12).
+    #[error("the journal is locked by a different process")]
+    Busy,
     /// The storage is full, or the journal is at its size limit.
     #[error("the journal storage is full")]
     Full,
@@ -127,13 +134,16 @@ pub enum JournalError {
 
 impl JournalError {
     /// The error family: `request` for a conflict, an old request, or a
-    /// record out of sequence, and `recording` for each storage failure.
+    /// record out of sequence, and `recording` for a locked journal and
+    /// each storage failure.
     pub fn family(&self) -> ErrorFamily {
         match self {
             Self::Conflict | Self::Expired | Self::Sequence | Self::NotFound => {
                 ErrorFamily::Request
             }
-            Self::Unavailable | Self::Full | Self::Sync | Self::Corrupt => ErrorFamily::Recording,
+            Self::Unavailable | Self::Busy | Self::Full | Self::Sync | Self::Corrupt => {
+                ErrorFamily::Recording
+            }
         }
     }
 }
@@ -583,6 +593,7 @@ mod tests {
     fn a_journal_error_has_its_family() {
         for error in [
             JournalError::Unavailable,
+            JournalError::Busy,
             JournalError::Full,
             JournalError::Sync,
             JournalError::Corrupt,

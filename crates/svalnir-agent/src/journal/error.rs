@@ -201,8 +201,8 @@ impl OperationJournalError {
     /// | Full, admission stopped, queue full | `Full` |
     /// | A failed file operation or synchronization | `Sync` |
     /// | Corrupt file, record that cannot be decoded, value out of range | `Corrupt` |
-    /// | `NotFound`, `Conflict`, `Expired`, `Sequence` | The same name |
-    /// | Each other failure, which includes a locked database | `Unavailable` |
+    /// | A locked database (`Busy`), `NotFound`, `Conflict`, `Expired`, `Sequence` | The same name |
+    /// | Each other failure | `Unavailable` |
     pub fn to_journal_error(&self) -> JournalError {
         match self {
             Self::Full(_) | Self::AdmissionStopped(_) | Self::QueueFull { .. } => {
@@ -212,6 +212,7 @@ impl OperationJournalError {
             Self::Corrupt(_) | Self::Decode { .. } | Self::InvalidRow { .. } => {
                 JournalError::Corrupt
             }
+            Self::Busy(_) => JournalError::Busy,
             Self::NotFound => JournalError::NotFound,
             Self::Conflict => JournalError::Conflict,
             Self::Expired => JournalError::Expired,

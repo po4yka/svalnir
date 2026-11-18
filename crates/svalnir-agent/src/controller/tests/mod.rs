@@ -1254,6 +1254,34 @@ fn the_wait_after_a_refusal_doubles_to_a_maximum_and_an_admission_resets_it() {
 }
 
 #[test]
+fn an_admission_that_the_journal_did_not_record_is_planned_again_at_the_next_evaluation() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    for _ in 0..3 {
+        let outstanding = bench.state.outstanding.clone().unwrap();
+        // The journal was locked by a different process.
+        let report = ApplyReport::Refused {
+            plan_id: outstanding.plan_id.clone(),
+            code: "admission_not_recorded".to_owned(),
+        };
+        bench.advance(SECOND);
+        let output = bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+        // The refusal released the plan, and no observation window
+        // follows it: the evaluation of the same step plans again.
+        assert_eq!(applies(&output).len(), 1);
+        assert_ne!(
+            bench.state.outstanding.as_ref().unwrap().plan_id,
+            outstanding.plan_id
+        );
+    }
+    assert_eq!(
+        bench.state.disk_incidents[0].last_refusal.as_deref(),
+        Some("admission_not_recorded")
+    );
+}
+
+#[test]
 fn a_rearm_does_not_release_a_plan_in_progress_and_is_not_applied_two_times() {
     let mut bench = Bench::new();
     bench.run(20 * SECOND, critical(two_jobs));

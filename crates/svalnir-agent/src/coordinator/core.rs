@@ -963,9 +963,10 @@ impl<J: CoordinatorJournal> Coordinator<J> {
 
     /// Records the plan of the controller and the admission in the
     /// durable journal, or the admission in the volatile record when the
-    /// journal failed and the critical-memory exception is authorized for
-    /// each step of the plan. The second value is true for the volatile
-    /// record.
+    /// storage of the journal failed and the critical-memory exception is
+    /// authorized for each step of the plan. A locked journal is a
+    /// refusal with `admission_not_recorded` and never the exception. The
+    /// second value is true for the volatile record.
     ///
     /// The plan record is written here and not before the reservation, so
     /// that a plan whose admission was refused for a limit leaves no
@@ -981,10 +982,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let plan_id: &PlanId = &plan.plan_id;
         let request_error =
             |text: &str, family: ErrorFamily| refused(admission_error(text, family, plan_id));
+        // A locked journal is a refusal of this attempt and not a storage
+        // failure: it never permits the critical-memory exception. The
+        // controller tries again at its next evaluation.
+        let locked = || request_error(code::ADMISSION_NOT_RECORDED, ErrorFamily::Recording);
         let mut storage_failed: bool = false;
         if request.plan.is_some() {
             match self.journal.record_plan(plan) {
                 Ok(()) => {}
+                Err(JournalError::Busy) => return Err(Box::new(locked())),
                 Err(error) if error.family() == ErrorFamily::Recording => storage_failed = true,
                 Err(_) => {
                     return Err(Box::new(request_error(
@@ -1044,6 +1050,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                         None,
                     ))));
                 }
+                Err(JournalError::Busy) => return Err(Box::new(locked())),
                 Err(_) => storage_failed = true,
             }
         }

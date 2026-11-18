@@ -215,6 +215,7 @@ A refusal of the coordinator or of the authorization keeps its own code and fami
 | --- | --- | --- |
 | `principal_mismatch` | `authority` | From the coordinator: a queued cancel is of a different user than the apply of the operation, and nothing is canceled. From the filesystem executor: the effective user of the executing process is not the principal of the request, and the target is skipped with no call |
 | `request_not_decodable` | `request` | A row of the request queue cannot be decoded by this build, for example a request kind of a later build. The request is rejected with no call and no operation |
+| `admission_not_recorded` | `recording` | The journal did not record the admission: a different process held its lock for longer than the bounded wait, or the storage failed and the critical-memory exception does not apply. Nothing was dispatched. A locked journal never starts the exception ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 12) |
 | `incident_allowance_missing` | `limits` | An automatic plan has no incident allowance: it did not come from the controller of the agent |
 | `reconcile_before_force` | `outcome` | The effect of the graceful step is not known, so no force step is dispatched before a reconciliation |
 | `approved_root_mismatch` | `evidence` | A root record of the executing process has the identity of the root of a file target and a different path or object. The target is skipped with no call |

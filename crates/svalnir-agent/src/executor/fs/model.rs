@@ -529,6 +529,12 @@ pub struct ExecutionFault {
     pub dispatch: DispatchState,
     /// Why the record was rejected.
     pub reason: FaultReason,
+    /// The work that the calls for the target did before the fault. The
+    /// values are those of [`FsTargetOutcome::work`]: entries that the
+    /// executor removed or moved stay removed or moved.
+    pub work: ProcessedWork,
+    /// The item that the Trash backend returned, when it named one.
+    pub trash_item: Option<LosslessPath>,
 }
 
 /// The result of one step: a target outcome, or the fault that prevented

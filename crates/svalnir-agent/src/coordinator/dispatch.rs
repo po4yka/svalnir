@@ -27,7 +27,9 @@ use super::core::{Active, Coordinator, GracefulOutcome, MAX_MEASURED_VOLUMES, Ob
 use super::error::{action_error, action_error_with, code};
 use super::ledger::Benefit;
 use super::ports::{CoordinatorJournal, TimeReading, TriggerStanding};
-use crate::executor::fs::{AdmittedStep, FsTargetOutcome, ProcessedWork, StepOutcome, Stop};
+use crate::executor::fs::{
+    AdmittedStep, ExecutionFault, FsTargetOutcome, ProcessedWork, StepOutcome, Stop,
+};
 use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
@@ -669,20 +671,35 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     ActionStage::Execution,
                 )),
             ),
-            Err(fault) => unknown_outcome(
-                &step.target_id,
-                fault.dispatch.clone(),
-                action_error_with(
-                    code::EXECUTOR_FAULT,
-                    ErrorFamily::Outcome,
-                    ActionStage::Execution,
-                    fault.dispatch,
-                    Some(&active.plan.plan_id),
-                    Some(active.operation.operation_id()),
-                    Some(&step.step_id),
-                ),
-            ),
+            Err(fault) => {
+                // The calls of the target ran before the fault: their
+                // work is in the totals of the operation.
+                add_work(&mut active.work, &fault.work);
+                Self::faulted(active, step, fault)
+            }
         }
+    }
+
+    /// The result of a target whose executor call was, or possibly was,
+    /// submitted and gave no consistent record.
+    fn faulted(
+        active: &Active,
+        step: &PlannedStep,
+        fault: ExecutionFault,
+    ) -> Result<TargetResult, Fault> {
+        unknown_outcome(
+            &step.target_id,
+            fault.dispatch.clone(),
+            action_error_with(
+                code::EXECUTOR_FAULT,
+                ErrorFamily::Outcome,
+                ActionStage::Execution,
+                fault.dispatch,
+                Some(&active.plan.plan_id),
+                Some(active.operation.operation_id()),
+                Some(&step.step_id),
+            ),
+        )
     }
 
     fn advance_filesystem(

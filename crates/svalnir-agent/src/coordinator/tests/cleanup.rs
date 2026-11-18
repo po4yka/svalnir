@@ -169,3 +169,68 @@ fn a_target_that_was_replaced_after_the_plan_is_skipped_and_the_others_run() {
     assert!(first.results()[0].failure.is_some());
     assert_eq!(view.work.removed_entries, EntryCount::new(1));
 }
+
+/// A filesystem executor that reports a fault after calls that removed
+/// entries.
+#[derive(Debug)]
+struct FaultAfterWork;
+
+impl super::super::FilesystemExecutor for FaultAfterWork {
+    fn execute(
+        &self,
+        _roots: &crate::executor::fs::ApprovedRoots,
+        _step: crate::executor::fs::AdmittedStep<'_>,
+        _stop: &dyn crate::executor::fs::StopSignal,
+    ) -> crate::executor::fs::StepOutcome {
+        use svalnir_core::quantity::Bytes;
+
+        Err(crate::executor::fs::ExecutionFault {
+            target_id: svalnir_core::id::TargetId::new("plan_1_target_a").unwrap(),
+            dispatch: DispatchState::Submitted,
+            reason: crate::executor::fs::FaultReason::Record(
+                svalnir_core::action::OutcomeError::Evidence,
+            ),
+            work: crate::executor::fs::ProcessedWork {
+                removed_entries: EntryCount::new(3),
+                removed_logical_bytes: Bytes::new(30),
+                removed_allocated_bytes: Bytes::new(4096),
+                exact: true,
+                ..crate::executor::fs::ProcessedWork::default()
+            },
+            trash_item: None,
+        })
+    }
+}
+
+#[test]
+fn the_work_of_a_target_whose_executor_reported_a_fault_stays_in_the_totals() {
+    let mut bench = Bench::new();
+    bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let started = bench.start_with(|dependencies, _| {
+        dependencies.filesystem = Box::new(FaultAfterWork);
+    });
+    let super::super::Start::Coordinating(mut coordinator) = started else {
+        panic!("a different coordinator holds the lock");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    // The effect of the target is not known, and the entries that the
+    // calls removed before the fault are counted.
+    let result = &view.operation.steps()[0].results()[0];
+    assert_eq!(result.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(result.dispatch, DispatchState::Submitted);
+    assert_eq!(view.work.removed_entries, EntryCount::new(3));
+    assert_eq!(
+        view.work.removed_logical_bytes,
+        svalnir_core::quantity::Bytes::new(30)
+    );
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+}

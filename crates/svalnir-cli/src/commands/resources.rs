@@ -5,13 +5,13 @@
 //! and the text rendering, which take values and read nothing.
 
 use serde::Serialize;
+use svalnir_agent::observe;
 use svalnir_agent::platform::memory::{
     self, MemorySnapshot, PageRate, RateLimits, RateUnavailable, SwapActivity, SwapUsage,
     VmStatistics,
 };
-use svalnir_agent::platform::volume::{self, FoundationCapacity, VolumeCapacity};
 use svalnir_core::id::SampleId;
-use svalnir_core::observation::{Observation, UnavailableReason};
+use svalnir_core::observation::Observation;
 use svalnir_core::quantity::{Bytes, CounterValue, Nanoseconds, PageCount};
 use svalnir_core::state::PressureState;
 use svalnir_core::volume::VolumeIdentity;
@@ -40,82 +40,15 @@ const POLICY_NOTE: &str =
 const GROWTH_NOTE: &str =
     "A growth signal needs retained samples from the background agent. One snapshot has none.";
 
-/// The disk part of a snapshot, as the collectors gave it.
-#[derive(Debug, Clone)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a snapshot has one disk reading, and a box adds an allocation to each one"
-)]
-pub(crate) enum DiskReading {
-    /// The startup data volume and its capacity.
-    Measured {
-        identity: VolumeIdentity,
-        capacity: VolumeCapacity,
-        foundation: FoundationCapacity,
-    },
-    /// The startup data volume has an identity, and the `statfs` capacity
-    /// collection failed. The reading has no capacity.
-    CapacityUnavailable {
-        identity: VolumeIdentity,
-        reason: String,
-    },
-    /// The startup data volume has no identity, so nothing was measured.
-    Unresolved(String),
-}
-
-/// One reading of the host.
-#[derive(Debug, Clone)]
-pub(crate) struct HostReading {
-    pub(crate) disk: DiskReading,
-    pub(crate) memory: MemorySnapshot,
-}
-
-/// Reads the disk capacity of the startup data volume.
-///
-/// A failed collection does not end the command. The `statfs` capacity is
-/// required: when it fails, the reading says so and the scope coverage is
-/// partial. The Foundation values are optional planning values: when they
-/// fail, their observations are unavailable and the coverage is unchanged.
-pub(crate) fn collect_disk(host: &Host) -> DiskReading {
-    let mounted = match Host::startup_data_volume() {
-        Ok(mounted) => mounted,
-        Err(error) => return DiskReading::Unresolved(error.to_string()),
-    };
-    let capacity: VolumeCapacity = match volume::collect_capacity(host.context(), &mounted.identity)
-    {
-        Ok(capacity) => capacity,
-        Err(error) => {
-            return DiskReading::CapacityUnavailable {
-                identity: mounted.identity,
-                reason: error.to_string(),
-            };
-        }
-    };
-    let foundation: FoundationCapacity =
-        match volume::collect_foundation_capacity(host.context(), &mounted.identity) {
-            Ok(foundation) => foundation,
-            Err(_) => volume::foundation_capacity_observations(
-                host.context(),
-                &mounted.identity,
-                Err(UnavailableReason::TransientFailure),
-                &capacity.total.sample,
-            ),
-        };
-    DiskReading::Measured {
-        identity: mounted.identity,
-        capacity,
-        foundation,
-    }
-}
+pub(crate) use svalnir_agent::observe::{DiskReading, HostReading};
 
 /// Reads the disk capacity and the memory state of the host.
 ///
-/// A disk collection failure keeps the memory reading. Only a memory
-/// collection failure is an error.
+/// A disk collection failure keeps the memory reading, and the scope
+/// coverage of the snapshot is then partial. Only a memory collection
+/// failure is an error.
 pub(crate) fn collect(host: &Host) -> Result<HostReading, ErrorBody> {
-    let disk: DiskReading = collect_disk(host);
-    let memory: MemorySnapshot = memory::collect_memory_snapshot(host.context())?;
-    Ok(HostReading { disk, memory })
+    Ok(observe::collect(host.observed())?)
 }
 
 /// The disk capacity of the startup data volume.

@@ -5,22 +5,18 @@
 //! through the adapters of `svalnir_agent`. No function here changes the
 //! host.
 
-use std::path::Path;
-
 use serde::Serialize;
+use svalnir_agent::observe;
 use svalnir_agent::platform::memory::{CollectError, CollectionContext};
-use svalnir_agent::platform::volume::{self, MountedVolume, VolumeQueryError};
+use svalnir_agent::platform::volume::{MountedVolume, VolumeQueryError};
 use svalnir_core::observation::{Observation, ObservationValue, Reading};
 
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 
-/// The mount point of the data volume of the startup volume group on macOS.
-const STARTUP_DATA_MOUNT_POINT: &str = "/System/Volumes/Data";
-
 /// The collectors of this process.
 #[derive(Debug)]
 pub(crate) struct Host {
-    context: CollectionContext,
+    observed: observe::Host,
 }
 
 impl Host {
@@ -31,26 +27,26 @@ impl Host {
     /// Returns `collector_unavailable` when the host gives no boot identity
     /// or no monotonic clock.
     pub(crate) fn open() -> Result<Self, ErrorBody> {
-        CollectionContext::for_current_process()
-            .map(|context| Self { context })
+        observe::Host::open()
+            .map(|observed| Self { observed })
             .map_err(|error| collector_unavailable(&error.to_string()))
+    }
+
+    /// The collectors that the clients share.
+    pub(crate) fn observed(&self) -> &observe::Host {
+        &self.observed
     }
 
     /// The collection context.
     pub(crate) fn context(&self) -> &CollectionContext {
-        &self.context
+        self.observed.context()
     }
 
     /// The volume that the `startup-data` selector names: the data volume of
     /// the startup volume group, or the root volume on a host that has no
     /// separate data volume.
     pub(crate) fn startup_data_volume() -> Result<MountedVolume, VolumeQueryError> {
-        let data: &Path = Path::new(STARTUP_DATA_MOUNT_POINT);
-        if data.is_dir() {
-            volume::volume_at(data)
-        } else {
-            volume::volume_at(Path::new("/"))
-        }
+        observe::Host::startup_data_volume()
     }
 
     /// A collector for the processes of the current user, with the boot,
@@ -67,7 +63,7 @@ impl Host {
         use svalnir_agent::platform::process::{
             CollectionContext as ProcessContext, DarwinProcessSource, ProcessCollector,
         };
-        let identity = self.context.identity();
+        let identity = self.context().identity();
         ProcessCollector::new(
             DarwinProcessSource::new(),
             ProcessContext {

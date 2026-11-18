@@ -399,6 +399,62 @@ impl OperationJournal {
         Self::open_with_migrations(path, options, MIGRATIONS)
     }
 
+    /// Opens the existing journal file at `path` for reads only. The open
+    /// does not make the file, does not migrate it, and sets no pragma that
+    /// writes; the connection is `SQLITE_OPEN_READ_ONLY` with `query_only`.
+    /// A write method on the journal fails with a storage error.
+    ///
+    /// The database must have the current schema version. A file of zero
+    /// bytes has the version 0 and is refused. The database is in the
+    /// write-ahead log mode. When the `-wal` and `-shm` files do not exist
+    /// (a clean close of the last writer removes them), the first read makes
+    /// both of them, and the `-wal` file is empty; the main file is not
+    /// changed. The test `a_read_only_open_changes_no_main_file_and_makes_the_wal_siblings`
+    /// records this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationJournalError::InvalidPath`] for an empty path or
+    /// `:memory:`, [`OperationJournalError::NewerVersion`] or
+    /// [`OperationJournalError::NotAJournal`] for a database of a different
+    /// kind, [`OperationJournalError::SchemaNotCurrent`] for an older
+    /// version, or a storage error.
+    pub fn open_read_only(path: &Path) -> Result<Self, OperationJournalError> {
+        let supported: u32 = migration::supported_version(MIGRATIONS)?;
+        if path.as_os_str().is_empty() || path.as_os_str() == ":memory:" {
+            return Err(OperationJournalError::InvalidPath(
+                path.display().to_string(),
+            ));
+        }
+        let options: JournalOptions = JournalOptions::default();
+        let connection: Connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(options.busy_timeout)?;
+        let found: u32 = migration::recorded_version(&connection, supported)?;
+        if found != supported {
+            return Err(OperationJournalError::SchemaNotCurrent { found, supported });
+        }
+        connection.pragma_update(None, "query_only", true)?;
+        let page_size: u64 = pragma_u64(&connection, "page_size")?.max(1);
+        let page_limit: u64 = pragma_u64(&connection, "max_page_count")?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+            options,
+            limits: SizeLimits {
+                page_size,
+                page_limit,
+                reserve_pages: options.admission_reserve.get().div_ceil(page_size),
+                max_wal_bytes: options.max_wal_size.get(),
+            },
+            cache: None,
+            plan_cache: None,
+            commit_fault: CommitFault::default(),
+        })
+    }
+
     fn open_with_migrations(
         path: &Path,
         options: &JournalOptions,

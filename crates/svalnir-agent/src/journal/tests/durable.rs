@@ -1148,3 +1148,81 @@ fn a_prune_removes_settled_records_and_an_old_request_is_rejected() {
     let reused = Plan::seal(file_content("plan_settled", 2)).unwrap();
     assert_eq!(journal.record_plan(&reused), Err(JournalError::Expired));
 }
+
+fn directory_files(directory: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_read_only_open_changes_no_main_file_and_makes_the_wal_siblings() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let directory = fixture.directory.path().to_path_buf();
+    let bytes_before = std::fs::read(fixture.path()).unwrap();
+    let files_before = directory_files(&directory);
+
+    let journal = OperationJournal::open_read_only(&fixture.path()).unwrap();
+    assert!(journal.coordination().unwrap().is_none());
+    assert_eq!(journal.recent_operations(1).unwrap().len(), 0);
+    drop(journal);
+
+    assert_eq!(std::fs::read(fixture.path()).unwrap(), bytes_before);
+    let files_after = directory_files(&directory);
+    let created: Vec<&String> = files_after
+        .iter()
+        .filter(|name| !files_before.contains(name))
+        .collect();
+    // Observed: after a clean close the read-write open leaves no `-wal`
+    // and no `-shm` file. The read-only open of the WAL database makes both
+    // of them, and the `-wal` file is empty. The main file is not changed.
+    assert_eq!(
+        created,
+        ["operations.sqlite-shm", "operations.sqlite-wal"],
+        "files before: {files_before:?}; after: {files_after:?}"
+    );
+    let wal = std::fs::metadata(directory.join("operations.sqlite-wal")).unwrap();
+    assert_eq!(wal.len(), 0);
+}
+
+#[test]
+fn a_read_only_open_refuses_a_zero_byte_file() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.path(), b"").unwrap();
+    let error = OperationJournal::open_read_only(&fixture.path()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OperationJournalError::SchemaNotCurrent { found: 0, .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::metadata(fixture.path()).unwrap().len(), 0);
+    assert_eq!(
+        directory_files(fixture.directory.path()),
+        ["operations.sqlite"]
+    );
+}
+
+#[test]
+fn a_read_only_open_refuses_an_older_version_and_does_not_change_it() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    {
+        let raw = Connection::open(fixture.path()).unwrap();
+        raw.pragma_update(None, "user_version", JOURNAL_VERSION - 1)
+            .unwrap();
+    }
+    let bytes_before = std::fs::read(fixture.path()).unwrap();
+    let error = OperationJournal::open_read_only(&fixture.path()).unwrap_err();
+    assert!(
+        matches!(error, OperationJournalError::SchemaNotCurrent { found, supported }
+            if found == JOURNAL_VERSION - 1 && supported == JOURNAL_VERSION),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read(fixture.path()).unwrap(), bytes_before);
+}

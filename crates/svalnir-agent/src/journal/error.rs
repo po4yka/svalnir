@@ -142,6 +142,18 @@ pub enum OperationJournalError {
         /// The newest version that this build can read and write.
         supported: u32,
     },
+    /// A read-only open found a version that is not the current one. A
+    /// read-only open does not migrate.
+    #[error(
+        "the operation journal has version {found}, and this build reads version {supported}; \
+         the agent or the command line migrates it"
+    )]
+    SchemaNotCurrent {
+        /// The version that the database records.
+        found: u32,
+        /// The version that this build reads.
+        supported: u32,
+    },
     /// The file is an `SQLite` database that is not an operation journal.
     /// This build did not change its content.
     #[error("the database is not a Svalnir operation journal")]

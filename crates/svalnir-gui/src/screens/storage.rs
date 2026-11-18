@@ -13,12 +13,14 @@ use crate::{
         tokens::{self, Tokens, to_hsla},
     },
     ui::{
+        action_button::{ActionButton, ButtonVariant},
         data_state::{format_age, format_bytes, used_capacity},
         entry::card_entry,
         legend::{Legend, LegendRow},
         pill::{StatusPill, Tone},
         provenance::ProvenanceLine,
         rolling::RollingNumber,
+        segmented::SegmentedControl,
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
@@ -544,61 +546,60 @@ impl StorageScreen {
     }
 
     fn metric_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      metric: SizeMetric,
-                      this: &Self,
-                      cx: &mut Context<Self>| {
-            let base = Button::new(id).label(label).small();
-            let base = if this.metric == metric {
-                base.primary()
-            } else {
-                base.outline()
-            };
-            base.on_click(cx.listener(move |screen, _, _, cx| {
-                screen.metric = metric;
-                cx.notify();
-            }))
-        };
-        h_flex()
-            .gap(px(4.0))
-            .child(button(
-                "metric-allocated",
-                "Allocated",
-                SizeMetric::Allocated,
-                self,
-                cx,
-            ))
-            .child(button(
-                "metric-logical",
-                "Logical",
-                SizeMetric::Logical,
-                self,
-                cx,
-            ))
-            .into_any_element()
+        let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        let metrics: [(&'static str, &'static str, SizeMetric); 2] = [
+            ("metric-allocated", "Allocated", SizeMetric::Allocated),
+            ("metric-logical", "Logical", SizeMetric::Logical),
+        ];
+        let active: usize = metrics.iter().position(|m| m.2 == self.metric).unwrap_or(0);
+        let entity = cx.entity();
+        SegmentedControl::new(
+            "metric-control",
+            metrics
+                .iter()
+                .map(|m| (SharedString::from(m.0), SharedString::from(m.1)))
+                .collect(),
+            active,
+        )
+        .track(to_hsla(tokens.surface_inset))
+        .on_change(move |index, _, cx| {
+            if let Some(m) = metrics.get(index) {
+                entity.update(cx, |screen, cx| {
+                    screen.metric = m.2;
+                    cx.notify();
+                });
+            }
+        })
+        .into_any_element()
     }
 
     fn layout_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let button =
-            |id: &'static str, layout: StorageLayout, this: &Self, cx: &mut Context<Self>| {
-                let base = Button::new(id).label(layout.name()).small();
-                let base = if this.layout == layout {
-                    base.primary()
-                } else {
-                    base.outline()
-                };
-                base.on_click(cx.listener(move |screen, _, _, cx| {
-                    screen.layout = layout;
+        let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        let layouts: [(&'static str, StorageLayout); 3] = [
+            ("layout-tiles", StorageLayout::Tiles),
+            ("layout-band", StorageLayout::Band),
+            ("layout-columns", StorageLayout::Columns),
+        ];
+        let active: usize = layouts.iter().position(|l| l.1 == self.layout).unwrap_or(0);
+        let entity = cx.entity();
+        SegmentedControl::new(
+            "layout-control",
+            layouts
+                .iter()
+                .map(|l| (SharedString::from(l.0), SharedString::from(l.1.name())))
+                .collect(),
+            active,
+        )
+        .track(to_hsla(tokens.surface_inset))
+        .on_change(move |index, _, cx| {
+            if let Some(l) = layouts.get(index) {
+                entity.update(cx, |screen, cx| {
+                    screen.layout = l.1;
                     cx.notify();
-                }))
-            };
-        h_flex()
-            .gap(px(4.0))
-            .child(button("layout-tiles", StorageLayout::Tiles, self, cx))
-            .child(button("layout-band", StorageLayout::Band, self, cx))
-            .child(button("layout-columns", StorageLayout::Columns, self, cx))
-            .into_any_element()
+                });
+            }
+        })
+        .into_any_element()
     }
 
     fn breadcrumb(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -645,9 +646,8 @@ impl StorageScreen {
             )))
             .child(
                 h_flex().child(
-                    Button::new("scan-start")
-                        .primary()
-                        .label(format!("Scan {name}"))
+                    ActionButton::new("scan-start", format!("Scan {name}"))
+                        .variant(ButtonVariant::Primary)
                         .on_click(cx.listener(|screen, _, _, cx| screen.start(cx))),
                 ),
             )
@@ -777,12 +777,11 @@ impl StorageScreen {
             }))
             .child(
                 h_flex().child(
-                    Button::new("scan-cancel")
-                        .outline()
-                        .label("Cancel")
-                        .on_click(cx.listener(|screen, _, _, cx| {
+                    ActionButton::new("scan-cancel", "Cancel").on_click(cx.listener(
+                        |screen, _, _, cx| {
                             screen.model.update(cx, |model, _| model.cancel_scan());
-                        })),
+                        },
+                    )),
                 ),
             )
             .into_any_element()
@@ -973,9 +972,7 @@ impl StorageScreen {
             .child(caption("scan-footer", done_footer(summary), tokens))
             .child(
                 h_flex().child(
-                    Button::new("scan-rescan")
-                        .outline()
-                        .label("Rescan")
+                    ActionButton::new("scan-rescan", "Rescan")
                         .on_click(cx.listener(|screen, _, _, cx| screen.start(cx))),
                 ),
             )
@@ -1040,9 +1037,7 @@ impl Render for StorageScreen {
                 )
                 .child(
                     h_flex().child(
-                        Button::new("scan-retry")
-                            .outline()
-                            .label("Try again")
+                        ActionButton::new("scan-retry", "Try again")
                             .on_click(cx.listener(|screen, _, _, cx| screen.start(cx))),
                     ),
                 )

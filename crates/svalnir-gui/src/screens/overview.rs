@@ -4,7 +4,7 @@
 use crate::{
     data::{
         model::{
-            AgentSnapshot, AgentState, GuardState, HostSnapshot, Loadable, Measured,
+            AgentSnapshot, AgentState, GuardState, HostSample, HostSnapshot, Loadable, Measured,
             OperationPhase, PressureLevel, ServiceSnapshot,
         },
         store::AppModel,
@@ -21,15 +21,19 @@ use crate::{
     },
     viz::{
         alloc::count_f32,
-        capacity_grid::CapacityGrid,
+        capacity_grid::{capacity_label, known_capacity},
+        led::{LedChart, LedField, LedSegment},
+        spark::{Sparkline, level_changes},
         tick_gauge::{PRESSURE_TICKS, PressureTone, TickGauge, pressure_gauge},
+        tick_track::{TRACK_TICKS, TickTrack, track_states},
+        treemap::CellRect,
     },
 };
 use gpui_kit::{
-    AnyElement, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement, Pixels, Render,
-    Role, SharedString, Styled, TestSupportExt as _, Window,
+    AnyElement, BoxShadow, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement, Pixels,
+    Render, Role, SharedString, Styled, TestSupportExt as _, Window,
     component::{ActiveTheme as _, IconName, h_flex, skeleton::Skeleton, v_flex},
-    div,
+    div, point,
     prelude::*,
     px,
 };
@@ -195,8 +199,46 @@ fn tone_color(tone: PressureTone, tokens: &Tokens) -> Hsla {
     })
 }
 
-fn disk_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyElement {
-    let mut header: ShellHeader = ShellHeader::new(IconName::HardDrive, "Disk headroom");
+/// The LED field of the hero chart: the used capacity as one `brand`
+/// segment and the free region after it. An unknown capacity is an empty lattice.
+fn hero_field(
+    used: &Measured<u64>,
+    total: &Measured<u64>,
+    columns: u16,
+    tokens: &Tokens,
+) -> LedField {
+    let rows: u16 = 10;
+    let mut field: LedField = LedField {
+        columns,
+        rows,
+        segments: Vec::new(),
+        free: None,
+        head: None,
+        phase: None,
+    };
+    if let Some((used, total)) = known_capacity(used, total) {
+        let wanted: u64 = (used.saturating_mul(u64::from(columns)) + total / 2) / total;
+        let used_cols: u16 = u16::try_from(wanted.min(u64::from(columns))).unwrap_or(columns);
+        field.segments.push(LedSegment::new(
+            CellRect::new(0, 0, used_cols, rows),
+            to_hsla(tokens.brand),
+            1,
+        ));
+        if used_cols < columns {
+            field.free = Some(CellRect::new(used_cols, 0, columns - used_cols, rows));
+        }
+    }
+    field
+}
+
+fn hero_card(
+    view: &View,
+    roll: &Entity<RollingNumber>,
+    tokens: &Tokens,
+    width: f32,
+    mono: &SharedString,
+) -> AnyElement {
+    let mut header: ShellHeader = ShellHeader::new(IconName::HardDrive, "Startup volume");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
         View::Failed(reason) => unavailable_body("disk-value", reason, tokens),
@@ -205,6 +247,16 @@ fn disk_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyE
                 header = header.subtitle(name.clone());
             }
             let used: Measured<u64> = used_capacity(&host.disk_total, &host.disk_available);
+            if let Some((u, t)) = known_capacity(&used, &host.disk_total) {
+                let percent: u64 = u.saturating_mul(100) / t;
+                header = header.aside(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(12.0))
+                        .text_color(to_hsla(tokens.muted_foreground))
+                        .child(format!("{percent}% used")),
+                );
+            }
             let value: DisplayValue = match &host.disk_available {
                 Measured::Value(available) => {
                     let (text, unit) = format_bytes(*available);
@@ -224,14 +276,34 @@ fn disk_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyE
                     DisplayValue::unavailable(reason.clone()).id("disk-value")
                 }
             };
+            let columns: u16 = {
+                let inner: f32 = (width - 32.0 - 12.0).max(120.0);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "the value is clamped to 20..=200 first"
+                )]
+                let cells: u16 = (inner / 6.0).floor().clamp(20.0, 200.0) as u16;
+                cells
+            };
+            let field: LedField = hero_field(&used, &host.disk_total, columns, tokens);
+            let scale: Option<String> = match &host.disk_total {
+                Measured::Value(total) if *total > 0 => {
+                    let (v, unit) = format_bytes(*total / u64::from(columns));
+                    Some(format!("1 cell = {v} {unit}"))
+                }
+                _ => None,
+            };
             v_flex()
                 .gap(px(12.0))
                 .child(value)
-                .child(
-                    CapacityGrid::new(used, host.disk_total.clone())
-                        .inline(true)
-                        .id("disk-grid"),
-                )
+                .child(LedChart::new(
+                    field,
+                    Vec::new(),
+                    "disk-grid",
+                    capacity_label(&used, &host.disk_total),
+                ))
+                .children(scale.map(|text| caption("disk-grid-scale", text, tokens)))
                 .children(stale.then(|| caption("disk-stale", stale_caption(host), tokens)))
                 .child(
                     ProvenanceLine::new(host.source, host.captured_at, "startup data volume")
@@ -243,7 +315,7 @@ fn disk_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyE
     card(header, body)
 }
 
-fn pressure_card(view: &View, tokens: &Tokens) -> AnyElement {
+fn pressure_card(view: &View, history: &[HostSample], tokens: &Tokens) -> AnyElement {
     let mut header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Memory pressure");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
@@ -270,6 +342,11 @@ fn pressure_card(view: &View, tokens: &Tokens) -> AnyElement {
             v_flex()
                 .gap(px(12.0))
                 .child(tick_gauge)
+                .child(TickTrack::new(
+                    "pressure-track",
+                    track_states(history.iter(), TRACK_TICKS),
+                    history.len(),
+                ))
                 .child(caption("pressure-caption", note, tokens))
                 .children(stale.then(|| caption("pressure-stale", stale_caption(host), tokens)))
                 .child(
@@ -282,7 +359,52 @@ fn pressure_card(view: &View, tokens: &Tokens) -> AnyElement {
     card(header, body)
 }
 
-fn swap_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyElement {
+fn swap_spark(host: &HostSnapshot, history: &[HostSample], tokens: &Tokens) -> AnyElement {
+    let values: Vec<Option<u64>> = history
+        .iter()
+        .map(|s| match &s.swap_used {
+            Measured::Value(v) => Some(*v),
+            Measured::Unavailable(_) => None,
+        })
+        .collect();
+    if values.iter().flatten().count() < 2 {
+        return caption("swap-spark-note", "Collecting samples\u{2026}", tokens);
+    }
+    let largest: u64 = values.iter().flatten().copied().max().unwrap_or(0);
+    let max: u64 = match &host.swap_total {
+        Measured::Value(total) => (*total).max(largest),
+        Measured::Unavailable(_) => largest,
+    }
+    .max(1);
+    let (text, unit) = format_bytes(max);
+    v_flex()
+        .gap(px(6.0))
+        .child(
+            div()
+                .id("swap-spark")
+                .test_support()
+                .aria_label(format!("Swap in use over {} samples", values.len()))
+                .child(Sparkline::new(
+                    values,
+                    max,
+                    level_changes(history),
+                    to_hsla(tokens.brand),
+                )),
+        )
+        .child(caption(
+            "swap-spark-scale",
+            format!("0 \u{2013} {text} {unit}"),
+            tokens,
+        ))
+        .into_any_element()
+}
+
+fn swap_card(
+    view: &View,
+    history: &[HostSample],
+    roll: &Entity<RollingNumber>,
+    tokens: &Tokens,
+) -> AnyElement {
     let header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Swap");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
@@ -310,6 +432,7 @@ fn swap_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyE
             v_flex()
                 .gap(px(12.0))
                 .child(value)
+                .child(swap_spark(host, history, tokens))
                 .child(caption(
                     "swap-caption",
                     "Swap in use. Nonzero swap alone is not a problem.",
@@ -369,6 +492,33 @@ pub const fn phase_pill(phase: OperationPhase, state_text: &str) -> (&str, Tone)
     }
 }
 
+/// A 3 by 3 lattice block: lit with a glow for an active guard.
+fn guard_led(active: bool, tokens: &Tokens) -> AnyElement {
+    let color: Hsla = to_hsla(tokens.positive);
+    let mut block = div().flex().flex_col().gap(px(1.0)).flex_shrink_0();
+    if active {
+        block = block.shadow(vec![BoxShadow {
+            color: color.opacity(0.5),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(6.0),
+            spread_radius: px(0.0),
+            inset: false,
+        }]);
+    }
+    for _ in 0..3 {
+        let mut line = h_flex().gap(px(1.0));
+        for _ in 0..3 {
+            line = line.child(div().size(px(3.0)).rounded(px(0.5)).bg(if active {
+                color
+            } else {
+                to_hsla(tokens.border)
+            }));
+        }
+        block = block.child(line);
+    }
+    block.into_any_element()
+}
+
 fn policies_card(
     service: &Loadable<ServiceSnapshot>,
     mono: &SharedString,
@@ -395,6 +545,8 @@ fn policies_card(
                         .child(
                             h_flex()
                                 .gap(px(8.0))
+                                .items_center()
+                                .child(guard_led(row.standing == GuardState::Active, tokens))
                                 .child(div().font_family(mono.clone()).child(row.name))
                                 .child(
                                     StatusPill::new(text, tone).id(format!("guard-{}", row.name)),
@@ -496,6 +648,7 @@ impl Render for OverviewScreen {
                 stale: true,
             },
         };
+        let history: Vec<HostSample> = model.history.iter().cloned().collect();
         let agent: Loadable<AgentSnapshot> = model.agent.clone();
         let service: Loadable<ServiceSnapshot> = model.service.clone();
         let mono: SharedString = cx.theme().mono_font_family.clone();
@@ -513,10 +666,17 @@ impl Render for OverviewScreen {
             / count_f32(columns))
         .max(MIN_CARD_WIDTH));
 
+        let full_width: Pixels = px(content.max(MIN_CARD_WIDTH));
         let cards: Vec<AnyElement> = vec![
-            disk_card(&view, &self.roll_disk, tokens),
-            pressure_card(&view, tokens),
-            swap_card(&view, &self.roll_swap, tokens),
+            hero_card(
+                &view,
+                &self.roll_disk,
+                tokens,
+                content.max(MIN_CARD_WIDTH),
+                &mono,
+            ),
+            pressure_card(&view, &history, tokens),
+            swap_card(&view, &history, &self.roll_swap, tokens),
             agent_card(&agent, tokens),
             policies_card(&service, &mono, tokens),
             intervention_card(&service, &mono, tokens),
@@ -542,19 +702,15 @@ impl Render for OverviewScreen {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(tokens::GRID_GAP)
-                    .children(cards.into_iter().map(|card| {
-                        div()
-                            .w(card_width)
-                            .min_w(px(MIN_CARD_WIDTH))
-                            .flex_shrink_0()
-                            .child(card)
-                    })),
-            )
+            .child(div().flex().flex_wrap().gap(tokens::GRID_GAP).children(
+                cards.into_iter().enumerate().map(|(index, card)| {
+                    div()
+                        .w(if index == 0 { full_width } else { card_width })
+                        .min_w(px(MIN_CARD_WIDTH))
+                        .flex_shrink_0()
+                        .child(card)
+                }),
+            ))
     }
 }
 

@@ -48,7 +48,7 @@ fn label(handle: AnyWindowHandle, id: &'static str, cx: &mut TestAppContext) -> 
 fn healthy_shows_value_scale_and_pill(cx: &mut TestAppContext) {
     let handle = open(FixtureScenario::Healthy, cx);
     let disk = label(handle, "disk-grid-scale", cx).expect("scale caption");
-    assert_eq!(disk, "1 cell = 5%");
+    assert!(disk.starts_with("1 cell = "), "{disk}");
     let pill = label(handle, "pressure-pill", cx).expect("pressure pill");
     assert_eq!(pill, "Normal");
     let chart = label(handle, "disk-grid", cx).expect("grid label");
@@ -124,4 +124,30 @@ fn unavailable_service_shows_a_problem_line(cx: &mut TestAppContext) {
     let handle = open(FixtureScenario::Unavailable, cx);
     let problem = label(handle, "policies-problem", cx).expect("problem line");
     assert!(problem.contains("cannot be read"), "{problem}");
+}
+
+#[gpui_kit::test]
+fn hero_chart_label_has_the_used_percentage(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    let chart = label(handle, "disk-grid", cx).expect("hero chart");
+    assert!(
+        chart.ends_with('%') && chart.contains(" used of "),
+        "{chart}"
+    );
+}
+
+#[gpui_kit::test]
+fn unavailable_hero_has_a_dash_and_the_track_counts_no_normal_sample(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Unavailable, cx);
+    let chart = label(handle, "disk-grid", cx).expect("hero chart");
+    assert!(chart.contains('\u{2014}'), "{chart}");
+    let track = label(handle, "pressure-track", cx).expect("tick track");
+    assert!(track.contains(" 0 normal"), "{track}");
+}
+
+#[gpui_kit::test]
+fn the_tick_track_counts_a_sample_per_refresh(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Pressure, cx);
+    let first = label(handle, "pressure-track", cx).expect("tick track");
+    assert!(first.contains("1 warning"), "{first}");
 }

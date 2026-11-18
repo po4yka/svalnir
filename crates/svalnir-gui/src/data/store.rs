@@ -92,6 +92,8 @@ pub struct AppModel {
     source: Arc<dyn DataSource>,
     /// The host reading.
     pub host: Loadable<HostSnapshot>,
+    /// The recent host readings, oldest first, at most `HISTORY_MAX`.
+    pub history: std::collections::VecDeque<crate::data::model::HostSample>,
     /// The agent state.
     pub agent: Loadable<AgentSnapshot>,
     /// The guards and the latest operation.
@@ -141,6 +143,7 @@ impl AppModel {
             fixture_name: source.fixture_name(),
             source,
             host: Loadable::Loading,
+            history: std::collections::VecDeque::new(),
             agent: Loadable::Loading,
             service: Loadable::Loading,
             scan: ScanState::Idle,
@@ -324,7 +327,14 @@ impl AppModel {
                     .update(cx, |model, cx| {
                         model.in_flight.host = false;
                         model.host = match result {
-                            Ok(snapshot) => Loadable::Ready(Arc::new(snapshot)),
+                            Ok(snapshot) => {
+                                crate::data::model::push_bounded(
+                                    &mut model.history,
+                                    crate::data::model::HostSample::of(&snapshot),
+                                    crate::data::model::HISTORY_MAX,
+                                );
+                                Loadable::Ready(Arc::new(snapshot))
+                            }
                             Err(reason) => Loadable::Unavailable(reason),
                         };
                         model.last_refresh = Some(SystemTime::now());

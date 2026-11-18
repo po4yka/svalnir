@@ -205,10 +205,10 @@ impl LedStyle {
             outline: 1.5,
             outline_radius: 6.0,
             lattice: lattice.opacity(0.5),
-            glow_alpha: if dark { 0.35 } else { 0.18 },
+            glow_alpha: if dark { 0.45 } else { 0.22 },
             dim_alpha: if dark { 0.28 } else { 0.22 },
             point: to_hsla(tokens.foreground).opacity(0.8),
-            free_outline: lattice,
+            free_outline: to_hsla(tokens.muted_foreground).opacity(0.35),
         }
     }
 
@@ -302,7 +302,7 @@ pub fn paint_led_field(
         let shadow: BoxShadow = BoxShadow {
             color: segment.color.opacity(style.glow_alpha),
             offset: Point::default(),
-            blur_radius: px(10.0),
+            blur_radius: px(14.0),
             spread_radius: px(0.0),
             inset: false,
         };
@@ -346,6 +346,16 @@ pub fn paint_led_field(
                 );
             }
         }
+    }
+    // A faint inner tint under the cells: the block reads as lit glass.
+    for segment in field
+        .segments
+        .iter()
+        .filter(|s| !s.dimmed && !s.rect.is_empty())
+    {
+        window.paint_quad(
+            fill(rect_bounds(segment.rect), segment.color.opacity(0.08)).corner_radii(radii),
+        );
     }
     // The cells of each segment.
     for segment in &field.segments {
@@ -392,7 +402,7 @@ pub fn paint_led_field(
     }
     // Outlines last, on top of the cells.
     for segment in field.segments.iter().filter(|s| !s.rect.is_empty()) {
-        let alpha: f32 = if segment.dimmed { 0.5 } else { 1.0 };
+        let alpha: f32 = if segment.dimmed { 0.35 } else { 1.0 };
         window.paint_quad(quad(
             outline_bounds(segment.rect),
             radii,

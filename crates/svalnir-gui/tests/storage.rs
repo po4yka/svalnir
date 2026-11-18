@@ -468,3 +468,19 @@ fn the_chart_fills_in_over_time_and_ends_at_one(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!((screen.read_with(&vcx, |s, _| s.chart_fill()) - 1.0).abs() < f32::EPSILON);
 }
+
+#[gpui_kit::test]
+fn arrow_keys_on_the_layout_control_change_the_layout(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    cx.update_window(handle, |_, window, cx| window.press("cmd-2", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.click("layout-band", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("right", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let columns = label_of(handle, "layout-columns", cx);
+    assert_eq!(columns.as_deref(), Some("Columns"));
+}

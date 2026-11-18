@@ -31,6 +31,71 @@ impl<T> Measured<T> {
     }
 }
 
+/// The most host samples that the model keeps.
+pub const HISTORY_MAX: usize = 180;
+
+/// The few values of one host reading that the Overview charts over time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSample {
+    /// When the reading was taken.
+    pub at: SystemTime,
+    /// The memory pressure.
+    pub pressure: Measured<PressureLevel>,
+    /// The used swap.
+    pub swap_used: Measured<u64>,
+    /// The available capacity of the startup volume.
+    pub disk_available: Measured<u64>,
+}
+
+impl HostSample {
+    /// The sample of a host reading.
+    #[must_use]
+    pub fn of(host: &HostSnapshot) -> Self {
+        Self {
+            at: host.captured_at,
+            pressure: host.pressure.clone(),
+            swap_used: host.swap_used.clone(),
+            disk_available: host.disk_available.clone(),
+        }
+    }
+}
+
+/// Appends `sample` and drops the oldest ones beyond `max`.
+pub fn push_bounded(
+    history: &mut std::collections::VecDeque<HostSample>,
+    sample: HostSample,
+    max: usize,
+) {
+    history.push_back(sample);
+    while history.len() > max {
+        history.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn history_keeps_the_newest_samples_within_the_bound() {
+        let mut history = std::collections::VecDeque::new();
+        for n in 0..5_u64 {
+            let sample = HostSample {
+                at: SystemTime::UNIX_EPOCH,
+                pressure: Measured::Value(PressureLevel::Normal),
+                swap_used: Measured::Value(n),
+                disk_available: Measured::Unavailable("x".into()),
+            };
+            push_bounded(&mut history, sample, 3);
+        }
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history.front().map(|s| s.swap_used.clone()),
+            Some(Measured::Value(2))
+        );
+    }
+}
+
 /// The memory pressure level of the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PressureLevel {

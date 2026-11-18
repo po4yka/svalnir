@@ -975,7 +975,7 @@ fn the_grant_of_one_guard_does_not_authorize_the_other_guard() {
 }
 
 #[test]
-fn a_pause_that_ended_on_the_wall_clock_in_this_boot_needs_a_new_measurement() {
+fn a_timed_pause_of_an_earlier_boot_refuses_each_automatic_step_after_its_wall_clock_expiry() {
     // A pause of 40 seconds from second 150 of the first boot.
     let at = clock(150);
     let request = PauseRequest {
@@ -984,8 +984,9 @@ fn a_pause_that_ended_on_the_wall_clock_in_this_boot_needs_a_new_measurement() {
     };
     let paused = durable(pause(&enabled_state(), &request, &control(&at, 150)).unwrap()).state;
     // The second boot starts while the pause applies. At its second 100
-    // the wall clock is 20 seconds after the expiry, so the pause ended at
-    // second 80 of this boot.
+    // the wall clock is 20 seconds after the recorded expiry. The wall
+    // clock is not evidence that the pause ended, so the pause is
+    // retained.
     let boot = "boot_2";
     let ask = |evidence_seconds: u64| {
         let mut content = file_content(
@@ -1024,12 +1025,11 @@ fn a_pause_that_ended_on_the_wall_clock_in_this_boot_needs_a_new_measurement() {
         };
         authorize(&context, &request)
     };
-    // A measurement from the time of the pause.
-    let refusal = answer(79).unwrap_err();
-    assert_eq!(refusal.reason, RefusalReason::MeasurementBeforeResume);
-    assert_eq!(refusal.stage, ActionStage::Dispatch);
-    answer(80).unwrap();
-    answer(95).unwrap();
+    for evidence_seconds in [79, 80, 95] {
+        let refusal = answer(evidence_seconds).unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::AutomationPaused);
+        assert_eq!(refusal.stage, ActionStage::Dispatch);
+    }
 }
 
 #[test]

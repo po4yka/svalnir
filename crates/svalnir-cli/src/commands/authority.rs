@@ -19,9 +19,9 @@ use svalnir_core::digest::ContentDigest;
 use svalnir_core::grant::{
     Acceptance, Acknowledged, AcknowledgementLevel, ActivationRefusal, ActivationReport,
     ActivationRequest, AuthorityState, Change, ControlRefusal, DisableRequest, EnableRefusal,
-    EnableReport, EnableRequest, GuardStanding, InstanceInhibition, PauseReport, PauseRequest,
-    PauseStatus, Persistence, RestrictionReport, ResumeReport, ResumeRequest, activate, disable,
-    enable, guard_standing, pause, pause_status, resume,
+    EnableReport, EnableRequest, GuardStanding, InstanceInhibition, PauseBasis, PauseReport,
+    PauseRequest, PauseStatus, Persistence, RestrictionReport, ResumeReport, ResumeRequest,
+    activate, disable, enable, guard_standing, pause, pause_status, resume,
 };
 use svalnir_core::id::{ActionGrantId, IncidentId, PolicyRevisionId};
 use svalnir_core::policy::PolicyId;
@@ -758,6 +758,10 @@ impl AuthorityView {
         let pause: String = match &self.pause {
             None => "not known (no clock value)".to_owned(),
             Some(PauseStatus::NotPaused) => "not paused".to_owned(),
+            Some(PauseStatus::Paused {
+                basis: PauseBasis::Retained,
+                ..
+            }) => "paused until `svalnir agent resume`: the pause is of an earlier boot or clock domain, so its end cannot be established".to_owned(),
             Some(PauseStatus::Paused { until, .. }) => until.map_or_else(
                 || "paused until `svalnir agent resume`".to_owned(),
                 |until| format!("paused until {until}"),

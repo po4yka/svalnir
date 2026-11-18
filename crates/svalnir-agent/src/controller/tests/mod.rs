@@ -755,6 +755,40 @@ fn a_pause_inhibits_each_plan_and_a_resume_needs_a_fresh_measurement() {
 }
 
 #[test]
+fn a_timed_pause_of_an_earlier_boot_inhibits_each_plan_until_a_resume() {
+    let mut bench = Bench::new();
+    let active: AuthorityState = bench.authority.clone().unwrap();
+    // A pause of 6 seconds that started in an earlier boot. The wall clock
+    // of this boot is far after its recorded expiry, and that is not
+    // evidence that the pause ended.
+    let mut earlier = paused_for(&active, bench.now, 6 * SECOND);
+    if let Some(deadline) = earlier
+        .pause
+        .as_mut()
+        .and_then(|pause| pause.deadline.as_mut())
+    {
+        deadline.boot_id = svalnir_core::id::BootId::new("boot_0").unwrap();
+    }
+    bench.authority = Some(earlier);
+    let output = bench.run(30 * SECOND, critical(two_jobs));
+    assert!(output.status.paused);
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(
+        guard(&output, Guard::Memory).blocked,
+        vec![BlockedReason::Paused]
+    );
+
+    // An explicit resume ends the pause; a measurement after it supports
+    // the plan.
+    bench.advance(SECOND);
+    bench.authority = Some(resumed(&bench.authority.clone().unwrap(), bench.now));
+    bench.advance(SAMPLE);
+    let output = bench.step(&critical(two_jobs)(bench.now), &[]);
+    assert!(!output.status.paused);
+    assert_eq!(the_apply(&output).guard, Guard::Memory);
+}
+
+#[test]
 fn the_resume_floor_of_the_instance_is_a_floor_only_in_its_boot_and_clock_domain() {
     use svalnir_core::grant::MeasurementFloor;
     use svalnir_core::id::{BootId, ClockDomainId};

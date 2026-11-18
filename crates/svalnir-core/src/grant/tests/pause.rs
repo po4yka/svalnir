@@ -89,8 +89,7 @@ fn a_timed_pause_ends_at_its_expiry() {
         assert_eq!(
             status,
             PauseStatus::Expired {
-                floor: Some(monotonic(100 + HOUR)),
-                basis: PauseBasis::Monotonic,
+                floor: monotonic(100 + HOUR),
             }
         );
         assert!(!status.is_paused());
@@ -111,7 +110,7 @@ fn the_wall_clock_does_not_end_a_pause_of_the_same_boot() {
 }
 
 #[test]
-fn a_pause_survives_a_restart_and_then_ends_on_the_wall_clock() {
+fn a_timed_pause_of_another_boot_is_retained_until_a_resume() {
     let state = paused_for_an_hour();
     // The record is what a client reads after a restart.
     let json = serde_json::to_string(&state).unwrap();
@@ -119,45 +118,64 @@ fn a_pause_survives_a_restart_and_then_ends_on_the_wall_clock() {
     assert_eq!(restored, state);
 
     // A new boot: the monotonic time starts again, so it cannot show that
-    // the pause ended. The wall clock is 10 minutes after the request.
+    // the pause ended, and the wall clock is not evidence. The pause is in
+    // effect before, at, and long after the recorded wall-clock expiry: a
+    // wall clock that is wrong after the boot does not end it.
+    let retained = PauseStatus::Paused {
+        remaining: None,
+        until: None,
+        basis: PauseBasis::Retained,
+    };
     let rebooted = clock_in("boot_2", 5);
-    let status = pause_status(restored.pause.as_ref(), &control(&rebooted, 100 + 600));
-    assert_eq!(
-        status,
-        PauseStatus::Paused {
-            remaining: Some(Nanoseconds::new((HOUR - 600) * SECOND)),
-            until: Some(wall(100 + HOUR)),
-            basis: PauseBasis::WallClock,
-        }
-    );
+    for seconds in [100 + 600, 100 + HOUR, 102 + HOUR, 100 + 1_000 * HOUR] {
+        let status = pause_status(restored.pause.as_ref(), &control(&rebooted, seconds));
+        assert_eq!(status, retained);
+        assert!(status.is_paused());
+    }
     // A monotonic time after the recorded expiry has no meaning in the new
     // boot.
     let late = clock_in("boot_2", 100 + 2 * HOUR);
-    assert!(pause_status(restored.pause.as_ref(), &control(&late, 100 + 600)).is_paused());
-    // The wall clock is at the recorded expiry: the pause ends now, at
-    // second 5 of the new boot.
     assert_eq!(
-        pause_status(restored.pause.as_ref(), &control(&rebooted, 100 + HOUR)),
-        PauseStatus::Expired {
-            floor: Some(monotonic(5)),
-            basis: PauseBasis::WallClock,
-        }
+        pause_status(restored.pause.as_ref(), &control(&late, 100 + 2 * HOUR)),
+        retained
     );
-    // Two seconds after the expiry, the pause ended at second 3.
+    // A different clock domain of the same boot also retains the pause.
+    let other_domain = super::EvaluationClock {
+        clock_domain: crate::id::ClockDomainId::new("clock_other").unwrap(),
+        ..clock(100 + 2 * HOUR)
+    };
     assert_eq!(
-        pause_status(restored.pause.as_ref(), &control(&rebooted, 102 + HOUR)),
-        PauseStatus::Expired {
-            floor: Some(monotonic(3)),
-            basis: PauseBasis::WallClock,
-        }
+        pause_status(
+            restored.pause.as_ref(),
+            &control(&other_domain, 100 + 2 * HOUR)
+        ),
+        retained
     );
-    // The pause ended before the new boot started.
+    // A retained pause gives no floor: it is in effect.
     assert_eq!(
-        pause_status(restored.pause.as_ref(), &control(&rebooted, 200 + HOUR)),
-        PauseStatus::Expired {
-            floor: None,
-            basis: PauseBasis::WallClock,
-        }
+        measurement_floor(
+            &restored,
+            &InstanceInhibition::default(),
+            &control(&rebooted, 100 + 2 * HOUR)
+        ),
+        None
+    );
+    // An explicit resume ends it.
+    let resumed = durable(
+        resume(
+            &restored,
+            &InstanceInhibition::default(),
+            &resume_request(),
+            &control(&rebooted, 100 + 2 * HOUR),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        pause_status(
+            resumed.state.pause.as_ref(),
+            &control(&rebooted, 100 + 2 * HOUR)
+        ),
+        PauseStatus::NotPaused
     );
 }
 

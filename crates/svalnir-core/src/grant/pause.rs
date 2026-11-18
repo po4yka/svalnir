@@ -33,7 +33,9 @@ pub struct ControlClock<'a> {
 ///
 /// In the boot and the clock domain of the pause, only the monotonic time
 /// decides. In a different boot the monotonic time has no meaning, and the
-/// wall-clock time decides.
+/// wall clock is not evidence that the pause ended: the pause stays until
+/// a resume (`docs/POLICY_SPEC.md` section 14). The wall-clock time is for
+/// display and history.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PauseDeadline {
@@ -103,9 +105,10 @@ pub enum PauseBasis {
     Indefinite,
     /// The monotonic time of the boot of the pause.
     Monotonic,
-    /// The wall-clock time, because the pause is from a different boot or
-    /// clock domain.
-    WallClock,
+    /// The pause is from a different boot or clock domain, so its end
+    /// cannot be established. The pause stays until a resume; a wall clock
+    /// at or after the recorded expiry does not end it.
+    Retained,
 }
 
 /// The status of a pause at one time.
@@ -116,26 +119,24 @@ pub enum PauseStatus {
     NotPaused,
     /// The pause inhibits automatic intervention.
     Paused {
-        /// The time that remains. `None` when the pause has no expiry, or
-        /// when the time is larger than the largest quantity.
+        /// The time that remains. `None` when the pause has no expiry or
+        /// is retained, or when the time is larger than the largest
+        /// quantity.
         remaining: Option<Nanoseconds>,
-        /// The wall-clock expiry. `None` when the pause has no expiry.
+        /// The wall-clock expiry. `None` when the pause has no expiry or
+        /// is retained: a retained pause has no end that can be
+        /// established.
         until: Option<WallTime>,
         /// What decided the status.
         basis: PauseBasis,
     },
-    /// The pause is at its expiry or after it. It inhibits nothing. The
-    /// next automatic action needs a measurement that is not older than
-    /// the expiry.
+    /// The pause is at its monotonic expiry or after it, in the boot and
+    /// the clock domain of the pause. It inhibits nothing. The next
+    /// automatic action needs a measurement that is not older than the
+    /// expiry.
     Expired {
-        /// The expiry on the monotonic timeline of the request. When the
-        /// wall-clock time decided, this is the time of the request less
-        /// the wall-clock time since the expiry. `None` when the pause
-        /// ended before that timeline started: each measurement of the
-        /// current boot is then newer.
-        floor: Option<MonotonicNanos>,
-        /// What decided the status.
-        basis: PauseBasis,
+        /// The expiry on the monotonic timeline of the request.
+        floor: MonotonicNanos,
     },
 }
 
@@ -157,24 +158,15 @@ fn wall_after(start: WallTime, duration: Nanoseconds) -> Option<WallTime> {
     WallTime::from_unix(unix_seconds, fraction).ok()
 }
 
-/// The time from `now` to `later`. `None` when `later` is before `now`, or
-/// when the time is larger than the largest quantity.
-fn wall_between(now: WallTime, later: WallTime) -> Option<Nanoseconds> {
-    let seconds: i128 = i128::from(later.unix_seconds()) - i128::from(now.unix_seconds());
-    let fraction: i128 =
-        i128::from(later.subsecond_nanoseconds()) - i128::from(now.subsecond_nanoseconds());
-    let total: i128 = seconds.checked_mul(1_000_000_000)?.checked_add(fraction)?;
-    u64::try_from(total).ok().map(Nanoseconds::new)
-}
-
 /// The status of `pause` at `clock`.
 ///
 /// A timed pause is expired at its expiry time and after it. In the boot
 /// and the clock domain of the pause, the monotonic time decides, and a
 /// change of the wall clock has no effect. In a different boot or clock
-/// domain, the wall-clock time decides: the pause stays until the wall
-/// clock is at the recorded expiry, so a restart does not end a pause
-/// early. A pause with no expiry stays until a resume.
+/// domain, a restart cannot establish that the pause expired safely: the
+/// wall clock can be wrong after a boot. The pause is then retained until
+/// a resume ([`PauseBasis::Retained`], `docs/POLICY_SPEC.md` section 14).
+/// A pause with no expiry stays until a resume.
 pub fn pause_status(pause: Option<&Pause>, clock: &ControlClock<'_>) -> PauseStatus {
     let Some(pause) = pause else {
         return PauseStatus::NotPaused;
@@ -196,29 +188,14 @@ pub fn pause_status(pause: Option<&Pause>, clock: &ControlClock<'_>) -> PauseSta
                 basis: PauseBasis::Monotonic,
             },
             _ => PauseStatus::Expired {
-                floor: Some(deadline.monotonic),
-                basis: PauseBasis::Monotonic,
+                floor: deadline.monotonic,
             },
         };
     }
-    if clock.wall < deadline.wall {
-        PauseStatus::Paused {
-            remaining: wall_between(clock.wall, deadline.wall),
-            until: Some(deadline.wall),
-            basis: PauseBasis::WallClock,
-        }
-    } else {
-        // The pause can have ended in the current boot. Its expiry is
-        // then the time since the wall-clock expiry before `now`. When
-        // that time is before the start of the monotonic timeline, each
-        // measurement of the current boot is newer.
-        let floor: Option<MonotonicNanos> = wall_between(deadline.wall, clock.wall)
-            .and_then(|elapsed| clock.clock.now.get().checked_sub(elapsed.get()))
-            .map(MonotonicNanos::new);
-        PauseStatus::Expired {
-            floor,
-            basis: PauseBasis::WallClock,
-        }
+    PauseStatus::Paused {
+        remaining: None,
+        until: None,
+        basis: PauseBasis::Retained,
     }
 }
 
@@ -418,7 +395,7 @@ pub fn measurement_floor(
         })
         .map(|floor| floor.at);
     let expired = |pause: Option<&Pause>| match pause_status(pause, clock) {
-        PauseStatus::Expired { floor, .. } => floor,
+        PauseStatus::Expired { floor } => Some(floor),
         _ => None,
     };
     [

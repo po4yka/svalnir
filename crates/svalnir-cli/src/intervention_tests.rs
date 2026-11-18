@@ -888,6 +888,51 @@ fn a_pause_and_a_resume_are_in_the_authority_record() {
     );
 }
 
+/// A timed pause of an earlier boot cannot be shown to have ended: the
+/// status keeps it with the reason `retained`, and a resume ends it.
+#[test]
+fn a_timed_pause_of_an_earlier_boot_is_shown_as_retained_until_a_resume() {
+    use svalnir_agent::journal::{AgentRecord, JournalOptions, OperationJournal};
+    use svalnir_core::grant::AuthorityState;
+
+    let world = World::new();
+    let paused = json(&world.environment, &["agent", "pause", "--for", "1m"]);
+    assert_eq!(paused.status, ExitStatus::Success, "{}", paused.stdout);
+    // The record as an earlier boot left it.
+    let path: PathBuf = world.path("state").join("operations.sqlite");
+    let mut journal = OperationJournal::open(&path, &JournalOptions::default()).unwrap();
+    let stored = journal
+        .agent_record::<AuthorityState>(AgentRecord::Authority)
+        .unwrap()
+        .unwrap();
+    let mut record: AuthorityState = stored.record;
+    let deadline = record.pause.as_mut().unwrap().deadline.as_mut().unwrap();
+    deadline.boot_id = svalnir_core::id::BootId::new("boot_of_an_earlier_start").unwrap();
+    // The recorded expiry is long past on the wall clock.
+    deadline.wall = svalnir_core::time::WallTime::from_unix(1_000_000_000, 0).unwrap();
+    journal
+        .put_agent_record(
+            AgentRecord::Authority,
+            &record,
+            Some(stored.revision),
+            svalnir_core::time::WallTime::from_unix(1_000_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    drop(journal);
+
+    let status = json(&world.environment, &["agent", "status"]);
+    let pause = status.result()["authority"]["pause"].clone();
+    assert_eq!(pause["status"], "paused", "{}", status.stdout);
+    assert_eq!(pause["basis"], "retained");
+    assert_eq!(pause["until"], Value::Null);
+    let text = run(&world.environment, &["agent", "status"]);
+    assert!(text.stdout.contains("earlier boot"), "{}", text.stdout);
+
+    let resumed = json(&world.environment, &["agent", "resume"]);
+    assert_eq!(resumed.status, ExitStatus::Success, "{}", resumed.stdout);
+    assert_eq!(resumed.result()["report"]["status"]["status"], "not_paused");
+}
+
 /// A pause whose write fails is not in effect, so the command reports an
 /// error and no pause: a pause report of a change that is not durable would
 /// show an end time that no record has.

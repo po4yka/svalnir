@@ -287,6 +287,8 @@ svalnir agent pause --for 1h
 svalnir agent resume
 ```
 
+A timed pause ends at its expiry on the monotonic clock of the boot and the clock domain in which it started; a change of the wall clock does not end it. After a reboot, or in a different clock domain, the end of the pause cannot be established, because the wall clock can be wrong after a boot. The pause then stays in effect until `agent resume` ([POLICY_SPEC.md](POLICY_SPEC.md) section 14), and the pause status has `status` `paused` and `basis` `retained`, with no `until` and no `remaining`.
+
 Activation compares the expected revision. Each enable request binds the revision that the user reviewed: an interactive enable flow presents the revision in effect and binds the revision that it presented, and a noninteractive mutation must name the reviewed revision explicitly. A request that names no revision is refused; the revision in effect is never bound in its place. A conflict requires renewed evaluation, not a silent overwrite.
 
 `--accept-force-quit` accepts the request for an application exit and the force quit. A memory guard whose revision does not permit a force quit needs the acceptance of the request for an application exit only. No flag of its own is specified for that acceptance: section 4 has the behavior of the Milestone 2 build, in which `policy enable memory-guard` with no acceptance flag gives it. Whether the acceptance gets a flag is open.

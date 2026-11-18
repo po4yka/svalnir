@@ -202,6 +202,7 @@ fn declaration(id: &str, revision: &str, lifecycle: LifecycleState) -> RuleDecla
         budget: RuleBudget {
             per_candidate: charge(1_000_000, 100),
             per_pass: charge(10_000_000, 1_000),
+            measurement_expiry: Nanoseconds::new(600 * SECOND),
         },
     }
 }

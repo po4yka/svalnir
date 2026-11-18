@@ -327,6 +327,10 @@ pub enum SkipReason {
     /// The unit changed after its measurement, and the mode of the
     /// discovery permits no new measurement.
     MeasurementStale,
+    /// The mode of the discovery permits no new measurement, and the
+    /// earlier measurement is older than the measurement expiry of the
+    /// rule, or its age is not known.
+    MeasurementExpired,
     /// The charge of the unit is larger than the candidate ceiling of the
     /// rule. A unit is not split.
     OverCandidateCeiling,
@@ -357,9 +361,10 @@ impl SkipReason {
             Self::RecordMismatch | Self::IdentityChanged | Self::Vanished => {
                 SkipCategory::StaleIdentity
             }
-            Self::HardLinked | Self::MeasurementIncomplete | Self::MeasurementStale => {
-                SkipCategory::UnknownWorkCharge
-            }
+            Self::HardLinked
+            | Self::MeasurementIncomplete
+            | Self::MeasurementStale
+            | Self::MeasurementExpired => SkipCategory::UnknownWorkCharge,
             Self::OverCandidateCeiling => SkipCategory::BudgetExhaustion,
             Self::AccessDenied => SkipCategory::MissingAccess,
         }

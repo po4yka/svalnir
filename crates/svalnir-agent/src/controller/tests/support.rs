@@ -193,6 +193,7 @@ pub(crate) fn rule(lifecycle: LifecycleState) -> Rule {
         budget: RuleBudget {
             per_candidate: WorkCharge::new(Bytes::new(1_000_000), EntryCount::new(100)),
             per_pass: WorkCharge::new(Bytes::new(10_000_000), EntryCount::new(1_000)),
+            measurement_expiry: Nanoseconds::new(600 * SECOND),
         },
     })
     .unwrap()

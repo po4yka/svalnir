@@ -214,6 +214,7 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
         budget: RuleBudget {
             per_candidate: WorkCharge::new(Bytes::new(GIBIBYTE), EntryCount::new(10_000)),
             per_pass: WorkCharge::new(Bytes::new(4 * GIBIBYTE), EntryCount::new(50_000)),
+            measurement_expiry: Nanoseconds::new(10 * MINUTE),
         },
     })
 }

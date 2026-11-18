@@ -1088,16 +1088,39 @@ pub(super) fn check_known<'k>(
 
 /// The measurement of a known candidate for a discovery that measures
 /// nothing: the earlier measurement when the unit has the same identity
-/// and the same times, and `None` when it changed.
+/// and the same times, and when the measurement is not older than
+/// `expiry` at `wall_now`.
+///
+/// # Errors
+///
+/// Returns [`SkipReason::MeasurementStale`] when the unit changed, and
+/// [`SkipReason::MeasurementExpired`] when the measurement is older than
+/// `expiry` or its age is not known: the measurement or the clock has no
+/// time, or the measurement has a time after `wall_now`.
 fn carried_measurement(
     known: &DiscoveredCandidate,
     now: &ObjectSnapshot,
-) -> Option<UnitMeasurement> {
+    wall_now: Option<WallTime>,
+    expiry: Nanoseconds,
+) -> Result<UnitMeasurement, SkipReason> {
     let unchanged: bool = known.evidence.object == now.object
         && known.evidence.stamp == now.stamp
         && known.evidence.owner == now.owner
         && known.evidence.link_count == now.link_count;
-    unchanged.then(|| UnitMeasurement {
+    if !unchanged {
+        return Err(SkipReason::MeasurementStale);
+    }
+    // A preflight stat does not show that the content did not grow, so the
+    // age of the measurement bounds how stale its charge can be.
+    let age: Option<Nanoseconds> = known
+        .measurement
+        .measured_at
+        .zip(wall_now)
+        .and_then(|(measured, now)| elapsed_between(measured, now));
+    if age.is_none_or(|age| age > expiry) {
+        return Err(SkipReason::MeasurementExpired);
+    }
+    Ok(UnitMeasurement {
         source: MeasurementSource::CarriedFromEarlierDiscovery,
         ..known.measurement.clone()
     })
@@ -1161,7 +1184,8 @@ pub(super) struct UnitUnderMeasurement<'a> {
 
 /// Establishes the complete charge of a unit (predicate 8): a measurement
 /// with the scanner, or, for a known candidate, the earlier measurement
-/// when the unit shows no change. Returns the bound that stopped the
+/// when the unit shows no change and the measurement is not older than the
+/// measurement expiry of the rule. Returns the bound that stopped the
 /// measurement, if one did.
 ///
 /// # Errors
@@ -1186,8 +1210,14 @@ pub(super) fn establish_charge(
         // owners and the times of the content are those of the earlier
         // discovery, and the executor compares each owner again.
         Some(known) => (
-            carried_measurement(known, before).map_or_else(
-                || Measured::Rejected(BTreeSet::from([SkipReason::MeasurementStale])),
+            carried_measurement(
+                known,
+                before,
+                bounds.wall_now(),
+                rule.budget.measurement_expiry,
+            )
+            .map_or_else(
+                |reason| Measured::Rejected(BTreeSet::from([reason])),
                 Measured::Complete,
             ),
             None,

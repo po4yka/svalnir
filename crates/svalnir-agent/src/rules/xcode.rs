@@ -200,6 +200,7 @@ const MAX_INFO_PLIST_BYTES: u64 = 64 * 1024;
 /// name.
 const NAME_HASH_LENGTH: usize = 28;
 
+const MINUTE: u64 = 60_000_000_000;
 const DAY: u64 = 86_400_000_000_000;
 const GIBIBYTE: u64 = 1 << 30;
 
@@ -343,6 +344,7 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
         budget: RuleBudget {
             per_candidate: WorkCharge::new(Bytes::new(20 * GIBIBYTE), EntryCount::new(500_000)),
             per_pass: WorkCharge::new(Bytes::new(50 * GIBIBYTE), EntryCount::new(1_000_000)),
+            measurement_expiry: Nanoseconds::new(10 * MINUTE),
         },
     })
 }

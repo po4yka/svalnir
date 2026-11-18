@@ -282,6 +282,10 @@ pub struct RuleBudget {
     pub per_candidate: WorkCharge,
     /// The ceiling of the rule in one pass.
     pub per_pass: WorkCharge,
+    /// The longest age of a measurement that a discovery with no new
+    /// measurement can use as the charge of a candidate. An older
+    /// measurement, or one whose age is not known, gives no charge.
+    pub measurement_expiry: Nanoseconds,
 }
 
 /// The declaration of one rule revision. [`Rule`] is the checked form.
@@ -333,8 +337,8 @@ pub enum RuleDeclarationError {
     /// zero.
     #[error("the declaration has no age policy or no activity window")]
     Age,
-    /// A part of a work bound is zero, or the candidate ceiling is larger
-    /// than the pass ceiling.
+    /// A part of a work bound is zero, the measurement expiry is zero, or
+    /// the candidate ceiling is larger than the pass ceiling.
     #[error("the declaration has no work bound")]
     Budget,
     /// The rebuild cost is not known.
@@ -467,6 +471,7 @@ impl Check for RuleDeclaration {
         };
         if has_zero(&budget.per_candidate)
             || has_zero(&budget.per_pass)
+            || budget.measurement_expiry == zero
             || !budget.per_candidate.fits_in(&budget.per_pass)
         {
             return Err(RuleDeclarationError::Budget);
@@ -931,6 +936,7 @@ mod tests {
             budget: RuleBudget {
                 per_candidate: charge(1_000_000, 100),
                 per_pass: charge(10_000_000, 1_000),
+                measurement_expiry: Nanoseconds::new(600_000_000_000),
             },
         }
     }
@@ -1103,6 +1109,10 @@ mod tests {
             (
                 RuleDeclarationError::Budget,
                 Box::new(|d| d.budget.per_pass = WorkCharge::ZERO),
+            ),
+            (
+                RuleDeclarationError::Budget,
+                Box::new(|d| d.budget.measurement_expiry = Nanoseconds::ZERO),
             ),
             (
                 RuleDeclarationError::Budget,

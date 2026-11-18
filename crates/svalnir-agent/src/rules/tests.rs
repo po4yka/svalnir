@@ -1301,6 +1301,79 @@ fn known_candidates_are_examined_again_with_no_listing_and_no_measurement() {
     assert!(matches!(error, DiscoveryError::TooManyKnownCandidates));
 }
 
+#[test]
+fn a_carried_measurement_older_than_the_measurement_expiry_gives_no_charge() {
+    let fixture = temporary_fixture();
+    add_item(&fixture, "item-a", |_| {});
+    let measured_at: WallTime = real_now_plus(2 * DAY_SECONDS);
+    let full = discover_temporary_with(
+        &fixture,
+        NO_LEASES,
+        DiscoveryMode::Full,
+        limits(),
+        &FixedClock(Some(measured_at)),
+    )
+    .unwrap();
+    assert_eq!(
+        candidate_of(&full, "item-a").measurement.measured_at,
+        Some(measured_at)
+    );
+    let registry = ReviewedRules::new().unwrap();
+    let expiry: Nanoseconds = registry
+        .expired_temporary()
+        .rule()
+        .budget
+        .measurement_expiry;
+    let expiry_seconds: i64 = i64::try_from(expiry.get() / 1_000_000_000).unwrap();
+    let at = |seconds: i64| WallTime::from_unix(measured_at.unix_seconds() + seconds, 0).unwrap();
+    let known = |clock: FixedClock| {
+        discover_temporary_with(
+            &fixture,
+            NO_LEASES,
+            DiscoveryMode::KnownCandidatesOnly(&full.candidates),
+            limits(),
+            &clock,
+        )
+        .unwrap()
+    };
+
+    // A measurement within the expiry is the charge.
+    let fresh = known(FixedClock(Some(at(expiry_seconds))));
+    let carried = candidate_of(&fresh, "item-a");
+    assert_eq!(
+        carried.measurement.source,
+        MeasurementSource::CarriedFromEarlierDiscovery
+    );
+    assert_eq!(
+        carried.candidate.eligibility.unit_and_charge_known,
+        Fact::Satisfied
+    );
+    assert_eq!(fresh.entries_examined, EntryCount::ZERO);
+
+    // An older measurement, and a measurement with a time after the time
+    // now, give no charge. The discovery still measures nothing.
+    for now in [at(expiry_seconds + 1), at(-1)] {
+        let old = known(FixedClock(Some(now)));
+        assert_eq!(old.candidates.len(), 0, "{now:?}");
+        assert_eq!(old.entries_examined, EntryCount::ZERO);
+        let skipped = skip_of(&old, "item-a");
+        assert_eq!(skipped.reasons, [SkipReason::MeasurementExpired], "{now:?}");
+        assert_eq!(skipped.eligibility.unit_and_charge_known, Fact::Unknown);
+        assert_eq!(
+            SkipReason::MeasurementExpired.category(),
+            SkipCategory::UnknownWorkCharge
+        );
+    }
+
+    // A clock with no wall-clock time gives no age.
+    let no_time = known(FixedClock(None));
+    assert!(
+        skip_of(&no_time, "item-a")
+            .reasons
+            .contains(&SkipReason::MeasurementExpired)
+    );
+}
+
 // ---------------------------------------------------------------------
 // `xcode.inactive-derived-data`.
 // ---------------------------------------------------------------------

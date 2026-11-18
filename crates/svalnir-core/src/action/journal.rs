@@ -333,8 +333,11 @@ pub trait Journal {
 
     /// Records a stop fence for an operation. A fence inhibits the next
     /// dispatch; it does not recall a call that was issued. After this
-    /// call returns `Ok`, each later `consume_dispatch` of the operation
-    /// returns [`DispatchConsumption::Fenced`].
+    /// call returns `Ok`, each later `consume_dispatch` of a step that is
+    /// not consumed returns [`DispatchConsumption::Fenced`]. A step that
+    /// was consumed before the fence returns
+    /// [`DispatchConsumption::AlreadyConsumed`]. Neither result permits a
+    /// call.
     ///
     /// # Errors
     ///

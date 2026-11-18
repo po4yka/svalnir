@@ -22,6 +22,7 @@ use svalnir_gui::{
     },
     screens::storage::StorageScreen,
     shell::nav,
+    viz::hover::{FocusTarget, request_launch_focus},
 };
 
 fn model_for(source: Arc<dyn DataSource>, cx: &mut TestAppContext) -> gpui_kit::Entity<AppModel> {
@@ -657,4 +658,116 @@ fn a_second_scan_shows_the_changes_against_the_first(cx: &mut TestAppContext) {
             "{text}"
         );
     }
+}
+
+fn press(handle: AnyWindowHandle, key: &'static str, cx: &mut TestAppContext) {
+    cx.update_window(handle, |_, window, cx| window.press(key, cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn bounds_of(
+    handle: AnyWindowHandle,
+    id: &'static str,
+    cx: &mut TestAppContext,
+) -> Option<Bounds<gpui_kit::Pixels>> {
+    let mut found = None;
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        found = window.try_find(id).map(|node| node.bounds());
+    })
+    .unwrap();
+    found
+}
+
+/// Opens Storage with a launch request for the folders chart and scans.
+fn scanned(layout: Option<&'static str>, cx: &mut TestAppContext) -> AnyWindowHandle {
+    cx.update(|cx| request_launch_focus(FocusTarget::Folders, cx));
+    let handle = open(FixtureScenario::Healthy, cx);
+    press(handle, "cmd-2", cx);
+    // No scan yet: the request waits, and parking ends.
+    assert!(label_of(handle, "storage-band-tip", cx).is_none());
+    cx.update_window(handle, |_, window, cx| window.click("scan-start", cx))
+        .unwrap();
+    cx.run_until_parked();
+    if let Some(id) = layout {
+        cx.update_window(handle, |_, window, cx| window.click(id, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    handle
+}
+
+fn assert_first_folder_card(card: &str) {
+    assert!(card.starts_with("Pictures, "), "{card}");
+    assert!(card.contains('%'), "{card}");
+    assert!(card.contains("Allocated: "), "{card}");
+    assert!(card.contains('/'), "the path note: {card}");
+}
+
+#[gpui_kit::test]
+fn the_tiles_card_follows_the_arrow_keys_to_the_free_region(cx: &mut TestAppContext) {
+    let handle = scanned(None, cx);
+    let card = label_of(handle, "storage-band-tip", cx).expect("card of the first folder");
+    assert_first_folder_card(&card);
+    let first_legend = label_of(handle, "storage-legend-row-0", cx).expect("legend row");
+    assert!(first_legend.starts_with("Pictures: "), "{first_legend}");
+    let mut free: Option<String> = None;
+    for _ in 0..40 {
+        press(handle, "right", cx);
+        let card = label_of(handle, "storage-band-tip", cx).expect("card");
+        if card.contains("Free space of the volume") {
+            free = Some(card);
+            break;
+        }
+    }
+    let free = free.expect("an arrow key reaches the free region");
+    assert!(free.contains('%'), "{free}");
+    press(handle, "escape", cx);
+    assert!(label_of(handle, "storage-band-tip", cx).is_none());
+}
+
+#[gpui_kit::test]
+fn the_ring_card_shows_the_first_segment(cx: &mut TestAppContext) {
+    let handle = scanned(None, cx);
+    cx.update_window(handle, |_, window, cx| window.click("layout-ring", cx))
+        .unwrap();
+    cx.run_until_parked();
+    // The ring has no launch request now: Tab to the ring, then Home.
+    let mut found: Option<String> = None;
+    for _ in 0..12 {
+        press(handle, "tab", cx);
+        press(handle, "home", cx);
+        found = label_of(handle, "storage-band-tip", cx);
+        if found.is_some() {
+            break;
+        }
+    }
+    let card = found.expect("ring card");
+    assert_first_folder_card(&card);
+    press(handle, "right", cx);
+    let next = label_of(handle, "storage-band-tip", cx).expect("next card");
+    assert_ne!(next, card);
+}
+
+#[gpui_kit::test]
+fn the_storage_card_sits_in_the_window_near_the_chart(cx: &mut TestAppContext) {
+    let handle = scanned(None, cx);
+    let window = Bounds::new(Point::default(), size(px(1120.0), px(720.0)));
+    let card = bounds_of(handle, "storage-band-tip", cx).expect("card bounds");
+    let chart = bounds_of(handle, "storage-band", cx).expect("chart bounds");
+    assert!(card.origin.x >= window.origin.x && card.origin.y >= window.origin.y);
+    assert!(card.right() <= window.right() && card.bottom() <= window.bottom());
+    assert!(
+        card.origin.x >= chart.origin.x - px(16.0),
+        "{card:?} {chart:?}"
+    );
+    assert!(
+        card.origin.y >= chart.origin.y - px(16.0),
+        "{card:?} {chart:?}"
+    );
+    assert!(
+        card.bottom() <= chart.bottom() + px(300.0),
+        "{card:?} {chart:?}"
+    );
 }

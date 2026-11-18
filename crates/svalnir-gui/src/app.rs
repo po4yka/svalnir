@@ -12,7 +12,10 @@ use crate::{
         window::MainWindow,
     },
     theme::{apply, fonts},
-    viz::storage_layouts::StorageLayout,
+    viz::{
+        hover::{FocusTarget, request_launch_focus},
+        storage_layouts::StorageLayout,
+    },
 };
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Entity, Pixels, WindowAppearance, WindowBounds,
@@ -44,6 +47,9 @@ Options:
                        same directory once more
   --readings N         With --fixture only: take N readings (1 to 180) at
                        launch, so the session chart has N readings
+  --focus CHART        Give a chart keyboard focus at launch and pick its
+                       first mark, so its card shows without a pointer
+                       (dial, session, volume, folders)
   --help               Print this text
 ";
 
@@ -90,6 +96,8 @@ pub struct LaunchOptions {
     pub readings: Option<usize>,
     /// The choice for the sidebar width: `Some(true)` is narrow.
     pub sidebar_narrow: Option<bool>,
+    /// The chart that has keyboard focus at launch.
+    pub focus: Option<FocusTarget>,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -203,6 +211,14 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                             format!("`--readings` needs a number from 1 to 180, not `{text}`")
                         })?,
                 );
+            }
+            "--focus" => {
+                let name: String = args
+                    .next()
+                    .ok_or_else(|| "`--focus` needs a chart name".to_owned())?;
+                options.focus = Some(FocusTarget::from_name(&name).ok_or_else(|| {
+                    format!("unknown chart `{name}`; use dial, session, volume, or folders")
+                })?);
             }
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
@@ -337,6 +353,9 @@ pub fn run() -> ExitCode {
             if let Some(layout) = options.layout {
                 view.update(cx, |view, cx| view.set_storage_layout(layout, cx));
             }
+            if let Some(target) = options.focus {
+                request_launch_focus(target, cx);
+            }
             if let Some(root) = &options.scan {
                 let model: Entity<AppModel> = view.read(cx).model().clone();
                 let rescan: bool = options.rescan;
@@ -386,6 +405,8 @@ mod tests {
             "1200x900",
             "--layout",
             "ring",
+            "--focus",
+            "dial",
             "--help",
         ]);
         assert_eq!(
@@ -401,6 +422,7 @@ mod tests {
                 layout: Some(StorageLayout::Ring),
                 readings: Some(40),
                 sidebar_narrow: Some(true),
+                focus: Some(FocusTarget::Dial),
                 help: true,
             })
         );
@@ -428,6 +450,12 @@ mod tests {
         assert!(parse(&["--size", "100x100"]).is_err());
         assert!(parse(&["--size", "wide"]).is_err());
         assert!(parse(&["--layout", "spiral"]).is_err());
+        assert!(parse(&["--focus", "tree"]).is_err());
+        assert!(parse(&["--focus"]).is_err());
+        assert_eq!(
+            parse(&["--focus", "folders"]).map(|o| o.focus),
+            Ok(Some(FocusTarget::Folders))
+        );
         assert!(parse(&["--fixture", "drift", "--readings", "0"]).is_err());
         assert!(parse(&["--fixture", "drift", "--readings", "181"]).is_err());
         assert!(parse(&["--fixture", "drift", "--readings", "x"]).is_err());

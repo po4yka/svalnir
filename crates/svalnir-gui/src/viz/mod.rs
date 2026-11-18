@@ -7,6 +7,7 @@ pub mod cell_ring;
 pub mod cells;
 pub mod dial;
 pub mod ghost;
+pub mod hover;
 pub mod led;
 pub mod runway;
 pub mod session;

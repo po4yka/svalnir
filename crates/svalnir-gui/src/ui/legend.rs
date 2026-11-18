@@ -53,6 +53,7 @@ pub struct Legend {
     id: SharedString,
     on_select: Option<Select>,
     on_hover: Option<Hover>,
+    highlight: Option<usize>,
 }
 
 impl std::fmt::Debug for Legend {
@@ -72,6 +73,7 @@ impl Legend {
             id: id.into(),
             on_select: None,
             on_hover: None,
+            highlight: None,
         }
     }
 
@@ -79,6 +81,14 @@ impl Legend {
     #[must_use]
     pub fn on_select(mut self, f: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_select = Some(Rc::new(f));
+        self
+    }
+
+    /// Shows the hover style on the row at `index`: the row of the segment that
+    /// the pointer or the keyboard has on the chart.
+    #[must_use]
+    pub const fn highlight(mut self, index: Option<usize>) -> Self {
+        self.highlight = index;
         self
     }
 
@@ -136,6 +146,10 @@ impl RenderOnce for Legend {
                     .gap(tokens::SPACE_2)
                     .items_center()
                     .min_w(px(0.0))
+                    .rounded(px(6.0))
+                    .when(self.highlight == Some(index), |row| {
+                        row.bg(to_hsla(tokens.surface_raised))
+                    })
                     .w(gpui_kit::relative(if columns == 2 { 0.5 } else { 1.0 }))
                     // Each column gives half of the SPACE_4 gutter: equal widths,
                     // and the right column ends at the content edge.

@@ -12,20 +12,23 @@ use crate::{
         tokens::{self, Tokens, to_hsla},
     },
     ui::{
+        chart_tip::{ChartTip, TipContent},
         data_state::{UNAVAILABLE_TEXT, format_bytes, used_capacity},
         pill::{StatusPill, Tone},
         ring_center::RingCenter,
         surface::Inset,
     },
     viz::{
+        hover::{FocusTarget, Tween, take_launch_focus},
         led::{LedStyle, lit_color},
         runway::{Estimate, Runway},
     },
 };
 use gpui_kit::{
-    App, Bounds, BoxShadow, Corners, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
+    App, Bounds, BoxShadow, Corners, Entity, FocusHandle, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
+    canvas,
     component::{
         ActiveTheme as _,
         button::{Button, ButtonVariants as _},
@@ -34,6 +37,7 @@ use gpui_kit::{
     div, fill, hsla, point, px, size,
 };
 use std::{
+    cell::Cell,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -931,11 +935,139 @@ pub fn names_hidden(model: &DialModel) -> [bool; 3] {
     std::array::from_fn(|index| name_hidden(model, index))
 }
 
+/// How far from the radius of a ring the pointer still picks it, in pixels.
+pub const RING_REACH: f32 = 6.0;
+
+/// The ring under the point `(x, y)`, in pixels from the top-left corner of the
+/// dial. The pointer picks a ring when its distance from the center is within
+/// `RING_REACH` of the ring radius, the nearest ring when more than one is
+/// within reach. The center, the space between the rings, and the outside give
+/// `None`.
+#[must_use]
+pub fn ring_at(x: f32, y: f32) -> Option<usize> {
+    let radius: f32 = (x - DIAL_SIZE / 2.0).hypot(y - DIAL_SIZE / 2.0);
+    RING_RADII
+        .iter()
+        .enumerate()
+        .map(|(index, ring)| (index, (radius - ring).abs()))
+        .filter(|(_, gap)| *gap <= RING_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+}
+
+/// The ring after `current` when the keyboard moves by `delta` places, from
+/// the outer ring to the inner one. With no ring, a move down picks the outer
+/// ring and a move up picks the inner one. The move stops at both ends.
+#[must_use]
+pub fn step_ring(current: Option<usize>, delta: i32) -> usize {
+    match current {
+        Some(at) => {
+            let moved: i64 = i64::try_from(at).unwrap_or(0) + i64::from(delta);
+            usize::try_from(moved.max(0)).unwrap_or(0).min(2)
+        }
+        None if delta >= 0 => 0,
+        None => 2,
+    }
+}
+
+/// The strength of each ring while ring `picked` is picked: full for the
+/// picked ring and `UNPICKED_ALPHA` for the others.
+#[must_use]
+pub fn ring_strengths(picked: usize) -> [f32; 3] {
+    std::array::from_fn(|index| if index == picked { 1.0 } else { UNPICKED_ALPHA })
+}
+
+/// The center of the head dot of `ring`, or of its first dot when the ring has
+/// no head, in pixels from the top-left corner of the dial.
+#[must_use]
+pub fn head_point(ring: &Ring) -> (f32, f32) {
+    let head: usize = dot_kinds(ring, None)
+        .iter()
+        .position(|kind| *kind == Dot::Head)
+        .unwrap_or(0);
+    let (x, y) = dot_center(head, ring.dots, RING_RADII[ring.kind.index()]);
+    (DIAL_SIZE / 2.0 + x, DIAL_SIZE / 2.0 + y)
+}
+
+/// The card of a ring: its name, the used share, and the measured rows. An
+/// unavailable ring has em dashes and the reason as the note; a swap with no
+/// swap space has the sentence of the panel as the note.
+#[must_use]
+pub fn ring_tip(ring: &Ring) -> TipContent {
+    let wanted: &[&str] = match ring.kind {
+        RingKind::Disk => &["Used", "Available", "Total", "Runway"],
+        RingKind::Swap => &["Used", "Total"],
+        RingKind::Pressure => &["State"],
+    };
+    let mut tip: TipContent = TipContent::new(ring.kind.name());
+    if let Some(ppm) = ring.share_ppm {
+        tip = tip.aside(share_percent_text(ppm));
+    }
+    let mut shown: usize = 0;
+    for (label, value) in &ring.rows {
+        if wanted.contains(label) {
+            tip = tip.row(*label, value.clone());
+            shown += 1;
+        }
+    }
+    if ring.state == RingState::Unavailable {
+        if shown == 0 {
+            // The runway row exists only when the model measured it.
+            for label in wanted.iter().filter(|l| **l != "Runway") {
+                tip = tip.row(*label, UNAVAILABLE_TEXT);
+            }
+        }
+        tip = tip.note(ring.detail.clone().unwrap_or_else(|| ring.note.clone()));
+    } else if shown == 0 {
+        tip = tip.note(ring.note.clone());
+    }
+    tip
+}
+
+/// The hover state that the dial keeps between frames.
+struct DialHover {
+    /// The ring under the pointer or the keyboard.
+    mark: Option<usize>,
+    /// Whether the keyboard set the mark.
+    keyboard: bool,
+    /// The strength of each ring.
+    tween: Option<Tween>,
+    /// The focus of the dial, for Tab and the arrow keys.
+    handle: FocusHandle,
+    /// The position of the dial in the window, set at each paint.
+    origin: Rc<Cell<Point<Pixels>>>,
+}
+
+/// Sets the ring of the dial. It redraws the dial and calls `pick` only when
+/// the ring changes.
+fn set_ring(
+    state: &Entity<DialHover>,
+    mark: Option<usize>,
+    keyboard: bool,
+    pick: Option<&PickHandler>,
+    window: &mut Window,
+    app: &mut App,
+) {
+    let changed: bool = state.update(app, |s, cx| {
+        if s.mark == mark {
+            return false;
+        }
+        s.mark = mark;
+        s.keyboard = keyboard && mark.is_some();
+        cx.notify();
+        true
+    });
+    if changed && let Some(handler) = pick {
+        handler(mark, window, app);
+    }
+}
+
 /// The inputs of one paint of the dial.
 #[derive(Debug, Clone)]
 struct DialPaint {
     model: DialModel,
     picked: usize,
+    strengths: [f32; 3],
     sweep: Option<f32>,
     colors: DialColors,
     glow: bool,
@@ -1018,11 +1150,7 @@ fn paint_dial(paint: &DialPaint, bounds: Bounds<Pixels>, window: &mut Window) {
     for (index, dots) in &kinds {
         let ring: &Ring = &paint.model.rings[*index];
         let radius: f32 = RING_RADII[*index];
-        let strength: f32 = if *index == paint.picked {
-            1.0
-        } else {
-            UNPICKED_ALPHA
-        } * rest;
+        let strength: f32 = paint.strengths[*index] * rest;
         for (dot, kind) in dots.iter().enumerate() {
             let base: Hsla = match ring.kind {
                 RingKind::Disk => paint.colors.disk,
@@ -1091,13 +1219,22 @@ fn paint_dial(paint: &DialPaint, bounds: Bounds<Pixels>, window: &mut Window) {
 }
 
 /// The dial as an element.
-#[derive(IntoElement, Debug)]
+#[derive(IntoElement)]
 pub struct HeadroomDial {
     model: DialModel,
     picked: Option<usize>,
     sweep: Option<f32>,
     muted: bool,
     hidden: Option<[bool; 3]>,
+    on_pick: Option<PickHandler>,
+    reduce_motion: bool,
+    launch: Option<FocusTarget>,
+}
+
+impl std::fmt::Debug for HeadroomDial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadroomDial").finish_non_exhaustive()
+    }
 }
 
 impl HeadroomDial {
@@ -1110,7 +1247,32 @@ impl HeadroomDial {
             sweep: None,
             muted: false,
             hidden: None,
+            on_pick: None,
+            reduce_motion: false,
+            launch: None,
         }
+    }
+
+    /// Lets a launch request for `target` focus the dial and pick its ring.
+    #[must_use]
+    pub const fn launch_focus(mut self, target: FocusTarget) -> Self {
+        self.launch = Some(target);
+        self
+    }
+
+    /// Sets the handler of the ring under the pointer or the keyboard, the
+    /// same one that the legend rows call: the index, or `None` when no ring.
+    #[must_use]
+    pub fn on_pick(mut self, f: impl Fn(Option<usize>, &mut Window, &mut App) + 'static) -> Self {
+        self.on_pick = Some(Rc::new(f));
+        self
+    }
+
+    /// With `reduce` true, ring changes apply in one step.
+    #[must_use]
+    pub const fn reduce_motion(mut self, reduce: bool) -> Self {
+        self.reduce_motion = reduce;
+        self
     }
 
     /// Sets which ring names are hidden. Compute them from the measured
@@ -1146,8 +1308,19 @@ impl HeadroomDial {
 
 impl RenderOnce for HeadroomDial {
     #[expect(clippy::too_many_lines, reason = "one build of the face and the texts")]
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
+        let animate: bool = !(self.reduce_motion || cx.reduce_motion());
+        let state: Entity<DialHover> =
+            window.use_keyed_state("headroom-dial-hover", cx, |_, cx| DialHover {
+                mark: None,
+                keyboard: false,
+                tween: None,
+                handle: cx.focus_handle().tab_stop(true),
+                origin: Rc::new(Cell::new(Point::default())),
+            });
+        let handle: FocusHandle = state.read(cx).handle.clone();
+        let mut focused: bool = handle.is_focused(window);
         let picked: usize = self.picked.unwrap_or(self.model.picked).min(2);
         let label: String = self.model.label();
         let center: &Ring = &self.model.rings[picked];
@@ -1215,9 +1388,77 @@ impl RenderOnce for HeadroomDial {
                     .into_any_element(),
             );
         }
+        if self
+            .launch
+            .is_some_and(|target| take_launch_focus(target, cx))
+        {
+            set_ring(
+                &state,
+                Some(picked),
+                true,
+                self.on_pick.as_ref(),
+                window,
+                cx,
+            );
+            let to_focus: FocusHandle = handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&to_focus, cx));
+            // The focus follows after this frame; keep the mark meanwhile.
+            focused = true;
+        }
+        let now: Instant = Instant::now();
+        let target: [f32; 3] = ring_strengths(picked);
+        let (mark, strengths, running, stale_keyboard): (Option<usize>, Vec<f32>, bool, bool) =
+            state.update(cx, |s, _| {
+                let stale_keyboard: bool = s.keyboard && !focused;
+                if stale_keyboard {
+                    s.mark = None;
+                    s.keyboard = false;
+                }
+                let tween: &mut Tween = s
+                    .tween
+                    .get_or_insert_with(|| Tween::new(target.to_vec(), now));
+                tween.retarget(target.to_vec(), now, animate);
+                (
+                    s.mark,
+                    tween.value_at(now),
+                    tween.running(now),
+                    stale_keyboard,
+                )
+            });
+        if running {
+            window.request_animation_frame();
+        }
+        if stale_keyboard && let Some(handler) = self.on_pick.clone() {
+            // Blur clears the pick; the screen is updated after this frame.
+            window.defer(cx, move |window, app| handler(None, window, app));
+        }
+        let origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&state.read(cx).origin);
+        let tip: Option<ChartTip> = mark.and_then(|index| {
+            let ring: &Ring = self.model.rings.get(index)?;
+            let (x, y) = head_point(ring);
+            Some(ChartTip::new(
+                "headroom-dial-tip",
+                ring_tip(ring),
+                Bounds::new(
+                    point(px(x - DOT_PX / 2.0), px(y - DOT_PX / 2.0)),
+                    size(px(DOT_PX), px(DOT_PX)),
+                ),
+                origin.get(),
+                animate,
+            ))
+        });
+        let paint_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let move_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let move_state: Entity<DialHover> = state.clone();
+        let move_pick: Option<PickHandler> = self.on_pick.clone();
+        let leave_state: Entity<DialHover> = state.clone();
+        let leave_pick: Option<PickHandler> = self.on_pick.clone();
+        let key_state: Entity<DialHover> = state;
+        let key_pick: Option<PickHandler> = self.on_pick.clone();
         let paint: DialPaint = DialPaint {
             model: self.model,
             picked,
+            strengths: std::array::from_fn(|index| strengths.get(index).copied().unwrap_or(1.0)),
             sweep: self.sweep,
             colors,
             glow: glow::enabled(cx),
@@ -1232,10 +1473,35 @@ impl RenderOnce for HeadroomDial {
             .w(px(DIAL_SIZE))
             .h(px(DIAL_SIZE))
             .flex_shrink_0()
+            .track_focus(&handle)
+            .on_mouse_move(move |event, window, app| {
+                let at: Point<Pixels> = event.position - move_origin.get();
+                let ring: Option<usize> = ring_at(at.x.into(), at.y.into());
+                set_ring(&move_state, ring, false, move_pick.as_ref(), window, app);
+            })
+            .on_hover(move |hovered, window, app| {
+                let from_pointer: bool = !leave_state.read(app).keyboard;
+                if !*hovered && from_pointer {
+                    set_ring(&leave_state, None, false, leave_pick.as_ref(), window, app);
+                }
+            })
+            .on_key_down(move |event, window, app| {
+                let current: Option<usize> = key_state.read(app).mark;
+                let next: Option<Option<usize>> = match event.keystroke.key.as_str() {
+                    "down" => Some(Some(step_ring(current, 1))),
+                    "up" => Some(Some(step_ring(current, -1))),
+                    "escape" => Some(None),
+                    _ => None,
+                };
+                if let Some(ring) = next {
+                    set_ring(&key_state, ring, true, key_pick.as_ref(), window, app);
+                    app.stop_propagation();
+                }
+            })
             .child(
                 div().absolute().top_0().left_0().size_full().child(
                     canvas(
-                        |_, _, _| (),
+                        move |bounds: Bounds<Pixels>, _, _| paint_origin.set(bounds.origin),
                         move |bounds: Bounds<Pixels>, (), window: &mut Window, _: &mut App| {
                             paint_dial(&paint, bounds, window);
                         },
@@ -1259,6 +1525,7 @@ impl RenderOnce for HeadroomDial {
                 }
                 center_view
             })
+            .children(tip)
     }
 }
 
@@ -1997,5 +2264,99 @@ mod tests {
             HeadroomDial::new(shown).hidden_names(flags).hidden,
             Some(flags)
         );
+    }
+
+    #[test]
+    fn the_pointer_picks_a_ring_within_six_pixels_of_its_radius() {
+        let c: f32 = DIAL_SIZE / 2.0;
+        // On the top of each ring, and 6 px off.
+        for (index, radius) in RING_RADII.iter().enumerate() {
+            assert_eq!(ring_at(c, c - radius), Some(index));
+            assert_eq!(ring_at(c, c - radius - 6.0), Some(index));
+            assert_eq!(ring_at(c + radius + 5.0, c), Some(index));
+        }
+        // The center, the gap between rings, and the outside pick nothing.
+        assert_eq!(ring_at(c, c), None);
+        assert_eq!(ring_at(c, c - 40.0), None);
+        assert_eq!(ring_at(c, c - 83.0), None);
+        assert_eq!(ring_at(c, c - 100.0), None);
+        assert_eq!(ring_at(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn the_nearest_ring_wins_where_two_are_in_reach() {
+        let c: f32 = DIAL_SIZE / 2.0;
+        // 84 px is 6 px from the outer ring and 8 px from the middle one.
+        assert_eq!(ring_at(c, c - 84.0), Some(0));
+        assert_eq!(ring_at(c, c - 82.0), Some(1));
+    }
+
+    #[test]
+    fn the_keyboard_steps_between_rings_and_stops_at_the_ends() {
+        assert_eq!(step_ring(None, 1), 0);
+        assert_eq!(step_ring(None, -1), 2);
+        assert_eq!(step_ring(Some(0), 1), 1);
+        assert_eq!(step_ring(Some(2), 1), 2);
+        assert_eq!(step_ring(Some(0), -1), 0);
+    }
+
+    #[test]
+    fn the_picked_ring_is_full_and_the_others_are_at_55_percent() {
+        assert_eq!(ring_strengths(1), [UNPICKED_ALPHA, 1.0, UNPICKED_ALPHA]);
+    }
+
+    fn spoken(ring: usize, host: &HostSnapshot) -> String {
+        ring_tip(&dial_model(host).rings[ring]).spoken()
+    }
+
+    #[test]
+    fn the_cards_of_a_healthy_host_state_the_measured_rows_only() {
+        let host = host();
+        let disk = ring_tip(&dial_model(&host).rings[0]);
+        assert_eq!(disk.title, "Disk");
+        assert!(disk.aside.is_some());
+        let labels: Vec<&str> = disk.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["Used", "Available", "Total"]);
+        assert!(disk.note.is_none());
+        let swap = ring_tip(&dial_model(&host).rings[1]);
+        let labels: Vec<&str> = swap.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["Used", "Total"]);
+        let pressure = ring_tip(&dial_model(&host).rings[2]);
+        assert_eq!(pressure.rows.len(), 1);
+        assert_eq!(pressure.rows[0].label, "State");
+        assert_eq!(pressure.rows[0].value, "Normal");
+    }
+
+    #[test]
+    fn an_unavailable_ring_has_em_dashes_and_its_reason_and_no_zero() {
+        let mut host = host();
+        host.disk_total = Measured::Unavailable("no volume".to_owned());
+        host.disk_available = Measured::Unavailable("no volume".to_owned());
+        let text = spoken(0, &host);
+        assert!(!text.contains("0 B"), "{text}");
+        let tip = ring_tip(&dial_model(&host).rings[0]);
+        assert!(tip.rows.iter().all(|r| r.value == UNAVAILABLE_TEXT));
+        assert!(tip.note.as_deref().is_some_and(|n| n.contains("no volume")));
+    }
+
+    #[test]
+    fn a_host_without_swap_space_has_the_sentence_as_the_note() {
+        let mut host = host();
+        host.swap_used = Measured::Value(0);
+        host.swap_total = Measured::Value(0);
+        let tip = ring_tip(&dial_model(&host).rings[1]);
+        assert_eq!(tip.rows.len(), 0);
+        assert_eq!(
+            tip.note.as_deref(),
+            Some("The system has no swap space, so the panel has no row.")
+        );
+    }
+
+    #[test]
+    fn the_card_anchors_at_the_head_dot_of_the_ring() {
+        let model = dial_model(&host());
+        let (x, y) = head_point(&model.rings[0]);
+        let radius = (x - DIAL_SIZE / 2.0).hypot(y - DIAL_SIZE / 2.0);
+        assert!((radius - RING_RADII[0]).abs() < 0.01);
     }
 }

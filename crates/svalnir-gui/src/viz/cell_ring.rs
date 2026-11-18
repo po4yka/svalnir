@@ -3,22 +3,26 @@
 //! (`DESIGN.md` section 5, "Cell ring").
 
 use crate::{
-    ui::ring_center::RingCenter,
+    ui::{
+        chart_tip::{ChartTip, TipContent},
+        ring_center::RingCenter,
+    },
     viz::{
         alloc::allocate_cells,
         dial::{DIAL_SIZE, dot_center, ring_progress},
         ghost::{Change, growth_cells},
-        led::{CellTone, LedStyle, cell_tone_at, lit_color, lit_share, lit_threshold},
+        hover::{FocusTarget, Mark, Tween, take_launch_focus},
+        led::{CellTone, LedStyle, cell_tone_at, lit_color, lit_share, lit_threshold, mix_color},
         storage_layouts::ChartItem,
     },
 };
 use gpui_kit::{
-    App, Bounds, Corners, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
+    App, Bounds, Corners, Entity, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
     component::ActiveTheme as _, div, fill, point, px, size,
 };
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, time::Instant};
 
 /// The number of rings.
 pub const RINGS: usize = 4;
@@ -29,6 +33,8 @@ pub const RADII: [f32; RINGS] = [66.0, 72.0, 78.0, 84.0];
 /// The diameter of one dot, in pixels. The inner ring has 3.45 px between two
 /// steps, so a dot of 4 px would touch its neighbours.
 const DOT: f32 = 3.0;
+/// The diameter of a dot of the hovered segment, in pixels.
+const DOT_HOT: f32 = 4.0;
 
 /// The steps of one segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +127,13 @@ pub fn ring_spans(weights: &[u64], free: Option<u64>) -> RingSpans {
 /// `None`.
 #[must_use]
 pub fn segment_at(x: f32, y: f32, spans: &RingSpans) -> Option<usize> {
+    ring_mark_at(x, y, spans).and_then(Mark::segment)
+}
+
+/// The mark under the point `(x, y)` in pixels from the top-left corner of the
+/// ring: a segment, or the free space. A gap step and the outside give `None`.
+#[must_use]
+pub fn ring_mark_at(x: f32, y: f32, spans: &RingSpans) -> Option<Mark> {
     let dx: f32 = x - DIAL_SIZE / 2.0;
     let dy: f32 = y - DIAL_SIZE / 2.0;
     let radius: f32 = dx.hypot(dy);
@@ -136,10 +149,58 @@ pub fn segment_at(x: f32, y: f32, spans: &RingSpans) -> Option<usize> {
         reason = "the value is between 0 and 120 and rounded first"
     )]
     let step: usize = ((turn * STEPS as f32).round() as usize) % STEPS;
-    spans
+    let inside = |span: &Span| span.len > 0 && step >= span.start && step < span.start + span.len;
+    if let Some(index) = spans.items.iter().position(inside) {
+        return Some(Mark::Segment(index));
+    }
+    spans.free.filter(inside).map(|_| Mark::Free)
+}
+
+/// The marks of a ring in keyboard order: the segments that have steps, then
+/// the free space.
+#[must_use]
+pub fn ring_marks(spans: &RingSpans) -> Vec<Mark> {
+    let mut out: Vec<Mark> = spans
         .items
         .iter()
-        .position(|span| span.len > 0 && step >= span.start && step < span.start + span.len)
+        .enumerate()
+        .filter(|(_, span)| span.len > 0)
+        .map(|(index, _)| Mark::Segment(index))
+        .collect();
+    if spans.free.is_some_and(|span| span.len > 0) {
+        out.push(Mark::Free);
+    }
+    out
+}
+
+/// The mark after `current` when the keyboard moves by `delta` places. With no
+/// mark, a move forward picks the first and a move back picks the last. The
+/// move stops at both ends.
+#[must_use]
+pub fn step_ring_mark(spans: &RingSpans, current: Option<Mark>, delta: i32) -> Option<Mark> {
+    let order: Vec<Mark> = ring_marks(spans);
+    let last: usize = order.len().checked_sub(1)?;
+    let next: usize = match current.and_then(|c| order.iter().position(|m| *m == c)) {
+        Some(at) => {
+            let moved: i64 = i64::try_from(at).unwrap_or(0) + i64::from(delta);
+            usize::try_from(moved.max(0)).unwrap_or(0).min(last)
+        }
+        None if delta >= 0 => 0,
+        None => last,
+    };
+    order.get(next).copied()
+}
+
+/// The center of the outer ring at the middle of a mark, in pixels from the
+/// top-left corner of the ring.
+#[must_use]
+pub fn ring_mark_point(spans: &RingSpans, mark: Mark) -> Option<(f32, f32)> {
+    let span: Span = match mark {
+        Mark::Segment(index) => *spans.items.get(index)?,
+        Mark::Free => spans.free?,
+    };
+    let (x, y) = dot_center(mid_step(span), STEPS, RADII[RINGS - 1]);
+    Some((DIAL_SIZE / 2.0 + x, DIAL_SIZE / 2.0 + y))
 }
 
 /// The step in the middle of a span.
@@ -148,13 +209,13 @@ pub const fn mid_step(span: Span) -> usize {
     span.start + span.len / 2
 }
 
-fn dot_box(origin: Point<Pixels>, center: (f32, f32)) -> Bounds<Pixels> {
+fn dot_box(origin: Point<Pixels>, center: (f32, f32), side: f32) -> Bounds<Pixels> {
     Bounds::new(
         point(
-            origin.x + px(DIAL_SIZE / 2.0 + center.0 - DOT / 2.0),
-            origin.y + px(DIAL_SIZE / 2.0 + center.1 - DOT / 2.0),
+            origin.x + px(DIAL_SIZE / 2.0 + center.0 - side / 2.0),
+            origin.y + px(DIAL_SIZE / 2.0 + center.1 - side / 2.0),
         ),
-        size(px(DOT), px(DOT)),
+        size(px(side), px(side)),
     )
 }
 
@@ -163,7 +224,10 @@ fn dot_box(origin: Point<Pixels>, center: (f32, f32)) -> Bounds<Pixels> {
 struct RingPaint {
     spans: RingSpans,
     colors: Vec<Hsla>,
-    dimmed: Vec<bool>,
+    /// The dim amount `0.0..=1.0` of each segment.
+    dim: Vec<f32>,
+    /// The growth amount `0.0..=1.0` of the dots of each segment.
+    grow: Vec<f32>,
     /// The lit threshold of each item, from its density.
     thresholds: Vec<u32>,
     /// The last steps of each span that the scan ghost hatches.
@@ -205,9 +269,7 @@ fn paint_ring(paint: &RingPaint, bounds: Bounds<Pixels>, window: &mut Window) {
                 if hatched && (step + ring) % 2 == 1 {
                     continue;
                 }
-                let tone: CellTone = if paint.dimmed[index] {
-                    CellTone::Dim
-                } else if hatched {
+                let tone: CellTone = if hatched {
                     CellTone::Lit
                 } else {
                     cell_tone_at(
@@ -217,18 +279,25 @@ fn paint_ring(paint: &RingPaint, bounds: Bounds<Pixels>, window: &mut Window) {
                         paint.thresholds[index],
                     )
                 };
-                let fill_color: Hsla = match tone {
+                let normal: Hsla = match tone {
                     // A hatched dot is not a dot of the density texture.
-                    CellTone::Lit if hatched && !paint.dimmed[index] => paint.ghost,
+                    CellTone::Lit if hatched => paint.ghost,
                     CellTone::Lit => lit_color(color),
                     CellTone::Dim => color.opacity(paint.dim_alpha),
                 };
+                let dim: f32 = paint.dim[index];
+                let fill_color: Hsla = if dim > 0.0 {
+                    mix_color(normal, color.opacity(paint.dim_alpha), dim)
+                } else {
+                    normal
+                };
+                let side: f32 = DOT + (DOT_HOT - DOT) * paint.grow[index];
                 window.paint_quad(
                     fill(
-                        dot_box(bounds.origin, dot_center(step, STEPS, radius)),
+                        dot_box(bounds.origin, dot_center(step, STEPS, radius), side),
                         fill_color,
                     )
-                    .corner_radii(corners),
+                    .corner_radii(Corners::all(px(side / 2.0))),
                 );
             }
         }
@@ -237,7 +306,7 @@ fn paint_ring(paint: &RingPaint, bounds: Bounds<Pixels>, window: &mut Window) {
                 if step < reach {
                     window.paint_quad(
                         fill(
-                            dot_box(bounds.origin, dot_center(step, STEPS, radius)),
+                            dot_box(bounds.origin, dot_center(step, STEPS, radius), DOT),
                             paint.empty,
                         )
                         .corner_radii(corners),
@@ -263,6 +332,10 @@ pub struct CellRing {
     center: (SharedString, SharedString),
     on_select: Option<SelectHandler>,
     on_hover: Option<HoverHandler>,
+    tips: Vec<TipContent>,
+    free_tip: Option<TipContent>,
+    reduce_motion: bool,
+    launch: Option<FocusTarget>,
 }
 
 impl std::fmt::Debug for CellRing {
@@ -292,7 +365,40 @@ impl CellRing {
             center: (center.0.into(), center.1.into()),
             on_select: None,
             on_hover: None,
+            tips: Vec::new(),
+            free_tip: None,
+            reduce_motion: false,
+            launch: None,
         }
+    }
+
+    /// Sets the cards of the segments, in the order of the items.
+    #[must_use]
+    pub fn tips(mut self, tips: Vec<TipContent>) -> Self {
+        self.tips = tips;
+        self
+    }
+
+    /// Sets the card of the free space.
+    #[must_use]
+    pub fn free_tip(mut self, tip: Option<TipContent>) -> Self {
+        self.free_tip = tip;
+        self
+    }
+
+    /// With `reduce` true, hover changes apply in one step.
+    #[must_use]
+    pub const fn reduce_motion(mut self, reduce: bool) -> Self {
+        self.reduce_motion = reduce;
+        self
+    }
+
+    /// Lets a launch request for `target` focus this ring and pick its first
+    /// mark.
+    #[must_use]
+    pub const fn launch_focus(mut self, target: FocusTarget) -> Self {
+        self.launch = Some(target);
+        self
     }
 
     /// Dims each segment but the one at `focus`.
@@ -325,25 +431,116 @@ impl CellRing {
     }
 }
 
+/// The hover state that one ring keeps between frames.
+struct RingHover {
+    /// The mark under the pointer or under the keyboard.
+    mark: Option<Mark>,
+    /// Whether the keyboard set the mark.
+    keyboard: bool,
+    /// The dim and growth amounts of the segments.
+    tween: Option<Tween>,
+    /// The focus of the ring, for Tab and the arrow keys.
+    handle: FocusHandle,
+    /// The position of the ring in the window, set at each paint.
+    origin: Rc<Cell<Point<Pixels>>>,
+}
+
+/// Sets the mark of the ring. It redraws the ring and calls `hover` only when
+/// the mark changes.
+fn set_ring_mark(
+    state: &Entity<RingHover>,
+    mark: Option<Mark>,
+    keyboard: bool,
+    hover: Option<&HoverHandler>,
+    window: &mut Window,
+    app: &mut App,
+) {
+    let changed: bool = state.update(app, |s, cx| {
+        if s.mark == mark {
+            return false;
+        }
+        s.mark = mark;
+        s.keyboard = keyboard && mark.is_some();
+        cx.notify();
+        true
+    });
+    if changed && let Some(handler) = hover {
+        handler(mark.and_then(Mark::segment), window, app);
+    }
+}
+
 impl RenderOnce for CellRing {
     #[expect(
         clippy::too_many_lines,
         reason = "one build of the ring and its hit area"
     )]
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let style: LedStyle = LedStyle::for_dark(dark);
         let weights: Vec<u64> = self.items.iter().map(|i| i.bytes).collect();
         let spans: RingSpans = ring_spans(&weights, self.free_bytes);
+        let animate: bool = !(self.reduce_motion || cx.reduce_motion());
+        let state: Entity<RingHover> = window.use_keyed_state(
+            SharedString::from(format!("{}-hover", self.id)),
+            cx,
+            |_, cx| RingHover {
+                mark: None,
+                keyboard: false,
+                tween: None,
+                handle: cx.focus_handle().tab_stop(true),
+                origin: Rc::new(Cell::new(Point::default())),
+            },
+        );
+        let handle: FocusHandle = state.read(cx).handle.clone();
+        let mut focused: bool = handle.is_focused(window);
+        // A launch request waits without cost until the ring has a mark.
+        let first: Option<Mark> = ring_marks(&spans).first().copied();
+        if first.is_some()
+            && self
+                .launch
+                .is_some_and(|target| take_launch_focus(target, cx))
+        {
+            set_ring_mark(&state, first, true, self.on_hover.as_ref(), window, cx);
+            let to_focus: FocusHandle = handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&to_focus, cx));
+            // The focus follows after this frame; keep the mark meanwhile.
+            focused = true;
+        }
+        let now: Instant = Instant::now();
+        let count: usize = self.items.len();
+        let focus: Option<usize> = self.focus;
+        let inert: Vec<bool> = self.items.iter().map(|i| i.inert).collect();
+        let (mark, values, running): (Option<Mark>, Vec<f32>, bool) = state.update(cx, |s, _| {
+            if s.keyboard && !focused {
+                s.mark = None;
+                s.keyboard = false;
+            }
+            let highlight: Option<usize> = focus.or(s.mark.and_then(Mark::segment));
+            let mut target: Vec<f32> = vec![0.0; 2 * count];
+            for (index, is_inert) in inert.iter().enumerate() {
+                target[index] =
+                    f32::from(u8::from(*is_inert || highlight.is_some_and(|h| h != index)));
+                target[count + index] = f32::from(u8::from(highlight == Some(index)));
+            }
+            let tween: &mut Tween = s
+                .tween
+                .get_or_insert_with(|| Tween::new(target.clone(), now));
+            tween.retarget(target, now, animate);
+            (s.mark, tween.value_at(now), tween.running(now))
+        });
+        if running {
+            window.request_animation_frame();
+        }
+        let (dim, grow): (Vec<f32>, Vec<f32>) = if values.len() == 2 * count {
+            (values[..count].to_vec(), values[count..].to_vec())
+        } else {
+            (vec![0.0; count], vec![0.0; count])
+        };
         let paint: RingPaint = RingPaint {
             spans: spans.clone(),
             colors: self.items.iter().map(|i| i.color).collect(),
-            dimmed: self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| item.inert || self.focus.is_some_and(|f| f != index))
-                .collect(),
+            dim,
+            grow,
             thresholds: self
                 .items
                 .iter()
@@ -374,17 +571,92 @@ impl RenderOnce for CellRing {
             empty: style.lattice,
             sweep: self.sweep,
         };
-        let origin: Rc<Cell<Point<Pixels>>> = Rc::new(Cell::new(Point::default()));
+        let origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&state.read(cx).origin);
+        let tip: Option<ChartTip> = mark.and_then(|m| {
+            let content: TipContent = match m {
+                Mark::Segment(index) => self.tips.get(index).cloned()?,
+                Mark::Free => self.free_tip.clone()?,
+            };
+            let (x, y) = ring_mark_point(&spans, m)?;
+            Some(ChartTip::new(
+                SharedString::from(format!("{}-tip", self.id)),
+                content,
+                Bounds::new(
+                    point(px(x - DOT / 2.0), px(y - DOT / 2.0)),
+                    size(px(DOT), px(DOT)),
+                ),
+                origin.get(),
+                animate,
+            ))
+        });
         let origin_paint: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
-        let mut root = div()
+        let items_active: Vec<bool> = self.items.iter().map(|i| i.activatable).collect();
+        let hit_spans: Rc<RingSpans> = Rc::new(spans);
+        let move_spans: Rc<RingSpans> = Rc::clone(&hit_spans);
+        let key_spans: Rc<RingSpans> = Rc::clone(&hit_spans);
+        let move_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let move_state: Entity<RingHover> = state.clone();
+        let move_hover: Option<HoverHandler> = self.on_hover.clone();
+        let leave_state: Entity<RingHover> = state.clone();
+        let leave_hover: Option<HoverHandler> = self.on_hover.clone();
+        let key_state: Entity<RingHover> = state;
+        let key_hover: Option<HoverHandler> = self.on_hover.clone();
+        let select: Option<SelectHandler> = self.on_select.clone();
+        let mut overlay = div()
+            .id(SharedString::from(format!("{}-hit", self.id)))
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .on_mouse_move(move |event, window, app| {
+                let at: Point<Pixels> = event.position - move_origin.get();
+                let mark: Option<Mark> = ring_mark_at(at.x.into(), at.y.into(), &move_spans);
+                set_ring_mark(&move_state, mark, false, move_hover.as_ref(), window, app);
+            })
+            .on_hover(move |hovered, window, app| {
+                let from_pointer: bool = !leave_state.read(app).keyboard;
+                if !*hovered && from_pointer {
+                    set_ring_mark(&leave_state, None, false, leave_hover.as_ref(), window, app);
+                }
+            });
+        if let Some(handler) = select {
+            let click_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+            let click_spans: Rc<RingSpans> = Rc::clone(&hit_spans);
+            overlay = overlay.on_click(move |event, window, app| {
+                let at: Point<Pixels> = event.position() - click_origin.get();
+                if let Some(index) = segment_at(at.x.into(), at.y.into(), &click_spans)
+                    && items_active.get(index).copied().unwrap_or(false)
+                {
+                    handler(index, window, app);
+                }
+            });
+        }
+        div()
             .id(self.id.clone())
             .role(Role::Image)
             .test_support()
             .aria_label(self.label)
+            .track_focus(&handle)
             .relative()
             .w(px(DIAL_SIZE))
             .h(px(DIAL_SIZE))
             .flex_shrink_0()
+            .on_key_down(move |event, window, app| {
+                let current: Option<Mark> = key_state.read(app).mark;
+                let next: Option<Option<Mark>> = match event.keystroke.key.as_str() {
+                    "right" | "down" => Some(step_ring_mark(&key_spans, current, 1)),
+                    "left" | "up" => Some(step_ring_mark(&key_spans, current, -1)),
+                    "home" => Some(ring_marks(&key_spans).first().copied()),
+                    "end" => Some(ring_marks(&key_spans).last().copied()),
+                    "escape" => Some(None),
+                    _ => None,
+                };
+                if let Some(mark) = next {
+                    set_ring_mark(&key_state, mark, true, key_hover.as_ref(), window, app);
+                    app.stop_propagation();
+                }
+            })
             .child(
                 div().absolute().top_0().left_0().size_full().child(
                     canvas(
@@ -395,62 +667,19 @@ impl RenderOnce for CellRing {
                     )
                     .size_full(),
                 ),
-            );
-        // One hit test of the whole arc of a segment, from the pointer.
-        if self.on_select.is_some() || self.on_hover.is_some() {
-            let items_active: Vec<bool> = self.items.iter().map(|i| i.activatable).collect();
-            let hit_spans: RingSpans = spans.clone();
-            let hover: Option<HoverHandler> = self.on_hover.clone();
-            let select: Option<SelectHandler> = self.on_select.clone();
-            let hover_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
-            let hover_spans: RingSpans = spans.clone();
-            let mut overlay = div()
-                .id(SharedString::from(format!("{}-hit", self.id)))
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_mouse_move(move |event, window, app| {
-                    if let Some(handler) = &hover {
-                        let at: Point<Pixels> = event.position - hover_origin.get();
-                        handler(
-                            segment_at(at.x.into(), at.y.into(), &hover_spans),
-                            window,
-                            app,
-                        );
-                    }
-                })
-                .on_hover({
-                    let leave: Option<HoverHandler> = self.on_hover.clone();
-                    move |hovered, window, app| {
-                        if !*hovered && let Some(handler) = &leave {
-                            handler(None, window, app);
-                        }
-                    }
-                });
-            if let Some(handler) = select {
-                overlay = overlay.on_click(move |event, window, app| {
-                    let at: Point<Pixels> = event.position() - origin.get();
-                    if let Some(index) = segment_at(at.x.into(), at.y.into(), &hit_spans)
-                        && items_active.get(index).copied().unwrap_or(false)
-                    {
-                        handler(index, window, app);
-                    }
-                });
-            }
-            root = root.child(overlay);
-        }
-        root.child(
-            RingCenter::new(
-                SharedString::from(format!("{}-center", self.id)),
-                self.center.0,
-                self.center.1,
-                // The inner ring: its diameter without the dot.
-                2.0 * RADII[0] - DOT,
             )
-            .caption_id(SharedString::from(format!("{}-center-caption", self.id))),
-        )
+            .child(overlay)
+            .child(
+                RingCenter::new(
+                    SharedString::from(format!("{}-center", self.id)),
+                    self.center.0,
+                    self.center.1,
+                    // The inner ring: its diameter without the dot.
+                    2.0 * RADII[0] - DOT,
+                )
+                .caption_id(SharedString::from(format!("{}-center-caption", self.id))),
+            )
+            .children(tip)
     }
 }
 
@@ -546,6 +775,50 @@ mod tests {
         assert_eq!(segment_at(x, y, &spans), None, "the free region");
         let (x, y) = point_at(105.0, 75.0);
         assert_eq!(segment_at(x, y, &spans), None, "upper left is free space");
+    }
+
+    fn marks_spans() -> RingSpans {
+        RingSpans {
+            items: vec![Span { start: 0, len: 59 }, Span { start: 60, len: 29 }],
+            free: Some(Span { start: 90, len: 29 }),
+        }
+    }
+
+    #[test]
+    fn the_free_space_is_a_mark_and_a_gap_is_not() {
+        let spans = marks_spans();
+        let (x, y) = point_at(100.0, 75.0);
+        assert_eq!(ring_mark_at(x, y, &spans), Some(Mark::Free));
+        let (x, y) = point_at(30.0, 75.0);
+        assert_eq!(ring_mark_at(x, y, &spans), Some(Mark::Segment(0)));
+        let (x, y) = point_at(59.0, 75.0);
+        assert_eq!(ring_mark_at(x, y, &spans), None);
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_segments_then_the_free_space() {
+        let spans = marks_spans();
+        let seg = Mark::Segment;
+        assert_eq!(step_ring_mark(&spans, None, 1), Some(seg(0)));
+        assert_eq!(step_ring_mark(&spans, None, -1), Some(Mark::Free));
+        assert_eq!(step_ring_mark(&spans, Some(seg(1)), 1), Some(Mark::Free));
+        assert_eq!(
+            step_ring_mark(&spans, Some(Mark::Free), 1),
+            Some(Mark::Free)
+        );
+        assert_eq!(step_ring_mark(&spans, Some(seg(0)), -1), Some(seg(0)));
+        assert_eq!(ring_marks(&spans).len(), 3);
+    }
+
+    #[test]
+    fn the_card_anchor_is_on_the_outer_ring_in_the_middle_of_the_mark() {
+        let spans = marks_spans();
+        let (x, y) = ring_mark_point(&spans, Mark::Segment(0)).expect("a segment");
+        let radius = (x - DIAL_SIZE / 2.0).hypot(y - DIAL_SIZE / 2.0);
+        assert!((radius - RADII[RINGS - 1]).abs() < 0.01);
+        // The middle of the first segment is on the right half of the ring.
+        assert!(x > DIAL_SIZE / 2.0);
+        assert!(ring_mark_point(&spans, Mark::Segment(9)).is_none());
     }
 
     #[test]

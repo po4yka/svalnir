@@ -6,7 +6,7 @@
 )]
 
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Point, TestAppContext, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Pixels, Point, TestAppContext, px, size,
     test::TestWindowExt as _,
 };
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use svalnir_gui::{
     app::{open_main_window, open_main_window_seeded},
     data::fixture::{FixtureScenario, FixtureSource},
     shell::nav,
+    viz::hover::{FocusTarget, request_launch_focus},
 };
 
 fn open(scenario: FixtureScenario, cx: &mut TestAppContext) -> AnyWindowHandle {
@@ -440,4 +441,117 @@ fn a_healthy_session_without_a_trend_shows_no_runway(cx: &mut TestAppContext) {
     assert!(chart.is_none_or(|c| !c.contains("runway")));
     let detail = label(handle, "dial-detail", cx).unwrap_or_default();
     assert!(!detail.contains("Runway"), "{detail}");
+}
+
+/// Asks the chart of `target` to take focus at launch, as `--focus` does.
+fn launch_focus(target: FocusTarget, cx: &mut TestAppContext) {
+    cx.update(|cx| request_launch_focus(target, cx));
+}
+
+fn press(handle: AnyWindowHandle, key: &'static str, cx: &mut TestAppContext) {
+    cx.update_window(handle, |_, window, cx| window.press(key, cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+/// The window bounds of an element, after a fresh frame.
+fn bounds_of(
+    handle: AnyWindowHandle,
+    id: &'static str,
+    cx: &mut TestAppContext,
+) -> Option<Bounds<Pixels>> {
+    let mut found: Option<Bounds<Pixels>> = None;
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        found = window.try_find(id).map(|node| node.bounds());
+    })
+    .unwrap();
+    found
+}
+
+fn reading_number(card: &str) -> usize {
+    let tail: &str = card.rsplit("Reading ").next().expect("reading note");
+    tail.split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("reading number")
+}
+
+#[gpui_kit::test]
+fn the_launch_focus_shows_the_newest_reading_and_keys_move_it(cx: &mut TestAppContext) {
+    launch_focus(FocusTarget::Session, cx);
+    let handle = open_drift(100, cx);
+    let card = label(handle, "session-tip", cx).expect("card of the newest reading");
+    assert!(card.contains("Available: "), "{card}");
+    assert!(card.contains("Disk used: "), "{card}");
+    assert!(card.contains("Swap used: "), "{card}");
+    assert!(card.contains("Pressure: "), "{card}");
+    assert!(card.contains("Changes: "), "{card}");
+    assert!(card.ends_with("Reading 100 of 100"), "{card}");
+    press(handle, "left", cx);
+    let card = label(handle, "session-tip", cx).expect("card after Left");
+    assert_eq!(reading_number(&card), 99, "{card}");
+    press(handle, "home", cx);
+    let card = label(handle, "session-tip", cx).expect("card after Home");
+    assert_eq!(reading_number(&card), 1, "{card}");
+    press(handle, "escape", cx);
+    assert!(label(handle, "session-tip", cx).is_none());
+}
+
+#[gpui_kit::test]
+fn an_unavailable_reading_card_has_dashes_and_no_zero(cx: &mut TestAppContext) {
+    launch_focus(FocusTarget::Session, cx);
+    // Step 20 of the Drift fixture is unavailable; 21 readings end there.
+    let handle = open_drift(21, cx);
+    let card = label(handle, "session-tip", cx).expect("card");
+    assert!(card.contains("Available: —"), "{card}");
+    assert!(!card.contains("0 B") && !card.contains("0%"), "{card}");
+}
+
+#[gpui_kit::test]
+fn the_dial_card_follows_the_arrow_keys_and_the_detail_panel(cx: &mut TestAppContext) {
+    launch_focus(FocusTarget::Dial, cx);
+    let handle = open(FixtureScenario::Healthy, cx);
+    let card = label(handle, "headroom-dial-tip", cx).expect("dial card");
+    assert!(
+        card.contains("Used: ") && card.contains("Total: "),
+        "{card}"
+    );
+    assert!(card.contains('%'), "{card}");
+    let detail = label(handle, "dial-detail", cx);
+    press(handle, "down", cx);
+    let next = label(handle, "headroom-dial-tip", cx).expect("card after Down");
+    assert_ne!(next, card);
+    assert_ne!(label(handle, "dial-detail", cx), detail);
+    press(handle, "escape", cx);
+    assert!(label(handle, "headroom-dial-tip", cx).is_none());
+}
+
+#[gpui_kit::test]
+fn the_unavailable_dial_card_has_a_dash_and_the_reason(cx: &mut TestAppContext) {
+    launch_focus(FocusTarget::Dial, cx);
+    let handle = open(FixtureScenario::Unavailable, cx);
+    let card = label(handle, "headroom-dial-tip", cx).expect("dial card");
+    assert!(card.contains("Used: —"), "{card}");
+    assert!(!card.contains("0 B") && !card.contains("0%"), "{card}");
+}
+
+#[gpui_kit::test]
+fn the_cards_sit_in_the_window_near_their_marks(cx: &mut TestAppContext) {
+    let window = Bounds::new(Point::default(), size(px(1120.0), px(720.0)));
+    launch_focus(FocusTarget::Session, cx);
+    let handle = open_drift(100, cx);
+    let card = bounds_of(handle, "session-tip", cx).expect("session card bounds");
+    let chart = bounds_of(handle, "session-chart", cx).expect("session chart bounds");
+    assert!(card.origin.x >= window.origin.x && card.origin.y >= window.origin.y);
+    assert!(card.right() <= window.right() && card.bottom() <= window.bottom());
+    // The card is next to the chart in window space, not at the window corner.
+    assert!(
+        card.origin.x >= chart.origin.x - px(16.0),
+        "{card:?} {chart:?}"
+    );
+    assert!(
+        card.origin.y >= chart.origin.y - px(300.0),
+        "{card:?} {chart:?}"
+    );
 }

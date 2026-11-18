@@ -14,6 +14,7 @@ use crate::{
         motion,
         tokens::{self, Tokens, to_hsla},
     },
+    ui::chart_tip::TipContent,
     ui::{
         data_state::{format_age, format_bytes, used_capacity},
         entry::card_entry,
@@ -24,6 +25,7 @@ use crate::{
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
+    viz::hover::{FocusTarget, volume_tips},
     viz::{
         alloc::count_f32,
         capacity_grid::{capacity_label, known_capacity},
@@ -377,15 +379,24 @@ fn hero_card(
                 }
                 _ => None,
             };
+            let (used_tip, free_tip): (Vec<TipContent>, Option<TipContent>) =
+                known_capacity(&used, &host.disk_total).map_or((Vec::new(), None), |(u, t)| {
+                    let (used_tip, free_tip) = volume_tips(u, t);
+                    (vec![used_tip], Some(free_tip))
+                });
             v_flex()
                 .gap(tokens::SPACE_3)
                 .child(value)
-                .child(LedChart::new(
-                    field,
-                    Vec::new(),
-                    "disk-grid",
-                    capacity_label(&used, &host.disk_total),
-                ))
+                .child(
+                    LedChart::new(
+                        field,
+                        Vec::new(),
+                        "disk-grid",
+                        capacity_label(&used, &host.disk_total),
+                    )
+                    .tips(used_tip)
+                    .free_tip(free_tip),
+                )
                 .children(scale.map(|text| caption("disk-grid-scale", text, tokens)))
                 .children(stale.then(|| caption("disk-stale", stale_caption(host), tokens)))
                 .child(
@@ -477,6 +488,9 @@ fn headroom_stats(host: &HostSnapshot, dark: bool) -> StatRow {
         .item(StatItem::new("pressure", "Pressure", state, color))
 }
 
+/// The shared handler of a pick of a ring.
+type PickFn = std::rc::Rc<dyn Fn(Option<usize>, &mut Window, &mut gpui_kit::App)>;
+
 /// The Headroom card: the dial, its legend, the detail panel, and the
 /// provenance line.
 #[expect(clippy::too_many_arguments, reason = "one card of the screen")]
@@ -503,6 +517,8 @@ fn headroom_card(
             if let Some((text, tone)) = headroom_aside(host) {
                 header = header.aside(StatusPill::new(text, tone).id("headroom-aside"));
             }
+            let on_pick: PickFn = std::rc::Rc::new(on_pick);
+            let dial_pick = std::rc::Rc::clone(&on_pick);
             let effective: usize = pick.unwrap_or(model.picked).min(2);
             let detail: DialDetail = DialDetail::new(model.rings[effective].clone()).muted(*stale);
             let body: AnyElement = v_flex()
@@ -519,6 +535,10 @@ fn headroom_card(
                                     HeadroomDial::new(shown)
                                         .hidden_names(names_hidden(&model))
                                         .picked(pick)
+                                        .launch_focus(FocusTarget::Dial)
+                                        .on_pick(move |index, window, app| {
+                                            dial_pick(index, window, app);
+                                        })
                                         .sweep(sweep)
                                         .muted(*stale),
                                 )
@@ -533,7 +553,9 @@ fn headroom_card(
                                     DialLegend::new(model, pill)
                                         .muted(*stale)
                                         .focus_handles(focus)
-                                        .on_pick(on_pick),
+                                        .on_pick(move |index, window, app| {
+                                            on_pick(index, window, app);
+                                        }),
                                 )
                                 .child(detail)
                                 .children(stale.then(|| {
@@ -608,7 +630,12 @@ fn session_card(
             );
             v_flex()
                 .gap(tokens::SPACE_3)
-                .child(SessionChart::new(model).live(live).muted(*stale))
+                .child(
+                    SessionChart::new(model)
+                        .live(live)
+                        .muted(*stale)
+                        .launch_focus(FocusTarget::Session),
+                )
                 .children(stale.then(|| caption("session-stale", stale_caption(host), tokens)))
                 .child(
                     ProvenanceLine::new(host.source, host.captured_at, "host readings")

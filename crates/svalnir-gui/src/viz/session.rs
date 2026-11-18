@@ -11,22 +11,31 @@ use crate::{
         glow,
         tokens::{self, Tokens, to_hsla},
     },
-    ui::data_state::{UNAVAILABLE_TEXT, format_bytes},
+    ui::{
+        chart_tip::{ChartTip, TipContent},
+        data_state::{UNAVAILABLE_TEXT, format_bytes},
+    },
     viz::{
         dial::DialColors,
+        hover::{FocusTarget, Tween, take_launch_focus},
         led::lit_color,
         runway::{self, Estimate, Trend},
         tick_track::{TickState, state_of, track_label},
     },
 };
 use gpui_kit::{
-    App, BorderStyle, Bounds, BoxShadow, Corners, Edges, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
+    App, BorderStyle, Bounds, BoxShadow, Corners, Edges, Entity, FocusHandle, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
+    canvas,
     component::{ActiveTheme as _, h_flex, v_flex},
     div, fill, hsla, point, px, quad, size,
 };
-use std::time::SystemTime;
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Instant, SystemTime},
+};
 
 /// The rows of the curve part.
 pub const CURVE_ROWS: usize = 10;
@@ -81,6 +90,12 @@ pub struct Column {
     pub pressure: Option<u8>,
     /// The pressure state of the reading.
     pub state: TickState,
+    /// The available space in bytes; `None` when unavailable.
+    pub available: Option<u64>,
+    /// The used space of the volume in bytes; `None` when unavailable.
+    pub disk_used: Option<u64>,
+    /// The used swap in bytes; `None` when unavailable.
+    pub swap_used: Option<u64>,
     /// The dots of the change strip, 0 to 3.
     pub change: u8,
     /// The row of the trend dot from the bottom, `0..CURVE_ROWS`; `None`
@@ -298,6 +313,9 @@ pub fn session_model(
                 Measured::Unavailable(_) => None,
             },
             state: state_of(&sample.pressure),
+            available: sample.disk_available.value().copied(),
+            disk_used: sample.disk_used.value().copied(),
+            swap_used: sample.swap_used.value().copied(),
             change,
             trend: fit
                 .as_ref()
@@ -556,6 +574,29 @@ pub fn clock_text(time: SystemTime, utc_offset: Option<i32>) -> String {
     format!("{:02}:{:02}", seconds / 3600, seconds / 60 % 60)
 }
 
+/// The time of day of `time` as "HH:MM:SS" for the title of a card. With
+/// `utc_offset` the text is local time; with `None` it is UTC and the text ends
+/// with " UTC". A time before the epoch is an em dash.
+#[must_use]
+pub fn clock_seconds_text(time: SystemTime, utc_offset: Option<i32>) -> String {
+    let Ok(since) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+        return UNAVAILABLE_TEXT.to_owned();
+    };
+    let utc: i64 = i64::try_from(since.as_secs() % 86_400).unwrap_or(0);
+    let seconds: i64 = (utc + i64::from(utc_offset.unwrap_or(0))).rem_euclid(86_400);
+    let text: String = format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+    if utc_offset.is_some() {
+        text
+    } else {
+        format!("{text} UTC")
+    }
+}
+
 /// The count of measured readings of `level` right before `index`, up to the
 /// first measured reading of another state. An unavailable reading is skipped.
 fn readings_before(samples: &[HostSample], index: usize, level: PressureLevel) -> usize {
@@ -780,8 +821,13 @@ impl SessionModel {
     /// The chip of the newest event, clamped inside the lattice.
     #[must_use]
     pub fn chip(&self) -> Option<Chip> {
-        let index: usize = self.events.len().checked_sub(1)?;
-        let event: &Event = &self.events[index];
+        self.chip_of(self.events.len().checked_sub(1)?)
+    }
+
+    /// The chip of the event at `index`, clamped inside the lattice.
+    #[must_use]
+    pub fn chip_of(&self, index: usize) -> Option<Chip> {
+        let event: &Event = self.events.get(index)?;
         let time: String = if event.time == UNAVAILABLE_TEXT || event.local {
             event.time.clone()
         } else {
@@ -865,6 +911,179 @@ impl SessionModel {
     }
 }
 
+/// The distance from an event marker within which the pointer picks it, in
+/// pixels.
+pub const MARKER_REACH: f32 = 8.0;
+/// The side of a pressure marker at rest, in pixels.
+const MARKER_REST: f32 = 6.0;
+/// The side of a hovered marker, in pixels.
+const MARKER_HOT: f32 = 8.0;
+
+/// The mark of the session chart that the pointer or the keyboard picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMark {
+    /// The reading with this index in `SessionModel::columns`.
+    Column(usize),
+    /// The event with this index in `SessionModel::events`.
+    Event(usize),
+}
+
+impl SessionMark {
+    /// The column that the mark stands at.
+    #[must_use]
+    pub fn column(self, model: &SessionModel) -> Option<usize> {
+        match self {
+            Self::Column(index) => Some(index),
+            Self::Event(index) => model.events.get(index).map(|event| event.column),
+        }
+    }
+}
+
+/// The mark under the point `(x, y)`, in pixels from the top-left corner of the
+/// chart. An event marker within `MARKER_REACH` wins over a column. A column is
+/// the whole height of the lattice at one reading. The gutters, a slot with no
+/// reading, and the zones outside the lattice give `None`.
+#[must_use]
+pub fn session_mark_at(
+    model: &SessionModel,
+    layout: &Layout,
+    x: f32,
+    y: f32,
+) -> Option<SessionMark> {
+    let rail_y: f32 = layout.label_band + 3.5;
+    let near = model
+        .events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let mx: f32 = LEFT_GUTTER + slot_center(model.offset() + event.column);
+            (index, (x - mx).hypot(y - rail_y))
+        })
+        .filter(|(_, distance)| *distance <= MARKER_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((index, _)) = near {
+        return Some(SessionMark::Event(index));
+    }
+    let across: f32 = x - LEFT_GUTTER;
+    if across < 0.0 || across >= layout.lattice || y < layout.band || y >= layout.matrix_bottom {
+        return None;
+    }
+    let slot: usize = slot_at(across);
+    let index: usize = slot.checked_sub(model.offset())?;
+    (index < model.columns.len()).then_some(SessionMark::Column(index))
+}
+
+/// The slot under `across` pixels from the left edge of the lattice.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is not negative and far below the usize range"
+)]
+fn slot_at(across: f32) -> usize {
+    (across / PITCH).floor().max(0.0) as usize
+}
+
+/// The mark after `current` when the keyboard moves by `delta` readings. With
+/// no mark, a move to the right picks the oldest reading on screen and a move to
+/// the left picks the newest. The move stops at both ends. A marked event moves
+/// from the column of the event.
+#[must_use]
+pub fn step_session_mark(
+    model: &SessionModel,
+    current: Option<SessionMark>,
+    delta: i32,
+) -> Option<SessionMark> {
+    let last: usize = model.columns.len().checked_sub(1)?;
+    let next: usize = match current.and_then(|mark| mark.column(model)) {
+        Some(at) => {
+            let moved: i64 = i64::try_from(at).unwrap_or(0) + i64::from(delta);
+            usize::try_from(moved.max(0)).unwrap_or(0).min(last)
+        }
+        None if delta >= 0 => 0,
+        None => last,
+    };
+    Some(SessionMark::Column(next))
+}
+
+/// The oldest reading on screen, or with `end` true the newest.
+#[must_use]
+pub fn edge_session_mark(model: &SessionModel, end: bool) -> Option<SessionMark> {
+    let last: usize = model.columns.len().checked_sub(1)?;
+    Some(SessionMark::Column(if end { last } else { 0 }))
+}
+
+/// The card of the reading at column `index`: the local time, the measured
+/// values, and the place of the reading on screen. An unavailable value is an
+/// em dash.
+#[must_use]
+pub fn column_tip(model: &SessionModel, index: usize) -> Option<TipContent> {
+    let column: &Column = model.columns.get(index)?;
+    let bytes = |value: Option<u64>| value.map_or_else(|| UNAVAILABLE_TEXT.to_owned(), bytes_text);
+    let nothing: bool = column.available.is_none()
+        && column.disk_used.is_none()
+        && column.swap_used.is_none()
+        && column.state == TickState::Empty;
+    let changes: String = if nothing {
+        UNAVAILABLE_TEXT.to_owned()
+    } else {
+        column.change.to_string()
+    };
+    Some(
+        TipContent::new(clock_seconds_text(column.at, column.utc_offset))
+            .row("Available", bytes(column.available))
+            .row("Disk used", bytes(column.disk_used))
+            .row("Swap used", bytes(column.swap_used))
+            .row("Pressure", state_word(column.state))
+            .row("Changes", changes)
+            .note(format!("Reading {} of {}", index + 1, model.columns.len())),
+    )
+}
+
+/// A time label of the axis as it shows: its left edge in the lattice and
+/// whether it is the label of the hovered reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxisSpot {
+    /// The slot of the reading.
+    pub slot: usize,
+    /// The text, "HH:MM".
+    pub text: String,
+    /// Whether the label is the one of the hovered reading.
+    pub hovered: bool,
+}
+
+/// The labels of the time axis while `hovered` is the hovered column. The
+/// hovered reading gets a label when it has none, and a label that it would
+/// overlap is left out.
+#[must_use]
+pub fn axis_spots(model: &SessionModel, hovered: Option<usize>) -> Vec<AxisSpot> {
+    let mut spots: Vec<AxisSpot> = model
+        .axis
+        .iter()
+        .map(|label| AxisSpot {
+            slot: label.slot,
+            text: label.text.clone(),
+            hovered: false,
+        })
+        .collect();
+    let Some(column) = hovered.and_then(|index| model.columns.get(index).map(|c| (index, c)))
+    else {
+        return spots;
+    };
+    let slot: usize = model.offset() + column.0;
+    if let Some(own) = spots.iter_mut().find(|spot| spot.slot == slot) {
+        own.hovered = true;
+        return spots;
+    }
+    let center: f32 = slot_center(slot);
+    spots.retain(|spot| (slot_center(spot.slot) - center).abs() >= 2.0 * AXIS_HALF);
+    spots.push(AxisSpot {
+        slot,
+        text: clock_text(column.1.at, column.1.utc_offset),
+        hovered: true,
+    });
+    spots
+}
+
 /// The progress `0.0..=1.0` of the ring of the live head at `phase` seconds.
 #[must_use]
 pub fn live_progress(phase: f32) -> f32 {
@@ -896,6 +1115,10 @@ struct SessionPaint {
     glow: bool,
     live: Option<f32>,
     muted: bool,
+    /// The hovered column, for the line and the full-strength dots.
+    hover_column: Option<usize>,
+    /// The hover amount `0.0..=1.0` of each event marker.
+    markers: Vec<f32>,
 }
 
 const PITCH: f32 = 6.0;
@@ -919,14 +1142,23 @@ fn rect_at(origin: Point<Pixels>, x: f32, y: f32, width: f32, height: f32) -> Bo
     )
 }
 
-/// A diamond of 6 px as five stepped rows.
-fn paint_diamond(window: &mut Window, origin: Point<Pixels>, cx: f32, cy: f32, color: Hsla) {
-    let step: f32 = 1.2;
+/// A diamond of `side` px (6 px at rest) as five stepped rows.
+fn paint_diamond(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    center: (f32, f32),
+    side: f32,
+    color: Hsla,
+) {
+    let (cx, cy) = center;
+    let unit: f32 = side / MARKER_REST;
+    let step: f32 = 1.2 * unit;
     let widths: [f32; 5] = [1.2, 3.6, 6.0, 3.6, 1.2];
     for (index, width) in widths.iter().enumerate() {
-        let top: f32 = cy - 3.0 + count_px(index) * step;
+        let wide: f32 = width * unit;
+        let top: f32 = cy - side / 2.0 + count_px(index) * step;
         window.paint_quad(fill(
-            rect_at(origin, cx - width / 2.0, top, *width, step),
+            rect_at(origin, cx - wide / 2.0, top, wide, step),
             color,
         ));
     }
@@ -983,7 +1215,11 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
             TickState::Critical => Some(paint.colors.negative),
             TickState::Normal | TickState::Empty => None,
         };
+        let hot: bool = paint.hover_column == Some(index);
         let tone = |base: Hsla| -> Hsla {
+            if hot {
+                return picked.unwrap_or(base).opacity(rest);
+            }
             picked.map_or_else(|| base.opacity(0.6 * rest), |p| p.opacity(rest))
         };
         // The curve: the value dot, and the dots below it at 12%.
@@ -1051,6 +1287,20 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
             );
         }
     }
+    // The line of the hovered column through the curve and the matrix.
+    if let Some(column) = paint.hover_column.filter(|c| *c < model.columns.len()) {
+        let x: f32 = slot_x(model.offset() + column) + DOT / 2.0 - 0.5;
+        window.paint_quad(fill(
+            rect_at(
+                origin,
+                x,
+                layout.band,
+                1.0,
+                layout.matrix_bottom - layout.band,
+            ),
+            paint.muted_ink.opacity(0.6 * rest),
+        ));
+    }
     // The dashed line of the lowest value on screen.
     if let Some(min) = model.min {
         let y: f32 = row_y(min.row) + DOT / 2.0;
@@ -1070,8 +1320,10 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
         rect_at(origin, LEFT_GUTTER, rail_y, layout.lattice, 1.0),
         paint.colors.border.opacity(rest),
     ));
-    for event in &model.events {
+    for (number, event) in model.events.iter().enumerate() {
         let x: f32 = slot_x(model.offset() + event.column) + DOT / 2.0 - 0.5;
+        let side: f32 = MARKER_REST
+            + (MARKER_HOT - MARKER_REST) * paint.markers.get(number).copied().unwrap_or(0.0);
         let tone: Hsla = event_color(event.kind, &paint.colors, paint.brand);
         let mut y: f32 = rail_y + 4.0;
         while y < layout.matrix_bottom {
@@ -1085,13 +1337,25 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
         match event.kind {
             EventKind::Pressure(_) => window.paint_quad(
                 fill(
-                    rect_at(origin, x + 0.5 - 3.0, rail_y + 0.5 - 3.0, 6.0, 6.0),
+                    rect_at(
+                        origin,
+                        x + 0.5 - side / 2.0,
+                        rail_y + 0.5 - side / 2.0,
+                        side,
+                        side,
+                    ),
                     tone.opacity(rest),
                 )
-                .corner_radii(Corners::all(px(3.0))),
+                .corner_radii(Corners::all(px(side / 2.0))),
             ),
             EventKind::Operation => {
-                paint_diamond(window, origin, x + 0.5, rail_y + 0.5, tone.opacity(rest));
+                paint_diamond(
+                    window,
+                    origin,
+                    (x + 0.5, rail_y + 0.5),
+                    side,
+                    tone.opacity(rest),
+                );
             }
         }
     }
@@ -1133,12 +1397,44 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
     }
 }
 
+/// The hover state that the chart keeps between frames.
+struct SessionHover {
+    /// The mark under the pointer or under the keyboard.
+    mark: Option<SessionMark>,
+    /// Whether the keyboard set the mark.
+    keyboard: bool,
+    /// The hover amount of each event marker.
+    tween: Option<Tween>,
+    /// The focus of the chart, for Tab and the arrow keys.
+    handle: FocusHandle,
+    /// The position of the chart in the window, set at each paint.
+    origin: Rc<Cell<Point<Pixels>>>,
+}
+
+/// Sets the mark of the chart. It redraws the chart only when the mark changes.
+fn set_session_mark(
+    state: &Entity<SessionHover>,
+    mark: Option<SessionMark>,
+    keyboard: bool,
+    app: &mut App,
+) {
+    state.update(app, |s, cx| {
+        if s.mark != mark {
+            s.mark = mark;
+            s.keyboard = keyboard && mark.is_some();
+            cx.notify();
+        }
+    });
+}
+
 /// The chart as an element with its key.
 #[derive(IntoElement, Debug)]
 pub struct SessionChart {
     model: SessionModel,
     live: Option<f32>,
     muted: bool,
+    reduce_motion: bool,
+    launch: Option<FocusTarget>,
 }
 
 impl SessionChart {
@@ -1149,7 +1445,24 @@ impl SessionChart {
             model,
             live: None,
             muted: false,
+            reduce_motion: false,
+            launch: None,
         }
+    }
+
+    /// Lets a launch request for `target` focus the chart and pick the newest
+    /// reading.
+    #[must_use]
+    pub const fn launch_focus(mut self, target: FocusTarget) -> Self {
+        self.launch = Some(target);
+        self
+    }
+
+    /// With `reduce` true, hover changes apply in one step.
+    #[must_use]
+    pub const fn reduce_motion(mut self, reduce: bool) -> Self {
+        self.reduce_motion = reduce;
+        self
     }
 
     /// The progress `0.0..=1.0` of the ring of the live head; `None` turns
@@ -1215,7 +1528,7 @@ impl RenderOnce for SessionChart {
         clippy::too_many_lines,
         reason = "one build of the chart and its texts"
     )]
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
         let mono: SharedString = cx.theme().mono_font_family.clone();
@@ -1226,6 +1539,62 @@ impl RenderOnce for SessionChart {
         let label: SharedString = self.model.label().into();
         let pressure_label: SharedString = track_label(&self.model.states()).into();
         let range: SharedString = range_caption(self.model.range).into();
+        let animate: bool = !(self.reduce_motion || cx.reduce_motion());
+        let state: Entity<SessionHover> =
+            window.use_keyed_state("session-chart-hover", cx, |_, cx| SessionHover {
+                mark: None,
+                keyboard: false,
+                tween: None,
+                handle: cx.focus_handle().tab_stop(true),
+                origin: Rc::new(Cell::new(Point::default())),
+            });
+        let handle: FocusHandle = state.read(cx).handle.clone();
+        let mut focused: bool = handle.is_focused(window);
+        // A launch request waits without cost until the chart has a reading.
+        let newest: Option<SessionMark> = edge_session_mark(&self.model, true);
+        if newest.is_some()
+            && self
+                .launch
+                .is_some_and(|target| take_launch_focus(target, cx))
+        {
+            set_session_mark(&state, newest, true, cx);
+            let to_focus: FocusHandle = handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&to_focus, cx));
+            // The focus follows after this frame; keep the mark meanwhile.
+            focused = true;
+        }
+        let now: Instant = Instant::now();
+        let event_count: usize = self.model.events.len();
+        let columns_count: usize = self.model.columns.len();
+        // One pass: the mark, and the eased hover amounts of the markers.
+        let (mark, markers, running): (Option<SessionMark>, Vec<f32>, bool) =
+            state.update(cx, |s, _| {
+                if s.keyboard && !focused {
+                    s.mark = None;
+                    s.keyboard = false;
+                }
+                // A mark of an older model can point past the readings now.
+                s.mark = s.mark.filter(|mark| match mark {
+                    SessionMark::Column(index) => *index < columns_count,
+                    SessionMark::Event(index) => *index < event_count,
+                });
+                let target: Vec<f32> = (0..event_count)
+                    .map(|index| f32::from(u8::from(s.mark == Some(SessionMark::Event(index)))))
+                    .collect();
+                let tween: &mut Tween = s
+                    .tween
+                    .get_or_insert_with(|| Tween::new(target.clone(), now));
+                tween.retarget(target, now, animate);
+                (s.mark, tween.value_at(now), tween.running(now))
+            });
+        if running {
+            window.request_animation_frame();
+        }
+        let hover_column: Option<usize> = match mark {
+            Some(SessionMark::Column(index)) => Some(index),
+            _ => None,
+        };
+        let origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&state.read(cx).origin);
         let row_top = |row: usize| layout.band + count_px(row) * PITCH;
         let center_of = |top_row: usize, dots: usize| row_top(top_row) + lattice_width(dots) / 2.0;
         let mut root = div()
@@ -1233,6 +1602,7 @@ impl RenderOnce for SessionChart {
             .role(Role::Image)
             .test_support()
             .aria_label(label)
+            .track_focus(&handle)
             .relative()
             .w(px(layout.width))
             .h(px(layout.height))
@@ -1269,7 +1639,11 @@ impl RenderOnce for SessionChart {
             );
         }
         // The chip of the newest event.
-        if let Some(chip) = self.model.chip() {
+        let chip: Option<Chip> = match mark {
+            Some(SessionMark::Event(index)) => self.model.chip_of(index),
+            _ => self.model.chip(),
+        };
+        if let Some(chip) = chip {
             let tone: Hsla = event_color(self.model.events[chip.event].kind, &colors, brand);
             texts.push(
                 div()
@@ -1316,7 +1690,7 @@ impl RenderOnce for SessionChart {
         // The newest values and the minimum, in the right gutter.
         let value_left: f32 = LEFT_GUTTER + layout.lattice + 6.0;
         let value_width: f32 = RIGHT_GUTTER - 6.0;
-        let [available, disk, swap, state] = self.model.newest_texts();
+        let [available, disk, swap, pressure_text] = self.model.newest_texts();
         let head_row: usize = self
             .model
             .columns
@@ -1336,7 +1710,7 @@ impl RenderOnce for SessionChart {
             (
                 "pressure",
                 center_of(PRESSURE_ROW, MATRIX_DOTS),
-                state,
+                pressure_text,
                 state_color,
             ),
         ];
@@ -1374,21 +1748,46 @@ impl RenderOnce for SessionChart {
             muted_ink,
             if self.model.axis_utc { "UTC" } else { "" },
         ));
-        for axis in &self.model.axis {
+        for axis in axis_spots(&self.model, hover_column) {
+            let left: f32 = clamp_span(slot_center(axis.slot), 2.0 * AXIS_HALF, layout.lattice);
             texts.push(small_text(
                 SharedString::from(format!("session-axis-{}", axis.slot)),
                 &mono,
-                (
-                    LEFT_GUTTER + slot_center(axis.slot) - AXIS_HALF,
-                    axis_top,
-                    2.0 * AXIS_HALF,
-                ),
+                (LEFT_GUTTER + left, axis_top, 2.0 * AXIS_HALF),
                 Align::Center,
-                muted_ink,
-                axis.text.clone(),
+                if axis.hovered { ink } else { muted_ink },
+                axis.text,
             ));
         }
         let trend_ink: Hsla = to_hsla(tokens.foreground);
+        // The card of the hovered reading, at its curve dot.
+        let tip: Option<ChartTip> = match mark {
+            Some(SessionMark::Column(index)) => column_tip(&self.model, index)
+                .zip(self.model.columns.get(index))
+                .map(|(content, column)| {
+                    let row: usize = column.curve.map_or(CURVE_ROWS - 1, |v| CURVE_ROWS - 1 - v);
+                    let spot: Point<Pixels> = point(
+                        px(LEFT_GUTTER + count_px(self.model.offset() + index) * PITCH),
+                        px(row_top(row)),
+                    );
+                    ChartTip::new(
+                        "session-tip",
+                        content,
+                        Bounds::new(spot, size(px(DOT), px(DOT))),
+                        origin.get(),
+                        animate,
+                    )
+                }),
+            _ => None,
+        };
+        let hit: Rc<SessionModel> = Rc::new(self.model.clone());
+        let move_hit: Rc<SessionModel> = Rc::clone(&hit);
+        let key_hit: Rc<SessionModel> = hit;
+        let move_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let paint_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let move_state: Entity<SessionHover> = state.clone();
+        let leave_state: Entity<SessionHover> = state.clone();
+        let key_state: Entity<SessionHover> = state;
         let paint: SessionPaint = SessionPaint {
             trend_ink,
             model: self.model,
@@ -1400,8 +1799,37 @@ impl RenderOnce for SessionChart {
             glow: glow::enabled(cx),
             live: self.live,
             muted: self.muted,
+            hover_column,
+            markers,
         };
         root = root
+            .on_mouse_move(move |event, _, app| {
+                let at: Point<Pixels> = event.position - move_origin.get();
+                let mark: Option<SessionMark> =
+                    session_mark_at(&move_hit, &layout, at.x.into(), at.y.into());
+                set_session_mark(&move_state, mark, false, app);
+            })
+            .on_hover(move |hovered, _, app| {
+                let from_pointer: bool = !leave_state.read(app).keyboard;
+                if !*hovered && from_pointer {
+                    set_session_mark(&leave_state, None, false, app);
+                }
+            })
+            .on_key_down(move |event, _, app| {
+                let current: Option<SessionMark> = key_state.read(app).mark;
+                let next: Option<Option<SessionMark>> = match event.keystroke.key.as_str() {
+                    "right" => Some(step_session_mark(&key_hit, current, 1)),
+                    "left" => Some(step_session_mark(&key_hit, current, -1)),
+                    "home" => Some(edge_session_mark(&key_hit, false)),
+                    "end" => Some(edge_session_mark(&key_hit, true)),
+                    "escape" => Some(None),
+                    _ => None,
+                };
+                if let Some(mark) = next {
+                    set_session_mark(&key_state, mark, true, app);
+                    app.stop_propagation();
+                }
+            })
             .child(
                 div()
                     .absolute()
@@ -1411,7 +1839,7 @@ impl RenderOnce for SessionChart {
                     .h(px(layout.height))
                     .child(
                         canvas(
-                            |_, _, _| (),
+                            move |bounds: Bounds<Pixels>, _, _| paint_origin.set(bounds.origin),
                             move |bounds: Bounds<Pixels>, (), window: &mut Window, _: &mut App| {
                                 paint_session(&paint, bounds, window);
                             },
@@ -1420,6 +1848,7 @@ impl RenderOnce for SessionChart {
                     ),
             )
             .children(texts)
+            .children(tip)
             .child(
                 div()
                     .id("pressure-track")
@@ -1978,5 +2407,199 @@ mod tests {
         let before = SystemTime::UNIX_EPOCH - Duration::from_secs(5);
         assert_eq!(clock_text(before, None), "\u{2014}");
         assert_eq!(clock_text(before, Some(3600)), "\u{2014}");
+    }
+
+    /// Ten readings in 20 slots; the pressure turns Warning at reading 6, so
+    /// there is one event.
+    fn hover_model() -> SessionModel {
+        let samples: Vec<HostSample> = (0..10)
+            .map(|n| {
+                let level = if n < 6 {
+                    PressureLevel::Normal
+                } else {
+                    PressureLevel::Warning
+                };
+                sample(n * 60, Some(100 + n), Some(level), 0)
+            })
+            .collect();
+        session_model(&samples, None, 20)
+    }
+
+    #[test]
+    fn the_pointer_picks_the_column_in_the_whole_lattice_height() {
+        let model = hover_model();
+        let layout = model.layout();
+        assert_eq!(model.offset(), 10);
+        let x = |slot: usize| LEFT_GUTTER + slot_center(slot);
+        let (top, bottom) = (layout.band + 1.0, layout.matrix_bottom - 1.0);
+        for y in [top, layout.band + 40.0, bottom] {
+            assert_eq!(
+                session_mark_at(&model, &layout, x(12), y),
+                Some(SessionMark::Column(2)),
+                "y {y}"
+            );
+        }
+        assert_eq!(
+            session_mark_at(&model, &layout, x(19), top),
+            Some(SessionMark::Column(9))
+        );
+    }
+
+    #[test]
+    fn the_gutters_the_empty_slots_and_the_outside_pick_nothing() {
+        let model = hover_model();
+        let layout = model.layout();
+        let y: f32 = layout.band + 20.0;
+        assert_eq!(session_mark_at(&model, &layout, 10.0, y), None);
+        assert_eq!(
+            session_mark_at(&model, &layout, LEFT_GUTTER + layout.lattice + 5.0, y),
+            None
+        );
+        // Slot 3 has no reading: the readings sit at the right.
+        assert_eq!(
+            session_mark_at(&model, &layout, LEFT_GUTTER + slot_center(3), y),
+            None
+        );
+        let x: f32 = LEFT_GUTTER + slot_center(15);
+        assert_eq!(
+            session_mark_at(&model, &layout, x, layout.matrix_bottom + 2.0),
+            None
+        );
+        assert_eq!(session_mark_at(&model, &layout, x, -1.0), None);
+    }
+
+    #[test]
+    fn an_event_marker_within_eight_pixels_wins_over_the_column() {
+        let model = hover_model();
+        let layout = model.layout();
+        assert_eq!(model.events.len(), 1);
+        let slot: usize = model.offset() + model.events[0].column;
+        let mx: f32 = LEFT_GUTTER + slot_center(slot);
+        let my: f32 = layout.label_band + 3.5;
+        assert_eq!(
+            session_mark_at(&model, &layout, mx, my),
+            Some(SessionMark::Event(0))
+        );
+        assert_eq!(
+            session_mark_at(&model, &layout, mx + 5.0, my + 5.0),
+            Some(SessionMark::Event(0)),
+            "7.1 px away"
+        );
+        // 9 px below the marker is outside the reach and above the lattice.
+        let far = session_mark_at(&model, &layout, mx, my + 9.0);
+        assert_ne!(far, Some(SessionMark::Event(0)));
+        // The lattice top is 6.5 px under the marker, so the marker still wins
+        // there; lower in the lattice the column wins.
+        assert_eq!(
+            session_mark_at(&model, &layout, mx, layout.band + 1.0),
+            Some(SessionMark::Event(0))
+        );
+        assert_eq!(
+            session_mark_at(&model, &layout, mx, layout.band + 6.0),
+            Some(SessionMark::Column(model.events[0].column))
+        );
+    }
+
+    #[test]
+    fn the_keyboard_moves_by_one_reading_and_stops_at_the_ends() {
+        let model = hover_model();
+        let col = SessionMark::Column;
+        assert_eq!(step_session_mark(&model, None, 1), Some(col(0)));
+        assert_eq!(step_session_mark(&model, None, -1), Some(col(9)));
+        assert_eq!(step_session_mark(&model, Some(col(4)), 1), Some(col(5)));
+        assert_eq!(step_session_mark(&model, Some(col(4)), -1), Some(col(3)));
+        assert_eq!(step_session_mark(&model, Some(col(9)), 1), Some(col(9)));
+        assert_eq!(step_session_mark(&model, Some(col(0)), -1), Some(col(0)));
+        assert_eq!(edge_session_mark(&model, false), Some(col(0)));
+        assert_eq!(edge_session_mark(&model, true), Some(col(9)));
+        // From an event the move starts at its column.
+        let at: usize = model.events[0].column;
+        assert_eq!(
+            step_session_mark(&model, Some(SessionMark::Event(0)), 1),
+            Some(col(at + 1))
+        );
+        let empty = session_model(&[], None, 20);
+        assert_eq!(step_session_mark(&empty, None, 1), None);
+        assert_eq!(edge_session_mark(&empty, true), None);
+    }
+
+    #[test]
+    fn the_card_time_has_seconds_and_says_utc_without_an_offset() {
+        assert_eq!(
+            clock_seconds_text(at(12 * 3600 + 4 * 60 + 9), None),
+            "12:04:09 UTC"
+        );
+        assert_eq!(
+            clock_seconds_text(at(12 * 3600 + 4 * 60 + 9), Some(3 * 3600)),
+            "15:04:09"
+        );
+        assert_eq!(clock_seconds_text(at(3600), Some(-5 * 3600)), "20:00:00");
+        let before = SystemTime::UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(clock_seconds_text(before, Some(3600)), "\u{2014}");
+        assert_eq!(clock_seconds_text(before, None), "\u{2014}");
+    }
+
+    #[test]
+    fn the_card_states_the_measured_values_of_one_reading() {
+        let model = hover_model();
+        let tip = column_tip(&model, 6).expect("a reading");
+        assert_eq!(tip.title, "00:06:00 UTC");
+        let rows: Vec<(&str, &str)> = tip
+            .rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.value.as_str()))
+            .collect();
+        assert_eq!(rows[0], ("Available", "106 B"));
+        assert_eq!(rows[1].0, "Disk used");
+        assert_eq!(rows[2], ("Swap used", "0 B"));
+        assert_eq!(rows[3], ("Pressure", "Warning"));
+        assert_eq!(rows[4].0, "Changes");
+        assert_eq!(tip.note.as_deref(), Some("Reading 7 of 10"));
+        assert!(column_tip(&model, 10).is_none());
+    }
+
+    #[test]
+    fn an_unavailable_reading_has_em_dashes_and_no_zero() {
+        let samples = [
+            sample(1, Some(100), Some(PressureLevel::Normal), 0),
+            HostSample {
+                at: at(2),
+                pressure: Measured::Unavailable("none".to_owned()),
+                swap_used: Measured::Unavailable("none".to_owned()),
+                disk_available: Measured::Unavailable("none".to_owned()),
+                disk_used: Measured::Unavailable("none".to_owned()),
+                utc_offset: Some(0),
+            },
+        ];
+        let model = session_model(&samples, None, 10);
+        let tip = column_tip(&model, 1).expect("a reading");
+        assert_eq!(tip.title, "00:00:02");
+        for row in &tip.rows {
+            assert_eq!(row.value, "\u{2014}", "{}", row.label);
+        }
+        assert!(!tip.spoken().contains("0 B"), "{}", tip.spoken());
+    }
+
+    #[test]
+    fn the_hovered_reading_gets_an_axis_label_and_hides_one_it_would_overlap() {
+        let model = hover_model();
+        let base = axis_spots(&model, None);
+        assert!(base.iter().all(|spot| !spot.hovered));
+        // A reading that has a label marks it.
+        let own: usize = base[0].slot - model.offset();
+        let marked = axis_spots(&model, Some(own));
+        assert_eq!(marked.len(), base.len());
+        assert_eq!(marked.iter().filter(|spot| spot.hovered).count(), 1);
+        // A reading next to a label replaces it.
+        let near: usize = own.saturating_sub(1);
+        let moved = axis_spots(&model, Some(near));
+        let hot: Vec<&AxisSpot> = moved.iter().filter(|spot| spot.hovered).collect();
+        assert_eq!(hot.len(), 1);
+        for pair in moved.windows(2) {
+            let gap = slot_center(pair[1].slot) - slot_center(pair[0].slot);
+            assert!(gap.abs() >= 2.0 * AXIS_HALF || pair[0].slot == pair[1].slot);
+        }
+        // A reading far from a label adds one.
+        assert!(axis_spots(&model, Some(0)).iter().any(|spot| spot.hovered));
     }
 }

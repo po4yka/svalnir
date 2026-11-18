@@ -13,6 +13,7 @@ use crate::{
         motion, palette,
         tokens::{self, Tokens, to_hsla},
     },
+    ui::chart_tip::TipContent,
     ui::{
         action_button::{ActionButton, ButtonVariant},
         data_state::{format_age, format_bytes, used_capacity},
@@ -26,6 +27,7 @@ use crate::{
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
+    viz::hover::{FocusTarget, free_tip, path_note, segment_tip, volume_tips},
     viz::{
         breakdown::{DEFAULT_SEGMENTS, Segment, breakdown},
         capacity_grid::CapacityGrid,
@@ -35,8 +37,8 @@ use crate::{
         led::{FillAxis, LedChart, LedField, LedHead, LedSegment, TileLabel, density_swatch},
         session::clock_text,
         storage_layouts::{
-            BAND_ROWS, CHART_ROWS, ChartItem, STRIP_ROWS, StorageLayout, apply_focus,
-            bytes_per_cell, chart_label, density_of, layout_field, scale_caption,
+            BAND_ROWS, CHART_ROWS, ChartItem, STRIP_ROWS, StorageLayout, bytes_per_cell,
+            chart_label, density_of, layout_field, scale_caption,
         },
         treemap::CellRect,
     },
@@ -420,12 +422,16 @@ fn volume_strip(used: &Measured<u64>, total: &Measured<u64>, width: f32, dark: b
     );
     let (used_text, used_unit) = format_bytes(*used);
     let (total_text, total_unit) = format_bytes(*total);
+    let (used_tip, free_tip): (TipContent, TipContent) = volume_tips(*used, *total);
     LedChart::new(
         field,
         labels,
         "volume-grid",
         format!("Used {used_text} {used_unit} of {total_text} {total_unit}"),
     )
+    .tips(vec![used_tip])
+    .free_tip(Some(free_tip))
+    .launch_focus(FocusTarget::Volume)
     .into_any_element()
 }
 
@@ -1005,6 +1011,7 @@ impl StorageScreen {
         let side_by_side: bool = self.layout == StorageLayout::Ring && width >= RING_SIDE_WIDTH;
         let legend_width: f32 = if side_by_side { 0.0 } else { width };
         let legend: Legend = Legend::new(rows, legend_width, "storage-legend")
+            .highlight(self.focused)
             .on_select(move |index, _, app| legend_open(index, app))
             .on_hover(move |index, _, app| {
                 this.update(app, |screen, cx| {
@@ -1020,6 +1027,49 @@ impl StorageScreen {
         } else {
             CHART_ROWS
         };
+        let (metric_name, other_name, other_metric): (&str, &str, SizeMetric) = match self.metric {
+            SizeMetric::Allocated => ("Allocated", "Logical", SizeMetric::Logical),
+            SizeMetric::Logical => ("Logical", "Allocated", SizeMetric::Allocated),
+        };
+        let tips: Vec<TipContent> = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let child = segments
+                    .get(index)
+                    .and_then(|segment| segment.source_index)
+                    .and_then(|i| summary.children.get(i));
+                if item.inert {
+                    return segment_tip(
+                        &item.label,
+                        item.bytes,
+                        total_items,
+                        (metric_name, item.bytes),
+                        None,
+                        Some("The scan did not read this part".to_owned()),
+                    );
+                }
+                let mut tip: TipContent = segment_tip(
+                    &item.label,
+                    item.bytes,
+                    total_items,
+                    (metric_name, item.bytes),
+                    child.map(|c| (other_name, c.size(other_metric))),
+                    child.filter(|c| c.is_directory).map(|c| path_note(&c.path)),
+                );
+                // The density and the change are the measured values of the
+                // legend row; an item without them gets no row.
+                if let Some(density) = item.density {
+                    tip = tip.row("Density", format!("{:.0}%", density * 100.0));
+                }
+                if let Some((text, _)) = item.change.and_then(change_text) {
+                    tip = tip.row("Change", text);
+                }
+                tip
+            })
+            .collect();
+        let free_card: Option<TipContent> =
+            free_bytes.map(|free| free_tip(free, total_items.saturating_add(free)));
         let chart: AnyElement = if total_items == 0 {
             self.twinkle = None;
             caption("storage-band-scale", scale_caption(0, 0), tokens)
@@ -1047,6 +1097,10 @@ impl StorageScreen {
                         (format!("{used_text} {used_unit}"), "used".to_owned()),
                     )
                     .focus(self.focused)
+                    .tips(tips.clone())
+                    .free_tip(free_card)
+                    .reduce_motion(cx.reduce_motion())
+                    .launch_focus(FocusTarget::Folders)
                     .sweep(sweep)
                     .on_hover(move |index, _, app| {
                         ring_this.update(app, |screen, cx| {
@@ -1074,7 +1128,6 @@ impl StorageScreen {
                 chart_rows,
             );
             let per_cell: u64 = bytes_per_cell(&items, &field);
-            apply_focus(&mut field, self.focused);
             self.apply_fill_in(&mut field, summary, window, cx);
             if self.gate(window, cx).continuous() {
                 field.phase = Some(self.phase);
@@ -1085,10 +1138,24 @@ impl StorageScreen {
             let label: String =
                 chart_label(self.layout, &summary.root.display().to_string(), &items);
             let chart_open = Rc::clone(&open);
+            let led_this: Entity<Self> = cx.entity();
             v_flex()
                 .gap(tokens::SPACE_2)
                 .child(
                     LedChart::new(field, labels, "storage-band", label)
+                        .focus(self.focused)
+                        .tips(tips)
+                        .free_tip(free_card.clone())
+                        .launch_focus(FocusTarget::Folders)
+                        .reduce_motion(cx.reduce_motion())
+                        .on_hover(move |index, _, app| {
+                            led_this.update(app, |screen, cx| {
+                                if screen.focused != index {
+                                    screen.focused = index;
+                                    cx.notify();
+                                }
+                            });
+                        })
                         .on_select(move |index, _, app| chart_open(index, app)),
                 )
                 .child(caption(

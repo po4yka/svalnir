@@ -5,15 +5,22 @@
 
 use crate::{
     theme::tokens::{Tokens, to_hsla},
-    viz::treemap::CellRect,
+    ui::chart_tip::{ChartTip, TipContent},
+    viz::{
+        hover::{
+            FocusTarget, Mark, Tween, edge_mark, mark_at, mark_rect, step_mark, take_launch_focus,
+        },
+        treemap::CellRect,
+    },
 };
 use gpui_kit::{
-    App, BorderStyle, Bounds, BoxShadow, Corners, Edges, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
-    component::ActiveTheme as _, div, fill, hsla, point, px, quad, size,
+    App, BorderStyle, Bounds, BoxShadow, Corners, Edges, Entity, FocusHandle, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point,
+    RenderOnce, Role, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, canvas, component::ActiveTheme as _, div, fill, hsla, point, px,
+    quad, size,
 };
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc, time::Instant};
 
 /// The most cells that one chart may have.
 pub const MAX_CELLS: usize = 8_000;
@@ -179,6 +186,11 @@ pub struct LedSegment {
     pub shrunk: bool,
     /// The end of the segment for the ghost.
     pub end_edge: EndEdge,
+    /// The hover amount `0.0..=1.0`: the outline grows from 1.5 px to 2 px and
+    /// the tint from 8% to 14%.
+    pub hover: f32,
+    /// The eased dim amount `0.0..=1.0`. `None` takes it from `dimmed`.
+    pub dim: Option<f32>,
 }
 
 impl LedSegment {
@@ -197,8 +209,28 @@ impl LedSegment {
             growth_cells: 0,
             shrunk: false,
             end_edge: EndEdge::Right,
+            hover: 0.0,
+            dim: None,
         }
     }
+
+    /// How much the segment is de-emphasized: `0.0` is full strength.
+    #[must_use]
+    pub fn dim_amount(&self) -> f32 {
+        self.dim
+            .unwrap_or(if self.dimmed { 1.0 } else { 0.0 })
+            .clamp(0.0, 1.0)
+    }
+}
+
+/// The color between `a` and `b` at `t`.
+pub fn mix_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    hsla(
+        a.h + (b.h - a.h) * t,
+        a.s + (b.s - a.s) * t,
+        a.l + (b.l - a.l) * t,
+        a.a + (b.a - a.a) * t,
+    )
 }
 
 /// A bright block of cells, for the front of a fill.
@@ -391,10 +423,12 @@ pub fn paint_led_field(
     for segment in field
         .segments
         .iter()
-        .filter(|s| glow_on && !s.dimmed && !s.rect.is_empty())
+        .filter(|s| glow_on && s.dim_amount() < 1.0 && !s.rect.is_empty())
     {
         let shadow: BoxShadow = BoxShadow {
-            color: segment.color.opacity(style.glow_alpha),
+            color: segment
+                .color
+                .opacity(style.glow_alpha * (1.0 - segment.dim_amount())),
             offset: Point::default(),
             blur_radius: px(14.0),
             spread_radius: px(0.0),
@@ -445,10 +479,11 @@ pub fn paint_led_field(
     for segment in field
         .segments
         .iter()
-        .filter(|s| !s.dimmed && !s.rect.is_empty())
+        .filter(|s| s.dim_amount() < 1.0 && !s.rect.is_empty())
     {
+        let tint: f32 = (0.08 + 0.06 * segment.hover) * (1.0 - segment.dim_amount());
         window.paint_quad(
-            fill(rect_bounds(segment.rect), segment.color.opacity(0.08)).corner_radii(radii),
+            fill(rect_bounds(segment.rect), segment.color.opacity(tint)).corner_radii(radii),
         );
     }
     // The cells of each segment.
@@ -471,7 +506,7 @@ pub fn paint_led_field(
                     );
                     continue;
                 }
-                let tone: CellTone = if segment.dimmed || in_label {
+                let tone: CellTone = if in_label {
                     CellTone::Dim
                 } else if hatched {
                     CellTone::Lit
@@ -480,8 +515,10 @@ pub fn paint_led_field(
                 };
                 let color: Hsla = match tone {
                     // A hatched cell is not a cell of the density texture.
-                    CellTone::Lit if hatched && !segment.dimmed && !in_label => style.ghost_line,
-                    CellTone::Lit => lit,
+                    CellTone::Lit if hatched => {
+                        mix_color(style.ghost_line, dim, segment.dim_amount())
+                    }
+                    CellTone::Lit => mix_color(lit, dim, segment.dim_amount()),
                     CellTone::Dim => dim,
                 };
                 window.paint_quad(fill(cell_bounds(x, y), color).corner_radii(cell_radii));
@@ -511,12 +548,12 @@ pub fn paint_led_field(
     }
     // Outlines last, on top of the cells.
     for segment in field.segments.iter().filter(|s| !s.rect.is_empty()) {
-        let alpha: f32 = if segment.dimmed { 0.35 } else { 1.0 };
+        let alpha: f32 = 1.0 - 0.65 * segment.dim_amount();
         window.paint_quad(quad(
             outline_bounds(segment.rect),
             radii,
             hsla(0.0, 0.0, 0.0, 0.0),
-            Edges::all(px(style.outline)),
+            Edges::all(px(style.outline + 0.5 * segment.hover)),
             segment.color.opacity(alpha),
             BorderStyle::Solid,
         ));
@@ -680,6 +717,45 @@ pub struct TileLabel {
 }
 
 type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+type HoverHandler = Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
+
+/// The hover state that one chart keeps between frames.
+struct LedHover {
+    /// The mark under the pointer or under the keyboard.
+    mark: Option<Mark>,
+    /// Whether the keyboard set the mark.
+    keyboard: bool,
+    /// The transition of the hover and dim amounts of the segments.
+    tween: Option<Tween>,
+    /// The focus of the chart, for Tab and the arrow keys.
+    handle: FocusHandle,
+    /// The position of the chart in the window, set at each paint.
+    origin: Rc<Cell<Point<Pixels>>>,
+}
+
+/// Sets the mark of a chart. It redraws the chart and calls `hover` only when
+/// the mark changes.
+fn set_mark(
+    state: &Entity<LedHover>,
+    mark: Option<Mark>,
+    keyboard: bool,
+    hover: Option<&HoverHandler>,
+    window: &mut Window,
+    app: &mut App,
+) {
+    let changed: bool = state.update(app, |s, cx| {
+        if s.mark == mark {
+            return false;
+        }
+        s.mark = mark;
+        s.keyboard = keyboard && mark.is_some();
+        cx.notify();
+        true
+    });
+    if changed && let Some(handler) = hover {
+        handler(mark.and_then(Mark::segment), window, app);
+    }
+}
 
 /// A chart: the canvas of a field and the labels over it.
 #[derive(IntoElement)]
@@ -689,6 +765,12 @@ pub struct LedChart {
     id: SharedString,
     label: SharedString,
     on_select: Option<SelectHandler>,
+    on_hover: Option<HoverHandler>,
+    focus: Option<usize>,
+    tips: Vec<TipContent>,
+    free_tip: Option<TipContent>,
+    reduce_motion: bool,
+    launch: Option<FocusTarget>,
 }
 
 impl std::fmt::Debug for LedChart {
@@ -714,13 +796,64 @@ impl LedChart {
             id: id.into(),
             label: label.into(),
             on_select: None,
+            on_hover: None,
+            focus: None,
+            tips: Vec::new(),
+            free_tip: None,
+            reduce_motion: false,
+            launch: None,
         }
+    }
+
+    /// Lets a launch request for `target` focus this chart and pick its first
+    /// mark.
+    #[must_use]
+    pub const fn launch_focus(mut self, target: FocusTarget) -> Self {
+        self.launch = Some(target);
+        self
     }
 
     /// Sets the handler of a click on an activatable tile; it gets the index.
     #[must_use]
     pub fn on_select(mut self, f: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_select = Some(Rc::new(f));
+        self
+    }
+
+    /// Sets the handler of the mark under the pointer or the keyboard: the
+    /// index of the segment, and `None` when the mark is no segment.
+    #[must_use]
+    pub fn on_hover(mut self, f: impl Fn(Option<usize>, &mut Window, &mut App) + 'static) -> Self {
+        self.on_hover = Some(Rc::new(f));
+        self
+    }
+
+    /// Highlights the segment at `focus` and dims the others, as a hover on
+    /// the segment does. The change eases over `FAST`.
+    #[must_use]
+    pub const fn focus(mut self, focus: Option<usize>) -> Self {
+        self.focus = focus;
+        self
+    }
+
+    /// Sets the cards of the segments, in the order of the segments.
+    #[must_use]
+    pub fn tips(mut self, tips: Vec<TipContent>) -> Self {
+        self.tips = tips;
+        self
+    }
+
+    /// Sets the card of the free region.
+    #[must_use]
+    pub fn free_tip(mut self, tip: Option<TipContent>) -> Self {
+        self.free_tip = tip;
+        self
+    }
+
+    /// With `reduce` true, hover changes apply in one step.
+    #[must_use]
+    pub const fn reduce_motion(mut self, reduce: bool) -> Self {
+        self.reduce_motion = reduce;
         self
     }
 }
@@ -730,7 +863,7 @@ impl RenderOnce for LedChart {
         clippy::too_many_lines,
         reason = "one build of the chart and its labels"
     )]
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
         let mut style: LedStyle = LedStyle::for_dark(dark);
@@ -742,16 +875,130 @@ impl RenderOnce for LedChart {
         let width: f32 = style.span(self.field.columns);
         let height: f32 = style.span(self.field.rows);
         let has_below: bool = self.labels.iter().any(|l| l.place == LabelPlace::Below);
-        let field: LedField = self.field;
+        let animate: bool = !(self.reduce_motion || cx.reduce_motion());
+        let state: Entity<LedHover> = window.use_keyed_state(
+            SharedString::from(format!("{}-hover", self.id)),
+            cx,
+            |_, cx| LedHover {
+                mark: None,
+                keyboard: false,
+                tween: None,
+                handle: cx.focus_handle().tab_stop(true),
+                origin: Rc::new(Cell::new(Point::default())),
+            },
+        );
+        let handle: FocusHandle = state.read(cx).handle.clone();
+        let mut focused: bool = handle.is_focused(window);
+        // A launch request waits without cost until the chart has a mark.
+        let first: Option<Mark> = edge_mark(&self.field, false);
+        if first.is_some()
+            && self
+                .launch
+                .is_some_and(|target| take_launch_focus(target, cx))
+        {
+            set_mark(&state, first, true, self.on_hover.as_ref(), window, cx);
+            let to_focus: FocusHandle = handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&to_focus, cx));
+            // The focus follows after this frame; keep the mark meanwhile.
+            focused = true;
+        }
+        let now: Instant = Instant::now();
+        let focus: Option<usize> = self.focus;
+        let mut field: LedField = self.field;
+        let count: usize = field.segments.len();
+        // One pass: the mark, and the eased hover and dim amounts.
+        let (mark, values, running): (Option<Mark>, Vec<f32>, bool) = state.update(cx, |s, _| {
+            if s.keyboard && !focused {
+                s.mark = None;
+                s.keyboard = false;
+            }
+            let highlight: Option<usize> = focus.or(s.mark.and_then(Mark::segment));
+            let mut target: Vec<f32> = vec![0.0; 2 * count];
+            for (index, segment) in field.segments.iter().enumerate() {
+                target[index] = f32::from(u8::from(highlight == Some(index)));
+                target[count + index] = f32::from(u8::from(
+                    segment.dimmed || highlight.is_some_and(|h| h != index),
+                ));
+            }
+            let tween: &mut Tween = s
+                .tween
+                .get_or_insert_with(|| Tween::new(target.clone(), now));
+            tween.retarget(target, now, animate);
+            (s.mark, tween.value_at(now), tween.running(now))
+        });
+        if values.len() == 2 * count {
+            for (index, segment) in field.segments.iter_mut().enumerate() {
+                segment.hover = values[index];
+                segment.dim = Some(values[count + index]);
+            }
+        }
+        if running {
+            window.request_animation_frame();
+        }
+        let field: Rc<LedField> = Rc::new(field);
+        let origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&state.read(cx).origin);
+        let tip: Option<ChartTip> = mark.and_then(|m| {
+            let content: TipContent = match m {
+                Mark::Segment(index) => self.tips.get(index).cloned()?,
+                Mark::Free => self.free_tip.clone()?,
+            };
+            let local: Bounds<Pixels> = mark_rect(&field, m, style.pitch, style.cell)?;
+            Some(ChartTip::new(
+                SharedString::from(format!("{}-tip", self.id)),
+                content,
+                local,
+                origin.get(),
+                animate,
+            ))
+        });
+        let paint_field: Rc<LedField> = Rc::clone(&field);
+        let origin_paint: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let move_field: Rc<LedField> = Rc::clone(&field);
+        let move_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+        let move_state: Entity<LedHover> = state.clone();
+        let move_hover: Option<HoverHandler> = self.on_hover.clone();
+        let leave_state: Entity<LedHover> = state.clone();
+        let leave_hover: Option<HoverHandler> = self.on_hover.clone();
+        let key_state: Entity<LedHover> = state;
+        let key_hover: Option<HoverHandler> = self.on_hover.clone();
+        let key_field: Rc<LedField> = Rc::clone(&field);
+        let pitch: f32 = style.pitch;
         let mut root = div()
             .id(self.id.clone())
             .role(Role::Image)
             .test_support()
             .aria_label(self.label)
+            .track_focus(&handle)
             .relative()
             .w(px(width))
             .h(px(height + if has_below { 48.0 } else { 0.0 }))
             .flex_shrink_0()
+            .on_mouse_move(move |event, window, app| {
+                let at: Point<Pixels> = event.position - move_origin.get();
+                let mark: Option<Mark> = mark_at(&move_field, at.x.into(), at.y.into(), pitch);
+                set_mark(&move_state, mark, false, move_hover.as_ref(), window, app);
+            })
+            .on_hover(move |hovered, window, app| {
+                let from_pointer: bool = !leave_state.read(app).keyboard;
+                if !*hovered && from_pointer {
+                    set_mark(&leave_state, None, false, leave_hover.as_ref(), window, app);
+                }
+            })
+            .on_key_down(move |event, window, app| {
+                let current: Option<Mark> = key_state.read(app).mark;
+                let next: Option<Option<Mark>> = match event.keystroke.key.as_str() {
+                    "right" | "down" => Some(step_mark(&key_field, current, 1)),
+                    "left" | "up" => Some(step_mark(&key_field, current, -1)),
+                    "home" => Some(edge_mark(&key_field, false)),
+                    "end" => Some(edge_mark(&key_field, true)),
+                    "escape" => Some(None),
+                    _ => None,
+                };
+                if let Some(mark) = next {
+                    set_mark(&key_state, mark, true, key_hover.as_ref(), window, app);
+                    app.stop_propagation();
+                }
+            })
             .child(
                 div()
                     .absolute()
@@ -761,14 +1008,15 @@ impl RenderOnce for LedChart {
                     .h(px(height))
                     .child(
                         canvas(
-                            |_, _, _| (),
+                            move |bounds: Bounds<Pixels>, _, _| origin_paint.set(bounds.origin),
                             move |bounds: Bounds<Pixels>, (), window: &mut Window, _: &mut App| {
-                                paint_led_field(&field, bounds, &style, window);
+                                paint_led_field(&paint_field, bounds, &style, window);
                             },
                         )
                         .size_full(),
                     ),
-            );
+            )
+            .children(tip);
         let foreground: Hsla = to_hsla(tokens.foreground);
         let muted: Hsla = to_hsla(tokens.muted_foreground);
         for (n, label) in self.labels.into_iter().enumerate() {

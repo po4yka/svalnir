@@ -18,8 +18,8 @@ use crate::{
     viz::led::{LedStyle, lit_color},
 };
 use gpui_kit::{
-    App, Bounds, BoxShadow, Corners, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
+    App, Bounds, BoxShadow, Corners, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
     component::{
         ActiveTheme as _,
@@ -28,7 +28,10 @@ use gpui_kit::{
     },
     div, fill, hsla, point, px, size,
 };
-use std::{rc::Rc, time::Duration};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 /// The side of the square of the dial, in pixels.
 pub const DIAL_SIZE: f32 = 196.0;
@@ -286,9 +289,11 @@ fn pressure_ring(host: &HostSnapshot) -> Ring {
     }
 }
 
-/// The index of the picked ring: the pressure ring while the state is not
-/// normal, and otherwise the ring with the largest used share. The first of
-/// equal shares wins. With no share, the measured pressure ring, else disk.
+/// The index of the picked ring. In this order: the pressure ring while the
+/// state is not normal; the ring with the largest used share above 0 (the
+/// first of equal shares wins); the pressure ring when it is measured; the
+/// first measured ring; ring 0. A ring with no capacity or a share of 0 does
+/// not win over a measured ring.
 fn pick(rings: &[Ring; 3]) -> usize {
     if matches!(
         rings[2].state,
@@ -299,16 +304,22 @@ fn pick(rings: &[Ring; 3]) -> usize {
     let mut best: Option<(usize, u64)> = None;
     for (index, ring) in rings.iter().enumerate().take(2) {
         if let Some(share) = ring.share_ppm
+            && share > 0
             && best.is_none_or(|(_, top)| share > top)
         {
             best = Some((index, share));
         }
     }
-    match best {
-        Some((index, _)) => index,
-        None if matches!(rings[2].state, RingState::Pressure(_)) => 2,
-        None => 0,
+    if let Some((index, _)) = best {
+        return index;
     }
+    if matches!(rings[2].state, RingState::Pressure(_)) {
+        return 2;
+    }
+    rings
+        .iter()
+        .position(|ring| ring.state != RingState::Unavailable)
+        .unwrap_or(0)
 }
 
 /// The model of the dial for one host reading.
@@ -317,6 +328,109 @@ pub fn dial_model(host: &HostSnapshot) -> DialModel {
     let rings: [Ring; 3] = [disk_ring(host), swap_ring(host), pressure_ring(host)];
     let picked: usize = pick(&rings);
     DialModel { rings, picked }
+}
+
+/// The lit count that eases from `from` to `to` at `progress`
+/// (`0.0..=1.0`) with `ease-ui-out`. It starts at `from` and ends exactly at
+/// `to`; a shrink eases down in the same way.
+#[must_use]
+pub fn eased_count(from: usize, to: usize, progress: f32) -> usize {
+    if from == to || progress >= 1.0 {
+        return to;
+    }
+    let eased: f32 = motion::ease_ui_out(progress);
+    let span: usize = from.abs_diff(to);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "a dot count is far below 2^24; the product is rounded and clamped first"
+    )]
+    let moved: usize = (span as f32 * eased.clamp(0.0, 1.0)).round() as usize;
+    let moved: usize = moved.min(span);
+    if to > from {
+        from + moved
+    } else {
+        from - moved
+    }
+}
+
+/// The lit count of a ring that shows a used share, or `None`.
+#[must_use]
+pub const fn lit_of(ring: &Ring) -> Option<usize> {
+    match ring.state {
+        RingState::Used { lit, .. } => Some(lit),
+        _ => None,
+    }
+}
+
+/// The move of the heads of the rings to a new reading: a lit count eases
+/// from the count on screen to the new count in `FRONT_EASE`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeadMove {
+    from: [Option<usize>; 3],
+    target: [Option<usize>; 3],
+    start: Option<Instant>,
+}
+
+impl HeadMove {
+    /// The lit counts on screen at `now`, and whether the move still runs.
+    #[must_use]
+    pub fn shown(&self, now: Instant) -> ([Option<usize>; 3], bool) {
+        let Some(start) = self.start else {
+            return (self.target, false);
+        };
+        let t: f32 = motion::progress(
+            now.saturating_duration_since(start),
+            Duration::ZERO,
+            motion::FRONT_EASE,
+        );
+        if t >= 1.0 {
+            return (self.target, false);
+        }
+        let mut out: [Option<usize>; 3] = self.target;
+        for (slot, (from, to)) in out.iter_mut().zip(self.from.iter().zip(self.target)) {
+            if let (Some(from), Some(to)) = (from, to) {
+                *slot = Some(eased_count(*from, to, t));
+            }
+        }
+        (out, true)
+    }
+
+    /// Takes the measured lit counts of a new reading. When a count changes
+    /// and `animate` is true, the move starts from the counts on screen. The
+    /// first reading, and any reading with `animate` false, applies at once.
+    pub fn observe(&mut self, targets: [Option<usize>; 3], now: Instant, animate: bool) {
+        if !animate {
+            // Reduce Motion that comes on during a move ends the move.
+            self.start = None;
+        }
+        if targets == self.target {
+            return;
+        }
+        let first: bool = self.target.iter().all(Option::is_none);
+        if animate && !first {
+            self.from = self.shown(now).0;
+            self.start = Some(now);
+        } else {
+            self.start = None;
+        }
+        self.target = targets;
+    }
+}
+
+/// `model` with the lit counts of its used rings replaced by `lit_counts`, where a
+/// ring has one. The soft part stays after the lit part, within the ring.
+#[must_use]
+pub fn with_lit_counts(model: &DialModel, lit_counts: [Option<usize>; 3]) -> DialModel {
+    let mut out: DialModel = model.clone();
+    for (ring, lit) in out.rings.iter_mut().zip(lit_counts) {
+        if let (RingState::Used { lit: old, soft }, Some(lit)) = (&mut ring.state, lit) {
+            *old = lit.min(ring.dots);
+            *soft = (*soft).min(ring.dots - *old);
+        }
+    }
+    out
 }
 
 /// How one dot of a ring is drawn.
@@ -759,6 +873,7 @@ pub struct DialLegend {
     pill: (&'static str, Tone),
     muted: bool,
     on_pick: Option<PickHandler>,
+    focus: Option<[FocusHandle; 3]>,
 }
 
 impl std::fmt::Debug for DialLegend {
@@ -776,6 +891,7 @@ impl DialLegend {
             pill,
             muted: false,
             on_pick: None,
+            focus: None,
         }
     }
 
@@ -783,6 +899,14 @@ impl DialLegend {
     #[must_use]
     pub const fn muted(mut self, muted: bool) -> Self {
         self.muted = muted;
+        self
+    }
+
+    /// Sets the focus handles of the three row buttons, so the caller can
+    /// read which row has the keyboard focus.
+    #[must_use]
+    pub fn focus_handles(mut self, handles: [FocusHandle; 3]) -> Self {
+        self.focus = Some(handles);
         self
     }
 
@@ -823,14 +947,18 @@ impl RenderOnce for DialLegend {
             };
             let hover: Option<PickHandler> = self.on_pick.clone();
             let click: Option<PickHandler> = self.on_pick.clone();
-            let name_button = Button::new(SharedString::from(format!("{}-button", ROW_IDS[index])))
-                .ghost()
-                .label(ring.kind.name())
-                .on_click(move |_, window, cx| {
-                    if let Some(pick) = &click {
-                        pick(Some(index), window, cx);
-                    }
-                });
+            let mut name_button =
+                Button::new(SharedString::from(format!("{}-button", ROW_IDS[index])))
+                    .ghost()
+                    .label(ring.kind.name())
+                    .on_click(move |_, window, cx| {
+                        if let Some(pick) = &click {
+                            pick(Some(index), window, cx);
+                        }
+                    });
+            if let Some(handles) = &self.focus {
+                name_button = name_button.track_focus(&handles[index]);
+            }
             let value: gpui_kit::AnyElement = if ring.kind == RingKind::Pressure {
                 StatusPill::new(self.pill.0, self.pill.1)
                     .id("pressure-pill")
@@ -1035,6 +1163,73 @@ mod tests {
         assert_eq!(dial_model(&snapshot).picked, 2);
         snapshot.pressure = Measured::Unavailable("x".into());
         assert_eq!(dial_model(&snapshot).picked, 0);
+    }
+
+    #[test]
+    fn a_ring_without_capacity_or_share_does_not_win_the_pick() {
+        let mut snapshot = host();
+        // Swap has no capacity; disk is measured: disk wins, not ring 1.
+        snapshot.swap_used = Measured::Value(0);
+        snapshot.swap_total = Measured::Value(0);
+        snapshot.disk_available = Measured::Value(512 * GB - GB);
+        assert_eq!(dial_model(&snapshot).picked, 0);
+        // Disk unavailable, swap with no capacity, pressure measured: pressure.
+        snapshot.disk_total = Measured::Unavailable("x".into());
+        assert_eq!(dial_model(&snapshot).picked, 2);
+        // Pressure unavailable too: the first measured ring is swap (share 0).
+        snapshot.pressure = Measured::Unavailable("x".into());
+        assert_eq!(dial_model(&snapshot).picked, 1);
+        // A swap with a share beats a disk with share 0.
+        snapshot.disk_total = Measured::Value(512 * GB);
+        snapshot.disk_available = Measured::Value(512 * GB);
+        snapshot.swap_total = Measured::Value(4 * GB);
+        snapshot.swap_used = Measured::Value(GB);
+        assert_eq!(dial_model(&snapshot).picked, 1);
+        // All shares are 0 and pressure is measured: pressure.
+        snapshot.swap_used = Measured::Value(0);
+        snapshot.pressure = Measured::Value(PressureLevel::Normal);
+        assert_eq!(dial_model(&snapshot).picked, 2);
+    }
+
+    #[test]
+    fn the_count_eases_from_the_old_to_the_new_value() {
+        assert_eq!(eased_count(10, 50, 0.0), 10, "start");
+        let middle: usize = eased_count(10, 50, 0.3);
+        assert!(middle > 10 && middle < 50, "{middle}");
+        assert_eq!(eased_count(10, 50, 1.0), 50, "end");
+        assert_eq!(eased_count(10, 50, 2.0), 50, "past the end");
+        assert_eq!(eased_count(7, 7, 0.4), 7, "equal values");
+        let down: usize = eased_count(50, 10, 0.3);
+        assert!(down < 50 && down > 10, "shrink {down}");
+        assert_eq!(eased_count(50, 10, 0.0), 50);
+        assert_eq!(eased_count(50, 10, 1.0), 10);
+    }
+
+    #[test]
+    fn the_head_move_runs_for_the_front_ease_and_ends_at_the_target() {
+        let t0: Instant = Instant::now();
+        let mut head: HeadMove = HeadMove::default();
+        head.observe([Some(10), Some(5), None], t0, true);
+        assert_eq!(head.shown(t0), ([Some(10), Some(5), None], false), "first");
+        head.observe([Some(40), Some(5), None], t0, true);
+        let (mid, running) = head.shown(t0 + motion::FRONT_EASE / 4);
+        assert!(running);
+        assert!(mid[0].is_some_and(|v| v > 10 && v < 40), "{mid:?}");
+        assert_eq!(mid[1], Some(5));
+        let (end, running) = head.shown(t0 + motion::FRONT_EASE);
+        assert_eq!((end[0], running), (Some(40), false));
+        // Without transitions the count applies at once.
+        head.observe([Some(20), Some(5), None], t0, false);
+        assert_eq!(head.shown(t0), ([Some(20), Some(5), None], false));
+    }
+
+    #[test]
+    fn lit_counts_replace_only_used_rings() {
+        let model = dial_model(&host());
+        let shown = with_lit_counts(&model, [Some(10), None, Some(3)]);
+        assert_eq!(lit_of(&shown.rings[0]), Some(10));
+        assert_eq!(lit_of(&shown.rings[1]), lit_of(&model.rings[1]));
+        assert_eq!(shown.rings[2].state, model.rings[2].state);
     }
 
     #[test]

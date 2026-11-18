@@ -10,6 +10,10 @@ use super::{
 };
 use std::{
     path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use svalnir_agent::scan::CancellationToken;
@@ -30,16 +34,22 @@ pub enum FixtureScenario {
     Stale,
     /// The agent has no journal.
     AgentAbsent,
+    /// A fixed sequence: each host reading is the next step. Available space
+    /// falls with small steps up and down, swap rises in steps, and the
+    /// pressure runs Normal, Warning, Critical, Normal, with three readings
+    /// unavailable. See [`drift_step`].
+    Drift,
 }
 
 impl FixtureScenario {
     /// Every scenario.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Healthy,
         Self::Pressure,
         Self::Unavailable,
         Self::Stale,
         Self::AgentAbsent,
+        Self::Drift,
     ];
 
     /// The name on the command line.
@@ -51,6 +61,7 @@ impl FixtureScenario {
             Self::Unavailable => "unavailable",
             Self::Stale => "stale",
             Self::AgentAbsent => "agent-absent",
+            Self::Drift => "drift",
         }
     }
 
@@ -64,26 +75,107 @@ impl FixtureScenario {
 }
 
 /// A [`DataSource`] with fixed values.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FixtureSource {
     scenario: FixtureScenario,
     pacing: Duration,
+    /// The readings that the origin of the `drift` times lies in the past.
+    lead: u32,
+    /// The number of host readings taken, for the `drift` sequence.
+    step: Arc<AtomicUsize>,
+    /// The time of the first call, the origin of the `drift` times.
+    base: Arc<OnceLock<SystemTime>>,
+}
+
+/// The time between two readings of the `drift` sequence.
+pub const DRIFT_SPACING: Duration = Duration::from_secs(10);
+/// The number of steps after which the `drift` sequence repeats.
+pub const DRIFT_PERIOD: usize = 360;
+
+/// The step of the `drift` sequence at which its operation is admitted.
+pub const DRIFT_OPERATION_STEP: u32 = 50;
+
+/// What a step of the `drift` sequence reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftReading {
+    /// No value can be read.
+    Unavailable,
+    /// The values: available bytes, used swap bytes, and the pressure.
+    Values {
+        /// The available space of the volume.
+        available: u64,
+        /// The used swap.
+        swap_used: u64,
+        /// The memory pressure.
+        pressure: PressureLevel,
+    },
+}
+
+/// The reading at `step` of the `drift` sequence. It has no randomness and
+/// no clock. Pressure is Normal for steps 0 to 39, Warning for 40 to 54,
+/// Critical for 55 to 59, and Normal again. Steps 20, 21, and 70 are
+/// unavailable. The sequence repeats after [`DRIFT_PERIOD`] steps. Available space falls by 0.4 GB a step with a wobble of up to
+/// 0.5 GB, so single steps go up too. Swap rises by 0.25 GB every 12 steps.
+#[must_use]
+pub fn drift_step(step: usize) -> DriftReading {
+    // The sequence repeats, so a window that stays open keeps valid values:
+    // the swap stays below its total and the available space above zero.
+    let step: usize = step % DRIFT_PERIOD;
+    if matches!(step, 20 | 21 | 70) {
+        return DriftReading::Unavailable;
+    }
+    let wobble: [i64; 5] = [0, 5, -2, 4, -3];
+    let fall: i64 = i64::try_from(step).unwrap_or(0) * 4;
+    let tenths: i64 = 3000 - fall + wobble[step % 5];
+    let available: u64 = u64::try_from(tenths).unwrap_or(0) * GB / 10;
+    let swap_used: u64 = u64::try_from(step / 12).unwrap_or(0) * GB / 4;
+    let pressure: PressureLevel = match step {
+        40..=54 => PressureLevel::Warning,
+        55..=59 => PressureLevel::Critical,
+        _ => PressureLevel::Normal,
+    };
+    DriftReading::Values {
+        available,
+        swap_used,
+        pressure,
+    }
 }
 
 impl FixtureSource {
     /// Creates the source of `scenario`.
     #[must_use]
-    pub const fn new(scenario: FixtureScenario) -> Self {
+    pub fn new(scenario: FixtureScenario) -> Self {
         Self {
             scenario,
             pacing: Duration::ZERO,
+            lead: 0,
+            step: Arc::new(AtomicUsize::new(0)),
+            base: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The origin of the `drift` times: the span of the seeded readings
+    /// before the first call.
+    fn origin(&self) -> SystemTime {
+        *self.base.get_or_init(|| {
+            let now: SystemTime = SystemTime::now();
+            now.checked_sub(DRIFT_SPACING * self.lead).unwrap_or(now)
+        })
+    }
+
+    /// Puts the origin of the `drift` times `readings` readings in the past,
+    /// so that the last of the readings taken at launch has the time of the
+    /// launch and none has a time in the future.
+    #[must_use]
+    pub fn with_seeded_readings(mut self, readings: usize) -> Self {
+        self.lead = u32::try_from(readings.saturating_sub(1)).unwrap_or(u32::MAX);
+        self
     }
 
     /// Sleeps `pacing` between the progress steps of a scan. The default is
     /// zero, so that a test does not wait.
     #[must_use]
-    pub const fn with_pacing(mut self, pacing: Duration) -> Self {
+    pub fn with_pacing(mut self, pacing: Duration) -> Self {
         self.pacing = pacing;
         self
     }
@@ -91,7 +183,14 @@ impl FixtureSource {
 
 impl DataSource for FixtureSource {
     fn host(&self) -> Result<HostSnapshot, String> {
-        let now: SystemTime = SystemTime::now();
+        let mut now: SystemTime = SystemTime::now();
+        let drift: Option<DriftReading> = (self.scenario == FixtureScenario::Drift).then(|| {
+            let step: usize = self.step.fetch_add(1, Ordering::Relaxed);
+            let spacing: u32 = u32::try_from(step).unwrap_or(u32::MAX);
+            // A reading never has a time in the future.
+            now = now.min(self.origin() + DRIFT_SPACING * spacing);
+            drift_step(step)
+        });
         let mut snapshot = HostSnapshot {
             captured_at: now,
             volume_name: Some("/System/Volumes/Data".to_owned()),
@@ -106,6 +205,31 @@ impl DataSource for FixtureSource {
         };
         match self.scenario {
             FixtureScenario::Healthy | FixtureScenario::AgentAbsent => {}
+            FixtureScenario::Drift => {
+                if let Some(DriftReading::Values {
+                    available,
+                    swap_used,
+                    pressure,
+                }) = drift
+                {
+                    snapshot.disk_available = Measured::Value(available);
+                    snapshot.disk_free = Measured::Value(available.saturating_sub(3 * GB));
+                    snapshot.swap_used = Measured::Value(swap_used);
+                    snapshot.swap_total = Measured::Value(8 * GB);
+                    snapshot.pressure = Measured::Value(pressure);
+                } else {
+                    let no = |what: &str| -> String {
+                        format!("{what} is not available in this reading")
+                    };
+                    snapshot.disk_total = Measured::Unavailable(no("disk total"));
+                    snapshot.disk_available = Measured::Unavailable(no("disk available"));
+                    snapshot.disk_free = Measured::Unavailable(no("disk free"));
+                    snapshot.pressure = Measured::Unavailable(no("pressure"));
+                    snapshot.memory_total = Measured::Unavailable(no("physical memory"));
+                    snapshot.swap_used = Measured::Unavailable(no("swap used"));
+                    snapshot.swap_total = Measured::Unavailable(no("swap total"));
+                }
+            }
             FixtureScenario::Pressure => {
                 snapshot.pressure = Measured::Value(PressureLevel::Warning);
                 snapshot.swap_used = Measured::Value(9 * GB);
@@ -150,7 +274,9 @@ impl DataSource for FixtureSource {
         let present: bool = self.scenario != FixtureScenario::AgentAbsent;
         let standing = |policy: PolicyId| -> GuardStanding {
             let active: bool = match self.scenario {
-                FixtureScenario::Healthy | FixtureScenario::Stale => policy == PolicyId::DiskGuard,
+                FixtureScenario::Healthy | FixtureScenario::Stale | FixtureScenario::Drift => {
+                    policy == PolicyId::DiskGuard
+                }
                 FixtureScenario::Pressure => true,
                 FixtureScenario::Unavailable | FixtureScenario::AgentAbsent => false,
             };
@@ -201,6 +327,19 @@ impl DataSource for FixtureSource {
                 snapshot
                     .problems
                     .push("The latest operation cannot be read in this fixture.".to_owned());
+            }
+            FixtureScenario::Drift => {
+                // Admitted inside the span of the readings, relative to the
+                // first call.
+                snapshot.latest_operation = Some(OperationRow {
+                    operation_id: "op_fixture_0003".to_owned(),
+                    state: OperationPhase::Completed,
+                    state_text: "Completed".to_owned(),
+                    admitted_at: SystemTime::now().min(
+                        self.origin() + DRIFT_SPACING * DRIFT_OPERATION_STEP + DRIFT_SPACING / 2,
+                    ),
+                    trigger: "automatic".to_owned(),
+                });
             }
             FixtureScenario::AgentAbsent => {}
         }
@@ -344,5 +483,85 @@ mod tests {
     fn agent_absent_has_no_journal() {
         let source = FixtureSource::new(FixtureScenario::AgentAbsent);
         assert_eq!(source.agent().state, AgentState::NoJournal);
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn the_drift_sequence_is_fixed() {
+        let pressure = |step: usize| match drift_step(step) {
+            DriftReading::Values { pressure, .. } => Some(pressure),
+            DriftReading::Unavailable => None,
+        };
+        assert_eq!(pressure(0), Some(PressureLevel::Normal));
+        assert_eq!(pressure(39), Some(PressureLevel::Normal));
+        assert_eq!(pressure(40), Some(PressureLevel::Warning));
+        assert_eq!(pressure(54), Some(PressureLevel::Warning));
+        assert_eq!(pressure(55), Some(PressureLevel::Critical));
+        assert_eq!(pressure(59), Some(PressureLevel::Critical));
+        assert_eq!(pressure(60), Some(PressureLevel::Normal));
+        let unavailable: Vec<usize> = (0..180)
+            .filter(|s| drift_step(*s) == DriftReading::Unavailable)
+            .collect();
+        assert_eq!(unavailable, [20, 21, 70]);
+        assert_eq!(drift_step(33), drift_step(33), "no randomness");
+        assert_eq!(drift_step(DRIFT_PERIOD + 33), drift_step(33), "it repeats");
+        assert_eq!(
+            drift_step(usize::MAX),
+            drift_step(usize::MAX % DRIFT_PERIOD)
+        );
+        for step in 0..DRIFT_PERIOD {
+            if let DriftReading::Values {
+                available,
+                swap_used,
+                ..
+            } = drift_step(step)
+            {
+                assert!(available > 0 && swap_used < 8 * GB, "step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn available_space_falls_with_small_steps_up_and_down() {
+        let available = |step: usize| match drift_step(step) {
+            DriftReading::Values { available, .. } => available,
+            DriftReading::Unavailable => 0,
+        };
+        assert!(available(0) > available(19));
+        assert!(available(60) > available(100));
+        let ups: usize = (1..19)
+            .filter(|s| available(*s) > available(*s - 1))
+            .count();
+        let downs: usize = (1..19)
+            .filter(|s| available(*s) < available(*s - 1))
+            .count();
+        assert!(ups > 0 && downs > 0, "{ups} {downs}");
+    }
+
+    #[test]
+    fn each_call_is_the_next_step_with_spaced_times() {
+        // Seeded readings are spaced in the past, and none is in the future.
+        let source = FixtureSource::new(FixtureScenario::Drift).with_seeded_readings(100);
+        let first = source.host().map(|h| h.captured_at);
+        let second = source.host().map(|h| h.captured_at);
+        let (Ok(first), Ok(second)) = (first, second) else {
+            panic!("the fixture always reads")
+        };
+        assert_eq!(second.duration_since(first).ok(), Some(DRIFT_SPACING));
+        assert!(second <= SystemTime::now());
+        let operation = source.service().latest_operation;
+        assert!(
+            operation
+                .is_some_and(|op| op.admitted_at > first && op.admitted_at <= SystemTime::now())
+        );
+        // With no seed, a reading has the time of its call.
+        let live = FixtureSource::new(FixtureScenario::Drift);
+        assert!(live.host().is_ok());
+        let later = live.host().map(|h| h.captured_at);
+        assert!(later.is_ok_and(|at| at <= SystemTime::now()));
     }
 }

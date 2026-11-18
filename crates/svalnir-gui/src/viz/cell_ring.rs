@@ -18,7 +18,7 @@ use gpui_kit::{
     component::{ActiveTheme as _, v_flex},
     div, fill, point, px, size,
 };
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 /// The number of rings.
 pub const RINGS: usize = 4;
@@ -48,8 +48,17 @@ pub struct RingSpans {
     pub free: Option<Span>,
 }
 
-/// Divides the steps among the items and the free space by their bytes. Each
-/// span that has more than one step leaves its last step as a gap.
+/// Divides the steps among the items and the free space by their bytes.
+///
+/// Every two neighbour segments (the last and the first too) keep a gap of
+/// one step. A segment of more than one step gives its last step as the gap.
+/// A segment of one step keeps its lit step; the gap after it comes from the
+/// larger of its two neighbours, or from the largest segment when both
+/// neighbours have one step. The steps of the segments and the gaps add up to
+/// the steps that the allocation gives. A part of no steps has an empty span.
+/// A segment of one step that finds no segment to give a step gets no step
+/// and is not drawn. The Storage screen groups the small items into "Other",
+/// so its charts have few segments and do not reach this case.
 #[must_use]
 pub fn ring_spans(weights: &[u64], free: Option<u64>) -> RingSpans {
     let free: u64 = free.unwrap_or(0);
@@ -59,23 +68,78 @@ pub fn ring_spans(weights: &[u64], free: Option<u64>) -> RingSpans {
         .iter()
         .fold(0_u64, |sum, part| sum.saturating_add(*part));
     let widths: Vec<usize> = allocate_cells(&parts, all, STEPS);
-    let mut start: usize = 0;
-    let mut items: Vec<Span> = Vec::with_capacity(weights.len());
-    let mut free_span: Option<Span> = None;
-    for (index, width) in widths.iter().enumerate() {
-        let len: usize = if *width > 1 { width - 1 } else { *width };
-        let span: Span = Span { start, len };
-        if index < weights.len() {
-            items.push(span);
-        } else if free > 0 && len > 0 {
-            free_span = Some(span);
+    let present: Vec<usize> = (0..widths.len()).filter(|i| widths[*i] > 0).collect();
+    let mut lens: Vec<usize> = present
+        .iter()
+        .map(|i| if widths[*i] > 1 { widths[*i] - 1 } else { 1 })
+        .collect();
+    let count: usize = present.len();
+    for pos in 0..count {
+        if widths[present[pos]] != 1 || count < 2 {
+            continue;
         }
-        start += width;
+        let before: usize = (pos + count - 1) % count;
+        let after: usize = (pos + 1) % count;
+        let (first, second): (usize, usize) = if lens[before] > lens[after] {
+            (before, after)
+        } else {
+            (after, before)
+        };
+        let largest: usize = (0..count)
+            .max_by_key(|i| (lens[*i], count - *i))
+            .unwrap_or(0);
+        if let Some(donor) = [first, second, largest]
+            .into_iter()
+            .find(|d| *d != pos && lens[*d] > 1)
+        {
+            lens[donor] -= 1;
+        } else {
+            // No segment can give a step: this one gives up its own.
+            lens[pos] = 0;
+        }
     }
+    let mut spans: Vec<Span> = vec![Span { start: 0, len: 0 }; widths.len()];
+    let mut start: usize = 0;
+    for (pos, index) in present.iter().enumerate() {
+        spans[*index] = Span {
+            start,
+            len: lens[pos],
+        };
+        start += lens[pos] + 1;
+    }
+    let free_span: Option<Span> = spans.pop().filter(|span| free > 0 && span.len > 0);
     RingSpans {
-        items,
+        items: spans,
         free: free_span,
     }
+}
+
+/// The index of the item at the pointer position `(x, y)` in a chart of
+/// `DIAL_SIZE` pixels, from its top-left corner. The pointer must be between
+/// the inner and the outer ring, each plus 3 px. The angle gives the step and
+/// the step gives the item. A gap step, the free space, and the outside give
+/// `None`.
+#[must_use]
+pub fn segment_at(x: f32, y: f32, spans: &RingSpans) -> Option<usize> {
+    let dx: f32 = x - DIAL_SIZE / 2.0;
+    let dy: f32 = y - DIAL_SIZE / 2.0;
+    let radius: f32 = dx.hypot(dy);
+    if radius < RADII[0] - 3.0 || radius > RADII[RINGS - 1] + 3.0 {
+        return None;
+    }
+    // The first step is at the top and the ring runs clockwise.
+    let turn: f32 = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "the value is between 0 and 120 and rounded first"
+    )]
+    let step: usize = ((turn * STEPS as f32).round() as usize) % STEPS;
+    spans
+        .items
+        .iter()
+        .position(|span| span.len > 0 && step >= span.start && step < span.start + span.len)
 }
 
 /// The step in the middle of a span.
@@ -169,6 +233,7 @@ fn paint_ring(paint: &RingPaint, bounds: Bounds<Pixels>, window: &mut Window) {
 }
 
 type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+type HoverHandler = Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
 
 /// The ring chart as an element.
 #[derive(IntoElement)]
@@ -181,6 +246,7 @@ pub struct CellRing {
     label: SharedString,
     center: (SharedString, SharedString),
     on_select: Option<SelectHandler>,
+    on_hover: Option<HoverHandler>,
 }
 
 impl std::fmt::Debug for CellRing {
@@ -209,6 +275,7 @@ impl CellRing {
             label: label.into(),
             center: (center.0.into(), center.1.into()),
             on_select: None,
+            on_hover: None,
         }
     }
 
@@ -226,6 +293,14 @@ impl CellRing {
         self
     }
 
+    /// Sets the handler of the pointer over a segment: the index of the item,
+    /// and `None` when the pointer is on no segment.
+    #[must_use]
+    pub fn on_hover(mut self, f: impl Fn(Option<usize>, &mut Window, &mut App) + 'static) -> Self {
+        self.on_hover = Some(Rc::new(f));
+        self
+    }
+
     /// Sets the handler of a click on an activatable segment.
     #[must_use]
     pub fn on_select(mut self, f: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
@@ -235,6 +310,7 @@ impl CellRing {
 }
 
 impl RenderOnce for CellRing {
+    #[expect(clippy::too_many_lines, reason = "one build of the element")]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
@@ -255,6 +331,8 @@ impl RenderOnce for CellRing {
             empty: style.lattice,
             sweep: self.sweep,
         };
+        let origin: Rc<Cell<Point<Pixels>>> = Rc::new(Cell::new(Point::default()));
+        let origin_paint: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
         let mut root = div()
             .id(self.id.clone())
             .role(Role::Image)
@@ -267,7 +345,7 @@ impl RenderOnce for CellRing {
             .child(
                 div().absolute().top_0().left_0().size_full().child(
                     canvas(
-                        |_, _, _| (),
+                        move |bounds: Bounds<Pixels>, _, _| origin_paint.set(bounds.origin),
                         move |bounds: Bounds<Pixels>, (), window: &mut Window, _: &mut App| {
                             paint_ring(&paint, bounds, window);
                         },
@@ -275,26 +353,50 @@ impl RenderOnce for CellRing {
                     .size_full(),
                 ),
             );
-        // One hit area in the middle of each activatable segment.
-        if let Some(handler) = &self.on_select {
-            for (index, (item, span)) in self.items.iter().zip(&spans.items).enumerate() {
-                if !item.activatable || span.len == 0 {
-                    continue;
-                }
-                let (x, y): (f32, f32) = dot_center(mid_step(*span), STEPS, 75.0);
-                let handler: SelectHandler = Rc::clone(handler);
-                root = root.child(
-                    div()
-                        .id(SharedString::from(format!("{}-tile-{index}", self.id)))
-                        .absolute()
-                        .left(px(DIAL_SIZE / 2.0 + x - 12.0))
-                        .top(px(DIAL_SIZE / 2.0 + y - 12.0))
-                        .size(px(24.0))
-                        .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                        .on_click(move |_, window, app| handler(index, window, app)),
-                );
+        // One hit test of the whole arc of a segment, from the pointer.
+        if self.on_select.is_some() || self.on_hover.is_some() {
+            let items_active: Vec<bool> = self.items.iter().map(|i| i.activatable).collect();
+            let hit_spans: RingSpans = spans.clone();
+            let hover: Option<HoverHandler> = self.on_hover.clone();
+            let select: Option<SelectHandler> = self.on_select.clone();
+            let hover_origin: Rc<Cell<Point<Pixels>>> = Rc::clone(&origin);
+            let hover_spans: RingSpans = spans.clone();
+            let mut overlay = div()
+                .id(SharedString::from(format!("{}-hit", self.id)))
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                .on_mouse_move(move |event, window, app| {
+                    if let Some(handler) = &hover {
+                        let at: Point<Pixels> = event.position - hover_origin.get();
+                        handler(
+                            segment_at(at.x.into(), at.y.into(), &hover_spans),
+                            window,
+                            app,
+                        );
+                    }
+                })
+                .on_hover({
+                    let leave: Option<HoverHandler> = self.on_hover.clone();
+                    move |hovered, window, app| {
+                        if !*hovered && let Some(handler) = &leave {
+                            handler(None, window, app);
+                        }
+                    }
+                });
+            if let Some(handler) = select {
+                overlay = overlay.on_click(move |event, window, app| {
+                    let at: Point<Pixels> = event.position() - origin.get();
+                    if let Some(index) = segment_at(at.x.into(), at.y.into(), &hit_spans)
+                        && items_active.get(index).copied().unwrap_or(false)
+                    {
+                        handler(index, window, app);
+                    }
+                });
             }
+            root = root.child(overlay);
         }
         root.child(
             v_flex()
@@ -333,6 +435,96 @@ impl RenderOnce for CellRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_gaps(spans: &RingSpans) {
+        let mut taken: Vec<bool> = vec![false; STEPS];
+        let all: Vec<Span> = spans.items.iter().copied().chain(spans.free).collect();
+        for span in all.iter().filter(|s| s.len > 0) {
+            for slot in &mut taken[span.start..span.start + span.len] {
+                assert!(!*slot, "a step is used twice");
+                *slot = true;
+            }
+        }
+        // No two segments touch: the step after a segment is a gap, also
+        // from the last step to the first.
+        for span in all.iter().filter(|s| s.len > 0) {
+            assert!(!taken[(span.start + span.len) % STEPS], "{span:?} touches");
+        }
+    }
+
+    #[test]
+    fn a_one_step_segment_keeps_its_step_and_the_larger_neighbour_gives_the_gap() {
+        // 1 step, 60 steps, 1 step, 58 steps and free space of one step.
+        let spans = ring_spans(&[1, 60, 1, 58], Some(1));
+        assert_eq!(spans.items[0].len, 1);
+        assert_eq!(spans.items[2].len, 1);
+        assert!(spans.free.is_some_and(|f| f.len == 1));
+        assert_gaps(&spans);
+        let total: usize = spans
+            .items
+            .iter()
+            .chain(spans.free.iter())
+            .filter(|s| s.len > 0)
+            .map(|s| s.len + 1)
+            .sum();
+        assert_eq!(total, STEPS, "steps and gaps add up to 120");
+    }
+
+    #[test]
+    fn several_shapes_never_touch() {
+        for (weights, free) in [
+            (vec![600_u64, 300], Some(100_u64)),
+            (vec![1, 1, 1, 1000], None),
+            (vec![50, 50], Some(1)),
+            (vec![1, 1], Some(1)),
+            (vec![1000], None),
+        ] {
+            let spans = ring_spans(&weights, free);
+            assert_gaps(&spans);
+        }
+    }
+
+    fn point_at(step: f32, radius: f32) -> (f32, f32) {
+        let turn: f32 = step / 120.0 * std::f32::consts::TAU;
+        (
+            DIAL_SIZE / 2.0 + radius * turn.sin(),
+            DIAL_SIZE / 2.0 - radius * turn.cos(),
+        )
+    }
+
+    #[test]
+    fn the_whole_arc_selects_a_segment() {
+        // Item 0: steps 0..59, gap 59, item 1: 60..89, gap 89, free 90..119.
+        let spans = RingSpans {
+            items: vec![Span { start: 0, len: 59 }, Span { start: 60, len: 29 }],
+            free: Some(Span { start: 90, len: 29 }),
+        };
+        let mid: f32 = DIAL_SIZE / 2.0;
+        assert_eq!(segment_at(mid, mid, &spans), None, "center");
+        assert_eq!(segment_at(0.0, 0.0, &spans), None, "outside");
+        assert_eq!(
+            segment_at(mid, mid - 100.0, &spans),
+            None,
+            "beyond the ring"
+        );
+        // Each quadrant: the right (step 30), the bottom (step 60 is item 1).
+        let (x, y) = point_at(30.0, 75.0);
+        assert_eq!(segment_at(x, y, &spans), Some(0), "right side");
+        let (x, y) = point_at(45.0, 69.0);
+        assert_eq!(segment_at(x, y, &spans), Some(0), "lower right, inner edge");
+        let (x, y) = point_at(75.0, 81.0);
+        assert_eq!(segment_at(x, y, &spans), Some(1), "lower left");
+        let (x, y) = point_at(10.0, 84.0 + 3.0);
+        assert_eq!(segment_at(x, y, &spans), Some(0), "outer edge plus 3 px");
+        let (x, y) = point_at(10.0, 84.0 + 4.0);
+        assert_eq!(segment_at(x, y, &spans), None, "outside the outer edge");
+        let (x, y) = point_at(59.0, 75.0);
+        assert_eq!(segment_at(x, y, &spans), None, "the gap step");
+        let (x, y) = point_at(100.0, 75.0);
+        assert_eq!(segment_at(x, y, &spans), None, "the free region");
+        let (x, y) = point_at(105.0, 75.0);
+        assert_eq!(segment_at(x, y, &spans), None, "upper left is free space");
+    }
 
     #[test]
     fn spans_follow_the_shares_and_leave_a_gap() {

@@ -120,6 +120,17 @@ pub struct AppModel {
 impl AppModel {
     /// Creates the model, starts the first load, and starts the poll loop.
     pub fn new(source: Arc<dyn DataSource>, cx: &mut Context<Self>) -> Self {
+        Self::new_seeded(source, 0, cx)
+    }
+
+    /// Like [`Self::new`], but takes `readings` host readings at once, through
+    /// the same path as a refresh, so the history has that many samples
+    /// before the first paint. With 0 it is the same as `new`.
+    pub fn new_seeded(
+        source: Arc<dyn DataSource>,
+        readings: usize,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let poll: Task<()> = cx.spawn(async move |this, cx: &mut AsyncApp| {
             loop {
                 let interval: Option<Duration> =
@@ -158,7 +169,16 @@ impl AppModel {
             in_flight: InFlight::default(),
             _poll: poll,
         };
-        model.refresh(cx);
+        if readings == 0 {
+            model.refresh(cx);
+        } else {
+            for _ in 0..readings {
+                let result: Result<HostSnapshot, String> = model.source.host();
+                model.apply_host(result);
+            }
+            model.mark_stale();
+            model.refresh_kinds(false, cx);
+        }
         let probe: Arc<dyn DataSource> = Arc::clone(&model.source);
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let root: Option<PathBuf> = cx
@@ -318,7 +338,28 @@ impl AppModel {
     /// Starts one background read of each kind. A request for a kind that is
     /// in flight is dropped.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if !self.in_flight.host {
+        self.refresh_kinds(true, cx);
+    }
+
+    /// Stores one host reading: the latest value and the history sample.
+    fn apply_host(&mut self, result: Result<HostSnapshot, String>) {
+        self.host = match result {
+            Ok(snapshot) => {
+                crate::data::model::push_bounded(
+                    &mut self.history,
+                    crate::data::model::HostSample::of(&snapshot),
+                    crate::data::model::HISTORY_MAX,
+                );
+                Loadable::Ready(Arc::new(snapshot))
+            }
+            Err(reason) => Loadable::Unavailable(reason),
+        };
+        self.last_refresh = Some(SystemTime::now());
+    }
+
+    /// Starts the reads; the host read only when `host` is true.
+    fn refresh_kinds(&mut self, host: bool, cx: &mut Context<Self>) {
+        if host && !self.in_flight.host {
             self.in_flight.host = true;
             let source: Arc<dyn DataSource> = Arc::clone(&self.source);
             cx.spawn(async move |this, cx: &mut AsyncApp| {
@@ -326,18 +367,7 @@ impl AppModel {
                 if this
                     .update(cx, |model, cx| {
                         model.in_flight.host = false;
-                        model.host = match result {
-                            Ok(snapshot) => {
-                                crate::data::model::push_bounded(
-                                    &mut model.history,
-                                    crate::data::model::HostSample::of(&snapshot),
-                                    crate::data::model::HISTORY_MAX,
-                                );
-                                Loadable::Ready(Arc::new(snapshot))
-                            }
-                            Err(reason) => Loadable::Unavailable(reason),
-                        };
-                        model.last_refresh = Some(SystemTime::now());
+                        model.apply_host(result);
                         model.mark_stale();
                         if let Some(root) = model.pending_scan.take() {
                             model.start_scan(&root, cx);

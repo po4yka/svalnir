@@ -900,6 +900,7 @@ impl StorageScreen {
             })
             .collect();
         let this: Entity<Self> = cx.entity();
+        let ring_this: Entity<Self> = this.clone();
         let select_this: Entity<Self> = this.clone();
         let select_metric: SizeMetric = self.metric;
         let select_summary: Arc<ScanSummary> = Arc::clone(summary);
@@ -967,6 +968,14 @@ impl StorageScreen {
                     )
                     .focus(self.focused)
                     .sweep(sweep)
+                    .on_hover(move |index, _, app| {
+                        ring_this.update(app, |screen, cx| {
+                            if screen.focused != index {
+                                screen.focused = index;
+                                cx.notify();
+                            }
+                        });
+                    })
                     .on_select(move |index, _, app| chart_open(index, app)),
                 )
                 .child(caption(

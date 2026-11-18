@@ -28,7 +28,7 @@ pub const USAGE: &str = "Usage: svalnir-gui [OPTIONS]
 
 Options:
   --fixture NAME       Show fixed data instead of measurements
-                       (healthy, pressure, unavailable, stale, agent-absent)
+                       (healthy, pressure, unavailable, stale, agent-absent, drift)
   --appearance MODE    Force the theme: light or dark
   --reduce-motion      Force Reduce Motion on
   --screen NAME        Open on a screen (overview, storage, memory,
@@ -38,6 +38,8 @@ Options:
                        (tiles, band, columns, ring)
   --scan PATH          Start a size scan of the directory PATH at launch.
                        The scan reads sizes only
+  --readings N         With --fixture only: take N readings (1 to 180) at
+                       launch, so the session chart has N readings
   --help               Print this text
 ";
 
@@ -78,6 +80,8 @@ pub struct LaunchOptions {
     pub layout: Option<StorageLayout>,
     /// The window size in points; `None` is the default size.
     pub size: Option<(u16, u16)>,
+    /// The number of readings that a fixture takes at launch, 1 to 180.
+    pub readings: Option<usize>,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -165,12 +169,31 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                 }
                 options.scan = Some(path);
             }
+            "--readings" => {
+                let text: String = args
+                    .next()
+                    .ok_or_else(|| "`--readings` needs a number from 1 to 180".to_owned())?;
+                options.readings = Some(
+                    text.parse::<usize>()
+                        .ok()
+                        .filter(|count| (1..=MAX_READINGS).contains(count))
+                        .ok_or_else(|| {
+                            format!("`--readings` needs a number from 1 to 180, not `{text}`")
+                        })?,
+                );
+            }
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    if options.readings.is_some() && options.fixture.is_none() {
+        return Err("`--readings` is valid only with `--fixture`".to_owned());
+    }
     Ok(options)
 }
+
+/// The most readings that `--readings` takes.
+pub const MAX_READINGS: usize = 180;
 
 /// Default window size.
 const DEFAULT_SIZE: (f32, f32) = (1120.0, 720.0);
@@ -189,6 +212,22 @@ pub fn open_main_window(
     appearance: Option<ForcedAppearance>,
     cx: &mut App,
 ) -> gpui_kit::Result<(AnyWindowHandle, Entity<MainWindow>)> {
+    open_main_window_seeded(bounds, source, appearance, 0, cx)
+}
+
+/// Like [`open_main_window`], and the model takes `readings` host readings
+/// before the first paint (0 takes none at once).
+///
+/// # Errors
+///
+/// Returns the platform error when the window cannot open.
+pub fn open_main_window_seeded(
+    bounds: Bounds<Pixels>,
+    source: Arc<dyn DataSource>,
+    appearance: Option<ForcedAppearance>,
+    readings: usize,
+    cx: &mut App,
+) -> gpui_kit::Result<(AnyWindowHandle, Entity<MainWindow>)> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
@@ -199,7 +238,7 @@ pub fn open_main_window(
             Some(forced) => apply::install_fixed(forced.window_appearance(), cx),
             None => apply::install(window, cx),
         }
-        let model: Entity<AppModel> = cx.new(|cx| AppModel::new(source, cx));
+        let model: Entity<AppModel> = cx.new(|cx| AppModel::new_seeded(source, readings, cx));
         cx.new(|cx| MainWindow::new(model, window, cx))
     })
 }
@@ -220,7 +259,9 @@ pub fn run() -> ExitCode {
     }
     let source: Arc<dyn DataSource> = match options.fixture {
         Some(scenario) => Arc::new(
-            FixtureSource::new(scenario).with_pacing(std::time::Duration::from_millis(120)),
+            FixtureSource::new(scenario)
+                .with_pacing(std::time::Duration::from_millis(120))
+                .with_seeded_readings(options.readings.unwrap_or(0)),
         ),
         None => Arc::new(LiveSource::from_environment()),
     };
@@ -245,7 +286,13 @@ pub fn run() -> ExitCode {
                 .size
                 .map_or(DEFAULT_SIZE, |(w, h)| (f32::from(w), f32::from(h)));
             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-            let view = match open_main_window(bounds, source, options.appearance, cx) {
+            let view = match open_main_window_seeded(
+                bounds,
+                source,
+                options.appearance,
+                options.readings.unwrap_or(0),
+                cx,
+            ) {
                 Ok((_, view)) => view,
                 Err(error) => {
                     tracing::error!(%error, "cannot open the main window");
@@ -288,6 +335,8 @@ mod tests {
         let options = parse(&[
             "--fixture",
             "pressure",
+            "--readings",
+            "40",
             "--appearance",
             "light",
             "--reduce-motion",
@@ -311,6 +360,7 @@ mod tests {
                 scan: Some(PathBuf::from("/tmp/a")),
                 size: Some((1200, 900)),
                 layout: Some(StorageLayout::Ring),
+                readings: Some(40),
                 help: true,
             })
         );
@@ -330,5 +380,12 @@ mod tests {
         assert!(parse(&["--size", "100x100"]).is_err());
         assert!(parse(&["--size", "wide"]).is_err());
         assert!(parse(&["--layout", "spiral"]).is_err());
+        assert!(parse(&["--fixture", "drift", "--readings", "0"]).is_err());
+        assert!(parse(&["--fixture", "drift", "--readings", "181"]).is_err());
+        assert!(parse(&["--fixture", "drift", "--readings", "x"]).is_err());
+        assert!(parse(&["--fixture", "drift", "--readings"]).is_err());
+        assert!(parse(&["--readings", "10"]).is_err(), "needs a fixture");
+        assert!(parse(&["--readings", "10", "--fixture", "drift"]).is_ok());
+        assert!(parse(&["--fixture", "drift", "--readings", "180"]).is_ok());
     }
 }

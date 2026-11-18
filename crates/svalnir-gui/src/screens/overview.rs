@@ -25,15 +25,18 @@ use crate::{
     viz::{
         alloc::count_f32,
         capacity_grid::{capacity_label, known_capacity},
-        dial::{DialLegend, DialModel, HeadroomDial, dial_model, sweep_total},
+        dial::{
+            DialLegend, DialModel, HeadMove, HeadroomDial, dial_model, lit_of, sweep_total,
+            with_lit_counts,
+        },
         led::{LedChart, LedField, LedSegment},
         session::{SessionChart, live_progress, session_model},
         treemap::CellRect,
     },
 };
 use gpui_kit::{
-    AnyElement, BoxShadow, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement, Pixels,
-    Render, Role, SharedString, Styled, TestSupportExt as _, Window,
+    AnyElement, BoxShadow, Context, Entity, FocusHandle, FontWeight, Hsla, IntoElement,
+    ParentElement, Pixels, Render, Role, SharedString, Styled, TestSupportExt as _, Window,
     component::{ActiveTheme as _, IconName, h_flex, skeleton::Skeleton, v_flex},
     div, point,
     prelude::*,
@@ -130,6 +133,9 @@ pub struct OverviewScreen {
     model: Entity<AppModel>,
     roll_disk: Entity<RollingNumber>,
     dial_pick: Option<usize>,
+    row_focus: [FocusHandle; 3],
+    head: HeadMove,
+    live_start: Instant,
     sweep_start: Option<Instant>,
     activation: u64,
     phase: f32,
@@ -145,6 +151,9 @@ impl OverviewScreen {
             model,
             roll_disk: RollingNumber::new("disk-value-roll", cx),
             dial_pick: None,
+            row_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            head: HeadMove::default(),
+            live_start: Instant::now(),
             sweep_start: None,
             activation: 1,
             phase: 0.0,
@@ -360,6 +369,8 @@ fn headroom_card(
     view: &View,
     pick: Option<usize>,
     sweep: Option<f32>,
+    lit_counts: Option<[Option<usize>; 3]>,
+    focus: [FocusHandle; 3],
     on_pick: impl Fn(Option<usize>, &mut Window, &mut gpui_kit::App) + 'static,
     tokens: &Tokens,
 ) -> AnyElement {
@@ -369,6 +380,8 @@ fn headroom_card(
         View::Failed(reason) => unavailable_body("headroom-value", reason, tokens),
         View::Data { host, stale } => {
             let model: DialModel = dial_model(host);
+            let shown: DialModel =
+                lit_counts.map_or_else(|| model.clone(), |counts| with_lit_counts(&model, counts));
             let pill: (&'static str, Tone) = pressure_pill(&host.pressure);
             v_flex()
                 .gap(px(12.0))
@@ -378,7 +391,7 @@ fn headroom_card(
                         .items_start()
                         .gap(px(24.0))
                         .child(
-                            HeadroomDial::new(model.clone())
+                            HeadroomDial::new(shown)
                                 .picked(pick)
                                 .sweep(sweep)
                                 .muted(*stale),
@@ -388,7 +401,12 @@ fn headroom_card(
                                 .flex_1()
                                 .min_w(px(240.0))
                                 .gap(px(12.0))
-                                .child(DialLegend::new(model, pill).muted(*stale).on_pick(on_pick))
+                                .child(
+                                    DialLegend::new(model, pill)
+                                        .muted(*stale)
+                                        .focus_handles(focus)
+                                        .on_pick(on_pick),
+                                )
                                 .children(stale.then(|| {
                                     caption("headroom-stale", stale_caption(host), tokens)
                                 }))
@@ -701,7 +719,17 @@ impl Render for OverviewScreen {
             None
         };
         let mono: SharedString = cx.theme().mono_font_family.clone();
-        let live: Option<f32> = gate.continuous().then(|| live_progress(self.phase));
+        // The live head moves per frame, from its own start instant. The
+        // frames stop with the continuous effects or when this screen is not
+        // rendered.
+        // The chart draws the ring only with the glow and only with data, so
+        // no frame is requested without them.
+        let glow_on: bool = crate::theme::glow::enabled(cx);
+        let live_shown: bool = gate.continuous() && glow_on && matches!(view, View::Data { .. });
+        let live: Option<f32> = live_shown.then(|| {
+            window.request_animation_frame();
+            live_progress(self.live_start.elapsed().as_secs_f32())
+        });
         // The ring sweep runs once, when the screen first shows data.
         let sweep: Option<f32> = if matches!(view, View::Data { .. }) {
             // The start is set also with Reduce Motion on, so a later change
@@ -718,6 +746,30 @@ impl Render for OverviewScreen {
         } else {
             None
         };
+        // The head move: the lit counts ease to the new reading.
+        let now: Instant = Instant::now();
+        let lit_counts: Option<[Option<usize>; 3]> = if let View::Data { host, .. } = &view {
+            let model: DialModel = dial_model(host);
+            let targets: [Option<usize>; 3] = [
+                lit_of(&model.rings[0]),
+                lit_of(&model.rings[1]),
+                lit_of(&model.rings[2]),
+            ];
+            self.head.observe(targets, now, gate.transitions());
+            let (counts, running) = self.head.shown(now);
+            if running {
+                window.request_animation_frame();
+            }
+            running.then_some(counts)
+        } else {
+            None
+        };
+        // The keyboard focus picks a ring like the pointer does; blur clears it.
+        let focused: Option<usize> = self
+            .row_focus
+            .iter()
+            .position(|handle| handle.is_focused(window));
+        let pick: Option<usize> = self.dial_pick.or(focused);
         let operation: Option<OperationRow> = service
             .value()
             .and_then(|snapshot| snapshot.latest_operation.clone());
@@ -736,7 +788,6 @@ impl Render for OverviewScreen {
             / count_f32(columns))
         .max(MIN_CARD_WIDTH));
 
-        let glow_on: bool = crate::theme::glow::enabled(cx);
         let full_width: Pixels = px(content.max(MIN_CARD_WIDTH));
         // On a wide window the dial and the session chart share one row.
         let paired: bool = content >= PAIR_MIN_WIDTH;
@@ -748,8 +799,10 @@ impl Render for OverviewScreen {
         let cards: Vec<AnyElement> = vec![
             headroom_card(
                 &view,
-                self.dial_pick,
+                pick,
                 sweep,
+                lit_counts,
+                self.row_focus.clone(),
                 move |index, _, app| {
                     this.update(app, |screen, cx| {
                         if screen.dial_pick != index {

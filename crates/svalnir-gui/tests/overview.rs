@@ -11,7 +11,7 @@ use gpui_kit::{
 };
 use std::sync::Arc;
 use svalnir_gui::{
-    app::open_main_window,
+    app::{open_main_window, open_main_window_seeded},
     data::fixture::{FixtureScenario, FixtureSource},
     shell::nav,
 };
@@ -220,4 +220,79 @@ fn an_unavailable_session_has_no_range_and_no_zero(cx: &mut TestAppContext) {
     let chart = label(handle, "session-chart", cx).expect("session chart");
     assert!(chart.contains('\u{2014}'), "{chart}");
     assert!(!chart.contains("0 B"), "{chart}");
+}
+
+fn open_drift(readings: usize, cx: &mut TestAppContext) -> AnyWindowHandle {
+    cx.update(gpui_kit::init);
+    cx.update(nav::bind_keys);
+    let (handle, _view) = cx.update(|cx| {
+        open_main_window_seeded(
+            Bounds::new(Point::default(), size(px(1120.0), px(720.0))),
+            Arc::new(FixtureSource::new(FixtureScenario::Drift).with_seeded_readings(readings)),
+            None,
+            readings,
+            cx,
+        )
+        .expect("open test window")
+    });
+    cx.run_until_parked();
+    handle
+}
+
+#[gpui_kit::test]
+fn drift_readings_fill_the_session_chart_before_the_first_paint(cx: &mut TestAppContext) {
+    let handle = open_drift(100, cx);
+    let chart = label(handle, "session-chart", cx).expect("session chart");
+    assert!(chart.contains("100 readings"), "{chart}");
+    // 3 of the 100 readings are unavailable: they are not a pressure state.
+    assert!(chart.contains("77 normal"), "{chart}");
+    assert!(chart.contains("15 warning"), "{chart}");
+    assert!(chart.contains("5 critical"), "{chart}");
+    // Three pressure changes and one operation.
+    assert!(chart.ends_with("4 events"), "{chart}");
+}
+
+#[gpui_kit::test]
+fn an_unavailable_reading_is_not_counted_as_a_value(cx: &mut TestAppContext) {
+    // Steps 0 to 20 hold 20 values; step 20 is the first unavailable one.
+    let handle = open_drift(21, cx);
+    let chart = label(handle, "session-chart", cx).expect("session chart");
+    assert!(chart.contains("21 readings"), "{chart}");
+    assert!(chart.contains("20 normal"), "{chart}");
+    assert!(
+        chart.contains("0 warning") && chart.contains("0 critical"),
+        "{chart}"
+    );
+}
+
+#[gpui_kit::test]
+fn keyboard_focus_on_a_legend_row_picks_the_ring_and_blur_clears_it(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    assert_eq!(
+        label(handle, "dial-center-caption", cx).as_deref(),
+        Some("Disk used")
+    );
+    let mut seen_swap: bool = false;
+    for _ in 0..16 {
+        cx.update_window(handle, |_, window, cx| window.press("tab", cx))
+            .unwrap();
+        cx.run_until_parked();
+        if label(handle, "dial-center-caption", cx).as_deref() == Some("Swap used") {
+            seen_swap = true;
+            break;
+        }
+    }
+    assert!(seen_swap, "tab never focused the swap row");
+    // Leave the legend: the pick clears.
+    let mut cleared: bool = false;
+    for _ in 0..16 {
+        cx.update_window(handle, |_, window, cx| window.press("tab", cx))
+            .unwrap();
+        cx.run_until_parked();
+        if label(handle, "dial-center-caption", cx).as_deref() == Some("Disk used") {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(cleared, "blur did not clear the pick");
 }

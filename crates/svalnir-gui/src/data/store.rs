@@ -2,7 +2,7 @@
 
 use super::{
     DataSource,
-    model::{AgentSnapshot, HostSnapshot, Loadable},
+    model::{AgentSnapshot, HostSnapshot, Loadable, ServiceSnapshot},
 };
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
@@ -35,6 +35,14 @@ pub fn is_stale(captured_at: SystemTime, now: SystemTime, interval: Duration) ->
         .is_ok_and(|age| age > interval * STALE_INTERVALS)
 }
 
+/// The reads that run now, one flag for each kind.
+#[derive(Debug, Default, Clone, Copy)]
+struct InFlight {
+    host: bool,
+    agent: bool,
+    service: bool,
+}
+
 /// The latest host and agent snapshots of one source.
 #[derive(Debug)]
 pub struct AppModel {
@@ -43,12 +51,13 @@ pub struct AppModel {
     pub host: Loadable<HostSnapshot>,
     /// The agent state.
     pub agent: Loadable<AgentSnapshot>,
+    /// The guards and the latest operation.
+    pub service: Loadable<ServiceSnapshot>,
     source_label: &'static str,
     fixture_name: Option<&'static str>,
     last_refresh: Option<SystemTime>,
     active: bool,
-    host_in_flight: bool,
-    agent_in_flight: bool,
+    in_flight: InFlight,
     _poll: Task<()>,
 }
 
@@ -79,10 +88,10 @@ impl AppModel {
             source,
             host: Loadable::Loading,
             agent: Loadable::Loading,
+            service: Loadable::Loading,
             last_refresh: None,
             active: true,
-            host_in_flight: false,
-            agent_in_flight: false,
+            in_flight: InFlight::default(),
             _poll: poll,
         };
         model.refresh(cx);
@@ -126,14 +135,14 @@ impl AppModel {
     /// Starts one background read of each kind. A request for a kind that is
     /// in flight is dropped.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if !self.host_in_flight {
-            self.host_in_flight = true;
+        if !self.in_flight.host {
+            self.in_flight.host = true;
             let source: Arc<dyn DataSource> = Arc::clone(&self.source);
             cx.spawn(async move |this, cx: &mut AsyncApp| {
                 let result = cx.background_spawn(async move { source.host() }).await;
                 if this
                     .update(cx, |model, cx| {
-                        model.host_in_flight = false;
+                        model.in_flight.host = false;
                         model.host = match result {
                             Ok(snapshot) => Loadable::Ready(Arc::new(snapshot)),
                             Err(reason) => Loadable::Unavailable(reason),
@@ -149,15 +158,33 @@ impl AppModel {
             })
             .detach();
         }
-        if !self.agent_in_flight {
-            self.agent_in_flight = true;
+        if !self.in_flight.agent {
+            self.in_flight.agent = true;
             let source: Arc<dyn DataSource> = Arc::clone(&self.source);
             cx.spawn(async move |this, cx: &mut AsyncApp| {
                 let snapshot = cx.background_spawn(async move { source.agent() }).await;
                 if this
                     .update(cx, |model, cx| {
-                        model.agent_in_flight = false;
+                        model.in_flight.agent = false;
                         model.agent = Loadable::Ready(Arc::new(snapshot));
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("the model closed before the read finished");
+                }
+            })
+            .detach();
+        }
+        if !self.in_flight.service {
+            self.in_flight.service = true;
+            let source: Arc<dyn DataSource> = Arc::clone(&self.source);
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let snapshot = cx.background_spawn(async move { source.service() }).await;
+                if this
+                    .update(cx, |model, cx| {
+                        model.in_flight.service = false;
+                        model.service = Loadable::Ready(Arc::new(snapshot));
                         cx.notify();
                     })
                     .is_err()
@@ -182,6 +209,11 @@ impl AppModel {
             && is_stale(snapshot.captured_at, now, interval)
         {
             self.agent = Loadable::Stale(Arc::clone(snapshot));
+        }
+        if let Loadable::Ready(snapshot) = &self.service
+            && is_stale(snapshot.captured_at, now, interval)
+        {
+            self.service = Loadable::Stale(Arc::clone(snapshot));
         }
     }
 }

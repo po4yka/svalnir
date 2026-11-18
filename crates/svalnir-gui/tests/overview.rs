@@ -85,3 +85,43 @@ fn absent_agent_is_not_running(cx: &mut TestAppContext) {
         Some("Not running")
     );
 }
+
+#[gpui_kit::test]
+fn healthy_shows_guard_and_completed_operation(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    assert_eq!(
+        label(handle, "guard-disk-guard", cx).as_deref(),
+        Some("Active")
+    );
+    assert_eq!(
+        label(handle, "operation-pill", cx).as_deref(),
+        Some("Completed")
+    );
+}
+
+#[gpui_kit::test]
+fn pressure_shows_running_operation(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Pressure, cx);
+    assert_eq!(
+        label(handle, "operation-pill", cx).as_deref(),
+        Some("Running")
+    );
+}
+
+#[gpui_kit::test]
+fn absent_journal_says_so_and_no_guard_can_act(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::AgentAbsent, cx);
+    assert_eq!(
+        label(handle, "intervention-empty", cx).as_deref(),
+        Some("No journal exists in the state directory.")
+    );
+    let caption = label(handle, "policies-no-guard", cx).expect("no-guard caption");
+    assert!(caption.starts_with("No guard can act."), "{caption}");
+}
+
+#[gpui_kit::test]
+fn unavailable_service_shows_a_problem_line(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Unavailable, cx);
+    let problem = label(handle, "policies-problem", cx).expect("problem line");
+    assert!(problem.contains("cannot be read"), "{problem}");
+}

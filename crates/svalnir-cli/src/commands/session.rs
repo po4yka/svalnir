@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use svalnir_agent::journal::{
-    AgentRecord, JournalOptions, OperationJournal, OperationJournalError,
-};
+use svalnir_agent::journal::{JournalOptions, OperationJournal, OperationJournalError};
 use svalnir_core::action::{ActionError, ClientRole, Principal};
 use svalnir_core::config::{ValidatedConfig, parse_and_validate};
 use svalnir_core::digest::ContentDigest;
@@ -20,7 +18,11 @@ use svalnir_core::policy::{ContinuityGeneration, EvaluationClock};
 use svalnir_core::process::Uid;
 use svalnir_core::time::WallTime;
 
-pub(crate) use svalnir_agent::observe::{CoordinatorPresence, coordinator_presence};
+use svalnir_agent::observe;
+pub(crate) use svalnir_agent::observe::{
+    AuthorityReadError, CoordinatorPresence, ExistingJournalError, StoredAuthority,
+    coordinator_presence,
+};
 
 use crate::environment::Environment;
 use crate::host::Host;
@@ -28,16 +30,7 @@ use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 
 /// The user of this process.
 pub(crate) fn current_uid() -> Uid {
-    #[cfg(unix)]
-    {
-        // SAFETY: `geteuid` has no argument, changes nothing, and does not
-        // fail.
-        Uid::new(unsafe { libc::geteuid() })
-    }
-    #[cfg(not(unix))]
-    {
-        Uid::new(0)
-    }
+    observe::current_uid()
 }
 
 /// The principal of a request of this client. The journal is same-user
@@ -205,22 +198,16 @@ pub(crate) fn open_existing_journal(
     environment: &Environment,
 ) -> Result<Option<OperationJournal>, ErrorBody> {
     let path: PathBuf = environment.journal_path()?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(journal_error(&OperationJournalError::NotAJournal)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(ErrorBody::new(
-                "journal_unavailable",
-                ErrorFamily::Recording,
-                ErrorStage::Storage,
-                "the operation journal cannot be inspected",
-            ));
-        }
-    }
-    OperationJournal::open(&path, &journal_options())
-        .map(Some)
-        .map_err(|error| journal_error(&error))
+    observe::open_existing_journal(&path, &journal_options()).map_err(|error| match error {
+        ExistingJournalError::NotAJournal => journal_error(&OperationJournalError::NotAJournal),
+        ExistingJournalError::Inspect => ErrorBody::new(
+            "journal_unavailable",
+            ErrorFamily::Recording,
+            ErrorStage::Storage,
+            "the operation journal cannot be inspected",
+        ),
+        ExistingJournalError::Open(error) => journal_error(&error),
+    })
 }
 
 /// Opens the journal for a command that writes. Makes the state directory
@@ -231,15 +218,6 @@ pub(crate) fn open_journal(environment: &Environment) -> Result<OperationJournal
         .map_err(|error| journal_error(&error))
 }
 
-/// The authority record of the journal with its record revision.
-#[derive(Debug, Clone)]
-pub(crate) struct StoredAuthority {
-    /// The record. With no record, the state of a user with no activation.
-    pub(crate) state: AuthorityState,
-    /// The revision of the record, or 0 with no record.
-    pub(crate) revision: u64,
-}
-
 /// Reads the authority record.
 ///
 /// # Errors
@@ -247,26 +225,15 @@ pub(crate) struct StoredAuthority {
 /// Returns an authority error for a record of a different user, and a
 /// recording error for a record that cannot be read.
 pub(crate) fn read_authority(journal: &OperationJournal) -> Result<StoredAuthority, ErrorBody> {
-    let uid: Uid = current_uid();
-    match journal
-        .agent_record::<AuthorityState>(AgentRecord::Authority)
-        .map_err(|error| journal_error(&error))?
-    {
-        None => Ok(StoredAuthority {
-            state: AuthorityState::new(uid),
-            revision: 0,
-        }),
-        Some(stored) if stored.record.principal != uid => Err(ErrorBody::new(
+    observe::read_authority(journal, current_uid()).map_err(|error| match error {
+        AuthorityReadError::Journal(error) => journal_error(&error),
+        AuthorityReadError::DifferentUser => ErrorBody::new(
             "authority_record_of_a_different_user",
             ErrorFamily::Authority,
             ErrorStage::Storage,
             "the authority record of the journal is of a different user; the command made no change",
-        )),
-        Some(stored) => Ok(StoredAuthority {
-            state: stored.record,
-            revision: stored.revision,
-        }),
-    }
+        ),
+    })
 }
 
 /// The error for a command that needs a policy revision in effect.

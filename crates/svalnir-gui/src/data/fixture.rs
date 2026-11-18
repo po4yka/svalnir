@@ -2,9 +2,13 @@
 
 use super::{
     DataSource,
-    model::{AgentSnapshot, AgentState, HostSnapshot, Measured, PressureLevel},
+    model::{
+        AgentSnapshot, AgentState, GuardRow, HostSnapshot, Measured, OperationPhase, OperationRow,
+        PressureLevel, ServiceSnapshot,
+    },
 };
 use std::time::{Duration, SystemTime};
+use svalnir_core::{grant::GuardStanding, policy::PolicyId};
 
 const GB: u64 = 1_000_000_000;
 
@@ -120,6 +124,68 @@ impl DataSource for FixtureSource {
             state,
             captured_at: SystemTime::now(),
         }
+    }
+
+    fn service(&self) -> ServiceSnapshot {
+        let now: SystemTime = SystemTime::now();
+        let present: bool = self.scenario != FixtureScenario::AgentAbsent;
+        let standing = |policy: PolicyId| -> GuardStanding {
+            let active: bool = match self.scenario {
+                FixtureScenario::Healthy | FixtureScenario::Stale => policy == PolicyId::DiskGuard,
+                FixtureScenario::Pressure => true,
+                FixtureScenario::Unavailable | FixtureScenario::AgentAbsent => false,
+            };
+            if active {
+                GuardStanding::Active
+            } else if present {
+                GuardStanding::Disabled
+            } else {
+                GuardStanding::NoActiveRevision
+            }
+        };
+        let mut snapshot = ServiceSnapshot {
+            journal_present: present,
+            active_revision: present.then(|| "rev-fixture-1".to_owned()),
+            guards: PolicyId::ALL
+                .iter()
+                .map(|policy| GuardRow::new(policy.as_str(), standing(*policy)))
+                .collect(),
+            latest_operation: None,
+            problems: Vec::new(),
+            captured_at: now,
+        };
+        match self.scenario {
+            FixtureScenario::Healthy | FixtureScenario::Stale => {
+                snapshot.latest_operation = Some(OperationRow {
+                    operation_id: "op_fixture_0001".to_owned(),
+                    state: OperationPhase::Completed,
+                    state_text: "Completed".to_owned(),
+                    admitted_at: now.checked_sub(Duration::from_mins(5)).unwrap_or(now),
+                    trigger: "automatic".to_owned(),
+                });
+            }
+            FixtureScenario::Pressure => {
+                snapshot.latest_operation = Some(OperationRow {
+                    operation_id: "op_fixture_0002".to_owned(),
+                    state: OperationPhase::Running,
+                    state_text: "Running".to_owned(),
+                    admitted_at: now.checked_sub(Duration::from_secs(40)).unwrap_or(now),
+                    trigger: "automatic".to_owned(),
+                });
+            }
+            FixtureScenario::Unavailable => {
+                snapshot.active_revision = None;
+                snapshot.guards.clear();
+                snapshot
+                    .problems
+                    .push("The authority record cannot be read in this fixture.".to_owned());
+                snapshot
+                    .problems
+                    .push("The latest operation cannot be read in this fixture.".to_owned());
+            }
+            FixtureScenario::AgentAbsent => {}
+        }
+        snapshot
     }
 
     fn label(&self) -> &'static str {

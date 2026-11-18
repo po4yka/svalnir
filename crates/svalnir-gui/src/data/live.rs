@@ -2,17 +2,22 @@
 
 use super::{
     DataSource,
-    model::{AgentSnapshot, AgentState, HostSnapshot, Measured, PressureLevel},
+    model::{
+        AgentSnapshot, AgentState, GuardRow, HostSnapshot, Measured, OperationPhase, OperationRow,
+        PressureLevel, ServiceSnapshot,
+    },
 };
 use std::{
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
-    time::SystemTime,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use svalnir_agent::{
+    journal::JournalOptions,
     observe::{self, CoordinatorPresence, DiskReading, Host},
     runtime::journal_path,
 };
+use svalnir_core::{grant::AuthorityState, time::WallTime};
 use svalnir_core::{observation::Observation, quantity::Bytes, state::PressureState};
 
 /// The state directory override variable; the same as the CLI reads.
@@ -144,6 +149,77 @@ impl DataSource for LiveSource {
         }
     }
 
+    fn service(&self) -> ServiceSnapshot {
+        let captured_at: SystemTime = SystemTime::now();
+        let mut snapshot = ServiceSnapshot {
+            journal_present: false,
+            active_revision: None,
+            guards: Vec::new(),
+            latest_operation: None,
+            problems: Vec::new(),
+            captured_at,
+        };
+        let uid = observe::current_uid();
+        let Ok(now) = WallTime::try_from(captured_at) else {
+            snapshot.problems.push(
+                "The system clock has no usable value, so the guards are not shown.".to_owned(),
+            );
+            return snapshot;
+        };
+        let opened = match &self.state_directory {
+            None => Ok(None),
+            Some(directory) => {
+                observe::open_existing_journal(&journal_path(directory), &JournalOptions::default())
+            }
+        };
+        let journal = match opened {
+            Ok(Some(journal)) => journal,
+            Ok(None) => {
+                snapshot.guards = guard_rows(&AuthorityState::new(uid), now);
+                return snapshot;
+            }
+            Err(error) => {
+                snapshot.journal_present = true;
+                snapshot
+                    .problems
+                    .push(format!("The journal cannot be read: {error}."));
+                return snapshot;
+            }
+        };
+        snapshot.journal_present = true;
+        match observe::read_authority(&journal, uid) {
+            Ok(stored) => {
+                snapshot.active_revision = stored
+                    .state
+                    .active
+                    .as_ref()
+                    .map(|active| active.revision.revision_id.to_string());
+                snapshot.guards = guard_rows(&stored.state, now);
+            }
+            Err(error) => snapshot
+                .problems
+                .push(format!("The authority record cannot be read: {error}.")),
+        }
+        match journal.recent_operations(1) {
+            Ok(operations) => {
+                snapshot.latest_operation = operations.first().map(|operation| {
+                    let (state, state_text) = OperationPhase::of(operation.state());
+                    OperationRow {
+                        operation_id: operation.operation_id().to_string(),
+                        state,
+                        state_text,
+                        admitted_at: system_time(operation.admitted_at()),
+                        trigger: operation.trigger_class().as_str().to_owned(),
+                    }
+                });
+            }
+            Err(error) => snapshot
+                .problems
+                .push(format!("The latest operation cannot be read: {error}.")),
+        }
+        snapshot
+    }
+
     fn label(&self) -> &'static str {
         "in-process collection"
     }
@@ -157,5 +233,22 @@ fn agent_state(journal: &Path) -> AgentState {
         CoordinatorPresence::Running => AgentState::Running,
         CoordinatorPresence::NotRunning => AgentState::NotRunning,
         CoordinatorPresence::Unknown => AgentState::Unknown,
+    }
+}
+
+fn guard_rows(state: &AuthorityState, now: WallTime) -> Vec<GuardRow> {
+    observe::guard_standings(state, now)
+        .into_iter()
+        .map(|(policy, standing)| GuardRow::new(policy.as_str(), standing))
+        .collect()
+}
+
+fn system_time(time: WallTime) -> SystemTime {
+    let seconds: i64 = time.unix_seconds();
+    let nanos: Duration = Duration::from_nanos(u64::from(time.subsecond_nanoseconds()));
+    if seconds >= 0 {
+        UNIX_EPOCH + Duration::from_secs(seconds.unsigned_abs()) + nanos
+    } else {
+        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs()) + nanos
     }
 }

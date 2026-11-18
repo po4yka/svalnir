@@ -12,10 +12,17 @@
 use std::path::Path;
 
 use serde::Serialize;
+use svalnir_core::grant::{AuthorityState, GuardStanding, InstanceInhibition, guard_standing};
 use svalnir_core::observation::UnavailableReason;
+use svalnir_core::policy::PolicyId;
+use svalnir_core::process::Uid;
+use svalnir_core::time::WallTime;
 use svalnir_core::volume::VolumeIdentity;
 
-use crate::journal::{CoordinatorLock, CoordinatorLockError, coordinator_lock_path};
+use crate::journal::{
+    AgentRecord, CoordinatorLock, CoordinatorLockError, JournalOptions, OperationJournal,
+    OperationJournalError, coordinator_lock_path,
+};
 use crate::platform::memory::{
     self, CollectError, CollectionContext, ContextError, MemorySnapshot,
 };
@@ -191,4 +198,118 @@ pub fn coordinator_presence(journal_path: &Path) -> CoordinatorPresence {
         Err(CoordinatorLockError::Held) => CoordinatorPresence::Running,
         Err(CoordinatorLockError::Io(_)) => CoordinatorPresence::Unknown,
     }
+}
+
+/// The user of this process.
+#[must_use]
+pub fn current_uid() -> Uid {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` has no argument, changes nothing, and does not
+        // fail.
+        Uid::new(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        Uid::new(0)
+    }
+}
+
+/// Why the journal file could not be opened for a read.
+#[derive(Debug, thiserror::Error)]
+pub enum ExistingJournalError {
+    /// The path is not a regular file.
+    #[error("the path of the operation journal is not a regular file")]
+    NotAJournal,
+    /// The path could not be inspected.
+    #[error("the operation journal cannot be inspected")]
+    Inspect,
+    /// The journal file exists and could not be opened.
+    #[error("the operation journal cannot be opened: {0}")]
+    Open(OperationJournalError),
+}
+
+/// Opens the journal when its file exists. The function does not make the
+/// state directory or the journal. `Ok(None)` means that the file is absent.
+///
+/// # Errors
+///
+/// Returns [`ExistingJournalError`] when the path is not a regular file,
+/// cannot be inspected, or cannot be opened as a journal.
+pub fn open_existing_journal(
+    path: &Path,
+    options: &JournalOptions,
+) -> Result<Option<OperationJournal>, ExistingJournalError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(ExistingJournalError::NotAJournal),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ExistingJournalError::Inspect),
+    }
+    OperationJournal::open(path, options)
+        .map(Some)
+        .map_err(ExistingJournalError::Open)
+}
+
+/// The authority record of the journal with its record revision.
+#[derive(Debug, Clone)]
+pub struct StoredAuthority {
+    /// The record. With no record, the state of a user with no activation.
+    pub state: AuthorityState,
+    /// The revision of the record, or 0 with no record.
+    pub revision: u64,
+}
+
+/// Why the authority record could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthorityReadError {
+    /// The journal could not give the record.
+    #[error("the authority record cannot be read: {0}")]
+    Journal(OperationJournalError),
+    /// The record belongs to a different user.
+    #[error("the authority record of the journal is of a different user")]
+    DifferentUser,
+}
+
+/// Reads the authority record of the journal for `uid`.
+///
+/// # Errors
+///
+/// Returns [`AuthorityReadError::DifferentUser`] for a record of a
+/// different user, and [`AuthorityReadError::Journal`] for a record that
+/// cannot be read.
+pub fn read_authority(
+    journal: &OperationJournal,
+    uid: Uid,
+) -> Result<StoredAuthority, AuthorityReadError> {
+    match journal
+        .agent_record::<AuthorityState>(AgentRecord::Authority)
+        .map_err(AuthorityReadError::Journal)?
+    {
+        None => Ok(StoredAuthority {
+            state: AuthorityState::new(uid),
+            revision: 0,
+        }),
+        Some(stored) if stored.record.principal != uid => Err(AuthorityReadError::DifferentUser),
+        Some(stored) => Ok(StoredAuthority {
+            state: stored.record,
+            revision: stored.revision,
+        }),
+    }
+}
+
+/// The standing of each guard at `now`, in the order of [`PolicyId::ALL`].
+/// The reading has no instance inhibition: a client process is not the
+/// running instance of the agent.
+#[must_use]
+pub fn guard_standings(state: &AuthorityState, now: WallTime) -> Vec<(PolicyId, GuardStanding)> {
+    PolicyId::ALL
+        .iter()
+        .map(|policy| {
+            (
+                *policy,
+                guard_standing(state, &InstanceInhibition::default(), *policy, now),
+            )
+        })
+        .collect()
 }

@@ -1,12 +1,12 @@
-//! The Overview screen: disk headroom, memory pressure, swap, and the agent.
-//!
-//! TODO(npochaev): add the "Policies" card and the "Latest intervention" card.
-//! The data source gives no policy list and no journal summary yet, so a card
-//! would show invented values.
+//! The Overview screen: disk headroom, memory pressure, swap, the agent, the
+//! policies, and the latest intervention.
 
 use crate::{
     data::{
-        model::{AgentSnapshot, AgentState, HostSnapshot, Loadable, Measured, PressureLevel},
+        model::{
+            AgentSnapshot, AgentState, GuardState, HostSnapshot, Loadable, Measured,
+            OperationPhase, PressureLevel, ServiceSnapshot,
+        },
         store::AppModel,
     },
     theme::tokens::{self, Tokens, to_hsla},
@@ -26,7 +26,7 @@ use crate::{
 use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement, Pixels, Render,
     Role, SharedString, Styled, TestSupportExt as _, Window,
-    component::{ActiveTheme as _, IconName, skeleton::Skeleton, v_flex},
+    component::{ActiveTheme as _, IconName, h_flex, skeleton::Skeleton, v_flex},
     div,
     prelude::*,
     px,
@@ -326,6 +326,131 @@ fn agent_card(agent: &Loadable<AgentSnapshot>, tokens: &Tokens) -> AnyElement {
     card(header, body)
 }
 
+/// The pill text and tone of an operation phase.
+#[must_use]
+pub const fn phase_pill(phase: OperationPhase, state_text: &str) -> (&str, Tone) {
+    match phase {
+        OperationPhase::Pending => ("Pending", Tone::Neutral),
+        OperationPhase::Running => ("Running", Tone::Brand),
+        OperationPhase::Completed => ("Completed", Tone::Positive),
+        OperationPhase::Partial => (state_text, Tone::Warning),
+        OperationPhase::NoAction => ("No action", Tone::Neutral),
+        OperationPhase::Failed => ("Failed", Tone::Negative),
+        OperationPhase::Unknown => ("Unknown outcome", Tone::Warning),
+    }
+}
+
+fn policies_card(
+    service: &Loadable<ServiceSnapshot>,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let mut header: ShellHeader = ShellHeader::new(IconName::Settings, "Policies");
+    let body: AnyElement = match service {
+        Loadable::Loading => skeleton_value(),
+        Loadable::Unavailable(reason) => unavailable_body("policies-value", reason, tokens),
+        Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => {
+            header = header.subtitle(match &snapshot.active_revision {
+                Some(id) => format!("Revision {id}"),
+                None => "No revision in effect".to_owned(),
+            });
+            let mut body = v_flex().gap(px(12.0));
+            for row in &snapshot.guards {
+                let (text, tone) = match row.standing {
+                    GuardState::Active => ("Active", Tone::Positive),
+                    GuardState::Inactive => ("Inactive", Tone::Neutral),
+                };
+                body = body.child(
+                    v_flex()
+                        .gap(px(4.0))
+                        .child(
+                            h_flex()
+                                .gap(px(8.0))
+                                .child(div().font_family(mono.clone()).child(row.name))
+                                .child(
+                                    StatusPill::new(text, tone).id(format!("guard-{}", row.name)),
+                                ),
+                        )
+                        .child(caption("guard-detail", row.detail, tokens)),
+                );
+            }
+            if !snapshot
+                .guards
+                .iter()
+                .any(|row| row.standing == GuardState::Active)
+            {
+                body = body.child(caption(
+                    "policies-no-guard",
+                    "No guard can act. No automatic cleanup and no automatic application control can occur.",
+                    tokens,
+                ));
+            }
+            for problem in &snapshot.problems {
+                body = body.child(caption("policies-problem", problem.clone(), tokens));
+            }
+            if matches!(service, Loadable::Stale(_)) {
+                body = body.child(caption(
+                    "policies-stale",
+                    format_age(
+                        SystemTime::now()
+                            .duration_since(snapshot.captured_at)
+                            .unwrap_or_default(),
+                    ),
+                    tokens,
+                ));
+            }
+            body.into_any_element()
+        }
+    };
+    card(header, body)
+}
+
+fn intervention_card(
+    service: &Loadable<ServiceSnapshot>,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let mut header: ShellHeader = ShellHeader::new(IconName::Bell, "Latest intervention");
+    let body: AnyElement = match service {
+        Loadable::Loading => skeleton_value(),
+        Loadable::Unavailable(reason) => unavailable_body("intervention-value", reason, tokens),
+        Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => {
+            if let Some(operation) = &snapshot.latest_operation {
+                let (text, tone) = phase_pill(operation.state, &operation.state_text);
+                header = header.aside(StatusPill::new(text.to_owned(), tone).id("operation-pill"));
+                let age: String = format_age(
+                    SystemTime::now()
+                        .duration_since(operation.admitted_at)
+                        .unwrap_or_default(),
+                );
+                v_flex()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("operation-id")
+                            .font_family(mono.clone())
+                            .child(operation.operation_id.clone()),
+                    )
+                    .child(caption(
+                        "operation-trigger",
+                        format!("Trigger: {}", operation.trigger),
+                        tokens,
+                    ))
+                    .child(caption("operation-age", age, tokens))
+                    .into_any_element()
+            } else {
+                let text: &str = if snapshot.journal_present {
+                    "No operation is in the journal."
+                } else {
+                    "No journal exists in the state directory."
+                };
+                caption("intervention-empty", text, tokens)
+            }
+        }
+    };
+    card(header, body)
+}
+
 impl Render for OverviewScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
@@ -343,6 +468,8 @@ impl Render for OverviewScreen {
             },
         };
         let agent: Loadable<AgentSnapshot> = model.agent.clone();
+        let service: Loadable<ServiceSnapshot> = model.service.clone();
+        let mono: SharedString = cx.theme().mono_font_family.clone();
 
         let viewport: f32 = window.viewport_size().width.into();
         let sidebar: f32 = if viewport < 900.0 {
@@ -362,6 +489,8 @@ impl Render for OverviewScreen {
             pressure_card(&view, tokens),
             swap_card(&view, tokens),
             agent_card(&agent, tokens),
+            policies_card(&service, &mono, tokens),
+            intervention_card(&service, &mono, tokens),
         ];
         let title: &'static str = "Overview";
         div()

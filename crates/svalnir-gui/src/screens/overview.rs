@@ -49,7 +49,7 @@ use std::{
 
 const MIN_CARD_WIDTH: f32 = 320.0;
 /// The width of the dial card when it shares a row with the session chart.
-const DIAL_CARD_WIDTH: f32 = 520.0;
+const DIAL_CARD_WIDTH: f32 = 560.0;
 /// The least content width at which the two cards share a row.
 const PAIR_MIN_WIDTH: f32 = 980.0;
 /// The sidebar width at full size and collapsed, and the content padding.
@@ -200,7 +200,7 @@ impl OverviewScreen {
 
 fn skeleton_value() -> AnyElement {
     v_flex()
-        .gap(px(8.0))
+        .gap(tokens::SPACE_2)
         .child(Skeleton::new().w(px(140.0)).h(px(30.0)))
         .child(Skeleton::new().w_full().h(px(8.0)))
         .into_any_element()
@@ -229,7 +229,7 @@ fn stale_caption(host: &HostSnapshot) -> String {
 
 fn unavailable_body(id: &'static str, reason: &str, tokens: &Tokens) -> AnyElement {
     v_flex()
-        .gap(px(8.0))
+        .gap(tokens::SPACE_2)
         .child(DisplayValue::unavailable(reason.to_owned()).id(id))
         .child(caption(
             "overview-unavailable-note",
@@ -240,9 +240,20 @@ fn unavailable_body(id: &'static str, reason: &str, tokens: &Tokens) -> AnyEleme
 }
 
 fn card(header: ShellHeader, body: impl IntoElement) -> AnyElement {
+    card_aligned(header, body, false)
+}
+
+/// A card whose content is centered in the height of its panel when
+/// `centered` is true, and starts at the top otherwise.
+fn card_aligned(header: ShellHeader, body: impl IntoElement, centered: bool) -> AnyElement {
+    let mut content = v_flex().flex_1().gap(tokens::SPACE_3);
+    if centered {
+        content = content.justify_center();
+    }
     Shell::new()
+        .grow()
         .child(header)
-        .child(Panel::new().child(v_flex().gap(px(12.0)).child(body)))
+        .child(Panel::new().grow().child(content.child(body)))
         .into_any_element()
 }
 
@@ -344,7 +355,7 @@ fn hero_card(
                 _ => None,
             };
             v_flex()
-                .gap(px(12.0))
+                .gap(tokens::SPACE_3)
                 .child(value)
                 .child(LedChart::new(
                     field,
@@ -384,12 +395,12 @@ fn headroom_card(
                 lit_counts.map_or_else(|| model.clone(), |counts| with_lit_counts(&model, counts));
             let pill: (&'static str, Tone) = pressure_pill(&host.pressure);
             v_flex()
-                .gap(px(12.0))
+                .gap(tokens::SPACE_3)
                 .child(
                     h_flex()
                         .flex_wrap()
-                        .items_start()
-                        .gap(px(24.0))
+                        .items_center()
+                        .gap(tokens::SPACE_6)
                         .child(
                             HeadroomDial::new(shown)
                                 .picked(pick)
@@ -400,7 +411,7 @@ fn headroom_card(
                             v_flex()
                                 .flex_1()
                                 .min_w(px(240.0))
-                                .gap(px(12.0))
+                                .gap(tokens::SPACE_3)
                                 .child(
                                     DialLegend::new(model, pill)
                                         .muted(*stale)
@@ -423,7 +434,7 @@ fn headroom_card(
                 .into_any_element()
         }
     };
-    card(header, body)
+    card_aligned(header, body, true)
 }
 
 /// The columns of the session chart that fit `width` pixels.
@@ -453,11 +464,12 @@ fn session_card(
         View::Loading => skeleton_value(),
         View::Failed(reason) => unavailable_body("session-value", reason, tokens),
         View::Data { host, stale } => {
-            // The card, panel, and inset take 72 px of the width.
-            let slots: usize = session_slots((width - 72.0).max(0.0));
+            // The shell and the panel pad the chart on both sides.
+            let padding: f32 = 2.0 * f32::from(tokens::SHELL_PADDING + tokens::PANEL_PADDING);
+            let slots: usize = session_slots((width - padding).max(0.0));
             let model = session_model(history, operation, slots);
             v_flex()
-                .gap(px(12.0))
+                .gap(tokens::SPACE_3)
                 .child(SessionChart::new(model).live(live).muted(*stale))
                 .children(stale.then(|| caption("session-stale", stale_caption(host), tokens)))
                 .child(
@@ -480,10 +492,10 @@ fn agent_card(agent: &Loadable<AgentSnapshot>, glow: bool, tokens: &Tokens) -> A
             header = header.aside(StatusPill::new(text, tone).id("agent-pill"));
             let stale: bool = matches!(agent, Loadable::Stale(_));
             v_flex()
-                .gap(px(8.0))
+                .gap(tokens::SPACE_2)
                 .child(inset_row(
                     h_flex()
-                        .gap(px(10.0))
+                        .gap(tokens::SPACE_2)
                         .items_center()
                         .child(guard_led(
                             matches!(snapshot.state, AgentState::Reporting { .. }),
@@ -527,6 +539,7 @@ pub const fn phase_pill(phase: OperationPhase, state_text: &str) -> (&str, Tone)
 /// A 3 by 3 lattice block: lit with a glow for an active guard.
 fn guard_led(active: bool, glow: bool, tokens: &Tokens) -> AnyElement {
     let color: Hsla = to_hsla(tokens.positive);
+    // 1 px: the gap of the cells of the guard indicator, not layout spacing.
     let mut block = div().flex().flex_col().gap(px(1.0)).flex_shrink_0();
     if active && glow {
         block = block.shadow(vec![BoxShadow {
@@ -538,6 +551,7 @@ fn guard_led(active: bool, glow: bool, tokens: &Tokens) -> AnyElement {
         }]);
     }
     for _ in 0..3 {
+        // 1 px: the gap of the cells of the guard indicator, not layout spacing.
         let mut line = h_flex().gap(px(1.0));
         for _ in 0..3 {
             line = line.child(div().size(px(3.0)).rounded(px(0.5)).bg(if active {
@@ -566,7 +580,7 @@ fn policies_card(
                 Some(id) => format!("Revision {id}"),
                 None => "No revision in effect".to_owned(),
             });
-            let mut body = v_flex().gap(px(12.0));
+            let mut body = v_flex().gap(tokens::SPACE_3);
             for row in &snapshot.guards {
                 let (text, tone) = match row.standing {
                     GuardState::Active => ("Active", Tone::Positive),
@@ -574,10 +588,10 @@ fn policies_card(
                 };
                 body = body.child(
                     v_flex()
-                        .gap(px(4.0))
+                        .gap(tokens::SPACE_1)
                         .child(
                             h_flex()
-                                .gap(px(8.0))
+                                .gap(tokens::SPACE_2)
                                 .items_center()
                                 .child(guard_led(row.standing == GuardState::Active, glow, tokens))
                                 .child(div().font_family(mono.clone()).child(row.name))
@@ -624,8 +638,8 @@ fn inset_row(content: impl IntoElement, tokens: &Tokens) -> AnyElement {
     div()
         .rounded(tokens::INSET_RADIUS)
         .bg(to_hsla(tokens.inset_tint))
-        .px(px(12.0))
-        .py(px(10.0))
+        .px(tokens::INSET_PADDING_X)
+        .py(tokens::INSET_PADDING_Y)
         .child(content)
         .into_any_element()
 }
@@ -650,11 +664,11 @@ fn intervention_card(
                 );
                 inset_row(
                     v_flex()
-                        .gap(px(4.0))
+                        .gap(tokens::SPACE_1)
                         .child(
                             h_flex()
                                 .justify_between()
-                                .gap(px(8.0))
+                                .gap(tokens::SPACE_2)
                                 .child(
                                     div()
                                         .id("operation-id")
@@ -857,6 +871,8 @@ impl Render for OverviewScreen {
             .child(div().flex().flex_wrap().gap(tokens::GRID_GAP).children(
                 cards.into_iter().enumerate().map(|(index, card)| {
                     div()
+                        .flex()
+                        .flex_col()
                         .w(match index {
                             0 => px(dial_width),
                             1 => px(session_width),

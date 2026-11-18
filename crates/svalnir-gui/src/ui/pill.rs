@@ -1,6 +1,6 @@
 //! The status pill: a tone, an optional icon, and always a text.
 
-use crate::theme::tokens::{Tokens, to_hsla};
+use crate::theme::tokens::{self, Tokens, to_hsla};
 use gpui_kit::{
     App, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, Role,
     SharedString, Styled as _, TestSupportExt as _, Window,
@@ -85,8 +85,9 @@ impl RenderOnce for StatusPill {
             .test_support()
             .aria_label(self.text.clone())
             .h(px(24.0))
+            // The inner padding of a control, not a layout gap.
             .px(px(10.0))
-            .gap(px(4.0))
+            .gap(tokens::SPACE_1)
             .items_center()
             .flex_shrink_0()
             // A pill keeps its own width in a column that stretches its children.

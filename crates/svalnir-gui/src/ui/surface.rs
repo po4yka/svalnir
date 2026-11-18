@@ -19,12 +19,20 @@ macro_rules! container {
         #[derive(IntoElement)]
         pub struct $name {
             children: Vec<AnyElement>,
+            grow: bool,
         }
 
         impl $name {
             /// Creates an empty container.
             pub fn new() -> Self {
-                Self { children: Vec::new() }
+                Self { children: Vec::new(), grow: false }
+            }
+
+            /// Grows to the free height of the parent.
+            #[must_use]
+            pub const fn grow(mut self) -> Self {
+                self.grow = true;
+                self
             }
         }
 
@@ -51,9 +59,11 @@ macro_rules! container {
         impl RenderOnce for $name {
             fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
                 let fill = to_hsla(tokens_of(cx).$fill);
-                div()
-                    .flex()
-                    .flex_col()
+                let mut base = div().flex().flex_col();
+                if self.grow {
+                    base = base.flex_grow(1.0);
+                }
+                base
                     .bg(fill)
                     .rounded($radius)
                     .px($pad_x)
@@ -140,9 +150,10 @@ impl RenderOnce for ShellHeader {
         div()
             .flex()
             .items_center()
-            .gap(px(12.0))
+            .gap(tokens::SPACE_3)
+            // The inner padding of a control, not a layout gap.
             .px(px(10.0))
-            .py(px(8.0))
+            .py(tokens::SPACE_2)
             .child(
                 div()
                     .flex()

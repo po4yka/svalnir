@@ -9,17 +9,18 @@ use crate::{
     data::model::{HostSnapshot, Measured, PressureLevel},
     theme::{
         glow, motion,
-        tokens::{Tokens, to_hsla},
+        tokens::{self, Tokens, to_hsla},
     },
     ui::{
         data_state::{UNAVAILABLE_TEXT, format_bytes, used_capacity},
         pill::{StatusPill, Tone},
+        ring_center::RingCenter,
     },
     viz::led::{LedStyle, lit_color},
 };
 use gpui_kit::{
-    App, Bounds, BoxShadow, Corners, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
+    App, Bounds, BoxShadow, Corners, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
     component::{
         ActiveTheme as _,
@@ -784,23 +785,19 @@ impl HeadroomDial {
 impl RenderOnce for HeadroomDial {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
-        let tokens: &Tokens = Tokens::for_dark(dark);
-        let mono: SharedString = cx.theme().mono_font_family.clone();
         let picked: usize = self.picked.unwrap_or(self.model.picked).min(2);
         let label: String = self.model.label();
         let center: &Ring = &self.model.rings[picked];
         let value: SharedString = center.center_value.clone().into();
         let caption: SharedString = center.center_caption.clone().into();
-        let value_color: Hsla = if self.muted || center.state == RingState::Unavailable {
-            to_hsla(tokens.muted_foreground)
-        } else {
-            to_hsla(tokens.foreground)
-        };
+        let center_state: RingState = center.state;
+        let center_unavailable: bool = center_state == RingState::Unavailable;
+        let colors: DialColors = DialColors::for_dark(dark);
         let paint: DialPaint = DialPaint {
             model: self.model,
             picked,
             sweep: self.sweep,
-            colors: DialColors::for_dark(dark),
+            colors,
             glow: glow::enabled(cx),
             muted: self.muted,
         };
@@ -824,40 +821,21 @@ impl RenderOnce for HeadroomDial {
                     .size_full(),
                 ),
             )
-            .child(
-                v_flex()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .id("dial-center-value")
-                            .test_support()
-                            .aria_label(value.clone())
-                            .font_family(mono)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_size(px(22.0))
-                            .text_color(value_color)
-                            .whitespace_nowrap()
-                            .child(value),
-                    )
-                    .child(
-                        div()
-                            .id("dial-center-caption")
-                            .test_support()
-                            .aria_label(caption.clone())
-                            .max_w(px(108.0))
-                            .overflow_hidden()
-                            .text_size(px(11.0))
-                            .text_color(to_hsla(tokens.muted_foreground))
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(caption),
-                    ),
-            )
+            .child({
+                let mut center_view = RingCenter::new(
+                    "dial-center-value",
+                    value,
+                    caption,
+                    // The inner ring: its diameter without the dot.
+                    2.0 * RING_RADII[2] - DOT_PX,
+                )
+                .caption_id("dial-center-caption")
+                .muted(self.muted || center_unavailable);
+                if let RingState::Pressure(level) = center_state {
+                    center_view = center_view.state(colors.sector(level_sector(level)));
+                }
+                center_view
+            })
     }
 }
 
@@ -920,6 +898,7 @@ impl DialLegend {
 }
 
 impl RenderOnce for DialLegend {
+    #[expect(clippy::too_many_lines, reason = "one build of the three rows")]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
@@ -931,7 +910,16 @@ impl RenderOnce for DialLegend {
         } else {
             to_hsla(tokens.foreground)
         };
-        let mut rows = v_flex().gap(px(10.0)).min_w(px(0.0));
+        let sans: SharedString = cx.theme().font_family.clone();
+        // The name column is as wide as the widest name (about 7 px a letter at 13 px).
+        let name_width: f32 = self
+            .model
+            .rings
+            .iter()
+            .map(|ring| ring.kind.name().chars().count())
+            .max()
+            .map_or(0.0, |count| count_f32(count) * 7.0);
+        let mut rows = v_flex().gap(tokens::SPACE_3).min_w(px(0.0));
         for (index, ring) in self.model.rings.iter().enumerate() {
             let swatch: Hsla = match ring.kind {
                 RingKind::Disk => colors.disk,
@@ -947,25 +935,60 @@ impl RenderOnce for DialLegend {
             };
             let hover: Option<PickHandler> = self.on_pick.clone();
             let click: Option<PickHandler> = self.on_pick.clone();
-            let mut name_button =
-                Button::new(SharedString::from(format!("{}-button", ROW_IDS[index])))
-                    .ghost()
-                    .label(ring.kind.name())
-                    .on_click(move |_, window, cx| {
-                        if let Some(pick) = &click {
-                            pick(Some(index), window, cx);
-                        }
-                    });
+            // The whole row is the target: an empty button covers it, so the
+            // click and the keyboard focus pick the ring.
+            let mut target = Button::new(SharedString::from(format!("{}-button", ROW_IDS[index])))
+                .ghost()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_click(move |_, window, cx| {
+                    if let Some(pick) = &click {
+                        pick(Some(index), window, cx);
+                    }
+                });
             if let Some(handles) = &self.focus {
-                name_button = name_button.track_focus(&handles[index]);
+                target = target.track_focus(&handles[index]);
             }
             let value: gpui_kit::AnyElement = if ring.kind == RingKind::Pressure {
                 StatusPill::new(self.pill.0, self.pill.1)
                     .id("pressure-pill")
                     .into_any_element()
-            } else {
+            } else if let Some((used, total)) = ring.value.split_once(" used of ") {
+                h_flex()
+                    .items_baseline()
+                    .gap(tokens::SPACE_1)
+                    .text_size(px(12.0))
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_color(value_color)
+                            .child(used.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .font_family(sans.clone())
+                            .text_color(muted)
+                            .child("used of"),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_color(value_color)
+                            .child(total.to_owned()),
+                    )
+                    .into_any_element()
+            } else if ring.value == UNAVAILABLE_TEXT {
                 div()
                     .font_family(mono.clone())
+                    .text_size(px(12.0))
+                    .text_color(value_color)
+                    .child(ring.value.clone())
+                    .into_any_element()
+            } else {
+                div()
+                    .font_family(sans.clone())
                     .text_size(px(12.0))
                     .text_color(value_color)
                     .child(ring.value.clone())
@@ -977,7 +1000,8 @@ impl RenderOnce for DialLegend {
                     .id(ROW_IDS[index])
                     .test_support()
                     .aria_label(SharedString::from(label))
-                    .gap(px(2.0))
+                    .relative()
+                    .gap(tokens::SPACE_1)
                     .on_hover(move |hovered, window, cx| {
                         if let Some(pick) = &hover {
                             pick(hovered.then_some(index), window, cx);
@@ -985,29 +1009,48 @@ impl RenderOnce for DialLegend {
                     })
                     .child(
                         h_flex()
-                            .gap(px(8.0))
                             .items_center()
                             .child(
                                 div()
-                                    .size(px(10.0))
+                                    .size(px(COLOR_DOT))
                                     .flex_shrink_0()
                                     .rounded_full()
                                     .bg(swatch),
                             )
-                            .child(name_button)
-                            .child(value),
+                            .child(
+                                div()
+                                    .ml(tokens::SPACE_2)
+                                    .w(px(name_width))
+                                    .flex_shrink_0()
+                                    .text_size(px(13.0))
+                                    .whitespace_nowrap()
+                                    .child(ring.kind.name()),
+                            )
+                            .child(div().ml(tokens::SPACE_3).child(value)),
                     )
                     .children(detail.map(|text| {
                         div()
-                            .pl(px(18.0))
+                            .ml(px(COLOR_DOT) + tokens::SPACE_2)
                             .text_size(px(12.0))
                             .text_color(muted)
                             .child(text)
-                    })),
+                    }))
+                    .child(target),
             );
         }
         rows
     }
+}
+
+/// The diameter of the color dot of a legend row, in pixels.
+const COLOR_DOT: f32 = 8.0;
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a name length is far below 2^24"
+)]
+const fn count_f32(count: usize) -> f32 {
+    count as f32
 }
 
 #[cfg(test)]

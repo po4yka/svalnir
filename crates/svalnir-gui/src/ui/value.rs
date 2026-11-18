@@ -1,7 +1,7 @@
 //! The large value of a card with its unit and context.
 
 use crate::{
-    theme::tokens::{Tokens, to_hsla},
+    theme::tokens::{self, Tokens, to_hsla},
     ui::{data_state::UNAVAILABLE_TEXT, rolling::RollingNumber},
 };
 use gpui_kit::{
@@ -109,11 +109,11 @@ impl RenderOnce for DisplayValue {
             _ => self.value.clone().into_any_element(),
         };
         v_flex()
-            .gap(px(4.0))
+            .gap(tokens::SPACE_1)
             .child(
                 h_flex()
                     .items_baseline()
-                    .gap(px(6.0))
+                    .gap(tokens::SPACE_1)
                     .child(
                         div()
                             .id(self.id.clone())

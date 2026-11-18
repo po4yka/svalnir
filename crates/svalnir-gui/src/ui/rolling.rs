@@ -157,9 +157,15 @@ impl Render for RollingNumber {
             .flex()
             .flex_row()
             .h(px(line))
+            .line_height(px(line))
             .text_size(px(size))
             .font_weight(self.weight)
             .text_color(color);
+        if elapsed >= roll_total(&self.slots) {
+            // At rest the text uses its natural glyph advances. The fixed
+            // slots keep columns still only while a digit rolls.
+            return row.child(self.text.clone());
+        }
         for slot in &self.slots {
             let cell = |top: f32, ch: char, alpha: f32| {
                 div()

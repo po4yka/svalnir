@@ -6,6 +6,7 @@ pub mod entry;
 pub mod legend;
 pub mod pill;
 pub mod provenance;
+pub mod ring_center;
 pub mod rolling;
 pub mod segmented;
 pub mod surface;

@@ -1,6 +1,6 @@
 //! The legend of a segmented chart: one button row for each segment.
 
-use crate::theme::tokens::{Tokens, to_hsla};
+use crate::theme::tokens::{self, Tokens, to_hsla};
 use gpui_kit::{
     App, Hsla, IntoElement, ParentElement as _, RenderOnce, SharedString, Styled as _,
     TestSupportExt as _, Window,
@@ -113,12 +113,22 @@ impl RenderOnce for Legend {
                     .id(row_id)
                     .test_support()
                     .aria_label(label)
-                    .gap(px(8.0))
+                    .gap(tokens::SPACE_2)
                     .items_center()
                     .min_w(px(0.0))
                     .w(gpui_kit::relative(if columns == 2 { 0.5 } else { 1.0 }))
-                    // The space between the two columns.
-                    .pr(px(if columns == 2 { 16.0 } else { 0.0 }))
+                    // Each column gives half of the SPACE_4 gutter: equal widths,
+                    // and the right column ends at the content edge.
+                    .pr(if columns == 2 && index % 2 == 0 {
+                        tokens::SPACE_4 * 0.5
+                    } else {
+                        px(0.0)
+                    })
+                    .pl(if columns == 2 && index % 2 == 1 {
+                        tokens::SPACE_4 * 0.5
+                    } else {
+                        px(0.0)
+                    })
                     .on_hover(move |hovered, window, cx| {
                         if let Some(hover) = &on_hover {
                             hover(hovered.then_some(index), window, cx);
@@ -154,6 +164,6 @@ impl RenderOnce for Legend {
             .collect();
         v_flex()
             .id(self.id.clone())
-            .child(h_flex().flex_wrap().gap_y(px(4.0)).children(items))
+            .child(h_flex().flex_wrap().gap_y(tokens::SPACE_1).children(items))
     }
 }

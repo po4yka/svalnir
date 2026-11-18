@@ -93,7 +93,19 @@ All changing numbers use tabular figures. A value and its unit stay together: th
 
 ### Shape and spacing
 
-The spacing unit is 4 px. The radii nest: each inner radius is the outer radius minus the padding between the two.
+The spacing unit is 4 px. Layout gaps and paddings use the steps of this scale.
+
+| Step | Value | Use |
+| --- | --- | --- |
+| `SPACE_1` | 4 px | A label and its own value or caption |
+| `SPACE_2` | 8 px | Rows of one group |
+| `SPACE_3` | 12 px | Blocks inside a panel; the same as the gap between shells |
+| `SPACE_4` | 16 px | Panel padding; the gap between two columns of one chart block |
+| `SPACE_6` | 24 px | A chart and its legend side by side; the content padding of the window |
+
+A layout value outside this scale needs a comment that states the reason.
+
+The radii nest: each inner radius is the outer radius minus the padding between the two.
 
 | Element | Radius | Size |
 | --- | --- | --- |
@@ -226,7 +238,7 @@ These charts use round dots on the 6 px pitch of the LED matrix. A dot has a dia
 - The pressure ring has three sectors with a gap of one dot: Normal, Warning, and Critical. The sector of the current state is lit in `positive`, `warning`, or `negative`. The sectors below it are dim, and the sectors above it are empty. The legend states the state as text.
 - The last lit dot of a ring is the head: white, with a white glow by the rule of the LED matrix.
 - One ring is picked out. The order is: the pressure ring while the state is not normal; the ring with the largest used share above 0; the pressure ring when it is measured; the first measured ring; ring 0. A ring with no capacity or a share of 0 does not win over a measured ring. The picked ring has full strength and a radial marker of 1.5 px by 8 px at its head. The other rings show their lit dots at 55%. Hover or keyboard focus on a legend row picks that ring.
-- The center shows the value of the picked ring as a display value and a caption of one line.
+- The center shows the value of the picked ring as a display value and a caption of one line. The center uses the display style: a sans number with a small muted unit, and the caption below. It does not use mono text.
 - A ring with an unavailable reading shows each second dot empty and no other dot. Its legend row shows an em dash, or the "Unavailable" pill for the pressure ring, and the reason.
 
 **Session chart.** One inset with a value curve and a sample matrix on one time axis. A column of the 6 px pitch is one reading; the newest reading is at the right.
@@ -240,7 +252,7 @@ These charts use round dots on the 6 px pitch of the LED matrix. A dot has a dia
 - The top strip is the change count: 0 to 3 dots for the number of series with a value larger than in the reading before.
 - The caption states the scale: "1 column = 1 reading".
 
-**Cell ring.** The ring layout of a storage chart: four concentric rings of dots with radii from 66 to 84 px, and 120 angular steps. A segment covers the steps of its share on the four rings, with a gap of one step. Free space shows each second dot empty. The center shows the used value. Focus dims the other segments by the rule of the LED matrix.
+**Cell ring.** The ring layout of a storage chart: four concentric rings of dots with radii from 66 to 84 px, and 120 angular steps. A segment covers the steps of its share on the four rings, with a gap of one step. Free space shows each second dot empty. The center shows the used value in the display style of the dial center: a sans number, a small muted unit, and the caption below, not mono text. Focus dims the other segments by the rule of the LED matrix.
 
 ### Components
 

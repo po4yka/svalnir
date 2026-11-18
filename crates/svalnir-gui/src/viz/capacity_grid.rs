@@ -2,7 +2,7 @@
 
 use crate::{
     data::model::Measured,
-    theme::tokens::{Tokens, to_hsla},
+    theme::tokens::{self, Tokens, to_hsla},
     ui::data_state::{UNAVAILABLE_TEXT, format_bytes},
     viz::{
         alloc::{CellState, used_cells, zone_start},
@@ -172,7 +172,7 @@ impl RenderOnce for CapacityGrid {
             .collect();
         let label: String = capacity_label(&self.used, &self.total);
         v_flex()
-            .gap(px(8.0))
+            .gap(tokens::SPACE_2)
             .child(CellStrip::new(cells, layout, self.id.clone(), label))
             .child(
                 div()

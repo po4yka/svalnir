@@ -278,6 +278,9 @@ impl StorageScreen {
     }
 }
 
+/// The content width from which the ring has its legend at the right.
+const RING_SIDE_WIDTH: f32 = 640.0;
+
 fn caption(id: &'static str, text: impl Into<SharedString>, tokens: &Tokens) -> AnyElement {
     let text: SharedString = text.into();
     div()
@@ -293,7 +296,7 @@ fn caption(id: &'static str, text: impl Into<SharedString>, tokens: &Tokens) -> 
 fn card(header: ShellHeader, body: impl IntoElement) -> AnyElement {
     Shell::new()
         .child(header)
-        .child(Panel::new().child(v_flex().gap(px(12.0)).child(body)))
+        .child(Panel::new().child(v_flex().gap(tokens::SPACE_3).child(body)))
         .into_any_element()
 }
 
@@ -308,7 +311,7 @@ fn volume_card(
     let body: AnyElement = match host {
         Loadable::Loading => Skeleton::new().w(px(140.0)).h(px(30.0)).into_any_element(),
         Loadable::Unavailable(reason) => v_flex()
-            .gap(px(8.0))
+            .gap(tokens::SPACE_2)
             .child(DisplayValue::unavailable(reason.clone()).id("volume-value"))
             .child(caption(
                 "volume-unavailable-note",
@@ -337,7 +340,7 @@ fn volume_card(
                 }
             };
             v_flex()
-                .gap(px(12.0))
+                .gap(tokens::SPACE_3)
                 .child(value)
                 .child(volume_strip(&used, &snapshot.disk_total, width, dark))
                 .children(stale.then(|| {
@@ -648,7 +651,7 @@ impl StorageScreen {
         if self.path_stack.is_empty() {
             return None;
         }
-        let mut row = h_flex().gap(px(4.0)).items_center().flex_wrap();
+        let mut row = h_flex().gap(tokens::SPACE_1).items_center().flex_wrap();
         let default: String = self
             .model
             .read(cx)
@@ -681,7 +684,7 @@ impl StorageScreen {
     fn idle_body(root: &Path, cx: &mut Context<Self>, id: &'static str) -> AnyElement {
         let name: String = last_component(root);
         v_flex()
-            .gap(px(12.0))
+            .gap(tokens::SPACE_3)
             .child(div().id(id).child(format!(
                 "Measure the folders of {}. The scan reads sizes only and changes nothing.",
                 root.display()
@@ -776,7 +779,7 @@ impl StorageScreen {
             });
         let label: String = format!("Scanning, {} entries read", progress.entries);
         v_flex()
-            .gap(px(12.0))
+            .gap(tokens::SPACE_3)
             .child(
                 h_flex()
                     .items_start()
@@ -800,7 +803,7 @@ impl StorageScreen {
                     ),
             )
             .child(
-                h_flex().gap(px(8.0)).child("Scanning").child(
+                h_flex().gap(tokens::SPACE_2).child("Scanning").child(
                     div()
                         .id("scan-running-path")
                         .font_family(mono.clone())
@@ -830,6 +833,7 @@ impl StorageScreen {
     }
 
     #[expect(clippy::too_many_lines, reason = "one build of the done view")]
+    #[expect(clippy::too_many_arguments, reason = "the render state of one screen")]
     fn done_body(
         &mut self,
         summary: &Arc<ScanSummary>,
@@ -838,6 +842,7 @@ impl StorageScreen {
         window: &mut Window,
         cx: &mut Context<Self>,
         tokens: &Tokens,
+        metric_caption: AnyElement,
     ) -> AnyElement {
         let segments: Vec<Segment> = breakdown(&summary.children, self.metric, DEFAULT_SEGMENTS);
         let mut color_index: usize = 0;
@@ -924,7 +929,10 @@ impl StorageScreen {
             }
         });
         let legend_open = Rc::clone(&open);
-        let legend: Legend = Legend::new(rows, width, "storage-legend")
+        // From 640 px of content the ring has its legend at the right.
+        let side_by_side: bool = self.layout == StorageLayout::Ring && width >= RING_SIDE_WIDTH;
+        let legend_width: f32 = if side_by_side { 0.0 } else { width };
+        let legend: Legend = Legend::new(rows, legend_width, "storage-legend")
             .on_select(move |index, _, app| legend_open(index, app))
             .on_hover(move |index, _, app| {
                 this.update(app, |screen, cx| {
@@ -957,7 +965,7 @@ impl StorageScreen {
                 .div_ceil(u64::try_from(STEPS).unwrap_or(1).max(1));
             let (step_text, step_unit) = format_bytes(step_bytes);
             v_flex()
-                .gap(px(8.0))
+                .gap(tokens::SPACE_2)
                 .child(
                     CellRing::new(
                         items.clone(),
@@ -1006,7 +1014,7 @@ impl StorageScreen {
                 chart_label(self.layout, &summary.root.display().to_string(), &items);
             let chart_open = Rc::clone(&open);
             v_flex()
-                .gap(px(8.0))
+                .gap(tokens::SPACE_2)
                 .child(
                     LedChart::new(field, labels, "storage-band", label)
                         .on_select(move |index, _, app| chart_open(index, app)),
@@ -1018,25 +1026,29 @@ impl StorageScreen {
                 ))
                 .into_any_element()
         };
-        let mut col = v_flex().gap(px(12.0)).child(size_value(
-            summary.total(self.metric),
-            "scan-total",
-            &self.roll_total,
-        ));
+        let mut value_row = h_flex()
+            .items_center()
+            .gap(tokens::SPACE_3)
+            .child(size_value(
+                summary.total(self.metric),
+                "scan-total",
+                &self.roll_total,
+            ));
+        let mut notes = v_flex().gap(tokens::SPACE_1);
         if summary.ended == ScanEnd::Cancelled {
-            col = col
-                .child(StatusPill::new("Cancelled", Tone::Neutral).id("scan-pill"))
-                .child(caption(
-                    "scan-cancelled-note",
-                    "The scan stopped before the end. The sizes cover the part that it read.",
-                    tokens,
-                ));
+            value_row =
+                value_row.child(StatusPill::new("Cancelled", Tone::Neutral).id("scan-pill"));
+            notes = notes.child(caption(
+                "scan-cancelled-note",
+                "The scan stopped before the end. The sizes cover the part that it read.",
+                tokens,
+            ));
         } else if !summary.complete {
-            col = col.child(StatusPill::new("Partial", Tone::Warning).id("scan-pill"));
+            value_row = value_row.child(StatusPill::new("Partial", Tone::Warning).id("scan-pill"));
         }
         if !summary.complete {
             for (index, gap) in summary.gaps.iter().enumerate() {
-                col = col.child(
+                notes = notes.child(
                     div()
                         .id(SharedString::from(format!("scan-gap-{index}")))
                         .text_size(px(12.0))
@@ -1044,17 +1056,39 @@ impl StorageScreen {
                 );
             }
             if summary.ended != ScanEnd::Cancelled {
-                col = col.child(caption(
+                notes = notes.child(caption(
                     "scan-partial-note",
                     "The total covers only what the scan could read.",
                     tokens,
                 ));
             }
         }
-        col.children(self.breadcrumb(cx))
-            .child(chart)
-            .child(legend)
-            .child(caption("scan-footer", done_footer(summary), tokens))
+        // The metric, its value, and the causes of a gap form one group;
+        // SPACE_4 separates the group from the chart.
+        let head = v_flex()
+            .gap(tokens::SPACE_2)
+            .mb(tokens::SPACE_1)
+            .child(
+                v_flex()
+                    .gap(tokens::SPACE_1)
+                    .child(metric_caption)
+                    .child(value_row),
+            )
+            .child(notes);
+        let mut col = v_flex().gap(tokens::SPACE_3).child(head);
+        col = col.children(self.breadcrumb(cx));
+        if side_by_side && total_items > 0 {
+            col = col.child(
+                h_flex()
+                    .items_center()
+                    .gap(tokens::SPACE_6)
+                    .child(chart)
+                    .child(div().flex_1().min_w(px(0.0)).child(legend)),
+            );
+        } else {
+            col = col.child(chart).child(legend);
+        }
+        col.child(caption("scan-footer", done_footer(summary), tokens))
             .child(
                 h_flex().child(
                     ActionButton::new("scan-rescan", "Rescan")
@@ -1110,9 +1144,13 @@ impl Render for StorageScreen {
             ScanState::Running {
                 progress, started, ..
             } => self.running_body(progress, *started, &mono, width, dark, window, cx, tokens),
-            ScanState::Done(summary) => self.done_body(summary, width, dark, window, cx, tokens),
+            ScanState::Done(summary) => {
+                let metric_caption: AnyElement =
+                    caption("scan-metric", self.metric.caption(), tokens);
+                self.done_body(summary, width, dark, window, cx, tokens, metric_caption)
+            }
             ScanState::Failed { reason, .. } => v_flex()
-                .gap(px(12.0))
+                .gap(tokens::SPACE_3)
                 .child(
                     div()
                         .id("scan-failed")
@@ -1132,11 +1170,12 @@ impl Render for StorageScreen {
             .subtitle(shown_root)
             .aside(
                 h_flex()
-                    .gap(px(12.0))
+                    .gap(tokens::SPACE_3)
                     .child(self.layout_control(cx))
                     .child(self.metric_control(cx)),
             );
-        let metric_caption: AnyElement = caption("scan-metric", self.metric.caption(), tokens);
+        let metric_caption: Option<AnyElement> = (!matches!(scan, ScanState::Done(_)))
+            .then(|| caption("scan-metric", self.metric.caption(), tokens));
         let reduce: bool = cx.reduce_motion();
         let title: &'static str = "Storage";
         div()
@@ -1163,9 +1202,9 @@ impl Render for StorageScreen {
                 card(
                     header,
                     v_flex()
-                        .gap(px(12.0))
+                        .gap(tokens::SPACE_3)
                         .children(notice.map(|text| caption("scan-notice", text, tokens)))
-                        .child(metric_caption)
+                        .children(metric_caption)
                         .children(crumb)
                         .child(body),
                 ),

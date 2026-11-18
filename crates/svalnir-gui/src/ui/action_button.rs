@@ -1,7 +1,7 @@
 //! The action button of `DESIGN.md` section 4: a full pill with a silver
 //! or a dark gradient, or no fill.
 
-use crate::theme::tokens::{Tokens, hex_alpha, to_hsla};
+use crate::theme::tokens::{self, Tokens, hex_alpha, to_hsla};
 use gpui_kit::{
     App, BoxShadow, ClickEvent, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, ParentElement as _, RenderOnce, Role, SharedString,
@@ -183,8 +183,9 @@ impl RenderOnce for ActionButton {
             .aria_label(self.label.clone())
             .track_focus(&focus)
             .h(px(self.size.height()))
+            // The inner padding of a control, not a layout gap.
             .px(px(14.0))
-            .gap(px(6.0))
+            .gap(tokens::SPACE_2)
             .items_center()
             .justify_center()
             .flex_shrink_0()

@@ -250,6 +250,7 @@ impl RenderOnce for SegmentedControl {
             .track_focus(&focus)
             .on_key_down(keys)
             .flex_shrink_0()
+            // The track padding of a control, not a layout gap.
             .p(px(2.0))
             .rounded_full()
             .border_2()

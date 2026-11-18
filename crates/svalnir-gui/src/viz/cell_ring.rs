@@ -3,7 +3,7 @@
 //! (`DESIGN.md` section 5, "Cell ring").
 
 use crate::{
-    theme::tokens::{Tokens, to_hsla},
+    ui::ring_center::RingCenter,
     viz::{
         alloc::allocate_cells,
         dial::{DIAL_SIZE, dot_center, ring_progress},
@@ -12,11 +12,10 @@ use crate::{
     },
 };
 use gpui_kit::{
-    App, Bounds, Corners, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    App, Bounds, Corners, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Pixels, Point, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, canvas,
-    component::{ActiveTheme as _, v_flex},
-    div, fill, point, px, size,
+    component::ActiveTheme as _, div, fill, point, px, size,
 };
 use std::{cell::Cell, rc::Rc};
 
@@ -310,12 +309,9 @@ impl CellRing {
 }
 
 impl RenderOnce for CellRing {
-    #[expect(clippy::too_many_lines, reason = "one build of the element")]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
-        let tokens: &Tokens = Tokens::for_dark(dark);
         let style: LedStyle = LedStyle::for_dark(dark);
-        let mono: SharedString = cx.theme().mono_font_family.clone();
         let weights: Vec<u64> = self.items.iter().map(|i| i.bytes).collect();
         let spans: RingSpans = ring_spans(&weights, self.free_bytes);
         let paint: RingPaint = RingPaint {
@@ -399,35 +395,14 @@ impl RenderOnce for CellRing {
             root = root.child(overlay);
         }
         root.child(
-            v_flex()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .id(SharedString::from(format!("{}-center", self.id)))
-                        .test_support()
-                        .aria_label(self.center.0.clone())
-                        .font_family(mono)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_size(px(20.0))
-                        .text_color(to_hsla(tokens.foreground))
-                        .whitespace_nowrap()
-                        .child(self.center.0),
-                )
-                .child(
-                    div()
-                        .max_w(px(100.0))
-                        .overflow_hidden()
-                        .text_size(px(11.0))
-                        .text_color(to_hsla(tokens.muted_foreground))
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(self.center.1),
-                ),
+            RingCenter::new(
+                SharedString::from(format!("{}-center", self.id)),
+                self.center.0,
+                self.center.1,
+                // The inner ring: its diameter without the dot.
+                2.0 * RADII[0] - DOT,
+            )
+            .caption_id(SharedString::from(format!("{}-center-caption", self.id))),
         )
     }
 }

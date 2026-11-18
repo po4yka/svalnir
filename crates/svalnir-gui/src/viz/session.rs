@@ -9,7 +9,7 @@ use crate::{
     data::model::{HostSample, Measured, OperationRow, PressureLevel},
     theme::{
         glow,
-        tokens::{Tokens, to_hsla},
+        tokens::{self, Tokens, to_hsla},
     },
     ui::data_state::{UNAVAILABLE_TEXT, format_bytes},
     viz::{
@@ -765,13 +765,17 @@ impl RenderOnce for SessionChart {
                 .text_color(muted_ink)
                 .child(text)
         };
-        v_flex().gap(px(10.0)).child(root).child(
-            h_flex()
-                .flex_wrap()
-                .gap_x(px(20.0))
-                .gap_y(px(4.0))
-                .child(caption("session-range", range))
-                .child(caption("session-scale", SCALE_CAPTION.into()))
+        v_flex().gap(tokens::SPACE_3).child(root).child(
+            v_flex()
+                .gap(tokens::SPACE_1)
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_x(tokens::SPACE_4)
+                        .gap_y(tokens::SPACE_1)
+                        .child(caption("session-range", range))
+                        .child(caption("session-scale", SCALE_CAPTION.into())),
+                )
                 .child(caption("session-rows", ROWS_CAPTION.into())),
         )
     }

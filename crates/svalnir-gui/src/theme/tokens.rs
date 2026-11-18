@@ -134,6 +134,16 @@ pub const ICON_TILE_SIZE: Pixels = px(36.0);
 pub const ICON_TILE_GLYPH: Pixels = px(18.0);
 /// Gap between shells in a dashboard.
 pub const GRID_GAP: Pixels = px(12.0);
+/// Spacing step 1: a label and its own value or caption.
+pub const SPACE_1: Pixels = px(4.0);
+/// Spacing step 2: rows of one group.
+pub const SPACE_2: Pixels = px(8.0);
+/// Spacing step 3: blocks inside a panel. Same as `GRID_GAP`.
+pub const SPACE_3: Pixels = px(12.0);
+/// Spacing step 4: panel padding and the gap between two columns of one chart block.
+pub const SPACE_4: Pixels = px(16.0);
+/// Spacing step 6: a chart and its legend side by side, and the content padding of the window.
+pub const SPACE_6: Pixels = px(24.0);
 /// Cell radius.
 pub const CELL_RADIUS: Pixels = px(3.0);
 /// Default cell size in a grid.

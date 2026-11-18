@@ -37,6 +37,10 @@ pub fn card_entry(card: AnyElement, index: usize, activation: u64, reduce: bool)
             "card-entry-{index}-{activation}"
         )))
         .relative()
+        // The wrapper stretches with its row, so the cards of a row share one height.
+        .flex()
+        .flex_col()
+        .flex_grow(1.0)
         .child(card)
         .with_animation(
             gpui_kit::SharedString::from(format!("card-anim-{index}-{activation}")),

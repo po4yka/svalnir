@@ -1054,22 +1054,42 @@ fn a_revision_that_changes_while_the_question_waits_refuses_the_enable() {
 fn an_enabled_guard_is_in_the_status_and_a_disable_removes_its_standing() {
     let world = World::new();
     let revision: String = world.activate(BALANCED_CONFIG, "none");
-    let enabled = json(
-        &world.environment,
-        &[
-            "policy",
-            "enable",
-            "memory-guard",
-            "--expected-revision",
-            &revision,
-        ],
-    );
+    let enable = |flags: &[&str]| {
+        let mut arguments: Vec<&str> = vec!["policy", "enable", "memory-guard"];
+        arguments.extend_from_slice(flags);
+        arguments.extend(["--expected-revision", revision.as_str()]);
+        json(&world.environment, &arguments)
+    };
+    // No acceptance flag accepts no class, and a force quit is not in this
+    // configuration: each is refused and changes nothing.
+    for flags in [&[][..], &["--accept-force-quit"][..]] {
+        let refused = enable(flags);
+        assert_eq!(
+            refused.status,
+            ExitStatus::Unavailable,
+            "{}",
+            refused.stdout
+        );
+        assert_eq!(refused.error_code(), "acceptance_mismatch", "{flags:?}");
+        let status = json(&world.environment, &["agent", "status"]);
+        assert_eq!(
+            status.result()["authority"]["guards"][1]["grant"],
+            Value::Null,
+            "{}",
+            status.stdout
+        );
+    }
+    let enabled = enable(&["--accept-application-exit"]);
     assert_eq!(enabled.status, ExitStatus::Success, "{}", enabled.stdout);
     // The configuration does not allow a force quit, so the grant has
     // only the request for an exit.
     assert_eq!(
         enabled.result()["report"]["action_classes"],
         serde_json::json!(["RequestApplicationExit"])
+    );
+    assert_eq!(
+        enabled.result()["report"]["acceptances"],
+        serde_json::json!(["application_exit"])
     );
     let status = json(&world.environment, &["status"]);
     let policies = &status.result()["policies"];
@@ -1350,6 +1370,7 @@ fn an_install_names_a_guard_that_the_authority_record_has_enabled() {
             "policy",
             "enable",
             "memory-guard",
+            "--accept-application-exit",
             "--expected-revision",
             &revision,
         ],
@@ -1473,6 +1494,56 @@ fn the_removal_of_old_documents_keeps_the_lock_files() {
 
 /// `--expected-revision none` cannot enable a guard, and the error says
 /// that the revisions do not agree.
+/// A guard whose revision permits a force quit needs `--accept-force-quit`;
+/// `--accept-application-exit` alone is refused. With the two flags, the
+/// accepted classes are those of `--accept-force-quit`.
+#[test]
+fn a_guard_that_permits_a_force_quit_needs_the_force_quit_acceptance() {
+    let world = World::new();
+    let config: String = BALANCED_CONFIG.replace(
+        "[memory_guard]\nenabled = true\n",
+        "[memory_guard]\nenabled = true\nallow_force_quit = true\n",
+    );
+    assert_ne!(config, BALANCED_CONFIG);
+    let revision: String = world.activate(&config, "none");
+    let enable = |flags: &[&str]| {
+        let mut arguments: Vec<&str> = vec!["policy", "enable", "memory-guard"];
+        arguments.extend_from_slice(flags);
+        arguments.extend(["--expected-revision", revision.as_str()]);
+        json(&world.environment, &arguments)
+    };
+    let refused = enable(&["--accept-application-exit"]);
+    assert_eq!(
+        refused.status,
+        ExitStatus::Unavailable,
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.error_code(), "acceptance_mismatch");
+    let enabled = enable(&["--accept-application-exit", "--accept-force-quit"]);
+    assert_eq!(enabled.status, ExitStatus::Success, "{}", enabled.stdout);
+    assert_eq!(
+        enabled.result()["report"]["action_classes"],
+        serde_json::json!(["RequestApplicationExit", "ForceApplicationExit"])
+    );
+    assert_eq!(
+        enabled.result()["report"]["acceptances"],
+        serde_json::json!(["force_quit"])
+    );
+    let text = run(
+        &world.environment,
+        &[
+            "policy",
+            "enable",
+            "memory-guard",
+            "--accept-force-quit",
+            "--expected-revision",
+            &revision,
+        ],
+    );
+    assert!(text.stdout.contains("force_quit"), "{}", text.stdout);
+}
+
 #[test]
 fn an_enable_that_expects_no_revision_is_a_revision_conflict() {
     let world = World::new();

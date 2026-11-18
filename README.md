@@ -390,7 +390,8 @@ svalnir policy show memory-guard
 svalnir policy simulate disk-guard
 svalnir policy simulate memory-guard
 
-# Enable the reviewed action classes as standing policies.
+# Enable the reviewed action classes as standing policies. A memory guard
+# that does not permit a force quit takes --accept-application-exit.
 svalnir policy enable disk-guard --accept-permanent-eviction
 svalnir policy enable memory-guard --accept-force-quit
 

@@ -450,7 +450,12 @@ pub struct PolicyEnableArgs {
     /// Accept permanent eviction of approved regenerable data.
     #[arg(long)]
     pub accept_permanent_eviction: bool,
-    /// Accept force quit of eligible applications.
+    /// Accept the request for an exit of eligible applications, with no
+    /// force quit.
+    #[arg(long)]
+    pub accept_application_exit: bool,
+    /// Accept force quit of eligible applications. It includes the request
+    /// for an exit.
     #[arg(long)]
     pub accept_force_quit: bool,
     /// Policy revision that was reviewed.

@@ -352,20 +352,37 @@ fn class_names(classes: &[ActionClass]) -> String {
         .join(", ")
 }
 
-/// The action classes that the flags of `policy enable` accept. Enabling
-/// the memory guard accepts the request for an application exit; a force
-/// quit needs its own flag.
+/// The action classes that the flags of `policy enable` accept. Each
+/// acceptance has its own flag; no flag accepts a class. With
+/// `--accept-application-exit` and `--accept-force-quit` together, the
+/// classes are those of `--accept-force-quit`.
 fn accepted_classes(arguments: &PolicyEnableArgs) -> Vec<ActionClass> {
     let mut acceptances: Vec<Acceptance> = Vec::new();
     if arguments.accept_permanent_eviction {
         acceptances.push(Acceptance::PermanentEviction);
     }
-    if arguments.accept_force_quit {
-        acceptances.push(Acceptance::ForceQuit);
-    } else if arguments.policy.policy == PolicyName::MemoryGuard {
+    if arguments.accept_application_exit {
         acceptances.push(Acceptance::ApplicationExit);
     }
+    if arguments.accept_force_quit {
+        acceptances.push(Acceptance::ForceQuit);
+    }
     Acceptance::classes_of(&acceptances)
+}
+
+/// The acceptances that the action classes of a recorded grant name.
+fn acceptances_of(classes: &[ActionClass]) -> Vec<Acceptance> {
+    let has = |class: &ActionClass| classes.contains(class);
+    let mut acceptances: Vec<Acceptance> = Vec::new();
+    if has(&ActionClass::EvictRegenerableData) {
+        acceptances.push(Acceptance::PermanentEviction);
+    }
+    if has(&ActionClass::ForceApplicationExit) {
+        acceptances.push(Acceptance::ForceQuit);
+    } else if has(&ActionClass::RequestApplicationExit) {
+        acceptances.push(Acceptance::ApplicationExit);
+    }
+    acceptances
 }
 
 fn enable_refusal(refusal: EnableRefusal) -> ErrorBody {
@@ -394,12 +411,16 @@ fn enable_refusal(refusal: EnableRefusal) -> ErrorBody {
         EnableRefusal::AcceptanceMismatch { missing, excess } => authority(
             "acceptance_mismatch",
             format!(
-                "the accepted action classes do not agree with the revision in effect: not accepted: {}; accepted but not in the policy: {}; `--accept-permanent-eviction` accepts EvictRegenerableData, and `--accept-force-quit` accepts ForceApplicationExit; the command made no change",
+                "the accepted action classes do not agree with the revision in effect: not accepted: {}; accepted but not in the policy: {}; `--accept-permanent-eviction` accepts EvictRegenerableData, `--accept-application-exit` accepts RequestApplicationExit, and `--accept-force-quit` accepts RequestApplicationExit and ForceApplicationExit; the command made no change",
                 class_names(&missing),
                 class_names(&excess)
             ),
         )
-        .with_fields(&["accept_permanent_eviction", "accept_force_quit"]),
+        .with_fields(&[
+            "accept_permanent_eviction",
+            "accept_application_exit",
+            "accept_force_quit",
+        ]),
         EnableRefusal::GrantIdInUse => session::identity_error(),
     }
 }
@@ -409,6 +430,9 @@ fn enable_refusal(refusal: EnableRefusal) -> ErrorBody {
 struct EnableView {
     #[serde(flatten)]
     report: EnableReport,
+    /// The acceptances that the recorded grant has: `permanent_eviction`,
+    /// `application_exit`, or `force_quit`.
+    acceptances: Vec<Acceptance>,
     standing: GuardStanding,
 }
 
@@ -511,6 +535,7 @@ pub(crate) fn policy_enable(
         state: acknowledged.state,
         inhibition: acknowledged.inhibition,
         report: EnableView {
+            acceptances: acceptances_of(&acknowledged.report.action_classes),
             report: acknowledged.report,
             standing,
         },

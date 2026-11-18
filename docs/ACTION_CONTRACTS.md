@@ -191,6 +191,8 @@ All filesystem action classes require anchored roots, valid object/volume identi
 
 Resolve paths without shell expansion. A display path is not a deletion capability. Avoid following unexpected symlinks, crossing unapproved mounts, or trusting a string-prefix scope check.
 
+An approved root must be on a filesystem that the mount flags report as local (`MNT_LOCAL`); a local external disk is local, and a network filesystem or an automounter map is not ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 4). Before it opens the root, the filesystem executor reads the mount table with `getfsstat` and `MNT_NOWAIT` and compares the text of the root path and the device of the root object of the plan with it. That comparison makes no call on the filesystem of the root. A root on a filesystem that is not local is refused with `root_not_local` (family `eligibility`). A root for which the table has no mount, or a table that cannot be read, is refused with `root_locality_unknown` (family `evidence`). In both cases no call is issued and the result is `Skipped`.
+
 Descriptor-relative traversal and identity checks reduce substitution risk; they do not make a later name-based unlink conditional on the previously inspected inode. A rename into quarantine also changes the source before post-move inspection. Unattended mutation requires the tested confinement argument specified in [CLEANUP_RULES.md](CLEANUP_RULES.md), including explicitly accepted residual risks where applicable.
 
 Ordinary user-cache mutation runs as its owner. Initial root deletion is limited to helper-owned data or reviewed administrator-controlled disposable namespaces. A denied user-scope action must not be retried automatically as root.

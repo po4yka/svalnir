@@ -187,6 +187,15 @@ pub enum DiscoveryError {
     /// The root is on another device than the bound volume.
     #[error("the root is not on the bound volume")]
     RootDevice,
+    /// The mount flags report the filesystem of the root, or of a directory
+    /// above it, as not local: a network filesystem or an automounter map.
+    /// A local external disk is local.
+    #[error("the root is not on a local filesystem")]
+    RootNotLocal,
+    /// The mount table cannot be read, or it has no mount for the root or
+    /// for a directory above it.
+    #[error("the locality of the filesystem of the root is not known")]
+    RootLocalityUnknown,
     /// The root does not have the positive classification that the rule
     /// needs, for example the root marker of Svalnir.
     #[error("the root is not classified as a root of the rule")]
@@ -286,6 +295,10 @@ pub enum SkipReason {
     NotRegenerable,
     /// The evidence does not establish that the content can be made again.
     RegenerabilityUnknown,
+    /// The source that makes the content again is on a filesystem that the
+    /// mount table does not report as local, so the rule does not examine
+    /// it.
+    SourceNotLocal,
     /// A hard exclusion or a user exclusion overlaps the unit.
     ExclusionOverlap,
     /// The unit, or an object in it, has another owner.
@@ -346,6 +359,7 @@ impl SkipReason {
             Self::ProtectedData
             | Self::NotRegenerable
             | Self::RegenerabilityUnknown
+            | Self::SourceNotLocal
             | Self::ExclusionOverlap => SkipCategory::ProtectedData,
             Self::WrongOwner | Self::SharedOwnership => SkipCategory::UnknownOwnership,
             Self::ActiveProducer => SkipCategory::ActiveProducer,

@@ -41,7 +41,10 @@ use super::unit::entry_change;
 use super::xcode::{
     ProducerProcesses, XCODE_DERIVED_DATA_LAYOUT, XcodeDerivedDataRule, XcodeEvidence,
 };
+use crate::platform::volume::raw::MOUNT_FLAG_LOCAL;
+use crate::platform::volume::{MountTable, MountTableSource, RawMount};
 use crate::scan::{CancellationToken, ScanClock, ScanTimestamp};
+use svalnir_core::observation::UnavailableReason;
 
 const DAY_SECONDS: i64 = 86_400;
 const PROJECT: &str = "App-abcdefghijklmnopqrstuvwxyzab";
@@ -1892,6 +1895,162 @@ fn a_user_exclusion_and_a_link_in_the_unit_path_stop_a_unit() {
         assert_eq!(skipped.eligibility.identity_matches, Fact::NotSatisfied);
     }
     assert_eq!(discovery.entries_examined, EntryCount::ZERO);
+}
+
+// ---------------------------------------------------------------------
+// Roots and sources on a filesystem that is not local. No test mounts a
+// volume: each test gives the rule a mount table.
+// ---------------------------------------------------------------------
+
+/// The mount point of a network volume that only the injected tables of
+/// the tests have. No test makes a call on a path below it.
+const REMOTE_VOLUME: &str = "/Volumes/svalnir-test-remote";
+
+fn remote_mount(point: &str, filesystem_type: &str, flags: u32) -> RawMount {
+    RawMount {
+        mount_point: point.as_bytes().to_vec(),
+        mounted_from: b"//host/share".to_vec(),
+        filesystem_type: filesystem_type.as_bytes().to_vec(),
+        fsid: [i32::MIN, 0],
+        flags,
+        block_size: 4_096,
+        blocks: 1,
+        blocks_free: 1,
+        blocks_available: 1,
+    }
+}
+
+/// The table of the host, with each mount reported as not local.
+fn no_local_mount() -> Result<MountTable, UnavailableReason> {
+    let mounts: Vec<RawMount> = MountTable::read()?
+        .mounts()
+        .iter()
+        .cloned()
+        .map(|mut raw| {
+            raw.flags &= !MOUNT_FLAG_LOCAL;
+            raw
+        })
+        .collect();
+    Ok(MountTable::from_mounts(mounts))
+}
+
+/// A table with a local `/` whose identity is not the device of any object.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature of a mount table source"
+)]
+fn no_mount_for_the_device() -> Result<MountTable, UnavailableReason> {
+    let mut root: RawMount = remote_mount("/", "apfs", MOUNT_FLAG_LOCAL);
+    root.fsid = [i32::MIN + 1, 0];
+    Ok(MountTable::from_mounts(vec![root]))
+}
+
+fn no_table() -> Result<MountTable, UnavailableReason> {
+    Err(UnavailableReason::TransientFailure)
+}
+
+/// The table of the host with a network volume and an automounter map.
+fn with_remote_volumes() -> Result<MountTable, UnavailableReason> {
+    let mut mounts: Vec<RawMount> = MountTable::read()?.mounts().to_vec();
+    mounts.push(remote_mount(REMOTE_VOLUME, "smbfs", 0));
+    // The automounter map has the local flag on some hosts.
+    mounts.push(remote_mount("/net", "autofs", MOUNT_FLAG_LOCAL));
+    Ok(MountTable::from_mounts(mounts))
+}
+
+/// Whether a discovery error is the expected one.
+type ExpectedError = fn(&DiscoveryError) -> bool;
+
+#[test]
+fn a_root_on_a_filesystem_that_is_not_local_is_refused() {
+    let temporary = temporary_fixture();
+    let (xcode, _) = xcode_fixture();
+    let cancel = CancellationToken::new();
+    let clock = later_clock();
+    let control = DiscoveryControl {
+        limits: limits(),
+        cancel: &cancel,
+        clock: &clock,
+    };
+    let registry = ReviewedRules::new().unwrap();
+    let cases: [(MountTableSource, ExpectedError); 3] = [
+        (no_local_mount, |error| {
+            matches!(error, DiscoveryError::RootNotLocal)
+        }),
+        (no_mount_for_the_device, |error| {
+            matches!(error, DiscoveryError::RootLocalityUnknown)
+        }),
+        (no_table, |error| {
+            matches!(error, DiscoveryError::RootLocalityUnknown)
+        }),
+    ];
+    for (source, expected) in cases {
+        let error = registry
+            .expired_temporary()
+            .clone()
+            .with_mount_table(source)
+            .discover(&temporary.scope(), NO_LEASES, DiscoveryMode::Full, &control)
+            .unwrap_err();
+        assert!(expected(&error), "{error:?}");
+        let error = registry
+            .xcode_derived_data()
+            .clone()
+            .with_mount_table(source)
+            .discover(&xcode.scope(), NOT_RUNNING, DiscoveryMode::Full, &control)
+            .unwrap_err();
+        assert!(expected(&error), "{error:?}");
+    }
+    // The table of the host reports the temporary directory as local.
+    assert!(
+        registry
+            .expired_temporary()
+            .discover(&temporary.scope(), NO_LEASES, DiscoveryMode::Full, &control)
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_project_on_a_filesystem_that_is_not_local_is_not_examined() {
+    let (fixture, project) = xcode_fixture();
+    let other = add_project(
+        &fixture,
+        "Other-abcdefghijklmnopqrstuvwxyzab",
+        Path::new("/net/host/Other/Other.xcodeproj"),
+    );
+    fs::write(
+        project.join("info.plist"),
+        info_plist(
+            &Path::new(REMOTE_VOLUME).join("App/App.xcodeproj"),
+            real_now_plus(-DAY_SECONDS),
+        ),
+    )
+    .unwrap();
+    let registry = ReviewedRules::new().unwrap();
+    let rule = registry
+        .xcode_derived_data()
+        .clone()
+        .with_mount_table(with_remote_volumes);
+    let discovery = discover_xcode_with(
+        &rule,
+        &fixture,
+        NOT_RUNNING,
+        DiscoveryMode::Full,
+        &month_later_clock(),
+    )
+    .unwrap();
+    assert_eq!(discovery.candidates.len(), 0, "{:?}", discovery.candidates);
+    for name in [PROJECT, "Other-abcdefghijklmnopqrstuvwxyzab"] {
+        for unit_path in super::xcode::UNIT_PATHS {
+            let skipped = skip_of(&discovery, &format!("{name}/{unit_path}"));
+            assert_eq!(skipped.reasons, [SkipReason::SourceNotLocal], "{name}");
+            assert_eq!(skipped.eligibility.regenerable, Fact::Unknown);
+        }
+    }
+    assert_eq!(
+        SkipReason::SourceNotLocal.category(),
+        SkipCategory::ProtectedData
+    );
+    assert!(other.is_dir());
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "the signature of a lock query")]

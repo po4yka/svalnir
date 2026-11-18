@@ -34,6 +34,7 @@ use super::model::{
     DiscoveryError, DiscoveryScope, MeasurementSource, ReclaimEstimate, RootEvidence, SizeMeasure,
     SkipReason, SkippedUnit, TargetEvidence, UnitMeasurement,
 };
+use crate::platform::volume::{Locality, MountTable};
 use crate::scan::{
     CancellationToken, EntryKind, EntryRecord, RegionCause, ScanCompletion, ScanError, ScanLimits,
     ScanObserver, ScanRequest, ScanResult, run_scan,
@@ -240,6 +241,69 @@ pub(super) fn is_plain_relative(path: &Path) -> bool {
         && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// Why [`walk_local`] did not give a snapshot.
+#[derive(Debug)]
+pub(super) enum WalkStop {
+    /// A component of the path is absent.
+    Absent,
+    /// A directory above the last component is a symbolic link.
+    LinkInAncestor,
+    /// The path, or an object on it, is on a filesystem that is not local.
+    NotLocal,
+    /// The mount table has no mount for the path or for an object on it.
+    LocalityUnknown,
+    /// A metadata read failed.
+    Failed(io::Error),
+}
+
+/// `Ok` for a local filesystem, and the stop of each other locality.
+fn require_local(locality: Locality) -> Result<(), WalkStop> {
+    match locality {
+        Locality::Local => Ok(()),
+        Locality::NotLocal => Err(WalkStop::NotLocal),
+        Locality::Unknown => Err(WalkStop::LocalityUnknown),
+    }
+}
+
+/// The snapshot of the object at the plain absolute path `path`, after the
+/// check that the path is on local filesystems only.
+///
+/// The text of the path is compared with the mount table before the first
+/// call. Then each component is examined with `lstat` from `/` down, and
+/// the device of each object must be a local filesystem of the table. A
+/// directory above the last component must not be a symbolic link. A call
+/// is thus made only for a name in a directory on a local filesystem, so no
+/// call follows the path into a network filesystem or starts an
+/// automount. The last component is not followed.
+pub(super) fn walk_local(path: &Path, mounts: &MountTable) -> Result<ObjectSnapshot, WalkStop> {
+    require_local(mounts.path_locality(path))?;
+    let measure = |prefix: &Path| {
+        let snapshot: ObjectSnapshot = lstat(prefix).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => WalkStop::Absent,
+            _ => WalkStop::Failed(error),
+        })?;
+        require_local(mounts.device_locality(snapshot.object.device))?;
+        Ok(snapshot)
+    };
+    let mut prefix: PathBuf = PathBuf::new();
+    let mut last: Option<ObjectSnapshot> = None;
+    for component in path.components() {
+        prefix.push(component);
+        if component == Component::RootDir {
+            continue;
+        }
+        if last.is_some_and(|parent| parent.kind == ObjectKind::SymbolicLink) {
+            return Err(WalkStop::LinkInAncestor);
+        }
+        last = Some(measure(&prefix)?);
+    }
+    match last {
+        Some(snapshot) => Ok(snapshot),
+        // The path is `/`.
+        None => measure(path),
+    }
+}
+
 /// The root of one discovery after its checks.
 #[derive(Debug)]
 pub(super) struct RootView {
@@ -271,15 +335,26 @@ fn with_resolved_forms(list: &[PathBuf]) -> Vec<PathBuf> {
 
 impl RootView {
     /// Checks the root of `scope`: a plain absolute path to a directory
-    /// that is not a symbolic link and has none in an ancestor, with the
-    /// owner of the discovery, on the bound device, and outside each
-    /// protected path.
-    pub(super) fn open(scope: &DiscoveryScope<'_>) -> Result<Self, DiscoveryError> {
+    /// that is not a symbolic link and has none in an ancestor, on local
+    /// filesystems only (see [`walk_local`]), with the owner of the
+    /// discovery, on the bound device, and outside each protected path.
+    pub(super) fn open(
+        scope: &DiscoveryScope<'_>,
+        mounts: &MountTable,
+    ) -> Result<Self, DiscoveryError> {
         let path: &Path = &scope.root.path;
         if !is_plain_absolute(path) {
             return Err(DiscoveryError::RootPath);
         }
-        let snapshot: ObjectSnapshot = lstat(path).map_err(DiscoveryError::RootUnavailable)?;
+        let snapshot: ObjectSnapshot = walk_local(path, mounts).map_err(|stop| match stop {
+            WalkStop::Absent => {
+                DiscoveryError::RootUnavailable(io::Error::from(io::ErrorKind::NotFound))
+            }
+            WalkStop::Failed(error) => DiscoveryError::RootUnavailable(error),
+            WalkStop::LinkInAncestor => DiscoveryError::RootPath,
+            WalkStop::NotLocal => DiscoveryError::RootNotLocal,
+            WalkStop::LocalityUnknown => DiscoveryError::RootLocalityUnknown,
+        })?;
         if snapshot.kind != ObjectKind::Directory {
             return Err(DiscoveryError::RootNotDirectory);
         }
@@ -293,6 +368,8 @@ impl RootView {
         // following of links, so a root with a link in an ancestor cannot
         // be executed. The comparisons of the discovery and of the overlap
         // resolution are on plain paths, so they need no resolved form.
+        // The walk found no link in an ancestor, so this call follows no
+        // link to another filesystem.
         if fs::canonicalize(path).as_deref().ok() != Some(path) {
             return Err(DiscoveryError::RootPath);
         }

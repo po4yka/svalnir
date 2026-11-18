@@ -59,6 +59,7 @@ use super::unit::{
     check_known, elapsed_between, establish_charge, list_root, lstat, read_record, reason_of,
     target_evidence,
 };
+use crate::platform::volume::{MountTable, MountTableSource};
 use crate::scan::EntryKind;
 
 /// The identity of the rule.
@@ -167,6 +168,7 @@ pub struct TemporaryEvidence<'a> {
 #[derive(Debug, Clone)]
 pub struct ExpiredTemporaryRule {
     rule: Rule,
+    mounts: MountTableSource,
 }
 
 /// The declaration of the revision of this build. Each layout is
@@ -342,7 +344,17 @@ impl ExpiredTemporaryRule {
     /// Makes the rule with the declaration of this build.
     pub(super) fn new() -> Result<Self, RegistryError> {
         let rule: Rule = Checked::new(declaration()?).map_err(RegistryError::Incomplete)?;
-        Ok(Self { rule })
+        Ok(Self {
+            rule,
+            mounts: MountTable::read,
+        })
+    }
+
+    /// The rule with another source of the mount table. A test gives a
+    /// table with a filesystem that is not local.
+    #[cfg(test)]
+    pub(super) fn with_mount_table(self, mounts: MountTableSource) -> Self {
+        Self { mounts, ..self }
     }
 
     /// The checked declaration of the rule revision.
@@ -359,7 +371,8 @@ impl ExpiredTemporaryRule {
     /// # Errors
     ///
     /// Returns a [`DiscoveryError`] when a limit is too large, when the
-    /// root fails a check or has no valid marker, when the root changed
+    /// root fails a check (also when it is not on a local filesystem) or
+    /// has no valid marker, when the root changed
     /// during the discovery, or when a known candidate belongs to another
     /// rule revision or root.
     pub fn discover(
@@ -383,7 +396,9 @@ impl ExpiredTemporaryRule {
         after_measurement: &mut dyn FnMut(&Path),
     ) -> Result<Discovery, DiscoveryError> {
         let mut collector: Collector<'_> = Collector::new(control)?;
-        let root: RootView = RootView::open(scope)?;
+        let mounts: MountTable =
+            (self.mounts)().map_err(|_| DiscoveryError::RootLocalityUnknown)?;
+        let root: RootView = RootView::open(scope, &mounts)?;
         check_root_marker(&root, scope)?;
         let mut completion: DiscoveryCompletion = DiscoveryCompletion::Finished;
         let mut item = ItemContext {

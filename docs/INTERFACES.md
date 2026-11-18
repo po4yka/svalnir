@@ -224,6 +224,8 @@ A refusal of the coordinator or of the authorization keeps its own code and fami
 | `incident_allowance_missing` | `limits` | An automatic plan has no incident allowance: it did not come from the controller of the agent |
 | `reconcile_before_force` | `outcome` | The effect of the graceful step is not known, so no force step is dispatched before a reconciliation |
 | `approved_root_mismatch` | `evidence` | A root record of the executing process has the identity of the root of a file target and a different path or object. The target is skipped with no call |
+| `root_not_local` | `eligibility` | From the filesystem executor: the mount table reports the filesystem of the root of a file target as not local (a network filesystem or an automounter map). The target is skipped with no call ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7) |
+| `root_locality_unknown` | `evidence` | From the filesystem executor: the mount table cannot be read, or it has no mount for the path or the device of the root of a file target. The target is skipped with no call |
 
 A plan explanation gives the reason `link_count_unknown` (family `evidence`) for an entry of a rule that skips hard-linked objects when the link count of the entry is not known. The `next_action` values of this build are `none`, `correct_request`, `refresh_observation`, `resolve_authority`, `respect_limits`, `prepare_new_plan`, `query_operation`, and `reconcile`.
 

@@ -15,6 +15,7 @@
 //! | [`collect_capacity`] | `disk.total_bytes`, `disk.free_bytes`, `disk.available_bytes` |
 //! | [`collect_foundation_capacity`] | The two Foundation planning values |
 //! | [`group_by_capacity_pool`] | Volumes grouped by shared free space |
+//! | [`MountTable`] | Whether a path or a device is on a local filesystem |
 //!
 //! The collectors take the [`CollectionContext`] of the memory module:
 //! `crate::platform::memory::CollectionContext`.
@@ -23,6 +24,7 @@
 
 pub mod capacity;
 pub mod identity;
+pub mod locality;
 pub mod pool;
 pub mod raw;
 
@@ -46,6 +48,7 @@ pub use identity::{
     VolumeUuidLookup, apfs_device_name, mounted_volume, reject_ambiguous_containers,
     reject_duplicate_volume_uuids,
 };
+pub use locality::{Locality, MountTable, MountTableSource};
 pub use pool::{CapacityGrouping, CapacityPool, CapacityPoolMembers, group_by_capacity_pool};
 pub use raw::{RawApfsContainer, RawFoundationCapacity, RawMount};
 

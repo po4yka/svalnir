@@ -45,6 +45,9 @@ use super::{
     ExecutorLimits, FsExecutor, FsExecutorConfig, FsTargetOutcome, NeverStop, RootError, Stop,
     TrashBackend, TrashFailure, TrashReply, TrashRequest,
 };
+use crate::platform::volume::raw::MOUNT_FLAG_LOCAL;
+use crate::platform::volume::{MountTable, MountTableSource, RawMount};
+use svalnir_core::observation::UnavailableReason;
 
 const ROOT_ID: &str = "root_1";
 
@@ -474,15 +477,15 @@ fn once(action: impl Fn(&[u8]) + Send + Sync + 'static, at: Checkpoint) -> Check
 
 fn checkpoint_injection(hook: CheckpointHook) -> Injection {
     Injection {
-        metadata: None,
         checkpoint: Some(hook),
+        ..Injection::default()
     }
 }
 
 fn metadata_injection(hook: MetadataHook) -> Injection {
     Injection {
         metadata: Some(hook),
-        checkpoint: None,
+        ..Injection::default()
     }
 }
 
@@ -2393,6 +2396,89 @@ fn a_root_whose_identity_changed_is_refused() {
     assert_skipped(&outcome, &ErrorFamily::Evidence, code::ROOT_UNAVAILABLE);
 
     assert!(file.exists());
+    fixture.assert_outside_unchanged();
+}
+
+/// The table of the host, with each mount reported as not local. No test
+/// mounts a volume.
+fn no_local_mount() -> Result<MountTable, UnavailableReason> {
+    let mounts: Vec<RawMount> = MountTable::read()?
+        .mounts()
+        .iter()
+        .cloned()
+        .map(|mut raw| {
+            raw.flags &= !MOUNT_FLAG_LOCAL;
+            raw
+        })
+        .collect();
+    Ok(MountTable::from_mounts(mounts))
+}
+
+/// The table of the host with no mount for the device of any object.
+fn no_mount_for_the_device() -> Result<MountTable, UnavailableReason> {
+    let mounts: Vec<RawMount> = MountTable::read()?
+        .mounts()
+        .iter()
+        .cloned()
+        .map(|mut raw| {
+            raw.fsid = [i32::MIN, 0];
+            raw
+        })
+        .collect();
+    Ok(MountTable::from_mounts(mounts))
+}
+
+fn no_table() -> Result<MountTable, UnavailableReason> {
+    Err(UnavailableReason::TransientFailure)
+}
+
+#[test]
+fn a_root_on_a_filesystem_that_is_not_local_gets_no_call() {
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("data.bin");
+    fs::write(&file, b"data").unwrap();
+    let cases: [(MountTableSource, &ErrorFamily, &str); 3] = [
+        (
+            no_local_mount,
+            &ErrorFamily::Eligibility,
+            code::ROOT_NOT_LOCAL,
+        ),
+        (
+            no_mount_for_the_device,
+            &ErrorFamily::Evidence,
+            code::ROOT_LOCALITY_UNKNOWN,
+        ),
+        (
+            no_table,
+            &ErrorFamily::Evidence,
+            code::ROOT_LOCALITY_UNKNOWN,
+        ),
+    ];
+    for class in [
+        ActionClass::EvictRegenerableData,
+        ActionClass::DeleteSelectedFiles,
+        ActionClass::MoveToTrash,
+    ] {
+        let envelope = fixture.envelope(class.clone(), "data.bin");
+        for (source, family, expected) in cases {
+            let injection = Injection {
+                mounts: Some(source),
+                ..Injection::default()
+            };
+            let outcome = run(
+                &fixture.executor_with(injection),
+                &fixture.roots(),
+                &envelope,
+            );
+            assert_skipped(&outcome, family, expected);
+            assert!(file.exists());
+        }
+    }
+    // The table of the host reports the temporary root as local.
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "data.bin");
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+    assert_eq!(outcome.result.effect, TargetEffect::Removed);
+    assert!(!file.exists());
     fixture.assert_outside_unchanged();
 }
 

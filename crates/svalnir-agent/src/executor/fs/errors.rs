@@ -48,6 +48,12 @@ pub mod code {
     pub const DEVICE_MISMATCH: &str = "device_mismatch";
     /// The approved root is absent.
     pub const ROOT_UNAVAILABLE: &str = "root_unavailable";
+    /// The mount flags report the filesystem of the approved root as not
+    /// local: a network filesystem or an automounter map.
+    pub const ROOT_NOT_LOCAL: &str = "root_not_local";
+    /// The mount table cannot be read, or it has no mount for the path or
+    /// the device of the approved root.
+    pub const ROOT_LOCALITY_UNKNOWN: &str = "root_locality_unknown";
     /// The device or the inode of the approved root changed, or a
     /// component of its path is a symbolic link or is not a directory.
     pub const ROOT_IDENTITY_CHANGED: &str = "root_identity_changed";
@@ -132,7 +138,7 @@ pub mod code {
     pub const BATCH_LIMIT: &str = "batch_limit";
 
     /// Each code of the executor.
-    pub const ALL: [&str; 51] = [
+    pub const ALL: [&str; 53] = [
         APPROVED_ROOT_MISMATCH,
         TREE_ENTRY_OWNER_MISMATCH,
         BATCH_LIMIT,
@@ -150,6 +156,8 @@ pub mod code {
         VOLUME_MISMATCH,
         DEVICE_MISMATCH,
         ROOT_UNAVAILABLE,
+        ROOT_NOT_LOCAL,
+        ROOT_LOCALITY_UNKNOWN,
         ROOT_IDENTITY_CHANGED,
         PARENT_NOT_DIRECTORY,
         MOUNT_CROSSED,

@@ -89,9 +89,10 @@ use super::plist::{ProjectInfo, parse_project_info};
 use super::registry::RegistryError;
 use super::unit::{
     Assessment, Collector, ObjectKind, ObjectSnapshot, RecordRead, RootView, UnitUnderMeasurement,
-    check_known, elapsed_between, establish_charge, is_plain_absolute, list_root, lstat,
-    read_record, reason_of, target_evidence,
+    WalkStop, check_known, elapsed_between, establish_charge, is_plain_absolute, list_root, lstat,
+    read_record, reason_of, target_evidence, walk_local,
 };
+use crate::platform::volume::{MountTable, MountTableSource};
 use crate::scan::EntryKind;
 
 /// The identity of the rule.
@@ -282,6 +283,7 @@ type LockProbe = fn(&File) -> io::Result<bool>;
 pub struct XcodeDerivedDataRule {
     rule: Rule,
     lock_probe: LockProbe,
+    mounts: MountTableSource,
 }
 
 /// The declaration of the revision of this build. Each layout is
@@ -516,7 +518,18 @@ impl XcodeDerivedDataRule {
     /// fixed result.
     pub(super) fn with_lock_probe(lock_probe: LockProbe) -> Result<Self, RegistryError> {
         let rule: Rule = Checked::new(declaration()?).map_err(RegistryError::Incomplete)?;
-        Ok(Self { rule, lock_probe })
+        Ok(Self {
+            rule,
+            lock_probe,
+            mounts: MountTable::read,
+        })
+    }
+
+    /// The rule with another source of the mount table. A test gives a
+    /// table with a filesystem that is not local.
+    #[cfg(test)]
+    pub(super) fn with_mount_table(self, mounts: MountTableSource) -> Self {
+        Self { mounts, ..self }
     }
 
     /// The checked declaration of the rule revision.
@@ -526,17 +539,19 @@ impl XcodeDerivedDataRule {
 
     /// Finds the candidates of the `DerivedData` root of `scope`.
     ///
-    /// The discovery reads metadata and `info.plist`, opens each build
-    /// database for a lock query, and reads the metadata of the project of
-    /// `WorkspacePath`. It changes nothing. With
+    /// The discovery reads the mount table, metadata, and `info.plist`,
+    /// opens each build database for a lock query, and reads the metadata
+    /// of the project of `WorkspacePath` when the mount table reports its
+    /// path as local. It changes nothing. With
     /// [`DiscoveryMode::KnownCandidatesOnly`] it lists no directory and
     /// measures no tree.
     ///
     /// # Errors
     ///
     /// Returns a [`DiscoveryError`] when a limit is too large, when the
-    /// root fails a check, when the root changed during the discovery, or
-    /// when a known candidate belongs to another rule revision or root.
+    /// root fails a check (also when it is not on a local filesystem), when
+    /// the root changed during the discovery, or when a known candidate
+    /// belongs to another rule revision or root.
     pub fn discover(
         &self,
         scope: &DiscoveryScope<'_>,
@@ -558,10 +573,13 @@ impl XcodeDerivedDataRule {
         after_measurement: &mut dyn FnMut(&Path),
     ) -> Result<Discovery, DiscoveryError> {
         let mut collector: Collector<'_> = Collector::new(control)?;
-        let root: RootView = RootView::open(scope)?;
+        let mounts: MountTable =
+            (self.mounts)().map_err(|_| DiscoveryError::RootLocalityUnknown)?;
+        let root: RootView = RootView::open(scope, &mounts)?;
         let mut context = UnitContext {
             rule: self,
             root: &root,
+            mounts: &mounts,
             scope,
             evidence,
             after_measurement,
@@ -581,6 +599,9 @@ impl XcodeDerivedDataRule {
 struct UnitContext<'a> {
     rule: &'a XcodeDerivedDataRule,
     root: &'a RootView,
+    /// The mount table of the discovery, for the project path of each
+    /// `info.plist`.
+    mounts: &'a MountTable,
     scope: &'a DiscoveryScope<'a>,
     evidence: XcodeEvidence,
     after_measurement: &'a mut dyn FnMut(&Path),
@@ -753,41 +774,44 @@ impl UnitContext<'_> {
     /// The data can be made again only from the project. A project that
     /// is absent disqualifies the units; a project that the rule cannot
     /// examine leaves the predicate unknown.
+    ///
+    /// The value of `WorkspacePath` comes from a file that the user can
+    /// write, and it can name a network volume or an automounter path. The
+    /// rule examines it only with [`walk_local`]: the mount table is read
+    /// before the first call that uses the path, and no call follows a
+    /// symbolic link. A project on a filesystem that is not local, or a
+    /// path with a symbolic link, leaves the predicate unknown.
     fn workspace_state(&self, workspace: &Path) -> ((Fact, Option<SkipReason>), bool) {
+        let unknown = (Fact::Unknown, Some(SkipReason::RegenerabilityUnknown));
         if !is_plain_absolute(workspace) {
-            let unknown = (Fact::Unknown, Some(SkipReason::RegenerabilityUnknown));
             return (unknown, false);
         }
         // A project in the root, or a root in the directory that holds
-        // the project, is a root that overlaps source. The comparison
-        // uses the path as given and the path with each symbolic link
-        // resolved. The source directory of a project or a workspace
-        // bundle is its parent; a package is its own source directory.
+        // the project, is a root that overlaps source. The source
+        // directory of a project or a workspace bundle is its parent; a
+        // package is its own source directory. The path has no symbolic
+        // link when the predicate can be satisfied, so the path as given
+        // is its resolved form.
         let is_bundle: bool = matches!(
             workspace
                 .extension()
                 .and_then(|extension| extension.to_str()),
             Some("xcodeproj" | "xcworkspace")
         );
-        let resolved: Option<PathBuf> = fs::canonicalize(workspace).ok();
-        let overlaps_source: bool =
-            std::iter::once(workspace)
-                .chain(resolved.as_deref())
-                .any(|form| {
-                    let in_source_directory: bool = is_bundle
-                        && form
-                            .parent()
-                            .is_some_and(|directory| self.root.is_within(directory));
-                    self.root.overlaps_path(form) || in_source_directory
-                });
+        let in_source_directory: bool = is_bundle
+            && workspace
+                .parent()
+                .is_some_and(|directory| self.root.is_within(directory));
+        let overlaps_source: bool = self.root.overlaps_path(workspace) || in_source_directory;
         let has_file = |name: &str| {
             fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
         };
-        let regenerable = match fs::metadata(workspace) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                (Fact::NotSatisfied, Some(SkipReason::NotRegenerable))
+        let regenerable = match walk_local(workspace, self.mounts) {
+            Err(WalkStop::Absent) => (Fact::NotSatisfied, Some(SkipReason::NotRegenerable)),
+            Err(WalkStop::NotLocal | WalkStop::LocalityUnknown) => {
+                (Fact::Unknown, Some(SkipReason::SourceNotLocal))
             }
-            Ok(metadata) if metadata.is_dir() => {
+            Ok(snapshot) if snapshot.kind == ObjectKind::Directory => {
                 let extension: Option<&str> = workspace
                     .extension()
                     .and_then(|extension| extension.to_str());
@@ -799,10 +823,10 @@ impl UnitContext<'_> {
                 if is_project {
                     (Fact::Satisfied, None)
                 } else {
-                    (Fact::Unknown, Some(SkipReason::RegenerabilityUnknown))
+                    unknown
                 }
             }
-            _ => (Fact::Unknown, Some(SkipReason::RegenerabilityUnknown)),
+            Ok(_) | Err(WalkStop::LinkInAncestor | WalkStop::Failed(_)) => unknown,
         };
         (regenerable, overlaps_source)
     }

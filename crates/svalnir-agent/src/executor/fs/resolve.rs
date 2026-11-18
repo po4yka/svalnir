@@ -7,9 +7,11 @@
 //! reason. No step falls back to the path string, and no call resolves a
 //! path of more than one component.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 
 use svalnir_core::action::{FileBinding, FileObjectType, StopReason};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
@@ -17,6 +19,7 @@ use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
 use super::errors::{Cause, code, read_cause};
 use super::model::{AnchoredRoot, ApprovedRoots, path_components};
 use super::native::{self, Kind, Metadata};
+use crate::platform::volume::{Locality, MountTable, MountTableSource};
 
 /// A point of the execution at which a test can change the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,9 @@ pub(super) struct Injection {
     pub(super) metadata: Option<MetadataHook>,
     /// Runs between a check and the call that follows it.
     pub(super) checkpoint: Option<CheckpointHook>,
+    /// Gives the mount table in place of the table of the host, for
+    /// example a table with a root that is not local.
+    pub(super) mounts: Option<MountTableSource>,
 }
 
 impl std::fmt::Debug for Injection {
@@ -52,6 +58,7 @@ impl std::fmt::Debug for Injection {
             .debug_struct("Injection")
             .field("metadata", &self.metadata.is_some())
             .field("checkpoint", &self.checkpoint.is_some())
+            .field("mounts", &self.mounts.is_some())
             .finish()
     }
 }
@@ -70,6 +77,11 @@ impl Injection {
         if let Some(hook) = &self.checkpoint {
             hook(checkpoint, path);
         }
+    }
+
+    /// The mount table: that of the hook, or that of the host.
+    fn mount_table(&self) -> Option<MountTable> {
+        self.mounts.unwrap_or(MountTable::read)().ok()
     }
 }
 
@@ -218,9 +230,37 @@ fn contains_home(root: &[CString], relative: &[CString], home: &[CString]) -> bo
     length <= home.len() && target.zip(home).all(|(left, right)| left == right)
 }
 
+/// Checks that the approved root is on a local filesystem, before any call
+/// that uses its path.
+///
+/// The mount table is read with `MNT_NOWAIT`, and the two queries compare
+/// the text of the root path and the device of the root object of the plan
+/// with the table. Neither query calls the filesystem of the root, so a
+/// network volume that does not answer cannot stop the step, and no
+/// automount starts. The open of the root then compares the identity of
+/// the root with the plan, so the device of the open root is the device
+/// that the table reported.
+fn check_root_locality(root: &AnchoredRoot, injection: &Injection) -> Result<(), Refusal> {
+    let path: &Path = Path::new(OsStr::from_bytes(root.root.path.as_bytes()));
+    let locality: Locality = injection
+        .mount_table()
+        .map_or(Locality::Unknown, |table| match table.path_locality(path) {
+            Locality::Local => table.device_locality(root.root.object.device),
+            other => other,
+        });
+    match locality {
+        Locality::Local => Ok(()),
+        Locality::NotLocal => Err(Refusal::skipped(Cause::eligibility(code::ROOT_NOT_LOCAL))),
+        Locality::Unknown => Err(Refusal::skipped(Cause::evidence(
+            code::ROOT_LOCALITY_UNKNOWN,
+        ))),
+    }
+}
+
 /// Opens the approved root from `/`, one component at a time, and compares
 /// its identity with the evidence of the root.
 fn open_root(root: &AnchoredRoot, injection: &Injection) -> Result<OwnedFd, Refusal> {
+    check_root_locality(root, injection)?;
     let changed = || Refusal::skipped(Cause::evidence(code::ROOT_IDENTITY_CHANGED));
     let mut directory: OwnedFd =
         native::open_filesystem_root().map_err(|error| Refusal::read_failure(&error))?;

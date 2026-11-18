@@ -409,6 +409,25 @@ fn user_protection_cases() -> Vec<ProtectionCase> {
         .with_protections("protected_executable_paths = [\"/applications/editor.APP\"]"),
         ProtectionCase::of("protected path from the home directory", keep, vec![])
             .with_protections("protected_executable_paths = [\"~/Applications\"]"),
+        // The home directory resolves the `~/` path of the list.
+        ProtectionCase::of(
+            "executable below a protected path of the home directory",
+            |candidate| {
+                if let Some(executable) = candidate.processes[1].executable.as_mut() {
+                    executable.path =
+                        path("/Users/a/Applications/Editor.app/Contents/MacOS/Editor");
+                }
+            },
+            vec![Reason::ProtectedExecutablePath],
+        )
+        .with_protections("protected_executable_paths = [\"~/Applications\"]"),
+        // An identity of a different boot is not evidence of a process of
+        // the boot of the plan.
+        ProtectionCase::of(
+            "member with an identity of a different boot",
+            |candidate| candidate.processes[1].boot_id = BootId::new("boot_2").unwrap(),
+            vec![Reason::MembershipNotVerified],
+        ),
         ProtectionCase::of(
             "protected paths and no executable evidence",
             |candidate| candidate.processes[1].executable = None,
@@ -555,18 +574,16 @@ fn each_duration_is_positive_and_fits_its_bound() {
             Nanoseconds::new(20 * SECOND - 1)),
         refused
     );
-    // A sum that overflows does not fit.
+    // A sum that overflows does not fit. The grace period is in its bound
+    // and is shorter than the lifetime, so only the sum of the grace period
+    // and the two windows refuses the request.
     assert_eq!(
-        build(
-            StopStrategy::ForceAfterGrace {
-                grace: Nanoseconds::MAX
-            },
-            |limits| {
-                limits.max_grace = Nanoseconds::MAX;
-                limits.max_execution_deadline = Nanoseconds::MAX;
-                limits.execution_deadline = Nanoseconds::MAX;
-            }
-        ),
+        build(force_after(10), |limits| {
+            limits.verification_window = Nanoseconds::new(u64::MAX / 2 + 1);
+            limits.max_verification_window = Nanoseconds::MAX;
+            limits.max_execution_deadline = Nanoseconds::MAX;
+            limits.execution_deadline = Nanoseconds::MAX;
+        }),
         refused
     );
 }

@@ -16,7 +16,7 @@ use super::context::{
 };
 use super::mode::{CleanupMode, PlanMode};
 use super::paths::{
-    Components, PathSet, components, has_prefix, is_canonical, is_canonical_relative, joins_to,
+    Components, PathSet, components, is_canonical, is_canonical_relative, joins_to,
 };
 use super::reason::{Omission, OmissionReason, push_reason};
 use crate::action::{
@@ -421,8 +421,11 @@ fn rule_checks<'a>(mode: &ModeSelection<'a>) -> Result<Option<RuleChecks<'a>>, P
 /// - No other selected entry that passed the checks above is the same
 ///   path or contains it. The comparison is made before the limits, so an
 ///   entry inside a parent that a limit leaves out is also left out.
+/// - No other selected entry that passed the checks above has the same
+///   volume and the same native object identifiers.
 /// - Its charge fits one batch and fits in what remains of the plan
-///   ceiling.
+///   ceiling. For the `evict` mode, the plan ceiling is not larger than the
+///   pass ceiling of the rule.
 ///
 /// Each other entry is in `preview.omitted` with each reason. When no
 /// entry is in the plan, the result has no plan; that is not an error.
@@ -463,7 +466,14 @@ pub fn build_cleanup_plan(
     let mut omitted: Vec<Omission> = Vec::new();
     let eligible: Vec<Eligible<'_>> = examine(&checks, request.entries, &mut omitted);
     let disjoint: Vec<Eligible<'_>> = remove_overlaps(eligible, &mut omitted);
-    let included: Vec<Eligible<'_>> = fill(disjoint, &request.limits, &mut omitted);
+    // The finite bounds of the rule apply unchanged to a manual eviction:
+    // the plan charges no more than one pass of the rule.
+    let plan_ceiling: WorkCharge = match &checks.rule {
+        Some(checks) => request.limits.plan.min(checks.rule.budget.per_pass),
+        None => request.limits.plan,
+    };
+    let included: Vec<Eligible<'_>> =
+        fill(disjoint, plan_ceiling, &request.limits.batch, &mut omitted);
     omitted.sort_by(|left, right| left.target_id.cmp(&right.target_id));
 
     let mut preview: PlanPreview = PlanPreview {
@@ -586,33 +596,64 @@ fn plan_parts(
     })
 }
 
+/// True when `path` is `parent` or is inside it: the folded components of
+/// `parent` are the first components of `path`.
+///
+/// The comparison is exact after the case fold. It is not the fail-closed
+/// comparison of the exclusion lists, which counts each pair of non-ASCII
+/// components as a match: that rule would leave out each second entry of a
+/// directory whose names are not ASCII. Two selected entries that are one
+/// object in two normalization forms are found by their object identifiers
+/// ([`remove_overlaps`]), when the two have them. An entry with no
+/// identifiers, and an entry inside a parent whose name has a different
+/// normalization form, is not found: the plan then has two steps for one
+/// object, and the second step finds its target absent or changed. No
+/// protection depends on this comparison.
+fn is_same_or_inside(path: &[Vec<u8>], parent: &[Vec<u8>]) -> bool {
+    path.len() >= parent.len() && path.iter().zip(parent).all(|(left, right)| left == right)
+}
+
 /// Leaves out each entry that is the same path as a different entry or is
-/// inside it (`docs/CLEANUP_RULES.md` section 8).
+/// inside it, and each entry that is the same object as a different entry
+/// (`docs/CLEANUP_RULES.md` section 8).
 ///
 /// The entries arrive in the sequence of their target identities. A
 /// shorter path is examined first, so a parent stays and its descendants
 /// are left out. Of two entries with the same path, the one with the
 /// smaller target identity stays. An entry is compared only with the
-/// entries that stay. The comparison is the fail-closed comparison of the
-/// exclusion lists.
+/// entries that stay.
+///
+/// Two entries with the same volume and the same native object identifiers
+/// are one object with two names: an alias of a root, a name in a
+/// different normalization form, or a hard link. The first one stays. One
+/// object then has one step and one charge.
 fn remove_overlaps<'a>(
     eligible: Vec<Eligible<'a>>,
     omitted: &mut Vec<Omission>,
 ) -> Vec<Eligible<'a>> {
-    let mut by_depth: Vec<(usize, &Components)> = eligible
-        .iter()
-        .map(|eligible| &eligible.path)
-        .enumerate()
-        .collect();
+    let mut by_depth: Vec<(usize, &Eligible<'a>)> = eligible.iter().enumerate().collect();
     // The sort is stable: entries of one depth keep the sequence of their
     // target identities.
-    by_depth.sort_by_key(|(_, path)| path.len());
+    by_depth.sort_by_key(|(_, eligible)| eligible.path.len());
     let mut kept: Vec<&Components> = Vec::new();
+    let mut objects: BTreeSet<(&VolumeId, FileObjectEvidence)> = BTreeSet::new();
     let mut stays: Vec<bool> = vec![false; eligible.len()];
-    for (index, path) in by_depth {
-        let overlaps: bool = kept.iter().any(|parent| has_prefix(path, parent));
+    for (index, candidate) in by_depth {
+        let path: &Components = &candidate.path;
+        let overlaps: bool = kept.iter().any(|parent| is_same_or_inside(path, parent));
+        let repeats: bool = candidate
+            .entry
+            .object
+            .is_some_and(|object| objects.contains(&(&candidate.entry.volume_id, object)));
+        // The path of an entry that repeats an object also covers the
+        // entries inside it: they are inside the object that stays.
         if !overlaps {
             kept.push(path);
+        }
+        if !overlaps && !repeats {
+            if let Some(object) = candidate.entry.object {
+                objects.insert((&candidate.entry.volume_id, object));
+            }
             if let Some(flag) = stays.get_mut(index) {
                 *flag = true;
             }
@@ -638,14 +679,15 @@ fn remove_overlaps<'a>(
 /// than a plan has targets, so the target count needs no check here.
 fn fill<'a>(
     disjoint: Vec<Eligible<'a>>,
-    limits: &CleanupLimits,
+    plan_ceiling: WorkCharge,
+    batch: &WorkCharge,
     omitted: &mut Vec<Omission>,
 ) -> Vec<Eligible<'a>> {
-    let mut remaining: WorkCharge = limits.plan;
+    let mut remaining: WorkCharge = plan_ceiling;
     let mut included: Vec<Eligible<'a>> = Vec::new();
     for eligible in disjoint {
         let charge: WorkCharge = eligible.charge;
-        let reason: Option<OmissionReason> = if charge.fits_in(&limits.batch) {
+        let reason: Option<OmissionReason> = if charge.fits_in(batch) {
             // `checked_sub` gives `None` when a part of the charge is
             // larger than what remains.
             match remaining.checked_sub(charge) {

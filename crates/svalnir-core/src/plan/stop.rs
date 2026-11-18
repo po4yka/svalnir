@@ -206,7 +206,13 @@ fn target_reasons(
         add(Reason::OtherUser);
     }
 
-    if matches!(binding, Err(CandidateBindingError::Membership)) {
+    // An identity of a different boot is not evidence of a process of this
+    // boot: the process ID and the start time can name another process.
+    let other_boot: bool = candidate
+        .processes
+        .iter()
+        .any(|process| process.boot_id != context.clock.boot_id);
+    if matches!(binding, Err(CandidateBindingError::Membership)) || other_boot {
         add(Reason::MembershipNotVerified);
     }
     if protected_paths.unresolved {
@@ -249,8 +255,9 @@ fn target_reasons(
 ///   `[protections].protected_bundle_ids`, and no executable is at or
 ///   below a path of `[protections].protected_executable_paths`. With such
 ///   a path in the configuration, each process has executable evidence.
-/// - Each process is a process of the principal and has a verified
-///   membership of the same instance.
+/// - Each process is a process of the principal, has a verified
+///   membership of the same instance, and has an identity of the boot of
+///   the clock of the plan.
 /// - Each executable path is absolute and canonical, and the home
 ///   directory resolves each `~/` path of the configuration.
 ///

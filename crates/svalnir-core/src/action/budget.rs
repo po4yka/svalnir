@@ -276,6 +276,7 @@ pub struct WorkBudget {
 
 /// One allowance with its level.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopedAllowance {
     /// The level.
     pub scope: BudgetScope,
@@ -553,6 +554,7 @@ impl From<CapacityDomainKey> for LeaseResource {
 /// or an application relaunch, and its expiry does not prove that a
 /// submitted effect stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLease {
     /// The identity of the lease.
     pub lease_id: LeaseId,

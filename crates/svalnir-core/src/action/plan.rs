@@ -35,7 +35,7 @@ use crate::policy::{
     ApplicationCandidate, EvaluationClock, ProtectionContext, ProtectionFact, hard_protection,
 };
 use crate::process::{ProcessIdentity, Uid, VerifiedMembership};
-use crate::quantity::Nanoseconds;
+use crate::quantity::{EntryCount, Nanoseconds};
 use crate::rule::RuleRef;
 use crate::time::{MonotonicNanos, WallTime};
 
@@ -371,8 +371,9 @@ pub enum PlanError {
     /// The plan has no target or no step, or more than the limit.
     #[error("the number of targets or steps is zero or is larger than the limit")]
     Count,
-    /// Two targets or two steps have the same identity.
-    #[error("two targets or two steps have the same identity")]
+    /// Two targets or two steps have the same identity, or two targets
+    /// bind the same object.
+    #[error("two targets or two steps have the same identity or the same object")]
     Duplicate,
     /// A step names a target that the plan does not have, or a target has
     /// no step.
@@ -387,7 +388,8 @@ pub enum PlanError {
     #[error("the steps do not agree with each other or with the force strategy")]
     Steps,
     /// The binding of a target does not agree with the action class of its
-    /// step, with the principal, or with its own evidence.
+    /// step, with the principal, or with its own evidence, or the charge
+    /// of a file target has no item.
     #[error("a target binding does not agree with its step or its evidence")]
     Binding,
     /// The limits are missing, are not finite, or are smaller than the sum
@@ -438,7 +440,10 @@ pub(super) fn check_file_binding(
     // The executor of the owning user changes only the objects of that
     // user.
     let owner_agrees: bool = !matches!(executor, ExecutorRole::User) || file.owner == principal;
-    if class.is_filesystem() && rule_agrees && owner_agrees {
+    // An entry is a minimum of one item. A charge of no items would use
+    // no part of an item limit, and it fits in an exhausted allowance.
+    let charge_agrees: bool = file.charge.items != EntryCount::ZERO;
+    if class.is_filesystem() && rule_agrees && owner_agrees && charge_agrees {
         Ok(())
     } else {
         Err(PlanError::Binding)
@@ -514,6 +519,34 @@ impl PlanContent {
         self.targets
             .iter()
             .find(|target| &target.target_id == target_id)
+    }
+
+    /// Checks that no two targets bind the same object: the same entry of
+    /// one root, the same application instance, or the same process
+    /// generation. Two target identities for one object would give two
+    /// steps and two charges for one irreversible action.
+    fn check_distinct_objects(&self) -> Result<(), PlanError> {
+        let mut entries: BTreeSet<(&RootId, &[u8])> = BTreeSet::new();
+        let mut instances: BTreeSet<&ApplicationInstanceId> = BTreeSet::new();
+        let mut generations: BTreeSet<&str> = BTreeSet::new();
+        for target in &self.targets {
+            let is_new: bool = match &target.binding {
+                TargetBinding::File(file) => {
+                    entries.insert((&file.root_id, file.relative_entry.as_bytes()))
+                }
+                TargetBinding::Application(application) => {
+                    instances.insert(&application.instance_id)
+                        && application
+                            .members
+                            .iter()
+                            .all(|member| generations.insert(member.generation_id.as_str()))
+                }
+            };
+            if !is_new {
+                return Err(PlanError::Duplicate);
+            }
+        }
+        Ok(())
     }
 
     fn check_trigger(&self) -> Result<(), PlanError> {
@@ -636,6 +669,7 @@ impl Check for PlanContent {
                 return Err(PlanError::Duplicate);
             }
         }
+        self.check_distinct_objects()?;
         let mut step_ids: BTreeSet<&StepId> = BTreeSet::new();
         for step in &self.steps {
             if !step_ids.insert(&step.step_id) {

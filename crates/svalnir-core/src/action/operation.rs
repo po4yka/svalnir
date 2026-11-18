@@ -106,6 +106,22 @@ pub enum OperationError {
     Outcome(#[from] OutcomeError),
 }
 
+/// The dispatch state that the results of one step give: `submitted` when
+/// a result is submitted, and `submission_uncertain` when no result is
+/// submitted and one is uncertain or has a value that this build does not
+/// recognize.
+fn dispatch_of(results: &[TargetResult]) -> DispatchState {
+    let mut dispatch = DispatchState::NotSubmitted;
+    for result in results {
+        match result.dispatch {
+            DispatchState::Submitted => return DispatchState::Submitted,
+            DispatchState::NotSubmitted => {}
+            _ => dispatch = DispatchState::SubmissionUncertain,
+        }
+    }
+    dispatch
+}
+
 /// One admitted application of a plan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "OperationWire")]
@@ -298,10 +314,33 @@ impl Operation {
         ) {
             return Err(OperationError::Settled);
         }
+        // An admission durability that this build does not recognize
+        // supports no step change: the build cannot know which recording
+        // the admission permitted.
+        if !self.admission_durability.is_recognized() {
+            return Err(OperationError::Recording);
+        }
         self.steps
             .iter()
             .position(|step| &step.id == step_id)
             .ok_or(OperationError::UnknownStep)
+    }
+
+    /// Whether the record of the step at `index` can have `durability`.
+    ///
+    /// A volatile record is only for a step that the critical-memory
+    /// exception applies to, in an operation that was admitted with
+    /// volatile durability. A durable admission has durable records, or
+    /// `persistence_failed` after a failed write. A value that this build
+    /// does not recognize is not permitted.
+    fn step_durability_permitted(&self, index: usize, durability: &Durability) -> bool {
+        match (&self.admission_durability, durability) {
+            (Durability::Durable, Durability::Durable | Durability::PersistenceFailed) => true,
+            (Durability::Volatile, Durability::Volatile) => {
+                critical_exception_applies(&self.steps[index].action_class, &self.trigger_class)
+            }
+            _ => false,
+        }
     }
 
     /// Whether each earlier step for the target of the step at `index`
@@ -327,6 +366,17 @@ impl Operation {
             })
     }
 
+    /// Whether the durability of each result is one that the record of
+    /// the step at `index` can have. A result with a durability that this
+    /// build does not recognize is kept: [`aggregate`] reads it as an
+    /// indeterminate effect.
+    fn result_durabilities_permitted(&self, index: usize, results: &[TargetResult]) -> bool {
+        results.iter().all(|result| {
+            !result.durability.is_recognized()
+                || self.step_durability_permitted(index, &result.durability)
+        })
+    }
+
     /// Moves a step to `IntentCommitted`, `DispatchConsumed`, or
     /// `Verifying`.
     ///
@@ -338,6 +388,10 @@ impl Operation {
     /// - `state` is a result state. A result needs target results.
     /// - An earlier step for the same target does not have the state
     ///   `Incomplete`, `Partial`, or `Failed` with a submitted call.
+    /// - `durability` is not one that the admission permits. A volatile
+    ///   record is only for a step that the critical-memory exception
+    ///   applies to. An operation with an admission durability that this
+    ///   build does not recognize changes no step.
     /// - [`StepProgress::advance`] rejects the change.
     pub fn advance_step(
         &mut self,
@@ -355,6 +409,9 @@ impl Operation {
         }
         if !self.earlier_steps_permit(index) {
             return Err(OperationError::Sequence);
+        }
+        if !self.step_durability_permitted(index, &durability) {
+            return Err(OperationError::Recording);
         }
         let step: &mut Step = &mut self.steps[index];
         step.progress = step.progress.advance(state, dispatch, durability)?;
@@ -375,6 +432,10 @@ impl Operation {
     ///
     /// - The operation is settled, or it has no step `step_id`.
     /// - `results` is empty, or a result names a different target.
+    /// - `durability`, or the durability of a result, is not one that the
+    ///   admission permits: a result of a volatile operation is `volatile`,
+    ///   and a result of a durable operation is `durable` or
+    ///   `persistence_failed`.
     /// - [`StepProgress::advance`] rejects the change, for example a
     ///   verified effect for a step whose dispatch was not consumed.
     pub fn settle_step(
@@ -384,6 +445,11 @@ impl Operation {
         durability: Durability,
     ) -> Result<(), OperationError> {
         let index: usize = self.open_step(step_id)?;
+        if !self.step_durability_permitted(index, &durability)
+            || !self.result_durabilities_permitted(index, &results)
+        {
+            return Err(OperationError::Recording);
+        }
         let step: &mut Step = &mut self.steps[index];
         if results
             .iter()
@@ -392,17 +458,7 @@ impl Operation {
             return Err(OperationError::ResultTarget);
         }
         let state: StepState = aggregate_step(&results)?;
-        let mut dispatch = DispatchState::NotSubmitted;
-        for result in &results {
-            match result.dispatch {
-                DispatchState::Submitted => {
-                    dispatch = DispatchState::Submitted;
-                    break;
-                }
-                DispatchState::NotSubmitted => {}
-                _ => dispatch = DispatchState::SubmissionUncertain,
-            }
-        }
+        let dispatch: DispatchState = dispatch_of(&results);
         step.progress = step.progress.advance(state, dispatch, durability)?;
         step.results = results;
         Ok(())
@@ -461,20 +517,32 @@ impl Operation {
             let state: &StepState = step.progress.state();
             let has_result_state: bool =
                 state.is_settled() || matches!(state, StepState::UnknownOutcome);
+            // The dispatch state of a step with results is the one that
+            // `settle_step` derives from them.
             let results_agree: bool = if has_result_state {
                 aggregate_step(&step.results).is_ok_and(|expected| &expected == state)
+                    && &dispatch_of(&step.results) == step.progress.dispatch()
             } else {
                 step.results.is_empty()
             };
-            // The record of a step is as durable as the admission permits.
-            let durability_agrees: bool = matches!(
-                (&self.admission_durability, step.progress.durability()),
-                (
-                    Durability::Durable,
-                    Durability::Durable | Durability::PersistenceFailed
-                ) | (Durability::Volatile, Durability::Volatile)
-                    | (Durability::Unrecognized(_), _)
-            );
+            // The record of a step and of each result is as durable as the
+            // admission permits. With an admission durability that this
+            // build does not recognize, a durable record is kept, and a
+            // volatile record is kept only for a step that the
+            // critical-memory exception applies to: no step of such an
+            // operation changes (`open_step`).
+            let permitted = |durability: &Durability| {
+                if self.admission_durability.is_recognized() {
+                    self.step_durability_permitted(index, durability)
+                } else {
+                    !matches!(durability, Durability::Volatile)
+                        || critical_exception_applies(&step.action_class, &self.trigger_class)
+                }
+            };
+            let durability_agrees: bool = permitted(step.progress.durability())
+                && step.results.iter().all(|result| {
+                    !result.durability.is_recognized() || permitted(&result.durability)
+                });
             // A step that has an intent or a call follows the sequence
             // rule of `advance_step`.
             let started: bool = step.progress.dispatch().is_possibly_submitted()

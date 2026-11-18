@@ -212,8 +212,9 @@ pub enum OutcomeError {
     /// The stop reason is not possible for the effect.
     #[error("the stop reason is not possible for the effect")]
     StopReason,
-    /// A skipped, refused, or failed target has no error, or a verified
-    /// effect has one.
+    /// A skipped, refused, or failed target has no error, a verified
+    /// effect has one, or the error says that no call was submitted and
+    /// the record says that a call was, or possibly was, submitted.
     #[error("the error record does not agree with the effect and the stop reason")]
     Failure,
     /// The evidence is not possible for the effect.
@@ -299,6 +300,18 @@ impl Check for TargetResultRecord {
             StopReason::Failed | StopReason::TargetSkipped
         );
         if needs_failure != self.failure.is_some() {
+            return Err(OutcomeError::Failure);
+        }
+        // The next step of an error comes from its own dispatch state. An
+        // error that says `not_submitted` in a record whose call was, or
+        // possibly was, submitted would permit a retry before
+        // reconciliation.
+        let failure_understates: bool = self.dispatch.is_possibly_submitted()
+            && self
+                .failure
+                .as_ref()
+                .is_some_and(|failure| matches!(failure.dispatch, NotSubmitted));
+        if failure_understates {
             return Err(OutcomeError::Failure);
         }
         let has_trash_item: bool = self.evidence.trash_item.is_some();

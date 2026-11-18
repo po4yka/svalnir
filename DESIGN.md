@@ -1,6 +1,6 @@
 # Svalnir Design
 
-**Status:** Design specification. No GPUI view exists. The client builds on `gpui-kit`; a component in this document is a `gpui-kit` component with these tokens, or a custom element where `gpui-kit` has no equivalent. Each value below is a starting value; record a change here before the code changes.
+**Status:** Design specification. A first read-only client exists: the window frame, the navigation, the Overview screen, and the Storage screen. "Implementation state" at the end of this document lists what the client does not build yet and where it differs. The client builds on `gpui-kit`; a component in this document is a `gpui-kit` component with these tokens, or a custom element where `gpui-kit` has no equivalent. Each value below is a starting value; record a change here before the code changes.
 
 This document owns the visual language of the GPUI client: tokens, surfaces, components, data visualization, and motion. The screen list is in the [README](README.md#gpui-desktop-experience). The presentation requirements that bind each screen are in [INTERFACES.md §14](docs/INTERFACES.md#14-gpui-parity-and-presentation). Metric meaning is in [RESOURCE_MODEL.md](docs/RESOURCE_MODEL.md), and operation states are in [ACTION_CONTRACTS.md](docs/ACTION_CONTRACTS.md). Where this document disagrees with one of those, that document takes precedence.
 
@@ -60,7 +60,7 @@ The tokens of this document are the source. The application sets them on the `gp
 | Sans, Mono | `font_family`, `mono_font_family` |
 | Motion constants of §6 | `motion` (`MotionTokens`) |
 
-`primary` in the `gpui-kit` theme is not `brand`: set `primary` to the silver button color, because `gpui-kit` uses it for the default emphasis of a control. Set `shadow` to off and keep `focus_ring` on. The radii of this document do not fit the two theme radii (`radius`, `radius_lg`); set the radius on each surface. The field names are from `gpui-kit` 0.10.0. No code applies this mapping yet.
+`primary` in the `gpui-kit` theme is not `brand`: set `primary` to the silver button color, because `gpui-kit` uses it for the default emphasis of a control. Set `shadow` to off and keep `focus_ring` on. The radii of this document do not fit the two theme radii (`radius`, `radius_lg`); set the radius on each surface. The field names are from `gpui-kit` 0.10.0. `crates/svalnir-gui/src/theme/apply.rs` applies this mapping; §12 lists the differences.
 
 ### Categorical palette
 
@@ -93,7 +93,19 @@ All changing numbers use tabular figures. A value and its unit stay together: th
 
 ### Shape and spacing
 
-The spacing unit is 4 px. The radii nest: each inner radius is the outer radius minus the padding between the two.
+The spacing unit is 4 px. Layout gaps and paddings use the steps of this scale.
+
+| Step | Value | Use |
+| --- | --- | --- |
+| `SPACE_1` | 4 px | A label and its own value or caption |
+| `SPACE_2` | 8 px | Rows of one group |
+| `SPACE_3` | 12 px | Blocks inside a panel; the same as the gap between shells |
+| `SPACE_4` | 16 px | Panel padding; the gap between two columns of one chart block |
+| `SPACE_6` | 24 px | A chart and its legend side by side; the content padding of the window |
+
+A layout value outside this scale needs a comment that states the reason.
+
+The radii nest: each inner radius is the outer radius minus the padding between the two.
 
 | Element | Radius | Size |
 | --- | --- | --- |
@@ -186,6 +198,21 @@ Action classes map to button variants as follows.
 
 A label names the action and its object. Do not use "OK", "Clean", or "Optimize".
 
+### Navigation
+
+The sidebar is the navigation of the main window. It uses the `sidebar` component.
+
+- The screens are in three groups with a label: "Monitor" (Overview, Storage, Memory, Applications), "Control" (Automation), and "Records" (History, Diagnostics).
+- A screen that has sections shows them as nested items below it: Overview has "Headroom", "This session", "Startup volume", "Agent", "Policies", and "Latest intervention"; Storage has "Startup volume" and "Folder sizes". A nested item shows the screen and moves the content to the section. A nested item has no icon.
+- A screen with nested items has a caret. The caret opens and closes the nested items; a click on the name of the screen shows the screen and opens them. The nested items of the active screen are open when the window opens. The open state of each screen stays while the window is open.
+- The sidebar has two widths: 256 px, and the icon width of the component (48 px). A toggle button in the header of the sidebar and the key Control-Command-S change the width. Below a window width of 900 px the sidebar is narrow. The choice of the user applies until the window width crosses 900 px.
+- A narrow sidebar shows no group label, no nested item, and no text. Each icon has a tooltip with the name of the screen, its key, and the text of its status mark.
+- The header of the sidebar has the name of the application and the toggle button. The footer has one row with the state of the agent: a dot in the tone of the state and one line of text. A state from a reading that is stale has a muted dot and the word "stale". A narrow sidebar shows the dot only.
+- An item can have a status mark at its right end. Storage has a small spinner while a scan runs. Memory has a dot in `warning` or `negative` while the measured memory pressure state is not normal. A mark has an accessible label with the same meaning as text.
+- Each screen keeps its scroll position while the window is open.
+- Command-1 to Command-7 show a screen. Command-] shows the next screen and Command-[ the screen before; the order does not wrap.
+- The change of the width uses the motion of the component. With Reduce Motion on, the width changes in one step.
+
 ## 5. Data visualization
 
 ### Cells and ticks
@@ -201,10 +228,100 @@ A **cell** is a small rounded square. A **tick** is a thin vertical bar. Both ar
 
 State the scale near the chart or in its accessible label ("1 cell = 1%"). A chart that has more cells than data resolution misleads; reduce the cell count.
 
+### LED matrix
+
+The storage charts and the volume strip are LED matrices. This is the signature mark of the client.
+
+- One lattice of small square cells covers the chart: a 4.5 px cell with a 1 px radius and a 1.5 px gap. An empty cell uses `border` at half strength, so the lattice shows in the whole chart.
+- A segment is a rectangle of lattice cells with a 1.5 px outline (radius 6 px) in its color, a fill of the color at 8%, and a glow of the color: blur 14 px, alpha 0.45 in the dark theme and 0.22 in the light theme.
+- In a segment, each cell is lit (the color mixed 15% toward white) or dim (the color at 28%, or 22% in the light theme). A hash of the cell position and of the segment selects the state, so the pattern has clumps and does not change between frames. About 45% of the cells are lit. In a chart of folder sizes the lit share is the density of the folder (see "Density texture"). In each other segment the pattern has no meaning. The area of the segment carries the quantity.
+- A label in a tile is on a plate: the color of the panel at 86%, with a radius of 6 px and a padding of 4 px by 6 px. The name uses `foreground`, and the size uses `foreground` at 80%. The cells under the plate are dim. Text does not sit on the cell pattern.
+- Free space is a region with a dashed 1 px outline (`muted-foreground` at 35%), a label, and sparse bright points. It is not a segment.
+- A segment that has no focus while a different one has it shows all its cells dim, its outline at 35%, and no glow.
+- The head of a fill is three lattice columns of white at 100%, 60%, and 30% with a white glow.
+- Do not draw the glow when Reduce Transparency or Increase Contrast is on, or while the memory pressure state is not normal.
+
+### Density, change, and direction
+
+These three marks show what the client measures and a size chart does not show: how dense a folder is on disk, how it changed between two scans, and where the available space goes.
+
+**Density texture.** In a chart of folder sizes, the share of lit cells in a segment is the density of the folder: its allocated size divided by its logical size, at most 1.
+
+- The lit share is 20% plus 70% of the density. A folder of sparse, compressed, or cloned data has few lit cells. A folder that fills its logical size has 90%.
+- The hash of the cell position selects the cells, so the pattern has clumps and does not change between frames. A higher density adds lit cells and does not move the others.
+- A segment with a logical size of 0, the "Not scanned" segment, and a segment that is not a folder keep the default share of 45% or their own rule.
+- "Other" uses the sum of the allocated sizes divided by the sum of the logical sizes of its items.
+- The cell ring uses the same rule for its dots.
+- A key is below the chart: a sparse swatch and a dense swatch with the text "Lit cells: allocated size ÷ logical size". The legend row of a folder with a density below 0.9 shows the density as a percentage in mono text ("64% dense").
+- The density is not a statement that space can be reclaimed.
+
+**Scan ghost.** After a second scan of one folder, the chart compares each item with the scan before it, in the size metric of the chart. The client keeps one earlier result for each scan root.
+
+- An item that is larger shows the difference as a hatched part at the end of its segment: a checkerboard of cells in `foreground` at 85% and empty cells, with an area of the difference. The text color makes the part differ from the density texture in the two themes. A difference below half a cell has no hatched part.
+- An item that is smaller shows a dashed 1.5 px line in `foreground` at 85% along the end edge of its segment.
+- The legend row shows the difference in mono text with a sign ("+2.1 GB", "−800.0 MB"), in `foreground` for a larger item and `muted-foreground` for a smaller one. A new item shows "new". The colors `positive` and `negative` are not used: a change of size is not good or bad.
+- An item of the earlier scan that this scan does not have is one line below the legend: "Not in this scan:" with the names and the earlier sizes.
+- A caption states the reference: "Compared with the scan of 12:04". Do not use the words "freed" or "reclaimed" for a difference (§7).
+- The ghost is not drawn when the earlier scan or this scan is partial for a different reason, when the metric of the earlier result is not available, or during a scan.
+
+**Runway.** The runway is the time until the available space of the startup volume is 0 if the trend of this session continues. It is an estimate, and each text of it starts with "≈".
+
+- The trend is a least-squares line through the measured readings of the available space among the newest 60 readings. It needs 12 or more measured readings over 60 s or more, with at most one third of the readings unavailable.
+- The runway shows only when the line falls and the fall over the readings is 0.05% of the volume or more. With a level or rising line the text is "steady". Without enough readings no runway text shows.
+- The text uses one unit: "≈ 40 min", "≈ 3 h", "≈ 2 d". Above 7 days the text is "more than 7 d".
+- The session chart draws the trend line as dots of 2.5 px in `foreground` at 80%, over the columns that the trend uses. The dots are on a straight line and not on the rows of the lattice, so the line differs from the steps of the curve. The footer has a tag "runway ≈ 3 h".
+- The disk ring of the dial shows the space that the trend takes in the next hour as dots of 2 px in the ring color after the head, at most to the end of the ring. The detail panel of the disk has a row "Runway" with the text and the note "estimate from N readings".
+- A runway value does not roll, does not animate, and is not a headline value (§6 "Limits"). It is not an input of a guard.
+
+### Dot rings and the session chart
+
+These charts use round dots on the 6 px pitch of the LED matrix. A dot has a diameter of 4 px.
+
+**Headroom dial.** Three concentric rings of dots on a dial face, in a square of 240 px. Each ring is one resource. A ring starts at the top and goes clockwise; the full turn is the capacity of the resource.
+
+- The radii are 90, 76, and 62 px, with 96, 80, and 64 dots. From the outside: the used space of the startup volume, the used swap, and the memory pressure state.
+- A dot of the used part is lit: the ring color mixed 15% toward white. A dot of the remaining part is empty: `border` at half strength.
+- Space that is available but not free (the system can reclaim it) is the soft part of the disk ring: each second dot in the ring color at 28%. The legend names it.
+- The pressure ring has three sectors with a gap of one dot: Normal, Warning, and Critical. The sector of the current state is lit in `positive`, `warning`, or `negative`. The sectors below it are dim, and the sectors above it are empty. The legend states the state as text.
+- The last lit dot of a ring is the head: white, with a white glow by the rule of the LED matrix.
+- One ring is picked out. The order is: the pressure ring while the state is not normal; the ring with the largest used share above 0; the pressure ring when it is measured; the first measured ring; ring 0. A ring with no capacity or a share of 0 does not win over a measured ring. The picked ring has full strength and a radial marker of 1.5 px by 8 px at its head. The other rings show their lit dots at 55%. Hover or keyboard focus on a legend row picks that ring.
+- The center shows the value of the picked ring as a display value and a caption of one line. The center uses the display style: a sans number with a small muted unit, and the caption below. It does not use mono text.
+- The dial face is outside the rings. It has 48 tick dots of 2 px at a radius of 102 px in `border`; each twelfth dot is `muted-foreground`. The mono labels "0", "25", "50", and "75" are at a radius of 113 px at the top, right, bottom, and left.
+- The start line is a 1 px vertical line in `muted-foreground` from a radius of 52 px to a radius of 98 px at the top, with a dot of 4 px at its outer end.
+- Each ring has its name at the left of the start line, at the height of the ring: mono text of 10 px, right-aligned, 6 px from the line. The name of the picked ring has the ring color. The other names use `muted-foreground`.
+- The header of the card has one status pill as its aside: the memory pressure state while it is not normal, and otherwise the used share of the startup volume ("49% disk used").
+- A detail panel for the picked ring is at the right of the dial, below the legend rows. It is an inset (§3) in the card, not the hover card of §4. It has the name of the ring, its headline value as an aside, and rows of a label and a mono value: for the disk "Used", "Available", "Free", "Reclaimable", and "Total"; for the swap "Used" and "Total"; for the pressure "State" and "Source". One sentence below the rows states what the ring shows. The panel has no control.
+- A key is below the dial: one row with the marks "Used", "Reclaimable", and "Empty" and their dots.
+- A ring with an unavailable reading shows each second dot empty and no other dot. Its legend row shows an em dash, or the "Unavailable" pill for the pressure ring, and the reason.
+
+**Session chart.** One inset with a value curve and a sample matrix on one time axis. A column of the 6 px pitch is one reading; the newest reading is at the right.
+
+- The curve part has 10 rows. A column shows one dot at the row of the value in the range of the readings on screen, and the dots below it in the series color at 12%. The caption states the range.
+- A column with an unavailable reading shows one empty dot on the lowest row.
+- The event rail is a 1 px line in `border` above the curve. An event is a marker on the rail: a dot of 6 px for a change of the memory pressure state, and a diamond of 6 px for the admission of the latest operation. The marker has the tone color of the event. A dotted 1 px line goes from the marker down through the chart.
+- An event has a label of two mono lines above its marker: the name ("Warning", or the trigger of the operation) in the tone color, and the kind ("pressure" or "operation") in `muted-foreground`. At most four events show a label: the newest four whose labels do not overlap. An older event keeps its marker and its line.
+- The newest event has a chip below the rail, at its line: the name, the time of the reading, and one fact ("after 40 normal readings", or the state text of the operation). The chip uses `surface-raised`.
+- A dashed 1 px line in `muted-foreground` at 50% marks the lowest value on screen, with a mono label at its right end ("min 260.0 GB").
+- The time axis is below the sample matrix: the local time of a reading as mono text ("12:04") at each label step, with a step that keeps 48 px or more between two labels.
+- Each row of the sample matrix has its name at the left in mono text ("changes", "disk", "swap", "pressure"), in a gutter that the curve shares. At the right of each row is the newest value of the row in mono text.
+- A key is below the chart: the scale "1 column = 1 reading", the marks "Fewer" and "More" with a column of 1 dot and a column of 4 dots, and the mark "Not normal" with a dot in `warning`.
+- The footer of the card has mono tags (§4): the number of readings, the range of the available space, the number of events, and the current state.
+- The newest column is the live head: a white dot with a glow, and a ring that expands from 4 px to 14 px and fades in 1.6 s. The ring is a continuous effect (§6).
+- The sample matrix is below the curve: one row for each series (disk used, swap used, memory pressure). A row is 4 dots high. A column shows 1 to 4 dots: the quarter of the value in the range of that row, or 1, 2, and 4 dots for Normal, Warning, and Critical. A row with one value in its range shows 1 dot in each column.
+- A column whose reading has a pressure state that is not normal is picked out: its dots use `warning` or `negative` in each row. The other columns use the row color at 60%.
+- The top strip is the change count: 0 to 3 dots for the number of series with a value larger than in the reading before.
+
+**Stat row.** A row of at most four values in the footer of a card or below a chart. A value has a muted label, a 2 px by 8 px dash in the series color, a number in the sans font at 16 px, and a muted suffix at 12 px. The Headroom card shows the available disk space, the used swap, and the pressure state. The folder chart of Storage shows the scanned size, the free space, and the number of causes of unread items.
+
+**Cell ring.** The ring layout of a storage chart: four concentric rings of dots with radii from 66 to 84 px, and 120 angular steps. A segment covers the steps of its share on the four rings, with a gap of one step. Free space shows each second dot empty. The center shows the used value in the display style of the dial center: a sans number, a small muted unit, and the caption below, not mono text. Focus dims the other segments by the rule of the LED matrix.
+
 ### Components
 
 | Component | Use in Svalnir |
 | --- | --- |
+| **Headroom dial** | Disk, swap, and memory pressure as three rings of dots on a dial face with the nearest limit picked out, and a detail panel for the picked ring. The first card of the Overview |
+| **Stat row** | Up to four values with a color dash below a chart |
+| **Session chart** | The available space of the startup volume since the window opened, with event flags and a live head, over a sample matrix of disk, swap, and pressure |
 | **Capacity grid** | Volume capacity as 100 cells at 1% each, filled by category. The warning and critical zones of the disk policy are tinted cells at the end. The inline variant is one row of 20 cells |
 | **Cell band** | One horizontal band of cells, split into category segments. The default storage summary |
 | **Cell ring, columns, tiles** | Alternative layouts of the same data: share of the volume, comparison between categories, and a treemap. All use one data model and one legend |
@@ -215,6 +332,8 @@ State the scale near the chart or in its accessible label ("1 cell = 1%"). A cha
 | **Step timeline** | Two cumulative step lines around a zero axis, a dotted net line, and activity spans below on the same time axis. Use it for bytes written against bytes reclaimed, and for footprint growth against release |
 | **Dot histogram** | One column of dots for each bin of a measured value, symmetric about the axis, with a line at the median and a labeled marker at the limit. Dots past the limit use `negative`. Use it for the footprint samples of one application against its budget, and for the durations of operations |
 | **Dot clock** | A ring of 24 hour sectors with one stack of dots for each sector, and the headline value in the center. Use it for interventions by hour of day in the selected range |
+| **History track** | One tick for each reading, the newest at the right with a head: `positive`, `warning`, or `negative` for the pressure state, and an empty tick for an unavailable reading. The caption states the number of readings and their source |
+| **Value line** | A 1.5 px line of one metric in an inset, with a fill of the line color at 10%, a dot at the newest value, a vertical marker at each change of state, and the range as a caption. An unavailable reading breaks the line |
 | **Stat grid** | Overview tiles: a label, a display value, a delta pill, and a thin bar or sparkline |
 | **Legend** | A grid of rows: category icon, name, and a mono size aligned right. Each row is a button |
 
@@ -224,6 +343,7 @@ State the scale near the chart or in its accessible label ("1 cell = 1%"). A cha
 - Draw free space as an empty region with a dashed outline and a label. Do not draw it as a category.
 - Hover and keyboard focus are linked in both directions. Focus on a legend row dims the other segments, and focus on a segment highlights its row. The status line then shows one sentence about that category.
 - A mark that has more detail than its legend row shows a detail card (§4): for example an intervention marker, an activity span, or a tick of an operation. The same text is the accessible description of the mark. A detail card does not hold a control.
+- Each chart shows a detail card for the mark under the pointer and for the mark that has keyboard focus: a segment, a ring, or a reading. The card states the measured values of that mark; it does not interpolate between marks.
 - One dot is a stated number of samples or events ("1 dot = 2 samples"), with the same scale in each column or sector of a chart.
 - A threshold is a marker with a label on the chart. Do not show a threshold by color only.
 - A failed or stale value is not zero. See §8.
@@ -258,7 +378,10 @@ An element exits faster than it enters. An action from the keyboard skips the sl
 | **Range change** | When the time range changes, the ticks refill from left to right with `cell-stagger`, and the value rolls |
 | **Expand** | A card grows in position to show a breakdown. The other cards move; they do not jump |
 | **Peak marker** | A thin line stays at the maximum of a column and then falls to the current value |
+| **Hover** | The mark under the pointer goes to its focus state in `fast`, and the other marks dim. The detail card fades in and moves 4 px in `fast`; a change of the mark moves the card and does not fade it again. With Reduce Motion on, both changes apply in one step |
 | **Idle field** | Sparse points fade in and out in the empty area of a cell chart |
+| **Ring sweep** | When a dial or a cell ring enters, each ring fills clockwise from the top to its measured value in `slow`, with 80 ms between rings. A new reading moves the head to the new value in 250 ms |
+| **Live head** | The newest column of the session chart has a ring that expands and fades. A new reading moves each column one step to the left in one frame; the head stays at the right |
 
 ### Limits
 
@@ -266,7 +389,7 @@ An element exits faster than it enters. An action from the keyboard skips the sl
 - Progress shows completed steps. If the total is not known, use an indeterminate state: the head cell and the elapsed time.
 - An animation does not suggest that an operation can be reversed. A removal has no reverse animation.
 - The idle field and other continuous effects run only in a visible, active window. They stop when the system reports memory pressure, when Low Power Mode is on, and when an incident is open.
-- With Reduce Motion on, replace movement with a 150 ms opacity change, apply fills in one step, and turn off the idle field, the particle effect, and the peak marker.
+- With Reduce Motion on, replace movement with a 150 ms opacity change, apply fills in one step, and turn off the idle field, the particle effect, the peak marker, the ring sweep, and the ring of the live head.
 - Limit continuous rendering to the cards on screen. Paint cells as plain quads in one custom element; a chart does not need one view per cell.
 - The interface has no sound.
 
@@ -340,7 +463,7 @@ These decisions were accepted on 2026-11-16.
 | Light theme | The first release includes it and follows the system appearance |
 | Storage categories and their colors | Take the categories from the resource model; assign palette colors in a fixed order |
 | Default storage layout | Cell band in Overview; tiles in Storage |
-| Glow on filled cells | None in the first release |
+| Glow on filled cells | A segment of an LED matrix and a head have a soft glow in their color. Accepted on 2026-11-18; this replaces "none in the first release". See "LED matrix" in §5 |
 | Component base | `gpui-kit`; see "Theme mapping" in §2 and "Component mapping" in §4 |
 | Icon set | Lucide (ISC License), through `gpui_kit::assets` |
 
@@ -350,11 +473,32 @@ The component base and the icon set were accepted after that date, with the chan
 
 | Screen | Primary components |
 | --- | --- |
-| Overview | Stat grid, inline capacity grid, tick gauge for memory pressure, last intervention as a phase header |
-| Storage | Cell band or tiles, legend, suggestion footer, approval queue |
+| Overview | Headroom dial, session chart, volume strip, guards, last intervention as a phase header |
+| Storage | Tiles, cell band, columns, or cell ring; legend, suggestion footer, approval queue |
 | Memory | Rate graph with intervention markers, tick gauge, data table of application footprints |
 | Applications | Data table, budget meters, protection controls, dot histogram of the footprint samples of the selected application |
 | Automation | Policy forms, range sliders for thresholds, budget meters, pause control |
 | History | Data table, tick track per operation, step timeline, dot clock of interventions by hour |
 | Diagnostics | Status pills for each permission and service, empty states with the fix |
 | Menu bar | Inline capacity grid, pressure pill, pause control |
+
+## 12. Implementation state
+
+The first client in `crates/svalnir-gui` applies sections 2 to 6 and section 8 to two screens. No recorded evidence under [VALIDATION.md](docs/VALIDATION.md) covers it. These points differ from this document or are not built.
+
+| Subject | State |
+| --- | --- |
+| Theme mapping (§2) | Applied at the start and when the system appearance changes. The theme holds solid colors; the action button of the client draws the silver gradient itself |
+| Fonts (§2) | Geist and Geist Mono are in the binary. Tabular figures and the tracking of the screen title are not applied; the rolling number gives each digit the same width |
+| Icons (§9) | The default icon bundle of `gpui-kit` has no clock or history glyph. History uses a document glyph and Diagnostics uses an inspector glyph |
+| Controls (§4) | The segmented control and the action button are custom. The segmented control estimates the width of an option from its text length |
+| LED matrix (§5) | Built for tiles, band, columns, and the volume strip. The glow turns off for Reduce Transparency, Increase Contrast, and a memory pressure state that is not normal; the client reads the two display settings when its window becomes active. The width of a tile label is an estimate |
+| Storage breakdown (§5, §10) | The resource model defines no storage categories, and the scanner reports none. The Storage screen shows the direct children of the scan root in palette order by size. At the default scan root the chart has the scale of the volume, with the free space and a "Not scanned" segment |
+| Linked focus (§5) | Hover on a legend row dims the other segments, in the tiles, band, columns, and ring layouts, and picks a ring of the headroom dial. Keyboard focus on a dial row picks its ring and blur clears the pick, like hover; a click on a dial row picks its ring. The cell ring selects and hovers a segment by its whole arc. Hover on a segment of the LED charts sets the same focus as the legend row, and a focus that the screen sets dims the other segments in `fast`. Each chart (the LED charts, the cell ring, the headroom dial, and the session chart) has the hover state, a keyboard mark, and a detail card. The chart is a tab stop. The arrow keys, Home, and End move the mark, and Escape clears it. The legend row of the focused Storage segment gets the highlight of the legend. The launch option `--focus CHART` gives a chart this focus at start. A request waits without cost until the chart has data. Not proven on screen: the legend row highlight that follows a mark, the link from the pointer on the dial and the session chart to a legend row, and a card at its final position in a real window. Tests read the card text and the card bounds in the test window only |
+| Charts (§5) | Built: LED tiles, band, and columns; the headroom dial; the session chart; the cell ring; the history track label of the pressure row; the legend. The tick gauge, the value line, and the sparkline were removed from the Overview. Differences: the radial marker of the dial is painted as eight small squares along the radius; the dots of the cell ring are 3 px, because the inner ring has 3.45 px between two steps; a segment of the cell ring is hit by one test of the pointer angle and radius (the ring radii plus or minus 3 px), and every two neighbour segments keep a gap of one step, which a segment of one step takes from its larger neighbour; the session chart shows local time, and it shows UTC with the mark "UTC" for a reading with no known zone offset; its "min" label is wider than the right gutter and reaches into the padding of the card, and it is left out when the newest value is at the same row; the stat row of the Headroom card and of the folder chart is built, and the Storage row is below the legend; the Overview puts the dial card and the session card in one row from a content width of 1150 px, so a window of 1300 px shows them one below the other; a curve of one value shows its dot in the middle row. Not built: budget meter, tick track of an operation, rate graph with interventions, step timeline, stat grid (the stat row is built), dot histogram, dot clock |The detail card (`ChartTip`) is built for the segments and the free region of the LED charts (the Storage tiles, band, and columns, and the volume strips). The headroom dial, the session chart, and the cell ring have the same card. A card shows measured values only, and an unavailable value is an em dash. The Storage card adds a Density row and, after a second scan, a Change row; the disk card of the dial adds a Runway row; each row is shown only when the model has the value. A card waits for the first paint of its chart, so a launch focus shows it one frame later at its real place. The tests of the card placement use the test window. Nobody has seen a card on a real screen yet |
+| Density, change, and direction (§5) | Built: the density texture in the tiles, band, columns, and ring layouts of the folder chart, with the key and the "NN% dense" text of a legend row; the scan ghost (hatched growth, dashed line for a smaller item, signed legend text, the "Not in this scan" line, and the caption), which needs two finished scans of one root in one session; the runway (trend dots in the session chart, the footer tag, the next-hour dots of the disk ring, the "Runway" row and note of the detail panel). Differences and limits: the client keeps one earlier result for each of at most 8 scan roots, in memory; a cancelled scan keeps the earlier result and has no ghost; "Other" and a new item have no hatched part or dashed line, and a new item shows "new" in the legend; the hatched growth is the last cells of the segment along its end edge (the rightmost columns in the tiles, band, and ring, the top rows in the columns layout), and a smaller item in the ring layout has no mark; two scans are comparable only when neither was cancelled and both are complete, or both are partial for the same causes and ended the same way; the runway needs a measured newest reading, and the volume size is the used plus the available space of that reading. Not built: a check on screen in both themes and with Reduce Motion on, and a test of the pixels of any of the three marks |
+| Motion (§6) | Built: scan fill with a head, rolling number, fill-in of a finished chart, idle field in the free region, card entry, sliding pill, the ring sweep of the dial (with each entry of the Overview cards) and of the cell ring, the move of a dial ring head to a new reading in 250 ms (`FRONT_EASE`, `ease-ui-out`, a lit count that ends at the measured count; it runs per frame and only without Reduce Motion), the ring of the live head (1.6 s period from its own start instant, redrawn by a timer of at most 30 Hz, not per frame, and it stops with the other continuous effects). Not built: removal, phase header, outcome line, range change, expand, peak marker |Also built: the hover of the LED charts (outline 1.5 px to 2 px, tint 8% to 14%, and the dim of the other segments, in `fast`) and the appearance of the detail card (fade and 4 px move in `fast`), both applied in one step with Reduce Motion. The same hover and card motion is built for the dial, the session chart, and the cell ring. A frame is requested only while a tween runs. The motion is not proven on screen |
+| History (§5) | The history track and the value line show the readings of this window since it opened, at most 180. The client reads no stored samples |
+| Navigation (§4) | Built with the `sidebar` component: three groups, nested section items for Overview and Storage that scroll the content, the open state kept while the window is open, the 256 px and icon widths with the 900 px rule and the toggle (button and Control-Command-S), the agent row in the footer, status marks for a scan and the memory pressure, and Command-] and Command-[. Differences: the icon width is 48 px, set by the component. The tooltip of an icon is the item label of the component with the name, the key, and the text of the status mark; a narrow sidebar draws no mark. The width change uses the 200 ms `ease-in-out` curve of the component, not `base` with `ease-ui-out`; Reduce Motion gives one step. The content takes the final width at once while the sidebar width animates. Each screen keeps its own scroll position while the window is open. The scroll is not animated. No screenshot check is recorded |
+| Screens (§11) | Overview and Storage are built without a state-changing action. The other five screens show a placeholder. No menu bar item exists |
+| Accessibility (§9) | Each chart has a text label and each state has text. Increase Contrast, Reduce Transparency, and a screen reader are not checked |

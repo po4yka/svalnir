@@ -169,6 +169,18 @@ pub enum OperationJournalError {
         /// The version that this build can read and write.
         supported: u32,
     },
+    /// A read-only open found a database with no journal schema. A
+    /// read-only open makes no schema.
+    #[error(
+        "the operation journal has version {found}, and this build reads version {supported}; \
+         a read-only open makes no schema"
+    )]
+    SchemaNotCurrent {
+        /// The version that the database records.
+        found: u32,
+        /// The version that this build reads.
+        supported: u32,
+    },
     /// The file is an `SQLite` database that is not an operation journal.
     /// This build did not change its content.
     #[error("the database is not a Svalnir operation journal")]

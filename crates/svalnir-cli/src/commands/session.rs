@@ -5,14 +5,11 @@
 //! Milestone 2 has no socket. A client and the agent share state through
 //! the journal in the state directory (`docs/INTERFACES.md` section 4).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use svalnir_agent::journal::{
-    AgentRecord, CoordinatorLock, JournalOptions, LockState, OperationJournal,
-    OperationJournalError,
-};
+use svalnir_agent::journal::{JournalOptions, OperationJournal, OperationJournalError};
 use svalnir_core::action::{ActionError, ClientRole, Principal};
 use svalnir_core::config::{ValidatedConfig, parse_and_validate};
 use svalnir_core::digest::ContentDigest;
@@ -21,22 +18,19 @@ use svalnir_core::policy::{ContinuityGeneration, EvaluationClock};
 use svalnir_core::process::Uid;
 use svalnir_core::time::WallTime;
 
+use svalnir_agent::observe;
+pub(crate) use svalnir_agent::observe::{
+    AuthorityReadError, CoordinatorPresence, ExistingJournalError, StoredAuthority,
+    coordinator_presence,
+};
+
 use crate::environment::Environment;
 use crate::host::Host;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 
 /// The user of this process.
 pub(crate) fn current_uid() -> Uid {
-    #[cfg(unix)]
-    {
-        // SAFETY: `geteuid` has no argument, changes nothing, and does not
-        // fail.
-        Uid::new(unsafe { libc::geteuid() })
-    }
-    #[cfg(not(unix))]
-    {
-        Uid::new(0)
-    }
+    observe::current_uid()
 }
 
 /// The principal of a request of this client. The journal is same-user
@@ -179,6 +173,11 @@ pub(crate) fn journal_error(error: &OperationJournalError) -> ErrorBody {
             ErrorFamily::Recording,
             "the operation journal is of an earlier build of Svalnir and has no migration; this build does not change it",
         ),
+        OperationJournalError::SchemaNotCurrent { .. } => (
+            "journal_not_current",
+            ErrorFamily::Recording,
+            "the operation journal is not of the current version; this build does not change it",
+        ),
         OperationJournalError::NotAJournal => (
             "journal_not_recognized",
             ErrorFamily::Recording,
@@ -217,22 +216,16 @@ pub(crate) fn open_existing_journal(
     environment: &Environment,
 ) -> Result<Option<OperationJournal>, ErrorBody> {
     let path: PathBuf = environment.journal_path()?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(journal_error(&OperationJournalError::NotAJournal)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(ErrorBody::new(
-                "journal_unavailable",
-                ErrorFamily::Recording,
-                ErrorStage::Storage,
-                "the operation journal cannot be inspected",
-            ));
-        }
-    }
-    OperationJournal::open(&path, &journal_options())
-        .map(Some)
-        .map_err(|error| journal_error(&error))
+    observe::open_existing_journal(&path, &journal_options()).map_err(|error| match error {
+        ExistingJournalError::NotAJournal => journal_error(&OperationJournalError::NotAJournal),
+        ExistingJournalError::Inspect => ErrorBody::new(
+            "journal_unavailable",
+            ErrorFamily::Recording,
+            ErrorStage::Storage,
+            "the operation journal cannot be inspected",
+        ),
+        ExistingJournalError::Open(error) => journal_error(&error),
+    })
 }
 
 /// Opens the journal for a command that writes. Makes the state directory
@@ -241,40 +234,6 @@ pub(crate) fn open_journal(environment: &Environment) -> Result<OperationJournal
     environment.create_state_directory()?;
     OperationJournal::open(&environment.journal_path()?, &journal_options())
         .map_err(|error| journal_error(&error))
-}
-
-/// Whether a coordinator process holds the coordinator lock of the journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CoordinatorPresence {
-    /// A process holds the lock: an agent, or a client that executes a
-    /// request.
-    Running,
-    /// No process holds the lock.
-    NotRunning,
-    /// The lock file cannot be used, so the answer is not known.
-    Unknown,
-}
-
-/// Reads the coordinator lock of the journal at `journal_path`. The
-/// function takes no lock, makes no file, and registers no coordinator, so
-/// a coordinator that starts at the same time is not refused by the
-/// reading. With no lock file, no coordinator ran on this journal.
-pub(crate) fn coordinator_presence(journal_path: &Path) -> CoordinatorPresence {
-    match CoordinatorLock::probe(journal_path) {
-        Ok(LockState::Free) => CoordinatorPresence::NotRunning,
-        Ok(LockState::Held(_)) => CoordinatorPresence::Running,
-        Err(_) => CoordinatorPresence::Unknown,
-    }
-}
-
-/// The authority record of the journal with its record revision.
-#[derive(Debug, Clone)]
-pub(crate) struct StoredAuthority {
-    /// The record. With no record, the state of a user with no activation.
-    pub(crate) state: AuthorityState,
-    /// The revision of the record, or 0 with no record.
-    pub(crate) revision: u64,
 }
 
 /// Reads the authority record.
@@ -286,34 +245,21 @@ pub(crate) struct StoredAuthority {
 /// build cannot decode, for example a record of an earlier build, gives
 /// `authority_record_not_readable` and no authority.
 pub(crate) fn read_authority(journal: &OperationJournal) -> Result<StoredAuthority, ErrorBody> {
-    let uid: Uid = current_uid();
-    match journal
-        .agent_record::<AuthorityState>(AgentRecord::Authority)
-        .map_err(|error| match error {
-            OperationJournalError::Decode { .. } => ErrorBody::new(
-                "authority_record_not_readable",
-                ErrorFamily::Recording,
-                ErrorStage::Storage,
-                "the authority record of the journal has a format that this build cannot read, for example the format of an earlier build; it gives no authority, and the command made no change; stop the agent and remove the operation journal `operations.sqlite` of the state directory to start with no authority record",
-            ),
-            error => journal_error(&error),
-        })?
-    {
-        None => Ok(StoredAuthority {
-            state: AuthorityState::new(uid),
-            revision: 0,
-        }),
-        Some(stored) if stored.record.principal != uid => Err(ErrorBody::new(
+    observe::read_authority(journal, current_uid()).map_err(|error| match error {
+        AuthorityReadError::Journal(OperationJournalError::Decode { .. }) => ErrorBody::new(
+            "authority_record_not_readable",
+            ErrorFamily::Recording,
+            ErrorStage::Storage,
+            "the authority record of the journal has a format that this build cannot read, for example the format of an earlier build; it gives no authority, and the command made no change; stop the agent and remove the operation journal `operations.sqlite` of the state directory to start with no authority record",
+        ),
+        AuthorityReadError::Journal(error) => journal_error(&error),
+        AuthorityReadError::DifferentUser => ErrorBody::new(
             "authority_record_of_a_different_user",
             ErrorFamily::Authority,
             ErrorStage::Storage,
             "the authority record of the journal is of a different user; the command made no change",
-        )),
-        Some(stored) => Ok(StoredAuthority {
-            state: stored.record,
-            revision: stored.revision,
-        }),
-    }
+        ),
+    })
 }
 
 /// The error for a command that needs a policy revision in effect.

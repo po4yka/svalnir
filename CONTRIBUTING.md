@@ -79,6 +79,8 @@ Apple Silicon macOS is the first native validation target. The manifests pin the
 
 Use the Apple development tools required by the chosen native and GPUI dependencies. Verify the selected GUI build requirements before assuming a command-line-tools-only installation is enough. Pin and test GPUI examples against the dependency actually used by the project.
 
+To look at a GUI change, run the client with fixed data: `cargo run -p svalnir-gui --locked -- --fixture healthy --appearance dark`. `--help` lists the fixture names and the options `--appearance`, `--reduce-motion`, `--screen`, `--size`, `--scan`, and `--readings` (with `--fixture` only; `--fixture drift` is a fixed sequence of readings). Without `--fixture`, the client measures the host in its own process and changes nothing. Give `--scan` a small directory, not the home directory.
+
 Portable domain logic, parsing, documentation, and appropriate fixture tests may be developed on another host once their targets exist. A portable pass does not establish that a macOS collector, signed IPC endpoint, helper, or GPUI application works. Report the native checks that remain unverified.
 
 Ordinary development should use unprivileged, disposable fixtures. Installation, background-service registration, permission changes, signing identities, and privileged integration require an explicitly controlled environment. Permission granted to a terminal is not evidence of access for a separately installed worker. Record which component and identity were tested.

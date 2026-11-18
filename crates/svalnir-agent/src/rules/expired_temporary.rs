@@ -453,6 +453,11 @@ impl ExpiredTemporaryRule {
                 }
             }
         }
+        // The marker is read again: a marker that was removed or replaced
+        // during the discovery leaves no result. A replaced root is
+        // reported first, as the end of the discovery does.
+        root.verify_unchanged()?;
+        check_root_marker(&root, scope)?;
         collector.finish(&self.rule, &root, completion)
     }
 }

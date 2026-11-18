@@ -40,6 +40,10 @@ pub enum ClaimError {
     /// A candidate names a rule revision that is not registered.
     #[error("a candidate names a rule revision that is not registered")]
     Unregistered(#[source] RuleRefusal),
+    /// A candidate carries a lifecycle state that is not the state of the
+    /// registry for its rule revision and layout.
+    #[error("a candidate carries a lifecycle state that the registry does not record")]
+    LifecycleMismatch,
 }
 
 /// The lifecycle state of one rule revision for one layout, with the
@@ -161,7 +165,9 @@ impl ReviewedRules {
     /// Returns [`ClaimError::TooManyCandidates`] when the list is longer
     /// than the largest candidate list of the policy, and
     /// [`ClaimError::Unregistered`] when a candidate names a rule revision
-    /// that is not registered.
+    /// that is not registered or a layout that the revision does not
+    /// support, and [`ClaimError::LifecycleMismatch`] when the lifecycle
+    /// state of a candidate is not the state of the registry.
     pub fn claim(
         &self,
         candidates: Vec<DiscoveredCandidate>,
@@ -170,8 +176,12 @@ impl ReviewedRules {
             return Err(ClaimError::TooManyCandidates);
         }
         for candidate in &candidates {
-            self.lookup(&candidate.candidate.rule)
+            let recorded: &LifecycleState = self
+                .lifecycle(&candidate.candidate.rule, &candidate.candidate.layout)
                 .map_err(ClaimError::Unregistered)?;
+            if *recorded != candidate.lifecycle {
+                return Err(ClaimError::LifecycleMismatch);
+            }
         }
         Ok(resolve_overlaps(candidates))
     }

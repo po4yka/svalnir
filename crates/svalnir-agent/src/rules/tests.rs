@@ -81,7 +81,10 @@ fn object_of(path: &Path) -> FileObjectEvidence {
 
 /// A temporary directory with one bound root in it.
 struct Fixture {
-    directory: TempDir,
+    /// Keeps the temporary directory until the fixture is dropped.
+    _directory: TempDir,
+    /// The temporary directory with each symbolic link resolved.
+    base: PathBuf,
     binding: RootBinding,
     principal: Uid,
     protected: Vec<PathBuf>,
@@ -91,7 +94,10 @@ struct Fixture {
 impl Fixture {
     fn new(root_name: &str) -> Self {
         let directory: TempDir = tempfile::tempdir().unwrap();
-        let root: PathBuf = directory.path().join(root_name);
+        // The temporary directory of macOS is below a symbolic link. A root
+        // path has no link in an ancestor, so the fixture resolves it.
+        let base: PathBuf = fs::canonicalize(directory.path()).unwrap();
+        let root: PathBuf = base.join(root_name);
         fs::create_dir(&root).unwrap();
         let metadata = fs::metadata(&root).unwrap();
         Self {
@@ -103,7 +109,8 @@ impl Fixture {
                 device: DeviceNumber::new(i32::try_from(metadata.dev()).unwrap()),
             },
             principal: Uid::new(metadata.uid()),
-            directory,
+            _directory: directory,
+            base,
             protected: Vec::new(),
             excluded: Vec::new(),
         }
@@ -111,6 +118,10 @@ impl Fixture {
 
     fn root(&self) -> &Path {
         &self.binding.path
+    }
+
+    fn base(&self) -> &Path {
+        &self.base
     }
 
     fn scope(&self) -> DiscoveryScope<'_> {
@@ -473,13 +484,22 @@ fn a_root_that_fails_a_check_is_rejected() {
 
     // A symbolic link to the root is not the root.
     let mut linked = temporary_fixture();
-    let link = linked.directory.path().join("link");
+    let link = linked.base().join("link");
     symlink(fixture.root(), &link).unwrap();
     linked.binding.path = link;
     assert!(matches!(
         discover(&linked),
         DiscoveryError::RootNotDirectory
     ));
+
+    // A path with a symbolic link in an ancestor is not a root: the
+    // executor does not follow the link, and the overlap resolution
+    // compares plain paths.
+    let mut aliased = temporary_fixture();
+    let alias = aliased.base().join("alias");
+    symlink(fixture.base(), &alias).unwrap();
+    aliased.binding.path = alias.join(fixture.root().file_name().unwrap());
+    assert!(matches!(discover(&aliased), DiscoveryError::RootPath));
 
     // A relative path and a path with `..`.
     let mut relative = temporary_fixture();
@@ -500,7 +520,7 @@ fn a_root_that_fails_a_check_is_rejected() {
     other_owner.principal = Uid::new(other_owner.principal.get() ^ 1);
     assert!(matches!(discover(&other_owner), DiscoveryError::RootOwner));
     let mut absent = temporary_fixture();
-    absent.binding.path = absent.directory.path().join("absent");
+    absent.binding.path = absent.base().join("absent");
     assert!(matches!(
         discover(&absent),
         DiscoveryError::RootUnavailable(_)
@@ -508,7 +528,7 @@ fn a_root_that_fails_a_check_is_rejected() {
 
     // A root in a protected path, and a root that contains one.
     let mut inside = temporary_fixture();
-    inside.protected = vec![inside.directory.path().to_path_buf()];
+    inside.protected = vec![inside.base().to_path_buf()];
     assert!(matches!(
         discover(&inside),
         DiscoveryError::RootOverlapsProtected
@@ -617,7 +637,7 @@ fn an_item_with_content_that_the_rule_preserves_is_skipped() {
 #[test]
 fn an_item_with_a_link_or_a_special_object_is_skipped() {
     let fixture = temporary_fixture();
-    let outside: PathBuf = fixture.directory.path().join("outside");
+    let outside: PathBuf = fixture.base().join("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("keep.bin"), vec![7_u8; 50_000]).unwrap();
 
@@ -807,7 +827,7 @@ fn a_root_that_is_replaced_during_the_discovery_gives_no_result() {
         clock: &clock,
     };
     let root: PathBuf = fixture.root().to_path_buf();
-    let moved: PathBuf = fixture.directory.path().join("moved");
+    let moved: PathBuf = fixture.base().join("moved");
     let mut replace_root = |_: &Path| {
         if root.exists() && !moved.exists() {
             fs::rename(&root, &moved).unwrap();
@@ -825,6 +845,68 @@ fn a_root_that_is_replaced_during_the_discovery_gives_no_result() {
         )
         .unwrap_err();
     assert!(matches!(error, DiscoveryError::RootChanged));
+}
+
+#[test]
+fn a_root_marker_that_is_removed_during_the_discovery_gives_no_result() {
+    let fixture = temporary_fixture();
+    add_item(&fixture, "item-a", |_| {});
+    let registry = ReviewedRules::new().unwrap();
+    let cancel = CancellationToken::new();
+    let clock = later_clock();
+    let control = DiscoveryControl {
+        limits: limits(),
+        cancel: &cancel,
+        clock: &clock,
+    };
+    let marker: PathBuf = fixture.root().join(ROOT_MARKER_NAME);
+    let marker_bytes: Vec<u8> = fs::read(&marker).unwrap();
+    let known = discover_temporary(&fixture).candidates;
+    assert_eq!(known.len(), 1);
+    for mode in [
+        DiscoveryMode::Full,
+        DiscoveryMode::KnownCandidatesOnly(&known),
+    ] {
+        let mut remove_marker = |_: &Path| {
+            fs::remove_file(&marker).unwrap();
+        };
+        let error = registry
+            .expired_temporary()
+            .discover_with(
+                &fixture.scope(),
+                NO_LEASES,
+                mode,
+                &control,
+                &mut remove_marker,
+            )
+            .unwrap_err();
+        assert!(matches!(error, DiscoveryError::RootNotClassified));
+        // The marker is back for the next run.
+        fs::write(&marker, &marker_bytes).unwrap();
+    }
+}
+
+#[test]
+fn a_candidate_with_a_lifecycle_that_is_not_that_of_the_registry_is_not_claimed() {
+    let fixture = temporary_fixture();
+    add_item(&fixture, "item-a", |_| {});
+    let discovery = discover_temporary(&fixture);
+    let candidate: DiscoveredCandidate = candidate_of(&discovery, "item-a").clone();
+    let registry = ReviewedRules::new().unwrap();
+
+    // The candidate as discovered is claimed.
+    let claimed = registry.claim(vec![candidate.clone()]).unwrap();
+    assert_eq!(claimed.candidates.len(), 1);
+
+    // A state that the registry does not record for the layout is refused.
+    let mut other_state = candidate.clone();
+    other_state.lifecycle = LifecycleState::Disabled {
+        inspection_permitted: true,
+    };
+    assert_eq!(
+        registry.claim(vec![other_state]).err(),
+        Some(ClaimError::LifecycleMismatch)
+    );
 }
 
 #[test]
@@ -1087,8 +1169,7 @@ fn info_plist(workspace: &Path, last_accessed: WallTime) -> String {
 /// fixture, outside the `DerivedData` root.
 fn add_workspace(fixture: &Fixture, name: &str) -> PathBuf {
     let workspace: PathBuf = fixture
-        .directory
-        .path()
+        .base()
         .join("src")
         .join(name)
         .join(format!("{name}.xcodeproj"));
@@ -1237,7 +1318,7 @@ fn the_fixed_units_of_a_recognized_project_are_candidates() {
 fn a_symbolic_link_in_a_unit_is_one_entry_and_is_not_followed() {
     let (fixture, project) = xcode_fixture();
     let before = discover_xcode(&fixture);
-    let outside: PathBuf = fixture.directory.path().join("outside");
+    let outside: PathBuf = fixture.base().join("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("large.bin"), vec![9_u8; 300_000]).unwrap();
     symlink(&outside, project.join("Build/Products/Debug/Linked")).unwrap();
@@ -1394,7 +1475,7 @@ fn a_project_with_no_source_or_with_source_overlap_is_not_a_candidate() {
     // The project of `WorkspacePath` is gone: the data cannot be made
     // again.
     let (fixture, _) = xcode_fixture();
-    fs::remove_dir_all(fixture.directory.path().join("src")).unwrap();
+    fs::remove_dir_all(fixture.base().join("src")).unwrap();
     let discovery = discover_xcode(&fixture);
     assert_eq!(discovery.candidates.len(), 0);
     for name in super::xcode::UNIT_PATHS {
@@ -1407,7 +1488,7 @@ fn a_project_with_no_source_or_with_source_overlap_is_not_a_candidate() {
 
     // The path is present and is not a project: unknown, not regenerable.
     let (fixture, _) = xcode_fixture();
-    let workspace = fixture.directory.path().join("src/App/App.xcodeproj");
+    let workspace = fixture.base().join("src/App/App.xcodeproj");
     fs::remove_file(workspace.join("project.pbxproj")).unwrap();
     let discovery = discover_xcode(&fixture);
     assert_eq!(discovery.candidates.len(), 0);
@@ -1418,7 +1499,7 @@ fn a_project_with_no_source_or_with_source_overlap_is_not_a_candidate() {
     // A `DerivedData` root in the directory of the project: a custom root
     // that overlaps source.
     let fixture = Fixture::new("DerivedData");
-    let workspace = fixture.directory.path().join("App.xcodeproj");
+    let workspace = fixture.base().join("App.xcodeproj");
     fs::create_dir(&workspace).unwrap();
     fs::write(workspace.join("project.pbxproj"), b"// project").unwrap();
     add_project(&fixture, PROJECT, &workspace);
@@ -1447,7 +1528,7 @@ fn a_user_exclusion_and_a_link_in_the_unit_path_stop_a_unit() {
     let (mut fixture, project) = xcode_fixture();
     fixture.excluded = vec![project.join("Index.noindex/DataStore")];
     // `Build` is a symbolic link to a directory with the two units.
-    let real_build = fixture.directory.path().join("RealBuild");
+    let real_build = fixture.base().join("RealBuild");
     fs::rename(project.join("Build"), &real_build).unwrap();
     symlink(&real_build, project.join("Build")).unwrap();
 
@@ -1698,7 +1779,7 @@ fn the_age_of_a_unit_is_the_newest_examined_time() {
 
     // `LastAccessedDate` is the newest time: Xcode opened the project
     // after the last change of the files.
-    let workspace = fixture.directory.path().join("src/App/App.xcodeproj");
+    let workspace = fixture.base().join("src/App/App.xcodeproj");
     fs::write(
         project.join("info.plist"),
         info_plist(&workspace, real_now_plus(25 * DAY_SECONDS)),
@@ -1964,7 +2045,7 @@ fn a_path_that_two_rules_claim_goes_to_one_rule_or_to_no_rule() {
 
     // The root of one rule is below the root of the other rule: the more
     // specific root claims the path, in each input sequence.
-    let wide_root: &Path = fixture.directory.path();
+    let wide_root: &Path = fixture.base();
     let wide = attributed_to(&item_a, &other, Some(wide_root));
     for list in [
         vec![item_a.clone(), wide.clone()],
@@ -2166,7 +2247,7 @@ fn a_known_candidate_of_the_temporary_rule_is_a_direct_entry_of_the_root() {
     assert_eq!(full.candidates.len(), 1);
     // A known candidate that names an entry below a link of the root. The
     // link goes to a directory outside the root.
-    let outside = fixture.directory.path().join("outside");
+    let outside = fixture.base().join("outside");
     fs::create_dir(&outside).unwrap();
     symlink(&outside, fixture.root().join("sub")).unwrap();
     let mut forged: DiscoveredCandidate = full.candidates[0].clone();

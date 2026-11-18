@@ -244,11 +244,9 @@ pub(super) fn is_plain_relative(path: &Path) -> bool {
 #[derive(Debug)]
 pub(super) struct RootView {
     pub(super) evidence: RootEvidence,
-    /// The path as the caller gave it.
+    /// The path as the caller gave it. It has no symbolic link in an
+    /// ancestor, so it is also its resolved form.
     pub(super) path: PathBuf,
-    /// The path with each symbolic link of its ancestors resolved, when it
-    /// is different from `path`.
-    resolved: Option<PathBuf>,
     snapshot: ObjectSnapshot,
     /// The hard exclusions, as given and resolved.
     protected: Vec<PathBuf>,
@@ -273,8 +271,9 @@ fn with_resolved_forms(list: &[PathBuf]) -> Vec<PathBuf> {
 
 impl RootView {
     /// Checks the root of `scope`: a plain absolute path to a directory
-    /// that is not a symbolic link, with the owner of the discovery, on
-    /// the bound device, and outside each protected path.
+    /// that is not a symbolic link and has none in an ancestor, with the
+    /// owner of the discovery, on the bound device, and outside each
+    /// protected path.
     pub(super) fn open(scope: &DiscoveryScope<'_>) -> Result<Self, DiscoveryError> {
         let path: &Path = &scope.root.path;
         if !is_plain_absolute(path) {
@@ -290,12 +289,15 @@ impl RootView {
         if snapshot.object.device != scope.root.device {
             return Err(DiscoveryError::RootDevice);
         }
-        let resolved: Option<PathBuf> = fs::canonicalize(path)
-            .ok()
-            .filter(|resolved| resolved != path);
+        // The executor opens each component of the root from `/` with no
+        // following of links, so a root with a link in an ancestor cannot
+        // be executed. The comparisons of the discovery and of the overlap
+        // resolution are on plain paths, so they need no resolved form.
+        if fs::canonicalize(path).as_deref().ok() != Some(path) {
+            return Err(DiscoveryError::RootPath);
+        }
         let protected: Vec<PathBuf> = with_resolved_forms(scope.protected_paths);
-        let root_forms = || std::iter::once(path).chain(resolved.as_deref());
-        if root_forms().any(|form| protected.iter().any(|entry| overlaps(form, entry))) {
+        if protected.iter().any(|entry| overlaps(path, entry)) {
             return Err(DiscoveryError::RootOverlapsProtected);
         }
         let display: LosslessPath =
@@ -309,7 +311,6 @@ impl RootView {
                 mount_id: scope.root.mount_id.clone(),
             },
             path: path.to_path_buf(),
-            resolved,
             snapshot,
             protected,
             excluded: with_resolved_forms(scope.user_exclusions),
@@ -324,28 +325,21 @@ impl RootView {
     /// Whether a hard exclusion or a user exclusion is the unit, is above
     /// it, or is below it.
     pub(super) fn is_excluded(&self, relative: &Path) -> bool {
-        let forms = std::iter::once(&self.path).chain(self.resolved.as_ref());
-        forms.into_iter().any(|root| {
-            let unit: PathBuf = root.join(relative);
-            self.protected
-                .iter()
-                .chain(&self.excluded)
-                .any(|entry| overlaps(&unit, entry))
-        })
+        let unit: PathBuf = self.path.join(relative);
+        self.protected
+            .iter()
+            .chain(&self.excluded)
+            .any(|entry| overlaps(&unit, entry))
     }
 
     /// Whether `path` is the root, is in it, or contains it.
     pub(super) fn overlaps_path(&self, path: &Path) -> bool {
-        std::iter::once(&self.path)
-            .chain(self.resolved.as_ref())
-            .any(|root| overlaps(root, path))
+        overlaps(&self.path, path)
     }
 
     /// Whether the root is `directory` or is below it.
     pub(super) fn is_within(&self, directory: &Path) -> bool {
-        std::iter::once(&self.path)
-            .chain(self.resolved.as_ref())
-            .any(|root| root.starts_with(directory))
+        self.path.starts_with(directory)
     }
 
     /// Checks that the object at the root path is the object of the first

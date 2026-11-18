@@ -24,6 +24,7 @@
 //! | [`platform::run_loop`] | The main run loop of the process: the evidence that it ran, and the run until a stop signal |
 //! | [`platform::sleep`] | The sleep time of the host and the sleep-boundary check of a rate interval |
 //! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
+//! | [`observe`] | The readings that a client process makes in its own process: the collection context, the disk and memory reading of the host, and the query of the coordinator lock |
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |
 //! | [`journal`] | The operation journal in `operations.sqlite`: plans, operations, revisions and grants, the request queue, the coordinator lock, recovery reads, and the named agent records |
@@ -39,6 +40,7 @@ pub mod controller;
 pub mod coordinator;
 pub mod executor;
 pub mod journal;
+pub mod observe;
 pub mod platform;
 pub mod rules;
 pub mod runtime;

@@ -5,13 +5,12 @@
 //! Milestone 2 has no socket. A client and the agent share state through
 //! the journal in the state directory (`docs/INTERFACES.md` section 4).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use svalnir_agent::journal::{
-    AgentRecord, CoordinatorLock, CoordinatorLockError, JournalOptions, OperationJournal,
-    OperationJournalError,
+    AgentRecord, JournalOptions, OperationJournal, OperationJournalError,
 };
 use svalnir_core::action::{ActionError, ClientRole, Principal};
 use svalnir_core::config::{ValidatedConfig, parse_and_validate};
@@ -20,6 +19,8 @@ use svalnir_core::grant::{ActiveRevision, AuthorityState, ControlClock};
 use svalnir_core::policy::{ContinuityGeneration, EvaluationClock};
 use svalnir_core::process::Uid;
 use svalnir_core::time::WallTime;
+
+pub(crate) use svalnir_agent::observe::{CoordinatorPresence, coordinator_presence};
 
 use crate::environment::Environment;
 use crate::host::Host;
@@ -228,42 +229,6 @@ pub(crate) fn open_journal(environment: &Environment) -> Result<OperationJournal
     environment.create_state_directory()?;
     OperationJournal::open(&environment.journal_path()?, &journal_options())
         .map_err(|error| journal_error(&error))
-}
-
-/// Whether a coordinator process holds the coordinator lock of the journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CoordinatorPresence {
-    /// A process holds the lock: an agent, or a client that executes a
-    /// request.
-    Running,
-    /// No process holds the lock.
-    NotRunning,
-    /// The lock file cannot be used, so the answer is not known.
-    Unknown,
-}
-
-/// Reads the coordinator lock of the journal at `journal_path`. The
-/// function takes the lock for an instant and releases it; it registers no
-/// coordinator. The journal file must exist.
-pub(crate) fn coordinator_presence(journal_path: &Path) -> CoordinatorPresence {
-    // With no lock file, no coordinator ran on this journal. A query does
-    // not make the file.
-    let lock_path = svalnir_agent::journal::coordinator_lock_path(journal_path);
-    if matches!(
-        std::fs::symlink_metadata(&lock_path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    ) {
-        return CoordinatorPresence::NotRunning;
-    }
-    match CoordinatorLock::try_acquire(journal_path) {
-        Ok(lock) => {
-            drop(lock);
-            CoordinatorPresence::NotRunning
-        }
-        Err(CoordinatorLockError::Held) => CoordinatorPresence::Running,
-        Err(CoordinatorLockError::Io(_)) => CoordinatorPresence::Unknown,
-    }
 }
 
 /// The authority record of the journal with its record revision.

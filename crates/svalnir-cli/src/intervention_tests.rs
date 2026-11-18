@@ -932,6 +932,162 @@ fn an_install_registers_an_observation_agent_through_the_service_host() {
     assert!(status.result()["authority"].is_null());
 }
 
+/// An install on a state directory whose authority record has an enabled
+/// guard does not say that the agent makes no automatic intervention.
+#[test]
+fn an_install_names_a_guard_that_the_authority_record_has_enabled() {
+    let (mut world, _host) = world_with_host(RecordingHost {
+        program: Some(PathBuf::from("/opt/svalnir/bin/svalnir-agent")),
+        ..RecordingHost::default()
+    });
+    let revision: String = world.activate(BALANCED_CONFIG, "none");
+    let enabled = json(
+        &world.environment,
+        &[
+            "policy",
+            "enable",
+            "memory-guard",
+            "--expected-revision",
+            &revision,
+        ],
+    );
+    assert_eq!(enabled.status, ExitStatus::Success, "{}", enabled.stdout);
+
+    // The question names the guard and the stop of a running agent.
+    world.environment.seams.test.answers =
+        Some(Arc::new(Mutex::new(VecDeque::from(["n".to_owned()]))));
+    let declined = json(&world.environment, &["agent", "install"]);
+    assert_eq!(declined.error_code(), "approval_declined");
+    assert!(
+        declined.stderr.contains("memory-guard"),
+        "{}",
+        declined.stderr
+    );
+    assert!(
+        declined.stderr.contains("is stopped and started again"),
+        "{}",
+        declined.stderr
+    );
+    assert!(
+        !declined.stderr.contains("observation mode"),
+        "{}",
+        declined.stderr
+    );
+
+    let installed = json(&world.environment, &["agent", "install", "--yes"]);
+    assert_eq!(
+        installed.status,
+        ExitStatus::Success,
+        "{}",
+        installed.stdout
+    );
+    let result = installed.result();
+    assert_eq!(result["mode"], "standing_guards");
+    assert_eq!(
+        result["standing_guards"],
+        serde_json::json!(["memory-guard"])
+    );
+    assert_eq!(result["guards_enabled"], serde_json::json!([]));
+    assert!(
+        !result["note"]
+            .as_str()
+            .unwrap()
+            .contains("no automatic intervention"),
+        "{result}"
+    );
+}
+
+/// A state directory that other users can read is refused, and so is a
+/// state directory that is a symbolic link.
+#[test]
+fn a_state_directory_that_is_not_private_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = World::new();
+    let state: PathBuf = world.path("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config: PathBuf = world.path("config.toml");
+    std::fs::write(&config, "schema_version = 1\n").unwrap();
+    let arguments = [
+        "config",
+        "apply",
+        "--config",
+        config.to_str().unwrap(),
+        "--expected-revision",
+        "none",
+    ];
+    let refused = json(&world.environment, &arguments);
+    assert_eq!(
+        refused.status,
+        ExitStatus::Unavailable,
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.error_code(), "state_directory_not_private");
+    assert_eq!(entries(&state), Vec::<String>::new());
+
+    // A link to a private directory is also not the state directory.
+    std::fs::remove_dir(&state).unwrap();
+    let real: PathBuf = world.path("real-state");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&real, &state).unwrap();
+    let refused = json(&world.environment, &arguments);
+    assert_eq!(refused.error_code(), "state_directory_not_private");
+    assert_eq!(entries(&real), Vec::<String>::new());
+
+    // A private directory is accepted.
+    std::fs::remove_file(&state).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let applied = json(&world.environment, &arguments);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+}
+
+/// The removal of old documents keeps each lock file: a client can hold
+/// the lock of an old file.
+#[test]
+fn the_removal_of_old_documents_keeps_the_lock_files() {
+    let (world, _tree, plan) = World::with_plan("permanent");
+    let plans: PathBuf = world.path("state").join("plans");
+    let old: std::time::SystemTime = std::time::SystemTime::now() - Duration::from_hours(720);
+    let lock: PathBuf = plans.join("stop-pg_old.lock");
+    let record: PathBuf = plans.join("stop-pg_old.json");
+    for path in [&lock, &record] {
+        std::fs::write(path, b"{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    crate::commands::plan_store::prune(&world.environment);
+    assert!(lock.exists());
+    assert!(!record.exists());
+    assert!(document_path(&world, &plan).exists());
+}
+
+/// `--expected-revision none` cannot enable a guard, and the error says
+/// that the revisions do not agree.
+#[test]
+fn an_enable_that_expects_no_revision_is_a_revision_conflict() {
+    let world = World::new();
+    world.activate(BALANCED_CONFIG, "none");
+    let refused = json(
+        &world.environment,
+        &[
+            "policy",
+            "enable",
+            "memory-guard",
+            "--expected-revision",
+            "none",
+        ],
+    );
+    assert_eq!(refused.status, ExitStatus::Conflict, "{}", refused.stdout);
+    assert_eq!(refused.error_code(), "revision_conflict");
+}
+
 #[test]
 fn an_uninstall_unloads_the_service_and_removes_the_definition() {
     let (world, host) = world_with_host(RecordingHost {

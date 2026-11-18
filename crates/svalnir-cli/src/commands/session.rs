@@ -116,9 +116,28 @@ impl Now {
     }
 }
 
-/// The wall-clock time of the system clock, for a record time.
+/// The wall-clock time of the system clock, for a time that is display
+/// data. A clock with no value gives the epoch.
 pub(crate) fn wall_now() -> WallTime {
     WallTime::try_from(SystemTime::now()).unwrap_or(WallTime::UNIX_EPOCH)
+}
+
+/// The wall-clock time of the system clock, for the time of an authority
+/// record.
+///
+/// # Errors
+///
+/// Returns `clock_unavailable` when the clock has no value that a record
+/// can hold: a record must not get the epoch as its time.
+pub(crate) fn record_time() -> Result<WallTime, ErrorBody> {
+    WallTime::try_from(SystemTime::now()).map_err(|_| {
+        ErrorBody::new(
+            "clock_unavailable",
+            ErrorFamily::Native,
+            ErrorStage::Collection,
+            "the system clock has no value that a record can hold; the command made no change",
+        )
+    })
 }
 
 /// The settings of a journal connection of the client.

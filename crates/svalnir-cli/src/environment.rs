@@ -149,6 +149,20 @@ impl Environment {
             plan_id: None,
             next_action: NextAction::None,
         })?;
+        // The builder sets the mode only of a directory that it makes. A
+        // directory that exists must also be private.
+        if !is_private_directory(&directory) {
+            return Err(ErrorBody {
+                code: "state_directory_not_private".into(),
+                family: ErrorFamily::Native,
+                stage: ErrorStage::Storage,
+                message: "the state directory is a symbolic link, has a different owner, or permits access to the group or to other users; its records can name private paths; make it a directory of this user with mode 0700; the command made no change".to_owned(),
+                fields: &[],
+                operation_id: None,
+                plan_id: None,
+                next_action: NextAction::None,
+            });
+        }
         Ok(directory)
     }
 
@@ -180,6 +194,29 @@ impl Environment {
                 next_action: NextAction::CorrectRequest,
             }),
         }
+    }
+}
+
+/// Whether `path` is a directory, and not a symbolic link, that this user
+/// owns and that no other user can read, write, or search.
+pub(crate) fn is_private_directory(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // The six low bits of the mode are the permissions of the group
+        // and of each other user. A private directory has none of them.
+        metadata.uid() == crate::commands::session::current_uid().get()
+            && metadata.mode().trailing_zeros() >= 6
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 

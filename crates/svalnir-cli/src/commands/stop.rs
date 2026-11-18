@@ -130,7 +130,7 @@ fn candidate(
             return Err(stop_error(
                 "target_not_attributed",
                 ErrorFamily::Eligibility,
-                "the process has no verified membership in an application or a managed job, and a plan binds no other process",
+                "the process has no verified membership in an application or a managed job, for example because a shell started it; a plan of this build binds only a process with such a membership, so this command cannot stop the process; this is a limit of this build and not a protection of the process, and `--force` does not change it",
             ));
         }
         // A managed job is signaled directly. The graceful request of an

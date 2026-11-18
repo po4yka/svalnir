@@ -31,7 +31,7 @@ pub(crate) const DEFAULT_LIMIT: usize = 20;
 /// The largest number of records of one query.
 pub(crate) const MAX_LIMIT: usize = 200;
 
-const HISTORY_NOTE: &str = "A size estimate is from the time of the plan and is not a result. A move to Trash is not reclaimed capacity. An observed capacity change includes other activity on the volume. The journal is evidence for recovery; it is not an undo record.";
+const HISTORY_NOTE: &str = "A size estimate is from the time of the plan and is not a result. A move to Trash is not reclaimed capacity. An observed capacity change includes other activity on the volume. The journal does not record the capacity observations: a record has them only for an operation that this client executed, and otherwise the value is not recorded. The journal is evidence for recovery; it is not an undo record.";
 
 /// The size estimates of the plan of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

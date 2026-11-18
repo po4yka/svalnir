@@ -444,4 +444,47 @@ impl ValidatedConfig {
     pub fn explicit_keys(&self) -> impl Iterator<Item = &str> {
         self.explicit.iter().map(String::as_str)
     }
+
+    /// Each personal folder of the template default of
+    /// `[protections].excluded_paths` ([`super::PERSONAL_FOLDERS`]) that
+    /// no path of the list protects: no path is the folder or a directory
+    /// that contains it. The comparison is of the components, with ASCII
+    /// case ignored, as on the default volume. A path that starts from `/`
+    /// is compared with `home` when it is given, and else protects no
+    /// folder. With the template default, the result is empty.
+    pub fn unprotected_personal_folders(
+        &self,
+        home: Option<&std::path::Path>,
+    ) -> Vec<&'static str> {
+        let lower = |component: &str| component.to_ascii_lowercase();
+        let covers = |path: &ConfigPath, folder: &ConfigPath| {
+            if path.base() == folder.base() {
+                let path: Vec<String> = path.components().map(lower).collect();
+                let folder: Vec<String> = folder.components().map(lower).collect();
+                return folder.starts_with(&path);
+            }
+            let expanded = |value: &ConfigPath| {
+                home.and_then(|home| value.expand(home).ok())
+                    .map(|expanded| expanded.to_string_lossy().to_ascii_lowercase())
+            };
+            match (expanded(path), expanded(folder)) {
+                (Some(path), Some(folder)) => {
+                    std::path::Path::new(&folder).starts_with(std::path::Path::new(&path))
+                }
+                _ => false,
+            }
+        };
+        super::PERSONAL_FOLDERS
+            .into_iter()
+            .filter(|text| {
+                ConfigPath::parse(text).is_ok_and(|folder| {
+                    !self
+                        .protections
+                        .excluded_paths
+                        .iter()
+                        .any(|path| covers(path, &folder))
+                })
+            })
+            .collect()
+    }
 }

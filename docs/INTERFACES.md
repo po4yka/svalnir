@@ -544,6 +544,8 @@ Explicit cancellation is scoped to an operation. Its acknowledgement distinguish
 
 `config validate` separates syntax/schema validation from live resolution of rules, worker capabilities, and target identities. It reports which checks ran and which require the agent or supported platform. A portable parser pass must not be presented as live native eligibility.
 
+A document whose `[protections].excluded_paths` list replaces the default gets one warning `personal_folder_not_protected` in the envelope `warnings` (on stderr in the text format) for each personal folder of the default list that the list does not protect ([POLICY_SPEC.md](POLICY_SPEC.md) section 12), from `config validate`, `config show`, and `config apply`. The comparison is of the path components, with ASCII case ignored; a path that starts from `/` is compared through the home directory of the client. A warning does not make the document invalid.
+
 `config show --effective` reports resolved values, their template/override provenance, active revision, and pending/degraded capabilities. Selecting `--config` for a simulation labels the proposed policy; it does not replace the active revision.
 
 Activation and grant changes use expected revisions and typed scope differences. Policy and helper storage do not form one atomic transaction. If required helper approval is pending, the response identifies the blocked subset rather than claiming a completed privilege expansion.

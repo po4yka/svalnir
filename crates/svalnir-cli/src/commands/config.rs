@@ -422,11 +422,35 @@ pub(crate) fn proposal_text<T: Serialize>(heading: &str, source: &SourceView, vi
     out
 }
 
+/// One warning for each personal folder of the default `[protections]`
+/// table that the `excluded_paths` list of the document does not protect
+/// (`docs/POLICY_SPEC.md` section 12). The home directory of the client
+/// resolves a path that starts from `/`.
+pub(crate) fn personal_folder_warnings(
+    config: &ValidatedConfig,
+    environment: &Environment,
+) -> Vec<crate::output::Warning> {
+    config
+        .unprotected_personal_folders(environment.home.as_deref())
+        .into_iter()
+        .map(|folder| crate::output::Warning {
+            code: "personal_folder_not_protected".into(),
+            message: format!(
+                "the `[protections].excluded_paths` list of the document replaces the default list and does not protect `{folder}`: a manual or automatic action can include entries there"
+            ),
+        })
+        .collect()
+}
+
 pub(crate) fn validate(
     arguments: &ProposalOption,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
     let proposal: Proposal = load(invocation.environment, arguments, false)?;
+    if let Some(config) = config::parse_and_validate(&proposal.text).config() {
+        let warnings = personal_folder_warnings(config, invocation.environment);
+        invocation.warnings.extend(warnings);
+    }
     let view = ValidateView::new(&proposal);
     invocation.emit(Kind::Report, &view, ValidateView::render)?;
     Ok(view.status())
@@ -441,6 +465,8 @@ pub(crate) fn show(
             .ok_or_else(super::session::no_active_revision)?;
         let authority = super::session::read_authority(&journal)?;
         let active = super::session::active_config(&journal, &authority.state)?;
+        let warnings = personal_folder_warnings(&active.config, invocation.environment);
+        invocation.warnings.extend(warnings);
         let view = ShowView::effective(&active);
         invocation.emit(Kind::Report, &view, ShowView::render)?;
         return Ok(ExitStatus::Success);
@@ -451,6 +477,8 @@ pub(crate) fn show(
         true,
     )?;
     let config: ValidatedConfig = validated(&proposal)?;
+    let warnings = personal_folder_warnings(&config, invocation.environment);
+    invocation.warnings.extend(warnings);
     let view = ShowView::new(proposal.source, &config);
     invocation.emit(Kind::Report, &view, ShowView::render)?;
     Ok(ExitStatus::Success)

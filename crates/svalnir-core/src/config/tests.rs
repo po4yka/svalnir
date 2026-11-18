@@ -1162,3 +1162,37 @@ fn the_personal_folders_are_the_default_of_the_protections_table() {
     let empty = valid("schema_version = 1\n[protections]\nexcluded_paths = []\n");
     assert_eq!(empty.protections().excluded_paths, Vec::<ConfigPath>::new());
 }
+
+/// A list that replaces the default names each personal folder that it
+/// does not protect. A path protects the folder and each folder below it.
+#[test]
+fn a_replaced_protections_list_names_each_personal_folder_that_it_does_not_protect() {
+    let home: &Path = Path::new("/Users/a");
+    let of = |list: &str| {
+        valid(&format!(
+            "schema_version = 1\n[protections]\nexcluded_paths = {list}\n"
+        ))
+        .unprotected_personal_folders(Some(home))
+    };
+    assert_eq!(
+        valid("schema_version = 1\n").unprotected_personal_folders(None),
+        Vec::<&str>::new()
+    );
+    assert_eq!(of("[]"), super::PERSONAL_FOLDERS);
+    assert_eq!(
+        of("[\"~/Desktop\", \"~/documents\", \"~/Library\", \"/Users/a/Music\"]"),
+        ["~/Downloads", "~/Movies", "~/Pictures", "~/Public"]
+    );
+    // A path inside a folder does not protect the whole folder.
+    assert!(of("[\"~/Documents/taxes\"]").contains(&"~/Documents"));
+    // A path that starts from `/` needs the home directory.
+    let config = valid("schema_version = 1\n[protections]\nexcluded_paths = [\"/Users/a\"]\n");
+    assert_eq!(
+        config.unprotected_personal_folders(Some(home)),
+        Vec::<&str>::new()
+    );
+    assert_eq!(
+        config.unprotected_personal_folders(None),
+        super::PERSONAL_FOLDERS
+    );
+}

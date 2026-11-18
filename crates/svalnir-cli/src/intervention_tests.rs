@@ -379,11 +379,45 @@ fn an_entry_in_a_personal_folder_is_protected_until_the_configuration_permits_it
     );
     assert_eq!(state_files(&world), before);
 
-    // The user replaces the list: the other folders stay protected, and
-    // `~/Documents` is not in the list.
-    world.activate(
+    // The user replaces the list: only `~/Desktop` and `~/Pictures` stay
+    // protected. The activation names each default folder that the list
+    // does not protect.
+    let config: PathBuf = world.path("config.toml");
+    std::fs::write(
+        &config,
         "schema_version = 1\n[protections]\nexcluded_paths = [\"~/Desktop\", \"~/Pictures\"]\n",
+    )
+    .unwrap();
+    let arguments = [
+        "config",
+        "apply",
+        "--config",
+        config.to_str().unwrap(),
+        "--expected-revision",
         &revision,
+    ];
+    let applied = json(&world.environment, &arguments);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    let warnings: Vec<String> = applied.envelope()["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|warning| warning["code"] == "personal_folder_not_protected")
+        .map(|warning| warning["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(warnings.len(), 7, "{warnings:?}");
+    for folder in ["~/Documents", "~/Downloads", "~/Library/CloudStorage"] {
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains(&format!("`{folder}`"))),
+            "{folder}: {warnings:?}"
+        );
+    }
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("`~/Desktop`"))
     );
     let planned = plan_with(&world, &scan, "permanent", &[&drafts]);
     assert_eq!(planned.status, ExitStatus::Success, "{}", planned.stdout);

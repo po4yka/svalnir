@@ -269,6 +269,8 @@ pub(crate) fn config_apply(
         false,
     )?;
     let config: ValidatedConfig = config_command::validated(&proposal)?;
+    let warnings = config_command::personal_folder_warnings(&config, invocation.environment);
+    invocation.warnings.extend(warnings);
     let registry = registry()?;
     let revision_id: PolicyRevisionId =
         PolicyRevisionId::new(session::new_id("rev")).map_err(|_| session::identity_error())?;

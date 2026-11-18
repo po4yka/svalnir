@@ -2,20 +2,26 @@
 
 use super::nav::{CloseWindow, KEY_CONTEXT, Refresh, Screen, SelectScreen};
 use crate::{
+    data::{
+        model::{AgentState, Loadable},
+        store::AppModel,
+    },
     screens::placeholder::Placeholder,
     theme::tokens::{self, Tokens, to_hsla},
+    ui::data_state::format_age,
 };
 use gpui_kit::{
-    AnyView, AppContext as _, ClickEvent, Context, Entity, EntityId, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    AnyElement, AnyView, AppContext as _, ClickEvent, Context, Entity, EntityId, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, Render, Role, StatefulInteractiveElement,
+    Styled, TestSupportExt as _, Window,
     component::{
-        ActiveTheme as _, TitleBar, h_flex,
+        ActiveTheme as _, Icon, IconName, TitleBar, h_flex,
         sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
         v_flex,
     },
     div, px,
 };
+use std::time::SystemTime;
 
 /// The main window view. It keeps one entity per screen so that screen state
 /// survives navigation.
@@ -24,12 +30,12 @@ pub struct MainWindow {
     active: Screen,
     screens: Vec<AnyView>,
     focus: FocusHandle,
-    status: SharedString,
+    model: Entity<AppModel>,
 }
 
 impl MainWindow {
     /// Creates the view with all screens built; Overview is active.
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let screens: Vec<AnyView> = Screen::ALL
             .iter()
             .map(|&screen| {
@@ -39,14 +45,87 @@ impl MainWindow {
             .collect();
         let focus: FocusHandle = cx.focus_handle();
         window.focus(&focus, cx);
+        cx.observe(&model, |_, _, cx| cx.notify()).detach();
+        let active: bool = window.is_window_active();
+        model.update(cx, |model, cx| model.set_active(active, cx));
+        cx.observe_window_activation(window, |this, window, cx| {
+            let active: bool = window.is_window_active();
+            this.model
+                .update(cx, |model, cx| model.set_active(active, cx));
+        })
+        .detach();
         Self {
             active: Screen::Overview,
             screens,
             focus,
-            // TODO(npochaev): a later step replaces this with the agent state
-            // and the age of the data.
-            status: "No data source".into(),
+            model,
         }
+    }
+
+    /// The status line: source, agent state, and the age of the data.
+    fn status_text(&self, cx: &Context<Self>) -> String {
+        let model: &AppModel = self.model.read(cx);
+        let agent: &str = match &model.agent {
+            Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => snapshot.state.label(),
+            Loadable::Loading => "loading",
+            Loadable::Unavailable(_) => "unavailable",
+        };
+        let updated: String = match &model.host {
+            Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => format_age(
+                SystemTime::now()
+                    .duration_since(snapshot.captured_at)
+                    .unwrap_or_default(),
+            ),
+            Loadable::Loading | Loadable::Unavailable(_) => "no data".to_owned(),
+        };
+        format!(
+            "{} \u{b7} agent {agent} \u{b7} updated {updated}",
+            model.source_label()
+        )
+    }
+
+    /// The text of the banner above the content, when one applies.
+    fn banner_text(&self, cx: &Context<Self>) -> Option<String> {
+        let model: &AppModel = self.model.read(cx);
+        if let Some(name) = model.fixture_name() {
+            return Some(format!(
+                "Fixture data: {name}. Values are not measurements."
+            ));
+        }
+        match &model.agent {
+            Loadable::Ready(snapshot) | Loadable::Stale(snapshot)
+                if matches!(
+                    snapshot.state,
+                    AgentState::NotRunning | AgentState::NoJournal
+                ) =>
+            {
+                Some(
+                    "The agent is not running. Values come from this window's own measurement; no automatic protection is active."
+                        .to_owned(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn banner(text: String, tokens: &Tokens) -> AnyElement {
+        h_flex()
+            .id("data-banner")
+            .role(Role::Status)
+            .test_support()
+            .aria_label(text.clone())
+            .gap(px(8.0))
+            .items_center()
+            .px(px(12.0))
+            .py(px(8.0))
+            .mb(px(12.0))
+            .rounded(px(12.0))
+            .bg(to_hsla(tokens.surface))
+            .text_size(px(13.0))
+            .text_color(to_hsla(tokens.warning))
+            .child(Icon::new(IconName::TriangleAlert).size_4())
+            .child(text)
+            .into_any_element()
     }
 
     /// The active screen.
@@ -89,6 +168,9 @@ impl Render for MainWindow {
         let collapsed: bool = window.viewport_size().width < tokens::SIDEBAR_COLLAPSE_WIDTH;
         let content: Option<AnyView> = self.screens.get(self.active.index()).cloned();
         let items: Vec<SidebarMenuItem> = self.nav_items(cx);
+        let status: String = self.status_text(cx);
+        let banner: Option<AnyElement> =
+            self.banner_text(cx).map(|text| Self::banner(text, tokens));
 
         v_flex()
             .size_full()
@@ -99,8 +181,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, action: &SelectScreen, _, cx| {
                 this.select(action.screen, cx);
             }))
-            // TODO(npochaev): a later step wires Refresh to the data layer.
-            .on_action(cx.listener(|_, _: &Refresh, _, _| {}))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                this.model.update(cx, AppModel::refresh);
+            }))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
@@ -122,11 +205,16 @@ impl Render for MainWindow {
                             .h_full()
                             .overflow_y_scroll()
                             .p(tokens::CONTENT_PADDING)
+                            .children(banner)
                             .children(content),
                     ),
             )
             .child(
                 h_flex()
+                    .id("status-line")
+                    .role(Role::Status)
+                    .test_support()
+                    .aria_label(status.clone())
                     .h(tokens::STATUS_LINE_HEIGHT)
                     .flex_shrink_0()
                     .items_center()
@@ -134,7 +222,7 @@ impl Render for MainWindow {
                     .bg(to_hsla(tokens.surface))
                     .text_size(px(12.0))
                     .text_color(to_hsla(tokens.muted_foreground))
-                    .child(self.status.clone()),
+                    .child(status),
             )
     }
 }

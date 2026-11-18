@@ -6919,7 +6919,9 @@ name = "svalnir-gui"
 version = "0.0.0"
 dependencies = [
  "gpui-kit",
+ "svalnir-agent",
  "svalnir-core",
+ "tempfile",
  "tracing",
 ]
 

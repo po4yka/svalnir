@@ -150,3 +150,9 @@ pub fn install(window: &mut Window, cx: &mut App) {
         .observe_window_appearance(|window, cx| sync(window.appearance(), cx))
         .detach();
 }
+
+/// Applies the theme of `appearance` for good: no observer follows the
+/// system appearance afterwards.
+pub fn install_fixed(appearance: WindowAppearance, cx: &mut App) {
+    sync(appearance, cx);
+}

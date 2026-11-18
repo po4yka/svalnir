@@ -9,8 +9,10 @@ use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, px, size,
     test::TestWindowExt as _,
 };
+use std::sync::Arc;
 use svalnir_gui::{
     app::open_main_window,
+    data::fixture::{FixtureScenario, FixtureSource},
     shell::{
         nav::{self, Screen},
         window::MainWindow,
@@ -23,6 +25,8 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<MainWindow>) {
     cx.update(|cx| {
         open_main_window(
             Bounds::new(Point::default(), size(px(1120.0), px(720.0))),
+            Arc::new(FixtureSource::new(FixtureScenario::Healthy)),
+            None,
             cx,
         )
         .expect("open test window")
@@ -75,7 +79,7 @@ fn screen_entities_survive_navigation(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn refresh_is_a_no_op_that_keeps_the_screen(cx: &mut TestAppContext) {
+fn refresh_keeps_the_screen(cx: &mut TestAppContext) {
     let (handle, view) = open(cx);
     cx.update_window(handle, |_, window, cx| window.press("cmd-r", cx))
         .unwrap();

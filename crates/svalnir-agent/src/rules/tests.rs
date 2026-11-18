@@ -467,6 +467,70 @@ fn a_root_with_no_valid_marker_is_not_a_temporary_root() {
     assert!(matches!(error, DiscoveryError::RootNotClassified));
 }
 
+/// The valid marker of the root of `fixture`, as JSON.
+fn valid_marker(fixture: &Fixture) -> serde_json::Value {
+    serde_json::to_value(TemporaryRootMarker {
+        schema_version: TEMPORARY_SCHEMA_VERSION,
+        kind: ROOT_MARKER_KIND.to_owned(),
+        owner_uid: fixture.principal.get(),
+        directory: object_of(fixture.root()),
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_forged_root_marker_does_not_classify_the_root() {
+    // Each marker differs from a valid one in one respect.
+    type Forge = fn(&Fixture, &Path);
+    let cases: [(&str, Forge); 6] = [
+        ("another owner", |fixture, marker| {
+            let mut value = valid_marker(fixture);
+            value["owner_uid"] = serde_json::json!(fixture.principal.get() ^ 1);
+            fs::write(marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        }),
+        ("another kind", |fixture, marker| {
+            let mut value = valid_marker(fixture);
+            value["kind"] = serde_json::json!("other_kind");
+            fs::write(marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        }),
+        ("another schema version", |fixture, marker| {
+            let mut value = valid_marker(fixture);
+            value["schema_version"] = serde_json::json!(TEMPORARY_SCHEMA_VERSION + 1);
+            fs::write(marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        }),
+        ("malformed JSON", |_, marker| {
+            fs::write(marker, b"{ not json").unwrap();
+        }),
+        ("a symbolic link", |fixture, marker| {
+            let real = fixture.base().join("real-marker.json");
+            fs::write(&real, serde_json::to_vec(&valid_marker(fixture)).unwrap()).unwrap();
+            symlink(&real, marker).unwrap();
+        }),
+        ("a hard link", |fixture, marker| {
+            let real = fixture.base().join("real-marker.json");
+            fs::write(&real, serde_json::to_vec(&valid_marker(fixture)).unwrap()).unwrap();
+            fs::hard_link(&real, marker).unwrap();
+        }),
+    ];
+    for (name, forge) in cases {
+        let fixture = Fixture::new("Temporary");
+        fs::create_dir(fixture.root().join("item-a")).unwrap();
+        forge(&fixture, &fixture.root().join(ROOT_MARKER_NAME));
+        let error = discover_temporary_with(
+            &fixture,
+            NO_LEASES,
+            DiscoveryMode::Full,
+            limits(),
+            &later_clock(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, DiscoveryError::RootNotClassified),
+            "{name}: {error:?}"
+        );
+    }
+}
+
 #[test]
 fn a_root_that_fails_a_check_is_rejected() {
     let fixture = temporary_fixture();

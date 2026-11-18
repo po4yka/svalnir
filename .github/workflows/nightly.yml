@@ -1,0 +1,87 @@
+name: Nightly
+
+# Run the tests on each GitHub-hosted macOS image, and the dependency policy
+# against the current advisory database. Each hosted runner is a new virtual
+# machine that GitHub discards after the job, so a defect in a test fixture
+# cannot change a developer's Mac.
+#
+# Do not add a pull_request trigger, and do not move a job to a self-hosted
+# runner: see "CI and releases" in CONTRIBUTING.md.
+
+on:
+  schedule:
+    # 02:17 UTC each day. The minute is not 0, because GitHub delays the
+    # scheduled runs at the start of an hour.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    # A fork does not run the schedule.
+    if: github.repository == 'po4yka/svalnir'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The arm64 images that GitHub supports. Keep the list the same as
+        # "CI and releases" in CONTRIBUTING.md.
+        os: [macos-15, macos-26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record the host environment
+        run: |
+          {
+            echo '### Host environment'
+            echo
+            echo '```text'
+            sw_vers
+            echo "Architecture: $(uname -m)"
+            echo "Memory bytes: $(sysctl -n hw.memsize)"
+            echo "Logical CPUs: $(sysctl -n hw.ncpu)"
+            echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            xcodebuild -version
+            df -h /
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install the Metal toolchain for GPUI shaders
+        run: xcrun -sdk macosx metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.os }}
+      - run: scripts/check.sh test
+
+  advisories:
+    name: Dependency policy
+    if: github.repository == 'po4yka/svalnir'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.21.0
+      - run: scripts/check.sh deny

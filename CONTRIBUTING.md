@@ -141,6 +141,17 @@ The license allow list in `deny.toml` contains only licenses that are compatible
 
 `.github/workflows/ci.yml` runs on each push to `main`, on each pull request, and on demand. The release workflow also calls it. It runs `scripts/check.sh` in three jobs: the Rust steps on macOS, the dependency policy on Linux, and the text, link, and workflow lint on Linux.
 
+`.github/workflows/nightly.yml` runs each night at 02:17 UTC and on demand. It has no pull request trigger. It runs two jobs:
+
+- The `test` step on each GitHub-hosted arm64 macOS image: `macos-15` and `macos-26`. Each runner is a new virtual machine that GitHub discards after the job, so a defect in a test fixture cannot change the Mac of a developer. The job writes the macOS version, the runner image, the Xcode version, and the capacity of the runner to the job summary.
+- The `deny` step on Linux. A new advisory for a dependency then shows without a push.
+
+A nightly run is not evidence for a release gate. The runners are virtual machines, and the jobs do not start the GPUI client, register a service, or change a permission. For those checks, use an environment that you control, and record it as [VALIDATION.md](docs/VALIDATION.md#8-supported-environment-matrix) specifies.
+
+Keep the nightly jobs on GitHub-hosted runners, and keep the triggers to the schedule and the manual run. The repository is public, so a self-hosted runner with a pull request trigger can run the code of a fork on the machine of a maintainer.
+
+GitHub stops the schedule of a public repository after 60 days without repository activity; start it again on the Actions page. GitHub sends the failure notification of a scheduled run to the person who last changed the `cron` line.
+
 `.github/workflows/release.yml` makes release artifacts:
 
 1. Set the workspace version in `Cargo.toml` to `MAJOR.MINOR.PATCH` and merge the change to `main`. Pre-release versions such as `0.1.0-rc.1` are not supported, because `CFBundleVersion` accepts integers only.

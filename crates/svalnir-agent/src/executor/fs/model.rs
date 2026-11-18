@@ -464,10 +464,16 @@ pub struct ProcessedWork {
     /// content of a directory that it moves.
     pub trashed_logical_bytes: Option<Bytes>,
     /// Whether each sum is exact. `false` when a size from the operating
-    /// system was not valid, when a sum did not fit its type, or when the
-    /// removal of an entry is possible and not established (the call
-    /// returned an error number that does not establish its effect, and
-    /// the entry is absent). Each sum is then an estimate.
+    /// system was not valid, when a sum did not fit its type, or when an
+    /// unlink call returned an error number that does not establish its
+    /// effect and the entry is absent. Each sum is then a lower bound of
+    /// the measured sizes.
+    ///
+    /// An exact sum is the sum of the measurements of the planned objects
+    /// immediately before their calls. Each removal has the attribution
+    /// `possible` (an actor can replace an entry between the comparison and
+    /// the call), so the sums are an estimate of what the calls removed in
+    /// each case, never a measurement of reclaimed capacity.
     pub exact: bool,
 }
 

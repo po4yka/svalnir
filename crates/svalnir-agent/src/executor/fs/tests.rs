@@ -356,7 +356,9 @@ fn assert_removed(outcome: &FsTargetOutcome) {
     assert_eq!(result.effect, TargetEffect::Removed);
     assert_eq!(result.dispatch, DispatchState::Submitted);
     assert_eq!(result.evidence.native, NativeResult::Succeeded);
-    assert_eq!(result.attribution, Attribution::Established);
+    // macOS has no conditional unlink: each removal is possible, never
+    // established.
+    assert_eq!(result.attribution, Attribution::Possible);
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert_eq!(result.durability, Durability::Durable);
     assert!(result.failure.is_none());
@@ -1189,7 +1191,12 @@ fn a_file_replaced_by_a_symbolic_link_after_the_revalidation_does_not_reach_the_
         &envelope,
     );
 
+    // The call removed the link, and the planned file stays at its new
+    // name. The name is absent, so the effect is `Removed`; the attribution
+    // is `possible`, because the executor cannot establish which object the
+    // call removed.
     assert_eq!(outcome.result.effect, TargetEffect::Removed);
+    assert_eq!(outcome.result.attribution, Attribution::Possible);
     assert!(fs::symlink_metadata(&file).is_err());
     assert_eq!(
         fs::read(fixture.root.join("aside.bin")).unwrap(),
@@ -2806,13 +2813,7 @@ fn an_interrupted_call_is_settled_by_one_observation_and_is_not_repeated() {
     // A call that returned success, and another object has the name: an
     // actor changed the name near the call, so the removed object is not
     // established.
-    assert_eq!(
-        settle(Ok(())),
-        EntryOutcome::Removed {
-            attribution: Attribution::Possible,
-            errno: None,
-        }
-    );
+    assert_eq!(settle(Ok(())), EntryOutcome::Removed { errno: None });
 
     // The call was interrupted and the name is absent: the entry was
     // removed, and the cause is possible, not established.
@@ -2820,10 +2821,13 @@ fn an_interrupted_call_is_settled_by_one_observation_and_is_not_repeated() {
     assert_eq!(
         settle(interrupted()),
         EntryOutcome::Removed {
-            attribution: Attribution::Possible,
-            errno: Some(libc::EINTR),
+            errno: Some(libc::EINTR)
         }
     );
+    // A call that returned success and a name that is absent after it: a
+    // removal also, and the executor maps each removal to the attribution
+    // `possible`.
+    assert_eq!(settle(Ok(())), EntryOutcome::Removed { errno: None });
     assert_eq!(
         settle(Err(io::Error::from_raw_os_error(libc::ENOENT))),
         EntryOutcome::Absent

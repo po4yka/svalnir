@@ -18,8 +18,13 @@
 //! The comparison and the `unlinkat` call are not one atomic step. An actor
 //! that can write to the directory can replace an entry between them; the
 //! call then removes the replacement of the same name in the same
-//! directory. It cannot leave the directory, because the call is relative
-//! to the open descriptor. The descriptor follows its directory: an actor
+//! directory, and the planned object stays at its new name. macOS has no
+//! unlink that is conditional on the inode, so the executor cannot detect
+//! this. Each successful unlink, of a file target, of an entry of a tree,
+//! and of a directory, thus has the attribution `possible`, never
+//! `established`: the name is absent, and that the call removed the planned
+//! object is not established. The call cannot leave the directory, because
+//! the call is relative to the open descriptor. The descriptor follows its directory: an actor
 //! that moves an open directory of the tree, or a directory above it, to
 //! another place makes the later calls act in that place. Each call still
 //! acts only on a name whose object was compared with the measurement.
@@ -33,7 +38,6 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
-use svalnir_core::action::Attribution;
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
 use svalnir_core::quantity::{Bytes, EntryCount};
 
@@ -55,13 +59,12 @@ pub(super) const STOP_CHECK_ENTRIES: u32 = 256;
 /// The result of one `unlinkat` call, after the observation of the entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum EntryOutcome {
-    /// The name is absent after the call.
+    /// The name is absent after the call, or another object has it after
+    /// a call that returned success. The attribution of each such result is
+    /// `possible`: see the race in the module documentation.
     Removed {
-        /// `Established` when the call returned success. `Possible` when
-        /// the call returned an error number that does not establish the
-        /// effect and the name is absent, or when the observation failed.
-        attribution: Attribution,
-        /// The error number of the call, when it returned one.
+        /// The error number of the call, when it returned one that does not
+        /// establish the effect.
         errno: Option<i32>,
     },
     /// The call returned `ENOENT`: the entry was absent when it ran.
@@ -120,11 +123,11 @@ pub(super) fn observe_entry(
 /// Reads the result of an `unlinkat` call and observes the entry. The call
 /// is not repeated for any result.
 ///
-/// `Established` states that the call returned success for the name and
-/// that no object has the name after it. It does not state that the
+/// [`EntryOutcome::Removed`] states that the call returned success, or an
+/// error number that does not establish its effect, and that the planned
+/// object does not have the name after it. It does not state that the
 /// removed object was the object of the plan: see the race in the module
-/// documentation. When another object has the name after the call, the
-/// attribution is `Possible`.
+/// documentation.
 pub(super) fn settle_unlink(
     result: &io::Result<()>,
     parent: BorrowedFd<'_>,
@@ -137,17 +140,13 @@ pub(super) fn settle_unlink(
     let error: &io::Error = match result {
         Ok(()) => {
             return match observed {
-                Observed::Gone => EntryOutcome::Removed {
-                    attribution: Attribution::Established,
-                    errno: None,
-                },
-                // Another object has the name after the call. An actor
-                // changed the name near the call, so the observation does
-                // not establish which object the call removed.
-                Observed::Replaced | Observed::Unobserved => EntryOutcome::Removed {
-                    attribution: Attribution::Possible,
-                    errno: None,
-                },
+                // No object has the name, another object has it (an actor
+                // changed the name near the call), or the name cannot be
+                // read. None of them establishes which object the call
+                // removed.
+                Observed::Gone | Observed::Replaced | Observed::Unobserved => {
+                    EntryOutcome::Removed { errno: None }
+                }
                 // The call returned success and the same object has the
                 // name, for example through a second link that another
                 // actor moved in.
@@ -164,10 +163,7 @@ pub(super) fn settle_unlink(
         CallVerdict::Absent => EntryOutcome::Absent,
         CallVerdict::NoEffect(cause) => EntryOutcome::NoEffect { errno, cause },
         CallVerdict::Indeterminate(cause) => match observed {
-            Observed::Gone => EntryOutcome::Removed {
-                attribution: Attribution::Possible,
-                errno,
-            },
+            Observed::Gone => EntryOutcome::Removed { errno },
             // The same object at the name does not establish that the call
             // had no effect: another actor can link a file with a second
             // name back in. The result stays in the `outcome` family.

@@ -177,7 +177,7 @@ impl HistoryRecord {
         if let Some(work) = &self.work {
             put_line!(
                 out,
-                "    Permanently removed: {}{} entries, {} allocated   Moved to Trash: {} entries",
+                "    Permanently removed (estimate): {}{} entries, {} allocated   Moved to Trash: {} entries",
                 if work.exact { "" } else { "at least " },
                 work.removed_entries.get(),
                 human_bytes(work.removed_allocated_bytes.get()),

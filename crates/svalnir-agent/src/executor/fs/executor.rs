@@ -122,12 +122,15 @@ impl Draft {
     /// The result of one `unlinkat` call for the target itself.
     fn of_entry(outcome: EntryOutcome, work: ProcessedWork) -> Self {
         match outcome {
-            EntryOutcome::Removed { attribution, errno } => {
+            // macOS has no conditional unlink, so the call can have removed
+            // a replacement of the planned object: each removal is
+            // possible, never established.
+            EntryOutcome::Removed { errno } => {
                 let native: NativeResult = errno.map_or(NativeResult::Succeeded, |errno| {
                     NativeResult::Errno { errno }
                 });
                 let mut draft = Self::submitted(TargetEffect::Removed, native, work);
-                draft.attribution = attribution;
+                draft.attribution = Attribution::Possible;
                 draft
             }
             EntryOutcome::Absent => Self::absent_at_call(

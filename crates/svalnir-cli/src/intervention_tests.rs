@@ -274,6 +274,28 @@ fn a_permanent_plan_removes_the_selected_entries() {
         "{}",
         text.stdout
     );
+    // Each removal has the attribution `possible`, so the removed counts
+    // are an estimate.
+    assert!(
+        text.stdout.contains("Permanently removed (estimate):"),
+        "{}",
+        text.stdout
+    );
+    let show = run(
+        &world.environment,
+        &[
+            "operations",
+            "show",
+            "--operation",
+            operation["operation_id"].as_str().unwrap(),
+        ],
+    );
+    assert!(
+        show.stdout
+            .contains("(an estimate: the sizes that the executor measured before each call)"),
+        "{}",
+        show.stdout
+    );
 }
 
 #[test]

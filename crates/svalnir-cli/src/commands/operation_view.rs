@@ -45,7 +45,9 @@ const DEGRADED_NOTE: &str = "A record of this operation is not in the durable jo
 pub(crate) struct EffectCounts {
     /// Entries that were moved to Trash. Not reclaimed capacity.
     pub(crate) moved_to_trash: u64,
-    /// Entries that were permanently removed.
+    /// Entries whose name is absent after a removal call. Each one has the
+    /// attribution `possible`: macOS has no conditional unlink, so the
+    /// call can have removed a replacement of the planned object.
     pub(crate) permanently_removed: u64,
     /// Processes whose exit was observed after the request.
     pub(crate) exit_verified: u64,
@@ -113,7 +115,9 @@ pub(crate) struct WorkView {
     pub(crate) removed_logical_bytes: Bytes,
     pub(crate) removed_allocated_bytes: Bytes,
     pub(crate) trashed_entries: EntryCount,
-    /// False when a count is a lower bound.
+    /// False when a count is a lower bound. Each count is an estimate:
+    /// macOS has no conditional unlink, so each removal has the
+    /// attribution `possible`.
     pub(crate) exact: bool,
 }
 
@@ -380,7 +384,7 @@ impl OperationReport {
             if work.removed_entries.get() > 0 {
                 put_line!(
                     out,
-                    "  Permanently removed: {}{} entries, {} logical, {} allocated (as the executor measured them)",
+                    "  Permanently removed: {}{} entries, {} logical, {} allocated (an estimate: the sizes that the executor measured before each call)",
                     if work.exact { "" } else { "at least " },
                     work.removed_entries.get(),
                     human_bytes(work.removed_logical_bytes.get()),

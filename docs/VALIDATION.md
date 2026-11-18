@@ -263,6 +263,8 @@ Choose representative combinations for independent concerns and targeted combina
 
 Use physical supported hardware for claims that virtualization cannot establish. Record virtualization when used, including its storage and timing limitations.
 
+The nightly workflow runs the tests on GitHub-hosted virtual machines and writes the macOS version, the runner image, and the Xcode version to each job summary; see [CONTRIBUTING.md](../CONTRIBUTING.md#ci-and-releases). These runs are not evidence for a claim that needs physical hardware.
+
 ## 9. Release gates and traceability
 
 Test-family coverage does not imply a gate has passed. These are the only release gates. Section 6 of [THREAT_MODEL.md](THREAT_MODEL.md) states the security evidence that the gates must contain and maps each security area to the families and gates below.

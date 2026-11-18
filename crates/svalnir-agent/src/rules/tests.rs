@@ -37,6 +37,7 @@ use super::native::is_locked_by_another_process;
 use super::overlap::{OverlapKind, resolve_overlaps};
 use super::plist::parse_project_info;
 use super::registry::{ClaimError, ReviewedRules};
+use super::unit::entry_owner_and_change;
 use super::xcode::{
     ProducerProcesses, XCODE_DERIVED_DATA_LAYOUT, XcodeDerivedDataRule, XcodeEvidence,
 };
@@ -1674,6 +1675,7 @@ fn known_units_are_examined_again_with_no_measurement() {
     let active = known(XcodeEvidence {
         producer_processes: ProducerProcesses::Running,
     });
+    assert_eq!(active.candidates.len(), 3);
     assert!(
         active
             .candidates
@@ -1706,9 +1708,12 @@ fn the_process_names_of_the_producer_only_add_activity() {
         ProducerProcesses::from_complete_inventory(["Finder", "Safari"]),
         ProducerProcesses::NotRunning
     );
+    // A complete inventory has the process of the caller. An inventory
+    // with no process is a failed query, and a failed query is not "no
+    // producer".
     assert_eq!(
         ProducerProcesses::from_complete_inventory([]),
-        ProducerProcesses::NotRunning
+        ProducerProcesses::Unknown
     );
 }
 
@@ -1944,4 +1949,144 @@ fn a_parent_and_a_descendant_are_not_two_candidates() {
     let resolved = resolve_overlaps(vec![products, rival, index.clone()]);
     assert_eq!(resolved.candidates, [index]);
     assert_eq!(resolved.conflicts[0].claimant, None);
+}
+
+// ---------------------------------------------------------------------
+// The content of a unit: owners, times, and known candidates.
+// ---------------------------------------------------------------------
+
+/// Sets the modification time of the file `path`.
+fn set_modified(path: &Path, time: SystemTime) {
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+}
+
+#[test]
+fn a_file_below_an_item_that_was_written_after_the_seal_invalidates_the_item() {
+    let fixture = temporary_fixture();
+    let item = add_item(&fixture, "item-a", |_| {});
+    // A writer rewrites a file in a directory below the item one hour after
+    // the seal. The modification time of the item directory does not
+    // change.
+    set_modified(
+        &item.join("nested/part-2.bin"),
+        SystemTime::now() + Duration::from_hours(1),
+    );
+
+    let discovery = discover_temporary(&fixture);
+
+    assert_eq!(discovery.candidates.len(), 0);
+    let skipped = skip_of(&discovery, "item-a");
+    assert_eq!(skipped.reasons, [SkipReason::ModifiedAfterSeal]);
+    assert_eq!(skipped.eligibility.protocols_valid, Fact::NotSatisfied);
+}
+
+#[test]
+fn a_file_below_a_unit_that_was_written_in_place_is_the_newest_time_of_the_unit() {
+    let (fixture, project) = xcode_fixture();
+    // An indexer rewrites a record 25 days after the other files. The
+    // times of the unit directory and of `info.plist` do not change.
+    set_modified(
+        &project.join("Index.noindex/DataStore/v5/records/AB"),
+        SystemTime::now() + Duration::from_hours(25 * 24),
+    );
+
+    let discovery = discover_xcode(&fixture);
+
+    let index = candidate_of(&discovery, &unit("Index.noindex"));
+    assert_eq!(index.blockers, [SkipReason::RetentionNotElapsed]);
+    let record: &RuleCandidateRecord = &index.candidate;
+    assert_eq!(record.eligibility.age_and_inactivity, Fact::NotSatisfied);
+    // The other units have no such file.
+    let products = candidate_of(&discovery, &unit("Build/Products"));
+    assert_eq!(products.blockers.len(), 0);
+}
+
+#[test]
+fn the_owner_and_the_identity_of_each_entry_below_a_unit_are_examined() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("object.o");
+    fs::write(&file, b"object").unwrap();
+    let owner = Uid::new(fs::metadata(&file).unwrap().uid());
+    let object = object_of(&file);
+
+    let change = entry_owner_and_change(&file, object, owner).unwrap();
+    assert!(change <= real_now_plus(60));
+    assert!(change >= real_now_plus(-60));
+    // An entry of another owner is not data of the user of the discovery.
+    let other = Uid::new(owner.get().wrapping_add(1));
+    assert_eq!(
+        entry_owner_and_change(&file, object, other),
+        Err(SkipReason::WrongOwner)
+    );
+    // Another object at the path is not the object that was measured.
+    let directory_object = object_of(directory.path());
+    assert_eq!(
+        entry_owner_and_change(&file, directory_object, owner),
+        Err(SkipReason::IdentityChanged)
+    );
+    fs::remove_file(&file).unwrap();
+    assert_eq!(
+        entry_owner_and_change(&file, object, owner),
+        Err(SkipReason::Vanished)
+    );
+}
+
+#[test]
+fn a_known_candidate_of_the_temporary_rule_is_a_direct_entry_of_the_root() {
+    let fixture = temporary_fixture();
+    add_item(&fixture, "item-a", |_| {});
+    let full = discover_temporary(&fixture);
+    assert_eq!(full.candidates.len(), 1);
+    // A known candidate that names an entry below a link of the root. The
+    // link goes to a directory outside the root.
+    let outside = fixture.directory.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, fixture.root().join("sub")).unwrap();
+    let mut forged: DiscoveredCandidate = full.candidates[0].clone();
+    forged.evidence.relative_entry =
+        svalnir_core::file::LosslessPath::from_bytes(b"sub/item").unwrap();
+
+    let error = discover_temporary_with(
+        &fixture,
+        NO_LEASES,
+        DiscoveryMode::KnownCandidatesOnly(&[forged]),
+        limits(),
+        &later_clock(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, DiscoveryError::KnownCandidate));
+}
+
+#[test]
+fn a_root_marker_that_cannot_be_read_is_a_denied_capability() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = temporary_fixture();
+    add_item(&fixture, "item-a", |_| {});
+    let marker = fixture.root().join(ROOT_MARKER_NAME);
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
+    // The superuser reads each file: the case does not exist for it.
+    if File::open(&marker).is_ok() {
+        return;
+    }
+
+    let error = discover_temporary_with(
+        &fixture,
+        NO_LEASES,
+        DiscoveryMode::Full,
+        limits(),
+        &later_clock(),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(&error, DiscoveryError::RootUnavailable(cause)
+            if cause.kind() == io::ErrorKind::PermissionDenied),
+        "{error:?}"
+    );
 }

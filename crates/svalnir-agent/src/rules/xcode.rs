@@ -72,9 +72,9 @@ use super::native::is_locked_by_another_process;
 use super::plist::{ProjectInfo, parse_project_info};
 use super::registry::RegistryError;
 use super::unit::{
-    Assessment, Collector, ObjectKind, ObjectSnapshot, RecordRead, RootView, check_known,
-    elapsed_between, establish_charge, is_plain_absolute, list_root, lstat, read_record, reason_of,
-    target_evidence,
+    Assessment, Collector, ObjectKind, ObjectSnapshot, RecordRead, RootView, UnitUnderMeasurement,
+    check_known, elapsed_between, establish_charge, is_plain_absolute, list_root, lstat,
+    read_record, reason_of, target_evidence,
 };
 use crate::scan::EntryKind;
 
@@ -160,11 +160,18 @@ impl ProducerProcesses {
     /// The evidence of a complete and current inventory, from the file
     /// names of the executables of the user.
     pub fn from_complete_inventory<'a>(executables: impl IntoIterator<Item = &'a str>) -> Self {
-        let runs: bool = executables
-            .into_iter()
-            .any(|name| XCODE_PRODUCER_EXECUTABLES.contains(&name));
+        let mut is_empty: bool = true;
+        let mut runs: bool = false;
+        for name in executables {
+            is_empty = false;
+            runs = runs || XCODE_PRODUCER_EXECUTABLES.contains(&name);
+        }
         if runs {
             Self::Running
+        } else if is_empty {
+            // A complete inventory has the process of the caller. An
+            // inventory with no process is a failed query, not evidence.
+            Self::Unknown
         } else {
             Self::NotRunning
         }
@@ -880,8 +887,11 @@ impl UnitContext<'_> {
         let stopped: Option<DiscoveryCompletion> = establish_charge(
             &mut assessment,
             known,
-            &path,
-            &before,
+            &UnitUnderMeasurement {
+                path: &path,
+                before: &before,
+                principal: self.scope.principal,
+            },
             &self.rule.rule,
             &mut collector.bounds,
             &mut |relative: &Path, _: EntryKind| classify_entry(unit, relative),
@@ -920,6 +930,7 @@ impl UnitContext<'_> {
         // build database, and the age. The lock query is after the
         // measurement, so that it is as late as the discovery permits.
         let (lock, database_modified) = self.build_database_state(project);
+        let content_change: Option<WallTime> = assessment.newest_content_change;
         let is_active: bool =
             self.processes == ProducerProcesses::Running || lock == LockState::Held;
         let is_unknown: bool =
@@ -931,9 +942,14 @@ impl UnitContext<'_> {
             before.modified(),
         ];
         let newest: Option<WallTime> = match database_modified {
-            Ok(database) if times.iter().all(Option::is_some) => {
-                times.into_iter().chain([database]).flatten().max()
-            }
+            // The times of the unit directory show a change of its own
+            // names only. The newest change of the measured content shows
+            // a file that was written in place below the unit.
+            Ok(database) if times.iter().all(Option::is_some) => times
+                .into_iter()
+                .chain([database, content_change])
+                .flatten()
+                .max(),
             _ => None,
         };
         let required: Nanoseconds = self

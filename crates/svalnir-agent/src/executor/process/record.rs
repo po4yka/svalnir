@@ -18,7 +18,11 @@ use thiserror::Error;
 use crate::platform::process::ADAPTER_ID;
 
 /// The reason the executor did not start a step, or could not make a
-/// result record. No external call was issued when `begin` returns one.
+/// result record. No external call was issued when `begin` returns one of
+/// the checks before the first call (`NotApplicationStep`,
+/// `DispatchNotConsumed`, `Recording`, `GracefulRecord`). Each other value
+/// shows a defect of the executor after its checks: a call to a member was
+/// possibly issued.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExecutorError {
     /// The step is not an application intervention on an application
@@ -35,7 +39,9 @@ pub enum ExecutorError {
     #[error("the recording of the step does not permit a submission")]
     Recording(#[source] RecordingRefusal),
     /// A force step of the strategy `force_after_grace` has no record of
-    /// its graceful step, or a different step has one.
+    /// its graceful step, or a different step has one, or the record has a
+    /// result that is not known: such a graceful step permits no force
+    /// step.
     #[error("the record of the graceful step does not agree with the step")]
     GracefulRecord,
     /// A member of the target has no result at the end of the step. This

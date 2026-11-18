@@ -298,11 +298,20 @@ fn a_child_that_exited_before_the_call_is_already_exited() {
     let source: DarwinProcessSource = DarwinProcessSource::new();
     let mut child: ChildGuard = spawn_child();
     let planned: ProcessIdentity = identity(source, child.pid());
-    // The test ends its own child and collects it. The PID is then free:
-    // no process has it, or a new process with a different start time has
-    // it. The executor issues no call in the two cases.
+    // The test ends its own child and does not collect it before the
+    // executor runs. A child that was not collected keeps its PID, so the
+    // PID cannot belong to another process while the executor has it. A
+    // collected child releases the PID, and only the check under test
+    // would then prevent a signal to a process of another owner.
     child.0.kill().unwrap();
-    assert_eq!(child.collect().signal(), Some(libc::SIGKILL));
+    let limit: Instant = Instant::now() + Duration::from_secs(10);
+    while source
+        .process_info(child.pid())
+        .is_ok_and(|info| !info.zombie)
+    {
+        assert!(Instant::now() < limit, "the child did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let executor: Executor = executor();
     let receipt = receipt();
     for (class, escalation) in [
@@ -318,14 +327,10 @@ fn a_child_that_exited_before_the_call_is_already_exited() {
             panic!("a call was issued for a process that exited");
         };
         let result: &TargetResult = &report.members[0].result;
-        let replaced: bool = report.members[0].state == Some(GenerationState::Replaced);
-        if replaced {
-            assert_eq!(result.effect, TargetEffect::Skipped);
-        } else {
-            assert_eq!(result.effect, TargetEffect::AlreadyExited);
-        }
+        assert_eq!(result.effect, TargetEffect::AlreadyExited);
         assert_eq!(result.dispatch, DispatchState::NotSubmitted);
         assert_eq!(result.evidence.native, NativeResult::NotCalled);
         assert_eq!(report.submitted_at, None);
     }
+    assert_eq!(child.collect().signal(), Some(libc::SIGKILL));
 }

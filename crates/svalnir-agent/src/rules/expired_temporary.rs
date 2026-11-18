@@ -33,6 +33,7 @@
 //! an examined record.
 
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -54,8 +55,9 @@ use super::model::{
 };
 use super::registry::RegistryError;
 use super::unit::{
-    Assessment, Collector, ObjectKind, ObjectSnapshot, RecordRead, RootView, check_known,
-    elapsed_between, establish_charge, list_root, lstat, read_record, reason_of, target_evidence,
+    Assessment, Collector, ObjectKind, ObjectSnapshot, RecordRead, RootView, UnitUnderMeasurement,
+    check_known, elapsed_between, establish_charge, list_root, lstat, read_record, reason_of,
+    target_evidence,
 };
 use crate::scan::EntryKind;
 
@@ -416,7 +418,24 @@ impl ExpiredTemporaryRule {
                 }
             }
             DiscoveryMode::KnownCandidatesOnly(known) => {
-                for candidate in check_known(&self.rule, &root, control, known)? {
+                let known: &[DiscoveredCandidate] = check_known(&self.rule, &root, control, known)?;
+                // A unit of this layout is a direct entry of the root. A
+                // path with more components is not a candidate of this
+                // rule, and a directory between the root and such an entry
+                // has no check: it can be a symbolic link.
+                let is_direct_entry = |candidate: &DiscoveredCandidate| {
+                    candidate
+                        .evidence
+                        .relative_entry
+                        .to_path_buf()
+                        .components()
+                        .count()
+                        == 1
+                };
+                if !known.iter().all(is_direct_entry) {
+                    return Err(DiscoveryError::KnownCandidate);
+                }
+                for candidate in known {
                     if let Err(stopped) = collector.bounds.take_unit() {
                         completion = stopped;
                         break;
@@ -441,12 +460,22 @@ impl ExpiredTemporaryRule {
 /// Checks the marker of the root: a valid record of this schema that names
 /// the root directory and the user of the discovery.
 fn check_root_marker(root: &RootView, scope: &DiscoveryScope<'_>) -> Result<(), DiscoveryError> {
-    let RecordRead::Read { bytes, .. } = read_record(
+    let bytes: Vec<u8> = match read_record(
         &root.path.join(ROOT_MARKER_NAME),
         MAX_RECORD_BYTES,
         scope.principal,
-    ) else {
-        return Err(DiscoveryError::RootNotClassified);
+    ) {
+        RecordRead::Read { bytes, .. } => bytes,
+        // A marker that cannot be read is a denied capability, not a root
+        // of another layout.
+        RecordRead::Denied => {
+            return Err(DiscoveryError::RootUnavailable(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )));
+        }
+        RecordRead::Absent | RecordRead::Invalid => {
+            return Err(DiscoveryError::RootNotClassified);
+        }
     };
     let marker: TemporaryRootMarker =
         serde_json::from_slice(&bytes).map_err(|_| DiscoveryError::RootNotClassified)?;
@@ -570,8 +599,11 @@ impl ItemContext<'_> {
         let stopped: Option<DiscoveryCompletion> = establish_charge(
             &mut assessment,
             known,
-            &path,
-            &before,
+            &UnitUnderMeasurement {
+                path: &path,
+                before: &before,
+                principal: self.scope.principal,
+            },
             self.rule,
             &mut collector.bounds,
             &mut classify_entry,
@@ -610,10 +642,18 @@ impl ItemContext<'_> {
                 assessment.eligibility.age_and_inactivity = Fact::NotSatisfied;
             }
             Some(sealed_at) => {
-                // A directory that changed after the seal had a writer
-                // that the seal did not stop.
-                let modified_after_seal: Option<bool> = before.modified().map(|modified| {
-                    elapsed_between(sealed_at, modified)
+                // A directory, or an object below it, that changed after
+                // the seal had a writer that the seal did not stop. The
+                // modification time of a directory shows only a change of
+                // its own names, so the newest change of the measured
+                // content is compared also.
+                let newest: Option<WallTime> = before.modified().map(|modified| {
+                    assessment
+                        .newest_content_change
+                        .map_or(modified, |content| content.max(modified))
+                });
+                let modified_after_seal: Option<bool> = newest.map(|newest| {
+                    elapsed_between(sealed_at, newest)
                         .is_some_and(|after| after > SEAL_WRITE_TOLERANCE)
                 });
                 match modified_after_seal {
@@ -628,7 +668,14 @@ impl ItemContext<'_> {
                 let (fact, activity, reasons) =
                     age_and_inactivity(self.rule, record, sealed_at, now, self.leases);
                 assessment.eligibility.age_and_inactivity = fact;
-                assessment.activity = activity;
+                // An item that changed after its seal, or whose time is
+                // not known, is not shown to be inactive since the seal.
+                assessment.activity = match activity {
+                    ActivityFact::Inactive { .. } if !protocol_reasons.is_empty() => {
+                        ActivityFact::Unknown
+                    }
+                    activity => activity,
+                };
                 assessment.reasons.extend(reasons);
             }
         }

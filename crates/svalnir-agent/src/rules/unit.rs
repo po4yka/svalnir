@@ -106,6 +106,13 @@ impl ObjectSnapshot {
         WallTime::from_unix(self.stamp.modified_seconds, nanoseconds).ok()
     }
 
+    /// The time of the last status change (`st_ctime`). `None` when the
+    /// time is outside the range of [`WallTime`].
+    pub(super) fn changed(&self) -> Option<WallTime> {
+        let nanoseconds: u32 = u32::try_from(self.stamp.changed_nanoseconds).ok()?;
+        WallTime::from_unix(self.stamp.changed_seconds, nanoseconds).ok()
+    }
+
     /// The object type of a plan target. `None` for a kind that no rule
     /// removes.
     pub(super) fn object_type(&self) -> Option<FileObjectType> {
@@ -469,6 +476,43 @@ struct UnitObserver<'a> {
     work_bytes: Option<u64>,
     reasons: BTreeSet<SkipReason>,
     classify: Classifier<'a>,
+    /// The user of the discovery. Each object below the unit must have
+    /// this owner.
+    owner: Uid,
+    /// The newest modification or status change of an object below the
+    /// unit.
+    newest_change: Option<WallTime>,
+}
+
+/// Reads the owner and the times of one measured entry below a unit.
+///
+/// The record of the scanner has the identity of the entry and neither its
+/// owner nor its times. The read is by path and does not follow a link at
+/// the last component; the identity ties the result to the object that the
+/// scanner measured. Returns the newer of the modification time and the
+/// status-change time.
+///
+/// # Errors
+///
+/// Returns the reason that the unit cannot be a candidate: the entry is
+/// absent or cannot be read, another object has the path, the owner is not
+/// `owner`, or a time is not valid.
+pub(super) fn entry_owner_and_change(
+    path: &Path,
+    object: FileObjectEvidence,
+    owner: Uid,
+) -> Result<WallTime, SkipReason> {
+    let snapshot: ObjectSnapshot = lstat(path).map_err(|error| reason_of(&error))?;
+    if snapshot.object != object {
+        return Err(SkipReason::IdentityChanged);
+    }
+    if snapshot.owner != owner {
+        return Err(SkipReason::WrongOwner);
+    }
+    match (snapshot.modified(), snapshot.changed()) {
+        (Some(modified), Some(changed)) => Ok(modified.max(changed)),
+        _ => Err(SkipReason::AgeUnknown),
+    }
 }
 
 impl ScanObserver for UnitObserver<'_> {
@@ -503,6 +547,17 @@ impl ScanObserver for UnitObserver<'_> {
                 self.reasons.insert(SkipReason::UnsupportedObject);
             }
             EntryKind::File | EntryKind::Directory | EntryKind::Symlink => {}
+        }
+        match entry_owner_and_change(entry.path, entry.object, self.owner) {
+            Ok(change) => {
+                self.newest_change = Some(
+                    self.newest_change
+                        .map_or(change, |newest| newest.max(change)),
+                );
+            }
+            Err(reason) => {
+                self.reasons.insert(reason);
+            }
         }
         match entry.path.strip_prefix(self.unit) {
             Ok(relative) => {
@@ -569,9 +624,10 @@ fn measure_unit(
     rule: &Rule,
     bounds: &mut Bounds<'_>,
     classify: Classifier<'_>,
-) -> Result<Measured, DiscoveryError> {
+    principal: Uid,
+) -> Result<(Measured, Option<WallTime>), DiscoveryError> {
     if let Some(completion) = bounds.stop() {
-        return Ok(Measured::Stopped(completion));
+        return Ok((Measured::Stopped(completion), None));
     }
     let ceiling: WorkCharge = rule.budget.per_candidate;
     let remaining: u64 = bounds.remaining_entries();
@@ -609,17 +665,22 @@ fn measure_unit(
         work_bytes: Some(0),
         reasons: BTreeSet::new(),
         classify,
+        owner: principal,
+        newest_change: None,
     };
     let scanned: Result<ScanResult, ScanError> =
         run_scan(&request, &scan_cancel, bounds.control.clock, &mut observer);
     let result: ScanResult = match scanned {
         Ok(result) => result,
-        Err(error) => return scan_refusal(error).map(Measured::Rejected),
+        Err(error) => {
+            return scan_refusal(error).map(|reasons| (Measured::Rejected(reasons), None));
+        }
     };
     bounds.entries_examined = bounds
         .entries_examined
         .saturating_add(result.entries_examined.get());
 
+    let newest_change: Option<WallTime> = observer.newest_change;
     let scan: FinishedScan<'_> = FinishedScan {
         result: &result,
         reasons: observer.reasons,
@@ -627,7 +688,7 @@ fn measure_unit(
         work_bytes: observer.work_bytes,
         scan_limit,
     };
-    Ok(scan.conclude(unit, &ceiling))
+    Ok((scan.conclude(unit, &ceiling), newest_change))
 }
 
 /// The skip reason of a scan that did not start.
@@ -761,6 +822,10 @@ pub(super) struct Assessment {
     pub(super) measurement: Option<UnitMeasurement>,
     /// The activity, as the policy reads it.
     pub(super) activity: ActivityFact,
+    /// The newest modification or status change of an object below the
+    /// unit. `None` when the unit was not measured in this discovery or
+    /// has no object below it.
+    pub(super) newest_content_change: Option<WallTime>,
 }
 
 impl Assessment {
@@ -775,6 +840,7 @@ impl Assessment {
             evidence: None,
             measurement: None,
             activity: ActivityFact::Unknown,
+            newest_content_change: None,
         }
     }
 
@@ -819,6 +885,7 @@ pub(super) fn conclude(
         evidence,
         measurement,
         activity,
+        newest_content_change: _,
     } = assessment;
     let relative_entry: LosslessPath = LosslessPath::from_path(&relative)
         .map_err(|_| DiscoveryError::Internal("the unit name"))?;
@@ -1076,7 +1143,7 @@ fn apply_rejection(eligibility: &mut CandidateEligibility, reasons: &BTreeSet<Sk
             | SkipReason::MountCrossing => {
                 eligibility.protocols_valid = Fact::NotSatisfied;
             }
-            SkipReason::IdentityChanged | SkipReason::Vanished => {
+            SkipReason::IdentityChanged | SkipReason::Vanished | SkipReason::WrongOwner => {
                 eligibility.identity_matches = Fact::NotSatisfied;
             }
             SkipReason::HardLinked | SkipReason::OverCandidateCeiling => {
@@ -1093,6 +1160,18 @@ fn apply_rejection(eligibility: &mut CandidateEligibility, reasons: &BTreeSet<Sk
     }
 }
 
+/// The unit whose charge [`establish_charge`] establishes.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct UnitUnderMeasurement<'a> {
+    /// The path of the unit.
+    pub(super) path: &'a Path,
+    /// The snapshot of the unit before the measurement.
+    pub(super) before: &'a ObjectSnapshot,
+    /// The user of the discovery. Each object below the unit must have
+    /// this owner.
+    pub(super) principal: Uid,
+}
+
 /// Establishes the complete charge of a unit (predicate 8): a measurement
 /// with the scanner, or, for a known candidate, the earlier measurement
 /// when the unit shows no change. Returns the bound that stopped the
@@ -1104,19 +1183,30 @@ fn apply_rejection(eligibility: &mut CandidateEligibility, reasons: &BTreeSet<Sk
 pub(super) fn establish_charge(
     assessment: &mut Assessment,
     known: Option<&DiscoveredCandidate>,
-    path: &Path,
-    before: &ObjectSnapshot,
+    unit: &UnitUnderMeasurement<'_>,
     rule: &Rule,
     bounds: &mut Bounds<'_>,
     classify: Classifier<'_>,
 ) -> Result<Option<DiscoveryCompletion>, DiscoveryError> {
-    let measured: Measured = match known {
-        None => measure_unit(path, before, rule, bounds, classify)?,
-        Some(known) => carried_measurement(known, before).map_or_else(
-            || Measured::Rejected(BTreeSet::from([SkipReason::MeasurementStale])),
-            Measured::Complete,
+    let UnitUnderMeasurement {
+        path,
+        before,
+        principal,
+    } = *unit;
+    let (measured, newest_change): (Measured, Option<WallTime>) = match known {
+        None => measure_unit(path, before, rule, bounds, classify, principal)?,
+        // A carried measurement examines no object below the unit: the
+        // owners and the times of the content are those of the earlier
+        // discovery, and the executor compares each owner again.
+        Some(known) => (
+            carried_measurement(known, before).map_or_else(
+                || Measured::Rejected(BTreeSet::from([SkipReason::MeasurementStale])),
+                Measured::Complete,
+            ),
+            None,
         ),
     };
+    assessment.newest_content_change = newest_change;
     match measured {
         Measured::Complete(measurement) => {
             assessment.eligibility.unit_and_charge_known = Fact::Satisfied;

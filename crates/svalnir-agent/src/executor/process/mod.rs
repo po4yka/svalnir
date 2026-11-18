@@ -14,9 +14,11 @@
 //!
 //! 1. [`ProcessExecutor::begin`] does the checks of the step as a whole
 //!    and the hard refusals. Then, for each member, it reads the process
-//!    again, compares the PID, the start time, the owner, the boot, and
-//!    the executable evidence with the planned identity, and issues one
-//!    call. It never waits.
+//!    again, compares the PID, the start time, the owner, and the
+//!    executable evidence with the planned identity, and issues one call.
+//!    The boot of each member is compared one time, in the checks of the
+//!    step, with the boot of the [`ExecutorContext`] that the caller gave;
+//!    a start time is a value of that boot. It never waits.
 //! 2. The caller keeps the [`Observation`] and calls
 //!    [`Observation::poll`] at the times it selects. The executor reads
 //!    its [`StepClock`]; it does not sleep and it holds no lock. A poll

@@ -279,12 +279,22 @@ pub(crate) struct StoredAuthority {
 /// # Errors
 ///
 /// Returns an authority error for a record of a different user, and a
-/// recording error for a record that cannot be read.
+/// recording error for a record that cannot be read. A record that this
+/// build cannot decode, for example a record of an earlier build, gives
+/// `authority_record_not_readable` and no authority.
 pub(crate) fn read_authority(journal: &OperationJournal) -> Result<StoredAuthority, ErrorBody> {
     let uid: Uid = current_uid();
     match journal
         .agent_record::<AuthorityState>(AgentRecord::Authority)
-        .map_err(|error| journal_error(&error))?
+        .map_err(|error| match error {
+            OperationJournalError::Decode { .. } => ErrorBody::new(
+                "authority_record_not_readable",
+                ErrorFamily::Recording,
+                ErrorStage::Storage,
+                "the authority record of the journal has a format that this build cannot read, for example the format of an earlier build; it gives no authority, and the command made no change; stop the agent and remove the operation journal `operations.sqlite` of the state directory to start with no authority record",
+            ),
+            error => journal_error(&error),
+        })?
     {
         None => Ok(StoredAuthority {
             state: AuthorityState::new(uid),

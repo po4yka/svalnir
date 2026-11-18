@@ -99,6 +99,12 @@ pub struct AuthorityState {
     /// The pause of automatic intervention.
     #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub pause: Option<Pause>,
+    /// The time of the latest resume of a durable pause, with its boot and
+    /// clock domain. Trigger evidence from before it supports no automatic
+    /// action in that boot and clock domain. In a different boot it is not
+    /// a floor: no sample of an earlier boot is usable in any case.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
+    pub resume_floor: Option<MeasurementFloor>,
 }
 
 impl AuthorityState {
@@ -109,6 +115,7 @@ impl AuthorityState {
             active: None,
             guards: Vec::new(),
             pause: None,
+            resume_floor: None,
         }
     }
 

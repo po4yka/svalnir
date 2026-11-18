@@ -6,7 +6,7 @@ use super::super::{
     Acceptance, ActionRequest, AuthorityState, Authorization, AuthorizationBasis,
     AuthorizationContext, DisableRequest, EvidenceStamp, IncidentBudget, InstanceInhibition,
     PauseRequest, Persistence, Refusal, RefusalReason, ResumeRequest, RevokeRequest, authorize,
-    disable, pause, resume, revoke,
+    disable, measurement_floor, pause, resume, revoke,
 };
 use super::{
     DERIVED_DATA, Registry, TEMPORARY, USER, activated, active_state, application_content,
@@ -889,6 +889,51 @@ fn a_paused_agent_refuses_each_automatic_step_and_resumes_with_a_new_measurement
     // The plan is of the earlier boot, so it is expired; the evidence
     // check is not the reason.
     assert_eq!(rebooted.reason(), RefusalReason::PlanExpired);
+}
+
+/// A resume in one process (a client) and the authorization in a
+/// different instance (the agent, with an inhibition of its own that saw
+/// no resume): the durable floor of the record refuses evidence from
+/// before the resume.
+#[test]
+fn the_durable_resume_floor_applies_to_an_instance_that_did_not_see_the_resume() {
+    let at = clock(150);
+    let endless = PauseRequest {
+        principal: USER,
+        duration: None,
+    };
+    let paused = durable(pause(&enabled_state(), &endless, &control(&at, 150)).unwrap()).state;
+    // The client resumes at second 170. Its instance ends after the write.
+    let client = InstanceInhibition::default();
+    let resumed: AuthorityState = resume(
+        &paused,
+        &client,
+        &ResumeRequest { principal: USER },
+        &control(&clock(170), 170),
+    )
+    .unwrap()
+    .acknowledge(&client, Persistence::Durable)
+    .state;
+    assert_eq!(resumed.resume_floor.as_ref().unwrap().at, monotonic(170));
+    // The agent reads the record. Its own inhibition has no floor.
+    let agent = |evidence_seconds: u64| Ask {
+        clock: clock(175),
+        evidence: Some(evidence_at(evidence_seconds)),
+        inhibition: InstanceInhibition::default(),
+        ..Ask::eviction(resumed.clone())
+    };
+    assert_eq!(agent(169).reason(), RefusalReason::MeasurementBeforeResume);
+    agent(170).answer().unwrap();
+    agent(174).answer().unwrap();
+    // The floor of a different boot is not a floor of this boot.
+    assert_eq!(
+        measurement_floor(
+            &resumed,
+            &InstanceInhibition::default(),
+            &control(&clock_in("boot_2", 5), 400)
+        ),
+        None
+    );
 }
 
 fn evidence_for(clock: &EvaluationClock) -> EvidenceStamp {

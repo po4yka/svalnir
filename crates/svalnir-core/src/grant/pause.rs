@@ -86,8 +86,10 @@ impl Pause {
 
 /// The time of a resume or of a pause expiry. An automatic action after it
 /// needs a measurement that is not older (`README.md`, "Enable continuous
-/// protection": a resume always refreshes the measurements).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+/// protection": a resume always refreshes the measurements). The floor is
+/// a floor only in its boot and clock domain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasurementFloor {
     /// The monotonic time.
     pub at: MonotonicNanos,
@@ -325,9 +327,13 @@ pub struct ResumeReport {
 
 /// Resumes automatic intervention.
 ///
-/// The change adds authority. When the record has a durable pause and the
-/// write fails, nothing changes: the pause stays. When the pause is only in
-/// the volatile state, there is nothing to write, and the resume applies.
+/// The change adds authority. When the record has a durable pause, the
+/// change removes it and records the time of the resume as the durable
+/// [`AuthorityState::resume_floor`], so that the authorization of each
+/// process, also of a process that did not see the resume, refuses trigger
+/// evidence from before it. When the write fails, nothing changes: the
+/// pause stays. When the pause is only in the volatile state, there is
+/// nothing to write, and the resume applies to the instance.
 /// A resume does not make an old plan valid and does not give a
 /// measurement: [`ResumeReport::requires_fresh_measurement`] is true, and
 /// the authorization refuses an automatic action whose evidence is older
@@ -353,6 +359,9 @@ pub fn resume(
     };
     let mut next: AuthorityState = state.clone();
     let durable_pause: Option<Pause> = next.pause.take();
+    if durable_pause.is_some() {
+        next.resume_floor = Some(floor.clone());
+    }
     let report: ResumeReport = ResumeReport {
         durable_pause,
         volatile_pause: inhibition.pause.clone(),
@@ -374,10 +383,11 @@ pub fn resume(
 }
 
 /// The floor that the pauses and the latest resume give for the trigger
-/// evidence of an automatic action at `clock`: the latest of the resume
-/// time and the monotonic expiry of each expired pause, in the boot and the
-/// clock domain of `clock`. A time of a different boot gives no floor: each
-/// measurement of the current boot is newer.
+/// evidence of an automatic action at `clock`: the latest of the durable
+/// resume floor of the record, the resume of the instance, and the
+/// monotonic expiry of each expired pause, in the boot and the clock domain
+/// of `clock`. A time of a different boot gives no floor: each measurement
+/// of the current boot is newer.
 ///
 /// The authorization uses this floor. A component that keeps its own
 /// record of the trigger evidence, for example the guard controller, calls
@@ -387,19 +397,23 @@ pub fn measurement_floor(
     inhibition: &InstanceInhibition,
     clock: &ControlClock<'_>,
 ) -> Option<MonotonicNanos> {
-    let resumed: Option<MonotonicNanos> = inhibition
-        .measurement_floor
-        .as_ref()
-        .filter(|floor| {
-            floor.clock_domain == clock.clock.clock_domain && floor.boot_id == clock.clock.boot_id
-        })
-        .map(|floor| floor.at);
+    let of_timeline = |floor: Option<&MeasurementFloor>| {
+        floor
+            .filter(|floor| {
+                floor.clock_domain == clock.clock.clock_domain
+                    && floor.boot_id == clock.clock.boot_id
+            })
+            .map(|floor| floor.at)
+    };
+    let resumed: Option<MonotonicNanos> = of_timeline(inhibition.measurement_floor.as_ref());
+    let resumed_durably: Option<MonotonicNanos> = of_timeline(state.resume_floor.as_ref());
     let expired = |pause: Option<&Pause>| match pause_status(pause, clock) {
         PauseStatus::Expired { floor } => Some(floor),
         _ => None,
     };
     [
         resumed,
+        resumed_durably,
         expired(state.pause.as_ref()),
         expired(inhibition.pause.as_ref()),
     ]

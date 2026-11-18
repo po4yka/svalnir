@@ -458,3 +458,76 @@ fn the_public_floor_is_the_latest_of_the_resume_and_each_expired_pause() {
         None
     );
 }
+
+#[test]
+fn a_resume_of_a_durable_pause_records_the_durable_resume_floor() {
+    let state = paused_for_an_hour();
+    let at = clock(500);
+    let none = InstanceInhibition::default();
+    let acknowledged = resume(&state, &none, &resume_request(), &control(&at, 500))
+        .unwrap()
+        .acknowledge(&none, Persistence::Durable);
+    let floor = MeasurementFloor {
+        at: monotonic(500),
+        clock_domain: at.clock_domain.clone(),
+        boot_id: at.boot_id.clone(),
+    };
+    assert_eq!(acknowledged.state.resume_floor, Some(floor.clone()));
+    // A different instance with no volatile floor gets the floor from the
+    // record.
+    assert_eq!(
+        measurement_floor(&acknowledged.state, &none, &control(&clock(600), 600)),
+        Some(monotonic(500))
+    );
+    // A later expired pause or a later volatile floor is the later floor.
+    let later = InstanceInhibition {
+        measurement_floor: Some(MeasurementFloor {
+            at: monotonic(550),
+            ..floor.clone()
+        }),
+        ..InstanceInhibition::default()
+    };
+    assert_eq!(
+        measurement_floor(&acknowledged.state, &later, &control(&clock(600), 600)),
+        Some(monotonic(550))
+    );
+    // A failed write records no floor and keeps the pause.
+    let failed = resume(&state, &none, &resume_request(), &control(&at, 500))
+        .unwrap()
+        .acknowledge(&none, Persistence::Failed);
+    assert_eq!(failed.state.resume_floor, None);
+}
+
+#[test]
+fn the_record_with_the_resume_floor_round_trips_and_an_old_record_is_refused() {
+    let state = paused_for_an_hour();
+    let at = clock(500);
+    let none = InstanceInhibition::default();
+    let resumed = resume(&state, &none, &resume_request(), &control(&at, 500))
+        .unwrap()
+        .acknowledge(&none, Persistence::Durable)
+        .state;
+    let json = serde_json::to_value(&resumed).unwrap();
+    assert_eq!(
+        json["resume_floor"]["at"],
+        serde_json::json!(resumed.resume_floor.as_ref().unwrap().at)
+    );
+    let restored: AuthorityState = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(restored, resumed);
+    // A record with no resume yet has the field with `null`.
+    let fresh = serde_json::to_value(enabled_state()).unwrap();
+    assert_eq!(fresh["resume_floor"], serde_json::Value::Null);
+    assert_eq!(
+        serde_json::from_value::<AuthorityState>(fresh).unwrap(),
+        enabled_state()
+    );
+    // A record of the earlier format has no `resume_floor` field. Its
+    // decoding fails, so it gives no authority.
+    let mut old = json.clone();
+    old.as_object_mut().unwrap().remove("resume_floor");
+    assert!(serde_json::from_value::<AuthorityState>(old).is_err());
+    // A floor with an unknown field is refused too.
+    let mut unknown = json;
+    unknown["resume_floor"]["source"] = serde_json::json!("client");
+    assert!(serde_json::from_value::<AuthorityState>(unknown).is_err());
+}

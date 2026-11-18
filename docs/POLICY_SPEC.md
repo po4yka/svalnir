@@ -372,7 +372,7 @@ Reservations backed by unresolved dispatch state remain charged conservatively. 
 
 Pause scope may cover all automation, one guard, a rule, or an application. Pause inhibits new dispatch and subsequent escalation/batches once observed; it does not recall a submitted OS request. Monitoring and bounded verification continue.
 
-A timed pause needs an explicit deadline and reported remaining state. If a restart cannot establish that it expired safely, retain the pause until renewed evidence or explicit resume. The wall clock is not such evidence: a pause of an earlier boot or of a different clock domain stays in effect until an explicit resume. Durable and non-durable acknowledgements follow section 5.
+A timed pause needs an explicit deadline and reported remaining state. If a restart cannot establish that it expired safely, retain the pause until renewed evidence or explicit resume. The wall clock is not such evidence: a pause of an earlier boot or of a different clock domain stays in effect until an explicit resume. A resume of a durable pause records its time, with its boot and clock domain, in the durable authority record. Each process that authorizes an automatic action reads that time, so trigger evidence from before the resume supports no automatic action, also in a process that did not see the resume. The time is a floor only in its boot and clock domain. Durable and non-durable acknowledgements follow section 5.
 
 Cooldowns are scoped to their cause: application relaunch, rule regrowth, pass pacing, or no-effect backoff. Expiry only allows reevaluation; it does not provide fresh evidence, expand grants, or reset incident usage. Rearm may replace a budget generation but cannot erase independent target cooldowns or unresolved effects.
 

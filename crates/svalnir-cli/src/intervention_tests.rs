@@ -2610,3 +2610,52 @@ fn a_rearm_that_the_agent_refuses_reports_the_reason_of_the_standing() {
     assert_eq!(refused.error_code(), "guard_disabled", "{}", refused.stdout);
     assert_eq!(refused.status.code(), 3);
 }
+
+/// A resume writes the durable resume floor into the authority record,
+/// and a record of the earlier format, with no floor, gives no authority.
+#[test]
+fn a_resume_writes_the_floor_and_an_old_authority_record_is_refused() {
+    use svalnir_agent::journal::{AgentRecord, JournalOptions, OperationJournal};
+
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let paused = json(&world.environment, &["agent", "pause"]);
+    assert_eq!(paused.status, ExitStatus::Success, "{}", paused.stdout);
+    let resumed = json(&world.environment, &["agent", "resume"]);
+    assert_eq!(resumed.status, ExitStatus::Success, "{}", resumed.stdout);
+    let path: PathBuf = world.path("state").join("operations.sqlite");
+    let mut journal = OperationJournal::open(&path, &JournalOptions::default()).unwrap();
+    let stored = journal
+        .agent_record::<Value>(AgentRecord::Authority)
+        .unwrap()
+        .unwrap();
+    let mut record: Value = stored.record;
+    assert!(!record["resume_floor"]["at"].is_null(), "{record}");
+    assert!(record["resume_floor"]["boot_id"].is_string(), "{record}");
+
+    // The record as an earlier build wrote it.
+    record.as_object_mut().unwrap().remove("resume_floor");
+    journal
+        .put_agent_record(
+            AgentRecord::Authority,
+            &record,
+            Some(stored.revision),
+            svalnir_core::time::WallTime::from_unix(1_000_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    drop(journal);
+    for arguments in [
+        &["agent", "resume"][..],
+        &["agent", "pause"][..],
+        &["policy", "disable", "memory-guard"][..],
+    ] {
+        let refused = json(&world.environment, arguments);
+        assert_eq!(
+            refused.error_code(),
+            "authority_record_not_readable",
+            "{arguments:?}: {}",
+            refused.stdout
+        );
+        assert_eq!(refused.status.code(), 1);
+    }
+}

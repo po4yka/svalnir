@@ -1712,3 +1712,26 @@ fn the_next_batch_waits_for_the_end_of_the_observation_window_and_starts_at_its_
     let output = bench.step(&at_end(bench.now), &[]);
     assert_eq!(the_apply(&output).guard, Guard::Disk);
 }
+
+#[test]
+fn the_durable_resume_floor_applies_to_a_controller_that_did_not_see_the_pause() {
+    let mut bench = Bench::new();
+    let active: AuthorityState = bench.authority.clone().unwrap();
+    // A client paused and resumed while this controller did not run. The
+    // instance of the controller has no floor of its own.
+    bench.authority = Some(resumed(
+        &paused(&active, bench.now),
+        bench.now + 40 * SECOND,
+    ));
+    // Each sample of the run is from before the resume.
+    let output = bench.run(30 * SECOND, critical(two_jobs));
+    assert_eq!(applies(&output).len(), 0);
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(
+        guard(&output, Guard::Memory).blocked,
+        vec![BlockedReason::AwaitingFreshMeasurement]
+    );
+    // A sample after the resume supports the plan.
+    bench.run(30 * SECOND, critical(two_jobs));
+    assert!(bench.state.outstanding.is_some());
+}

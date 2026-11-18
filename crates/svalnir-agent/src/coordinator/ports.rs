@@ -7,9 +7,7 @@
 
 use std::fmt::Debug;
 
-use svalnir_core::action::{
-    ApplicationBinding, Journal, Plan, ResourceEffect, StopFence, TargetBinding,
-};
+use svalnir_core::action::{Journal, Plan, ResourceEffect, StopFence, TargetBinding};
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
 use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
@@ -104,9 +102,11 @@ pub trait AuthoritySource: Debug {
     /// Whether the trigger of an automatic plan holds now.
     fn trigger(&self, plan: &Plan, time: &TimeReading) -> TriggerStanding;
 
-    /// The fact of the hard-protection catalog for the members of an
-    /// application target, with the control plane of this process.
-    fn protection(&self, binding: &ApplicationBinding) -> ProtectionFact;
+    /// The fact of the hard-protection catalog for the processes of a
+    /// target, with the control plane of this process: the members of an
+    /// application target, or the one process of a process target
+    /// ([`TargetBinding::processes`]).
+    fn protection(&self, processes: &[ProcessIdentity]) -> ProtectionFact;
 }
 
 /// The measurements of outcome verification.

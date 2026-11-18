@@ -419,7 +419,7 @@ impl AuthoritySource for TestAuthority {
         }
     }
 
-    fn protection(&self, _binding: &ApplicationBinding) -> ProtectionFact {
+    fn protection(&self, _processes: &[ProcessIdentity]) -> ProtectionFact {
         self.records().protection
     }
 }
@@ -1024,6 +1024,31 @@ pub(super) fn stop_plan(
     now: u64,
 ) -> Plan {
     Plan::seal(stop_content(plan, members, escalation, now)).unwrap()
+}
+
+/// The content of a manual stop plan for the one process `process`, which
+/// gets the association `Unattributed`: a target of one process with no
+/// verified membership.
+pub(super) fn process_stop_content(
+    plan: &str,
+    mut process: ProcessIdentity,
+    escalation: Escalation,
+    now: u64,
+) -> PlanContent {
+    let mut content: PlanContent = stop_content(plan, vec![process.clone()], escalation, now);
+    process.association = ProcessAssociation::Unattributed;
+    content.targets[0].binding =
+        TargetBinding::Process(svalnir_core::action::ProcessBinding { process });
+    content
+}
+
+pub(super) fn process_stop_plan(
+    plan: &str,
+    process: ProcessIdentity,
+    escalation: Escalation,
+    now: u64,
+) -> Plan {
+    Plan::seal(process_stop_content(plan, process, escalation, now)).unwrap()
 }
 
 pub(super) fn incident_id(text: &str) -> IncidentId {

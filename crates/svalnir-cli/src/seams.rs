@@ -298,10 +298,6 @@ pub(crate) struct TestSeams {
     pub(crate) while_asked: Option<WhileAsked>,
     /// The service host.
     pub(crate) service_host: Option<Arc<dyn ServiceHost>>,
-    /// Gives a target process with no verified membership the membership
-    /// of a synthetic application instance. The process inventory of a
-    /// test runner does not attribute a child process of the test.
-    pub(crate) attribute_target: bool,
 }
 
 /// The service host of a test that set none: it has no agent executable
@@ -419,26 +415,6 @@ impl Seams {
         #[cfg(not(test))]
         {
             Arc::new(SystemServiceHost)
-        }
-    }
-
-    /// Whether a target process with no verified membership gets a
-    /// synthetic one. Always false outside a test.
-    #[cfg_attr(
-        not(test),
-        expect(
-            clippy::unused_self,
-            reason = "a test build reads the values of the test"
-        )
-    )]
-    pub(crate) fn attributes_target(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.test.attribute_target
-        }
-        #[cfg(not(test))]
-        {
-            false
         }
     }
 

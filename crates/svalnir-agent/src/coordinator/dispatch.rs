@@ -18,6 +18,7 @@ use svalnir_core::action::{
 };
 use svalnir_core::grant::{ActionRequest, RefusalReason};
 use svalnir_core::id::{OperationId, StepId, TargetId, VolumeId};
+use svalnir_core::process::ProcessIdentity;
 use svalnir_core::quantity::ByteDelta;
 use svalnir_core::state::PressureState;
 use svalnir_core::time::MonotonicNanos;
@@ -348,15 +349,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     charge: file.charge,
                 },
             ),
-            TargetBinding::Application(_) => (
+            // A process target is manual, so its slot has no incident.
+            TargetBinding::Application(_) | TargetBinding::Process(_) => (
                 self.config.process_adapter.clone(),
                 Reservation::ApplicationSlot {
                     incident_id: plan.trigger.incident_id.clone(),
                 },
             ),
-            // Admission refuses a plan with a process target, so no step
-            // of one gets an envelope.
-            TargetBinding::Process(_) => return Err(Fault),
         };
         Checked::new(EnvelopeContent {
             schema_version: PLAN_SCHEMA_VERSION,
@@ -830,10 +829,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         step: &PlannedStep,
         time: &TimeReading,
     ) -> Result<StepEnd, Fault> {
-        let Some(TargetBinding::Application(binding)) = active
+        // The members of an application target, or the one process of a
+        // process target.
+        let Some(processes) = active
             .plan
             .target(&step.target_id)
-            .map(|t| t.binding.clone())
+            .and_then(|target| target.binding.processes())
+            .map(<[ProcessIdentity]>::to_vec)
         else {
             return Err(Fault);
         };
@@ -889,7 +891,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let input = StepInput {
             envelope: &envelope,
             receipt: &receipt,
-            protection: self.authority.protection(&binding),
+            protection: self.authority.protection(&processes),
             graceful,
             stop: None,
         };

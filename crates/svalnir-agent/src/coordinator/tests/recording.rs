@@ -379,6 +379,50 @@ fn a_restart_finds_the_target_gone_or_replaced_and_signals_nothing() {
 }
 
 #[test]
+fn a_restart_reconciles_a_target_of_one_process_from_the_reading_of_its_generation() {
+    for (exited, effect, state) in [
+        (true, TargetEffect::AlreadyExited, OperationState::Completed),
+        // A graceful request that the process did not follow is not a
+        // failure.
+        (
+            false,
+            TargetEffect::StillRunning,
+            OperationState::Incomplete,
+        ),
+    ] {
+        let mut bench = Bench::new();
+        let process = bench.host.spawn(4242);
+        let plan = super::support::process_stop_plan(
+            "plan_1",
+            process.clone(),
+            Escalation::None,
+            bench.clock.now(),
+        );
+        bench.store(&plan);
+        let mut coordinator = bench.start();
+        let operation_id = admitted(&mut coordinator, stored_request(&plan));
+        coordinator.step();
+        assert_eq!(bench.host.calls().len(), 1);
+        // The process of the coordinator stops in the observation.
+        drop(coordinator);
+        if exited {
+            bench.host.world().processes.remove(&4242);
+        }
+        let mut coordinator = bench.start();
+        coordinator.step();
+        let view = coordinator.operation(&operation_id).unwrap().unwrap();
+        let [result] = view.operation.steps()[0].results() else {
+            panic!("a process target has one result");
+        };
+        assert_eq!(result.effect, effect);
+        assert_eq!(result.member.as_ref(), Some(&process.generation_id));
+        assert_eq!(view.operation.state(), &state);
+        // The new lifetime sends no signal for the old operation.
+        assert_eq!(bench.host.calls().len(), 1);
+    }
+}
+
+#[test]
 fn a_clean_stop_releases_the_registration_and_needs_no_reconciliation() {
     let (mut bench, mut coordinator, operation_id) = admitted_cleanup();
     // An operation that is not settled keeps the registration.

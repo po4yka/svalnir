@@ -709,21 +709,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 plan_id,
             )));
         }
-        // The process executor of this build signals the members of an
-        // application or of a managed job. It has no step for a target of
-        // one process, and the protection port is for an application
-        // binding. Such a plan is refused here, before a reservation.
-        let has_process_target: bool = plan
-            .targets
-            .iter()
-            .any(|target| matches!(target.binding, TargetBinding::Process(_)));
-        if has_process_target {
-            return Err(Box::new(admission_error(
-                code::PROCESS_TARGET_NOT_AVAILABLE,
-                ErrorFamily::Request,
-                plan_id,
-            )));
-        }
         self.check_revisions(plan, &request.approval, mode, time)?;
         self.authorize_each(
             plan,
@@ -733,9 +718,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             &ActionStage::Admission,
             time,
         )?;
+        // The catalog of hard protections, for the members of an
+        // application target and for the one process of a process target.
         for target in &plan.targets {
-            if let TargetBinding::Application(application) = &target.binding
-                && self.authority.protection(application) != ProtectionFact::NotProtected
+            if let Some(processes) = target.binding.processes()
+                && self.authority.protection(processes) != ProtectionFact::NotProtected
             {
                 return Err(Box::new(admission_error(
                     code::TARGET_PROTECTED,

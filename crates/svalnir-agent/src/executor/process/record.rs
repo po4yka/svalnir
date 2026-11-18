@@ -26,8 +26,8 @@ use crate::platform::process::ADAPTER_ID;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExecutorError {
     /// The step is not an application intervention on an application
-    /// target for the user executor.
-    #[error("the step is not an application intervention on an application target")]
+    /// target or on a target of one process, for the user executor.
+    #[error("the step is not an application intervention on an application or a process target")]
     NotApplicationStep,
     /// The dispatch receipt is not the receipt of a consumption by this
     /// caller. The caller queries the state of the step; it does not submit

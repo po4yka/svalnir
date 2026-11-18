@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use svalnir_core::action::{ApplicationBinding, Plan};
+use svalnir_core::action::Plan;
 use svalnir_core::authority::ActionGrant;
 use svalnir_core::grant::{
     ActionRequest, AuthorityState, Authorization, AuthorizationContext, ControlClock,
@@ -19,8 +19,10 @@ use svalnir_core::grant::{
 };
 use svalnir_core::id::{IncidentId, PlanId};
 use svalnir_core::plan::{CleanupMode, PlanMode};
-use svalnir_core::policy::{ControlPlaneProcess, ProtectionContext, ProtectionFact};
-use svalnir_core::process::Uid;
+use svalnir_core::policy::{
+    ControlPlaneProcess, ProtectionContext, ProtectionFact, hard_protection,
+};
+use svalnir_core::process::{ProcessIdentity, Uid};
 use svalnir_core::rule::{RuleMode, RuleRegistry};
 
 use super::model::{TriggerKey, TriggerRecord};
@@ -201,11 +203,14 @@ impl AuthoritySource for SharedAuthority {
             .map_or(TriggerStanding::Unknown, |standing| (*standing).clone())
     }
 
-    fn protection(&self, binding: &ApplicationBinding) -> ProtectionFact {
+    fn protection(&self, processes: &[ProcessIdentity]) -> ProtectionFact {
         let records = self.records();
-        binding.hard_protection(&ProtectionContext {
-            principal: records.principal,
-            control_plane: records.control_plane.as_deref(),
-        })
+        hard_protection(
+            processes,
+            &ProtectionContext {
+                principal: records.principal,
+                control_plane: records.control_plane.as_deref(),
+            },
+        )
     }
 }

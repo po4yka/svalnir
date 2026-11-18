@@ -373,6 +373,23 @@ pub enum TargetBinding {
     Process(ProcessBinding),
 }
 
+impl TargetBinding {
+    /// The processes that a step of an application intervention applies
+    /// to: the members of an application target, or the one process of a
+    /// process target. `None` for a file target.
+    ///
+    /// The hard-protection catalog and the identity revalidation take the
+    /// same list for the two kinds, so one process with no membership has
+    /// the protections of an instance with one member.
+    pub fn processes(&self) -> Option<&[ProcessIdentity]> {
+        match self {
+            Self::File(_) => None,
+            Self::Application(application) => Some(&application.members),
+            Self::Process(binding) => Some(std::slice::from_ref(&binding.process)),
+        }
+    }
+}
+
 /// One target of a plan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

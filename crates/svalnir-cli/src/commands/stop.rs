@@ -3,9 +3,13 @@
 //! intervention (`docs/INTERFACES.md` section 5).
 //!
 //! The target ID names one process generation, and the plan has that one
-//! process as its only member: the command never selects the processes of
-//! an application by name. The process must have a verified membership in
-//! an application or a managed job, because a plan binds no other target.
+//! process and no other: the command never selects the processes of an
+//! application by name. A process with a verified membership in an
+//! application or a managed job is the only member of an application
+//! target. A process with no application or job evidence, for example a
+//! process that a shell started, is a target of one process
+//! (`docs/ACTION_CONTRACTS.md` section 3), which the executor signals
+//! directly after it checks the identity evidence again.
 //!
 //! The command keeps its plan identity in a stop record of the process
 //! generation. A repeated request, for example after a lost response,
@@ -19,9 +23,7 @@ use svalnir_agent::platform::process::{
 };
 use svalnir_core::action::Plan;
 use svalnir_core::authority::AuthorityBinding;
-use svalnir_core::id::{
-    ApplicationInstanceId, MembershipSnapshotId, PlanId, ProcessGenerationId, StepId, TargetId,
-};
+use svalnir_core::id::{MembershipSnapshotId, PlanId, ProcessGenerationId, StepId, TargetId};
 use svalnir_core::plan::{
     PlanBuildError, PlanContext, PlanOutcome, StopKind, StopLimits, StopRequest, StopStepIds,
     StopStrategy, build_stop_plan, check_expiry, explain, manual_plan_lifetime,
@@ -30,7 +32,7 @@ use svalnir_core::policy::{
     ApplicationCandidate, ControlPlaneProcess, ForegroundStatus, ProtectionContext, ProtectionFact,
     hard_protection,
 };
-use svalnir_core::process::{AttributionMethod, ProcessAssociation, ProcessIdentity};
+use svalnir_core::process::ProcessIdentity;
 use svalnir_core::quantity::Nanoseconds;
 
 use super::apply::{self, ApplyFlow};
@@ -117,32 +119,15 @@ fn shape(arguments: &ProcessesStopArgs) -> Result<Shape, ErrorBody> {
     })
 }
 
-/// The candidate of a stop plan with one member: the process of the
-/// target ID.
+/// The candidate of a stop plan with one process: the process of the
+/// target ID, with the association that the inventory gave it. The plan
+/// builder binds it as the only member of its instance, or, with no
+/// application or job evidence, as a target of one process.
 fn candidate(
     record: &ProcessRecord,
     control_plane: Option<&[ControlPlaneProcess]>,
-    environment: &Environment,
 ) -> Result<ApplicationCandidate, ErrorBody> {
-    let mut identity: ProcessIdentity = record.identity.clone();
-    if identity.association.verified_membership().is_none() {
-        if !environment.seams.attributes_target() {
-            return Err(stop_error(
-                "target_not_attributed",
-                ErrorFamily::Eligibility,
-                "the process has no verified membership in an application or a managed job, for example because a shell started it; a plan of this build binds only a process with such a membership, so this command cannot stop the process; this is a limit of this build and not a protection of the process, and `--force` does not change it",
-            ));
-        }
-        // A managed job is signaled directly. The graceful request of an
-        // application goes through Launch Services, which does not know
-        // a child process of a test.
-        identity.association = ProcessAssociation::ManagedJob {
-            instance_id: ApplicationInstanceId::new(format!("job-test-{}", identity.generation_id))
-                .map_err(|_| session::identity_error())?,
-            label: "test.svalnir.child".to_owned(),
-            attribution: AttributionMethod::LaunchdJob,
-        };
-    }
+    let identity: ProcessIdentity = record.identity.clone();
     let protection = ProtectionContext {
         principal: session::current_uid(),
         control_plane,
@@ -272,7 +257,7 @@ fn new_plan(
 ) -> Result<StoredPlan, ErrorBody> {
     let authority = session::read_authority(journal)?;
     let ActiveConfig { active, config } = session::active_config(journal, &authority.state)?;
-    let candidate: ApplicationCandidate = candidate(record, control_plane, environment)?;
+    let candidate: ApplicationCandidate = candidate(record, control_plane)?;
     check_protection(candidate.hard_protection)?;
     let plan_text: String = session::new_id("plan");
     let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;

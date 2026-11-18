@@ -247,6 +247,38 @@ fn each_strategy_gives_its_steps_and_its_force_strategy() {
     }
 }
 
+#[test]
+fn one_process_with_no_membership_is_a_target_of_one_process() {
+    let fixture: Fixture = Fixture::new();
+    let mut candidate: ApplicationCandidate = candidate();
+    candidate.processes.truncate(1);
+    candidate.processes[0].association = ProcessAssociation::Unattributed;
+    for strategy in strategies() {
+        let outcome: PlanOutcome =
+            build_stop_plan(&fixture.context(), &stop_request(&candidate, strategy)).unwrap();
+        assert_eq!(outcome.preview.omitted, []);
+        let plan = outcome.plan.as_ref().unwrap();
+        assert_eq!(mode_of(plan), Some(PlanMode::Stop(strategy.kind())));
+        assert_eq!(plan.trigger.class, TriggerClass::Manual);
+        assert_eq!(plan.executor, ExecutorRole::User);
+        // The binding has the identity evidence of the one process and no
+        // member list, and the steps are those of the strategy.
+        let [target] = plan.targets.as_slice() else {
+            panic!("a stop plan has one target");
+        };
+        let TargetBinding::Process(binding) = &target.binding else {
+            panic!("the target of one process with no membership is a process target");
+        };
+        assert_eq!(binding.process, candidate.processes[0]);
+        assert_eq!(
+            target.binding.processes(),
+            Some(candidate.processes.as_slice())
+        );
+        assert_eq!(plan.limits.grace, strategy.grace());
+        assert_eq!(plan.limits.work, None);
+    }
+}
+
 /// One change of the candidate, the `[protections]` lines, the home
 /// directory, and the reasons that the change gives.
 struct ProtectionCase {
@@ -282,8 +314,76 @@ impl ProtectionCase {
 
 fn protection_cases() -> Vec<ProtectionCase> {
     let mut cases: Vec<ProtectionCase> = hard_protection_cases();
+    cases.extend(single_process_cases());
     cases.extend(user_protection_cases());
     cases
+}
+
+/// The cases of a candidate of one process, and of processes with no
+/// membership.
+fn single_process_cases() -> Vec<ProtectionCase> {
+    use OmissionReason as Reason;
+    vec![
+        // One process is a target only with no application or job
+        // evidence. A kind or a method that this build does not recognize
+        // can be a membership for a different build.
+        ProtectionCase::of(
+            "one process with an association that this build does not recognize",
+            |candidate| {
+                candidate.processes.truncate(1);
+                candidate.processes[0].association = ProcessAssociation::Unrecognized;
+            },
+            vec![Reason::MembershipNotVerified],
+        ),
+        ProtectionCase::of(
+            "one process with an attribution method that this build does not recognize",
+            |candidate| {
+                candidate.processes.truncate(1);
+                candidate.processes[0].association = ProcessAssociation::Application {
+                    instance_id: ApplicationInstanceId::new("app_Editor").unwrap(),
+                    bundle_identifier: "com.example.Editor".to_owned(),
+                    attribution: AttributionMethod::from_wire("parent_process"),
+                };
+            },
+            vec![Reason::MembershipNotVerified],
+        ),
+        ProtectionCase::of(
+            "two processes with no membership",
+            |candidate| {
+                for process in &mut candidate.processes {
+                    process.association = ProcessAssociation::Unattributed;
+                }
+            },
+            vec![Reason::MembershipNotVerified],
+        ),
+        ProtectionCase::of(
+            "one process with no membership and a recorded protection",
+            |candidate| {
+                candidate.processes.truncate(1);
+                candidate.processes[0].association = ProcessAssociation::Unattributed;
+                candidate.hard_protection = ProtectionFact::Protected;
+            },
+            vec![Reason::HardProtected],
+        ),
+        ProtectionCase::of(
+            "one process with no membership and no executable evidence",
+            |candidate| {
+                candidate.processes.truncate(1);
+                candidate.processes[0].association = ProcessAssociation::Unattributed;
+                candidate.processes[0].executable = None;
+            },
+            vec![Reason::ProtectionUnknown],
+        ),
+        ProtectionCase::of(
+            "one process with no membership and a system executable",
+            |candidate| {
+                candidate.processes.truncate(1);
+                candidate.processes[0].association = ProcessAssociation::Unattributed;
+                candidate.processes[0].executable.as_mut().unwrap().path = path("/bin/sleep");
+            },
+            vec![Reason::HardProtected],
+        ),
+    ]
 }
 
 /// The cases of the hard protections and of the membership evidence.
@@ -355,16 +455,6 @@ fn hard_protection_cases() -> Vec<ProtectionCase> {
         ProtectionCase::of(
             "member with no application evidence",
             |candidate| candidate.processes[1].association = ProcessAssociation::Unattributed,
-            vec![Reason::MembershipNotVerified],
-        ),
-        // The binding for one process exists, and this builder makes no
-        // plan with it: this build has no executor step for it.
-        ProtectionCase::of(
-            "one process with no membership",
-            |candidate| {
-                candidate.processes.truncate(1);
-                candidate.processes[0].association = ProcessAssociation::Unattributed;
-            },
             vec![Reason::MembershipNotVerified],
         ),
         ProtectionCase::of(

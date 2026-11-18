@@ -1717,31 +1717,240 @@ delegate_source!(ChangingOwner, |self, pid| {
     Ok(info)
 });
 
-#[test]
-fn a_step_for_one_process_with_no_membership_gives_no_call() {
+// A target of one process with no verified membership.
+
+/// The envelope of a step on the one process `process`, which gets the
+/// association `Unattributed`.
+fn process_envelope(
+    class: ActionClass,
+    escalation: Escalation,
+    mut process: ProcessIdentity,
+) -> RequestEnvelope {
     use svalnir_core::action::{ProcessBinding, TargetBinding};
-    // This executor signals the members of an application or of a managed
-    // job. An envelope with a process target is not one of its steps.
-    let host: Host = Host::new().with_process(100, 10);
-    for (class, escalation) in [
-        (ActionClass::RequestApplicationExit, Escalation::None),
-        (
-            ActionClass::ForceApplicationExit,
-            Escalation::ImmediateForce,
-        ),
-    ] {
-        let mut process: ProcessIdentity = member(100, 10, job());
-        let mut content = content(class, escalation, vec![process.clone()], USER);
-        process.association = ProcessAssociation::Unattributed;
-        content.target.binding = TargetBinding::Process(ProcessBinding { process });
-        let envelope: RequestEnvelope = Checked::new(content).unwrap();
-        assert_eq!(
-            host.executor()
-                .begin(input(&envelope, &receipt()))
-                .unwrap_err(),
-            ExecutorError::NotApplicationStep
-        );
+    let is_force: bool = class == ActionClass::ForceApplicationExit;
+    let mut content = content(class, escalation, vec![process.clone()], USER);
+    if is_force {
+        content.correlation.step_id = svalnir_core::id::StepId::new("step_2").unwrap();
     }
-    assert_eq!(host.calls(), Vec::new());
-    assert_eq!(host.0.borrow().info_queries, 0);
+    process.association = ProcessAssociation::Unattributed;
+    content.target.binding = TargetBinding::Process(ProcessBinding { process });
+    Checked::new(content).unwrap()
+}
+
+fn process_graceful(escalation: Escalation, process: ProcessIdentity) -> RequestEnvelope {
+    process_envelope(ActionClass::RequestApplicationExit, escalation, process)
+}
+
+fn process_force(escalation: Escalation, process: ProcessIdentity) -> RequestEnvelope {
+    process_envelope(ActionClass::ForceApplicationExit, escalation, process)
+}
+
+#[test]
+fn one_process_with_no_membership_gets_one_signal_and_its_exit_is_observed() {
+    let host: Host = Host::new().with_process(100, 10);
+    let envelope = process_graceful(Escalation::None, member(100, 10, job()));
+    let observation = observing(begin(&host, &envelope));
+    // One signal to the one process ID: no application request, and no
+    // call to a different process.
+    assert_eq!(host.calls(), vec![NativeCall::Signal(100, TERM)]);
+    assert_eq!(observation.waiting(), 1);
+    // The return value of the signal is not the result.
+    host.exit(100);
+    let report = finished(poll(&host, observation, None));
+    let [outcome] = report.members.as_slice() else {
+        panic!("a process target has one result");
+    };
+    assert_eq!(outcome.result.effect, TargetEffect::ExitVerified);
+    assert_eq!(outcome.result.dispatch, DispatchState::Submitted);
+    assert_eq!(outcome.result.attribution, Attribution::Established);
+    assert_eq!(
+        outcome.result.member.as_ref(),
+        Some(&member(100, 10, job()).generation_id)
+    );
+    assert_eq!(report.next, NextStep::None);
+    assert_eq!(
+        aggregate_step(&report.results()).unwrap(),
+        StepState::Completed
+    );
+}
+
+#[test]
+fn the_identity_of_one_process_is_checked_immediately_before_each_signal() {
+    type Change = fn(&Host);
+    let cases: [(Change, &str); 4] = [
+        // The PID has a different generation.
+        (
+            |host| host.change(|world| world.processes.get_mut(&100).unwrap().start_seconds = 20),
+            code::PROCESS_REPLACED,
+        ),
+        // The process replaced its program image.
+        (
+            |host| {
+                host.change(|world| {
+                    world.processes.get_mut(&100).unwrap().path = "/opt/other".to_owned();
+                });
+            },
+            code::PROCESS_EXECUTABLE_CHANGED,
+        ),
+        (
+            |host| host.change(|world| world.processes.get_mut(&100).unwrap().inode = 7),
+            code::PROCESS_EXECUTABLE_CHANGED,
+        ),
+        (
+            |host| host.change(|world| world.processes.get_mut(&100).unwrap().effective_uid = 0),
+            code::PROCESS_OWNER_CHANGED,
+        ),
+    ];
+    for (change, expected) in cases {
+        for (class, escalation) in [
+            (ActionClass::RequestApplicationExit, Escalation::None),
+            (
+                ActionClass::ForceApplicationExit,
+                Escalation::ImmediateForce,
+            ),
+        ] {
+            let host: Host = Host::new().with_process(100, 10);
+            let envelope = process_envelope(class, escalation, member(100, 10, job()));
+            change(&host);
+            let report = finished(begin(&host, &envelope));
+            assert_all_skipped(&host, &report, expected, &ErrorFamily::Evidence);
+        }
+    }
+    // A plan with no executable evidence is not a sealed plan of a process
+    // target: the check of the envelope refuses it.
+    let mut process: ProcessIdentity = member(100, 10, job());
+    process.executable = None;
+    let mut bare = content(
+        ActionClass::RequestApplicationExit,
+        Escalation::None,
+        vec![process.clone()],
+        USER,
+    );
+    process.association = ProcessAssociation::Unattributed;
+    bare.target.binding =
+        svalnir_core::action::TargetBinding::Process(svalnir_core::action::ProcessBinding {
+            process,
+        });
+    assert!(Checked::new(bare).is_err());
+}
+
+#[test]
+fn a_force_step_of_one_process_follows_its_graceful_step_and_checks_the_identity_again() {
+    let host: Host = Host::new().with_process(100, 10);
+    let process: ProcessIdentity = member(100, 10, job());
+    let envelope = process_graceful(Escalation::ForceAfterGrace, process.clone());
+    let observation = observing(begin(&host, &envelope));
+    host.advance(GRACE);
+    let report = finished(poll(&host, observation, None));
+    assert_eq!(report.members[0].result.effect, TargetEffect::StillRunning);
+    assert!(matches!(report.next, NextStep::Force { .. }));
+    let results = report.results();
+    let force_envelope = process_force(Escalation::ForceAfterGrace, process.clone());
+    let receipt = receipt();
+
+    // A different generation has the PID at the force step: no signal.
+    let replaced: Host = Host::new().with_process(100, 20);
+    replaced.change(|world| world.now = host.0.borrow().now);
+    let skipped = finished(
+        replaced
+            .executor()
+            .begin(force_input(&force_envelope, &receipt, &report, &results))
+            .unwrap(),
+    );
+    assert_all_skipped(
+        &replaced,
+        &skipped,
+        code::PROCESS_REPLACED,
+        &ErrorFamily::Evidence,
+    );
+
+    // The planned generation runs: one force signal, and the exit is
+    // observed.
+    host.change(|world| {
+        world.exits_on_call.insert(100);
+    });
+    let observation = observing(
+        host.executor()
+            .begin(force_input(&force_envelope, &receipt, &report, &results))
+            .unwrap(),
+    );
+    assert_eq!(
+        host.calls(),
+        vec![
+            NativeCall::Signal(100, TERM),
+            NativeCall::Signal(100, ProcessSignal::Kill)
+        ]
+    );
+    let forced = finished(poll(&host, observation, None));
+    assert_eq!(forced.members[0].result.effect, TargetEffect::ExitVerified);
+    assert_eq!(forced.next, NextStep::None);
+}
+
+#[test]
+fn the_hard_refusals_apply_to_a_target_of_one_process() {
+    type Setup = fn(&Host) -> ProcessIdentity;
+    let cases: [(Setup, &str); 5] = [
+        (
+            |_| member(OWN_PID, 10, job()),
+            code::TARGET_IS_CONTROL_PLANE,
+        ),
+        (
+            |_| member(PARENT_PID, 10, job()),
+            code::TARGET_IS_CONTROL_PLANE,
+        ),
+        (
+            |host| {
+                host.change(|world| world.own = None);
+                member(100, 10, job())
+            },
+            code::CONTROL_PLANE_UNKNOWN,
+        ),
+        (
+            |_| {
+                let mut planned = member(100, 10, job());
+                planned.executable.as_mut().unwrap().path =
+                    LosslessPath::from_bytes("/bin/sleep").unwrap();
+                planned
+            },
+            code::TARGET_PROTECTED,
+        ),
+        (
+            |_| {
+                let mut planned = member(100, 10, job());
+                planned.executable.as_mut().unwrap().path =
+                    LosslessPath::from_bytes("/opt/bin/svalnir").unwrap();
+                planned
+            },
+            code::TARGET_PROTECTED,
+        ),
+    ];
+    for (setup, expected) in cases {
+        let host: Host = Host::new()
+            .with_process(100, 10)
+            .with_process(OWN_PID, 10)
+            .with_process(PARENT_PID, 10);
+        let process: ProcessIdentity = setup(&host);
+        for envelope in [
+            process_graceful(Escalation::None, process.clone()),
+            process_graceful(Escalation::ForceAfterGrace, process.clone()),
+            process_force(Escalation::ImmediateForce, process.clone()),
+        ] {
+            let report = finished(begin(&host, &envelope));
+            assert_all_skipped(&host, &report, expected, &ErrorFamily::Eligibility);
+        }
+    }
+    // The protection fact of the caller is necessary also.
+    for (fact, expected) in [
+        (ProtectionFact::Protected, code::TARGET_PROTECTED),
+        (ProtectionFact::Unknown, code::TARGET_PROTECTION_UNKNOWN),
+    ] {
+        let host: Host = Host::new().with_process(100, 10);
+        let envelope = process_force(Escalation::ImmediateForce, member(100, 10, job()));
+        let protected = StepInput {
+            protection: fact,
+            ..input(&envelope, durable())
+        };
+        let report = finished(host.executor().begin(protected).unwrap());
+        assert_all_skipped(&host, &report, expected, &ErrorFamily::Eligibility);
+    }
 }

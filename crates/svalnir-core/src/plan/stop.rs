@@ -12,7 +12,7 @@ use super::paths::{PathSet, is_canonical};
 use super::reason::{Omission, OmissionReason, push_reason};
 use crate::action::{
     ActionClass, ApplicationBinding, CandidateBindingError, Plan, PlanLimits, PlanTarget,
-    PlannedStep, TargetBinding,
+    PlannedStep, ProcessBinding, TargetBinding,
 };
 use crate::id::{StepId, TargetId};
 use crate::policy::{ApplicationCandidate, ProtectionContext, ProtectionFact, hard_protection};
@@ -151,7 +151,7 @@ fn check_limits(request: &StopRequest<'_>, lifetime: Nanoseconds) -> Result<(), 
 fn target_reasons(
     context: &PlanContext<'_>,
     request: &StopRequest<'_>,
-    binding: &Result<ApplicationBinding, CandidateBindingError>,
+    binding: &Result<TargetBinding, CandidateBindingError>,
 ) -> Vec<OmissionReason> {
     use OmissionReason as Reason;
     let candidate: &ApplicationCandidate = request.candidate;
@@ -237,39 +237,74 @@ fn target_reasons(
     reasons
 }
 
-/// Builds the plan of a manual stop of one application or job instance.
+/// The binding of the candidate of a stop request.
 ///
-/// The target is the membership snapshot of the candidate: the same
-/// processes and the same membership identity
+/// A candidate of exactly one process for which no application or job
+/// evidence was found ([`ProcessAssociation::Unattributed`]) is the target
+/// of one process ([`TargetBinding::Process`]). Each other candidate is
+/// the membership snapshot of one instance
+/// ([`ApplicationBinding::from_candidate`]): two processes with no
+/// membership are not one target, because nothing shows that they belong
+/// together. A process with an association kind or an attribution method
+/// that this build does not recognize is not such a process: a different
+/// build can know it as a member of an instance, and the member rules of
+/// that instance then apply to it. It gets no target.
+fn binding_of(candidate: &ApplicationCandidate) -> Result<TargetBinding, CandidateBindingError> {
+    let [process] = candidate.processes.as_slice() else {
+        return ApplicationBinding::from_candidate(candidate).map(TargetBinding::Application);
+    };
+    if !matches!(process.association, ProcessAssociation::Unattributed) {
+        return ApplicationBinding::from_candidate(candidate).map(TargetBinding::Application);
+    }
+    // The same rule as for an instance: only `NotProtected` gives a target.
+    match candidate.hard_protection {
+        ProtectionFact::NotProtected => Ok(TargetBinding::Process(ProcessBinding {
+            process: process.clone(),
+        })),
+        ProtectionFact::Protected => Err(CandidateBindingError::Protected),
+        ProtectionFact::Unknown => Err(CandidateBindingError::ProtectionUnknown),
+    }
+}
+
+/// Builds the plan of a manual stop of one application or job instance, or
+/// of one process that has no verified membership.
+///
+/// The target of an instance is the membership snapshot of the candidate:
+/// the same processes and the same membership identity
 /// ([`ApplicationBinding::from_candidate`]). Descendants, executables with
 /// a similar name, and process groups are not members. The members have
 /// the sequence of their generation identities, so the result does not
 /// depend on the sequence of the input.
+///
+/// A candidate of exactly one process with no application or job
+/// evidence ([`ProcessAssociation::Unattributed`]), for example a process
+/// that a shell started, is the target of that one process
+/// ([`TargetBinding::Process`]). It has no member list. Its
+/// executor step signals the process directly, after the revalidation of
+/// its identity evidence (`docs/ACTION_CONTRACTS.md` sections 3 and 8).
 ///
 /// The target is in the plan only when each of these is true, for each
 /// strategy:
 ///
 /// - The hard protection that the candidate recorded and the fact that the
 ///   catalog gives now ([`hard_protection`]) are the two `NotProtected`.
+///   The catalog gives `Unknown` for a process with no executable
+///   evidence, so a target of one process always has that evidence.
 /// - No process claims a bundle identifier of
 ///   `[protections].protected_bundle_ids`, and no executable is at or
 ///   below a path of `[protections].protected_executable_paths`. With such
 ///   a path in the configuration, each process has executable evidence.
-/// - Each process is a process of the principal, has a verified
-///   membership of the same instance, and has an identity of the boot of
-///   the clock of the plan.
+/// - Each process is a process of the principal and has an identity of
+///   the boot of the clock of the plan. The processes are the verified
+///   members of one instance, or the candidate is one process with no
+///   application or job evidence.
 /// - Each executable path is absolute and canonical, and the home
 ///   directory resolves each `~/` path of the configuration.
 ///
 /// In each other case the result has no plan, and `preview.omitted` has
-/// the target with each reason. That result is not an error.
-///
-/// A process with no verified membership is not a target of this builder,
-/// and the reason is `MembershipNotVerified`. The binding for one such
-/// process exists ([`TargetBinding::Process`]), and [`Plan::seal`] has its
-/// checks. This builder makes no plan with it, because this build has no
-/// executor step that revalidates and signals one process with no
-/// membership.
+/// the target with each reason. That result is not an error. Two or more
+/// processes of which one has no verified membership give the reason
+/// `MembershipNotVerified`.
 ///
 /// The steps are one graceful step, one graceful step and then one force
 /// step, or one force step, as the strategy says.
@@ -302,10 +337,9 @@ pub fn build_stop_plan(
     let kind: StopKind = request.strategy.kind();
     let mode: PlanMode = PlanMode::Stop(kind);
 
-    let binding: Result<ApplicationBinding, CandidateBindingError> =
-        ApplicationBinding::from_candidate(request.candidate);
+    let binding: Result<TargetBinding, CandidateBindingError> = binding_of(request.candidate);
     let reasons: Vec<OmissionReason> = target_reasons(context, request, &binding);
-    let mut binding: ApplicationBinding = match binding {
+    let mut binding: TargetBinding = match binding {
         Ok(binding) if reasons.is_empty() => binding,
         _ => {
             // A binding error always gives a reason. This fallback keeps a
@@ -334,9 +368,11 @@ pub fn build_stop_plan(
             });
         }
     };
-    binding
-        .members
-        .sort_by(|left, right| left.generation_id.cmp(&right.generation_id));
+    if let TargetBinding::Application(application) = &mut binding {
+        application
+            .members
+            .sort_by(|left, right| left.generation_id.cmp(&right.generation_id));
+    }
 
     let step = |step_id: &StepId, action_class: ActionClass| PlannedStep {
         step_id: step_id.clone(),
@@ -353,7 +389,7 @@ pub fn build_stop_plan(
     let plan: Plan = context.seal(PlanParts {
         targets: vec![PlanTarget {
             target_id: request.target_id.clone(),
-            binding: TargetBinding::Application(binding),
+            binding,
         }],
         steps,
         limits: PlanLimits {

@@ -2,18 +2,18 @@
 
 use svalnir_core::action::{
     ActionClass, ErrorFamily, Escalation, ExecutorRole, Journal as _, OperationState,
-    PermittedNextStep, Plan, PlanContent, ProcessBinding, TargetBinding,
+    PermittedNextStep, Plan, PlanContent, TargetBinding,
 };
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::id::{PolicyRevisionId, RuleId, RuleRevisionId};
 use svalnir_core::policy::ProtectionFact;
-use svalnir_core::process::ProcessAssociation;
 use svalnir_core::rule::RuleRef;
 
 use super::super::{ApplyOutcome, ApplyRequest, Start, code};
 use super::support::{
-    Bench, NoRules, SECOND, admitted, approval, cleanup_content, cleanup_plan, member,
-    open_journal, principal, queued, refusal, run, stop_content, stop_plan, stored_request,
+    Bench, GRACE, NativeCall, NoRules, SECOND, START, admitted, approval, cleanup_content,
+    cleanup_plan, open_journal, principal, process_stop_plan, queued, refusal, run, stop_content,
+    stop_plan, stored_request,
 };
 use crate::journal::{RequestBody, RequestCompletion, RequestStatus};
 use crate::rules::{
@@ -394,33 +394,118 @@ fn two_operations_on_different_processes_wait_in_sequence() {
 }
 
 #[test]
-fn a_plan_with_a_target_of_one_process_is_refused_and_no_call_is_issued() {
-    // The process executor of this build has no step for one process with
-    // no application membership, and the protection port is for an
-    // application binding. The plan is refused before a reservation.
-    let mut bench = Bench::new();
-    let spawned = bench.host.spawn(4_242);
-    for escalation in [
-        Escalation::None,
-        Escalation::ForceAfterGrace,
-        Escalation::ImmediateForce,
+fn a_plan_with_a_target_of_one_process_signals_that_process_only() {
+    use crate::executor::process::{GracefulSignal, ProcessSignal};
+    use svalnir_core::action::{DispatchState, TargetEffect};
+    let term = NativeCall::Signal(4_242, ProcessSignal::Graceful(GracefulSignal::default()));
+    let kill = NativeCall::Signal(4_242, ProcessSignal::Kill);
+    for (escalation, calls) in [
+        (Escalation::None, vec![term.clone()]),
+        (Escalation::ForceAfterGrace, vec![term, kill.clone()]),
+        (Escalation::ImmediateForce, vec![kill]),
     ] {
-        let name = format!("plan_{}", escalation.as_str());
-        let mut content: PlanContent =
-            stop_content(&name, vec![member(4_242)], escalation, bench.clock.now());
-        let mut process = spawned.clone();
-        process.association = ProcessAssociation::Unattributed;
-        content.targets[0].binding = TargetBinding::Process(ProcessBinding { process });
-        let plan = Plan::seal(content).unwrap();
+        let mut bench = Bench::new();
+        let process = bench.host.spawn(4_242);
+        // A second process of the user, with the same executable name
+        // pattern. It is not a target.
+        bench.host.spawn(4_243);
+        // The force signal ends the process. The graceful signal of the
+        // strategy with a force step does not.
+        let ignores_term: bool = matches!(escalation, Escalation::ForceAfterGrace);
+        let plan = process_stop_plan("plan_1", process.clone(), escalation, bench.clock.now());
+        assert!(matches!(plan.targets[0].binding, TargetBinding::Process(_)));
         bench.store(&plan);
         let mut coordinator = bench.start();
-        let error = refusal(&mut coordinator, stored_request(&plan));
-        assert_eq!(error.code.as_str(), code::PROCESS_TARGET_NOT_AVAILABLE);
-        assert_eq!(error.family, ErrorFamily::Request);
-        drop(coordinator);
-        assert_eq!(bench.intents(), 0);
-        assert_eq!(bench.host.calls(), Vec::new());
-        let journal = open_journal(&bench.tree.database);
-        assert_eq!(journal.unsettled_operation_count().unwrap(), 0);
+        let operation_id = admitted(&mut coordinator, stored_request(&plan));
+        coordinator.step();
+        if ignores_term {
+            // The process runs to the end of the grace period.
+            bench.clock.set(START + GRACE);
+            coordinator.step();
+            coordinator.step();
+        }
+        // The exit is an observation, not the return value of the signal.
+        bench.host.world().processes.remove(&4_242);
+        let view = run(&mut coordinator, &bench.clock, &operation_id);
+        assert_eq!(bench.host.calls(), calls);
+        assert_eq!(view.operation.state(), &OperationState::Completed);
+        let last = view.operation.steps().last().unwrap();
+        let [result] = last.results() else {
+            panic!("a process target has one result for each step");
+        };
+        assert_eq!(result.effect, TargetEffect::ExitVerified);
+        assert_eq!(result.dispatch, DispatchState::Submitted);
+        assert_eq!(result.member.as_ref(), Some(&process.generation_id));
+        assert!(bench.host.world().processes.contains_key(&4_243));
     }
+}
+
+#[test]
+fn the_hard_protection_applies_to_a_target_of_one_process() {
+    for fact in [ProtectionFact::Protected, ProtectionFact::Unknown] {
+        for escalation in [Escalation::None, Escalation::ImmediateForce] {
+            let mut bench = Bench::new();
+            let process = bench.host.spawn(4_242);
+            let plan = process_stop_plan("plan_1", process, escalation, bench.clock.now());
+            bench.store(&plan);
+            bench.authority.records().protection = fact;
+            let mut coordinator = bench.start();
+            let error = refusal(&mut coordinator, stored_request(&plan));
+            assert_eq!(error.code.as_str(), code::TARGET_PROTECTED);
+            assert_eq!(error.family, ErrorFamily::Eligibility);
+            drop(coordinator);
+            assert_eq!(bench.intents(), 0);
+            assert_eq!(bench.host.calls(), Vec::new());
+        }
+    }
+}
+
+#[test]
+fn a_protection_that_starts_after_admission_stops_the_step_of_one_process() {
+    // The executor asks the catalog again at the dispatch boundary.
+    let mut bench = Bench::new();
+    let process = bench.host.spawn(4_242);
+    let plan = process_stop_plan(
+        "plan_1",
+        process,
+        Escalation::ImmediateForce,
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    bench.authority.records().protection = ProtectionFact::Protected;
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(bench.host.calls(), Vec::new());
+    assert!(bench.host.world().processes.contains_key(&4_242));
+    assert_ne!(view.operation.state(), &OperationState::Completed);
+}
+
+#[test]
+fn a_target_of_one_process_takes_the_lease_of_its_generation() {
+    // A second plan for the same process generation, as a process target
+    // or as a member of an application target, waits or is refused: one
+    // intervention on one generation at a time.
+    let mut bench = Bench::new();
+    let process = bench.host.spawn(4_242);
+    let first = process_stop_plan(
+        "plan_1",
+        process.clone(),
+        Escalation::None,
+        bench.clock.now(),
+    );
+    let second = stop_plan(
+        "plan_2",
+        vec![process],
+        Escalation::ImmediateForce,
+        bench.clock.now(),
+    );
+    bench.store(&first);
+    bench.store(&second);
+    let mut coordinator = bench.start();
+    admitted(&mut coordinator, stored_request(&first));
+    coordinator.step();
+    let error = refusal(&mut coordinator, stored_request(&second));
+    assert_eq!(error.code.as_str(), code::LEASE_UNAVAILABLE);
+    assert_eq!(bench.host.calls().len(), 1);
 }

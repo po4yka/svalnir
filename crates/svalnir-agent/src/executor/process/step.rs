@@ -1,6 +1,10 @@
 //! One step of an application intervention: the final check, the calls,
 //! and the observation of the exit.
 //!
+//! The target is an application or managed-job instance with its members,
+//! or one process that has no verified membership. The one process gets
+//! the checks of an instance with one member, and its call is one signal.
+//!
 //! [`ProcessExecutor::begin`] does the final check and issues the calls of
 //! one step. It never waits. When a call was issued, it returns an
 //! [`Observation`]; the caller calls [`Observation::poll`] at the times it
@@ -11,9 +15,9 @@
 use std::collections::BTreeMap;
 
 use svalnir_core::action::{
-    ActionClass, ApplicationBinding, Attribution, DispatchConsumption, DispatchReceipt,
-    DispatchState, Escalation, ExecutorRole, NativeResult, RequestEnvelope, StopReason,
-    TargetBinding, TargetEffect, TargetResult, check_dispatch_recording,
+    ActionClass, Attribution, DispatchConsumption, DispatchReceipt, DispatchState, Escalation,
+    ExecutorRole, NativeResult, RequestEnvelope, StopReason, TargetBinding, TargetEffect,
+    TargetResult, check_dispatch_recording,
 };
 use svalnir_core::id::{
     BootId, ClockDomainId, ExecutorEpochId, OperationId, ProcessGenerationId, StepId,
@@ -212,7 +216,28 @@ enum Backend<'a> {
     Unsupported,
 }
 
-fn backend_of(kind: StepKind, member: &ProcessIdentity) -> Backend<'_> {
+/// The kind of the target of a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    /// An application or managed-job instance with its members.
+    Instance,
+    /// One process that has no verified membership.
+    Process,
+}
+
+fn backend_of(kind: StepKind, subject: Subject, member: &ProcessIdentity) -> Backend<'_> {
+    if subject == Subject::Process {
+        // The one process of a process target has no application and no
+        // job, so it has no application API and no request that applies
+        // to it: its call is one signal to its process ID. A process with
+        // a verified membership is a target only through its instance;
+        // the check of the envelope refuses it, and it gets no call here.
+        return if member.association.verified_membership().is_none() {
+            Backend::Signal
+        } else {
+            Backend::Unsupported
+        };
+    }
     match &member.association {
         ProcessAssociation::Application {
             bundle_identifier,
@@ -480,7 +505,9 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
     /// Does the final check of one step and issues its calls.
     ///
     /// The step is `RequestApplicationExit` or `ForceApplicationExit` on an
-    /// application target. The sequence is:
+    /// application target or on a target of one process. The one process
+    /// is checked as the only member of an instance, and its call is one
+    /// signal. The sequence is:
     ///
     /// 1. The checks of the step as a whole: the stop request, the context,
     ///    the deadline, the evidence validity, the leases, the grace
@@ -511,8 +538,12 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
             ActionClass::ForceApplicationExit => StepKind::Force,
             _ => return Err(ExecutorError::NotApplicationStep),
         };
-        let TargetBinding::Application(application) = &envelope.target.binding else {
-            return Err(ExecutorError::NotApplicationStep);
+        let (subject, members): (Subject, &[ProcessIdentity]) = match &envelope.target.binding {
+            TargetBinding::Application(application) => (Subject::Instance, &application.members),
+            TargetBinding::Process(binding) => {
+                (Subject::Process, std::slice::from_ref(&binding.process))
+            }
+            TargetBinding::File(_) => return Err(ExecutorError::NotApplicationStep),
         };
         if !matches!(envelope.executor, ExecutorRole::User) {
             return Err(ExecutorError::NotApplicationStep);
@@ -550,21 +581,27 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
             escalation: envelope.limits.escalation.clone(),
             grace: envelope.limits.grace,
             wall: self.clock.wall_now(),
-            slots: vec![None; application.members.len()],
+            slots: vec![None; members.len()],
             pending: Vec::new(),
             submitted_at: None,
         };
-        let window: Nanoseconds = match self.check_step(&input, kind, application) {
+        let window: Nanoseconds = match self.check_step(&input, kind, members) {
             Ok(checked) => checked,
             Err(outcome) => {
-                for (index, member) in application.members.iter().enumerate() {
+                for (index, member) in members.iter().enumerate() {
                     work.settle(index, member, None, (*outcome).clone())?;
                 }
                 return Ok(StepRun::Finished(work.finish(input.stop)?));
             }
         };
 
-        self.dispatch(&mut work, kind, envelope, application, prior.as_ref())?;
+        self.dispatch(
+            &mut work,
+            (kind, subject),
+            envelope,
+            members,
+            prior.as_ref(),
+        )?;
         if work.pending.is_empty() {
             return Ok(StepRun::Finished(work.finish(None)?));
         }
@@ -582,7 +619,7 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
         &self,
         input: &StepInput<'_>,
         kind: StepKind,
-        application: &ApplicationBinding,
+        members: &[ProcessIdentity],
     ) -> Result<Nanoseconds, Box<Outcome>> {
         let envelope: &RequestEnvelope = input.envelope;
         let skip = |failure: Failure| Box::new(Outcome::skipped(failure, false));
@@ -623,18 +660,19 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
                 return Err(skip(Failure::limits(code::GRACE_NOT_EXPIRED)));
             }
         }
-        if let Some(failure) = self.refusal(envelope.principal.uid, application, input.protection) {
+        if let Some(failure) = self.refusal(envelope.principal.uid, members, input.protection) {
             return Err(skip(failure));
         }
         Ok(window)
     }
 
     /// The hard refusals of the executor. They apply to each plan, each
-    /// trigger, and each strategy.
+    /// trigger, each strategy, and each kind of target: `members` is the
+    /// member list of an instance or the one process of a process target.
     fn refusal(
         &self,
         principal: Uid,
-        application: &ApplicationBinding,
+        members: &[ProcessIdentity],
         protection: ProtectionFact,
     ) -> Option<Failure> {
         match protection {
@@ -654,7 +692,7 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
         if principal != user {
             return Some(Failure::eligibility(code::TARGET_OTHER_USER));
         }
-        for member in &application.members {
+        for member in members {
             let pid: Pid = member.pid;
             // PID 1 is `launchd`. `Pid` has no value of 0 or less.
             if pid.get() <= 1 {
@@ -678,7 +716,7 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
             principal,
             control_plane: None,
         };
-        if hard_protection(&application.members, &context) == ProtectionFact::Protected {
+        if hard_protection(members, &context) == ProtectionFact::Protected {
             return Some(Failure::eligibility(code::TARGET_PROTECTED));
         }
         None
@@ -690,15 +728,15 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
     fn dispatch(
         &self,
         work: &mut Work,
-        kind: StepKind,
+        (kind, subject): (StepKind, Subject),
         envelope: &RequestEnvelope,
-        application: &ApplicationBinding,
+        members: &[ProcessIdentity],
         prior: Option<&impl Fn(&ProcessGenerationId) -> Prior>,
     ) -> Result<(), ExecutorError> {
         let mut followers: Vec<(usize, &ProcessIdentity, GenerationState)> = Vec::new();
         let mut first: Vec<(usize, &ProcessIdentity, Backend<'_>)> = Vec::new();
         let mut second: Vec<(usize, &ProcessIdentity, Backend<'_>)> = Vec::new();
-        for (index, member) in application.members.iter().enumerate() {
+        for (index, member) in members.iter().enumerate() {
             match prior.map(|prior| prior(&member.generation_id)) {
                 Some(Prior::Exited) => {
                     work.settle(index, member, None, Outcome::already_exited(false))?;
@@ -712,7 +750,7 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
                 }
                 Some(Prior::Running) | None => {}
             }
-            match backend_of(kind, member) {
+            match backend_of(kind, subject, member) {
                 Backend::Follow => {
                     followers.push((index, member, observe(&self.source, member)));
                 }

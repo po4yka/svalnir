@@ -35,9 +35,6 @@ pub mod code {
     /// The plan needs the privileged helper, which Milestone 2 does not
     /// call.
     pub const HELPER_NOT_AVAILABLE: &str = "helper_not_available";
-    /// The plan has a target of one process with no application
-    /// membership. This build has no executor for that target.
-    pub const PROCESS_TARGET_NOT_AVAILABLE: &str = "process_target_not_available";
     /// An allowance has no room for the charge of the plan.
     pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
     /// The incident of the plan has no allowance record.

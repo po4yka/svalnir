@@ -100,7 +100,6 @@ impl World {
         let trash: PathBuf = directory.path().join("trash");
         std::fs::create_dir_all(&trash).unwrap();
         environment.seams.test.trash_directory = Some(trash);
-        environment.seams.test.attribute_target = true;
         Self {
             environment,
             directory,
@@ -1407,6 +1406,24 @@ fn a_graceful_stop_reports_the_observed_exit_of_the_child() {
     assert_eq!(operation["target_results"][0]["member"], target);
     assert_eq!(operation["target_results"][0]["effect"], "ExitVerified");
     assert!(child.has_exited());
+    // The inventory finds no application and no job for a child of the
+    // test, as for a process that a shell started. The plan binds it as
+    // a target of one process, with no synthetic membership.
+    {
+        use svalnir_core::action::{Journal as _, TargetBinding};
+        let journal = crate::commands::session::open_journal(&world.environment)
+            .ok()
+            .unwrap();
+        let plan_id = svalnir_core::id::PlanId::new(result["plan_id"].as_str().unwrap()).unwrap();
+        let plan = journal.plan(&plan_id).unwrap().unwrap();
+        let [bound] = plan.targets.as_slice() else {
+            panic!("a stop plan has one target");
+        };
+        let TargetBinding::Process(binding) = &bound.binding else {
+            panic!("the child is not a target of one process");
+        };
+        assert_eq!(binding.process.generation_id.as_str(), target);
+    }
 
     // A repeated request finds the plan and the operation of the first
     // one: it makes no second plan and sends no second signal.

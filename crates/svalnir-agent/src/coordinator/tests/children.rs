@@ -22,7 +22,9 @@ use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::MonotonicNanos;
 
 use super::super::{Clock, Dependencies, OperationView, Phase, Start, SystemProbe, TimeReading};
-use super::support::{Bench, admitted, evaluation_clock, stop_content, stored_request};
+use super::support::{
+    Bench, admitted, evaluation_clock, process_stop_content, stop_content, stored_request,
+};
 use crate::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
@@ -151,11 +153,21 @@ impl Clock for HostClock {
 
 /// Applies a manual stop plan for a live child and runs it to its end.
 fn stop_child(child: &ChildGuard, escalation: Escalation) -> OperationView {
+    stop_child_as(child, escalation, false)
+}
+
+/// Applies a manual stop plan for a live child and runs it to its end.
+/// With `single`, the child is a target of one process with no verified
+/// membership; else it is the only member of a job instance.
+fn stop_child_as(child: &ChildGuard, escalation: Escalation, single: bool) -> OperationView {
     let mut bench = Bench::new();
     let source = DarwinProcessSource::new();
     let now: u64 = source.monotonic_now().unwrap().get();
-    let mut content: PlanContent =
-        stop_content("plan_1", vec![identity(child.pid())], escalation, now);
+    let mut content: PlanContent = if single {
+        process_stop_content("plan_1", identity(child.pid()), escalation, now)
+    } else {
+        stop_content("plan_1", vec![identity(child.pid())], escalation, now)
+    };
     if content.limits.grace.is_some() {
         content.limits.grace = Some(Nanoseconds::new(300_000_000));
     }
@@ -221,4 +233,27 @@ fn a_live_child_that_ignores_the_request_is_forced_after_the_grace_period() {
     assert_eq!(steps[1].results()[0].effect, TargetEffect::ExitVerified);
     let status = child.0.wait().unwrap();
     assert_eq!(status.signal(), Some(libc::SIGKILL));
+}
+
+#[test]
+fn a_live_child_with_no_membership_is_stopped_as_one_process() {
+    // The graceful signal, and the observed exit.
+    let mut child = spawn_child(false);
+    let view = stop_child_as(&child, Escalation::None, true);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert_eq!(
+        view.operation.steps()[0].results()[0].effect,
+        TargetEffect::ExitVerified
+    );
+    assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGTERM));
+
+    // A child that ignores the request gets the force signal after the
+    // grace period.
+    let mut child = spawn_child(true);
+    let view = stop_child_as(&child, Escalation::ForceAfterGrace, true);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    let steps = view.operation.steps();
+    assert_eq!(steps[0].results()[0].effect, TargetEffect::StillRunning);
+    assert_eq!(steps[1].results()[0].effect, TargetEffect::ExitVerified);
+    assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
 }

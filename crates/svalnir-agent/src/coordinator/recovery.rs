@@ -138,9 +138,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 // A different object at the name is a different target.
                 FileProbe::PlannedObject | FileProbe::OtherObject | FileProbe::Unknown => None,
             },
-            TargetBinding::Application(application) => {
+            // The members of an application target, or the one process
+            // of a process target.
+            TargetBinding::Application(_) | TargetBinding::Process(_) => {
                 let mut results: Vec<TargetResult> = Vec::new();
-                for member in &application.members {
+                for member in binding.processes().unwrap_or_default() {
                     let effect: TargetEffect = match self.probe.process(member) {
                         // A reused PID is a different process. The planned
                         // generation is gone.
@@ -163,9 +165,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 }
                 (!results.is_empty()).then_some(results)
             }
-            // Admission refuses a plan with a process target, so no
-            // operation has one. The evidence settles nothing.
-            TargetBinding::Process(_) => None,
         }
     }
 

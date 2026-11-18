@@ -395,3 +395,47 @@ fn the_history_of_an_incident_is_bounded_and_never_shortened() {
             .all(|record| record.final_usage == Some(memory_usage(1, 0)))
     );
 }
+
+#[test]
+fn a_record_with_an_erased_history_is_not_rearmed() {
+    let state = enabled_state();
+    let at = clock(600);
+    let condition = settled(memory_usage(1, 0));
+    let mut budget = memory_budget();
+    for generation in 1..=3 {
+        budget = rearm(
+            &state,
+            &budget,
+            &condition,
+            &request(generation),
+            &at,
+            wall(600),
+        )
+        .unwrap()
+        .budget;
+    }
+    assert_eq!(budget.generation, Generation::new(4));
+
+    // The entries of two earlier generations are gone. The last entry is
+    // the current generation, so only the sequence shows the loss.
+    let mut erased = budget.clone();
+    erased.history.drain(1..3);
+    assert_eq!(
+        rearm(&state, &erased, &condition, &request(4), &at, wall(600)),
+        Err(RearmRefusal::RecordNotUsable)
+    );
+    // An earlier generation with no recorded usage.
+    let mut no_usage = budget.clone();
+    no_usage.history[1].final_usage = None;
+    assert_eq!(
+        rearm(&state, &no_usage, &condition, &request(4), &at, wall(600)),
+        Err(RearmRefusal::RecordNotUsable)
+    );
+    // The complete record is rearmed, and the exception record of the
+    // open stays as it was.
+    let mut granted = budget;
+    granted.volatile_exception_at_open = true;
+    let next = rearm(&state, &granted, &condition, &request(4), &at, wall(600)).unwrap();
+    assert!(next.budget.volatile_exception_at_open);
+    assert_eq!(next.budget.history.len(), 5);
+}

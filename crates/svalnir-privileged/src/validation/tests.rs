@@ -576,8 +576,10 @@ fn refuses_an_expired_grant() {
     let request: HelperRequest = request("step-1");
     let state: HelperState = state();
 
+    // The request expires 100 ns after the time of the fixture clock. The
+    // grant applies until the request expires, and not later.
     let mut before: HelperClock = clock();
-    before.wall = WallTime::from_unix(GRANT_EXPIRY - 1, 999_999_999).unwrap();
+    before.wall = WallTime::from_unix(GRANT_EXPIRY - 1, 999_999_900).unwrap();
     assert!(matches!(
         validate(&state, &caller(), &request, &before),
         Verdict::Accept(_)
@@ -1892,8 +1894,12 @@ fn an_unknown_field_is_rejected_at_each_level() {
     // A record of `svalnir-core` that does not reject an unknown field
     // itself is covered by the exactness check.
     let mut value: Value = encode(&request("step-1"));
-    value["operation"]["evict_entries"]["grant"]["ceiling"] = json!("999999");
+    value["operation"]["evict_entries"]["rule"]["mode"] = json!("automatic_eviction");
     assert_eq!(decode(&value), Err(DecodeError::NotExact));
+    // The grant reference rejects an unknown field itself.
+    let mut value: Value = encode(&request("step-1"));
+    value["operation"]["evict_entries"]["grant"]["ceiling"] = json!("999999");
+    assert_eq!(decode(&value), Err(DecodeError::Malformed));
 }
 
 #[test]
@@ -2175,4 +2181,191 @@ fn a_refusal_is_an_action_error_with_no_submitted_call() {
     assert_eq!(error.plan_id, Some(request.correlation.plan_id));
     assert_eq!(error.operation_id, Some(request.correlation.operation_id));
     assert_eq!(error.step_id, Some(request.correlation.step_id));
+}
+
+// Regression tests of the review of the validation.
+
+#[test]
+fn refuses_a_request_that_is_valid_after_the_expiry_of_its_grant() {
+    let request: HelperRequest = request("step-1");
+    let mut state: HelperState = state();
+
+    // The grant is in effect at the time of the check, and it expires
+    // 1 ns before the request does. The executor could submit a call in
+    // that time.
+    let mut late: HelperClock = clock();
+    late.wall = WallTime::from_unix(GRANT_EXPIRY - 1, 999_999_901).unwrap();
+    assert_eq!(
+        reason_of(&validate(&state, &caller(), &request, &late)),
+        RefusalReason::GrantExpiresBeforeRequest
+    );
+    assert!(matches!(
+        state.admit(&caller(), &request, &late),
+        Admission::Refused(_)
+    ));
+    assert!(state.consumed().is_empty());
+
+    // A grant with no expiry applies for each validity.
+    let mut open: PrivilegeGrant = grant_for("grant-1", USER, "root-a");
+    open.expires_at = None;
+    assert!(matches!(
+        validate(&state_with(open, limits()), &caller(), &request, &late),
+        Verdict::Accept(_)
+    ));
+}
+
+#[test]
+fn a_restored_step_that_was_in_work_has_an_outcome_that_is_not_known() {
+    for in_work in [StepState::DispatchConsumed, StepState::Verifying] {
+        let mut first: HelperState = state();
+        admit_ok(&mut first, &request("step-1"));
+        if in_work == StepState::Verifying {
+            first
+                .record_progress(&key("step-1"), StepState::Verifying)
+                .unwrap();
+        }
+        admit_ok(&mut first, &request("step-2"));
+        first
+            .record_progress(&key("step-2"), StepState::NoAction)
+            .unwrap();
+
+        // The helper starts again with its durable record.
+        let consumed: Vec<_> = first.consumed().requests().cloned().collect();
+        let mut restored: HelperState = HelperState::restore(
+            config(),
+            vec![helper_grant(grant_for("grant-1", USER, "root-a"), limits())],
+            consumed,
+        )
+        .unwrap();
+        let status = |state: &HelperState, step: &str| match validate(
+            state,
+            &caller(),
+            &query(step),
+            &clock(),
+        ) {
+            Verdict::Known(status) => status.state,
+            other => panic!("the query has no recorded state: {other:?}"),
+        };
+        assert_eq!(status(&restored, "step-1"), StepState::UnknownOutcome);
+        assert_eq!(status(&restored, "step-2"), StepState::NoAction);
+        // The step stays consumed: the same request gets the state and no
+        // second acceptance.
+        assert!(matches!(
+            admit(&mut restored, &request("step-1")),
+            Admission::Known(_)
+        ));
+        // Reconciliation can settle it.
+        restored
+            .record_progress(&key("step-1"), StepState::Completed)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_restored_record_with_a_state_before_consumption_is_refused() {
+    let mut first: HelperState = state();
+    admit_ok(&mut first, &request("step-1"));
+    let grants = || vec![helper_grant(grant_for("grant-1", USER, "root-a"), limits())];
+    for state in [
+        StepState::Admitted,
+        StepState::IntentCommitted,
+        StepState::from_wire("Finished"),
+    ] {
+        let mut record = first.consumed().requests().next().unwrap().clone();
+        record.state = state;
+        assert_eq!(
+            HelperState::restore(config(), grants(), vec![record]).err(),
+            Some(StateError::Record(RecordError::State))
+        );
+    }
+    // More records than the capacity: none is dropped to make room.
+    let mut small: HelperConfig = config();
+    small.record_capacity = 1;
+    small.principal_quota = 1;
+    let mut two: HelperState = state();
+    admit_ok(&mut two, &request("step-1"));
+    admit_ok(&mut two, &request("step-2"));
+    assert_eq!(
+        HelperState::restore(
+            small,
+            grants(),
+            two.consumed().requests().cloned().collect()
+        )
+        .err(),
+        Some(StateError::Record(RecordError::Full))
+    );
+}
+
+#[test]
+fn the_dry_run_refuses_a_new_step_for_a_full_record() {
+    let mut small: HelperConfig = config();
+    small.record_capacity = 1;
+    small.principal_quota = 1;
+    let mut generous: GrantLimits = limits();
+    generous.rate.max_requests = 10;
+    let mut state: HelperState = HelperState::new(
+        small,
+        vec![helper_grant(grant_for("grant-1", USER, "root-a"), generous)],
+    )
+    .unwrap();
+    admit_ok(&mut state, &request("step-1"));
+    // The quota of the user is the first limit.
+    assert_eq!(
+        refused(&state, &request("step-2")),
+        RefusalReason::RecordQuota
+    );
+    // With room in the quota, the capacity of the record is the limit.
+    state.config.principal_quota = 2;
+    assert_eq!(
+        refused(&state, &request("step-2")),
+        RefusalReason::RecordFull
+    );
+}
+
+#[test]
+fn the_target_ceiling_of_the_protocol_does_not_depend_on_the_grant() {
+    let mut state: HelperState = state();
+    // A record that did not pass `HelperGrant::new`.
+    state.grants[0].limits.max_targets = MAX_TARGETS_PER_REQUEST + 2;
+    let entries: Vec<EntryTarget> = (0..=MAX_TARGETS_PER_REQUEST)
+        .map(|index: usize| entry(&format!("cache/{index}.tmp"), 0, 1))
+        .collect();
+    assert_eq!(
+        refused(&state, &request_with("step-1", entries)),
+        RefusalReason::TargetCeiling
+    );
+}
+
+#[test]
+fn a_rate_sum_that_does_not_fit_is_refused_and_not_saturated() {
+    let mut grant: PrivilegeGrant = grant_for("grant-1", USER, "root-a");
+    grant.ceiling = charge(u64::MAX, CEILING_ITEMS);
+    let mut wide: GrantLimits = limits();
+    wide.rate.work = charge(u64::MAX, RATE_ITEMS);
+    let mut state: HelperState = state_with(grant, wide);
+    admit_ok(
+        &mut state,
+        &request_with("step-1", vec![entry("cache/a.tmp", u64::MAX, 1)]),
+    );
+    assert_eq!(
+        refused(
+            &state,
+            &request_with("step-2", vec![entry("cache/b.tmp", 1, 1)])
+        ),
+        RefusalReason::ArithmeticOverflow
+    );
+}
+
+#[test]
+fn a_key_two_times_in_a_nested_record_is_rejected() {
+    let text: String = serde_json::to_string(&encode(&request("step-1"))).unwrap();
+    // The grant reference with its generation two times: a parser that
+    // keeps the last value would see the generation 3.
+    let needle: &str = "\"generation\":\"3\"";
+    assert_eq!(text.matches(needle).count(), 1);
+    let doubled: String = text.replace(needle, "\"generation\":\"9\",\"generation\":\"3\"");
+    assert_eq!(
+        decode_request(doubled.as_bytes(), SupportedProtocols::CURRENT),
+        Err(DecodeError::Malformed)
+    );
 }

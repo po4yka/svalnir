@@ -35,6 +35,7 @@ pub struct ControlClock<'a> {
 /// decides. In a different boot the monotonic time has no meaning, and the
 /// wall-clock time decides.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PauseDeadline {
     /// The monotonic time at which the pause ends.
     pub monotonic: MonotonicNanos,
@@ -48,10 +49,12 @@ pub struct PauseDeadline {
 
 /// A pause of each automatic intervention of the user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pause {
     /// The wall-clock time of the request, for history only.
     pub started_wall: WallTime,
     /// The expiry. `None` means that the pause applies until a resume.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub deadline: Option<PauseDeadline>,
 }
 
@@ -246,9 +249,14 @@ pub enum PauseRefusal {
 /// The report of a pause.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PauseReport {
-    /// The pause that the record now has.
+    /// The pause that the request asks for. The durable record has it
+    /// only when the acknowledgement is
+    /// [`super::AcknowledgementLevel::DurablyApplied`]. When the write
+    /// failed, the durable record keeps `replaced`, the running instance
+    /// has this pause in addition, and the pause in effect is the longer
+    /// of the two: use [`pause_status`] on each for a status message.
     pub pause: Pause,
-    /// The pause that the request replaced.
+    /// The pause of the durable record before the request.
     pub replaced: Option<Pause>,
 }
 

@@ -232,20 +232,29 @@ fn unchanged_report(
 
 /// What the running instance inhibits when the activation cannot be
 /// persisted, and what a durable activation makes unnecessary.
-fn persistence_effects(guards: &[GuardActivation]) -> (Fallback, Settled) {
+fn persistence_effects(differences: &[ScopeDifference]) -> (Fallback, Settled) {
     let restriction = |policy: PolicyId| InhibitedGuard {
         policy,
         cause: InhibitionCause::Restriction,
     };
     // When the request cannot be persisted, the earlier revision stays in
     // effect. A guard that the request restricts is inhibited, also when
-    // the request widens the scope of the other guard
-    // (`docs/POLICY_SPEC.md` section 5).
+    // the request widens the scope of the other guard, and also when the
+    // same request has a widening difference for the same guard
+    // (`docs/POLICY_SPEC.md` section 5). The combined effect of a guard is
+    // not the question: it is `Widening` as soon as one difference widens,
+    // and the restriction that the user asked for would then be lost.
     let on_failure: Fallback = Fallback {
-        guards: guards
+        guards: PolicyId::ALL
             .iter()
-            .filter(|guard| guard.effect == ScopeEffect::Narrowing)
-            .map(|guard| restriction(guard.policy))
+            .copied()
+            .filter(|policy| {
+                differences.iter().any(|difference| {
+                    difference.effect == ScopeEffect::Narrowing
+                        && difference.guards.includes(*policy)
+                })
+            })
+            .map(restriction)
             .collect(),
         pause: None,
     };
@@ -280,10 +289,11 @@ fn persistence_effects(guards: &[GuardActivation]) -> (Fallback, Settled) {
 /// The activation makes no grant, and the profile makes none.
 ///
 /// When the record cannot be persisted, the earlier revision stays in
-/// effect. The running instance inhibits each guard whose scope the
-/// request makes narrower, and the acknowledgement is
+/// effect. The running instance inhibits each guard that has a narrowing
+/// difference, also when another difference of the same request makes the
+/// scope of the guard wider, and the acknowledgement is
 /// [`super::AcknowledgementLevel::CurrentInstanceInhibition`]. When the
-/// request makes no guard narrower, the acknowledgement is
+/// request has no narrowing difference, the acknowledgement is
 /// [`super::AcknowledgementLevel::NotApplied`]. A wider scope never
 /// applies without a durable record.
 ///
@@ -360,7 +370,7 @@ pub fn activate(
                 .map_or_default(|(_, widening)| widening.clone()),
         })
         .collect();
-    let (on_failure, on_durable) = persistence_effects(&guards);
+    let (on_failure, on_durable) = persistence_effects(&differences);
     let report: ActivationReport = ActivationReport {
         revision,
         previous: previous.map(|active| active.revision.revision_id.clone()),

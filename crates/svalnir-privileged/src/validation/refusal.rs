@@ -81,6 +81,11 @@ pub enum RefusalReason {
     /// The grant is expired.
     #[error("the grant is expired")]
     GrantExpired,
+    /// The grant expires before the request does. An accepted step can be
+    /// executed until the expiry of its request, so the grant must apply
+    /// for that full time.
+    #[error("the grant expires before the request")]
+    GrantExpiresBeforeRequest,
     /// The grant does not have the root.
     #[error("the grant does not have the root")]
     RootNotGranted,
@@ -135,7 +140,7 @@ pub enum RefusalReason {
 
 impl RefusalReason {
     /// Each reason. A path reason is there one time, with one defect.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::ProtocolMajor,
         Self::ProtocolMinor,
         Self::ContentNotEncodable,
@@ -156,6 +161,7 @@ impl RefusalReason {
         Self::GrantGenerationUnknown,
         Self::GrantRevoked,
         Self::GrantExpired,
+        Self::GrantExpiresBeforeRequest,
         Self::RootNotGranted,
         Self::GrantDoesNotCover,
         Self::ObjectEvidenceAbsent,
@@ -195,6 +201,7 @@ impl RefusalReason {
             | Self::GrantGenerationUnknown
             | Self::GrantRevoked
             | Self::GrantExpired
+            | Self::GrantExpiresBeforeRequest
             | Self::RootNotGranted
             | Self::GrantDoesNotCover => ErrorFamily::Authority,
             Self::ObjectEvidenceAbsent | Self::ClockNotComparable => ErrorFamily::Evidence,
@@ -234,6 +241,7 @@ impl RefusalReason {
             Self::GrantGenerationUnknown => "helper_grant_generation_unknown",
             Self::GrantRevoked => "helper_grant_revoked",
             Self::GrantExpired => "helper_grant_expired",
+            Self::GrantExpiresBeforeRequest => "helper_grant_expires_before_request",
             Self::RootNotGranted => "helper_root_not_granted",
             Self::GrantDoesNotCover => "helper_grant_does_not_cover",
             Self::ObjectEvidenceAbsent => "helper_object_evidence_absent",

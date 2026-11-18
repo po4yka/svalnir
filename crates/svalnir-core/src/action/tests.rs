@@ -1648,6 +1648,8 @@ fn a_step_takes_only_results_that_its_progress_supports() {
         StepState::Failed,
         StepState::UnknownOutcome,
         StepState::Admitted,
+        StepState::Partial,
+        StepState::Incomplete,
     ] {
         assert_eq!(
             operation.advance_step(&s1, state, DispatchState::Submitted, Durability::Durable),
@@ -1684,14 +1686,17 @@ fn a_step_takes_only_results_that_its_progress_supports() {
     assert_eq!(operation.durability(), Durability::PersistenceFailed);
     // A skipped result after a submitted call is not possible.
     submit(&mut operation, "s2");
-    assert!(matches!(
+    assert_eq!(
         operation.settle_step(
             &step_id("s2"),
             vec![result("b", TargetEffect::Skipped)],
             Durability::Durable
         ),
-        Err(OperationError::Transition(_))
-    ));
+        Err(OperationError::Transition(TransitionError::NotPermitted {
+            from: "Verifying".to_owned(),
+            to: "NoAction".to_owned()
+        }))
+    );
     settle_step(
         &mut operation,
         "s2",
@@ -1841,6 +1846,69 @@ fn a_force_step_follows_only_a_settled_graceful_step_that_left_the_target() {
     settle_step(&mut operation, "force", vec![skipped]);
     assert_eq!(operation.settle(), Ok(&OperationState::Incomplete));
     assert_eq!(operation.dispatch(), DispatchState::Submitted);
+}
+
+#[test]
+fn a_force_step_follows_a_graceful_step_that_left_one_member_running() {
+    let plan = seal(application_content(Escalation::ForceAfterGrace));
+    let force = step_id("force");
+    let for_member = |generation: &str, effect: TargetEffect| {
+        Checked::new(TargetResultRecord {
+            member: Some(ProcessGenerationId::new(generation).unwrap()),
+            ..record("app", effect)
+        })
+        .unwrap()
+    };
+    let mut operation = admit(&plan);
+    submit(&mut operation, "graceful");
+    settle_step(
+        &mut operation,
+        "graceful",
+        vec![
+            for_member("proc_1", TargetEffect::ExitVerified),
+            for_member("proc_2", TargetEffect::StillRunning),
+        ],
+    );
+    assert_eq!(
+        operation
+            .step(&step_id("graceful"))
+            .unwrap()
+            .progress()
+            .state(),
+        &StepState::Partial
+    );
+    // One member still runs after the grace period: the force step is
+    // permitted.
+    operation
+        .advance_step(
+            &force,
+            StepState::IntentCommitted,
+            DispatchState::NotSubmitted,
+            Durability::Durable,
+        )
+        .unwrap();
+    operation
+        .advance_step(
+            &force,
+            StepState::DispatchConsumed,
+            DispatchState::NotSubmitted,
+            Durability::Durable,
+        )
+        .unwrap();
+    operation
+        .advance_step(
+            &force,
+            StepState::Verifying,
+            DispatchState::Submitted,
+            Durability::Durable,
+        )
+        .unwrap();
+    settle_step(
+        &mut operation,
+        "force",
+        vec![for_member("proc_2", TargetEffect::ExitVerified)],
+    );
+    assert_eq!(operation.settle(), Ok(&OperationState::Completed));
 }
 
 #[test]
@@ -2022,7 +2090,10 @@ fn an_operation_round_trips_and_a_state_without_results_is_rejected() {
     assert!(!decoded.state().is_recognized());
     assert!(!decoded.state().is_settled());
     assert_eq!(serde_json::to_value(&decoded).unwrap(), newer);
-    assert!(decoded.settle().is_err());
+    assert!(matches!(
+        decoded.settle(),
+        Err(OperationError::Transition(_))
+    ));
     assert_eq!(
         decoded.settle_step(
             &step_id("s2"),

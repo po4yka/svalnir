@@ -53,6 +53,15 @@ fn association(name: &str) -> ProcessAssociation {
     }
 }
 
+/// The association of a process with the managed job `name`.
+fn job_association(name: &str) -> ProcessAssociation {
+    ProcessAssociation::ManagedJob {
+        instance_id: ApplicationInstanceId::new(format!("job_{name}")).unwrap(),
+        label: format!("com.example.{name}"),
+        attribution: AttributionMethod::LaunchdJob,
+    }
+}
+
 /// One process of the application `name` of the user.
 fn process(name: &str, generation: &str, pid: i32) -> ProcessIdentity {
     ProcessIdentity {
@@ -279,6 +288,62 @@ fn one_process_with_no_membership_is_a_target_of_one_process() {
     }
 }
 
+#[test]
+fn a_managed_job_is_a_target_with_its_members() {
+    let fixture: Fixture = Fixture::new();
+    let mut candidate: ApplicationCandidate = candidate();
+    for process in &mut candidate.processes {
+        process.association = job_association("Job");
+    }
+    for strategy in strategies() {
+        let outcome: PlanOutcome =
+            build_stop_plan(&fixture.context(), &stop_request(&candidate, strategy)).unwrap();
+        assert_eq!(outcome.preview.omitted, []);
+        let plan = outcome.plan.as_ref().unwrap();
+        let [target] = plan.targets.as_slice() else {
+            panic!("a stop plan has one target");
+        };
+        let TargetBinding::Application(binding) = &target.binding else {
+            panic!("a managed job is an application target");
+        };
+        assert_eq!(binding.instance_id.as_str(), "job_Job");
+        let members: Vec<&str> = binding
+            .members
+            .iter()
+            .map(|member| member.generation_id.as_str())
+            .collect();
+        assert_eq!(members, ["gen_helper", "gen_main"]);
+    }
+}
+
+#[test]
+fn an_application_member_and_a_job_member_of_one_instance_give_a_plan() {
+    // The builder compares the instance identity only: it records the
+    // present behavior of the membership check.
+    let fixture: Fixture = Fixture::new();
+    let mut candidate: ApplicationCandidate = candidate();
+    candidate.processes[1].association = ProcessAssociation::ManagedJob {
+        instance_id: ApplicationInstanceId::new("app_Editor").unwrap(),
+        label: "com.example.Editor".to_owned(),
+        attribution: AttributionMethod::LaunchdJob,
+    };
+    let outcome: PlanOutcome = build_stop_plan(
+        &fixture.context(),
+        &stop_request(&candidate, StopStrategy::Graceful),
+    )
+    .unwrap();
+    assert_eq!(outcome.preview.omitted, []);
+    let plan = outcome.plan.as_ref().unwrap();
+    let [target] = plan.targets.as_slice() else {
+        panic!("a stop plan has one target");
+    };
+    let TargetBinding::Application(binding) = &target.binding else {
+        panic!("the members have one instance");
+    };
+    assert_eq!(binding.instance_id.as_str(), "app_Editor");
+    assert_eq!(binding.members.len(), 2);
+}
+
 /// One change of the candidate, the `[protections]` lines, the home
 /// directory, and the reasons that the change gives.
 struct ProtectionCase {
@@ -471,6 +536,16 @@ fn hard_protection_cases() -> Vec<ProtectionCase> {
         ProtectionCase::of(
             "members of two instances",
             |candidate| candidate.processes[1].association = association("Other"),
+            vec![Reason::MembershipNotVerified],
+        ),
+        ProtectionCase::of(
+            "application member and job member of two instances",
+            |candidate| candidate.processes[1].association = job_association("Other"),
+            vec![Reason::MembershipNotVerified],
+        ),
+        ProtectionCase::of(
+            "member with an association that this build does not recognize",
+            |candidate| candidate.processes[1].association = ProcessAssociation::Unrecognized,
             vec![Reason::MembershipNotVerified],
         ),
     ]

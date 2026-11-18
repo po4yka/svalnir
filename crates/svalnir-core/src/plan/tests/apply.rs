@@ -66,6 +66,19 @@ fn an_approval_is_bound_to_the_plan_identity_the_digest_and_the_mode() {
         Err(ApprovalMismatch::Digest)
     );
 
+    // A wrong identity and a wrong digest together: the identity is
+    // compared first, also with a wrong mode.
+    let both: PlanApproval = PlanApproval {
+        plan_id: PlanId::new("plan_2").unwrap(),
+        digest: ContentDigest::of_bytes(b""),
+    };
+    for mode in [TRASH, PlanMode::Cleanup(CleanupMode::Permanent)] {
+        assert_eq!(
+            check_approval(&plan, &both, mode),
+            Err(ApprovalMismatch::PlanId)
+        );
+    }
+
     // An approval of one mode does not apply a plan of a different mode.
     for mode in [
         PlanMode::Cleanup(CleanupMode::Permanent),
@@ -345,6 +358,29 @@ fn the_apply_check_gives_the_first_refusal() {
         check_apply(&plan, &wrong, TRASH, &late, &current(&next_policy)).unwrap_err();
     assert_eq!(refusal, ApplyRefusal::Approval(ApprovalMismatch::Digest));
     assert_eq!(refusal.family(), ErrorFamily::Authority);
+    let refusal: ApplyRefusal = check_apply(
+        &plan,
+        &approval,
+        PlanMode::Cleanup(CleanupMode::Permanent),
+        &late,
+        &current(&next_policy),
+    )
+    .unwrap_err();
+    assert_eq!(refusal, ApplyRefusal::Approval(ApprovalMismatch::Mode));
+    assert_eq!(refusal.family(), ErrorFamily::Authority);
+    // A clock of a different boot is not comparable; the expiry is checked
+    // before the revisions.
+    let other_boot: EvaluationClock = EvaluationClock {
+        boot_id: BootId::new("boot_2").unwrap(),
+        ..clock_at(BUILT_AT + 1)
+    };
+    let refusal: ApplyRefusal =
+        check_apply(&plan, &approval, TRASH, &other_boot, &current(&next_policy)).unwrap_err();
+    assert_eq!(
+        refusal,
+        ApplyRefusal::Expiry(ExpiryCause::ClockNotComparable)
+    );
+    assert_eq!(refusal.family(), ErrorFamily::Limits);
     let refusal: ApplyRefusal =
         check_apply(&plan, &approval, TRASH, &late, &current(&next_policy)).unwrap_err();
     assert_eq!(refusal, ApplyRefusal::Expiry(ExpiryCause::Expired));

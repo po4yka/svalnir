@@ -760,11 +760,10 @@ mod tests {
         assert_eq!(consumed.durability(), &Durability::Volatile);
         // `IntentCommitted` is a durable state.
         for durability in [volatile.clone(), Durability::Durable] {
-            assert!(
-                admitted
-                    .advance(StepState::IntentCommitted, NotSubmitted, durability)
-                    .is_err()
-            );
+            assert!(matches!(
+                admitted.advance(StepState::IntentCommitted, NotSubmitted, durability),
+                Err(TransitionError::NotPermitted { .. })
+            ));
         }
         // A volatile record does not become durable in place.
         assert!(matches!(
@@ -788,11 +787,10 @@ mod tests {
             Err(TransitionError::NotPermitted { .. })
         ));
         // A durable record does not become volatile.
-        assert!(
-            durable
-                .advance(StepState::NoAction, NotSubmitted, volatile)
-                .is_err()
-        );
+        assert!(matches!(
+            durable.advance(StepState::NoAction, NotSubmitted, volatile),
+            Err(TransitionError::Durability { .. })
+        ));
         // A failed write cannot consume a dispatch.
         let committed = durable
             .advance(
@@ -801,15 +799,14 @@ mod tests {
                 Durability::Durable,
             )
             .unwrap();
-        assert!(
-            committed
-                .advance(
-                    StepState::DispatchConsumed,
-                    NotSubmitted,
-                    Durability::PersistenceFailed
-                )
-                .is_err()
-        );
+        assert!(matches!(
+            committed.advance(
+                StepState::DispatchConsumed,
+                NotSubmitted,
+                Durability::PersistenceFailed
+            ),
+            Err(TransitionError::Durability { .. })
+        ));
         committed
             .advance(
                 StepState::Failed,
@@ -824,6 +821,46 @@ mod tests {
         });
         assert!(serde_json::from_value::<StepProgress>(failed_admission).is_err());
         assert!(StepProgress::admitted(Durability::from_wire("other")).is_err());
+    }
+
+    #[test]
+    fn a_record_whose_write_failed_does_not_become_durable() {
+        let consumed = StepProgress::admitted(Durability::Durable)
+            .unwrap()
+            .advance(
+                StepState::IntentCommitted,
+                NotSubmitted,
+                Durability::Durable,
+            )
+            .unwrap()
+            .advance(
+                StepState::DispatchConsumed,
+                NotSubmitted,
+                Durability::Durable,
+            )
+            .unwrap();
+        // The call was submitted, and the write of the record failed.
+        let verifying = consumed
+            .advance(
+                StepState::Verifying,
+                Submitted,
+                Durability::PersistenceFailed,
+            )
+            .unwrap();
+        assert_eq!(verifying.durability(), &Durability::PersistenceFailed);
+        // The record does not become durable again.
+        assert!(matches!(
+            verifying.advance(StepState::Completed, Submitted, Durability::Durable),
+            Err(TransitionError::Durability { .. })
+        ));
+        // It can stay in the failed-write condition.
+        verifying
+            .advance(
+                StepState::Completed,
+                Submitted,
+                Durability::PersistenceFailed,
+            )
+            .unwrap();
     }
 
     #[test]

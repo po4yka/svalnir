@@ -778,6 +778,30 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_consume_or_release_changes_no_level() {
+        // The first level has a reservation and accepts the change; the
+        // second level has none and refuses it.
+        let mut reserved = WorkAllowance::new(charge(50, 100));
+        reserved.reserve(charge(10, 1)).unwrap();
+        let mut budget = WorkBudget::new(vec![
+            ScopedAllowance {
+                scope: BudgetScope::Batch,
+                allowance: reserved,
+            },
+            ScopedAllowance {
+                scope: BudgetScope::Grant,
+                allowance: WorkAllowance::new(charge(50, 100)),
+            },
+        ])
+        .unwrap();
+        let before = budget.clone();
+        assert_eq!(budget.consume(charge(10, 1)), Err(BudgetError::NotReserved));
+        assert_eq!(budget, before);
+        assert_eq!(budget.release(charge(10, 1)), Err(BudgetError::NotReserved));
+        assert_eq!(budget, before);
+    }
+
+    #[test]
     fn a_budget_needs_a_bound_and_distinct_levels() {
         assert_eq!(WorkBudget::new(Vec::new()), Err(WorkBudgetError::Unbounded));
         let entry = ScopedAllowance {

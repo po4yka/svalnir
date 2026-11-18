@@ -226,6 +226,9 @@ fn a_rule_that_is_not_validated_for_manual_eviction_gives_an_empty_plan() {
         LifecycleState::Disabled {
             inspection_permitted: true,
         },
+        LifecycleState::Disabled {
+            inspection_permitted: false,
+        },
         LifecycleState::Retired,
     ] {
         let rule: Rule = rule_with(lifecycle);
@@ -235,6 +238,37 @@ fn a_rule_that_is_not_validated_for_manual_eviction_gives_an_empty_plan() {
         assert_eq!(outcome.plan, None);
         assert_eq!(reasons(&outcome, "a"), [OmissionReason::ModeNotValidated]);
     }
+    // A rule that is validated for automatic eviction permits the manual
+    // mode also.
+    let automatic: Rule = rule_with(LifecycleState::AutomaticEvictionValidated {
+        evidence: crate::rule::PromotionEvidence {
+            record: "VAL-07/record".to_owned(),
+        },
+    });
+    let selection = ModeSelection::Evict {
+        rule: Ok(&automatic),
+    };
+    let outcome: PlanOutcome =
+        build_cleanup_plan(&fixture.context(), &request(selection, &entries)).unwrap();
+    assert_eq!(planned(&outcome), ["target_a"]);
+    assert_eq!(outcome.preview.omitted, []);
+}
+
+#[test]
+fn the_candidate_ceiling_applies_to_the_items_also() {
+    let fixture: Fixture = Fixture::new();
+    let rule: Rule = rule();
+    // The ceiling of the rule is 100 items for each candidate.
+    let mut over: CleanupEntry = entry("over", 100);
+    over.charge = Some(charge(100, 101));
+    let mut at: CleanupEntry = entry("at", 100);
+    at.charge = Some(charge(100, 100));
+    let entries: [CleanupEntry; 2] = [over, at];
+    let selection = ModeSelection::Evict { rule: Ok(&rule) };
+    let outcome: PlanOutcome =
+        build_cleanup_plan(&fixture.context(), &request(selection, &entries)).unwrap();
+    assert_eq!(planned(&outcome), ["target_at"]);
+    assert_eq!(reasons(&outcome, "over"), [Reason::ExceedsCandidateCeiling]);
 }
 
 #[test]
@@ -509,8 +543,10 @@ fn a_path_of_the_protections_table_excludes_the_entry_in_each_mode() {
             "{entry_path}"
         );
     }
-    let included: [&str; 4] = [
+    let included: [&str; 5] = [
         "/Users/a/Library/Caches/x",
+        // A text prefix of an exclusion is not inside it.
+        "/Volumes/Wor",
         // A prefix of the text is not a parent directory.
         "/Users/a/Documents2",
         "/Volumes/Work/keeper",
@@ -835,6 +871,27 @@ fn a_charge_sum_that_overflows_leaves_the_entry_out() {
 }
 
 #[test]
+fn an_item_sum_that_overflows_leaves_the_entry_out() {
+    let mut first: CleanupEntry = entry("a", 1);
+    first.charge = Some(charge(1, u64::MAX));
+    let mut second: CleanupEntry = entry("b", 1);
+    second.charge = Some(charge(1, u64::MAX));
+    let mut third: CleanupEntry = entry("c", 1);
+    third.charge = Some(charge(1, 1));
+    let mut unlimited: CleanupLimits = limits();
+    unlimited.plan = WorkCharge::new(Bytes::MAX, crate::quantity::EntryCount::MAX);
+    unlimited.batch = unlimited.plan;
+    let outcome: PlanOutcome = with_limits(&[first, second, third], unlimited);
+    assert_eq!(planned(&outcome), ["target_a"]);
+    assert_eq!(reasons(&outcome, "b"), [OmissionReason::ExceedsPlanLimit]);
+    assert_eq!(reasons(&outcome, "c"), [OmissionReason::ExceedsPlanLimit]);
+    assert_eq!(
+        outcome.plan.as_ref().unwrap().limits.work,
+        Some(charge(1, u64::MAX))
+    );
+}
+
+#[test]
 fn a_plan_with_no_target_is_a_valid_result() {
     // No entry was selected.
     let outcome: PlanOutcome = trash(&[]);
@@ -1006,6 +1063,9 @@ fn context_changes() -> Vec<ContextChange> {
         ("no grant", |context| {
             context.authority.action_grants.clear();
         }),
+        ("creation time", |context| {
+            context.created_wall = crate::time::WallTime::from_unix(1_800_000_001, 0).unwrap();
+        }),
         ("expiry", |context| {
             context.lifetime = Nanoseconds::new(LIFETIME.get() + 1);
         }),
@@ -1159,7 +1219,7 @@ fn a_change_of_each_covered_field_changes_the_digest() {
             changed_digest(keep_context, keep_limits, change, None),
         ));
     }
-    assert_eq!(digests.len(), 29);
+    assert_eq!(digests.len(), 30);
 
     let distinct: BTreeSet<&ContentDigest> = digests.iter().map(|(_, digest)| digest).collect();
     for (name, digest) in &digests {

@@ -667,6 +667,7 @@ pub(crate) fn prepared(rule: &Rule, spec: &CandidateSpec) -> PreparedCandidate {
         object_type: spec.object_type.clone(),
         owner: Some(user()),
         object: Some(spec.object),
+        link_count: Some(EntryCount::new(1)),
         charge: Some(charge),
         estimate: SizeEstimate::default(),
     }

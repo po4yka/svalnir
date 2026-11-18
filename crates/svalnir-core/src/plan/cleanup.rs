@@ -125,6 +125,10 @@ pub struct CleanupEntry {
     /// The native identifiers of the object. `None` means that the
     /// evidence is absent; the adapter decides whether it can act.
     pub object: Option<FileObjectEvidence>,
+    /// The number of names of the object (`st_nlink`). `None` when it is
+    /// not known: an unknown number is not one. The `evict` mode needs it
+    /// for a rule that skips hard-linked objects.
+    pub link_count: Option<EntryCount>,
     /// The known conservative charge of the entry. `None` when it is not
     /// known: an unknown charge is not zero.
     pub charge: Option<WorkCharge>,
@@ -276,6 +280,14 @@ impl EntryChecks<'_> {
         if entry.owner.is_none() {
             add(Reason::OwnerUnknown);
         }
+        if self
+            .rule
+            .as_ref()
+            .is_some_and(|checks| Self::skips_links(checks, entry))
+            && entry.link_count.is_none()
+        {
+            add(Reason::LinkCountUnknown);
+        }
         if let (Some(_), Some(evidence)) = (&self.rule, &entry.rule) {
             for (predicate, fact) in evidence.eligibility.facts() {
                 if !matches!(fact, Fact::Satisfied | Fact::NotSatisfied) {
@@ -292,6 +304,13 @@ impl EntryChecks<'_> {
             add(Reason::ExceedsCandidateCeiling);
         }
         reasons
+    }
+
+    /// Whether the rule skips the entry when it has more than one name:
+    /// the rule has `skip_hard_linked`, and the entry is not a directory.
+    fn skips_links(checks: &RuleChecks<'_>, entry: &CleanupEntry) -> bool {
+        checks.rule.exclusions.skip_hard_linked
+            && !matches!(entry.object_type, FileObjectType::Directory)
     }
 
     /// The reasons of the `evict` mode that the rule revision gives: the
@@ -331,6 +350,17 @@ impl EntryChecks<'_> {
             add(Reason::ObjectTypeNotSupported);
         }
         if checks.descendants.overlaps(&entry.relative_entry) {
+            add(Reason::RuleExclusion);
+        }
+        // A hard-linked object has a name that the rule did not find. Its
+        // removal frees no storage, and the other name can be outside the
+        // root. A directory has one name; its link count is the number of
+        // its subdirectories.
+        if Self::skips_links(checks, entry)
+            && entry
+                .link_count
+                .is_some_and(|count| count > EntryCount::new(1))
+        {
             add(Reason::RuleExclusion);
         }
         for (predicate, fact) in evidence.eligibility.facts() {
@@ -422,7 +452,9 @@ fn rule_checks<'a>(mode: &ModeSelection<'a>) -> Result<Option<RuleChecks<'a>>, P
 /// - For the `evict` mode: the entry is a candidate of the exact rule
 ///   revision, the revision is validated for manual eviction of the layout,
 ///   no protected descendant of the rule overlaps the entry, the rule
-///   removes the object type, each of the ten eligibility predicates is
+///   removes the object type, for a rule that skips hard-linked objects an
+///   entry that is not a directory has a known link count of one, each of
+///   the ten eligibility predicates is
 ///   `satisfied`, and the charge fits the candidate ceiling of the rule.
 /// - No other selected entry that passed the checks above is the same
 ///   path or contains it. The comparison is made before the limits, so an

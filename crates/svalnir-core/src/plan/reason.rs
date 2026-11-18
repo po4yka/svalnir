@@ -43,8 +43,10 @@ pub enum OmissionReason {
     /// The rule revision is not validated for manual eviction of the
     /// layout.
     ModeNotValidated,
-    /// A protected descendant of the rule is the entry, contains the entry,
-    /// or is inside the entry.
+    /// A mandatory exclusion of the rule applies: a protected descendant
+    /// of the rule is the entry, contains the entry, or is inside the
+    /// entry, or the rule skips hard-linked objects and the object has more
+    /// than one name.
     RuleExclusion,
     /// The evidence shows that an eligibility predicate of the rule does
     /// not hold.
@@ -69,6 +71,9 @@ pub enum OmissionReason {
     ProtectionUnknown,
     /// The owner of the entry is not known.
     OwnerUnknown,
+    /// The rule skips hard-linked objects, and the number of names of the
+    /// object is not known.
+    LinkCountUnknown,
     /// The configuration protects executable paths, and a process has no
     /// executable evidence.
     ExecutableUnknown,
@@ -116,6 +121,7 @@ impl OmissionReason {
             | Self::PathNotCanonical
             | Self::ProtectionUnknown
             | Self::OwnerUnknown
+            | Self::LinkCountUnknown
             | Self::ExecutableUnknown
             | Self::EligibilityUnknown { .. }
             | Self::WorkChargeUnknown => ErrorFamily::Evidence,

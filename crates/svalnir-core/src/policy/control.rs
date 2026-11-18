@@ -446,7 +446,7 @@ fn fold(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
-fn components(bytes: &[u8]) -> Vec<Vec<u8>> {
+pub(super) fn components(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
         .split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
@@ -461,7 +461,7 @@ fn component_matches(left: &[u8], right: &[u8]) -> bool {
 }
 
 /// True when `path` starts with all components of `prefix`.
-fn has_prefix(path: &[Vec<u8>], prefix: &[Vec<u8>]) -> bool {
+pub(super) fn has_prefix(path: &[Vec<u8>], prefix: &[Vec<u8>]) -> bool {
     path.len() >= prefix.len()
         && path
             .iter()

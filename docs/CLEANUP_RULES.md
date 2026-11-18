@@ -111,6 +111,14 @@ A path exclusion applies to the object selected and its descendants. Parent-dire
 
 These exclusions have two levels. OS-managed protected storage, swapfiles, and Svalnir's control-plane/recovery roots are hard exclusions for cleanup actions. Personal documents, media, archives, and similar user data are excluded from rule-mediated automatic eviction; a user may separately select eligible user-owned files for a manual Trash or explicitly authorized permanent-removal action under [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md). That manual selection is outside this automatic rule catalog. User-configured protections apply in their declared scope: global `[protections]` includes manual actions, while `[disk_guard.exclusions]` governs automatic disk-guard work. Mandatory exclusions of a particular rule apply whenever that rule executes. A cleanup-rule grant or force flag cannot override the rule's exclusions or hard protected roots.
 
+The catalog of protected file locations in `svalnir-core` has the hard exclusions that a path can establish. An entry is protected when it is one of these locations, is inside one, or contains one:
+
+- The directories of the operating system: `/System`, `/usr` (not `/usr/local`), `/bin`, `/sbin`, and `/Library/Apple`.
+- The virtual-memory storage: `/private/var/vm`, also with the spelling `/var/vm`.
+- The state directory of Svalnir.
+
+An entry is also protected when it is the home directory of the user or a directory that contains the home directory. An entry that contains a protected location is protected because its removal removes that location. The comparison ignores case, and it treats two different names as equal when one of them is not ASCII, so that a name in a different Unicode normalization form stays protected. The caller resolves symbolic links before it asks the catalog. An entry whose path the catalog cannot classify, or an entry for which the home directory or the state directory is not known, has an unknown protection and is not in a plan. The catalog can only add a protection. A location that is not in the catalog is not approved by that fact: the other exclusions of this section and the eligibility rules of section 6 apply.
+
 Extensions and names are useful rejection hints, not complete semantic detection. A database without a familiar suffix remains a database; a directory named `Caches` may contain valuable data. Mixed or ambiguous content stays ineligible.
 
 A new integration that needs to retire one of these protected families is a separately reviewed product capability. It cannot be introduced by weakening this table through ordinary cleanup parameters.
@@ -183,7 +191,7 @@ Catalogs may attribute one object to several rules or expose nested candidate ro
 - Do not schedule a parent and descendant as separate deletions.
 - Apply all relevant exclusions before choosing a disjoint candidate set.
 - Use file/volume identity to detect repeated objects where supported.
-- Skip hard-linked objects for automatic deletion unless the specific rule has a tested link-accounting and confinement contract.
+- Skip hard-linked objects for automatic deletion unless the specific rule has a tested link-accounting and confinement contract. The plan builder applies the same exclusion to the `evict` mode: for a rule that skips hard-linked objects, an entry that is not a directory is in the plan only when its link count is known and is one. An entry with more than one name is left out as a rule exclusion, and an entry with an unknown link count is left out because that fact is not known. A directory is not examined: its link count is the number of its subdirectories.
 - Never sum available capacity independently for volumes sharing the same APFS capacity domain.
 
 Deduplicated reporting is not permission to remove every link. Removing one directory entry does not necessarily free its object's blocks. Apple describes delayed reclamation for still-open files in [unlink semantics][unlink]; APFS also supports volumes sharing container space, as described in [Disk Utility guidance][apfs].
@@ -320,7 +328,7 @@ A dry run performs no deletion, Trash movement, producer garbage collection, per
 
 Prepared plans expire and require fresh execution checks. They do not lock the filesystem. A later scan must not replace a rejected target silently while keeping the original plan ID.
 
-Explain skipped candidates with stable reason categories, not only free-form errors: unsupported version/layout, protected data, unknown ownership, active producer, missing quiescence, unsafe namespace, stale identity, unknown work charge, budget exhaustion, missing access, missing authorization, or unavailable journal.
+Explain skipped candidates with stable reason categories, not only free-form errors: unsupported version/layout, protected data, unknown ownership, active producer, missing quiescence, unsafe namespace, stale identity, unknown link count, unknown work charge, budget exhaustion, missing access, missing authorization, or unavailable journal.
 
 ## 14. Outcomes, failure, and backoff
 

@@ -236,6 +236,7 @@ fn entry(name: &str, bytes: u64) -> CleanupEntry {
             device: DeviceNumber::new(1),
             inode: InodeNumber::new(inode_of(name)),
         }),
+        link_count: Some(EntryCount::new(1)),
         charge: Some(charge(bytes, 10)),
         estimate: SizeEstimate {
             logical_bytes: Some(Bytes::new(bytes)),

@@ -28,7 +28,7 @@ use svalnir_core::plan::{
     PlanExplanation, PlanMode, PlanOutcome, PlanPreview, SizeEstimate, TargetPreview,
     build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
 };
-use svalnir_core::policy::ProtectionFact;
+use svalnir_core::policy::{FileProtectionContext, ProtectionFact, file_hard_protection};
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
 use svalnir_core::rule::{RuleMode, RuleRegistry as _};
@@ -309,23 +309,38 @@ fn bound_path(
     LosslessPath::from_bytes(bytes).ok()
 }
 
-/// The product protection of a file entry. This build has no catalog of
-/// protected file locations in `svalnir-core`; the client protects the
-/// home directory, each directory that contains it, and the state
-/// directory of Svalnir. The filesystem executor refuses the first two
-/// again, and the plan builder applies the `[protections]` table.
+/// The hard protection of a file entry, from the catalog of protected
+/// file locations of `svalnir-core`: storage of the operating system, swap
+/// storage, the state directory of Svalnir, and the home directory with
+/// each directory that contains it. The filesystem executor refuses the
+/// home directory and its ancestors again, and the plan builder applies
+/// the `[protections]` table.
+///
+/// The catalog compares path text, so each path has no symbolic link, as
+/// `canonicalize` gives it.
 fn file_protection(path: &Path, home: Option<&Path>, state_directory: &Path) -> ProtectionFact {
-    let Some(home) = home else {
+    let lossless = |path: &Path| LosslessPath::from_path(path).ok();
+    let Some(path) = lossless(path) else {
         return ProtectionFact::Unknown;
     };
-    if home.starts_with(path)
-        || path.starts_with(state_directory)
-        || state_directory.starts_with(path)
-    {
-        ProtectionFact::Protected
-    } else {
-        ProtectionFact::NotProtected
-    }
+    let home: Option<LosslessPath> = home.and_then(lossless);
+    let state_directory: Option<LosslessPath> = lossless(state_directory);
+    file_hard_protection(
+        &path,
+        &FileProtectionContext {
+            home_directory: home.as_ref(),
+            state_directory: state_directory.as_ref(),
+        },
+    )
+}
+
+/// The hard protection of the entry at `path`, with its symbolic links
+/// resolved. An entry whose path does not resolve has an unknown
+/// protection.
+fn entry_protection(path: &Path, home: Option<&Path>, state_directory: &Path) -> ProtectionFact {
+    std::fs::canonicalize(path).map_or(ProtectionFact::Unknown, |canonical| {
+        file_protection(&canonical, home, state_directory)
+    })
 }
 
 /// The type of a file object that a plan can bind.
@@ -463,6 +478,9 @@ fn select(
             object_type,
             owner: Some(Uid::new(metadata.uid())),
             object: Some(entry.object),
+            // The entry was measured again above, so this is the number
+            // of names of the object that the plan binds.
+            link_count: Some(EntryCount::new(metadata.nlink())),
             charge: Some(WorkCharge::new(work_bytes, items)),
             estimate: SizeEstimate {
                 logical_bytes: Some(entry.logical),
@@ -472,12 +490,7 @@ fn select(
                 // storage can make the reclaimed size smaller.
                 estimated_reclaimable_bytes: (mode != CleanMode::Trash).then_some(entry.allocated),
             },
-            // The comparison uses the path with no symbolic link, as the
-            // home directory and the state directory are.
-            hard_protection: std::fs::canonicalize(&path)
-                .map_or(ProtectionFact::Unknown, |canonical| {
-                    file_protection(&canonical, home.as_deref(), &state_directory)
-                }),
+            hard_protection: entry_protection(&path, home.as_deref(), &state_directory),
             rule: None,
         });
     }
@@ -946,5 +959,13 @@ mod tests {
             file_protection(Path::new("/tmp/x"), None, state),
             ProtectionFact::Unknown
         );
+        // The catalog of the core crate also has the storage of the
+        // operating system and the swap storage.
+        assert_eq!(protection("/System/Library"), ProtectionFact::Protected);
+        assert_eq!(
+            protection("/private/var/vm/swapfile0"),
+            ProtectionFact::Protected
+        );
+        assert_eq!(protection("/private"), ProtectionFact::Protected);
     }
 }

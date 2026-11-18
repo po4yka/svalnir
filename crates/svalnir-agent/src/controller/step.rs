@@ -1494,6 +1494,7 @@ impl<'a> Run<'a> {
                 object_type: prepared.object_type.clone(),
                 owner: prepared.owner,
                 object: prepared.object,
+                link_count: prepared.link_count,
                 charge: prepared.charge,
                 estimate: prepared.estimate,
                 hard_protection: candidate.facts.hard_protection,

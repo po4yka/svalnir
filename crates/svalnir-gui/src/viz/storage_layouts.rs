@@ -193,6 +193,7 @@ pub fn layout_field(
         segments,
         free: free_rect,
         head: None,
+        phase: None,
     };
     (field, labels)
 }

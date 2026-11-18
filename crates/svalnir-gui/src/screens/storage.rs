@@ -3,31 +3,34 @@
 use crate::{
     data::{
         model::{
-            HostSnapshot, Loadable, Measured, ScanEnd, ScanProgress, ScanState, ScanSummary,
-            SizeMetric,
+            HostSnapshot, Loadable, Measured, PressureLevel, ScanEnd, ScanProgress, ScanState,
+            ScanSummary, SizeMetric,
         },
         store::AppModel,
     },
     theme::{
-        palette,
+        motion, palette,
         tokens::{self, Tokens, to_hsla},
     },
     ui::{
         data_state::{format_age, format_bytes, used_capacity},
+        entry::card_entry,
         legend::{Legend, LegendRow},
         pill::{StatusPill, Tone},
         provenance::ProvenanceLine,
+        rolling::RollingNumber,
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
     viz::{
         breakdown::{DEFAULT_SEGMENTS, Segment, breakdown},
         capacity_grid::CapacityGrid,
-        led::{LedChart, LedField, TileLabel},
+        led::{FillAxis, LedChart, LedField, LedHead, LedSegment, TileLabel},
         storage_layouts::{
             BAND_ROWS, CHART_ROWS, ChartItem, STRIP_ROWS, StorageLayout, apply_focus,
             bytes_per_cell, chart_label, layout_field, scale_caption,
         },
+        treemap::CellRect,
     },
 };
 use gpui_kit::{
@@ -38,7 +41,6 @@ use gpui_kit::{
         button::{Button, ButtonVariants as _},
         h_flex,
         skeleton::Skeleton,
-        spinner::Spinner,
         v_flex,
     },
     div,
@@ -49,8 +51,47 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
+
+/// The time source of the animations; a test replaces it.
+#[derive(Clone)]
+pub struct Clock(Rc<dyn Fn() -> Instant>);
+
+impl Clock {
+    /// The wall clock.
+    #[must_use]
+    pub fn system() -> Self {
+        Self(Rc::new(Instant::now))
+    }
+
+    /// A clock that reads `now`.
+    pub fn new(now: impl Fn() -> Instant + 'static) -> Self {
+        Self(Rc::new(now))
+    }
+
+    fn now(&self) -> Instant {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Clock")
+    }
+}
+
+/// What a fill-in belongs to: a new result, layout, or metric restarts it.
+#[derive(Debug, Clone, PartialEq)]
+struct FillKey {
+    finished_at: SystemTime,
+    root: PathBuf,
+    layout: StorageLayout,
+    metric: SizeMetric,
+}
+
+/// The cells of the head of the scan front.
+const HEAD_COLUMNS: u16 = 3;
 
 /// Opens the folder of a chart item.
 type OpenFn = Rc<dyn Fn(usize, &mut gpui_kit::App)>;
@@ -90,6 +131,21 @@ pub struct StorageScreen {
     layout: StorageLayout,
     focused: Option<usize>,
     path_stack: Vec<PathBuf>,
+    /// The size of the folder in the scan, as the parent level measured it.
+    scale: Option<u64>,
+    clock: Clock,
+    fill_key: Option<FillKey>,
+    fill_start: Instant,
+    last_fill: f32,
+    front_from: u64,
+    front_target: u64,
+    front_at: Instant,
+    roll_total: Entity<RollingNumber>,
+    roll_used: Entity<RollingNumber>,
+    activation: u64,
+    phase: f32,
+    twinkle: Option<gpui_kit::Task<()>>,
+    last_render: Instant,
 }
 
 impl StorageScreen {
@@ -102,6 +158,77 @@ impl StorageScreen {
             layout: StorageLayout::Tiles,
             focused: None,
             path_stack: Vec::new(),
+            scale: None,
+            clock: Clock::system(),
+            fill_key: None,
+            fill_start: Instant::now(),
+            last_fill: 1.0,
+            front_from: 0,
+            front_target: 0,
+            front_at: Instant::now(),
+            roll_total: RollingNumber::new("scan-total-roll", cx),
+            roll_used: RollingNumber::new("volume-value-roll", cx),
+            activation: 1,
+            phase: 0.0,
+            twinkle: None,
+            last_render: Instant::now(),
+        }
+    }
+
+    /// Marks a new activation of the screen: the cards enter again.
+    pub fn activate(&mut self, cx: &mut Context<Self>) {
+        self.activation += 1;
+        cx.notify();
+    }
+
+    /// Runs the twinkle timer at about 12 Hz while the screen renders; the
+    /// timer ends when the screen stops rendering.
+    fn start_twinkle(&mut self, cx: &mut Context<Self>) {
+        if self.twinkle.is_some() {
+            return;
+        }
+        self.twinkle = Some(cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| {
+            loop {
+                cx.background_executor().timer(motion::TWINKLE_TICK).await;
+                let alive: bool = this
+                    .update(cx, |screen, cx| {
+                        if screen.last_render.elapsed() > motion::TWINKLE_TICK * 6 {
+                            screen.twinkle = None;
+                            return false;
+                        }
+                        screen.phase = (screen.phase + motion::TWINKLE_TICK.as_secs_f32()) % 600.0;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Replaces the time source of the animations.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    /// The fill of the last segment of the Done chart at the latest render.
+    #[must_use]
+    pub const fn chart_fill(&self) -> f32 {
+        self.last_fill
+    }
+
+    fn gate(&self, window: &Window, cx: &Context<Self>) -> motion::Gate {
+        let normal: bool = !matches!(
+            &self.model.read(cx).host,
+            Loadable::Ready(h) | Loadable::Stale(h)
+                if matches!(h.pressure, Measured::Value(p) if p != PressureLevel::Normal)
+        );
+        motion::Gate {
+            reduce_motion: cx.reduce_motion(),
+            window_active: window.is_window_active(),
+            pressure_normal: normal,
         }
     }
 
@@ -123,13 +250,26 @@ impl StorageScreen {
 
     /// Opens the folder `path` below the current root and scans it.
     pub fn push(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.push_with_scale(path, None, cx);
+    }
+
+    /// Like [`Self::push`]; `expected` is the size that the parent level
+    /// measured for the folder, in the shown metric.
+    pub fn push_with_scale(
+        &mut self,
+        path: PathBuf,
+        expected: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
         self.path_stack.push(path);
+        self.scale = expected;
         self.start(cx);
     }
 
     /// Pops to `level` (0 is the default root) and scans that folder.
     pub fn pop_to(&mut self, level: usize, cx: &mut Context<Self>) {
         self.path_stack.truncate(level);
+        self.scale = None;
         self.start(cx);
     }
 }
@@ -155,6 +295,7 @@ fn card(header: ShellHeader, body: impl IntoElement) -> AnyElement {
 
 fn volume_card(
     host: &Loadable<HostSnapshot>,
+    roll: &Entity<RollingNumber>,
     tokens: &Tokens,
     width: f32,
     dark: bool,
@@ -183,6 +324,7 @@ fn volume_card(
                     let (total_text, total_unit) = format_bytes(*total);
                     DisplayValue::new(used_text, used_unit)
                         .id("volume-value")
+                        .rolling(roll.clone())
                         .muted(stale)
                         .context(format!("used of {total_text} {total_unit}"))
                 }
@@ -262,9 +404,9 @@ fn lattice_columns(width: f32) -> u16 {
         .unwrap_or(20)
 }
 
-fn size_value(bytes: u64, id: &'static str) -> DisplayValue {
+fn size_value(bytes: u64, id: &'static str, roll: &Entity<RollingNumber>) -> DisplayValue {
     let (text, unit) = format_bytes(bytes);
-    DisplayValue::new(text, unit).id(id)
+    DisplayValue::new(text, unit).id(id).rolling(roll.clone())
 }
 
 fn done_footer(summary: &ScanSummary) -> String {
@@ -283,7 +425,124 @@ fn done_footer(summary: &ScanSummary) -> String {
     )
 }
 
+/// The band of a running scan. `shown` is the eased front and never passes
+/// `measured`; each block is scaled by `shown / measured`. With a `scale` the
+/// band spans it and the rest is lattice; the second value tells that the
+/// measurement exceeds the scale.
+fn running_field(
+    children: &[crate::data::model::ChildSize],
+    metric: SizeMetric,
+    shown: u64,
+    measured: u64,
+    scale: Option<u64>,
+    width: f32,
+    dark: bool,
+) -> (LedField, bool) {
+    let columns: u16 = lattice_columns(width);
+    let larger: bool = scale.is_some_and(|s| s > 0 && shown > s);
+    let ratio = |bytes: u64| -> u64 {
+        if measured == 0 {
+            return 0;
+        }
+        u64::try_from(u128::from(bytes) * u128::from(shown.min(measured)) / u128::from(measured))
+            .unwrap_or(u64::MAX)
+    };
+    let items: Vec<ChartItem> = children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| ChartItem {
+            label: child.name.clone(),
+            bytes: ratio(child.size(metric)),
+            color: Hsla::from(palette::category_color(index, dark)),
+            activatable: false,
+            inert: false,
+        })
+        .filter(|item| item.bytes > 0)
+        .collect();
+    let total: u64 = items.iter().map(|i| i.bytes).fold(0, u64::saturating_add);
+    let scale: Option<u64> = scale.filter(|s| *s > 0);
+    let mut field: LedField = if items.is_empty() || total == 0 {
+        LedField {
+            columns,
+            rows: BAND_ROWS,
+            segments: Vec::new(),
+            free: None,
+            head: None,
+            phase: None,
+        }
+    } else {
+        let free: Option<u64> = scale.map(|s| s.saturating_sub(total)).filter(|f| *f > 0);
+        layout_field(&items, total, free, StorageLayout::Band, columns, BAND_ROWS).0
+    };
+    field.free = None;
+    let color: Hsla = field.segments.last().map_or_else(
+        || Hsla::from(palette::neutral_color(dark)),
+        |segment: &LedSegment| segment.color,
+    );
+    let x: u16 = match scale {
+        Some(_) => field
+            .segments
+            .iter()
+            .rfind(|segment| !segment.rect.is_empty())
+            .map_or(0, |segment| segment.rect.x + segment.rect.w + 1),
+        None => field.columns.saturating_sub(HEAD_COLUMNS),
+    }
+    .min(field.columns.saturating_sub(HEAD_COLUMNS));
+    field.head = Some(LedHead {
+        rect: CellRect::new(x, 0, HEAD_COLUMNS.min(field.columns), field.rows),
+        color,
+    });
+    (field, larger)
+}
+
 impl StorageScreen {
+    /// Sets the fill of each segment of the Done chart: 0 to 1 in palette
+    /// order, then idle. Reduce Motion applies the full fill at once.
+    fn apply_fill_in(
+        &mut self,
+        field: &mut LedField,
+        summary: &ScanSummary,
+        window: &Window,
+        cx: &Context<Self>,
+    ) {
+        let key = FillKey {
+            finished_at: summary.finished_at,
+            root: summary.root.clone(),
+            layout: self.layout,
+            metric: self.metric,
+        };
+        let now: Instant = self.clock.now();
+        if self.fill_key.as_ref() != Some(&key) {
+            self.fill_key = Some(key);
+            self.fill_start = now;
+        }
+        let gate: motion::Gate = self.gate(window, cx);
+        let elapsed: Duration = now.saturating_duration_since(self.fill_start);
+        let count: usize = field.segments.len();
+        let running: bool = gate.transitions() && elapsed < motion::fill_in_total(count);
+        let axis = if self.layout == StorageLayout::Band {
+            FillAxis::Horizontal
+        } else {
+            FillAxis::Vertical
+        };
+        for (index, segment) in field.segments.iter_mut().enumerate() {
+            segment.axis = axis;
+            segment.fill = if gate.transitions() {
+                if running {
+                    motion::fill_in(elapsed, index)
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+        }
+        self.last_fill = field.segments.last().map_or(1.0, |s| s.fill);
+        if running {
+            window.request_animation_frame();
+        }
+    }
+
     fn metric_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let button = |id: &'static str,
                       label: &'static str,
@@ -395,52 +654,127 @@ impl StorageScreen {
             .into_any_element()
     }
 
+    /// The running view: the total, the path, and the band that fills.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one build of the running view"
+    )]
     fn running_body(
+        &mut self,
         progress: &ScanProgress,
-        started: std::time::Instant,
+        started: Instant,
         mono: &SharedString,
-        metric: SizeMetric,
+        width: f32,
+        dark: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
         tokens: &Tokens,
     ) -> AnyElement {
-        let total: u64 = match metric {
+        let metric: SizeMetric = self.metric;
+        let measured: u64 = match metric {
             SizeMetric::Allocated => progress.allocated,
             SizeMetric::Logical => progress.logical,
         };
+        let gate: motion::Gate = self.gate(window, cx);
+        let now: Instant = self.clock.now();
+        if self.front_target != measured {
+            self.front_from = if gate.transitions() {
+                motion::eased_front(
+                    self.front_from,
+                    self.front_target,
+                    now.saturating_duration_since(self.front_at),
+                )
+            } else {
+                measured
+            };
+            self.front_target = measured;
+            self.front_at = now;
+        }
+        let shown: u64 = if gate.transitions() {
+            motion::eased_front(
+                self.front_from,
+                self.front_target,
+                now.saturating_duration_since(self.front_at),
+            )
+        } else {
+            measured
+        };
+        if shown < measured {
+            window.request_animation_frame();
+        }
+        let scale: Option<u64> = self.scale.or_else(|| {
+            if !self.path_stack.is_empty() {
+                return None;
+            }
+            match &self.model.read(cx).host {
+                Loadable::Ready(h) | Loadable::Stale(h) => {
+                    match used_capacity(&h.disk_total, &h.disk_available) {
+                        Measured::Value(used) => Some(used),
+                        Measured::Unavailable(_) => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        let (field, larger): (LedField, bool) = running_field(
+            &progress.children,
+            metric,
+            shown,
+            measured,
+            scale,
+            width,
+            dark,
+        );
         let path: String = progress
             .current_path
             .as_ref()
             .map_or_else(String::new, |p| {
                 middle_ellipsis(&p.display().to_string(), MAX_PATH_CHARS)
             });
+        let label: String = format!("Scanning, {} entries read", progress.entries);
         v_flex()
             .gap(px(12.0))
             .child(
                 h_flex()
-                    .gap(px(8.0))
-                    .items_center()
-                    .child(Spinner::new())
-                    .child("Scanning"),
+                    .items_start()
+                    .justify_between()
+                    .child(size_value(shown, "scan-running-total", &self.roll_total))
+                    .child(
+                        v_flex()
+                            .items_end()
+                            .child(caption(
+                                "scan-running-entries",
+                                format!("{} entries", progress.entries),
+                                tokens,
+                            ))
+                            .child(
+                                div()
+                                    .id("scan-running-elapsed")
+                                    .font_family(mono.clone())
+                                    .text_size(px(12.0))
+                                    .child(format!("{} s", started.elapsed().as_secs())),
+                            ),
+                    ),
             )
             .child(
-                div()
-                    .font_family(mono.clone())
-                    .text_size(px(12.0))
-                    .child(path),
+                h_flex().gap(px(8.0)).child("Scanning").child(
+                    div()
+                        .id("scan-running-path")
+                        .font_family(mono.clone())
+                        .text_size(px(12.0))
+                        .text_color(to_hsla(tokens.muted_foreground))
+                        .child(path),
+                ),
             )
-            .child(size_value(total, "scan-running-total"))
-            .child(caption(
-                "scan-running-entries",
-                format!("{} entries", progress.entries),
-                tokens,
-            ))
-            .child(
-                div()
-                    .id("scan-running-elapsed")
-                    .font_family(mono.clone())
-                    .text_size(px(12.0))
-                    .child(format!("{} s", started.elapsed().as_secs())),
-            )
+            .child(LedChart::new(field, Vec::new(), "scan-band", label))
+            .children(larger.then(|| {
+                caption(
+                    "scan-larger",
+                    "Larger than the earlier measurement.",
+                    tokens,
+                )
+            }))
             .child(
                 h_flex().child(
                     Button::new("scan-cancel")
@@ -456,10 +790,11 @@ impl StorageScreen {
 
     #[expect(clippy::too_many_lines, reason = "one build of the done view")]
     fn done_body(
-        &self,
+        &mut self,
         summary: &Arc<ScanSummary>,
         width: f32,
         dark: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
         tokens: &Tokens,
     ) -> AnyElement {
@@ -525,6 +860,7 @@ impl StorageScreen {
             .collect();
         let this: Entity<Self> = cx.entity();
         let select_this: Entity<Self> = this.clone();
+        let select_metric: SizeMetric = self.metric;
         let select_summary: Arc<ScanSummary> = Arc::clone(summary);
         let select_segments: Vec<Segment> = segments.clone();
         let open: OpenFn = Rc::new(move |index, app| {
@@ -539,7 +875,10 @@ impl StorageScreen {
             };
             if child.is_directory {
                 let path: PathBuf = child.path.clone();
-                select_this.update(app, |screen, cx| screen.push(path, cx));
+                let expected: u64 = child.size(select_metric);
+                select_this.update(app, |screen, cx| {
+                    screen.push_with_scale(path, Some(expected), cx);
+                });
             }
         });
         let legend_open = Rc::clone(&open);
@@ -572,6 +911,13 @@ impl StorageScreen {
             );
             let per_cell: u64 = bytes_per_cell(&items, &field);
             apply_focus(&mut field, self.focused);
+            self.apply_fill_in(&mut field, summary, window, cx);
+            if self.gate(window, cx).continuous() {
+                field.phase = Some(self.phase);
+                self.start_twinkle(cx);
+            } else {
+                self.twinkle = None;
+            }
             let label: String =
                 chart_label(self.layout, &summary.root.display().to_string(), &items);
             let chart_open = Rc::clone(&open);
@@ -588,9 +934,11 @@ impl StorageScreen {
                 ))
                 .into_any_element()
         };
-        let mut col = v_flex()
-            .gap(px(12.0))
-            .child(size_value(summary.total(self.metric), "scan-total"));
+        let mut col = v_flex().gap(px(12.0)).child(size_value(
+            summary.total(self.metric),
+            "scan-total",
+            &self.roll_total,
+        ));
         if summary.ended == ScanEnd::Cancelled {
             col = col
                 .child(StatusPill::new("Cancelled", Tone::Neutral).id("scan-pill"))
@@ -636,6 +984,7 @@ impl StorageScreen {
 }
 
 impl Render for StorageScreen {
+    #[expect(clippy::too_many_lines, reason = "one build of the screen")]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let tokens: &Tokens = Tokens::for_dark(dark);
@@ -663,6 +1012,14 @@ impl Render for StorageScreen {
             ScanState::Running { .. } | ScanState::Failed { .. } => self.breadcrumb(cx),
             ScanState::Idle | ScanState::Done(_) => None,
         };
+        self.last_render = Instant::now();
+        if !matches!(scan, ScanState::Done(_)) {
+            self.twinkle = None;
+        }
+        if !matches!(scan, ScanState::Running { .. }) {
+            self.front_from = 0;
+            self.front_target = 0;
+        }
         let body: AnyElement = match &scan {
             ScanState::Idle => match &root {
                 Some(root) => Self::idle_body(root, cx, "scan-idle"),
@@ -670,8 +1027,8 @@ impl Render for StorageScreen {
             },
             ScanState::Running {
                 progress, started, ..
-            } => Self::running_body(progress, *started, &mono, self.metric, cx, tokens),
-            ScanState::Done(summary) => self.done_body(summary, width, dark, cx, tokens),
+            } => self.running_body(progress, *started, &mono, width, dark, window, cx, tokens),
+            ScanState::Done(summary) => self.done_body(summary, width, dark, window, cx, tokens),
             ScanState::Failed { reason, .. } => v_flex()
                 .gap(px(12.0))
                 .child(
@@ -700,6 +1057,7 @@ impl Render for StorageScreen {
                     .child(self.metric_control(cx)),
             );
         let metric_caption: AnyElement = caption("scan-metric", self.metric.caption(), tokens);
+        let reduce: bool = cx.reduce_motion();
         let title: &'static str = "Storage";
         div()
             .flex()
@@ -715,15 +1073,25 @@ impl Render for StorageScreen {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(volume_card(&host, tokens, width, dark))
-            .child(card(
-                header,
-                v_flex()
-                    .gap(px(12.0))
-                    .children(notice.map(|text| caption("scan-notice", text, tokens)))
-                    .child(metric_caption)
-                    .children(crumb)
-                    .child(body),
+            .child(card_entry(
+                volume_card(&host, &self.roll_used, tokens, width, dark),
+                0,
+                self.activation,
+                reduce,
+            ))
+            .child(card_entry(
+                card(
+                    header,
+                    v_flex()
+                        .gap(px(12.0))
+                        .children(notice.map(|text| caption("scan-notice", text, tokens)))
+                        .child(metric_caption)
+                        .children(crumb)
+                        .child(body),
+                ),
+                1,
+                self.activation,
+                reduce,
             ))
     }
 }

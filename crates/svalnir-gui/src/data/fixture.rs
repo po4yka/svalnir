@@ -67,13 +67,25 @@ impl FixtureScenario {
 #[derive(Debug, Clone, Copy)]
 pub struct FixtureSource {
     scenario: FixtureScenario,
+    pacing: Duration,
 }
 
 impl FixtureSource {
     /// Creates the source of `scenario`.
     #[must_use]
     pub const fn new(scenario: FixtureScenario) -> Self {
-        Self { scenario }
+        Self {
+            scenario,
+            pacing: Duration::ZERO,
+        }
+    }
+
+    /// Sleeps `pacing` between the progress steps of a scan. The default is
+    /// zero, so that a test does not wait.
+    #[must_use]
+    pub const fn with_pacing(mut self, pacing: Duration) -> Self {
+        self.pacing = pacing;
+        self
     }
 }
 
@@ -204,14 +216,6 @@ impl DataSource for FixtureSource {
         if self.scenario == FixtureScenario::Unavailable {
             return Err("the scan root is not readable in this fixture".to_owned());
         }
-        for step in 1..=3_u64 {
-            progress(ScanProgress {
-                entries: step * 40_000,
-                current_path: Some(root.join("Library").join("Caches")),
-                logical: step * 60 * GB,
-                allocated: step * 62 * GB,
-            });
-        }
         let big: [(&str, bool, u64); 7] = [
             ("Library", true, 614),
             ("Developer", true, 482),
@@ -239,6 +243,33 @@ impl DataSource for FixtureSource {
                 logical: 50_000_000 + index * 1_000_000,
                 allocated: 52_000_000 + index * 1_000_000,
             });
+        }
+        let steps: u64 = 12;
+        for step in 1..=steps {
+            let shown: usize = usize::try_from(step)
+                .unwrap_or(1)
+                .saturating_mul(children.len())
+                .div_ceil(usize::try_from(steps).unwrap_or(1))
+                .max(1);
+            let grown: Vec<ChildSize> = children
+                .iter()
+                .take(shown)
+                .map(|child| ChildSize {
+                    logical: child.logical / steps * step,
+                    allocated: child.allocated / steps * step,
+                    ..child.clone()
+                })
+                .collect();
+            progress(ScanProgress {
+                entries: step * 40_000,
+                current_path: grown.last().map(|child| child.path.clone()),
+                logical: grown.iter().map(|child| child.logical).sum(),
+                allocated: grown.iter().map(|child| child.allocated).sum(),
+                children: grown,
+            });
+            if !self.pacing.is_zero() {
+                std::thread::sleep(self.pacing);
+            }
         }
         let total_logical: u64 = children.iter().map(|child| child.logical).sum();
         let total_allocated: u64 = children.iter().map(|child| child.allocated).sum();

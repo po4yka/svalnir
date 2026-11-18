@@ -399,3 +399,72 @@ fn cancel_ends_the_scan_as_cancelled(cx: &mut TestAppContext) {
         other => panic!("expected Done, got {other:?}"),
     }
 }
+
+#[test]
+fn the_fixture_scan_publishes_growing_children_before_done() {
+    use std::cell::RefCell;
+    let seen: RefCell<Vec<ScanProgress>> = RefCell::new(Vec::new());
+    let source = FixtureSource::new(FixtureScenario::Healthy);
+    let summary = source
+        .scan(Path::new("/root"), &CancellationToken::new(), &|p| {
+            seen.borrow_mut().push(p);
+        })
+        .expect("scan");
+    let seen = seen.into_inner();
+    assert_eq!(seen.len(), 12);
+    assert!(seen.iter().all(|p| !p.children.is_empty()));
+    assert!(seen.windows(2).all(|w| {
+        w[0].allocated <= w[1].allocated
+            && w[1].children.len() >= w[0].children.len()
+            && w[1]
+                .children
+                .iter()
+                .zip(&w[0].children)
+                .all(|(a, b)| a.name == b.name)
+    }));
+    assert!(seen.iter().all(|p| p.children.len() <= 32));
+    assert!(seen[11].allocated <= summary.total_allocated);
+}
+
+fn done_screen(
+    reduce: bool,
+    cx: &mut TestAppContext,
+) -> (
+    gpui_kit::Entity<StorageScreen>,
+    std::rc::Rc<std::cell::Cell<std::time::Duration>>,
+    gpui_kit::VisualTestContext,
+) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(reduce));
+    let model = model_for(Arc::new(FixtureSource::new(FixtureScenario::Healthy)), cx);
+    let (screen, vcx) = cx.add_window_view(|_, cx| StorageScreen::new(model.clone(), cx));
+    let mut vcx = vcx.clone();
+    let base = std::time::Instant::now();
+    let offset = std::rc::Rc::new(std::cell::Cell::new(std::time::Duration::ZERO));
+    let read = std::rc::Rc::clone(&offset);
+    screen.update(&mut vcx, |screen, _| {
+        screen.set_clock(svalnir_gui::screens::storage::Clock::new(move || {
+            base + read.get()
+        }));
+    });
+    screen.update(&mut vcx, |screen, cx| screen.pop_to(0, cx));
+    vcx.run_until_parked();
+    (screen, offset, vcx)
+}
+
+#[gpui_kit::test]
+fn reduce_motion_fills_the_chart_at_once(cx: &mut TestAppContext) {
+    let (screen, _offset, vcx) = done_screen(true, cx);
+    assert!((screen.read_with(&vcx, |s, _| s.chart_fill()) - 1.0).abs() < f32::EPSILON);
+    vcx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn the_chart_fills_in_over_time_and_ends_at_one(cx: &mut TestAppContext) {
+    let (screen, offset, mut vcx) = done_screen(false, cx);
+    assert!(screen.read_with(&vcx, |s, _| s.chart_fill()) < 1.0);
+    offset.set(std::time::Duration::from_secs(2));
+    screen.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!((screen.read_with(&vcx, |s, _| s.chart_fill()) - 1.0).abs() < f32::EPSILON);
+}

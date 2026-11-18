@@ -12,8 +12,10 @@ use crate::{
     theme::tokens::{self, Tokens, to_hsla},
     ui::{
         data_state::{format_age, format_bytes, used_capacity},
+        entry::card_entry,
         pill::{StatusPill, Tone},
         provenance::ProvenanceLine,
+        rolling::RollingNumber,
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
     },
@@ -113,13 +115,27 @@ enum View {
 #[derive(Debug)]
 pub struct OverviewScreen {
     model: Entity<AppModel>,
+    roll_disk: Entity<RollingNumber>,
+    roll_swap: Entity<RollingNumber>,
+    activation: u64,
 }
 
 impl OverviewScreen {
     /// Creates the screen and observes the model.
     pub fn new(model: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
         cx.observe(&model, |_, _, cx| cx.notify()).detach();
-        Self { model }
+        Self {
+            model,
+            roll_disk: RollingNumber::new("disk-value-roll", cx),
+            roll_swap: RollingNumber::new("swap-value-roll", cx),
+            activation: 1,
+        }
+    }
+
+    /// Marks a new activation of the screen: the cards enter again.
+    pub fn activate(&mut self, cx: &mut Context<Self>) {
+        self.activation += 1;
+        cx.notify();
     }
 }
 
@@ -179,7 +195,7 @@ fn tone_color(tone: PressureTone, tokens: &Tokens) -> Hsla {
     })
 }
 
-fn disk_card(view: &View, tokens: &Tokens) -> AnyElement {
+fn disk_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyElement {
     let mut header: ShellHeader = ShellHeader::new(IconName::HardDrive, "Disk headroom");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
@@ -192,8 +208,10 @@ fn disk_card(view: &View, tokens: &Tokens) -> AnyElement {
             let value: DisplayValue = match &host.disk_available {
                 Measured::Value(available) => {
                     let (text, unit) = format_bytes(*available);
-                    let value: DisplayValue =
-                        DisplayValue::new(text, unit).id("disk-value").muted(*stale);
+                    let value: DisplayValue = DisplayValue::new(text, unit)
+                        .id("disk-value")
+                        .rolling(roll.clone())
+                        .muted(*stale);
                     match &host.disk_total {
                         Measured::Value(total) => {
                             let (total_text, total_unit) = format_bytes(*total);
@@ -264,7 +282,7 @@ fn pressure_card(view: &View, tokens: &Tokens) -> AnyElement {
     card(header, body)
 }
 
-fn swap_card(view: &View, tokens: &Tokens) -> AnyElement {
+fn swap_card(view: &View, roll: &Entity<RollingNumber>, tokens: &Tokens) -> AnyElement {
     let header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Swap");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
@@ -273,8 +291,10 @@ fn swap_card(view: &View, tokens: &Tokens) -> AnyElement {
             let value: DisplayValue = match &host.swap_used {
                 Measured::Value(used) => {
                     let (text, unit) = format_bytes(*used);
-                    let value: DisplayValue =
-                        DisplayValue::new(text, unit).id("swap-value").muted(*stale);
+                    let value: DisplayValue = DisplayValue::new(text, unit)
+                        .id("swap-value")
+                        .rolling(roll.clone())
+                        .muted(*stale);
                     match &host.swap_total {
                         Measured::Value(total) => {
                             let (total_text, total_unit) = format_bytes(*total);
@@ -494,13 +514,19 @@ impl Render for OverviewScreen {
         .max(MIN_CARD_WIDTH));
 
         let cards: Vec<AnyElement> = vec![
-            disk_card(&view, tokens),
+            disk_card(&view, &self.roll_disk, tokens),
             pressure_card(&view, tokens),
-            swap_card(&view, tokens),
+            swap_card(&view, &self.roll_swap, tokens),
             agent_card(&agent, tokens),
             policies_card(&service, &mono, tokens),
             intervention_card(&service, &mono, tokens),
         ];
+        let reduce: bool = cx.reduce_motion();
+        let cards: Vec<AnyElement> = cards
+            .into_iter()
+            .enumerate()
+            .map(|(index, card)| card_entry(card, index, self.activation, reduce))
+            .collect();
         let title: &'static str = "Overview";
         div()
             .flex()

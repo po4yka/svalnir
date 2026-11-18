@@ -116,10 +116,37 @@ impl LedSegment {
 }
 
 /// A bright block of cells, for the front of a fill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LedHead {
-    /// The cells that are painted white.
+    /// The cells of the head. The rightmost column is the front.
     pub rect: CellRect,
+    /// The color under the white: the color of the last block.
+    pub color: Hsla,
+}
+
+/// The white weight of column `index` of a head of `width` columns: 1.0 at
+/// the front (the last column), then 0.6, then 0.3, and 0.15 beyond.
+#[must_use]
+pub fn head_white(index: u16, width: u16) -> f32 {
+    match width.saturating_sub(1).saturating_sub(index) {
+        0 => 1.0,
+        1 => 0.6,
+        2 => 0.3,
+        _ => 0.15,
+    }
+}
+
+/// The brightness `0.0..=1.0` of the free point at `(x, y)` at `phase`
+/// seconds. Each point has its own period (2.5 s to 5 s) and offset from its
+/// hash; about a third of the points are visible at a time.
+#[must_use]
+pub fn twinkle(x: u16, y: u16, phase: f32) -> f32 {
+    let h: u32 = cell_hash(u32::from(x), u32::from(y), 0x7717);
+    let period: f32 = 2.5 + f32::from(u8::try_from(h & 0xff).unwrap_or(0)) / 255.0 * 2.5;
+    let offset: f32 = f32::from(u16::try_from((h >> 8) & 0xffff).unwrap_or(0)) / 65_535.0 * period;
+    let turn: f32 = ((phase + offset) / period).rem_euclid(1.0);
+    let pulse: f32 = (turn * std::f32::consts::PI).sin().powi(2);
+    ((pulse - 0.75) / 0.25).clamp(0.0, 1.0)
 }
 
 /// The data of one chart.
@@ -135,6 +162,9 @@ pub struct LedField {
     pub free: Option<CellRect>,
     /// The bright head.
     pub head: Option<LedHead>,
+    /// The time in seconds that drives the twinkle of the free points;
+    /// `None` leaves the points static.
+    pub phase: Option<f32>,
 }
 
 /// Pixel measures and colors of a chart, from the tokens of one theme.
@@ -301,14 +331,19 @@ pub fn paint_led_field(
                 continue;
             }
             window.paint_quad(fill(cell_bounds(x, y), style.lattice).corner_radii(cell_radii));
-            if field.free.is_some_and(|r| r.contains(x, y)) && free_point(x, y) {
+            let brightness: f32 = field.phase.map_or(1.0, |phase| twinkle(x, y, phase));
+            if field.free.is_some_and(|r| r.contains(x, y)) && free_point(x, y) && brightness > 0.0
+            {
                 let c: Bounds<Pixels> = cell_bounds(x, y);
                 let inset: Pixels = px((style.cell - 3.0) / 2.0);
                 let dot: Bounds<Pixels> = Bounds::new(
                     point(c.origin.x + inset, c.origin.y + inset),
                     size(px(3.0), px(3.0)),
                 );
-                window.paint_quad(fill(dot, style.point).corner_radii(Corners::all(px(1.5))));
+                window.paint_quad(
+                    fill(dot, style.point.opacity(style.point.a * brightness))
+                        .corner_radii(Corners::all(px(1.5))),
+                );
             }
         }
     }
@@ -336,11 +371,21 @@ pub fn paint_led_field(
             }
         }
     }
-    if let Some(head) = field.head {
-        let white: Hsla = hsla(0.0, 0.0, 1.0, 0.95);
+    if let Some(head) = field.head.filter(|h| !h.rect.is_empty()) {
         let r: CellRect = head.rect;
+        let glow: BoxShadow = BoxShadow {
+            color: hsla(0.0, 0.0, 1.0, 0.5),
+            offset: Point::default(),
+            blur_radius: px(16.0),
+            spread_radius: px(0.0),
+            inset: false,
+        };
+        window.paint_drop_shadows(rect_bounds(r), Corners::all(px(2.0)), &[glow]);
+        let base: Hsla = lit_color(head.color);
         for y in r.y..r.y.saturating_add(r.h).min(field.rows) {
             for x in r.x..r.x.saturating_add(r.w).min(field.columns) {
+                window.paint_quad(fill(cell_bounds(x, y), base).corner_radii(cell_radii));
+                let white: Hsla = hsla(0.0, 0.0, 1.0, head_white(x - r.x, r.w));
                 window.paint_quad(fill(cell_bounds(x, y), white).corner_radii(cell_radii));
             }
         }
@@ -607,5 +652,35 @@ mod tests {
         assert_eq!(filled_cells(10, 0.0), 0);
         assert_eq!(filled_cells(10, 0.31), 4);
         assert_eq!(filled_cells(10, 7.0), 10);
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn twinkle_stays_in_bounds_and_about_a_third_shows() {
+        let mut visible: u32 = 0;
+        let mut total: u32 = 0;
+        for x in 0..40_u16 {
+            for y in 0..10_u16 {
+                for step in 0..50_u16 {
+                    let b: f32 = twinkle(x, y, f32::from(step) * 0.2);
+                    assert!((0.0..=1.0).contains(&b));
+                    total += 1;
+                    visible += u32::from(b > 0.0);
+                }
+            }
+        }
+        let percent: u32 = visible * 100 / total;
+        assert!((20..45).contains(&percent), "percent {percent}");
+    }
+
+    #[test]
+    fn head_columns_fade_from_the_front() {
+        assert!((head_white(2, 3) - 1.0).abs() < f32::EPSILON);
+        assert!((head_white(1, 3) - 0.6).abs() < f32::EPSILON);
+        assert!((head_white(0, 3) - 0.3).abs() < f32::EPSILON);
     }
 }

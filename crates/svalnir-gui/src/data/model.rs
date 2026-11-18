@@ -394,6 +394,9 @@ pub struct ScanProgress {
     pub logical: u64,
     /// The allocated bytes measured so far.
     pub allocated: u64,
+    /// The direct children measured so far: at most 32, the largest by
+    /// allocated size, in the order in which the scan first saw them.
+    pub children: Vec<ChildSize>,
 }
 
 /// The state of the scan of the Storage screen.

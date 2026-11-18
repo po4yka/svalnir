@@ -31,22 +31,22 @@ pub struct MainWindow {
     screens: Vec<AnyView>,
     focus: FocusHandle,
     model: Entity<AppModel>,
+    overview: Entity<OverviewScreen>,
+    storage: Entity<StorageScreen>,
 }
 
 impl MainWindow {
     /// Creates the view with all screens built; Overview is active.
     pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let overview: Entity<OverviewScreen> = cx.new(|cx| OverviewScreen::new(model.clone(), cx));
+        let storage: Entity<StorageScreen> = cx.new(|cx| StorageScreen::new(model.clone(), cx));
         let screens: Vec<AnyView> = Screen::ALL
             .iter()
             .map(|&screen| {
                 if screen == Screen::Overview {
-                    let view: Entity<OverviewScreen> =
-                        cx.new(|cx| OverviewScreen::new(model.clone(), cx));
-                    AnyView::from(view)
+                    AnyView::from(overview.clone())
                 } else if screen == Screen::Storage {
-                    let view: Entity<StorageScreen> =
-                        cx.new(|cx| StorageScreen::new(model.clone(), cx));
-                    AnyView::from(view)
+                    AnyView::from(storage.clone())
                 } else {
                     let view: Entity<Placeholder> = cx.new(|_| Placeholder::new(screen));
                     AnyView::from(view)
@@ -69,6 +69,8 @@ impl MainWindow {
             screens,
             focus,
             model,
+            overview,
+            storage,
         }
     }
 
@@ -158,6 +160,11 @@ impl MainWindow {
     pub fn select(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if self.active != screen {
             self.active = screen;
+            match screen {
+                Screen::Overview => self.overview.update(cx, OverviewScreen::activate),
+                Screen::Storage => self.storage.update(cx, StorageScreen::activate),
+                _ => {}
+            }
             cx.notify();
         }
     }

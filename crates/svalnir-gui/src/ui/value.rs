@@ -2,10 +2,10 @@
 
 use crate::{
     theme::tokens::{Tokens, to_hsla},
-    ui::data_state::UNAVAILABLE_TEXT,
+    ui::{data_state::UNAVAILABLE_TEXT, rolling::RollingNumber},
 };
 use gpui_kit::{
-    App, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce,
+    App, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce,
     SharedString, Styled as _, TestSupportExt as _, Window,
     component::{ActiveTheme as _, h_flex, v_flex},
     div,
@@ -22,6 +22,7 @@ pub struct DisplayValue {
     muted: bool,
     reason: Option<SharedString>,
     id: SharedString,
+    rolling: Option<Entity<RollingNumber>>,
 }
 
 impl std::fmt::Debug for DisplayValue {
@@ -42,6 +43,7 @@ impl DisplayValue {
             muted: false,
             reason: None,
             id: SharedString::from("display-value"),
+            rolling: None,
         }
     }
 
@@ -63,6 +65,13 @@ impl DisplayValue {
     #[must_use]
     pub fn muted(mut self, muted: bool) -> Self {
         self.muted = muted;
+        self
+    }
+
+    /// Draws the value through `rolling`, whose digits roll on a change.
+    #[must_use]
+    pub fn rolling(mut self, rolling: Entity<RollingNumber>) -> Self {
+        self.rolling = Some(rolling);
         self
     }
 
@@ -88,6 +97,17 @@ impl RenderOnce for DisplayValue {
             Some(context) => format!("{} {context}", self.unit),
             None => self.unit.to_string(),
         };
+        let shown: gpui_kit::AnyElement = match (&self.rolling, self.reason.is_none()) {
+            (Some(rolling), true) => {
+                let text: SharedString = self.value.clone();
+                rolling.update(cx, |number, cx| {
+                    number.set_style(30.0, FontWeight::MEDIUM, value_color);
+                    number.set_text(text, cx);
+                });
+                rolling.clone().into_any_element()
+            }
+            _ => self.value.clone().into_any_element(),
+        };
         v_flex()
             .gap(px(4.0))
             .child(
@@ -102,7 +122,7 @@ impl RenderOnce for DisplayValue {
                             .text_size(px(30.0))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(value_color)
-                            .child(self.value),
+                            .child(shown),
                     )
                     .child(div().text_size(px(12.0)).text_color(muted).child(suffix)),
             )

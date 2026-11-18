@@ -9,7 +9,7 @@ use super::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
@@ -274,11 +274,15 @@ impl DataSource for LiveSource {
 
 /// The shortest interval between two progress calls.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// The most children that one progress value carries.
+const PROGRESS_CHILDREN: usize = 32;
 
 /// Sums the sizes of the direct children of the root and reports progress.
 struct ChildObserver<'a> {
     root: PathBuf,
     children: HashMap<OsString, ChildSize>,
+    /// The names of `children` in the order of their first insertion.
+    order: Vec<OsString>,
     entries: u64,
     logical: u64,
     allocated: u64,
@@ -294,6 +298,7 @@ impl<'a> ChildObserver<'a> {
         Self {
             root: root.to_path_buf(),
             children: HashMap::new(),
+            order: Vec::new(),
             entries: 0,
             logical: 0,
             allocated: 0,
@@ -316,6 +321,30 @@ impl<'a> ChildObserver<'a> {
             .flatten()
     }
 
+    /// Records `child`; a name seen first joins the end of the order.
+    fn record(&mut self, key: OsString, child: ChildSize) {
+        if self.children.insert(key.clone(), child).is_none() {
+            self.order.push(key);
+        }
+    }
+
+    /// The at most 32 largest children by allocated size, in first-seen order.
+    fn snapshot_children(&self) -> Vec<ChildSize> {
+        let mut largest: Vec<(&OsString, u64)> = self
+            .children
+            .iter()
+            .map(|(key, child)| (key, child.allocated))
+            .collect();
+        largest.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        largest.truncate(PROGRESS_CHILDREN);
+        let keep: HashSet<&OsString> = largest.into_iter().map(|entry| entry.0).collect();
+        self.order
+            .iter()
+            .filter(|key| keep.contains(key))
+            .filter_map(|key| self.children.get(key).cloned())
+            .collect()
+    }
+
     fn report(&mut self) {
         let due: bool = self
             .last_report
@@ -327,6 +356,7 @@ impl<'a> ChildObserver<'a> {
                 current_path: self.current.clone(),
                 logical: self.logical,
                 allocated: self.allocated,
+                children: self.snapshot_children(),
             });
         }
     }
@@ -361,32 +391,28 @@ impl ScanObserver for ChildObserver<'_> {
                 self.report();
                 return;
             }
-            self.children.insert(
-                key.clone(),
-                ChildSize {
-                    name: key.to_string_lossy().into_owned(),
-                    path: entry.path.to_path_buf(),
-                    is_directory: false,
-                    logical,
-                    allocated,
-                },
-            );
+            let child = ChildSize {
+                name: key.to_string_lossy().into_owned(),
+                path: entry.path.to_path_buf(),
+                is_directory: false,
+                logical,
+                allocated,
+            };
+            self.record(key, child);
         }
         self.report();
     }
 
     fn directory_finished(&mut self, directory: &DirectoryRecord<'_>) {
         if let Some(key) = self.child_key(directory.path) {
-            self.children.insert(
-                key.clone(),
-                ChildSize {
-                    name: key.to_string_lossy().into_owned(),
-                    path: directory.path.to_path_buf(),
-                    is_directory: true,
-                    logical: directory.logical_bytes.get(),
-                    allocated: directory.allocated_bytes.get(),
-                },
-            );
+            let child = ChildSize {
+                name: key.to_string_lossy().into_owned(),
+                path: directory.path.to_path_buf(),
+                is_directory: true,
+                logical: directory.logical_bytes.get(),
+                allocated: directory.allocated_bytes.get(),
+            };
+            self.record(key, child);
         }
     }
 }

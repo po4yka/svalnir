@@ -203,7 +203,9 @@ pub fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let source: Arc<dyn DataSource> = match options.fixture {
-        Some(scenario) => Arc::new(FixtureSource::new(scenario)),
+        Some(scenario) => Arc::new(
+            FixtureSource::new(scenario).with_pacing(std::time::Duration::from_millis(120)),
+        ),
         None => Arc::new(LiveSource::from_environment()),
     };
     gpui_kit::application()

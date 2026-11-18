@@ -158,6 +158,12 @@ struct IncidentEntry {
     pacing: Pacing,
     cooldown_until: Option<MonotonicNanos>,
     backoff_level: u32,
+    /// True when the slots were exhausted because the usage of the budget
+    /// generation is not known. A larger ceiling for the same generation
+    /// then gives no slot back.
+    slots_exhausted: bool,
+    /// The same for the work scopes that are not for one request.
+    work_exhausted: bool,
 }
 
 /// The ledger of one executor lifetime.
@@ -260,18 +266,32 @@ impl Ledger {
         &mut self,
         given: &IncidentAllowance,
         journal: Option<JournalUsage>,
+        now: MonotonicNanos,
     ) -> Result<(), LedgerRefusal> {
         let carried_over: bool = given.opened_in != self.epoch;
         if !self.incidents.contains_key(&given.incident_id) && self.incidents.len() >= MAX_INCIDENTS
         {
-            // An incident with no admitted operation makes room. Its
-            // usage is in the journal.
-            self.incidents.retain(|_, entry| entry.has_reservation());
+            // An incident with no admitted operation makes room: its
+            // usage is in the journal. A record whose cooldown is in
+            // force, or whose allowance was exhausted because its usage
+            // is not known, stays: the journal has neither value.
+            self.incidents.retain(|_, entry| {
+                entry.has_reservation()
+                    || entry.slots_exhausted
+                    || entry.work_exhausted
+                    || entry.cooldown_until.is_some_and(|until| now < until)
+            });
             if self.incidents.len() >= MAX_INCIDENTS {
                 return Err(LedgerRefusal::new(code::BUDGET_EXHAUSTED));
             }
         }
         let known: Option<&IncidentEntry> = self.incidents.get(&given.incident_id);
+        // A budget generation only increases. An allowance of a
+        // generation before the recorded one is not a rearm, and it does
+        // not replace the usage of the recorded generation.
+        if known.is_some_and(|entry| given.generation < entry.generation) {
+            return Err(LedgerRefusal::new(code::INCIDENT_ALLOWANCE_MISSING));
+        }
         let same_generation: bool = known.is_some_and(|entry| entry.generation == given.generation);
         // The lower bound of the consumed counters of a new record.
         let floor: Option<JournalUsage> = match (known, journal) {
@@ -279,11 +299,17 @@ impl Ledger {
             (None, None) if carried_over => Some(JournalUsage::Unknown),
             (Some(_), _) | (None, None) => None,
         };
+        let unknown_floor: bool = matches!(floor, Some(JournalUsage::Unknown));
+        let slots_exhausted: bool =
+            unknown_floor || (same_generation && known.is_some_and(|entry| entry.slots_exhausted));
+        let work_exhausted: bool =
+            unknown_floor || (same_generation && known.is_some_and(|entry| entry.work_exhausted));
         let slots: Option<SlotAllowance> = match (known.and_then(|entry| entry.slots), given.slots)
         {
             (earlier, Some(given)) => {
                 let reserved: u32 = earlier.map_or(0, |earlier| earlier.reserved());
                 let consumed: u32 = match (earlier, floor) {
+                    _ if slots_exhausted => given.ceiling(),
                     (Some(earlier), _) if same_generation => {
                         earlier.consumed().max(given.consumed())
                     }
@@ -306,7 +332,9 @@ impl Ledger {
         };
         let work: Option<WorkBudget> =
             match (known.and_then(|entry| entry.work.as_ref()), &given.work) {
-                (earlier, Some(given)) => merge_budgets(earlier, given, same_generation, floor),
+                (earlier, Some(given)) => {
+                    merge_budgets(earlier, given, same_generation, floor, work_exhausted)
+                }
                 (earlier, None) => earlier.cloned(),
             };
         let (cooldown_until, backoff_level) = match known {
@@ -333,6 +361,8 @@ impl Ledger {
                 pacing: given.pacing,
                 cooldown_until,
                 backoff_level,
+                slots_exhausted,
+                work_exhausted,
             },
         );
         Ok(())
@@ -352,6 +382,7 @@ impl Ledger {
             && let Some(slots) = &entry.slots
         {
             entry.slots = Some(SlotAllowance::exhausted(slots.ceiling()));
+            entry.slots_exhausted = true;
         }
     }
 
@@ -685,6 +716,7 @@ fn merge_budgets(
     given: &WorkBudget,
     same_generation: bool,
     floor: Option<JournalUsage>,
+    exhausted: bool,
 ) -> Option<WorkBudget> {
     let mut allowances: Vec<ScopedAllowance> = Vec::with_capacity(given.allowances().len());
     for scoped in given.allowances() {
@@ -708,6 +740,7 @@ fn merge_budgets(
             given_consumed
         } else {
             match (before, floor) {
+                _ if exhausted => ceiling,
                 (Some(before), _) if same_generation => larger(before.consumed()),
                 (_, Some(JournalUsage::Known { work, .. })) => larger(work),
                 (_, Some(JournalUsage::Unknown)) => ceiling,

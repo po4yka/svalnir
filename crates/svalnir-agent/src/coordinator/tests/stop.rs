@@ -393,6 +393,9 @@ fn a_query_and_a_cancel_are_answered_while_an_executor_call_runs() {
     );
     assert!(first.exists());
     release.send(()).unwrap();
+    // A second executor call then gets no release and does not wait: a
+    // cancel that the driver ignored fails the test and does not hang it.
+    drop(release);
     let view = driver.join().unwrap();
     // The call that was issued ended with its real result, and the next
     // target was not dispatched.

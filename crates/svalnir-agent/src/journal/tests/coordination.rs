@@ -9,8 +9,8 @@ use svalnir_core::id::RequestId;
 
 use super::super::{
     ClaimedRequest, CoordinatorLock, CoordinatorLockError, Enqueued, MAX_OPEN_REQUESTS,
-    OperationJournal, OperationJournalError, QueuedRequest, RequestBody, RequestCompletion,
-    RequestStatus, SequenceViolation, coordinator_lock_path,
+    OperationJournal, OperationJournalError, QueuedRequest, REQUEST_NOT_DECODABLE, RequestBody,
+    RequestCompletion, RequestStatus, SequenceViolation, coordinator_lock_path,
 };
 use super::{
     Fixture, admit, approval, dispatch, envelope, epoch, failure, file_plan, new_operation,
@@ -143,11 +143,23 @@ fn a_clean_stop_needs_no_reconciliation() {
     let start = journal
         .begin_coordination(&lock, &epoch("epoch_2"), wall(2))
         .unwrap();
-    assert!(!start.reconciliation_pending);
+    // The release was clean, and `operation_1` has a consumed dispatch
+    // with no result: the journal admits nothing before an inspection.
+    assert!(start.reconciliation_pending);
     let predecessor = start.predecessor.unwrap();
     assert_eq!(predecessor.executor_epoch, epoch("epoch_1"));
     assert!(predecessor.released);
-    // New work of the new lifetime is admitted at once.
+    let plan_2 = file_plan("plan_2", 1);
+    journal.record_plan(&plan_2).unwrap();
+    assert_eq!(
+        journal.admit(
+            &approval(&plan_2),
+            &plan_2.principal,
+            &new_operation(&plan_2, "operation_2", "epoch_2", Durability::Durable),
+        ),
+        Err(JournalError::Sequence)
+    );
+    journal.complete_reconciliation(&epoch("epoch_2")).unwrap();
     admit(
         &mut journal,
         &file_plan("plan_2", 1),
@@ -542,7 +554,7 @@ fn the_queue_has_a_bounded_number_of_open_requests() {
         Enqueued::Existing(RequestStatus::Queued)
     );
 
-    // A completed request makes a place.
+    // A completed request makes a place. A claimed request does not.
     let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
     journal
         .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
@@ -551,6 +563,10 @@ fn the_queue_has_a_bounded_number_of_open_requests() {
         .claim_next_request(&epoch("epoch_1"))
         .unwrap()
         .unwrap();
+    assert!(matches!(
+        journal.enqueue_request(&over),
+        Err(OperationJournalError::QueueFull { .. })
+    ));
     journal
         .complete_request(
             &claimed.request.request_id,
@@ -583,4 +599,85 @@ fn a_prune_keeps_a_plan_that_an_open_request_names() {
         journal.request_status(&request_id("request_1")).unwrap(),
         Some(RequestStatus::Queued)
     );
+}
+
+#[test]
+fn a_clean_stop_with_each_operation_settled_needs_no_reconciliation() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.open();
+    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    journal
+        .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
+        .unwrap();
+    journal.end_coordination(&epoch("epoch_1")).unwrap();
+    let start = journal
+        .begin_coordination(&lock, &epoch("epoch_2"), wall(1))
+        .unwrap();
+    assert!(!start.reconciliation_pending);
+    admit(
+        &mut journal,
+        &file_plan("plan_1", 1),
+        "operation_1",
+        "epoch_2",
+    );
+}
+
+#[test]
+fn a_request_that_cannot_be_decoded_is_rejected_and_the_next_one_is_claimed() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.open();
+    let lock = CoordinatorLock::try_acquire(&fixture.path()).unwrap();
+    journal
+        .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
+        .unwrap();
+    let damaged = apply_request("request_1", "plan_1");
+    let good = apply_request("request_2", "plan_2");
+    journal.enqueue_request(&damaged).unwrap();
+    journal.enqueue_request(&good).unwrap();
+    // A row of a newer client: this build does not know the field.
+    let changed: usize = journal
+        .connection
+        .execute(
+            "UPDATE request SET payload = '{\"later_field\":1}' WHERE request_id = 'request_1'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    assert_eq!(
+        journal.claim_next_request(&epoch("epoch_1")).unwrap(),
+        Some(ClaimedRequest {
+            request: good,
+            redelivered: false
+        })
+    );
+    let status = journal.request_status(&damaged.request_id).unwrap();
+    let Some(RequestStatus::Completed {
+        completion: RequestCompletion::Rejected { error },
+    }) = status
+    else {
+        panic!("the damaged request is not rejected: {status:?}");
+    };
+    assert_eq!(error.code.as_str(), REQUEST_NOT_DECODABLE);
+    assert_eq!(error.family, ErrorFamily::Request);
+    assert_eq!(journal.claim_next_request(&epoch("epoch_1")).unwrap(), None);
+
+    // With only a damaged row, the rejection is recorded and no request
+    // is claimed.
+    let alone = apply_request("request_3", "plan_3");
+    journal.enqueue_request(&alone).unwrap();
+    journal
+        .connection
+        .execute(
+            "UPDATE request SET payload = '[]' WHERE request_id = 'request_3'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(journal.claim_next_request(&epoch("epoch_1")).unwrap(), None);
+    assert!(matches!(
+        journal.request_status(&alone.request_id).unwrap(),
+        Some(RequestStatus::Completed {
+            completion: RequestCompletion::Rejected { .. }
+        })
+    ));
 }

@@ -435,12 +435,17 @@ impl<J: CoordinatorJournal> Coordinator<J> {
 
     /// The final check immediately before a call: the boundary check and
     /// the durable stop fence, which a different process can write.
-    fn final_check(
-        &self,
-        active: &Active,
-        step: &PlannedStep,
-        time: &TimeReading,
-    ) -> Option<StopReason> {
+    ///
+    /// The check reads the time again. The measurements, the intent, and
+    /// the dispatch consumption are between the first check of the step
+    /// and this one, and a storage transaction can take long: a deadline,
+    /// a plan expiry, a lease, or a grant can end in that interval. With
+    /// no time, no call is issued.
+    fn final_check(&self, active: &Active, step: &PlannedStep) -> Option<StopReason> {
+        let Some(time) = self.clock.now() else {
+            return Some(StopReason::DeadlineExpired);
+        };
+        let time: &TimeReading = &time;
         if let Some(reason) = self.boundary(active, step, &ActionStage::Dispatch, time) {
             return Some(reason);
         }
@@ -691,7 +696,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let Some(charged) = self.charge_consumed(active, step, charge)? else {
             return Ok(StepEnd::Next);
         };
-        if let Some(reason) = self.final_check(active, step, time) {
+        if let Some(reason) = self.final_check(active, step) {
             self.end_without_call(active, step, charge, charged, reason.clone(), None)?;
             return Ok(StepEnd::Stop(reason, None));
         }
@@ -809,7 +814,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             );
             return Ok(StepEnd::Stop(StopReason::Failed, Some(error)));
         };
-        if let Some(reason) = self.final_check(active, step, time) {
+        if let Some(reason) = self.final_check(active, step) {
             self.end_without_call(active, step, None, charged, reason.clone(), None)?;
             return Ok(StepEnd::Stop(reason, None));
         }
@@ -1329,6 +1334,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             active.unrecorded = true;
         }
         self.board.publish(active.view(Phase::Finished));
+        self.board.set_recorded(&operation_id, recorded);
         if unknown || !recorded {
             // The leases and the reservation stay: a conflicting step
             // needs a reconciliation first.
@@ -1383,6 +1389,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 self.flush(&mut active) && self.journal.record_operation(&active.operation).is_ok();
             if saved {
                 active.unrecorded = false;
+                self.board.set_recorded(&operation_id, true);
             }
             if saved && active.operation.state().is_settled() {
                 if let Some(stop) = &mut active.stop {

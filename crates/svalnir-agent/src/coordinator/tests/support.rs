@@ -1067,6 +1067,8 @@ pub(super) enum FailPoint {
     RecordStep,
     RecordOperation,
     SetStopFence,
+    CompleteRequest,
+    PersistVolatile,
 }
 
 /// A function that a test runs inside a journal call.
@@ -1233,6 +1235,16 @@ impl CoordinatorJournal for FailingJournal {
         epoch: &ExecutorEpochId,
         completion: &RequestCompletion,
     ) -> Result<(), OperationJournalError> {
+        if self
+            .failing
+            .lock()
+            .unwrap()
+            .contains(&FailPoint::CompleteRequest)
+        {
+            return Err(OperationJournalError::File(std::io::Error::other(
+                "injected failure",
+            )));
+        }
         self.inner.complete_request(request_id, epoch, completion)
     }
 
@@ -1240,7 +1252,11 @@ impl CoordinatorJournal for FailingJournal {
         &mut self,
         record: &mut VolatileRecord,
     ) -> Result<VolatilePersistReport, OperationJournalError> {
-        if self.failing.lock().unwrap().contains(&FailPoint::Admit) {
+        let failing: bool = {
+            let failing = self.failing.lock().unwrap();
+            failing.contains(&FailPoint::Admit) || failing.contains(&FailPoint::PersistVolatile)
+        };
+        if failing {
             return Err(OperationJournalError::NotFound);
         }
         record.persist_into(&mut self.inner)

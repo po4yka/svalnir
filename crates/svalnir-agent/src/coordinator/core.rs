@@ -12,7 +12,7 @@ use svalnir_core::action::{
 };
 use svalnir_core::grant::{ActionRequest, EvidenceStamp, IncidentBudget};
 use svalnir_core::id::{
-    AdapterId, ExecutorEpochId, OperationId, PlanId, StepId, TargetId, VolumeId,
+    AdapterId, ExecutorEpochId, OperationId, PlanId, RequestId, StepId, TargetId, VolumeId,
 };
 use svalnir_core::observation::Observation;
 use svalnir_core::plan::{
@@ -36,8 +36,8 @@ use super::ports::{
 use crate::executor::fs::ApprovedRoots;
 use crate::executor::process::{NextStep, Observation as ExitObservation};
 use crate::journal::{
-    CoordinationStart, CoordinatorLock, CoordinatorLockError, RequestBody, RequestCompletion,
-    VolatileRecord,
+    ClaimedRequest, CoordinationStart, CoordinatorLock, CoordinatorLockError, RequestBody,
+    RequestCompletion, VolatileRecord,
 };
 
 /// The largest number of admitted operations that wait for the active
@@ -274,6 +274,11 @@ pub struct Coordinator<J: CoordinatorJournal> {
     pub(super) parked: BTreeMap<OperationId, Box<Active>>,
     pub(super) reconciliation_pending: bool,
     pub(super) start: CoordinationStart,
+    /// A claimed request that a pending reconciliation stopped.
+    pub(super) held_request: Option<ClaimedRequest>,
+    /// The completion of a claimed request that the journal did not
+    /// record.
+    pub(super) unwritten_completion: Option<(RequestId, RequestCompletion)>,
 }
 
 fn refused(error: ActionError) -> ApplyOutcome {
@@ -391,9 +396,14 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             .map_err(StartError::Journal)?;
         // Volatile counts were possibly lost when the lifetime before
         // this one did not stop cleanly, or when a reconciliation that an
-        // earlier lifetime left is pending.
-        let unclean: bool = start.reconciliation_pending
-            || start.predecessor.as_ref().is_some_and(|predecessor| {
+        // earlier lifetime left is pending. An operation that stays
+        // `UnknownOutcome` after a clean stop makes the registration
+        // pending and does not make the stop unclean. With no
+        // predecessor, pending work was written outside the protocol.
+        let unclean: bool = start
+            .predecessor
+            .as_ref()
+            .map_or(start.reconciliation_pending, |predecessor| {
                 !predecessor.released || predecessor.reconciliation_pending
             });
         // An operation that is not settled is reconciled also after a
@@ -433,6 +443,8 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             parked: BTreeMap::new(),
             reconciliation_pending: start.reconciliation_pending || unsettled,
             start,
+            held_request: None,
+            unwritten_completion: None,
         })))
     }
 
@@ -541,8 +553,10 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             Ok(Some(existing)) => return existing,
             Err(error) => return refused(*error),
         }
-        // The plan of the controller is stored after the checks, so a
-        // refused request leaves no record.
+        // The plan of the controller is stored after the checks of the
+        // request. A refusal of the admission after this point (a budget,
+        // a lease, the queue bound) leaves the plan record, with no
+        // consumption: the plan can be applied again before its expiry.
         let mut journal_failed: bool = false;
         if request.plan.is_some() {
             match self.journal.record_plan(&plan) {
@@ -585,6 +599,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 )));
             }
             if let Some(operation) = self.known_operation(operation_id) {
+                // The same plan identity with different content is not
+                // the plan of the earlier apply.
+                if operation.plan_digest() != plan.digest() {
+                    return Err(Box::new(admission_error(
+                        code::PLAN_CONFLICT,
+                        ErrorFamily::Request,
+                        plan_id,
+                    )));
+                }
                 return Ok(Some(ApplyOutcome::Existing {
                     operation: Box::new(operation),
                 }));
@@ -733,26 +756,31 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             code: code::INCIDENT_ALLOWANCE_MISSING,
         };
         let incident_id = plan.trigger.incident_id.as_ref().ok_or(missing)?;
-        if let Some(given) = &request.incident {
-            if &given.incident_id != incident_id {
-                return Err(missing);
-            }
-            let first_record: bool = !self.ledger.knows(incident_id, given.generation);
-            // A new record reads the consumed dispatches of the journal.
-            let journal: Option<JournalUsage> = if self.ledger.has(incident_id) {
-                None
-            } else {
-                Some(self.journal_usage(given))
-            };
-            self.ledger.observe_incident(given, journal)?;
-            if first_record {
-                let volatile_exception: bool = self
-                    .authority
-                    .incident(incident_id)
-                    .is_some_and(|budget| budget.volatile_exception_at_open);
-                self.ledger
-                    .exhaust_slots_if_volatile_lost(given, volatile_exception);
-            }
+        // An automatic plan is applied by the controller, with the
+        // allowance of its incident. A request with no allowance (a
+        // request of the journal queue, or a client that applies a stored
+        // automatic plan) does not use the allowance that the ledger has
+        // from an earlier request of the guard.
+        let given: &IncidentAllowance = request.incident.as_ref().ok_or(missing)?;
+        if &given.incident_id != incident_id {
+            return Err(missing);
+        }
+        let first_record: bool = !self.ledger.knows(incident_id, given.generation);
+        // A new record reads the consumed dispatches of the journal.
+        let journal: Option<JournalUsage> = if self.ledger.has(incident_id) {
+            None
+        } else {
+            Some(self.journal_usage(given))
+        };
+        self.ledger
+            .observe_incident(given, journal, time.clock.now)?;
+        if first_record {
+            let volatile_exception: bool = self
+                .authority
+                .incident(incident_id)
+                .is_some_and(|budget| budget.volatile_exception_at_open);
+            self.ledger
+                .exhaust_slots_if_volatile_lost(given, volatile_exception);
         }
         self.ledger
             .reserve_incident(incident_id, total, time.clock.now)
@@ -1038,8 +1066,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             .journal
             .operation(operation_id)
             .map_err(CoordinatorError::Record)?;
-        Ok(stored.map(|operation| {
-            let fenced: bool = self.journal.has_stop_fence(operation_id).unwrap_or(false);
+        let Some(operation) = stored else {
+            return Ok(None);
+        };
+        // A fence that cannot be read is not reported as no fence.
+        let fenced: bool = self
+            .journal
+            .has_stop_fence(operation_id)
+            .map_err(CoordinatorError::Record)?;
+        Ok(Some({
             let finished: bool = operation.state().is_settled();
             OperationView {
                 stop: fenced.then_some(StopView {
@@ -1111,6 +1146,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 return Ok(level);
             }
             self.active = Some(active);
+        }
+        // A parked operation dispatches no further step. The journal does
+        // not have its result (or the result is not known), so the level
+        // is the level of its stop, and never `Settled`.
+        if let Some(mut active) = self.parked.remove(operation_id) {
+            let level: StopAcknowledgement = self.fence(&mut active, StopReason::Canceled);
+            self.board.publish(active.view(Phase::Finished));
+            self.parked.insert(operation_id.clone(), active);
+            return Ok(level);
         }
         let not_found = |family: ErrorFamily| {
             action_error(
@@ -1224,22 +1268,44 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     }
 
     /// Claims one request of the journal queue and executes it. Returns
-    /// true when a request was claimed.
+    /// true when a request was executed.
+    ///
+    /// A request that a pending reconciliation stopped is held and is
+    /// executed again by a later call, before a new claim. A completion
+    /// that the journal did not record is written again by a later call,
+    /// before a new claim. Thus the coordinator holds at most one request
+    /// and one completion.
     pub fn serve_queue(&mut self) -> bool {
-        // A request that cannot be executed now is not claimed: a claim
-        // goes back to the queue only at the next registration.
+        if let Some((request_id, completion)) = self.unwritten_completion.take() {
+            // An error that is not a storage failure shows that the
+            // request is not a claim of this lifetime, or that it has a
+            // different result. A new write cannot change that.
+            if let Err(error) = self
+                .journal
+                .complete_request(&request_id, &self.epoch, &completion)
+                && error.is_storage_failure()
+            {
+                self.unwritten_completion = Some((request_id, completion));
+                return false;
+            }
+        }
+        // A request that cannot be executed now is not claimed.
         if self.reconciliation_pending {
             return false;
         }
-        let Ok(Some(claimed)) = self.journal.claim_next_request(&self.epoch) else {
-            return false;
+        let claimed: ClaimedRequest = match self.held_request.take() {
+            Some(held) => held,
+            None => match self.journal.claim_next_request(&self.epoch) {
+                Ok(Some(claimed)) => claimed,
+                Ok(None) | Err(_) => return false,
+            },
         };
         let request_id = claimed.request.request_id.clone();
-        let completion: RequestCompletion = match claimed.request.body {
+        let completion: RequestCompletion = match claimed.request.body.clone() {
             RequestBody::Apply { approval } => {
                 let outcome: ApplyOutcome = self.apply(ApplyRequest {
                     approval,
-                    principal: claimed.request.principal,
+                    principal: claimed.request.principal.clone(),
                     plan: None,
                     incident: None,
                 });
@@ -1251,38 +1317,93 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                         operation_id: operation.operation_id().clone(),
                     },
                     // A pending reconciliation is not a rejection of the
-                    // request: it stays claimed, and a later lifetime
-                    // gets it again.
+                    // request. The request stays claimed, and this
+                    // lifetime executes it after the reconciliation.
                     ApplyOutcome::Refused { error }
                         if error.code.as_str() == code::RECONCILIATION_PENDING =>
                     {
+                        self.held_request = Some(claimed);
                         return true;
                     }
                     ApplyOutcome::Refused { error } => RequestCompletion::Rejected { error },
                 }
             }
-            RequestBody::Cancel { operation_id } => match self.cancel(&operation_id) {
-                Ok(StopAcknowledgement::Received | StopAcknowledgement::CurrentInstance) => {
-                    RequestCompletion::Stopped {
-                        fence: StopFence::CurrentInstance,
-                    }
-                }
-                Ok(StopAcknowledgement::DurableFence | StopAcknowledgement::Settled) => {
-                    RequestCompletion::Stopped {
-                        fence: StopFence::Durable,
-                    }
-                }
-                Err(error) => RequestCompletion::Rejected { error: *error },
-            },
+            RequestBody::Cancel { operation_id } => {
+                self.cancel_for(&operation_id, &claimed.request.principal)
+            }
         };
-        // A completion that is not recorded leaves the request claimed. A
-        // later lifetime gets it again, and the journal then returns the
-        // operation of this apply.
-        drop(
-            self.journal
-                .complete_request(&request_id, &self.epoch, &completion),
-        );
+        // A completion that a storage failure stopped is written again
+        // before the next claim. If this lifetime ends first, a later
+        // lifetime gets the request again, and the journal then returns
+        // the operation of this apply.
+        if let Err(error) = self
+            .journal
+            .complete_request(&request_id, &self.epoch, &completion)
+            && error.is_storage_failure()
+        {
+            self.unwritten_completion = Some((request_id, completion));
+        }
         true
+    }
+
+    /// The user of the apply of an operation that this lifetime admitted.
+    fn applicant(&self, operation_id: &OperationId) -> Option<&Principal> {
+        self.active
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.parked.values())
+            .find(|active| active.operation.operation_id() == operation_id)
+            .map(|active| &active.principal)
+            .or_else(|| {
+                self.plans
+                    .values()
+                    .find(|(known, _)| known == operation_id)
+                    .map(|(_, principal)| principal)
+            })
+    }
+
+    /// Executes a cancel request of the journal queue for `principal`.
+    fn cancel_for(
+        &mut self,
+        operation_id: &OperationId,
+        principal: &Principal,
+    ) -> RequestCompletion {
+        // A request of a different user does not stop the operation.
+        if self
+            .applicant(operation_id)
+            .is_some_and(|applicant| applicant.uid != principal.uid)
+        {
+            return RequestCompletion::Rejected {
+                error: action_error(
+                    code::PRINCIPAL_MISMATCH,
+                    ErrorFamily::Authority,
+                    ActionStage::Admission,
+                    None,
+                    Some(operation_id),
+                    None,
+                ),
+            };
+        }
+        match self.cancel(operation_id) {
+            Ok(StopAcknowledgement::Received | StopAcknowledgement::CurrentInstance) => {
+                RequestCompletion::Stopped {
+                    fence: StopFence::CurrentInstance,
+                }
+            }
+            // The result of a volatile operation is not in the durable
+            // journal, so its stop is not reported as durable.
+            Ok(StopAcknowledgement::Settled) if self.volatile.operation(operation_id).is_some() => {
+                RequestCompletion::Stopped {
+                    fence: StopFence::CurrentInstance,
+                }
+            }
+            Ok(StopAcknowledgement::DurableFence | StopAcknowledgement::Settled) => {
+                RequestCompletion::Stopped {
+                    fence: StopFence::Durable,
+                }
+            }
+            Err(error) => RequestCompletion::Rejected { error: *error },
+        }
     }
 
     /// Calls [`Coordinator::step`] until the operation is finished or the
@@ -1322,8 +1443,10 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     /// # Errors
     ///
     /// Returns [`CoordinatorError::Unsettled`] with no change when an
-    /// operation of this lifetime is not settled: the registration then
-    /// stays, and the next lifetime reconciles. Returns
+    /// operation of this lifetime is not settled, or when the journal
+    /// did not take a record of the volatile history: the registration
+    /// then stays, and the next lifetime reconciles and applies the
+    /// conservative budget rule. Returns
     /// [`CoordinatorError::Journal`] when the journal does not record the
     /// release.
     pub fn shutdown(mut self) -> Result<J, (Box<Self>, CoordinatorError)> {
@@ -1339,6 +1462,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
         if !self.volatile.pending_records().is_empty() {
             drop(self.journal.persist_volatile(&mut self.volatile));
+        }
+        // A volatile record that the journal does not have is lost with
+        // this process. The registration then stays, so the next lifetime
+        // starts as after an unclean stop and does not replenish a budget
+        // from a journal that has no record of the volatile consumption.
+        if !self.volatile.pending_records().is_empty() {
+            return Err((Box::new(self), CoordinatorError::Unsettled));
         }
         match self.journal.end_coordination(&self.epoch) {
             Ok(()) => Ok(self.journal),

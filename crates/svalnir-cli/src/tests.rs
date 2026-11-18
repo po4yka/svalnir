@@ -869,6 +869,25 @@ fn without_a_file_the_proposal_is_the_built_in_template() {
         envelope["result"]["explicit_keys"],
         serde_json::json!(["schema_version"])
     );
+    // The default `[protections]` table has the personal folders.
+    for policy in envelope["result"]["policies"].as_array().unwrap() {
+        assert_eq!(
+            policy["protections"]["excluded_paths"],
+            serde_json::json!([
+                "~/Desktop",
+                "~/Documents",
+                "~/Downloads",
+                "~/Movies",
+                "~/Music",
+                "~/Pictures",
+                "~/Public",
+                "~/Library/Mobile Documents",
+                "~/Library/CloudStorage"
+            ]),
+            "{policy}"
+        );
+    }
+    assert_eq!(envelope["result"]["template_revision"], 2);
 
     let text = svalnir(&["policy", "show", "memory-guard"]);
     assert_eq!(text.status, ExitStatus::Success);

@@ -6,6 +6,7 @@ pub(crate) mod support;
 
 use svalnir_core::action::{ActionClass, Escalation, Plan, TargetBinding, TriggerClass};
 use svalnir_core::config::ValidatedConfig;
+use svalnir_core::file::LosslessPath;
 use svalnir_core::grant::{AuthorityState, InstanceInhibition};
 use svalnir_core::id::{ExecutorEpochId, OperationId, PlanId};
 use svalnir_core::policy::{ApplicationCandidate, ForegroundStatus};
@@ -39,6 +40,9 @@ struct Bench {
     health: Health,
     /// The inhibition of the agent instance.
     inhibition: InstanceInhibition,
+    /// The home directory of the agent. The default `[protections]` table
+    /// has paths below it, and no candidate of the bench is there.
+    home: LosslessPath,
 }
 
 impl Bench {
@@ -58,6 +62,7 @@ impl Bench {
             now: START,
             health: Health::default(),
             inhibition: InstanceInhibition::default(),
+            home: LosslessPath::from_bytes("/Users/test").unwrap(),
         }
     }
 
@@ -73,7 +78,7 @@ impl Bench {
             time: &reading,
             epoch: &self.epoch,
             principal: user(),
-            home_directory: None,
+            home_directory: Some(&self.home),
             config: &self.config,
             authority: self.authority.as_ref(),
             inhibition: &self.inhibition,
@@ -517,6 +522,7 @@ fn the_plan_of_a_memory_incident_has_the_configured_strategy_and_grace_period() 
         now: START,
         health: Health::default(),
         inhibition: InstanceInhibition::default(),
+        home: LosslessPath::from_bytes("/Users/test").unwrap(),
     };
     let mut plan: Option<Plan> = None;
     for _ in 0..6 {

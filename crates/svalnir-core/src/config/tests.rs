@@ -52,6 +52,9 @@ fn findings(text: &str) -> Vec<(FindingCode, String)> {
         .collect()
 }
 
+/// The `excluded_paths` line of the example of `docs/POLICY_SPEC.md`.
+const SPEC_EXCLUDED_PATHS: &str = "excluded_paths = [\"~/Desktop\", \"~/Documents\", \"~/Downloads\", \"~/Movies\", \"~/Music\", \"~/Pictures\", \"~/Public\", \"~/Library/Mobile Documents\", \"~/Library/CloudStorage\"]";
+
 /// Asserts that the document has exactly one finding.
 #[track_caller]
 fn assert_one(text: &str, code: FindingCode, path: &str) {
@@ -321,7 +324,7 @@ fn a_value_of_another_type_is_rejected() {
         "disk_guard.volumes",
     );
     assert_one(
-        &spec_with("excluded_paths = []", "excluded_paths = [\"~/a\", 5]"),
+        &spec_with(SPEC_EXCLUDED_PATHS, "excluded_paths = [\"~/a\", 5]"),
         FindingCode::WrongType,
         "protections.excluded_paths[1]",
     );
@@ -705,7 +708,10 @@ fn an_identifier_that_occurs_again_is_rejected() {
     );
     // `~/Documents/` and `~/Documents` are the same path.
     assert_one(
-        &spec_with("\"~/Downloads\"", "\"~/Documents/\""),
+        &spec_with(
+            "\"~/Downloads\", \"~/Pictures\"",
+            "\"~/Documents/\", \"~/Pictures\"",
+        ),
         FindingCode::DuplicateIdentifier,
         "disk_guard.exclusions.paths[1]",
     );
@@ -745,10 +751,7 @@ fn a_path_has_no_shell_evaluation() {
         "",
     ] {
         assert_one(
-            &spec_with(
-                "excluded_paths = []",
-                &format!("excluded_paths = ['{path}']"),
-            ),
+            &spec_with(SPEC_EXCLUDED_PATHS, &format!("excluded_paths = ['{path}']")),
             FindingCode::InvalidPath,
             "protections.excluded_paths[0]",
         );
@@ -1133,4 +1136,29 @@ fn a_rejected_budget_array_is_not_an_empty_selection() {
         FindingCode::WrongType,
         "memory_guard.app_budgets",
     );
+}
+
+/// An absent `excluded_paths` has the personal folders of the template. A
+/// list in the document replaces them, and an empty list protects no path.
+#[test]
+fn the_personal_folders_are_the_default_of_the_protections_table() {
+    let defaults: Vec<String> = valid("schema_version = 1\n")
+        .protections()
+        .excluded_paths
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(defaults, super::PERSONAL_FOLDERS);
+    let replaced = valid("schema_version = 1\n[protections]\nexcluded_paths = [\"~/Work\"]\n");
+    assert_eq!(
+        replaced
+            .protections()
+            .excluded_paths
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>(),
+        ["~/Work"]
+    );
+    let empty = valid("schema_version = 1\n[protections]\nexcluded_paths = []\n");
+    assert_eq!(empty.protections().excluded_paths, Vec::<ConfigPath>::new());
 }

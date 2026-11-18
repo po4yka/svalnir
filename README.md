@@ -357,8 +357,10 @@ svalnir status --format json
 svalnir scan "$HOME" --save
 svalnir report --scan SCAN_ID
 
-# Prepare a manual developer-artifact cleanup in Trash mode.
-svalnir clean plan --scan SCAN_ID --profile developer --mode trash
+# List the candidates of the scan, then prepare a manual cleanup in Trash
+# mode of the entries that you name.
+svalnir clean plan --scan SCAN_ID --mode trash
+svalnir clean plan --scan SCAN_ID --mode trash --entry ~/Library/Caches/com.example.app
 svalnir clean show --plan PLAN_ID
 svalnir clean apply --plan PLAN_ID
 

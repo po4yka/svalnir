@@ -201,7 +201,7 @@ Ordinary user-cache mutation runs as its owner. Initial root deletion is limited
 
 ### MoveToTrash
 
-The plan lists exact selected entries, supported Trash behavior, and the effect to be confirmed. Generic automatic exclusions do not turn a deliberate manual selection of an ordinary personal file into an automatic rule; manual selection remains separately scoped and reviewed.
+The plan lists exact selected entries, supported Trash behavior, and the effect to be confirmed. The user names each selected entry; a client makes no plan of this class or of `DeleteSelectedFiles` from a scan with no named entry ([INTERFACES.md](INTERFACES.md) section 4). Generic automatic exclusions do not turn a deliberate manual selection of an ordinary personal file into an automatic rule; manual selection remains separately scoped and reviewed.
 
 Use a supported operation and retain its result or resulting item reference when available. If the backend cannot support the target, return an unsupported result. Do not silently permanently delete, copy to an arbitrary fallback location, empty Trash, or expand selection.
 

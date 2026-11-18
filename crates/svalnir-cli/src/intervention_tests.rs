@@ -159,12 +159,30 @@ impl World {
             .to_owned()
     }
 
-    /// Prepares a plan and returns its identity.
-    fn plan(&self, scan: &str, mode: &str) -> String {
-        let outcome = json(
+    /// The paths of the candidates of a scan: `clean plan` with no entry.
+    fn candidates(&self, scan: &str, mode: &str) -> Vec<String> {
+        let listed = json(
             &self.environment,
             &["clean", "plan", "--scan", scan, "--mode", mode],
         );
+        assert_eq!(listed.status, ExitStatus::Usage, "{}", listed.stdout);
+        listed.result()["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["path"]["value"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Prepares a plan that names each candidate of the scan, and returns
+    /// its identity.
+    fn plan(&self, scan: &str, mode: &str) -> String {
+        let candidates: Vec<String> = self.candidates(scan, mode);
+        let mut arguments: Vec<&str> = vec!["clean", "plan", "--scan", scan, "--mode", mode];
+        for candidate in &candidates {
+            arguments.extend(["--entry", candidate.as_str()]);
+        }
+        let outcome = json(&self.environment, &arguments);
         assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
         outcome.result()["explanation"]["plan"]["plan_id"]
             .as_str()
@@ -190,6 +208,210 @@ fn entries(directory: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// The bytes of each file of the state directory, by name.
+fn state_files(world: &World) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut directories: Vec<PathBuf> = vec![world.path("state")];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path: PathBuf = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                files.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+/// `clean plan` with the arguments and each `--entry`.
+fn plan_with(world: &World, scan: &str, mode: &str, entries: &[&Path]) -> Outcome {
+    let mut arguments: Vec<&str> = vec!["clean", "plan", "--scan", scan, "--mode", mode];
+    for entry in entries {
+        arguments.extend(["--entry", entry.to_str().unwrap()]);
+    }
+    json(&world.environment, &arguments)
+}
+
+#[test]
+fn a_plan_with_no_entry_lists_the_candidates_and_makes_no_plan() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let tree: PathBuf = world.tree();
+    let scan: String = world.scan(&tree);
+    let before = state_files(&world);
+    for mode in ["trash", "permanent"] {
+        let listed = plan_with(&world, &scan, mode, &[]);
+        assert_eq!(listed.status, ExitStatus::Usage, "{}", listed.stdout);
+        assert_eq!(listed.envelope()["kind"], "report");
+        assert_eq!(listed.envelope()["schema_version"], 1);
+        let result = listed.result();
+        assert_eq!(result["mode"], mode);
+        assert_eq!(result["selection"], "entries_required");
+        assert!(result.get("explanation").is_none(), "{result}");
+        let paths: Vec<&str> = result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["path"]["value"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&tree.join("build").to_str().unwrap()),
+            "{paths:?}"
+        );
+        assert!(result["note"].as_str().unwrap().contains("--entry PATH"));
+        let text = run(
+            &world.environment,
+            &["clean", "plan", "--scan", &scan, "--mode", mode],
+        );
+        assert_eq!(text.status, ExitStatus::Usage);
+        assert!(
+            text.stdout.starts_with("Candidates of scan "),
+            "{}",
+            text.stdout
+        );
+    }
+    // No plan, no plan document, and no change of the journal.
+    assert_eq!(state_files(&world), before);
+    assert!(!world.path("state").join("plans").exists());
+    assert_eq!(entries(&tree).len(), 3);
+}
+
+#[test]
+fn a_named_entry_is_the_only_target_and_an_entry_not_in_the_scan_is_refused() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let tree: PathBuf = world.tree();
+    let scan: String = world.scan(&tree);
+    let cache: PathBuf = tree.join("cache");
+    for mode in ["trash", "permanent"] {
+        let planned = plan_with(&world, &scan, mode, &[&cache]);
+        assert_eq!(planned.status, ExitStatus::Success, "{}", planned.stdout);
+        let targets = planned.result()["explanation"]["targets"].clone();
+        let targets = targets.as_array().unwrap();
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0]["path"]["value"], cache.to_str().unwrap());
+        assert_eq!(planned.result()["explanation"]["totals"]["targets"], 1);
+    }
+    // A path of the tree that the scan record does not name, a path that
+    // does not exist, and a prefix of a recorded entry.
+    let before = state_files(&world);
+    for absent in [
+        tree.join("cache/c.bin/x"),
+        tree.join("missing"),
+        tree.join("cac"),
+        tree.clone(),
+    ] {
+        let refused = plan_with(&world, &scan, "permanent", &[&cache, &absent]);
+        assert_eq!(refused.status, ExitStatus::Usage, "{}", refused.stdout);
+        assert_eq!(refused.error_code(), "entry_not_in_scan", "{absent:?}");
+    }
+    assert_eq!(state_files(&world), before);
+    // The `evict` mode takes no entry and is otherwise unchanged.
+    let evict = json(
+        &world.environment,
+        &[
+            "clean",
+            "plan",
+            "--scan",
+            &scan,
+            "--mode",
+            "evict",
+            "--rule",
+            "svalnir.expired-temporary",
+            "--entry",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(evict.status, ExitStatus::Usage, "{}", evict.stdout);
+    assert_eq!(evict.error_code(), "entry_not_accepted");
+    let evict = json(
+        &world.environment,
+        &[
+            "clean",
+            "plan",
+            "--scan",
+            &scan,
+            "--mode",
+            "evict",
+            "--rule",
+            "svalnir.expired-temporary",
+        ],
+    );
+    assert_eq!(evict.status, ExitStatus::Unavailable, "{}", evict.stdout);
+    assert_eq!(evict.error_code(), "rule_mode_not_validated");
+    assert_eq!(state_files(&world), before);
+}
+
+/// The default `[protections]` table covers the personal folders of the
+/// home directory. A configuration whose `excluded_paths` does not name
+/// the folder permits a manual plan inside it.
+#[test]
+fn an_entry_in_a_personal_folder_is_protected_until_the_configuration_permits_it() {
+    let world = World::new();
+    let revision: String = world.activate("schema_version = 1\n", "none");
+    let documents: PathBuf = world.path("home").join("Documents");
+    std::fs::create_dir_all(documents.join("drafts")).unwrap();
+    std::fs::write(documents.join("drafts/a.txt"), vec![1_u8; 4096]).unwrap();
+    std::fs::write(documents.join("taxes.pdf"), vec![2_u8; 8192]).unwrap();
+    let documents: PathBuf = std::fs::canonicalize(&documents).unwrap();
+    let scan: String = world.scan(&documents);
+    let drafts: PathBuf = documents.join("drafts");
+    let before = state_files(&world);
+    let refused = plan_with(&world, &scan, "permanent", &[&drafts]);
+    assert_eq!(
+        refused.status,
+        ExitStatus::Unavailable,
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.error_code(), "target_protected");
+    assert!(
+        refused.envelope()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("excluded_paths"),
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(state_files(&world), before);
+
+    // The user replaces the list: the other folders stay protected, and
+    // `~/Documents` is not in the list.
+    world.activate(
+        "schema_version = 1\n[protections]\nexcluded_paths = [\"~/Desktop\", \"~/Pictures\"]\n",
+        &revision,
+    );
+    let planned = plan_with(&world, &scan, "permanent", &[&drafts]);
+    assert_eq!(planned.status, ExitStatus::Success, "{}", planned.stdout);
+    let targets = planned.result()["explanation"]["targets"].clone();
+    assert_eq!(targets.as_array().unwrap().len(), 1, "{targets}");
+    assert_eq!(targets[0]["path"]["value"], drafts.to_str().unwrap());
+}
+
+#[test]
+fn the_list_of_the_candidates_escapes_a_name() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let tree: PathBuf = world.path("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a\u{1b}[31mb\nOperation fake: Completed"), b"x").unwrap();
+    let scan: String = world.scan(&tree);
+    let listed = run(
+        &world.environment,
+        &["clean", "plan", "--scan", &scan, "--mode", "trash"],
+    );
+    assert_eq!(listed.status, ExitStatus::Usage, "{}", listed.stderr);
+    assert!(!listed.stdout.contains('\u{1b}'), "{}", listed.stdout);
+    assert!(
+        !listed.stdout.contains("\nOperation fake"),
+        "{}",
+        listed.stdout
+    );
+    assert!(listed.stdout.contains("--entry PATH"), "{}", listed.stdout);
 }
 
 #[test]
@@ -1784,9 +2006,19 @@ fn a_manual_request_needs_a_revision_in_effect() {
     let world = World::new();
     let tree: PathBuf = world.tree();
     let scan: String = world.scan(&tree);
+    let entry: PathBuf = tree.join("build");
     let plan = json(
         &world.environment,
-        &["clean", "plan", "--scan", &scan, "--mode", "trash"],
+        &[
+            "clean",
+            "plan",
+            "--scan",
+            &scan,
+            "--mode",
+            "trash",
+            "--entry",
+            entry.to_str().unwrap(),
+        ],
     );
     assert_eq!(plan.status, ExitStatus::Unavailable, "{}", plan.stdout);
     assert_eq!(plan.error_code(), "no_active_policy_revision");
@@ -1854,12 +2086,14 @@ fn the_text_forms_escape_a_name_and_keep_machine_output_clean() {
     let tree: PathBuf = world.path("tree");
     std::fs::create_dir_all(&tree).unwrap();
     // A name with a terminal escape sequence and a line break.
-    std::fs::write(tree.join("a\u{1b}[31mb\nOperation fake: Completed"), b"x").unwrap();
+    let name: PathBuf = tree.join("a\u{1b}[31mb\nOperation fake: Completed");
+    std::fs::write(&name, b"x").unwrap();
     let scan: String = world.scan(&tree);
-    let plan = run(
-        &world.environment,
-        &["clean", "plan", "--scan", &scan, "--mode", "trash"],
-    );
+    let entry: &str = name.to_str().unwrap();
+    let arguments = [
+        "clean", "plan", "--scan", &scan, "--mode", "trash", "--entry", entry,
+    ];
+    let plan = run(&world.environment, &arguments);
     assert_eq!(plan.status, ExitStatus::Success, "{}", plan.stderr);
     assert!(!plan.stdout.contains('\u{1b}'), "{}", plan.stdout);
     assert!(!plan.stdout.contains("\nOperation fake"), "{}", plan.stdout);

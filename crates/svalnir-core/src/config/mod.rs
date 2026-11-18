@@ -54,5 +54,5 @@ pub use schema::{
     EligibleGroup, GlobalTrigger, History, MemoryGuard, Privacy, Profile, Protections,
     RestartPolicy, SCHEMA_VERSION, ValidatedConfig, VolumeSelector,
 };
-pub use template::TEMPLATE_REVISION;
+pub use template::{PERSONAL_FOLDERS, TEMPLATE_REVISION};
 pub use validate::{MAX_APP_BUDGETS, MAX_DOCUMENT_BYTES, Validation, parse_and_validate};

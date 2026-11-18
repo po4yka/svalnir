@@ -251,6 +251,12 @@ pub struct CleanPlanArgs {
     /// Reviewed cleanup rule. Only the `evict` mode accepts it, and requires it.
     #[arg(long, value_name = "RULE_ID", required_if_eq("mode", "evict"))]
     pub rule: Option<String>,
+    /// An entry of the saved scan to select, by its exact path. Repeat it
+    /// for each entry. With none, the `trash` and `permanent` modes list the
+    /// candidates of the scan and make no plan. The `evict` mode takes no
+    /// entry.
+    #[arg(long = "entry", value_name = "PATH")]
+    pub entries: Vec<PathBuf>,
 }
 
 /// Manual cleanup mode.

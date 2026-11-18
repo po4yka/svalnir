@@ -145,7 +145,8 @@ fn read_document(context: &mut Context, table: &Table) -> (Option<ValidatedConfi
     let (agent, plan_ttl): (AgentConfig, Option<Duration>) =
         read_agent(context, agent_table, &template.agent);
     let protections_table: TableReader<'_> = root.table(context, "protections");
-    let protections: Protections = read_protections(context, protections_table);
+    let protections: Protections =
+        read_protections(context, protections_table, &template.excluded_paths);
     let disk_table: TableReader<'_> = root.table(context, "disk_guard");
     let disk_guard: DiskGuard = read_disk_guard(context, disk_table, &template.disk_guard);
     let memory_table: TableReader<'_> = root.table(context, "memory_guard");
@@ -386,13 +387,24 @@ fn names<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     values.collect()
 }
 
-fn read_protections(context: &mut Context, mut table: TableReader<'_>) -> Protections {
+/// Reads `[protections]`. An absent `excluded_paths` has the personal
+/// folders of the template; a list in the document replaces them.
+fn read_protections(
+    context: &mut Context,
+    mut table: TableReader<'_>,
+    default_excluded: &[ConfigPath],
+) -> Protections {
     let excluded = table.text_list(context, "excluded_paths");
+    let excluded_paths: Vec<ConfigPath> = if matches!(excluded, Read::Absent) {
+        default_excluded.to_vec()
+    } else {
+        read_paths(context, excluded)
+    };
     let bundle_ids = table.text_list(context, "protected_bundle_ids");
     let executables = table.text_list(context, "protected_executable_paths");
     table.finish(context);
     Protections {
-        excluded_paths: read_paths(context, excluded),
+        excluded_paths,
         protected_bundle_ids: read_bundle_ids(context, bundle_ids),
         protected_executable_paths: read_paths(context, executables),
     }

@@ -54,6 +54,8 @@ pub(crate) mod policy;
 pub(crate) mod processes;
 pub(crate) mod resources;
 pub(crate) mod scan;
+#[cfg(unix)]
+pub(crate) mod selection;
 pub(crate) mod session;
 mod start_failure;
 #[cfg(target_os = "macos")]

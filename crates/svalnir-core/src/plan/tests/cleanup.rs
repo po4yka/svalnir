@@ -555,8 +555,33 @@ fn a_path_of_the_protections_table_excludes_the_entry_in_each_mode() {
     for entry_path in included {
         assert_eq!(excluded_reasons(list, home, entry_path), [], "{entry_path}");
     }
-    // With no list, nothing is excluded.
-    assert_eq!(excluded_reasons("", home, "/Users/a/Documents"), []);
+    // With no list, the personal folders of the template are excluded,
+    // with each entry below them and each directory that contains them.
+    for entry_path in [
+        "/Users/a/Documents",
+        "/Users/a/Desktop/notes",
+        "/Users/a/Pictures",
+        "/Users/a/Movies",
+        "/Users/a/Music",
+        "/Users/a/Downloads/x.dmg",
+        "/Users/a/Public",
+        "/Users/a/Library/Mobile Documents/com~apple~CloudDocs",
+        "/Users/a/Library/CloudStorage/Provider-a",
+        "/Users/a/Library",
+    ] {
+        assert_eq!(
+            excluded_reasons("", home, entry_path),
+            [ExcludedPath],
+            "{entry_path}"
+        );
+    }
+    assert_eq!(excluded_reasons("", home, "/Users/a/Library/Caches/x"), []);
+    // An empty list in the document replaces the template: nothing is
+    // excluded.
+    assert_eq!(
+        excluded_reasons("excluded_paths = []", home, "/Users/a/Documents"),
+        []
+    );
 }
 
 #[test]

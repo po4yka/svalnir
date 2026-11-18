@@ -8,8 +8,11 @@
 //!
 //! The candidates of a plan in the `trash` or the `permanent` mode are the
 //! entries that the saved scan record names: its largest files and its
-//! largest directories below the scan root. The plan builder leaves out a
-//! protected, excluded, or overlapping entry and states the reason.
+//! largest directories below the scan root. The user names each entry of
+//! the plan ([`super::selection`]); with no entry, the command lists the
+//! candidates and makes no plan. The plan builder leaves out an
+//! overlapping entry and states the reason, and the command refuses a
+//! named entry that a protection covers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
@@ -36,9 +39,9 @@ use svalnir_core::volume::VolumeIdentity;
 
 use super::apply::{self, ApplyFlow};
 use super::plan_store::{self, PlanDocument, RootRecord};
-use super::plan_view;
 use super::session::{self, ActiveConfig, Now, journal_error};
 use super::{CommandFailure, Invocation};
+use super::{plan_view, selection};
 use crate::cli::{CleanApplyArgs, CleanMode, CleanPlanArgs, PlanRef};
 use crate::environment::Environment;
 use crate::host::Host;
@@ -437,15 +440,26 @@ struct Selection {
     stale: Vec<StaleEntry>,
 }
 
+/// The paths of the entries that the scan record names, in the sequence
+/// of [`select`].
+fn recorded_paths(scan: &ScanResult) -> impl Iterator<Item = &LosslessPath> {
+    scan.largest_directories
+        .iter()
+        .map(|directory| &directory.path)
+        .chain(scan.largest_files.iter().map(|file| &file.path))
+}
+
 /// Makes the candidates of a plan from the entries that the scan record
-/// names. Each entry is measured again with `lstat`; an entry that is
-/// absent or is a different object than at the scan is not a candidate.
+/// names, or only from those of `named`. Each entry is measured again with
+/// `lstat`; an entry that is absent or is a different object than at the
+/// scan is not a candidate.
 fn select(
     scan: &ScanResult,
     root: &RootRecord,
     mode: CleanMode,
     plan_text: &str,
     environment: &Environment,
+    named: Option<&BTreeSet<LosslessPath>>,
 ) -> Result<Selection, ErrorBody> {
     let home: Option<PathBuf> = environment
         .home
@@ -481,6 +495,9 @@ fn select(
         stale: Vec::new(),
     };
     for (index, entry) in recorded.enumerate() {
+        if named.is_some_and(|named| !named.contains(entry.path)) {
+            continue;
+        }
         let mut stale = |reason: &'static str| {
             selection.stale.push(StaleEntry {
                 path: entry.path.clone(),
@@ -689,10 +706,40 @@ pub(crate) fn plan(
         .into());
     }
     if arguments.mode == CleanMode::Evict {
+        if !arguments.entries.is_empty() {
+            return Err(selection::entry_not_accepted().into());
+        }
         return Err(evict_refusal(arguments.rule.as_deref()).into());
     }
     let environment: &Environment = invocation.environment;
     let scan: ScanResult = super::scan::load_scan(&arguments.scan, environment)?;
+    if arguments.entries.is_empty() {
+        // No selection: the candidates for review, and no plan, no plan
+        // document, and no journal change.
+        let root: RootRecord = root_record(&scan)?;
+        let listed: Selection =
+            select(&scan, &root, arguments.mode, "candidate", environment, None)?;
+        let view = selection::CandidatesView::new(
+            scan.scan_id.clone(),
+            if arguments.mode == CleanMode::Permanent {
+                "permanent"
+            } else {
+                "trash"
+            },
+            &listed.entries,
+            listed.stale,
+        );
+        invocation.emit(Kind::Report, &view, selection::CandidatesView::render)?;
+        return Ok(selection::NO_ENTRY_STATUS);
+    }
+    let named: BTreeSet<LosslessPath> = selection::named_entries(
+        // The scan root is the cleanup root and never a target.
+        &recorded_paths(&scan)
+            .filter(|path| *path != &scan.root)
+            .collect::<Vec<&LosslessPath>>(),
+        &arguments.entries,
+        environment,
+    )?;
     let host: Host = Host::open()?;
     let now: Now = Now::read(&host)?;
     let mut journal: OperationJournal = session::open_journal(environment)?;
@@ -702,7 +749,14 @@ pub(crate) fn plan(
     let plan_text: String = session::new_id("plan");
     let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
     let root: RootRecord = root_record(&scan)?;
-    let selection: Selection = select(&scan, &root, arguments.mode, &plan_text, environment)?;
+    let chosen: Selection = select(
+        &scan,
+        &root,
+        arguments.mode,
+        &plan_text,
+        environment,
+        Some(&named),
+    )?;
     let outcome: PlanOutcome = build(
         environment,
         &now,
@@ -710,8 +764,9 @@ pub(crate) fn plan(
         &plan_id,
         &active.revision.revision_id,
         arguments.mode,
-        &selection.entries,
+        &chosen.entries,
     )?;
+    selection::refuse_protected(&outcome)?;
     let has_plan: bool = outcome.plan.is_some();
     if let Some(plan) = &outcome.plan {
         // The journal has the sealed plan before the document names it.
@@ -728,7 +783,7 @@ pub(crate) fn plan(
     let view = PlanView {
         scan_id: Some(scan.scan_id),
         explanation: explain(&outcome, &now.clock),
-        stale_entries: selection.stale,
+        stale_entries: chosen.stale,
         operation_id: None,
         cleanup_roots: if has_plan {
             vec![root.path]

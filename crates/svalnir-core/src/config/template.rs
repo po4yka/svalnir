@@ -14,6 +14,7 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use super::path::ConfigPath;
 use super::schema::{
     AgentConfig, AutomaticMode, DiskExclusions, DiskGuard, GlobalTrigger, History, MemoryGuard,
     Privacy, Profile, VolumeSelector,
@@ -21,7 +22,25 @@ use super::schema::{
 use crate::quantity::{Bytes, EntryCount};
 
 /// The revision of the template. Increase it when a value changes.
-pub const TEMPLATE_REVISION: u32 = 1;
+pub const TEMPLATE_REVISION: u32 = 2;
+
+/// The personal folders of the home directory: the default of
+/// `[protections].excluded_paths` (`docs/POLICY_SPEC.md` section 12). Each
+/// path protects the folder, each entry below it, and each directory that
+/// contains it, for manual and automatic actions. A document that gives
+/// the key replaces the list; `excluded_paths = []` permits a manual
+/// selection inside these folders.
+pub const PERSONAL_FOLDERS: [&str; 9] = [
+    "~/Desktop",
+    "~/Documents",
+    "~/Downloads",
+    "~/Movies",
+    "~/Music",
+    "~/Pictures",
+    "~/Public",
+    "~/Library/Mobile Documents",
+    "~/Library/CloudStorage",
+];
 
 const MEBIBYTE: u64 = 1024 * 1024;
 const GIBIBYTE: u64 = 1024 * MEBIBYTE;
@@ -30,11 +49,12 @@ const fn gibibytes(count: u64) -> Bytes {
     Bytes::new(count * GIBIBYTE)
 }
 
-/// The values of the omitted keys. `[protections]` has no entry, because
-/// each of its lists is empty.
+/// The values of the omitted keys. Of `[protections]`, only
+/// `excluded_paths` has a default that is not empty.
 #[derive(Debug, Clone)]
 pub(super) struct Template {
     pub(super) agent: AgentConfig,
+    pub(super) excluded_paths: Vec<ConfigPath>,
     pub(super) disk_guard: DiskGuard,
     pub(super) memory_guard: MemoryGuard,
     pub(super) history: History,
@@ -54,6 +74,10 @@ impl Template {
                 plan_ttl: Duration::from_secs(30),
                 manual_plan_ttl: Duration::from_mins(10),
             },
+            excluded_paths: PERSONAL_FOLDERS
+                .iter()
+                .filter_map(|text| ConfigPath::parse(text).ok())
+                .collect(),
             disk_guard: DiskGuard {
                 enabled: false,
                 volumes: vec![VolumeSelector::startup_data()],

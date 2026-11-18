@@ -145,6 +145,7 @@ pub struct OverviewScreen {
     last_render: Instant,
     twinkle: Option<gpui_kit::Task<()>>,
     nav: NavLayout,
+    live_timer: Option<gpui_kit::Task<()>>,
 }
 
 impl OverviewScreen {
@@ -164,6 +165,7 @@ impl OverviewScreen {
             last_render: Instant::now(),
             twinkle: None,
             nav: NavLayout::default(),
+            live_timer: None,
         }
     }
 
@@ -189,6 +191,32 @@ impl OverviewScreen {
                             return false;
                         }
                         screen.phase = (screen.phase + motion::TWINKLE_TICK.as_secs_f32()) % 600.0;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Redraws the screen at 30 Hz at most for the ring of the live head; the
+    /// timer ends when the screen stops rendering.
+    fn start_live_timer(&mut self, cx: &mut Context<Self>) {
+        if self.live_timer.is_some() {
+            return;
+        }
+        self.live_timer = Some(cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| {
+            loop {
+                cx.background_executor().timer(motion::LIVE_TICK).await;
+                let alive: bool = this
+                    .update(cx, |screen, cx| {
+                        if screen.last_render.elapsed() > motion::LIVE_TICK * 6 {
+                            screen.live_timer = None;
+                            return false;
+                        }
                         cx.notify();
                         true
                     })
@@ -899,17 +927,23 @@ impl Render for OverviewScreen {
             None
         };
         let mono: SharedString = cx.theme().mono_font_family.clone();
-        // The live head moves per frame, from its own start instant. The
-        // frames stop with the continuous effects or when this screen is not
-        // rendered.
+        // The live head moves from its own start instant, redrawn by a timer.
+        // The timer stops with the continuous effects or when this screen is
+        // not rendered.
         // The chart draws the ring only with the glow and only with data, so
-        // no frame is requested without them.
+        // no timer runs without them.
         let glow_on: bool = crate::theme::glow::enabled(cx);
         let live_shown: bool = gate.continuous() && glow_on && matches!(view, View::Data { .. });
-        let live: Option<f32> = live_shown.then(|| {
-            window.request_animation_frame();
-            live_progress(self.live_start.elapsed().as_secs_f32())
-        });
+        // A timer of 30 Hz redraws the screen; a frame per display refresh
+        // would redraw the whole screen too often. The phase of the ring comes
+        // from `live_start`, so a late tick does not change it.
+        let live: Option<f32> = if live_shown {
+            self.start_live_timer(cx);
+            Some(live_progress(self.live_start.elapsed().as_secs_f32()))
+        } else {
+            self.live_timer = None;
+            None
+        };
         // The ring sweep runs once, when the screen first shows data.
         let sweep: Option<f32> = if matches!(view, View::Data { .. }) {
             // The start is set also with Reduce Motion on, so a later change

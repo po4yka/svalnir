@@ -174,10 +174,17 @@ pub const FILL_STAGGER: Duration = Duration::from_millis(40);
 pub const FRONT_EASE: Duration = Duration::from_millis(250);
 /// The interval of the twinkle timer (about 12 Hz).
 pub const TWINKLE_TICK: Duration = Duration::from_millis(83);
+/// The interval of the timer of the live head (about 30 Hz).
+pub const LIVE_TICK: Duration = Duration::from_millis(33);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_live_head_redraws_at_30_hz_at_most() {
+        assert!(LIVE_TICK >= Duration::from_millis(33));
+    }
 
     #[test]
     fn ease_ends_and_is_monotone() {

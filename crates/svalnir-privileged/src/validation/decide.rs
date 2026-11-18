@@ -146,6 +146,13 @@ enum Evaluation {
 /// The part of a request that identifies its effect. The transport
 /// identity is not a part: a new transport identity does not make a new
 /// request.
+///
+/// The validity window is a part (`docs/INTERFACES.md` section 12). Only a
+/// repeat with the same correlation, the same validity window, and the same
+/// operation gets the recorded state of the step. A repeat of the same step
+/// with a new `issued_at` or `expires_at` has a different digest, and the
+/// helper refuses it with [`RefusalReason::ConflictingDuplicate`]. Thus a
+/// repeat cannot extend the time in which the executor can submit a call.
 #[derive(Serialize)]
 struct RequestContent<'request> {
     correlation: &'request StepCorrelation,

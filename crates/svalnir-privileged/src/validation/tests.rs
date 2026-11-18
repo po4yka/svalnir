@@ -1121,6 +1121,40 @@ fn a_recorded_step_with_a_different_content_is_refused() {
 }
 
 #[test]
+fn only_a_repeat_with_the_same_validity_window_gets_the_recorded_state() {
+    let mut state: HelperState = state();
+    let original: HelperRequest = request("step-1");
+    admit_ok(&mut state, &original);
+
+    // The same content and the same validity window, also with a new
+    // transport identity: the recorded state.
+    let mut same_window: HelperRequest = original.clone();
+    same_window.request_id = RequestId::new("request-repeat").unwrap();
+    for repeat in [&original, &same_window] {
+        let Admission::Known(status) = admit(&mut state, repeat) else {
+            panic!("the identical repeat is not answered with its state");
+        };
+        assert_eq!(status.state, StepState::DispatchConsumed);
+    }
+
+    // The same step with a new validity window that the helper would
+    // accept for a new step: a conflicting duplicate. A later window and a
+    // window that only ends later are both refused.
+    let mut later_window: HelperRequest = same_window.clone();
+    later_window.validity = validity(NOW, NOW + 200);
+    let mut longer_window: HelperRequest = same_window;
+    longer_window.validity = validity(NOW - 100, NOW + 300);
+    for repeat in [later_window, longer_window] {
+        let admission: Admission = admit(&mut state, &repeat);
+        let Admission::Refused(refusal) = admission else {
+            panic!("the repeat with a new window is not refused: {admission:?}");
+        };
+        assert_eq!(refusal.reason, RefusalReason::ConflictingDuplicate);
+    }
+    assert_eq!(state.consumed().len(), 1);
+}
+
+#[test]
 fn a_recorded_transport_identity_is_refused_for_a_different_step() {
     let mut state: HelperState = state();
     admit_ok(&mut state, &request("step-1"));

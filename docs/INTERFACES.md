@@ -508,7 +508,7 @@ Operation notifications may be missed; durable operation status is queried by op
 
 `request_id` correlates a transport exchange. `PlanId`, `OperationId`, and `StepId` identify domain work and deduplication boundaries. They are not interchangeable.
 
-A duplicate apply of the same valid plan returns its admitted operation or known rejection. Different content under an existing operation/step identity is rejected. Consumption retention covers request validity; expired historical IDs are never accepted as fresh instructions.
+A duplicate apply of the same valid plan returns its admitted operation or known rejection. Different content under an existing operation/step identity is rejected. At the helper boundary, the content of a delegated step is its correlation, its validity window, and its operation; the transport `request_id` is not a part. Only a repeat with the same content, and thus the same `issued_at` and `expires_at`, returns the recorded state of the step. A repeat of the same step with a different validity window is different content, and the helper refuses it with `helper_conflicting_duplicate`. After a lost reply, the agent thus repeats the original request unchanged or sends a status query (section 10). Consumption retention covers request validity; expired historical IDs are never accepted as fresh instructions.
 
 On a lost reply:
 

@@ -342,7 +342,7 @@ Read-only observations may be retried with bounded backoff. A mutation retry nee
 
 ### Deduplication and replay
 
-Deduplicate by principal, operation/step identity, and executor context. The same identifier with different action content is an invalid request, not an update.
+Deduplicate by principal, operation/step identity, and executor context. The same identifier with different action content is an invalid request, not an update. For a helper step, the validity window of the request is a part of its content: a repeat with a new validity window is refused as a conflicting duplicate ([INTERFACES.md](INTERFACES.md) section 12).
 
 Record durable dispatch consumption before normal external submission. Duplicate apply/dispatch messages return status and must not create a second native call. Keep consumption records for at least the request's full validity window; after retention expires, reject an old request rather than treating it as new.
 

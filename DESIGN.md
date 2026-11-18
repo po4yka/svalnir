@@ -201,6 +201,19 @@ A **cell** is a small rounded square. A **tick** is a thin vertical bar. Both ar
 
 State the scale near the chart or in its accessible label ("1 cell = 1%"). A chart that has more cells than data resolution misleads; reduce the cell count.
 
+### LED matrix
+
+The storage charts and the volume strip are LED matrices. This is the signature mark of the client.
+
+- One lattice of small square cells covers the chart: a 4.5 px cell with a 1 px radius and a 1.5 px gap. An empty cell uses `border` at half strength, so the lattice shows in the whole chart.
+- A segment is a rectangle of lattice cells with a 1.5 px outline (radius 6 px) in its color, a fill of the color at 8%, and a glow of the color: blur 14 px, alpha 0.45 in the dark theme and 0.22 in the light theme.
+- In a segment, each cell is lit (the color mixed 15% toward white) or dim (the color at 28%, or 22% in the light theme). A hash of the cell position and of the segment selects the state, so the pattern has clumps and does not change between frames. About 45% of the cells are lit. The pattern is texture: it has no meaning, and the area of the segment carries the quantity.
+- A label in a tile dims the cells under its text only.
+- Free space is a region with a dashed 1 px outline (`muted-foreground` at 35%), a label, and sparse bright points. It is not a segment.
+- A segment that has no focus while a different one has it shows all its cells dim, its outline at 35%, and no glow.
+- The head of a fill is three lattice columns of white at 100%, 60%, and 30% with a white glow.
+- Do not draw the glow when Reduce Transparency or Increase Contrast is on, or while the memory pressure state is not normal.
+
 ### Components
 
 | Component | Use in Svalnir |
@@ -215,6 +228,8 @@ State the scale near the chart or in its accessible label ("1 cell = 1%"). A cha
 | **Step timeline** | Two cumulative step lines around a zero axis, a dotted net line, and activity spans below on the same time axis. Use it for bytes written against bytes reclaimed, and for footprint growth against release |
 | **Dot histogram** | One column of dots for each bin of a measured value, symmetric about the axis, with a line at the median and a labeled marker at the limit. Dots past the limit use `negative`. Use it for the footprint samples of one application against its budget, and for the durations of operations |
 | **Dot clock** | A ring of 24 hour sectors with one stack of dots for each sector, and the headline value in the center. Use it for interventions by hour of day in the selected range |
+| **History track** | One tick for each reading, the newest at the right with a head: `positive`, `warning`, or `negative` for the pressure state, and an empty tick for an unavailable reading. The caption states the number of readings and their source |
+| **Value line** | A 1.5 px line of one metric in an inset, with a fill of the line color at 10%, a dot at the newest value, a vertical marker at each change of state, and the range as a caption. An unavailable reading breaks the line |
 | **Stat grid** | Overview tiles: a label, a display value, a delta pill, and a thin bar or sparkline |
 | **Legend** | A grid of rows: category icon, name, and a mono size aligned right. Each row is a button |
 
@@ -340,7 +355,7 @@ These decisions were accepted on 2026-11-16.
 | Light theme | The first release includes it and follows the system appearance |
 | Storage categories and their colors | Take the categories from the resource model; assign palette colors in a fixed order |
 | Default storage layout | Cell band in Overview; tiles in Storage |
-| Glow on filled cells | None in the first release |
+| Glow on filled cells | A segment of an LED matrix and a head have a soft glow in their color. Accepted on 2026-11-18; this replaces "none in the first release". See "LED matrix" in §5 |
 | Component base | `gpui-kit`; see "Theme mapping" in §2 and "Component mapping" in §4 |
 | Icon set | Lucide (ISC License), through `gpui_kit::assets` |
 
@@ -361,17 +376,19 @@ The component base and the icon set were accepted after that date, with the chan
 
 ## 12. Implementation state
 
-The first client in `crates/svalnir-gui` applies sections 2 to 5 and section 8 to two screens. No recorded evidence under [VALIDATION.md](docs/VALIDATION.md) covers it. These points differ from this document or are not built.
+The first client in `crates/svalnir-gui` applies sections 2 to 6 and section 8 to two screens. No recorded evidence under [VALIDATION.md](docs/VALIDATION.md) covers it. These points differ from this document or are not built.
 
 | Subject | State |
 | --- | --- |
-| Theme mapping (§2) | Applied at the start and when the system appearance changes. The theme holds solid colors, so the primary button is the midpoint of the silver gradient; the gradient is not built |
-| Fonts (§2) | The font files are not in the repository. The system fonts apply. Tabular figures and the tracking of the screen title are not applied |
+| Theme mapping (§2) | Applied at the start and when the system appearance changes. The theme holds solid colors; the action button of the client draws the silver gradient itself |
+| Fonts (§2) | Geist and Geist Mono are in the binary. Tabular figures and the tracking of the screen title are not applied; the rolling number gives each digit the same width |
 | Icons (§9) | The default icon bundle of `gpui-kit` has no clock or history glyph. History uses a document glyph and Diagnostics uses an inspector glyph |
-| Storage breakdown (§5, §10) | The resource model defines no storage categories, and the scanner reports none. The Storage screen shows the direct children of the scan root in palette order by size. Free space is not in the band |
+| Controls (§4) | The segmented control and the action button are custom. The segmented control estimates the width of an option from its text length |
+| LED matrix (§5) | Built for tiles, band, columns, and the volume strip. The glow does not yet turn off for Reduce Transparency, Increase Contrast, or memory pressure. The width of a tile label is an estimate |
+| Storage breakdown (§5, §10) | The resource model defines no storage categories, and the scanner reports none. The Storage screen shows the direct children of the scan root in palette order by size. At the default scan root the chart has the scale of the volume, with the free space and a "Not scanned" segment |
 | Linked focus (§5) | Hover on a legend row dims the other segments. Keyboard focus does not |
-| Segmented control (§4) | The metric control of the Storage screen is two buttons, not the `tab` component. In the light theme the two states are hard to tell apart |
-| Motion (§6) | The scan fill, the rolling number, the idle field, the particle effect, and the peak marker are not built. A value changes in one step. The running scan shows a spinner, the path, and the elapsed time |
-| Charts (§5) | Built: capacity grid, cell band, tick gauge as a line, legend. Not built: cell ring, columns, tiles, budget meter, tick track, rate graph, step timeline, stat grid, dot histogram, dot clock |
+| Charts (§5) | Built: LED tiles, band, and columns, the tick gauge as a line with a head, the history track, the value line, and the legend. Not built: cell ring, budget meter, tick track of an operation, rate graph with interventions, step timeline, stat grid, dot histogram, dot clock |
+| Motion (§6) | Built: scan fill with a head, rolling number, fill-in of a finished chart, idle field in the free region, card entry, sliding pill. Not built: removal, phase header, outcome line, range change, expand, peak marker |
+| History (§5) | The history track and the value line show the readings of this window since it opened, at most 180. The client reads no stored samples |
 | Screens (§11) | Overview and Storage are built without a state-changing action. The other five screens show a placeholder. No menu bar item exists |
 | Accessibility (§9) | Each chart has a text label and each state has text. Increase Contrast, Reduce Transparency, and a screen reader are not checked |

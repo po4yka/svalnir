@@ -1,6 +1,6 @@
 # Svalnir Design
 
-**Status:** Design specification. No GPUI view exists. The client builds on `gpui-kit`; a component in this document is a `gpui-kit` component with these tokens, or a custom element where `gpui-kit` has no equivalent. Each value below is a starting value; record a change here before the code changes.
+**Status:** Design specification. A first read-only client exists: the window frame, the navigation, the Overview screen, and the Storage screen. "Implementation state" at the end of this document lists what the client does not build yet and where it differs. The client builds on `gpui-kit`; a component in this document is a `gpui-kit` component with these tokens, or a custom element where `gpui-kit` has no equivalent. Each value below is a starting value; record a change here before the code changes.
 
 This document owns the visual language of the GPUI client: tokens, surfaces, components, data visualization, and motion. The screen list is in the [README](README.md#gpui-desktop-experience). The presentation requirements that bind each screen are in [INTERFACES.md §14](docs/INTERFACES.md#14-gpui-parity-and-presentation). Metric meaning is in [RESOURCE_MODEL.md](docs/RESOURCE_MODEL.md), and operation states are in [ACTION_CONTRACTS.md](docs/ACTION_CONTRACTS.md). Where this document disagrees with one of those, that document takes precedence.
 
@@ -60,7 +60,7 @@ The tokens of this document are the source. The application sets them on the `gp
 | Sans, Mono | `font_family`, `mono_font_family` |
 | Motion constants of §6 | `motion` (`MotionTokens`) |
 
-`primary` in the `gpui-kit` theme is not `brand`: set `primary` to the silver button color, because `gpui-kit` uses it for the default emphasis of a control. Set `shadow` to off and keep `focus_ring` on. The radii of this document do not fit the two theme radii (`radius`, `radius_lg`); set the radius on each surface. The field names are from `gpui-kit` 0.10.0. No code applies this mapping yet.
+`primary` in the `gpui-kit` theme is not `brand`: set `primary` to the silver button color, because `gpui-kit` uses it for the default emphasis of a control. Set `shadow` to off and keep `focus_ring` on. The radii of this document do not fit the two theme radii (`radius`, `radius_lg`); set the radius on each surface. The field names are from `gpui-kit` 0.10.0. `crates/svalnir-gui/src/theme/apply.rs` applies this mapping; §12 lists the differences.
 
 ### Categorical palette
 
@@ -358,3 +358,20 @@ The component base and the icon set were accepted after that date, with the chan
 | History | Data table, tick track per operation, step timeline, dot clock of interventions by hour |
 | Diagnostics | Status pills for each permission and service, empty states with the fix |
 | Menu bar | Inline capacity grid, pressure pill, pause control |
+
+## 12. Implementation state
+
+The first client in `crates/svalnir-gui` applies sections 2 to 5 and section 8 to two screens. No recorded evidence under [VALIDATION.md](docs/VALIDATION.md) covers it. These points differ from this document or are not built.
+
+| Subject | State |
+| --- | --- |
+| Theme mapping (§2) | Applied at the start and when the system appearance changes. The theme holds solid colors, so the primary button is the midpoint of the silver gradient; the gradient is not built |
+| Fonts (§2) | The font files are not in the repository. The system fonts apply. Tabular figures and the tracking of the screen title are not applied |
+| Icons (§9) | The default icon bundle of `gpui-kit` has no clock or history glyph. History uses a document glyph and Diagnostics uses an inspector glyph |
+| Storage breakdown (§5, §10) | The resource model defines no storage categories, and the scanner reports none. The Storage screen shows the direct children of the scan root in palette order by size. Free space is not in the band |
+| Linked focus (§5) | Hover on a legend row dims the other segments. Keyboard focus does not |
+| Segmented control (§4) | The metric control of the Storage screen is two buttons, not the `tab` component. In the light theme the two states are hard to tell apart |
+| Motion (§6) | The scan fill, the rolling number, the idle field, the particle effect, and the peak marker are not built. A value changes in one step. The running scan shows a spinner, the path, and the elapsed time |
+| Charts (§5) | Built: capacity grid, cell band, tick gauge as a line, legend. Not built: cell ring, columns, tiles, budget meter, tick track, rate graph, step timeline, stat grid, dot histogram, dot clock |
+| Screens (§11) | Overview and Storage are built without a state-changing action. The other five screens show a placeholder. No menu bar item exists |
+| Accessibility (§9) | Each chart has a text label and each state has text. Increase Contrast, Reduce Transparency, and a screen reader are not checked |

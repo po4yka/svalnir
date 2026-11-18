@@ -213,6 +213,9 @@ These points are open in this build:
 - A test build of the client has no service host of the system and no Trash of the system: a test that sets none gets a host and a Trash that refuse each call.
 - The service manager calls of `agent install` and `agent uninstall` were not run on a host. The exit statuses that the client reads as "not loaded" (3 and 113) and the load that follows an unload at once are not verified.
 - A plan binds only a process with a verified membership in an application or a managed job. A process that a shell started has none, so `processes stop` refuses it with `target_not_attributed`. The stop of a single process of the user that is not a member of an application needs a target binding that `svalnir-core` does not have.
+- The GUI of this build reads and does not request. It links the agent library and reads the host, the coordinator lock, the authority record, and the newest operation of the journal in its own process, through the same `svalnir_agent::observe` functions as the CLI. It opens an existing journal and creates no state directory and no journal. It sends no request to the queue and is not a coordinator. With only the coordinator lock, it cannot tell an agent from a client that executes a request.
+- The GUI starts a folder-size scan only on a request of the user, refuses it while the memory pressure state is not normal, and writes no scan record to the catalog. The CLI and the GUI therefore do not share scan results.
+- [RESOURCE_MODEL.md](RESOURCE_MODEL.md) defines no storage categories, and the scanner reports none. A storage breakdown is by directory until the resource model defines them.
 - The graceful request of an application member goes through Launch Services. For a helper process of an application, which Launch Services does not register, the graceful step is skipped with `application_not_registered`.
 
 ## 5. Manual approval and standing authorization

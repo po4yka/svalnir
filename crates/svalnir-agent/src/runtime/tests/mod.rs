@@ -1675,3 +1675,56 @@ fn a_panic_of_the_collector_thread_stops_the_service_and_the_stop_is_not_clean()
     // The driver released the coordinator lock: a new lifetime starts.
     drop(bench.start());
 }
+
+#[test]
+fn a_journal_prune_keeps_the_operations_of_an_open_incident() {
+    use svalnir_core::grant::{IncidentBudget, InstanceInhibition};
+    use svalnir_core::id::IncidentId;
+    use svalnir_core::policy::PolicyId;
+
+    use super::driver::journal_prune_cutoff;
+    use crate::controller::MemoryIncidentRecord;
+
+    let at = |seconds: i64| WallTime::from_unix(seconds, 0).unwrap();
+    let retention_cutoff = at(1_794_830_400);
+    let incident = |opened: WallTime| MemoryIncidentRecord {
+        incident_id: IncidentId::new("incident_1").unwrap(),
+        budget: IncidentBudget::open(
+            IncidentId::new("incident_1").unwrap(),
+            PolicyId::MemoryGuard,
+            &AuthorityState::new(user()),
+            &InstanceInhibition::default(),
+            opened,
+        ),
+        opened_in: ExecutorEpochId::new("epoch_1").unwrap(),
+        established: true,
+        unknown_outcome: false,
+        observe_until: None,
+        backoff: None,
+        last_refusal: None,
+        refusals: 0,
+    };
+
+    // With no open incident, the retention time is the cutoff.
+    let mut state = ControllerState::default();
+    assert_eq!(
+        journal_prune_cutoff(retention_cutoff, &state),
+        Some(retention_cutoff)
+    );
+    // An incident that opened before the retention cutoff continues: no
+    // operation that was admitted at or after its start is removed.
+    let opened = at(1_794_830_400 - 3_600);
+    state.memory_incident = Some(incident(opened));
+    assert_eq!(journal_prune_cutoff(retention_cutoff, &state), Some(opened));
+    // An incident that is newer than the retention cutoff changes nothing.
+    state.memory_incident = Some(incident(at(1_794_830_400 + 60)));
+    assert_eq!(
+        journal_prune_cutoff(retention_cutoff, &state),
+        Some(retention_cutoff)
+    );
+    // An incident with no start time permits no prune.
+    let mut unknown = incident(opened);
+    unknown.budget.history.clear();
+    state.memory_incident = Some(unknown);
+    assert_eq!(journal_prune_cutoff(retention_cutoff, &state), None);
+}

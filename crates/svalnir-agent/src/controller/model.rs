@@ -306,7 +306,45 @@ pub enum PriorState {
     Recorded(Box<ControllerState>),
 }
 
+/// The start of the oldest open incident of a controller state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenIncidents {
+    /// No incident is open.
+    None,
+    /// The wall-clock time at which the oldest open incident opened.
+    Since(WallTime),
+    /// An incident is open and its record has no start time.
+    Unknown,
+}
+
 impl ControllerState {
+    /// The start of the oldest open incident.
+    ///
+    /// The journal has the consumed dispatches of an incident only as the
+    /// records of its operations. A restart reads them to know the usage
+    /// of the incident, so the retention of the journal must keep each
+    /// operation that was admitted at or after this time
+    /// (`docs/ACTION_CONTRACTS.md` section 12: a restart does not
+    /// replenish a budget during continuing pressure). The time is the
+    /// start of the first budget generation, on the wall clock, as the
+    /// admission time of an operation is.
+    #[must_use]
+    pub fn open_incidents(&self) -> OpenIncidents {
+        let budgets = self
+            .disk_incidents
+            .iter()
+            .map(|incident| &incident.budget)
+            .chain(self.memory_incident.iter().map(|incident| &incident.budget));
+        let mut oldest: Option<WallTime> = None;
+        for budget in budgets {
+            let Some(start) = budget.history.iter().map(|record| record.started_at).min() else {
+                return OpenIncidents::Unknown;
+            };
+            oldest = Some(oldest.map_or(start, |oldest| oldest.min(start)));
+        }
+        oldest.map_or(OpenIncidents::None, OpenIncidents::Since)
+    }
+
     /// The record to store: this state with each qualification window
     /// idle. The latches, the incidents, the usage, and the cooldowns
     /// stay.

@@ -1062,6 +1062,7 @@ mod tests {
     fn the_aside_shows_pressure_when_not_normal_else_the_disk_share() {
         let mut host = HostSnapshot {
             captured_at: SystemTime::UNIX_EPOCH,
+            utc_offset: None,
             volume_name: None,
             disk_total: Measured::Value(1000),
             disk_available: Measured::Value(510),
@@ -1084,6 +1085,7 @@ mod tests {
     fn host_with(swap_used: u64, swap_total: u64) -> HostSnapshot {
         HostSnapshot {
             captured_at: SystemTime::UNIX_EPOCH,
+            utc_offset: None,
             volume_name: None,
             disk_total: Measured::Value(1_000_000_000),
             disk_available: Measured::Value(999_999_999),

@@ -1518,6 +1518,7 @@ mod tests {
     fn host() -> HostSnapshot {
         HostSnapshot {
             captured_at: SystemTime::UNIX_EPOCH,
+            utc_offset: None,
             volume_name: None,
             disk_total: Measured::Value(512 * GB),
             disk_available: Measured::Value(256 * GB),

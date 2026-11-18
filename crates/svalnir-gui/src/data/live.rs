@@ -134,8 +134,10 @@ impl DataSource for LiveSource {
                 unavailable(reason),
             ),
         };
+        let captured_at: SystemTime = SystemTime::now();
         Ok(HostSnapshot {
-            captured_at: SystemTime::now(),
+            captured_at,
+            utc_offset: crate::platform::utc_offset_seconds(captured_at),
             volume_name,
             disk_total,
             disk_available,

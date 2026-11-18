@@ -65,6 +65,8 @@ pub const LIVE_PERIOD_SECS: f32 = 1.6;
 /// One column: one reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
+    /// The offset of the local time from UTC at the reading, when known.
+    pub utc_offset: Option<i32>,
     /// When the reading was taken.
     pub at: SystemTime,
     /// The row of the curve dot from the bottom, `0..CURVE_ROWS`; `None`
@@ -109,7 +111,9 @@ pub struct Event {
     pub kind: EventKind,
     /// The name: the new state, or the trigger of the operation.
     pub text: String,
-    /// The time of the reading, "HH:MM" in UTC.
+    /// Whether `time` is local time. When false it is UTC.
+    pub local: bool,
+    /// The time of the reading, "HH:MM".
     pub time: String,
     /// The fact of the chip: "after 40 normal readings", or the state text
     /// of the operation.
@@ -139,6 +143,8 @@ pub struct SessionModel {
     pub newest: Option<Newest>,
     /// The time labels of the axis.
     pub axis: Vec<AxisLabel>,
+    /// Whether the times of the axis are UTC and not local time.
+    pub axis_utc: bool,
 }
 
 /// The range of the measured values of `values`.
@@ -260,6 +266,7 @@ pub fn session_model(
             state: state_of(&sample.pressure),
             change,
             at: sample.at,
+            utc_offset: sample.utc_offset,
         });
     }
     let offset: usize = slots.saturating_sub(visible.len());
@@ -275,7 +282,8 @@ pub fn session_model(
                     column,
                     kind: EventKind::Pressure(*level),
                     text: level.label().to_owned(),
-                    time: clock_text(sample.at),
+                    time: clock_text(sample.at, sample.utc_offset),
+                    local: sample.utc_offset.is_some(),
                     fact: after_text(readings_before(samples, start + column, old), old),
                     labeled: false,
                     label: None,
@@ -294,7 +302,8 @@ pub fn session_model(
             column,
             kind: EventKind::Operation,
             text: short_text(operation),
-            time: clock_text(visible[column].at),
+            time: clock_text(visible[column].at, visible[column].utc_offset),
+            local: visible[column].utc_offset.is_some(),
             fact: operation.state_text.clone(),
             labeled: false,
             label: None,
@@ -322,13 +331,15 @@ pub fn session_model(
                 swap_used: sample.swap_used.value().copied(),
                 state: column.state,
             });
+    // The axis says "UTC" when a reading on screen has no local offset.
+    let axis_utc: bool = columns.iter().any(|column| column.utc_offset.is_none());
     let axis: Vec<AxisLabel> = (0..columns.len())
         .rev()
         .step_by(AXIS_STEP)
         .filter(|index| slot_center(offset + index) >= AXIS_HALF)
         .map(|index| AxisLabel {
             slot: offset + index,
-            text: clock_text(columns[index].at),
+            text: clock_text(columns[index].at, columns[index].utc_offset),
         })
         .collect();
     SessionModel {
@@ -339,6 +350,7 @@ pub fn session_model(
         min,
         newest,
         axis,
+        axis_utc,
     }
 }
 
@@ -454,15 +466,18 @@ pub fn state_word(state: TickState) -> &'static str {
     }
 }
 
-/// The time of day of `time` as "HH:MM" in UTC. The crate has no local-time
-/// helper, so the chip adds "UTC".
+/// The time of day of `time` as "HH:MM". With `utc_offset`, the seconds east
+/// of UTC of the local zone, the text is local time; with `None` it is UTC,
+/// and the chart then says "UTC".
 #[must_use]
-pub fn clock_text(time: SystemTime) -> String {
+pub fn clock_text(time: SystemTime, utc_offset: Option<i32>) -> String {
     let Ok(since) = time.duration_since(SystemTime::UNIX_EPOCH) else {
         return UNAVAILABLE_TEXT.to_owned();
     };
-    let seconds: u64 = since.as_secs();
-    format!("{:02}:{:02}", seconds / 3600 % 24, seconds / 60 % 60)
+    let day: i64 = 24 * 3600;
+    let utc: i64 = i64::try_from(since.as_secs() % 86_400).unwrap_or(0);
+    let seconds: i64 = (utc + i64::from(utc_offset.unwrap_or(0))).rem_euclid(day);
+    format!("{:02}:{:02}", seconds / 3600, seconds / 60 % 60)
 }
 
 /// The count of measured readings of `level` right before `index`, up to the
@@ -689,7 +704,7 @@ impl SessionModel {
     pub fn chip(&self) -> Option<Chip> {
         let index: usize = self.events.len().checked_sub(1)?;
         let event: &Event = &self.events[index];
-        let time: String = if event.time == UNAVAILABLE_TEXT {
+        let time: String = if event.time == UNAVAILABLE_TEXT || event.local {
             event.time.clone()
         } else {
             format!("{} UTC", event.time)
@@ -1255,7 +1270,7 @@ impl RenderOnce for SessionChart {
             (0.0, axis_top, name_width),
             Align::End,
             muted_ink,
-            "UTC",
+            if self.model.axis_utc { "UTC" } else { "" },
         ));
         for axis in &self.model.axis {
             texts.push(small_text(
@@ -1393,6 +1408,7 @@ mod tests {
             swap_used: Measured::Value(swap),
             disk_available: available.map_or_else(no, Measured::Value),
             disk_used: available.map_or_else(no, |a| Measured::Value(1_000_u64.saturating_sub(a))),
+            utc_offset: None,
         }
     }
 
@@ -1590,9 +1606,13 @@ mod tests {
 
     #[test]
     fn the_clock_is_hours_and_minutes_in_utc() {
-        assert_eq!(clock_text(at(0)), "00:00");
-        assert_eq!(clock_text(at(12 * 3600 + 4 * 60 + 59)), "12:04");
-        assert_eq!(clock_text(at(25 * 3600 + 60)), "01:01");
+        assert_eq!(clock_text(at(0), None), "00:00");
+        assert_eq!(clock_text(at(12 * 3600 + 4 * 60 + 59), None), "12:04");
+        assert_eq!(clock_text(at(25 * 3600 + 60), None), "01:01");
+        // Local time: east of UTC, west of UTC across midnight, a half hour.
+        assert_eq!(clock_text(at(12 * 3600), Some(3 * 3600)), "15:00");
+        assert_eq!(clock_text(at(3600), Some(-5 * 3600)), "20:00");
+        assert_eq!(clock_text(at(23 * 3600), Some(5 * 3600 + 1800)), "04:30");
     }
 
     #[test]
@@ -1838,6 +1858,7 @@ mod tests {
     #[test]
     fn a_time_before_the_epoch_is_an_em_dash() {
         let before = SystemTime::UNIX_EPOCH - Duration::from_secs(5);
-        assert_eq!(clock_text(before), "\u{2014}");
+        assert_eq!(clock_text(before, None), "\u{2014}");
+        assert_eq!(clock_text(before, Some(3600)), "\u{2014}");
     }
 }

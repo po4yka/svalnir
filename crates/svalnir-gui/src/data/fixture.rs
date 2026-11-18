@@ -79,6 +79,8 @@ impl FixtureScenario {
 pub struct FixtureSource {
     scenario: FixtureScenario,
     pacing: Duration,
+    /// Whether a reading has the offset of the local time zone.
+    local_time: bool,
     /// The readings that the origin of the `drift` times lies in the past.
     lead: u32,
     /// The number of host readings taken, for the `drift` sequence.
@@ -148,6 +150,7 @@ impl FixtureSource {
         Self {
             scenario,
             pacing: Duration::ZERO,
+            local_time: false,
             lead: 0,
             step: Arc::new(AtomicUsize::new(0)),
             base: Arc::new(OnceLock::new()),
@@ -172,6 +175,15 @@ impl FixtureSource {
         self
     }
 
+    /// Gives each reading the offset of the local time zone, so that the
+    /// times on screen are local. Without it the times are UTC, which keeps
+    /// a test independent of the zone of the host.
+    #[must_use]
+    pub const fn with_local_time(mut self) -> Self {
+        self.local_time = true;
+        self
+    }
+
     /// Sleeps `pacing` between the progress steps of a scan. The default is
     /// zero, so that a test does not wait.
     #[must_use]
@@ -193,6 +205,11 @@ impl DataSource for FixtureSource {
         });
         let mut snapshot = HostSnapshot {
             captured_at: now,
+            // A test has no local zone; the launch asks for it.
+            utc_offset: self
+                .local_time
+                .then(|| crate::platform::utc_offset_seconds(now))
+                .flatten(),
             volume_name: Some("/System/Volumes/Data".to_owned()),
             disk_total: Measured::Value(512 * GB),
             disk_available: Measured::Value(185 * GB + GB / 2),

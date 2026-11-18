@@ -450,6 +450,7 @@ mod tests {
         let snapshot = |pressure: Measured<PressureLevel>| -> Loadable<HostSnapshot> {
             Loadable::Ready(Arc::new(HostSnapshot {
                 captured_at: SystemTime::UNIX_EPOCH,
+                utc_offset: None,
                 volume_name: None,
                 disk_total: Measured::Unavailable(String::new()),
                 disk_available: Measured::Unavailable(String::new()),

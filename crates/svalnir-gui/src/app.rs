@@ -261,7 +261,8 @@ pub fn run() -> ExitCode {
         Some(scenario) => Arc::new(
             FixtureSource::new(scenario)
                 .with_pacing(std::time::Duration::from_millis(120))
-                .with_seeded_readings(options.readings.unwrap_or(0)),
+                .with_seeded_readings(options.readings.unwrap_or(0))
+                .with_local_time(),
         ),
         None => Arc::new(LiveSource::from_environment()),
     };

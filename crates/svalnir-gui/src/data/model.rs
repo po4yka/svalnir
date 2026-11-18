@@ -47,6 +47,9 @@ pub struct HostSample {
     pub disk_available: Measured<u64>,
     /// The used capacity of the startup volume: total minus available.
     pub disk_used: Measured<u64>,
+    /// The offset of the local time from UTC at the reading, in seconds
+    /// east. `None` when it is not known; the time then shows as UTC.
+    pub utc_offset: Option<i32>,
 }
 
 impl HostSample {
@@ -59,6 +62,7 @@ impl HostSample {
             swap_used: host.swap_used.clone(),
             disk_available: host.disk_available.clone(),
             disk_used: crate::ui::data_state::used_capacity(&host.disk_total, &host.disk_available),
+            utc_offset: host.utc_offset,
         }
     }
 }
@@ -89,6 +93,7 @@ mod history_tests {
                 swap_used: Measured::Value(n),
                 disk_available: Measured::Unavailable("x".into()),
                 disk_used: Measured::Unavailable("x".into()),
+                utc_offset: None,
             };
             push_bounded(&mut history, sample, 3);
         }
@@ -128,6 +133,9 @@ impl PressureLevel {
 pub struct HostSnapshot {
     /// When the reading was taken.
     pub captured_at: SystemTime,
+    /// The offset of the local time from UTC at the reading, in seconds
+    /// east. `None` when it is not known.
+    pub utc_offset: Option<i32>,
     /// The mount point of the startup data volume, when it is known.
     pub volume_name: Option<String>,
     /// The capacity of the volume.

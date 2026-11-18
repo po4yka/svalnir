@@ -59,6 +59,7 @@ pub enum ScopeError {
 /// `disk_guard.reclaim_below` or `memory_guard.app_budgets[ID].cooldown`.
 /// A size is in bytes, a time is in nanoseconds, and a count is a number.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Threshold {
     /// The key path.
     pub key: String,
@@ -69,6 +70,7 @@ pub struct Threshold {
 /// One setting of a configuration with a text value. The key has the
 /// format of a finding path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Setting {
     /// The key path.
     pub key: String,
@@ -78,6 +80,7 @@ pub struct Setting {
 
 /// One approved rule revision and its roots.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleScope {
     /// The rule revision.
     pub reference: RuleRef,
@@ -87,6 +90,7 @@ pub struct RuleScope {
 
 /// The scope of the disk guard.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskScope {
     /// True when the configuration requests an active disk policy.
     pub requested: bool,
@@ -102,6 +106,7 @@ pub struct DiskScope {
 
 /// The scope of the memory guard.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each field is one key of the configuration schema"
@@ -134,6 +139,7 @@ pub struct MemoryScope {
 /// The scope of one validated configuration. Each list is in a canonical
 /// sequence, so that equal configurations give equal scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyScope {
     /// The profile, as its configuration text. A profile is not a grant.
     pub profile: String,
@@ -670,6 +676,7 @@ pub enum ScopeChange {
 
 /// One difference of two scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeDifference {
     /// The kind.
     pub kind: ScopeDifferenceKind,

@@ -76,6 +76,7 @@ pub enum GenerationBasis {
 
 /// The record of one budget generation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetGenerationRecord {
     /// The generation.
     pub generation: Generation,
@@ -83,6 +84,7 @@ pub struct BudgetGenerationRecord {
     pub basis: GenerationBasis,
     /// The user that authorized the generation. `None` for the generation
     /// that the incident opened with.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub authorized_by: Option<Uid>,
     /// The wall-clock time at which the generation started, for history
     /// only.
@@ -90,12 +92,14 @@ pub struct BudgetGenerationRecord {
     /// The usage of the generation at the time of the rearm that ended it.
     /// `None` for the current generation: the incident state has its
     /// usage.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub final_usage: Option<IncidentUsage>,
 }
 
 /// The budget authority of one incident: the current budget generation and
 /// the history of the generations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentBudget {
     /// The incident.
     pub incident_id: IncidentId,
@@ -237,6 +241,24 @@ pub struct Rearm {
     pub cooldowns_in_force: Vec<Cooldown>,
 }
 
+/// Whether the history of `budget` has exactly one entry for each
+/// generation from 1 to the current one, in sequence, and each entry before
+/// the last one has its final usage.
+fn history_is_complete(budget: &IncidentBudget) -> bool {
+    let mut expected: Option<Generation> = Some(Generation::new(1));
+    let last: usize = budget.history.len().saturating_sub(1);
+    for (index, entry) in budget.history.iter().enumerate() {
+        if expected != Some(entry.generation) || (index < last && entry.final_usage.is_none()) {
+            return false;
+        }
+        expected = entry.generation.next();
+    }
+    budget
+        .history
+        .last()
+        .is_some_and(|entry| entry.generation == budget.generation)
+}
+
 /// Rearms an incident: records a new authorized budget generation.
 ///
 /// The request names the incident and the budget generation that the user
@@ -278,6 +300,13 @@ pub fn rearm(
     }
     if condition.outstanding_operation || condition.usage.has_reservation() {
         return Err(RearmRefusal::OperationUnsettled);
+    }
+    // The history has one entry for each generation, from the first one.
+    // A record with a missing entry does not show the usage of each
+    // earlier generation, and its length is not the number of rearms, so
+    // the limit below would not apply to it.
+    if !history_is_complete(budget) {
+        return Err(RearmRefusal::RecordNotUsable);
     }
     if budget.history.len() >= MAX_BUDGET_GENERATIONS {
         return Err(RearmRefusal::HistoryFull);

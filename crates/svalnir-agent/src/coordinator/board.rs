@@ -8,7 +8,7 @@
 //! application, native callback, or storage operation
 //! (`docs/ACTION_CONTRACTS.md` section 6).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,9 @@ struct BoardState {
     operations: BTreeMap<OperationId, OperationView>,
     finished: VecDeque<OperationId>,
     stop_requests: Vec<OperationId>,
+    /// The finished operations whose result is in memory and not in the
+    /// journal. Each one is also in `finished`, so the set is bounded.
+    unrecorded: BTreeSet<OperationId>,
 }
 
 #[derive(Debug, Default)]
@@ -157,11 +160,24 @@ impl Board {
             while state.finished.len() > MAX_RETAINED_OPERATIONS {
                 if let Some(oldest) = state.finished.pop_front() {
                     state.operations.remove(&oldest);
+                    state.unrecorded.remove(&oldest);
                 }
             }
         }
         drop(state);
         self.changed.notify_all();
+    }
+
+    /// Records whether the journal has the result of a finished
+    /// operation. A result that the journal does not have is not
+    /// acknowledged as settled.
+    pub(super) fn set_recorded(&self, operation_id: &OperationId, recorded: bool) {
+        let mut state = self.lock();
+        if recorded {
+            state.unrecorded.remove(operation_id);
+        } else if state.operations.contains_key(operation_id) {
+            state.unrecorded.insert(operation_id.clone());
+        }
     }
 
     pub(super) fn view(&self, operation_id: &OperationId) -> Option<OperationView> {
@@ -190,11 +206,13 @@ impl Board {
         level: StopAcknowledgement,
     ) -> Option<StopAcknowledgement> {
         let mut state = self.lock();
+        let recorded: bool = !state.unrecorded.contains(operation_id);
         let view: &mut OperationView = state.operations.get_mut(operation_id)?;
         if view.phase == Phase::Finished {
-            // An operation that is finished and not settled dispatches
-            // nothing. It is not reported as settled.
-            return Some(if view.operation.state().is_settled() {
+            // An operation that is finished and not settled, or whose
+            // result the journal does not have, dispatches nothing. It
+            // is not reported as settled.
+            return Some(if recorded && view.operation.state().is_settled() {
                 StopAcknowledgement::Settled
             } else {
                 view.stop

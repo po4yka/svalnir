@@ -67,6 +67,15 @@
 //! - The coordinator records no rejection. A refused plan stays
 //!   unconsumed and can be applied again before its expiry when the
 //!   reason of the refusal can change.
+//! - An automatic plan is applied with the allowance of its incident
+//!   ([`IncidentAllowance`]). An automatic plan with no allowance (a
+//!   request of the journal queue, or a stored plan that a client
+//!   applies) is refused with `incident_allowance_missing`.
+//! - A cancel request of the journal queue stops only an operation that
+//!   the same user applied.
+//! - [`Coordinator::shutdown`] releases the registration only when the
+//!   journal has each record of the volatile history. If not, the next
+//!   lifetime starts as after an unclean stop.
 //! - An operation of an earlier executor lifetime is never dispatched
 //!   again. Reconciliation settles it from fresh evidence, or it stays
 //!   `UnknownOutcome`.

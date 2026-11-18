@@ -29,7 +29,7 @@ use crate::cli::AgentServiceArgs;
 use crate::environment::Environment;
 use crate::host::Host;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
-use crate::seams::{Confirmation, ServiceFailure, ServiceHost};
+use crate::seams::{Confirmation, ProgramProblem, ServiceFailure, ServiceHost};
 use crate::text::{escape, json_tree, put_line};
 
 /// The directory of the per-user service definitions, below the home
@@ -120,11 +120,18 @@ impl AgentSummary {
                     Some("the status record of the agent is not readable by this build".to_owned()),
                 ),
             };
-        let lifecycle = journal
-            .agent_record::<LifecycleRecord>(AgentRecord::Lifecycle)
-            .ok()
-            .flatten()
-            .map(|stored| stored.record);
+        // A record that cannot be read is not an absent record: the view
+        // names each one.
+        let mut problems: Vec<String> = status_problem.into_iter().collect();
+        let lifecycle = if let Ok(stored) =
+            journal.agent_record::<LifecycleRecord>(AgentRecord::Lifecycle)
+        {
+            stored.map(|stored| stored.record)
+        } else {
+            problems
+                .push("the lifecycle record of the agent is not readable by this build".to_owned());
+            None
+        };
         // The lock holder is the agent when the registration of the
         // journal is that of the status record.
         let holder_is_agent: bool = match (&registration, &status) {
@@ -152,13 +159,14 @@ impl AgentSummary {
             ),
         };
         let now: Option<Now> = Host::open().ok().and_then(|host| Now::read(&host).ok());
-        let (authority, problem) = match session::read_authority(&journal) {
-            Ok(stored) => (
-                Some(AuthorityView::new(&stored.state, now.as_ref())),
-                status_problem,
-            ),
-            Err(error) => (None, Some(error.message)),
+        let authority = match session::read_authority(&journal) {
+            Ok(stored) => Some(AuthorityView::new(&stored.state, now.as_ref())),
+            Err(error) => {
+                problems.push(error.message);
+                None
+            }
         };
+        let problem: Option<String> = (!problems.is_empty()).then(|| problems.join("; "));
         Ok(Self {
             journal: "present",
             coordinator,
@@ -363,16 +371,45 @@ struct ServiceChangeView {
     program: Option<LosslessPath>,
     state_directory: Option<LosslessPath>,
     log: Option<LosslessPath>,
-    /// `observation`: the definition has no option that enables a guard.
+    /// `observation` when the authority record has no enabled guard,
+    /// `standing_guards` when it has one, and `unknown` when the record
+    /// cannot be read. The definition has no option that enables a guard.
     mode: Option<&'static str>,
     /// The guards that this command enabled: none.
     guards_enabled: Vec<&'static str>,
+    /// The guards that the authority record of the state directory has
+    /// enabled, on which the agent acts. `None` when the record cannot be
+    /// read, and for `agent uninstall`.
+    standing_guards: Option<Vec<&'static str>>,
     /// Whether the service manager took the request.
     service_manager: &'static str,
     note: &'static str,
 }
 
 const INSTALL_NOTE: &str = "The agent starts in observation mode: it measures, serves requests of this client, and makes no automatic intervention. This command enabled no guard and made no grant. Enable a guard with `svalnir config apply` and `svalnir policy enable`.";
+
+const INSTALL_NOTE_STANDING: &str = "This command enabled no guard and made no grant. The authority record of this state directory has an enabled guard from an earlier `svalnir policy enable`: the agent acts on it when its conditions occur. Disable it with `svalnir policy disable`, or stop all automatic work with `svalnir agent pause`.";
+
+const INSTALL_NOTE_UNKNOWN: &str = "This command enabled no guard and made no grant. The authority record of this state directory cannot be read, so it is not known whether an earlier request enabled a guard; an enabled guard is one on which the agent acts. Read the record with `svalnir agent status`.";
+
+/// The guards that the authority record has enabled. `None` when the
+/// record cannot be read: a guard is then possibly enabled.
+fn standing_guards(environment: &Environment) -> Option<Vec<&'static str>> {
+    let summary: AgentSummary = AgentSummary::collect(environment).ok()?;
+    match (&summary.authority, &summary.problem) {
+        (Some(authority), _) => Some(
+            authority
+                .guards
+                .iter()
+                .filter(|guard| guard.grant.is_some())
+                .map(|guard| guard.policy)
+                .collect(),
+        ),
+        // A journal with no authority record has no enabled guard.
+        (None, None) => Some(Vec::new()),
+        (None, Some(_)) => None,
+    }
+}
 
 const UNINSTALL_NOTE: &str = "The service is not registered. The state directory, the journal, and the authority record stay; a guard that is enabled stays enabled in the record, and no agent acts on it.";
 
@@ -391,6 +428,17 @@ impl ServiceChangeView {
         }
         if let Some(mode) = self.mode {
             put_line!(out, "  Mode: {mode}; guards enabled by this command: none");
+        }
+        if let Some(guards) = self
+            .standing_guards
+            .as_ref()
+            .filter(|guards| !guards.is_empty())
+        {
+            put_line!(
+                out,
+                "  Guards enabled in the authority record: {}",
+                guards.join(", ")
+            );
         }
         put_line!(out, "\n{}", self.note);
         out
@@ -416,11 +464,15 @@ pub(crate) fn install(
     })?;
     // The location of the agent executable has no packaging contract yet:
     // this build accepts only an executable beside this one.
-    let program: PathBuf = host.agent_program().ok_or_else(|| {
-        service_error(
+    let program: PathBuf = host.agent_program().map_err(|problem| match problem {
+        ProgramProblem::NotFound => service_error(
             "agent_program_not_found",
             "the `svalnir-agent` executable is not beside the `svalnir` executable; this build has no other install location for it; the command made no change",
-        )
+        ),
+        ProgramProblem::NotTrusted => service_error(
+            "agent_program_not_trusted",
+            "a different user can change the `svalnir-agent` executable or its directory: the owner is not this user or the superuser, or the group or each user has write permission; a service must not start such a file at each login; the command made no change",
+        ),
     })?;
     let state_directory: PathBuf = environment.state_directory()?;
     let log: PathBuf = environment.agent_log_path()?;
@@ -436,11 +488,32 @@ pub(crate) fn install(
             "a path of the service definition is not absolute or is not text that a property list can hold; the command made no change",
         )
     })?;
+    let standing: Option<Vec<&'static str>> = standing_guards(environment);
+    let (mode, note, consequence): (&'static str, &'static str, String) = match &standing {
+        Some(guards) if guards.is_empty() => (
+            "observation",
+            INSTALL_NOTE,
+            "It starts the Svalnir agent at login, in observation mode. It enables no guard.".to_owned(),
+        ),
+        Some(guards) => (
+            "standing_guards",
+            INSTALL_NOTE_STANDING,
+            format!(
+                "It starts the Svalnir agent at login. It enables no guard, but the authority record has an enabled guard ({}), and the agent acts on it.",
+                guards.join(", ")
+            ),
+        ),
+        None => (
+            "unknown",
+            INSTALL_NOTE_UNKNOWN,
+            "It starts the Svalnir agent at login. It enables no guard. The authority record cannot be read, so it is not known whether a guard is enabled.".to_owned(),
+        ),
+    };
     approve(
         invocation,
         arguments.yes,
         &format!(
-            "Register the per-user service {LAUNCH_AGENT_LABEL}?\nIt starts the Svalnir agent at login, in observation mode. It enables no guard."
+            "Register the per-user service {LAUNCH_AGENT_LABEL}?\n{consequence}\nAn agent of this service that runs now is stopped and started again; an operation that it executes is left for reconciliation."
         ),
     )?;
     environment.create_state_directory()?;
@@ -468,10 +541,11 @@ pub(crate) fn install(
         program: lossless(&program),
         state_directory: lossless(&state_directory),
         log: lossless(&log),
-        mode: Some("observation"),
+        mode: Some(mode),
         guards_enabled: Vec::new(),
+        standing_guards: standing,
         service_manager: "loaded",
-        note: INSTALL_NOTE,
+        note,
     };
     invocation.emit(Kind::Report, &view, ServiceChangeView::render)?;
     Ok(ExitStatus::Success)
@@ -519,6 +593,7 @@ pub(crate) fn uninstall(
         log: None,
         mode: None,
         guards_enabled: Vec::new(),
+        standing_guards: None,
         service_manager: "unloaded",
         note: UNINSTALL_NOTE,
     };

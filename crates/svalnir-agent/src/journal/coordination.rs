@@ -99,13 +99,16 @@ impl CoordinatorLock {
             // symbolic link at the path is refused.
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        // One resolution of the path: the recorded database path is the
+        // one whose lock file is locked.
+        let database: PathBuf = canonical_path(database);
         let file: File = options
-            .open(coordinator_lock_path(&canonical_path(database)))
+            .open(coordinator_lock_path(&database))
             .map_err(CoordinatorLockError::Io)?;
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 _file: file,
-                database: canonical_path(database),
+                database,
             }),
             Err(TryLockError::WouldBlock) => Err(CoordinatorLockError::Held),
             Err(TryLockError::Error(error)) => Err(CoordinatorLockError::Io(error)),
@@ -146,8 +149,7 @@ pub struct CoordinationStart {
     /// Whether the journal refuses admission and dispatch until
     /// [`OperationJournal::complete_reconciliation`]: the predecessor did
     /// not release its registration, or it left a pending reconciliation,
-    /// or the journal has no predecessor and has an operation that is not
-    /// settled.
+    /// or the journal has an operation that is not settled.
     pub reconciliation_pending: bool,
     /// The number of requests that an earlier executor lifetime claimed
     /// and did not complete. They are in the queue again.
@@ -228,7 +230,8 @@ impl OperationJournal {
     /// lifetime `epoch`.
     ///
     /// When the coordinator before this one did not release its
-    /// registration, the journal records a pending reconciliation. The
+    /// registration, or an operation is not settled, the journal records
+    /// a pending reconciliation. The
     /// requests that an earlier lifetime claimed and did not complete go
     /// back to the queue, marked as delivered again, in the same
     /// transaction.
@@ -272,17 +275,19 @@ impl OperationJournal {
         if used {
             return Err(OperationJournalError::Conflict);
         }
-        // With no registration, work that is not settled was written
-        // outside the coordinator protocol, and nothing shows that its
-        // writer stopped cleanly.
-        let reconciliation_pending: bool = match &predecessor {
-            Some(record) => record.reconciliation_pending || !record.released,
-            None => transaction.query_row(
-                "SELECT EXISTS (SELECT 1 FROM operation WHERE settled = 0)",
-                [],
-                |row| row.get(0),
-            )?,
-        };
+        // Work that is not settled needs an inspection before new work,
+        // also after a release: a release does not show that each
+        // operation of the lifetime has a result. With no registration,
+        // such work was written outside the coordinator protocol.
+        let unsettled: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM operation WHERE settled = 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        let reconciliation_pending: bool = unsettled
+            || predecessor
+                .as_ref()
+                .is_some_and(|record| record.reconciliation_pending || !record.released);
         transaction.execute(
             "INSERT INTO coordinator \
              (id, executor_epoch, process_id, started_unix_s, released, reconciliation_pending) \

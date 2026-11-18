@@ -35,12 +35,33 @@ impl Generation {
     }
 }
 
+/// The decoding of an optional field of an authority record that must be
+/// present in the encoded form, with `null` for an absent value.
+///
+/// The derived decoding gives `None` for a key that is absent. For an
+/// expiry, a pause, or a bound grant, `None` is the value that restricts
+/// least, so a record with a missing or misspelled key would decode with
+/// more authority than it was written with. With this function the absent
+/// key is a decoding error.
+pub(crate) mod required_option {
+    use serde::{Deserialize, Deserializer};
+
+    pub(crate) fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Option::<T>::deserialize(deserializer)
+    }
+}
+
 /// One activated policy revision: the validated configuration that is in
 /// effect.
 ///
 /// The record cannot grant OS access and cannot broaden a helper limit. An
 /// edit of the configuration file does not make a revision.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRevision {
     /// The identity of the revision.
     pub revision_id: PolicyRevisionId,
@@ -54,6 +75,7 @@ pub struct PolicyRevision {
 
 /// A reference to one generation of an action grant.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionGrantRef {
     /// The grant.
     pub grant_id: ActionGrantId,
@@ -63,6 +85,7 @@ pub struct ActionGrantRef {
 
 /// A reference to one generation of a privilege grant.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivilegeGrantRef {
     /// The grant.
     pub grant_id: PrivilegeGrantId,
@@ -76,6 +99,7 @@ pub struct PrivilegeGrantRef {
 /// intent, and it does not make an incompatible rule or a broader target
 /// valid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionGrant {
     /// The identity of the grant.
     pub grant_id: ActionGrantId,
@@ -99,6 +123,7 @@ pub struct ActionGrant {
     pub granted_at: WallTime,
     /// The time after which the grant does not apply. `None` means that the
     /// grant applies until it is revoked.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub expires_at: Option<WallTime>,
     /// True when the grant was revoked. A revoked grant covers nothing.
     pub revoked: bool,
@@ -160,6 +185,7 @@ impl ActionGrant {
 /// the catalogs, and the metrics of the caller. An agent counter cannot
 /// authorize a helper action over this ceiling.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivilegeGrant {
     /// The identity of the grant.
     pub grant_id: PrivilegeGrantId,
@@ -179,6 +205,7 @@ pub struct PrivilegeGrant {
     /// The wall-clock time of the approval, for history only.
     pub approved_at: WallTime,
     /// The time after which the grant does not apply.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub expires_at: Option<WallTime>,
     /// True when the grant was revoked.
     pub revoked: bool,
@@ -226,6 +253,7 @@ impl PrivilegeGrant {
 /// The authority that a plan binds to. A change of one of these values
 /// after the plan was built stops the plan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityBinding {
     /// The effective policy revision.
     pub policy_revision: PolicyRevisionId,
@@ -233,6 +261,7 @@ pub struct AuthorityBinding {
     /// none: its authority is the approval that is bound to the plan.
     pub action_grants: Vec<ActionGrantRef>,
     /// The privilege grant, when a helper does a step of the plan.
+    #[serde(deserialize_with = "required_option::deserialize")]
     pub privilege_grant: Option<PrivilegeGrantRef>,
 }
 

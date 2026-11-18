@@ -63,6 +63,8 @@ pub mod code {
     /// An entry of a directory target changed between the measurement of
     /// the tree and its removal.
     pub const TREE_CHANGED: &str = "tree_changed";
+    /// An entry of a directory target has another owner than the target.
+    pub const TREE_ENTRY_OWNER_MISMATCH: &str = "tree_entry_owner_mismatch";
     /// The directory target has more nested levels than the limit.
     pub const TREE_DEPTH_LIMIT: &str = "tree_depth_limit";
     /// The directory target has more entries than the limit.
@@ -127,7 +129,8 @@ pub mod code {
     pub const BATCH_LIMIT: &str = "batch_limit";
 
     /// Each code of the executor.
-    pub const ALL: [&str; 49] = [
+    pub const ALL: [&str; 50] = [
+        TREE_ENTRY_OWNER_MISMATCH,
         BATCH_LIMIT,
         TRASH_ITEM_IDENTITY_MISMATCH,
         RELATIVE_ENTRY_INVALID,

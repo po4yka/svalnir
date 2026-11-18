@@ -343,6 +343,9 @@ enum TrashMode {
     Move,
     /// Moves the entry and gives no item.
     MoveWithoutItem,
+    /// Moves the entry, gives no item, and puts another file at the name
+    /// of the source before it replies.
+    MoveWithoutItemThenReplace,
     /// Moves nothing and reports a failure.
     Fail(TrashFailure),
     /// Moves nothing and reports a move.
@@ -395,6 +398,14 @@ impl TrashBackend for FakeTrash {
             },
             TrashMode::MoveWithoutItem => {
                 self.move_entry(&source).unwrap();
+                TrashReply::Moved {
+                    item: None,
+                    item_object: None,
+                }
+            }
+            TrashMode::MoveWithoutItemThenReplace => {
+                self.move_entry(&source).unwrap();
+                fs::write(&source, b"replacement").unwrap();
                 TrashReply::Moved {
                     item: None,
                     item_object: None,
@@ -1687,8 +1698,12 @@ fn an_entry_with_a_name_that_is_not_utf8_is_removed() {
     let fixture = Fixture::new();
     let name: &OsStr = OsStr::from_bytes(b"n\xff.bin");
     let file: PathBuf = fixture.root.join(name);
-    if fs::write(&file, b"data").is_err() {
-        return;
+    match fs::write(&file, b"data") {
+        Ok(()) => {}
+        // The filesystem of the temporary directory does not accept the
+        // name. Each other error is a failure of the test.
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+        Err(error) => panic!("the fixture file was not made: {error}"),
     }
     let tree: PathBuf = fixture.root.join("tree");
     fs::create_dir(&tree).unwrap();
@@ -2356,11 +2371,13 @@ fn an_interrupted_call_is_settled_by_one_observation_and_is_not_repeated() {
             cause: super::errors::Cause::outcome(code::INTERRUPTED),
         }
     );
-    // A call that returned success, and another object has the name.
+    // A call that returned success, and another object has the name: an
+    // actor changed the name near the call, so the removed object is not
+    // established.
     assert_eq!(
         settle(Ok(())),
         EntryOutcome::Removed {
-            attribution: Attribution::Established,
+            attribution: Attribution::Possible,
             errno: None,
         }
     );
@@ -2421,4 +2438,250 @@ fn an_entry_that_goes_away_before_the_call_gives_already_absent_after_a_submissi
     assert_eq!(outcome.work.vanished_entries, EntryCount::new(1));
     assert_eq!(outcome.work.removed_entries, EntryCount::ZERO);
     fixture.assert_outside_unchanged();
+}
+
+// ---------------------------------------------------------------------
+// Results that must not overstate or understate the effect
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_trash_move_with_no_item_and_another_object_at_the_name_is_an_unknown_outcome() {
+    // The backend gives no item identity, and after the call another
+    // object has the name of the source. Only the absence of the name can
+    // show that the object of the plan was moved.
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("a.txt");
+    fs::write(&file, b"planned").unwrap();
+    let envelope = fixture.envelope(ActionClass::MoveToTrash, "a.txt");
+    let trash = FakeTrash::new(&fixture.trash, TrashMode::MoveWithoutItemThenReplace);
+    let executor = FsExecutor::new(&fixture.config(), Box::new(trash)).unwrap();
+
+    let outcome = run(&executor, &fixture.roots(), &envelope);
+
+    let result: &TargetResult = &outcome.result;
+    assert_eq!(result.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(result.dispatch, DispatchState::Submitted);
+    assert_eq!(result.attribution, Attribution::Possible);
+    assert_eq!(failure_code(result), code::OUTCOME_UNVERIFIED);
+    assert_eq!(outcome.work.trashed_entries, EntryCount::ZERO);
+    assert_eq!(outcome.work.remaining_entries, EntryCount::new(1));
+    assert_eq!(fs::read(&file).unwrap(), b"replacement".to_vec());
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_tree_whose_directory_goes_away_after_its_entries_were_removed_is_not_a_no_op() {
+    // Another actor moves the target directory after its comparison. The
+    // executor removes the measured file through the open descriptor, and
+    // the call on the name of the directory then finds no entry.
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("only.bin"), [1_u8; 10]).unwrap();
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    let aside: PathBuf = fixture.root.join("aside");
+    let (from, to) = (tree.clone(), aside.clone());
+    let hook: CheckpointHook = Box::new(move |checkpoint: Checkpoint, path: &[u8]| {
+        if checkpoint == Checkpoint::EntryChecked && path.ends_with(b"only.bin") {
+            fs::rename(&from, &to).unwrap();
+        }
+    });
+
+    let outcome = run(
+        &fixture.executor_with(checkpoint_injection(hook)),
+        &fixture.roots(),
+        &envelope,
+    );
+
+    let result: &TargetResult = &outcome.result;
+    // `AlreadyAbsent` states a no-op. The executor removed an entry.
+    assert_eq!(result.effect, TargetEffect::Removed);
+    assert_eq!(result.dispatch, DispatchState::Submitted);
+    assert_eq!(result.attribution, Attribution::Possible);
+    assert_eq!(
+        result.evidence.native,
+        NativeResult::Errno {
+            errno: libc::ENOENT
+        }
+    );
+    assert_eq!(outcome.work.removed_entries, EntryCount::new(1));
+    assert_eq!(outcome.work.removed_logical_bytes, Bytes::new(10));
+    assert_eq!(outcome.work.vanished_entries, EntryCount::new(1));
+    assert!(!tree.exists());
+    assert!(aside.is_dir());
+    assert!(fs::read_dir(&aside).unwrap().next().is_none());
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn the_removed_bytes_are_those_of_the_comparison_before_the_call() {
+    // The file grows between the measurement of the tree and its removal.
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    let file: PathBuf = tree.join("grow.bin");
+    fs::write(&file, [1_u8; 10]).unwrap();
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    let grown: PathBuf = file.clone();
+    let hook = once(
+        move |_path: &[u8]| fs::write(&grown, [2_u8; 100]).unwrap(),
+        Checkpoint::TreeEnumerated,
+    );
+
+    let outcome = run(
+        &fixture.executor_with(checkpoint_injection(hook)),
+        &fixture.roots(),
+        &envelope,
+    );
+
+    assert_removed(&outcome);
+    assert_eq!(outcome.work.removed_entries, EntryCount::new(2));
+    assert_eq!(outcome.work.removed_logical_bytes, Bytes::new(100));
+    fixture.assert_outside_unchanged();
+}
+
+/// Makes `root/tree` with the directories `d1` and `d2`, each with one
+/// file.
+fn make_two_directories(fixture: &Fixture) -> PathBuf {
+    let tree: PathBuf = fixture.root.join("tree");
+    for name in ["d1", "d2"] {
+        fs::create_dir_all(tree.join(name)).unwrap();
+        fs::write(tree.join(name).join("file.bin"), [1_u8; 10]).unwrap();
+    }
+    tree
+}
+
+/// A signal that gives `Canceled` from its reading number `first_stop`.
+fn stop_from(first_stop: u32) -> impl Fn() -> Option<Stop> {
+    let checks = AtomicU32::new(0);
+    move || (checks.fetch_add(1, Ordering::SeqCst) + 1 >= first_stop).then_some(Stop::Canceled)
+}
+
+#[test]
+fn a_stop_inside_a_directory_target_issues_no_later_call_and_reports_the_part_that_was_done() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_two_directories(&fixture);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    let receipt: DispatchReceipt = receipt();
+    let step = AdmittedStep::new(&envelope, &receipt).unwrap();
+    // The executor reads the signal before each directory below the
+    // target. The second reading stops.
+    let signal = stop_from(2);
+
+    let outcome = fixture
+        .executor()
+        .execute_step_until(&fixture.roots(), step, &signal)
+        .unwrap();
+
+    let result: &TargetResult = &outcome.result;
+    assert_eq!(result.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(result.dispatch, DispatchState::Submitted);
+    assert_eq!(result.attribution, Attribution::Possible);
+    assert_eq!(result.stop_reason, StopReason::Canceled);
+    assert!(result.failure.is_none());
+    // One directory with its file was removed. The other directory, its
+    // file, and the target directory stay.
+    assert_eq!(outcome.work.removed_entries, EntryCount::new(2));
+    assert_eq!(outcome.work.remaining_entries, EntryCount::new(3));
+    assert!(tree.is_dir());
+    let left: Vec<PathBuf> = ["d1", "d2"]
+        .iter()
+        .map(|name| tree.join(name))
+        .filter(|directory| directory.exists())
+        .collect();
+    assert_eq!(left.len(), 1);
+    assert!(left[0].join("file.bin").exists());
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_stop_before_the_first_call_of_a_directory_target_is_a_skipped_target() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_two_directories(&fixture);
+    let before = listing(&tree);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    let receipt: DispatchReceipt = receipt();
+    let step = AdmittedStep::new(&envelope, &receipt).unwrap();
+    let signal = stop_from(1);
+
+    let outcome = fixture
+        .executor()
+        .execute_step_until(&fixture.roots(), step, &signal)
+        .unwrap();
+
+    let result: &TargetResult = &outcome.result;
+    assert_eq!(result.effect, TargetEffect::Skipped);
+    assert_eq!(result.dispatch, DispatchState::NotSubmitted);
+    assert_eq!(result.evidence.native, NativeResult::NotCalled);
+    assert_eq!(result.stop_reason, StopReason::Canceled);
+    assert_eq!(outcome.work.removed_entries, EntryCount::ZERO);
+    assert_eq!(outcome.work.remaining_entries, EntryCount::new(5));
+    assert_eq!(listing(&tree), before);
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_stop_inside_a_directory_target_stops_the_batch() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_two_directories(&fixture);
+    let later: PathBuf = fixture.root.join("later.bin");
+    fs::write(&later, b"later").unwrap();
+    let envelopes = [
+        fixture.envelope(ActionClass::EvictRegenerableData, "tree"),
+        fixture.envelope(ActionClass::EvictRegenerableData, "later.bin"),
+    ];
+    let receipt: DispatchReceipt = receipt();
+    let steps: Vec<AdmittedStep<'_>> = envelopes
+        .iter()
+        .map(|envelope| AdmittedStep::new(envelope, &receipt).unwrap())
+        .collect();
+    // The first reading is that of the batch before the tree. The third
+    // reading is before the second directory of the tree.
+    let stop = stop_from(3);
+
+    let outcome: BatchOutcome = fixture
+        .executor()
+        .execute_batch(&fixture.roots(), steps, &stop);
+
+    assert_eq!(outcome.stopped, Some(Stop::Canceled));
+    let first: &TargetResult = &outcome.outcomes[0].as_ref().unwrap().result;
+    assert_eq!(first.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(first.stop_reason, StopReason::Canceled);
+    let second: &TargetResult = &outcome.outcomes[1].as_ref().unwrap().result;
+    assert_eq!(second.effect, TargetEffect::Skipped);
+    assert_eq!(second.dispatch, DispatchState::NotSubmitted);
+    assert_eq!(second.stop_reason, StopReason::Canceled);
+    assert!(tree.is_dir());
+    assert!(later.exists());
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_tree_with_an_entry_of_another_owner_is_refused_as_a_whole() {
+    for class in PERMANENT {
+        let fixture = Fixture::new();
+        let tree: PathBuf = make_tree(&fixture);
+        let before = listing(&tree);
+        let envelope = fixture.envelope(class, "tree");
+        // The measurement reports another owner for one file of the tree.
+        let hook: MetadataHook = Box::new(|path: &[u8], metadata: &mut Metadata| {
+            if path.ends_with(b"tree/a/one.bin") {
+                metadata.owner = metadata.owner.wrapping_add(1);
+            }
+        });
+
+        let outcome = run(
+            &fixture.executor_with(metadata_injection(hook)),
+            &fixture.roots(),
+            &envelope,
+        );
+
+        assert_skipped(
+            &outcome,
+            &ErrorFamily::Eligibility,
+            code::TREE_ENTRY_OWNER_MISMATCH,
+        );
+        assert_eq!(listing(&tree), before);
+        fixture.assert_outside_unchanged();
+    }
 }

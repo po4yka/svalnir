@@ -137,7 +137,8 @@ impl AcceptedView {
 /// The response of a command that waited for an operation.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ApplyView {
-    /// `finished`, `timed_out`, or `interrupted`.
+    /// `finished`, `timed_out`, `interrupted`, `no_coordinator`, or, for
+    /// an existing operation that is not at its end, `not_waited`.
     pub(crate) wait: &'static str,
     /// True when the plan was applied before this request. No second
     /// operation was made.
@@ -188,16 +189,14 @@ impl ApplyView {
     }
 }
 
-/// The display path of each file target of a plan document.
-pub(crate) fn target_paths(document: Option<&PlanDocument>) -> BTreeMap<TargetId, LosslessPath> {
+/// The display path of each file target of a plan, from the values that
+/// the sealed plan binds and the cleanup roots of the plan document.
+pub(crate) fn target_paths(
+    plan: &Plan,
+    document: Option<&PlanDocument>,
+) -> BTreeMap<TargetId, LosslessPath> {
     document.map_or_else(BTreeMap::new, |document| {
-        document
-            .outcome
-            .preview
-            .targets
-            .iter()
-            .filter_map(|target| Some((target.target_id.clone(), target.path.clone()?)))
-            .collect()
+        super::clean::bound_paths(plan, document)
     })
 }
 
@@ -236,8 +235,12 @@ fn existing_view(
     operation: &Operation,
 ) -> ApplyView {
     let stop_fence: Option<bool> = journal.try_has_stop_fence(operation.operation_id()).ok();
+    let ended: bool = operation.state().is_settled()
+        || operation.state() == &svalnir_core::action::OperationState::UnknownOutcome;
     ApplyView {
-        wait: "finished",
+        // An operation that is not at its end was not waited for: the
+        // executor of the first request has it.
+        wait: if ended { "finished" } else { "not_waited" },
         existing_operation: true,
         plan_id: flow.plan.plan_id.clone(),
         executor: None,
@@ -249,7 +252,7 @@ fn existing_view(
                         .as_ref()
                         .and_then(|document| document.measurements.as_ref()),
                 )
-                .with_paths(target_paths(flow.document.as_ref())),
+                .with_paths(target_paths(flow.plan, flow.document.as_ref())),
         ),
         notes: Vec::new(),
     }
@@ -263,16 +266,16 @@ fn emit_existing(
     view: &ApplyView,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    invocation.emit(Kind::Operation, view, ApplyView::render)?;
     let in_progress: bool = view
         .operation
         .as_ref()
         .is_some_and(|operation| operation.state == svalnir_core::action::OperationState::Admitted);
-    if flow.no_wait && in_progress {
-        Ok(ExitStatus::Success)
+    let status: ExitStatus = if flow.no_wait && in_progress {
+        ExitStatus::Success
     } else {
-        Ok(view.status())
-    }
+        view.status()
+    };
+    invocation.emit_with_status(Kind::Operation, view, ApplyView::render, status)
 }
 
 /// The parts of an `accepted` response that the operation gives.
@@ -290,14 +293,24 @@ fn accepted_view(
         } else {
             "request_queued"
         },
-        operation_id,
         plan_id: flow.plan.plan_id.clone(),
         state: report.map_or_else(
-            || "queued".to_owned(),
+            || {
+                // An operation that exists is admitted, also when its
+                // view cannot be read now.
+                if operation_id.is_some() {
+                    svalnir_core::action::OperationState::Admitted
+                        .as_str()
+                        .to_owned()
+                } else {
+                    "queued".to_owned()
+                }
+            },
             |report| report.state.as_str().to_owned(),
         ),
         dispatch: report.map(|report| report.dispatch.as_str().to_owned()),
         durability: report.map(|report| report.durability.as_str().to_owned()),
+        operation_id,
         executor,
         request_id,
         notes,
@@ -339,8 +352,12 @@ fn respond_transient(
             None,
             vec![NO_WAIT_NOTE, TRANSIENT_NOTE],
         );
-        invocation.emit(Kind::Accepted, &view, AcceptedView::render)?;
-        return Ok(ExitStatus::Success);
+        return invocation.emit_with_status(
+            Kind::Accepted,
+            &view,
+            AcceptedView::render,
+            ExitStatus::Success,
+        );
     }
     let end = running.wait(invocation.timeout, &invocation.environment.interrupt);
     let (wait, operation, note) = wait_parts(end, flow.what)?;
@@ -350,11 +367,12 @@ fn respond_transient(
         plan_id: flow.plan.plan_id.clone(),
         executor: Some(Executor::TransientCoordinator),
         request_id: None,
-        operation: operation.map(|report| report.with_paths(target_paths(flow.document.as_ref()))),
+        operation: operation
+            .map(|report| report.with_paths(target_paths(flow.plan, flow.document.as_ref()))),
         notes: note.into_iter().collect(),
     };
-    invocation.emit(Kind::Operation, &view, ApplyView::render)?;
-    Ok(view.status())
+    let status: ExitStatus = view.status();
+    invocation.emit_with_status(Kind::Operation, &view, ApplyView::render, status)
 }
 
 /// Records the operation of a plan in its plan document, so that a
@@ -423,6 +441,16 @@ fn run_queued(
     } else {
         queued.wait(invocation.timeout, false, &invocation.environment.interrupt)
     };
+    // A wait that failed after the admission still knows the operation:
+    // the plan document gets it, so a repeated request finds it.
+    if let super::execution::WaitEnd::Failed(error) = &end
+        && let Some(operation_id) = error
+            .operation_id
+            .as_deref()
+            .and_then(|text| OperationId::new(text).ok())
+    {
+        record_operation(flow, &operation_id, invocation);
+    }
     let (wait, report, note) = wait_parts(end, flow.what)?;
     if let Some(report) = &report {
         record_operation(flow, &report.operation_id.clone(), invocation);
@@ -436,14 +464,14 @@ fn run_queued(
             Some(request_id),
             vec![NO_WAIT_NOTE, QUEUED_NOTE],
         );
-        invocation.emit(Kind::Accepted, &view, AcceptedView::render)?;
         // An interrupt ends the client with its own status. The request
         // stays in the queue.
-        return Ok(if wait == "interrupted" {
+        let status: ExitStatus = if wait == "interrupted" {
             ExitStatus::Interrupted
         } else {
             ExitStatus::Success
-        });
+        };
+        return invocation.emit_with_status(Kind::Accepted, &view, AcceptedView::render, status);
     }
     let view = ApplyView {
         wait,
@@ -451,11 +479,12 @@ fn run_queued(
         plan_id: flow.plan.plan_id.clone(),
         executor: Some(Executor::QueuedForCoordinator),
         request_id: Some(request_id),
-        operation: report.map(|report| report.with_paths(target_paths(flow.document.as_ref()))),
+        operation: report
+            .map(|report| report.with_paths(target_paths(flow.plan, flow.document.as_ref()))),
         notes: std::iter::once(QUEUED_NOTE).chain(note).collect(),
     };
-    invocation.emit(Kind::Operation, &view, ApplyView::render)?;
-    Ok(view.status())
+    let status: ExitStatus = view.status();
+    invocation.emit_with_status(Kind::Operation, &view, ApplyView::render, status)
 }
 
 #[cfg(target_os = "macos")]

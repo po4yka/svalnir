@@ -946,3 +946,73 @@ fn the_authority_record_round_trips_and_each_transition_is_deterministic() {
         disable(&state, &disable_request(DISK))
     );
 }
+
+#[test]
+fn a_restriction_of_a_guard_that_the_same_request_also_widens_inhibits_when_not_persisted() {
+    let state = enabled_state();
+    // The two differences are for the memory guard: the force quit is
+    // removed (narrower) and a protected application is removed (wider).
+    let mixed = config(&[
+        ("allow_force_quit = true", "allow_force_quit = false"),
+        (
+            r#"protected_bundle_ids = ["com.example.Protected"]"#,
+            "protected_bundle_ids = []",
+        ),
+    ]);
+    let request = activation(&state, &mixed, "policy_2");
+    let change = activate(&state, &request, &registry()).unwrap();
+    let memory = &change.report.differences;
+    assert!(
+        memory
+            .iter()
+            .any(|difference| difference.effect == ScopeEffect::Narrowing
+                && difference.guards.includes(MEMORY))
+    );
+    // The combined effect is widening, and the restriction is not lost.
+    assert_eq!(change.report.guards[1].effect, ScopeEffect::Widening);
+    assert!(change.is_restriction());
+    let acknowledged = change.acknowledge(&none(), Persistence::Failed);
+    assert_eq!(
+        acknowledged.level,
+        AcknowledgementLevel::CurrentInstanceInhibition
+    );
+    assert_eq!(acknowledged.state, state);
+    assert!(acknowledged.inhibition.guards.contains(&InhibitedGuard {
+        policy: MEMORY,
+        cause: InhibitionCause::Restriction,
+    }));
+}
+
+#[test]
+fn the_durable_record_refuses_an_unknown_key_and_an_absent_optional_key() {
+    let state = enabled_state();
+    let encoded = serde_json::to_value(&state).unwrap();
+    let decoded: AuthorityState = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, state);
+
+    // A key of a later build can restrict authority. This build does not
+    // drop it silently.
+    let mut unknown = encoded.clone();
+    unknown["only_while_on_power"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<AuthorityState>(unknown).is_err());
+    let mut unknown_grant = encoded.clone();
+    unknown_grant["guards"][0]["grant"]["limit"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<AuthorityState>(unknown_grant).is_err());
+    let mut unknown_scope = encoded.clone();
+    unknown_scope["active"]["scope"]["memory"]["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<AuthorityState>(unknown_scope).is_err());
+
+    // An absent key is not "no pause" and not "no expiry".
+    let mut no_pause = encoded.clone();
+    assert!(no_pause.as_object_mut().unwrap().remove("pause").is_some());
+    assert!(serde_json::from_value::<AuthorityState>(no_pause).is_err());
+    let mut no_expiry = encoded;
+    assert!(
+        no_expiry["guards"][0]["grant"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_at")
+            .is_some()
+    );
+    assert!(serde_json::from_value::<AuthorityState>(no_expiry).is_err());
+}

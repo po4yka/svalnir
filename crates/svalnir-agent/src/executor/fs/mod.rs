@@ -33,7 +33,8 @@
 //!   reclaimed capacity.
 //! - It reads no clock for a deadline. The coordinator gives the deadline,
 //!   the cancellation, and each revision change through the
-//!   [`StopSignal`].
+//!   [`StopSignal`]. [`FsExecutor::execute_step_until`] reads the signal
+//!   between the entries of a directory target also.
 //! - It repeats no call. After an error number that does not establish the
 //!   effect, it observes the entry one time and reports what it found.
 //!
@@ -57,6 +58,7 @@
 //! - A target whose root is not in the [`ApprovedRoots`] of the call.
 //! - A target, a directory between the root and the target, or an entry
 //!   of a directory target on another device than the root.
+//! - A directory target with an entry of another owner than the target.
 //! - A binding with no device and inode evidence.
 //! - A step whose principal is not the effective user of the process.
 //!
@@ -69,7 +71,13 @@
 //!
 //! - `unlinkat` then removes the replacement of the same name in the same
 //!   open directory. It follows no symbolic link and cannot leave that
-//!   directory. A replacement directory is removed only when it is empty.
+//!   directory. In a directory target, a replacement directory is removed
+//!   only when it is empty; for a file target it is not removed.
+//! - A descriptor follows its directory. An actor that moves an open
+//!   directory of a directory target, or a directory above the target, to
+//!   another place after its comparison makes the later calls act in that
+//!   place, also outside the approved root. Each call still acts only on a
+//!   name whose object was compared with the measurement of the tree.
 //! - The Trash operation takes a path. A replaced component of the path
 //!   can redirect it. The executor compares the identity of the moved item
 //!   after the call and reports a difference as `UnknownOutcome` with the

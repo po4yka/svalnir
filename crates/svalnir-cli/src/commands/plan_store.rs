@@ -166,10 +166,12 @@ fn plan_directory(environment: &Environment) -> Result<PathBuf, ErrorBody> {
     builder
         .create(&directory)
         .map_err(|error| store_error(&format!("cannot be written: {}", error.kind())))?;
-    // The directory of the documents is a directory of the state
+    // The directory of the documents is a private directory of the state
     // directory, not a link to a different place.
-    if !std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
-        return Err(store_error("has a directory that is not a directory"));
+    if !crate::environment::is_private_directory(&directory) {
+        return Err(store_error(
+            "has a directory that is a link, has a different owner, or is not private",
+        ));
     }
     Ok(directory)
 }
@@ -336,12 +338,16 @@ pub(crate) fn prune(environment: &Environment) {
     let now: SystemTime = SystemTime::now();
     for entry in entries.take(MAX_PRUNE_ENTRIES).flatten() {
         let path: PathBuf = entry.path();
-        let is_document: bool = path.extension().is_some_and(|extension| {
-            extension == "json" || extension == "new" || extension == "lock"
-        }) && path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| name.starts_with("plan-") || name.starts_with("stop-"));
+        // A lock file is never removed: a client can hold its lock, and a
+        // new file with the same name would be a second lock for the same
+        // process generation.
+        let is_document: bool = path
+            .extension()
+            .is_some_and(|extension| extension == "json" || extension == "new")
+            && path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("plan-") || name.starts_with("stop-"));
         let is_old: bool = entry
             .metadata()
             .ok()

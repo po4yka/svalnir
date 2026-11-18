@@ -1,5 +1,6 @@
 //! The filesystem executor: one admitted step to one target result.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::os::fd::AsFd as _;
 use std::time::SystemTime;
@@ -15,8 +16,8 @@ use svalnir_core::time::WallTime;
 use super::errors::{CallVerdict, Cause, code, mutation_verdict};
 use super::model::{
     AdmittedStep, ApprovedRoots, BatchOutcome, ConfigError, ExecutionFault, ExecutorLimits,
-    FsExecutorConfig, FsTargetOutcome, MAX_BATCH_STEPS, ProcessedWork, StepOutcome, Stop,
-    StopSignal, path_components,
+    FsExecutorConfig, FsTargetOutcome, MAX_BATCH_STEPS, NeverStop, ProcessedWork, StepOutcome,
+    Stop, StopSignal, path_components,
 };
 use super::native::{self, Kind};
 use super::remove::{
@@ -92,12 +93,10 @@ impl Draft {
         }
     }
 
-    /// The backend returned `ENOENT`: the entry was absent when the call
-    /// ran. The cause of the absence is not established.
-    fn absent_at_call(work: ProcessedWork) -> Self {
-        let native = NativeResult::Errno {
-            errno: libc::ENOENT,
-        };
+    /// The backend found no entry: the entry was absent when the call ran.
+    /// The cause of the absence is not established. `native` is what the
+    /// backend returned.
+    fn absent_at_call(native: NativeResult, work: ProcessedWork) -> Self {
         let mut draft = Self::submitted(TargetEffect::AlreadyAbsent, native, work);
         draft.attribution = Attribution::Possible;
         draft
@@ -131,7 +130,12 @@ impl Draft {
                 draft.attribution = attribution;
                 draft
             }
-            EntryOutcome::Absent => Self::absent_at_call(work),
+            EntryOutcome::Absent => Self::absent_at_call(
+                NativeResult::Errno {
+                    errno: libc::ENOENT,
+                },
+                work,
+            ),
             EntryOutcome::NoEffect { errno, cause } => Self::no_effect(errno, cause, work),
             EntryOutcome::Unknown { errno, cause } => {
                 // A call that returned success has no error number.
@@ -141,6 +145,21 @@ impl Draft {
                 Self::unknown(native, cause, work)
             }
         }
+    }
+}
+
+/// A stop signal that keeps the first stop that it gave.
+struct Latch<'a> {
+    signal: &'a dyn StopSignal,
+    seen: Cell<Option<Stop>>,
+}
+
+impl StopSignal for Latch<'_> {
+    fn check(&self) -> Option<Stop> {
+        if self.seen.get().is_none() {
+            self.seen.set(self.signal.check());
+        }
+        self.seen.get()
     }
 }
 
@@ -275,22 +294,26 @@ impl FsExecutor {
         stop: &dyn StopSignal,
     ) -> BatchOutcome {
         let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(steps.len());
-        let mut stopped: Option<Stop> = None;
+        // A stop inside a directory target stays for each later target.
+        let stop = Latch {
+            signal: stop,
+            seen: Cell::new(None),
+        };
         for (index, step) in steps.into_iter().enumerate() {
-            if stopped.is_none() {
-                stopped = stop.check();
-            }
-            let outcome: StepOutcome = if let Some(stop) = stopped {
+            let outcome: StepOutcome = if let Some(stop) = stop.check() {
                 seal(&step, Draft::stopped(stop))
             } else if index >= MAX_BATCH_STEPS {
                 let refusal = Refusal::skipped(Cause::limits(code::BATCH_LIMIT));
                 seal(&step, Draft::refused(refusal))
             } else {
-                self.execute_step(roots, step)
+                self.execute_step_until(roots, step, &stop)
             };
             outcomes.push(outcome);
         }
-        BatchOutcome { outcomes, stopped }
+        BatchOutcome {
+            outcomes,
+            stopped: stop.seen.get(),
+        }
     }
 
     /// Does one step.
@@ -304,15 +327,45 @@ impl FsExecutor {
     /// Returns an [`ExecutionFault`] when the executor could not make a
     /// consistent target result. That is a defect of the executor; the
     /// fault says whether a call was submitted.
+    pub fn execute_step(&self, roots: &ApprovedRoots, step: AdmittedStep<'_>) -> StepOutcome {
+        self.execute_step_until(roots, step, &NeverStop)
+    }
+
+    /// Does one step, and reads `signal` between the entries of a directory
+    /// target.
+    ///
+    /// The caller reads the signal before the step. A file target is one
+    /// call, so the executor does not read the signal for it. For a
+    /// directory target, the executor reads the signal before each
+    /// directory below the target and at intervals between the other
+    /// entries. After a stop it issues no call: the entries that it removed
+    /// stay removed, the target directory stays, and the result is
+    /// `UnknownOutcome` with the stop reason of the signal and the counts
+    /// in [`ProcessedWork`]. A target with no removed entry has `Skipped`
+    /// (no call was issued) or `Refused` (each call had no effect).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecutionFault`], as [`FsExecutor::execute_step`] does.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "the step is consumed: one dispatch consumption gives one call"
     )]
-    pub fn execute_step(&self, roots: &ApprovedRoots, step: AdmittedStep<'_>) -> StepOutcome {
-        seal(&step, self.draft_of(roots, &step))
+    pub fn execute_step_until(
+        &self,
+        roots: &ApprovedRoots,
+        step: AdmittedStep<'_>,
+        signal: &dyn StopSignal,
+    ) -> StepOutcome {
+        seal(&step, self.draft_of(roots, &step, signal))
     }
 
-    fn draft_of(&self, roots: &ApprovedRoots, step: &AdmittedStep<'_>) -> Draft {
+    fn draft_of(
+        &self,
+        roots: &ApprovedRoots,
+        step: &AdmittedStep<'_>,
+        signal: &dyn StopSignal,
+    ) -> Draft {
         let envelope = step.envelope();
         // The user executor changes only the objects of its own user, with
         // the rights of that user.
@@ -353,7 +406,7 @@ impl FsExecutor {
                 }
                 Draft::of_entry(outcome, work)
             }
-            Kind::Directory => match remove_tree(&located, &self.limits, &self.injection) {
+            Kind::Directory => match remove_tree(&located, &self.limits, &self.injection, signal) {
                 Ok(removal) => Self::draft_of_tree(removal),
                 Err(refusal) => Draft::refused(refusal),
             },
@@ -370,8 +423,12 @@ impl FsExecutor {
             work,
             first_cause,
             indeterminate,
+            called,
         } = removal;
         let outcome: EntryOutcome = match root {
+            Attempt::Stopped(stop) => {
+                return Self::draft_of_stopped_tree(stop, work, first_cause, indeterminate, called);
+            }
             // The comparison of the target directory comes before each
             // call, so no call was issued.
             Attempt::Vanished => return Draft::absent_before_call(),
@@ -379,6 +436,19 @@ impl FsExecutor {
             Attempt::Called(outcome) => outcome,
         };
         match outcome {
+            // The directory was absent at its call, after the executor
+            // removed entries of it: another actor removed or moved the
+            // empty directory. `AlreadyAbsent` states a no-op, which is
+            // false here. The name is absent, and the executor did a part
+            // of the removal.
+            EntryOutcome::Absent if work.removed_entries > EntryCount::ZERO => {
+                let native = NativeResult::Errno {
+                    errno: libc::ENOENT,
+                };
+                let mut draft = Draft::submitted(TargetEffect::Removed, native, work);
+                draft.attribution = Attribution::Possible;
+                draft
+            }
             // The directory is gone, or its condition is not established.
             EntryOutcome::Removed { .. } | EntryOutcome::Absent | EntryOutcome::Unknown { .. } => {
                 Draft::of_entry(outcome, work)
@@ -404,6 +474,44 @@ impl FsExecutor {
                 None => Draft::no_effect(errno, first_cause.unwrap_or(cause), work),
             },
         }
+    }
+
+    /// The result of a directory target whose removal a stop ended. The
+    /// target directory got no call and stays.
+    fn draft_of_stopped_tree(
+        stop: Stop,
+        work: ProcessedWork,
+        first_cause: Option<Cause>,
+        indeterminate: Option<Cause>,
+        called: bool,
+    ) -> Draft {
+        if !called {
+            let mut draft = Draft::stopped(stop);
+            draft.work = work;
+            return draft;
+        }
+        if let Some(unknown) = indeterminate {
+            return Draft::unknown(NativeResult::Unavailable, unknown, work);
+        }
+        if work.removed_entries > EntryCount::ZERO {
+            // A part of the entries was removed. As for each other target
+            // that was removed in part, the result is `UnknownOutcome`,
+            // which never understates the effect.
+            let mut draft = Draft::submitted(
+                TargetEffect::UnknownOutcome,
+                NativeResult::Unavailable,
+                work,
+            );
+            draft.attribution = Attribution::Possible;
+            draft.stop_reason = stop.stop_reason();
+            return draft;
+        }
+        // Each call that was issued had no effect.
+        Draft::no_effect(
+            None,
+            first_cause.unwrap_or(Cause::native(code::NATIVE_ERROR)),
+            work,
+        )
     }
 
     /// Moves a revalidated target to Trash. A failure is reported; it is
@@ -435,10 +543,12 @@ impl FsExecutor {
                     // The backend reports a move and the object of the
                     // plan is where it was.
                     Draft::unknown(NativeResult::Succeeded, unverified(), remaining)
-                } else if item_object.is_none() && observed == Observed::Unobserved {
-                    // The reply of the backend is the only evidence: it
-                    // gave no item identity, and the source name cannot be
-                    // read.
+                } else if item_object.is_none() && observed != Observed::Gone {
+                    // The backend gave no item identity, so only the
+                    // absence of the source name can show that the object
+                    // of the plan was moved. The name cannot be read, or
+                    // another object has it: an actor changed the name
+                    // near the call, and the moved object is not known.
                     Draft::unknown(NativeResult::Succeeded, unverified(), remaining)
                 } else if item_object.is_some_and(|object| object != located.object) {
                     // The backend moved another object: a component of the
@@ -515,7 +625,7 @@ impl FsExecutor {
             (CallVerdict::Absent, Observed::Gone) => {
                 let mut work = ProcessedWork::none();
                 work.vanished_entries = EntryCount::new(1);
-                Draft::absent_at_call(work)
+                Draft::absent_at_call(native_of(errno), work)
             }
             // The backend found no entry at the path, and the object of
             // the plan is where it was: a component of the path changed.

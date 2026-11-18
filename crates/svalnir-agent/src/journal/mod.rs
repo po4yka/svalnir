@@ -125,7 +125,9 @@
 //! coordinator. A registration that was not released marks an unclean stop,
 //! and the journal then refuses each admission and each dispatch
 //! consumption until the new coordinator calls
-//! [`OperationJournal::complete_reconciliation`]. A journal that has no
+//! [`OperationJournal::complete_reconciliation`]. A registration that
+//! finds an operation that is not settled does the same, also after a
+//! release. A journal that has no
 //! registration applies no such gate; the first registration finds work
 //! that is not settled and marks the reconciliation as pending.
 //!
@@ -169,8 +171,8 @@ use self::migration::{MIGRATIONS, Migration};
 pub use self::record::{AgentRecord, MAX_AGENT_RECORD_BYTES, StoredAgentRecord};
 pub use self::recovery::{ConsumedDispatch, RecoveryPosition, RecoveryRecord, StepRecovery};
 pub use self::request::{
-    ClaimedRequest, Enqueued, MAX_OPEN_REQUESTS, QueuedRequest, RequestBody, RequestCompletion,
-    RequestStatus,
+    ClaimedRequest, Enqueued, MAX_OPEN_REQUESTS, QueuedRequest, REQUEST_NOT_DECODABLE, RequestBody,
+    RequestCompletion, RequestStatus,
 };
 pub use self::retention::PruneReport;
 pub use self::revision::MAX_REVISION_SOURCE_BYTES;

@@ -2504,3 +2504,6 @@ fn a_resource_effect_round_trips_and_an_unknown_resource_stays_unknown() {
         serde_json::from_value(json!({ "resource": "thermal_state", "before": 1 })).unwrap();
     assert_eq!(newer, ResourceEffect::Unrecognized);
 }
+
+// Regression tests of the review of Milestone 2.
+mod review;

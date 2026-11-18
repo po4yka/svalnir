@@ -843,7 +843,6 @@ fn a_root_principal_and_a_member_of_another_boot_are_refused() {
         code::EXECUTOR_CONTEXT_CHANGED,
         &ErrorFamily::Evidence,
     );
-    assert_eq!(USER, 501);
 }
 
 // Verification.
@@ -877,6 +876,44 @@ fn a_failed_verification_query_is_an_unknown_outcome() {
     assert_eq!(
         aggregate_step(&report.results()).unwrap(),
         StepState::UnknownOutcome
+    );
+}
+
+#[test]
+fn a_graceful_step_with_an_unknown_member_permits_no_force_call_for_another_member() {
+    // 100 runs at the end of the grace period. The condition of 101 is not
+    // known: its query fails.
+    let host: Host = Host::new().with_process(100, 10).with_process(101, 10);
+    let members = vec![member(100, 10, job()), member(101, 10, job())];
+    let envelope = graceful(Escalation::ForceAfterGrace, members.clone());
+    let observation = observing(begin(&host, &envelope));
+    host.change(|world| {
+        world.info_failures.insert(101, QueryFailure::Failed(5));
+    });
+    host.advance(GRACE);
+    let report = finished(poll(&host, observation, None));
+    assert_eq!(report.members[0].result.effect, TargetEffect::StillRunning);
+    assert_eq!(
+        report.members[1].result.effect,
+        TargetEffect::UnknownOutcome
+    );
+    assert_eq!(report.next, NextStep::Reconcile);
+    // A caller that submits the force step in spite of that gets no call.
+    host.change(|world| {
+        world.info_failures.clear();
+    });
+    let results = report.results();
+    let after_grace = force(Escalation::ForceAfterGrace, members);
+    let receipt = receipt();
+    assert_eq!(
+        host.executor()
+            .begin(force_input(&after_grace, &receipt, &report, &results))
+            .unwrap_err(),
+        ExecutorError::GracefulRecord
+    );
+    assert_eq!(
+        host.calls(),
+        vec![NativeCall::Signal(100, TERM), NativeCall::Signal(101, TERM)]
     );
 }
 
@@ -1515,15 +1552,13 @@ fn a_graceful_record_with_an_unrecognized_value_permits_no_force_call() {
     let results = vec![Checked::new(record).unwrap()];
     let envelope = force(Escalation::ForceAfterGrace, members);
     let receipt = receipt();
-    let forced = finished(
+    // An unrecognized field is an effect that is not known: the step as a
+    // whole is refused before the first call.
+    assert_eq!(
         host.executor()
             .begin(force_input(&envelope, &receipt, &report, &results))
-            .unwrap(),
-    );
-    assert_eq!(forced.members[0].result.effect, TargetEffect::Skipped);
-    assert_eq!(
-        code_of(&forced.members[0].result),
-        code::GRACEFUL_REQUEST_NOT_SUBMITTED
+            .unwrap_err(),
+        ExecutorError::GracefulRecord
     );
     assert_eq!(host.calls(), vec![NativeCall::Signal(100, TERM)]);
 }

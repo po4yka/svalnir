@@ -224,7 +224,8 @@ impl ConsumedRequests {
     }
 
     /// Makes the record from the requests of an earlier lifetime of the
-    /// helper.
+    /// helper. A step that the earlier lifetime left in `DispatchConsumed`
+    /// or `Verifying` gets the state `UnknownOutcome`.
     ///
     /// # Errors
     ///
@@ -238,7 +239,18 @@ impl ConsumedRequests {
         requests: impl IntoIterator<Item = ConsumedRequest>,
     ) -> Result<Self, RecordError> {
         let mut record: Self = Self::new(capacity, retention)?;
-        for request in requests {
+        for mut request in requests {
+            // The lifetime that did the step is gone. A step that it did
+            // not settle has no executor now, and its effect is not known:
+            // the call was possibly submitted. The step stays consumed, a
+            // query does not report it as in work, and reconciliation
+            // settles it.
+            if matches!(
+                request.state,
+                StepState::DispatchConsumed | StepState::Verifying
+            ) {
+                request.state = StepState::UnknownOutcome;
+            }
             record.insert(request)?;
         }
         Ok(record)

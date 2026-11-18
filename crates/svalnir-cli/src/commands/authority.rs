@@ -272,7 +272,7 @@ pub(crate) fn config_apply(
     let registry = registry()?;
     let revision_id: PolicyRevisionId =
         PolicyRevisionId::new(session::new_id("rev")).map_err(|_| session::identity_error())?;
-    let now: WallTime = session::wall_now();
+    let now: WallTime = session::record_time()?;
 
     let mut journal: OperationJournal = open_journal(invocation.environment)?;
     let stored: StoredAuthority = read_authority(&journal)?;
@@ -422,7 +422,7 @@ pub(crate) fn policy_enable(
         None => None,
     };
     let accepted: Vec<ActionClass> = accepted_classes(arguments);
-    let now: WallTime = session::wall_now();
+    let now: WallTime = session::record_time()?;
     // A guard is enabled only for a revision in effect, which a journal
     // records. With no journal, the command makes none.
     let mut journal: OperationJournal = session::open_existing_journal(invocation.environment)?
@@ -435,6 +435,11 @@ pub(crate) fn policy_enable(
         .map(|active| active.revision.revision_id.clone())
         .ok_or_else(session::no_active_revision)?;
 
+    // `--expected-revision none` expects no revision in effect, and a
+    // guard is enabled only for a revision in effect.
+    if reviewed.is_none() && arguments.expected_revision.is_some() {
+        return Err(revision_conflict(None, Some(&active), "").into());
+    }
     // With no reviewed revision, an interactive user reviews the revision
     // in effect and the action classes here.
     let mut interactive: bool = false;
@@ -512,7 +517,7 @@ pub(crate) fn policy_disable(
     arguments: &PolicyRef,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    let now: WallTime = session::wall_now();
+    let now: WallTime = session::record_time()?;
     let mut journal: OperationJournal = open_journal(invocation.environment)?;
     let stored: StoredAuthority = read_authority(&journal)?;
     let change: Change<RestrictionReport> = disable(

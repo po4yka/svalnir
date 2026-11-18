@@ -182,7 +182,8 @@ pub enum TargetExplanation {
         rule: Option<RuleRef>,
         /// The admission charge. It is not a size.
         admission_charge: WorkCharge,
-        /// The size estimates.
+        /// The size estimates. The estimate of reclaimable bytes is `None`
+        /// for a mode that reclaims no capacity.
         estimate: SizeEstimate,
     },
     /// An application or a managed job.
@@ -266,7 +267,15 @@ pub struct PlanExplanation {
     pub preset: Option<String>,
 }
 
-fn target_explanation(target: &PlanTarget, preview: Option<&TargetPreview>) -> TargetExplanation {
+/// The explanation of one target. With `reclaims` false, the mode
+/// reclaims no capacity, and the target has no estimate of reclaimable
+/// bytes: an estimate for a permanent removal is not shown for a move to
+/// Trash.
+fn target_explanation(
+    target: &PlanTarget,
+    preview: Option<&TargetPreview>,
+    reclaims: bool,
+) -> TargetExplanation {
     match &target.binding {
         TargetBinding::File(file) => TargetExplanation::File {
             target_id: target.target_id.clone(),
@@ -279,7 +288,13 @@ fn target_explanation(target: &PlanTarget, preview: Option<&TargetPreview>) -> T
             has_object_evidence: file.object.is_some(),
             rule: file.rule.clone(),
             admission_charge: file.charge,
-            estimate: preview.map_or_default(|preview| preview.estimate),
+            estimate: {
+                let mut estimate: SizeEstimate = preview.map_or_default(|preview| preview.estimate);
+                if !reclaims {
+                    estimate.estimated_reclaimable_bytes = None;
+                }
+                estimate
+            },
         },
         TargetBinding::Application(application) => TargetExplanation::Application {
             target_id: target.target_id.clone(),
@@ -351,7 +366,7 @@ pub fn explain(outcome: &PlanOutcome, clock: &EvaluationClock) -> PlanExplanatio
     let targets: Vec<TargetExplanation> = outcome.plan.as_ref().map_or_else(Vec::new, |plan| {
         plan.targets
             .iter()
-            .map(|target| target_explanation(target, preview_of(&target.target_id)))
+            .map(|target| target_explanation(target, preview_of(&target.target_id), reclaims))
             .collect()
     });
     let summary: Option<PlanSummary> = outcome.plan.as_ref().map(|plan| {
@@ -392,7 +407,18 @@ pub fn explain(outcome: &PlanOutcome, clock: &EvaluationClock) -> PlanExplanatio
         targets,
         totals,
         batches: outcome.preview.batches.clone(),
-        omitted: outcome.preview.omitted.clone(),
+        omitted: outcome
+            .preview
+            .omitted
+            .iter()
+            .cloned()
+            .map(|mut omission| {
+                if !reclaims {
+                    omission.estimate.estimated_reclaimable_bytes = None;
+                }
+                omission
+            })
+            .collect(),
         preset: outcome.preview.preset.clone(),
     }
 }

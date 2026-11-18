@@ -82,6 +82,9 @@ pub mod code {
     pub const OBJECT_STILL_PRESENT: &str = "object_still_present";
     /// The coordinator has no operation with the identity.
     pub const OPERATION_NOT_FOUND: &str = "operation_not_found";
+    /// The request is of a different user than the apply of the
+    /// operation.
+    pub const PRINCIPAL_MISMATCH: &str = "principal_mismatch";
     /// The coordinator made no new identity.
     pub const IDENTITY_UNAVAILABLE: &str = "identity_unavailable";
     /// A reconciliation is pending and is not complete.

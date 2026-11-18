@@ -7,7 +7,7 @@ use svalnir_core::digest::ContentDigest;
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::quantity::{EntryCount, Nanoseconds};
 use svalnir_core::rule::RuleRef;
-use svalnir_core::time::MonotonicNanos;
+use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::path::EntryPath;
 use super::record::{ConsumedRequest, RateUsage, RecordError, StepKey, StepStatus};
@@ -60,7 +60,10 @@ pub struct BoundedEviction {
     /// not larger than a ceiling of the grant.
     pub limit: WorkCharge,
     /// The monotonic time after which the executor submits no call: the
-    /// expiry of the request.
+    /// expiry of the request. The helper accepted the request only because
+    /// the grant applies until this time. A revocation after the
+    /// acceptance is not in this value: the executor asks the state again
+    /// before each call.
     pub deadline: MonotonicNanos,
 }
 
@@ -152,7 +155,10 @@ struct RequestContent<'request> {
 ///
 /// The function is pure: it reads no clock and no file, and it changes
 /// nothing. With the same arguments it gives the same result. Use it to
-/// examine a decision. To act on a request, use [`HelperState::admit`],
+/// examine a decision. It decides against the record as it is:
+/// [`HelperState::admit`] first removes each record that can be removed,
+/// so the two results can be different for a state that has such a record
+/// (a full record, or a settled step whose retention is complete). To act on a request, use [`HelperState::admit`],
 /// which also records the consumption.
 ///
 /// The helper uses only its own state and the identity that the transport
@@ -173,6 +179,7 @@ struct RequestContent<'request> {
 ///    a refusal.
 /// 5. The validity: the timeline, the expiry, and the longest validity.
 /// 6. The grant: its user, its generation, its revocation, and its expiry.
+///    The grant must apply for the full validity of the request.
 /// 7. The root and the rule revision of the root.
 /// 8. The entries: their number, their names, and their bounds.
 /// 9. The ceilings of one operation, in bytes and in items.
@@ -311,7 +318,11 @@ fn evaluate_eviction(
 
     // Deduplication comes before each check of freshness and authority. A
     // repeated step gets its recorded state, and never a second acceptance,
-    // also after its request expired or its grant changed.
+    // also after its request expired or its grant changed. This is true
+    // while the record has the step. The record removes a settled step
+    // only after its request is expired and its retention is complete; a
+    // later request for the same step identity is then a new step, with
+    // each check of freshness, authority, and rate.
     if let Some(recorded) = state.consumed.find(&key) {
         return if recorded.content == content {
             Ok(Evaluation::Known(recorded.status()))
@@ -329,6 +340,7 @@ fn evaluate_eviction(
     check_validity(&request.validity, clock, state.config.max_validity)?;
 
     let record: &HelperGrant = check_grant(state, caller, &eviction.grant, clock)?;
+    check_grant_outlasts(record.grant(), &request.validity, clock)?;
     let root: &ApprovedRoot = record
         .root(&eviction.root_id)
         .ok_or(RefusalReason::RootNotGranted)?;
@@ -476,6 +488,43 @@ fn check_grant<'state>(
         return Err(RefusalReason::GrantExpired);
     }
     Ok(record)
+}
+
+/// Checks that the grant applies for the full validity of the request.
+///
+/// The executor can submit a call until the expiry of the request, which
+/// is a monotonic time. The expiry of the grant is a wall-clock time. The
+/// function adds the time that remains of the request to the wall-clock
+/// time of the check, and refuses the request when the result is after the
+/// expiry of the grant. Thus an accepted step
+/// is not executed after its grant expired. A result that the wall clock
+/// cannot hold is refused.
+fn check_grant_outlasts(
+    grant: &PrivilegeGrant,
+    validity: &RequestValidity,
+    clock: &HelperClock,
+) -> Result<(), RefusalReason> {
+    const NANOSECONDS_PER_SECOND: u128 = 1_000_000_000;
+    let Some(expiry) = grant.expires_at else {
+        return Ok(());
+    };
+    let remaining: Nanoseconds = validity
+        .expires_at
+        .checked_duration_since(clock.monotonic)
+        .ok_or(RefusalReason::ArithmeticOverflow)?;
+    let total: u128 = u128::from(clock.wall.subsecond_nanoseconds())
+        .checked_add(u128::from(remaining.get()))
+        .ok_or(RefusalReason::ArithmeticOverflow)?;
+    let last_call: WallTime = i64::try_from(total / NANOSECONDS_PER_SECOND)
+        .ok()
+        .and_then(|seconds: i64| clock.wall.unix_seconds().checked_add(seconds))
+        .zip(u32::try_from(total % NANOSECONDS_PER_SECOND).ok())
+        .and_then(|(seconds, fraction): (i64, u32)| WallTime::from_unix(seconds, fraction).ok())
+        .ok_or(RefusalReason::ArithmeticOverflow)?;
+    if last_call > expiry {
+        return Err(RefusalReason::GrantExpiresBeforeRequest);
+    }
+    Ok(())
 }
 
 /// Checks the entries and adds their bounds.

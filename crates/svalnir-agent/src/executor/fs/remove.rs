@@ -6,8 +6,9 @@
 //! 1. The measurement reads the tree through descriptors and keeps the
 //!    name, the device, the inode, and the type of each entry. It issues no
 //!    mutation. A tree that does not fit the depth, entry, or descriptor
-//!    bound, that has a mount point, a dataless directory, or a type that
-//!    is not supported, is refused as a whole: nothing is removed.
+//!    bound, that has a mount point, a dataless directory, an entry of
+//!    another owner than the target, or a type that is not supported, is
+//!    refused as a whole: nothing is removed.
 //! 2. The removal goes bottom-up through the measured entries only. It
 //!    compares each entry with its measurement immediately before the
 //!    call, never follows a symbolic link, and never reads a directory
@@ -18,7 +19,15 @@
 //! that can write to the directory can replace an entry between them; the
 //! call then removes the replacement of the same name in the same
 //! directory. It cannot leave the directory, because the call is relative
-//! to the open descriptor.
+//! to the open descriptor. The descriptor follows its directory: an actor
+//! that moves an open directory of the tree, or a directory above it, to
+//! another place makes the later calls act in that place. Each call still
+//! acts only on a name whose object was compared with the measurement.
+//!
+//! The removal reads the stop signal between the entries of the tree: before
+//! each directory below the target and after each [`STOP_CHECK_ENTRIES`]
+//! entries. After a stop it issues no call. The entries that it removed
+//! stay removed, and the target directory stays.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -29,7 +38,7 @@ use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
 use svalnir_core::quantity::{Bytes, EntryCount};
 
 use super::errors::{CallVerdict, Cause, code, mutation_verdict, read_cause};
-use super::model::{ExecutorLimits, ProcessedWork};
+use super::model::{ExecutorLimits, ProcessedWork, Stop, StopSignal};
 use super::native::{self, DirStream, Kind, Metadata};
 use super::resolve::{
     Checkpoint, Injection, Located, Refusal, identity_of, is_absent, is_not_directory, push_name,
@@ -37,6 +46,10 @@ use super::resolve::{
 
 /// The size in bytes of one `st_blocks` unit.
 const BLOCK_BYTES: u64 = 512;
+
+/// The largest number of entries of a directory target that the removal
+/// starts between two readings of the stop signal.
+pub(super) const STOP_CHECK_ENTRIES: u32 = 256;
 
 /// The result of one `unlinkat` call, after the observation of the entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,9 +120,10 @@ pub(super) fn observe_entry(
 /// is not repeated for any result.
 ///
 /// `Established` states that the call returned success for the name and
-/// that the object of the comparison does not have the name after it. It
-/// does not state that the removed object was the object of the plan: see
-/// the race in the module documentation.
+/// that no object has the name after it. It does not state that the
+/// removed object was the object of the plan: see the race in the module
+/// documentation. When another object has the name after the call, the
+/// attribution is `Possible`.
 pub(super) fn settle_unlink(
     result: &io::Result<()>,
     parent: BorrowedFd<'_>,
@@ -122,11 +136,14 @@ pub(super) fn settle_unlink(
     let error: &io::Error = match result {
         Ok(()) => {
             return match observed {
-                Observed::Gone | Observed::Replaced => EntryOutcome::Removed {
+                Observed::Gone => EntryOutcome::Removed {
                     attribution: Attribution::Established,
                     errno: None,
                 },
-                Observed::Unobserved => EntryOutcome::Removed {
+                // Another object has the name after the call. An actor
+                // changed the name near the call, so the observation does
+                // not establish which object the call removed.
+                Observed::Replaced | Observed::Unobserved => EntryOutcome::Removed {
                     attribution: Attribution::Possible,
                     errno: None,
                 },
@@ -248,6 +265,8 @@ impl Snapshot {
 struct Measure<'a> {
     limits: &'a ExecutorLimits,
     device: DeviceNumber,
+    /// The owner of the target directory, which is the owner of the plan.
+    owner: u32,
     injection: &'a Injection,
     entries: u64,
 }
@@ -321,6 +340,15 @@ impl Measure<'_> {
             }
             if metadata.device != Some(self.device) {
                 return Err(Refusal::skipped(Cause::evidence(code::MOUNT_CROSSED)));
+            }
+            // The plan has the owner of the target only. An entry of
+            // another owner is not data of the owning user: the write
+            // permission on its directory permits the unlink, and the plan
+            // does not.
+            if metadata.owner != self.owner {
+                return Err(Refusal::skipped(Cause::eligibility(
+                    code::TREE_ENTRY_OWNER_MISMATCH,
+                )));
             }
             let children: Vec<Snapshot> = match metadata.kind {
                 Kind::Other => {
@@ -397,6 +425,10 @@ pub(super) enum Attempt {
     NotAttempted(Refusal),
     /// The call was issued.
     Called(EntryOutcome),
+    /// The stop signal gave a stop. No call was issued for the entry. For
+    /// a directory, the calls for a part of its entries were possibly
+    /// issued before the stop.
+    Stopped(Stop),
 }
 
 /// The result of the removal of a directory target.
@@ -410,11 +442,21 @@ pub(super) struct TreeRemoval {
     pub(super) first_cause: Option<Cause>,
     /// The cause of the first call whose effect is not established.
     pub(super) indeterminate: Option<Cause>,
+    /// Whether a mutation call was issued for an entry of the tree.
+    pub(super) called: bool,
 }
 
 /// The removal pass over the measured tree.
 struct Removal<'a> {
     injection: &'a Injection,
+    stop: &'a dyn StopSignal,
+    /// The stop that the signal gave. It stays for each later entry.
+    stopped: Option<Stop>,
+    /// Whether the removal started the target directory.
+    started: bool,
+    /// The entries that were started after the last reading of the signal.
+    since_check: u32,
+    called: bool,
     work: ProcessedWork,
     first_cause: Option<Cause>,
     indeterminate: Option<Cause>,
@@ -443,8 +485,10 @@ impl Removal<'_> {
         snapshot: &Snapshot,
         path: &mut Vec<u8>,
     ) -> Attempt {
-        let attempt: Attempt = self.attempt(parent, snapshot, path);
+        let (attempt, checked): (Attempt, Option<Metadata>) = self.attempt(parent, snapshot, path);
         match &attempt {
+            // `attempt` counted the entries that the stop left.
+            Attempt::Stopped(_) => {}
             // The name is absent. That does not show where the object is:
             // another actor can have moved the subtree.
             Attempt::Vanished => add_entries(
@@ -461,7 +505,12 @@ impl Removal<'_> {
                 self.remain(snapshot.entries());
             }
             Attempt::Called(EntryOutcome::Removed { errno, .. }) => {
-                count_removed(&mut self.work, &snapshot.metadata);
+                // The sizes are those of the comparison immediately before
+                // the call, not those of the earlier measurement.
+                count_removed(
+                    &mut self.work,
+                    checked.as_ref().unwrap_or(&snapshot.metadata),
+                );
                 // The call returned an error number: the removal is
                 // possible, not established.
                 if errno.is_some() {
@@ -482,23 +531,54 @@ impl Removal<'_> {
         attempt
     }
 
+    /// Reads the stop signal when a reading is due. The caller of the
+    /// executor read the signal immediately before the target, so the
+    /// target directory itself has no reading.
+    fn stop_before(&mut self, snapshot: &Snapshot) -> Option<Stop> {
+        let is_target: bool = !self.started;
+        self.started = true;
+        if self.stopped.is_some() || is_target {
+            return self.stopped;
+        }
+        self.since_check = self.since_check.saturating_add(1);
+        if snapshot.metadata.kind == Kind::Directory || self.since_check >= STOP_CHECK_ENTRIES {
+            self.since_check = 0;
+            self.stopped = self.stop.check();
+        }
+        self.stopped
+    }
+
+    /// The result has the measurement of the comparison before the call,
+    /// when the comparison was done.
     fn attempt(
         &mut self,
         parent: BorrowedFd<'_>,
         snapshot: &Snapshot,
         path: &mut Vec<u8>,
-    ) -> Attempt {
+    ) -> (Attempt, Option<Metadata>) {
+        if let Some(stop) = self.stop_before(snapshot) {
+            // No entry of the subtree gets a call.
+            self.remain(snapshot.entries());
+            return (Attempt::Stopped(stop), None);
+        }
         let name: &CStr = &snapshot.name;
-        let changed =
-            || Attempt::NotAttempted(Refusal::skipped(Cause::evidence(code::TREE_CHANGED)));
+        let changed = || {
+            (
+                Attempt::NotAttempted(Refusal::skipped(Cause::evidence(code::TREE_CHANGED))),
+                None,
+            )
+        };
         let current: Metadata = match native::stat_at(parent, name) {
             Ok(current) => self.injection.observe(path, current),
-            Err(error) if is_absent(&error) => return Attempt::Vanished,
+            Err(error) if is_absent(&error) => return (Attempt::Vanished, None),
             Err(error) => {
-                return Attempt::NotAttempted(Refusal {
-                    cause: read_cause(error.raw_os_error()),
-                    stop_reason: svalnir_core::action::StopReason::Failed,
-                });
+                return (
+                    Attempt::NotAttempted(Refusal {
+                        cause: read_cause(error.raw_os_error()),
+                        stop_reason: svalnir_core::action::StopReason::Failed,
+                    }),
+                    None,
+                );
             }
         };
         let object: Option<FileObjectEvidence> = identity_of(&snapshot.metadata);
@@ -518,7 +598,7 @@ impl Removal<'_> {
                     Ok(descriptor) => descriptor,
                     Err(OpenFailure::Changed) => return changed(),
                     Err(OpenFailure::Read(error)) => {
-                        return Attempt::NotAttempted(Refusal::read_failure(&error));
+                        return (Attempt::NotAttempted(Refusal::read_failure(&error)), None);
                     }
                 };
             let directory_length: usize = path.len();
@@ -530,7 +610,14 @@ impl Removal<'_> {
             path.truncate(directory_length);
             // The descriptor is closed before the directory is removed.
             drop(descriptor);
+            // A stop in the entries of the directory: the directory is not
+            // empty, and it gets no call. Its entries are counted.
+            if let Some(stop) = self.stopped {
+                self.remain(1);
+                return (Attempt::Stopped(stop), None);
+            }
         }
+        self.called = true;
         // `AT_REMOVEDIR` removes an empty directory only. A directory with
         // an entry that was not removed, or with an entry that appeared
         // after the measurement, stays, and the call returns `ENOTEMPTY`.
@@ -538,7 +625,7 @@ impl Removal<'_> {
         let mut outcome: EntryOutcome =
             settle_unlink(&result, parent, name, object, self.injection, path);
         if !is_directory {
-            return Attempt::Called(outcome);
+            return (Attempt::Called(outcome), Some(current));
         }
         let children_done: bool = self.work.remaining_entries == remaining_before
             && self.indeterminate.is_some() == indeterminate_before;
@@ -560,7 +647,7 @@ impl Removal<'_> {
             }
             _ => {}
         }
-        Attempt::Called(outcome)
+        (Attempt::Called(outcome), Some(current))
     }
 }
 
@@ -574,11 +661,13 @@ pub(super) fn remove_tree(
     located: &Located,
     limits: &ExecutorLimits,
     injection: &Injection,
+    stop: &dyn StopSignal,
 ) -> Result<TreeRemoval, Refusal> {
     let mut path: Vec<u8> = located.path.clone();
     let mut measure = Measure {
         limits,
         device: located.device,
+        owner: located.metadata.owner,
         injection,
         entries: 0,
     };
@@ -597,6 +686,11 @@ pub(super) fn remove_tree(
     injection.reach(Checkpoint::TreeEnumerated, &located.path);
     let mut removal = Removal {
         injection,
+        stop,
+        stopped: None,
+        started: false,
+        since_check: 0,
+        called: false,
         work: ProcessedWork::none(),
         first_cause: None,
         indeterminate: None,
@@ -608,5 +702,6 @@ pub(super) fn remove_tree(
         work: removal.work,
         first_cause: removal.first_cause,
         indeterminate: removal.indeterminate,
+        called: removal.called,
     })
 }

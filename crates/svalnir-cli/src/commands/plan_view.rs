@@ -90,7 +90,13 @@ fn render_summary(explanation: &PlanExplanation, out: &mut String) {
         "  Targets: {}   Estimated logical size: {}   Estimated reclaimable: {}",
         explanation.totals.targets,
         optional_bytes(explanation.totals.estimated_logical_bytes),
-        optional_bytes(explanation.totals.estimated_reclaimable_bytes),
+        if explanation.counts_as_reclaimed_capacity {
+            optional_bytes(explanation.totals.estimated_reclaimable_bytes)
+        } else {
+            // A move to Trash and a stop of a process reclaim no capacity:
+            // the value is known, and it is none.
+            "none".to_owned()
+        },
     );
 }
 
@@ -132,20 +138,51 @@ fn render_target(target: &TargetExplanation, out: &mut String) {
     }
 }
 
-/// Renders the scope and the consequence of a plan.
-pub(crate) fn render(explanation: &PlanExplanation, out: &mut String) {
+/// Renders the scope and the consequence of a plan. A long list of
+/// targets is cut; [`render_question`] has each target.
+pub(crate) fn render(explanation: &PlanExplanation, roots: &[LosslessPath], out: &mut String) {
+    render_with(explanation, roots, Some(TEXT_LIST_LIMIT), out);
+}
+
+/// Renders the scope and the consequence of a plan for the approval
+/// question: each target is in the text, because the answer approves each
+/// target.
+pub(crate) fn render_question(
+    explanation: &PlanExplanation,
+    roots: &[LosslessPath],
+    out: &mut String,
+) {
+    render_with(explanation, roots, None, out);
+}
+
+fn render_with(
+    explanation: &PlanExplanation,
+    roots: &[LosslessPath],
+    target_limit: Option<usize>,
+    out: &mut String,
+) {
     render_summary(explanation, out);
+    for root in roots {
+        put_line!(
+            out,
+            "  Cleanup root: {}   (no entry outside it is changed)",
+            root.display_label()
+        );
+    }
     if !explanation.targets.is_empty() {
         out.push_str("\nTargets\n");
     }
-    for target in explanation.targets.iter().take(TEXT_LIST_LIMIT) {
+    let shown: usize = target_limit.map_or(explanation.targets.len(), |limit| {
+        limit.min(explanation.targets.len())
+    });
+    for target in explanation.targets.iter().take(shown) {
         render_target(target, out);
     }
-    if explanation.targets.len() > TEXT_LIST_LIMIT {
+    if explanation.targets.len() > shown {
         put_line!(
             out,
             "  ... and {} more; `--format json` has each target",
-            explanation.targets.len() - TEXT_LIST_LIMIT
+            explanation.targets.len() - shown
         );
     }
     if !explanation.omitted.is_empty() {

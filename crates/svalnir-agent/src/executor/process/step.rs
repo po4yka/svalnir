@@ -378,15 +378,30 @@ fn prior_of(
             }
         }
     }
-    let classify = |result: &TargetResult| {
-        // A record with a value that this build does not recognize passed
-        // no consistency check. It is not read as a known result, and it
-        // permits no force call.
-        let recognized: bool = result.dispatch.is_recognized()
+    // A record with a value that this build does not recognize passed no
+    // consistency check, and it is not read as a known result.
+    let is_recognized = |result: &TargetResult| {
+        result.dispatch.is_recognized()
             && result.attribution.is_recognized()
             && result.durability.is_recognized()
             && result.stop_reason.is_recognized()
-            && !matches!(result.evidence.native, NativeResult::Unrecognized);
+            && !matches!(result.evidence.native, NativeResult::Unrecognized)
+    };
+    // A graceful step with a result that is not known, or that this build
+    // does not recognize, is `UnknownOutcome` as a whole. It permits no
+    // force step, also for a member that the same step left running: the
+    // caller reconciles first (`NextStep::Reconcile`).
+    let is_unknown =
+        |result: &TargetResult| result.effect.is_indeterminate() || !is_recognized(result);
+    if whole
+        .into_iter()
+        .chain(members.values().copied())
+        .any(is_unknown)
+    {
+        return Err(ExecutorError::GracefulRecord);
+    }
+    let classify = |result: &TargetResult| {
+        let recognized: bool = is_recognized(result);
         let running: bool = matches!(
             result.effect,
             TargetEffect::StillRunning | TargetEffect::Refused

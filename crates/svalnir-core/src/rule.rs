@@ -345,9 +345,9 @@ pub enum RuleDeclarationError {
     /// implementation has no such mode.
     #[error("a validated state names a mode that the implementation does not have")]
     Mode,
-    /// A root path is absolute, or it has an empty, `.`, or `..`
-    /// component.
-    #[error("a root path is not a confined relative path")]
+    /// A root path or a protected descendant is absolute, or it has an
+    /// empty, `.`, or `..` component.
+    #[error("a root path or a protected descendant is not a confined relative path")]
     Root,
 }
 
@@ -388,6 +388,17 @@ impl Check for RuleDeclaration {
         check_list(&self.exclusions.supported_object_types)?;
         if self.exclusions.descendants.len() > MAX_RULE_ENTRIES {
             return Err(RuleDeclarationError::List);
+        }
+        // A protected descendant is compared by its components with an
+        // entry that is relative to the root. A descendant with a `.` or
+        // `..` component matches no entry, so it would protect nothing.
+        if self
+            .exclusions
+            .descendants
+            .iter()
+            .any(|descendant| !is_confined(descendant))
+        {
+            return Err(RuleDeclarationError::Root);
         }
         let layout_names: Vec<&str> = self
             .layouts
@@ -544,7 +555,13 @@ pub trait RuleRegistry {
         layout: &str,
         mode: &RuleMode,
     ) -> Result<&Rule, RuleRefusal> {
-        let Some(rule) = self.rule(reference) else {
+        // An implementation can have its own lookup. A rule of a
+        // different identity or revision is not the exact revision: no
+        // other revision takes its place.
+        let Some(rule) = self
+            .rule(reference)
+            .filter(|rule| &rule.reference == reference)
+        else {
             let has_rule: bool = self
                 .rules()
                 .iter()
@@ -1482,5 +1499,69 @@ mod tests {
             record.candidate.facts.rule_readiness = RuleReadiness::NotReady;
             RuleCandidate::new(&rule, record).unwrap();
         }
+    }
+    #[test]
+    fn a_protected_descendant_is_a_confined_relative_path() {
+        let manual = || LifecycleState::ManualActionValidated {
+            evidence: evidence(),
+        };
+        let with_descendant = |text: &str| {
+            let mut declaration = declaration(manual());
+            declaration.exclusions.descendants = vec![LosslessPath::from_bytes(text).unwrap()];
+            Checked::new(declaration).map(|_| ())
+        };
+        assert_eq!(with_descendant("keep"), Ok(()));
+        assert_eq!(with_descendant("keep/index"), Ok(()));
+        // A component-wise comparison of each of these paths with an entry
+        // can miss the protection, or can apply to each entry.
+        for text in [
+            "./keep",
+            "keep/../keep",
+            "..",
+            "/keep",
+            "keep/",
+            "keep//index",
+        ] {
+            assert_eq!(
+                with_descendant(text),
+                Err(RuleDeclarationError::Root),
+                "{text}"
+            );
+        }
+    }
+
+    /// A registry whose own lookup finds a rule by its identity only.
+    struct ByIdentity(Vec<Rule>);
+
+    impl RuleRegistry for ByIdentity {
+        fn rules(&self) -> Vec<&Rule> {
+            self.0.iter().collect()
+        }
+
+        fn rule(&self, reference: &RuleRef) -> Option<&Rule> {
+            self.0.iter().find(|rule| rule.reference.id == reference.id)
+        }
+    }
+
+    #[test]
+    fn a_lookup_that_gives_a_different_revision_does_not_resolve() {
+        let manual = LifecycleState::ManualActionValidated {
+            evidence: evidence(),
+        };
+        let mut second = declaration(manual);
+        second.reference = reference("svalnir.expired-temporary", "r2");
+        let registry = ByIdentity(vec![Checked::new(second).unwrap()]);
+        let layout = "temporary-v1";
+        let mode = RuleMode::ManualEviction;
+
+        let r2 = reference("svalnir.expired-temporary", "r2");
+        assert_eq!(registry.resolve(&r2, layout, &mode).unwrap().reference, r2);
+        // The lookup gives `r2` for `r1`. `resolve` does not give it.
+        let r1 = reference("svalnir.expired-temporary", "r1");
+        assert_eq!(registry.rule(&r1).unwrap().reference, r2);
+        assert_eq!(
+            registry.resolve(&r1, layout, &mode).unwrap_err(),
+            RuleRefusal::UnknownRevision
+        );
     }
 }

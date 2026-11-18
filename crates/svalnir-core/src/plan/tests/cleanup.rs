@@ -694,7 +694,14 @@ fn the_plan_ceiling_is_exact_at_the_boundary() {
         Some(charge(350, 30))
     );
 
-    // One byte less: `b` does not fit after `a`, and the smaller `c` does.
+    // One byte less: `c` does not fit after `a` and `b`.
+    let mut one_short: CleanupLimits = limits();
+    one_short.plan = charge(349, 30);
+    let outcome: PlanOutcome = with_limits(&entries, one_short);
+    assert_eq!(planned(&outcome), ["target_a", "target_b"]);
+    assert_eq!(reasons(&outcome, "c"), [ExceedsPlanLimit]);
+
+    // `b` does not fit after `a`, and the smaller `c` does.
     let mut bytes_short: CleanupLimits = limits();
     bytes_short.plan = charge(299, 30);
     let outcome: PlanOutcome = with_limits(&entries, bytes_short);

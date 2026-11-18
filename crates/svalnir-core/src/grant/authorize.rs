@@ -21,8 +21,8 @@ use super::rearm::IncidentBudget;
 use super::state::{ActiveRevision, AuthorityState, InstanceInhibition, policy_id};
 use crate::action::{
     ActionClass, ActionError, ActionStage, DispatchState, ErrorCode, ErrorCodeError, ErrorFamily,
-    FileBinding, Plan, PlanApproval, PlannedStep, RecordingMode, TargetBinding, TriggerClass,
-    critical_exception_applies,
+    Escalation, FileBinding, Plan, PlanApproval, PlannedStep, RecordingMode, TargetBinding,
+    TriggerClass, critical_exception_applies,
 };
 use crate::authority::{ActionGrant, ActionGrantRef};
 use crate::digest::ContentDigest;
@@ -450,7 +450,11 @@ impl StepCheck<'_> {
                 (None, Some(RuleMode::ManualEviction)) => {
                     return Err(RefusalReason::RuleNotGranted);
                 }
-                _ => {}
+                // A rule has no mode for another action class, so there
+                // is no lifecycle state that permits it. A sealed plan of
+                // the plan builder binds a rule only for an eviction.
+                (Some(_), None) => return Err(RefusalReason::RuleNotGranted),
+                (None, _) => {}
             }
         }
         Ok(AuthorizationBasis::PlanApproval {
@@ -511,7 +515,14 @@ impl StepCheck<'_> {
                 self.check_rule_mode(rule, &RuleMode::AutomaticEviction)
             }
             TargetBinding::Application(_) => {
-                if grant.permits_escalation(&self.request.plan.limits.escalation, now) {
+                let escalation: &Escalation = &self.request.plan.limits.escalation;
+                // A force step belongs to a force strategy. A plan with
+                // no force strategy cannot use the force class of the
+                // grant for one of its steps.
+                let force_without_strategy: bool = self.step.action_class
+                    == ActionClass::ForceApplicationExit
+                    && matches!(escalation, Escalation::None);
+                if !force_without_strategy && grant.permits_escalation(escalation, now) {
                     Ok(())
                 } else {
                     Err(RefusalReason::EscalationNotGranted)

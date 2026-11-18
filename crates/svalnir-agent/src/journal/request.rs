@@ -15,7 +15,10 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use svalnir_core::action::{ActionError, PlanApproval, Principal, StopFence};
+use svalnir_core::action::{
+    ActionError, ActionStage, DispatchState, ErrorCode, ErrorFamily, PlanApproval, Principal,
+    StopFence,
+};
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::id::{ExecutorEpochId, OperationId, RequestId};
 use svalnir_core::time::WallTime;
@@ -126,6 +129,26 @@ pub struct ClaimedRequest {
     pub redelivered: bool,
 }
 
+/// The code of the rejection of a request row that this build cannot
+/// decode.
+pub const REQUEST_NOT_DECODABLE: &str = "request_not_decodable";
+
+/// The completion of a request row that this build cannot decode: a
+/// rejection of the family `request`, with no call and no operation.
+fn not_decodable() -> Option<RequestCompletion> {
+    Some(RequestCompletion::Rejected {
+        error: ActionError {
+            code: ErrorCode::new(REQUEST_NOT_DECODABLE).ok()?,
+            family: ErrorFamily::Request,
+            stage: ActionStage::Admission,
+            dispatch: DispatchState::NotSubmitted,
+            plan_id: None,
+            operation_id: None,
+            step_id: None,
+        },
+    })
+}
+
 /// One `request` row.
 struct RequestRow {
     digest: String,
@@ -234,6 +257,11 @@ impl OperationJournal {
     /// registered coordinator of the lifetime `epoch`. Each request is
     /// claimed by one call only.
     ///
+    /// A request row that this build cannot decode (a row of a newer
+    /// client, or a damaged row) is completed as rejected with the code
+    /// [`REQUEST_NOT_DECODABLE`], and the call continues with the next
+    /// row.
+    ///
     /// # Errors
     ///
     /// Returns [`OperationJournalError::Sequence`] when `epoch` is not the
@@ -250,27 +278,52 @@ impl OperationJournal {
         } = self;
         let transaction = Self::write_transaction(connection)?;
         coordination::check_registered(&transaction, epoch)?;
-        let next: Option<(i64, String, bool)> = transaction
-            .query_row(
-                "SELECT seq, payload, redelivered FROM request \
-                 WHERE state = 'queued' ORDER BY seq LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((seq, payload, redelivered)) = next else {
-            return Ok(None);
+        // Each turn of the loop completes one row that cannot be decoded,
+        // so the loop ends: the queue has at most `MAX_OPEN_REQUESTS` open
+        // rows and this transaction is the only writer.
+        let mut rejected: bool = false;
+        let claimed: Option<ClaimedRequest> = loop {
+            let next: Option<(i64, String, bool)> = transaction
+                .query_row(
+                    "SELECT seq, payload, redelivered FROM request \
+                     WHERE state = 'queued' ORDER BY seq LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((seq, payload, redelivered)) = next else {
+                break None;
+            };
+            match decode::<QueuedRequest>("request", &payload) {
+                Ok(request) => {
+                    transaction.execute(
+                        "UPDATE request SET state = 'claimed', claim_epoch = ?1 WHERE seq = ?2",
+                        params![epoch.as_str(), seq],
+                    )?;
+                    break Some(ClaimedRequest {
+                        request,
+                        redelivered,
+                    });
+                }
+                Err(error) => {
+                    // A row that this build cannot decode is rejected, so
+                    // that it does not stop each request after it.
+                    let Some(completion) = not_decodable() else {
+                        return Err(error);
+                    };
+                    transaction.execute(
+                        "UPDATE request SET state = 'completed', claim_epoch = ?1, \
+                         completion = ?2 WHERE seq = ?3",
+                        params![epoch.as_str(), encode(&completion)?, seq],
+                    )?;
+                    rejected = true;
+                }
+            }
         };
-        let request: QueuedRequest = decode("request", &payload)?;
-        transaction.execute(
-            "UPDATE request SET state = 'claimed', claim_epoch = ?1 WHERE seq = ?2",
-            params![epoch.as_str(), seq],
-        )?;
-        commit(transaction, commit_fault)?;
-        Ok(Some(ClaimedRequest {
-            request,
-            redelivered,
-        }))
+        if claimed.is_some() || rejected {
+            commit(transaction, commit_fault)?;
+        }
+        Ok(claimed)
     }
 
     /// Records the result of a request that the lifetime `epoch` claimed.

@@ -5,6 +5,7 @@ mod apply;
 mod cleanup;
 mod explain;
 mod paths;
+mod review;
 mod stop;
 
 use super::{
@@ -203,6 +204,15 @@ fn rule() -> Rule {
     rule_with(manual_validated())
 }
 
+/// A file serial number for the entry `name`: each name has its own
+/// number, so two entries of the tests are two objects.
+fn inode_of(name: &str) -> u64 {
+    name.bytes()
+        .fold(14_695_981_039_346_656_037_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
+        })
+}
+
 /// One selected directory `/Users/a/Library/Caches/NAME` of the user, with
 /// a charge of `bytes` and ten items, no protection, and satisfied evidence
 /// of the rule of the tests.
@@ -220,7 +230,7 @@ fn entry(name: &str, bytes: u64) -> CleanupEntry {
         owner: Some(USER),
         object: Some(FileObjectEvidence {
             device: DeviceNumber::new(1),
-            inode: InodeNumber::new(42),
+            inode: InodeNumber::new(inode_of(name)),
         }),
         charge: Some(charge(bytes, 10)),
         estimate: SizeEstimate {

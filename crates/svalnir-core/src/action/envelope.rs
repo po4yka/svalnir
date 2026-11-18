@@ -10,14 +10,14 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::budget::{ResourceLease, WorkCharge};
+use super::budget::{LeaseResource, ResourceLease, WorkCharge};
 use super::checked::{Check, Checked};
 use super::class::ActionClass;
 use super::journal::critical_exception_applies;
 use super::plan::{
-    Escalation, ExecutorRole, PLAN_SCHEMA_VERSION, PlanError, PlanTarget, Principal, TargetBinding,
-    Trigger, check_application_binding, check_file_binding, check_trigger_identities,
-    step_agrees_with_escalation,
+    ClientRole, Escalation, ExecutorRole, PLAN_SCHEMA_VERSION, PlanError, PlanTarget, Principal,
+    TargetBinding, Trigger, check_application_binding, check_file_binding,
+    check_trigger_identities, step_agrees_with_escalation,
 };
 use crate::authority::AuthorityBinding;
 use crate::digest::ContentDigest;
@@ -170,14 +170,15 @@ pub enum EnvelopeError {
     /// the incident of the trigger.
     #[error("the target or the reservation does not agree with the action class")]
     Target,
-    /// The privilege grant does not agree with the executor.
+    /// The privilege grant does not agree with the executor, or an
+    /// automatic request names no action grant.
     #[error("the privilege grant does not agree with the executor")]
     Authority,
     /// The evidence is not valid at the time of its observation.
     #[error("the validity of the evidence is empty")]
     Evidence,
-    /// The step has no lease, or a lease has a different owner or
-    /// executor lifetime.
+    /// The step has no lease, a lease has a different owner or executor
+    /// lifetime, or no lease is for the conflict domain of the target.
     #[error("the leases do not agree with the operation")]
     Lease,
     /// Volatile recording is not permitted for the action class and the
@@ -205,6 +206,16 @@ impl Check for EnvelopeContent {
         check_trigger_identities(&self.trigger).map_err(|_| EnvelopeError::Trigger)?;
         if !self.action_class.accepts_trigger(&self.trigger.class) {
             return Err(EnvelopeError::Trigger);
+        }
+        // The checks of the plan for an automatic trigger: the agent is the
+        // client, and the plan names an action grant.
+        if self.trigger.class.is_automatic() {
+            if !matches!(self.principal.role, ClientRole::Agent) {
+                return Err(EnvelopeError::Trigger);
+            }
+            if self.authority.action_grants.is_empty() {
+                return Err(EnvelopeError::Authority);
+            }
         }
         if !step_agrees_with_escalation(
             &self.action_class,
@@ -254,6 +265,28 @@ impl Check for EnvelopeContent {
                 && lease.executor_epoch == self.evidence.executor_epoch
         };
         if self.leases.is_empty() || !self.leases.iter().all(lease_agrees) {
+            return Err(EnvelopeError::Lease);
+        }
+        // A lease is for the conflict domain of the target: the cleanup
+        // root of a file target, or a member generation of an application
+        // target. A lease on a different domain coordinates nothing for
+        // this step.
+        //
+        // TODO(npochaev): require a lease for each member generation. The
+        // coordinator acquires one for each member; the envelope fixtures
+        // of the process executor and of the journal have one for the
+        // first member only.
+        let holds =
+            |resource: &LeaseResource| self.leases.iter().any(|lease| &lease.resource == resource);
+        let domain_held: bool = match &self.target.binding {
+            TargetBinding::File(file) => holds(&LeaseResource::CleanupRoot(file.root_id.clone())),
+            TargetBinding::Application(application) => application.members.iter().any(|member| {
+                holds(&LeaseResource::ProcessGeneration(
+                    member.generation_id.clone(),
+                ))
+            }),
+        };
+        if !domain_held {
             return Err(EnvelopeError::Lease);
         }
         if matches!(self.recording, RecordingMode::VolatileCriticalException)

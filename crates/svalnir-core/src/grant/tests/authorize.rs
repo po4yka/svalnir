@@ -308,10 +308,14 @@ fn a_manual_rule_action_needs_a_rule_that_is_validated_for_manual_use() {
             RefusalReason::RuleModeNotValidated
         );
     }
-    // A selected-file deletion is not a rule action.
-    ask(&LifecycleState::Proposed, &ActionClass::DeleteSelectedFiles)
-        .answer()
-        .unwrap();
+    // A selected-file deletion is not a rule action: its plan binds no
+    // rule revision, in each lifecycle state of the rule.
+    for lifecycle in [LifecycleState::Proposed, manual.clone(), automatic()] {
+        assert_eq!(
+            ask(&lifecycle, &ActionClass::DeleteSelectedFiles).reason(),
+            RefusalReason::RuleNotGranted
+        );
+    }
 }
 
 // Refusals.
@@ -1036,4 +1040,46 @@ fn a_pause_that_ended_on_the_wall_clock_in_this_boot_needs_a_new_measurement() {
     assert_eq!(refusal.stage, ActionStage::Dispatch);
     answer(80).unwrap();
     answer(95).unwrap();
+}
+
+#[test]
+fn a_manual_step_of_a_class_with_no_rule_mode_cannot_bind_a_rule() {
+    let state = enabled_state();
+    // A permanent deletion of selected files that names a rule revision.
+    // The rule has no mode for the class, so no lifecycle state permits
+    // it. The registry has the rule as validated for automatic eviction.
+    let plan = seal(file_content(
+        &state,
+        &ActionClass::DeleteSelectedFiles,
+        Some(rule_ref(TEMPORARY, "r1")),
+    ));
+    let ask = Ask {
+        approval: Some(approval_of(&plan)),
+        evidence: None,
+        ..Ask::new(state.clone(), plan, "s1")
+    };
+    assert_eq!(ask.reason(), RefusalReason::RuleNotGranted);
+    // With no rule, the approval is the authority.
+    Ask::manual(state, &ActionClass::DeleteSelectedFiles)
+        .answer()
+        .unwrap();
+}
+
+#[test]
+fn a_force_step_of_an_automatic_plan_with_no_force_strategy_is_refused() {
+    let state = enabled_state();
+    let mut content = as_automatic(
+        &state,
+        application_content(&state, Escalation::ImmediateForce),
+        TriggerClass::GlobalCriticalMemory,
+        MEMORY,
+    );
+    // The plan has a force step and names no force strategy.
+    content.limits.escalation = Escalation::None;
+    let Ok(plan) = Plan::seal(content) else {
+        // The plan contract refuses the plan before the authorization.
+        return;
+    };
+    let ask = Ask::new(state, plan, "force");
+    assert_eq!(ask.reason(), RefusalReason::EscalationNotGranted);
 }

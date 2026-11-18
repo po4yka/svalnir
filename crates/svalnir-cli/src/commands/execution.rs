@@ -117,6 +117,10 @@ pub(crate) enum Applied {
     Queued(Box<Queued>),
 }
 
+/// The number of reads in sequence that a wait tries again when the
+/// journal is busy.
+pub(crate) const BUSY_READS: u32 = 40;
+
 /// How a wait ended.
 pub(crate) enum WaitEnd {
     /// The operation has its final record, or an unknown outcome.
@@ -263,6 +267,58 @@ fn dependencies(
     ))
 }
 
+/// Starts a coordinator on the journal, or reports that a different
+/// process holds the coordinator lock.
+fn start_coordinator(
+    environment: &Environment,
+    database: &std::path::Path,
+    epoch: &ExecutorEpochId,
+    dependencies: Dependencies,
+) -> Result<Start<OperationJournal>, ErrorBody> {
+    let journal: OperationJournal = open_journal(environment)?;
+    let unavailable = || {
+        ErrorBody::new(
+            "coordinator_unavailable",
+            ErrorFamily::Recording,
+            ErrorStage::Dispatch,
+            "the coordinator lock or the registration of the journal cannot be used; the command made no change",
+        )
+    };
+    let config: CoordinatorConfig = coordinator_config()?;
+    // A status query of a different client holds the lock for an instant.
+    // The start is tried again before the request goes to the queue, so
+    // that such a query does not send the request to a queue that no
+    // process serves.
+    let mut start = Coordinator::start(
+        journal,
+        database,
+        epoch.clone(),
+        config.clone(),
+        dependencies,
+    )
+    .map_err(|_| unavailable())?;
+    for _ in 0..LOCK_RETRIES {
+        match start {
+            Start::Busy {
+                journal,
+                dependencies,
+            } => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+                start = Coordinator::start(
+                    journal,
+                    database,
+                    epoch.clone(),
+                    config.clone(),
+                    *dependencies,
+                )
+                .map_err(|_| unavailable())?;
+            }
+            Start::Coordinating(_) => break,
+        }
+    }
+    Ok(start)
+}
+
 /// Applies the stored plan of `input`.
 ///
 /// # Errors
@@ -279,50 +335,22 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
     let epoch: ExecutorEpochId =
         ExecutorEpochId::new(session::new_id("client")).map_err(|_| session::identity_error())?;
     let (dependencies, clock, authority) = dependencies(input, &epoch)?;
-    let journal: OperationJournal = open_journal(input.environment)?;
     let database = input.environment.journal_path()?;
-    let unavailable = || {
-        ErrorBody::new(
-            "coordinator_unavailable",
-            ErrorFamily::Recording,
-            ErrorStage::Dispatch,
-            "the coordinator lock or the registration of the journal cannot be used; the command made no change",
-        )
-    };
-    let config: CoordinatorConfig = coordinator_config()?;
-    // A status query of a different client holds the lock for an instant.
-    // The start is tried again before the request goes to the queue, so
-    // that such a query does not send the request to a queue that no
-    // process serves.
-    let mut start = Coordinator::start(
-        journal,
-        &database,
-        epoch.clone(),
-        config.clone(),
-        dependencies,
-    )
-    .map_err(|_| unavailable())?;
-    for _ in 0..LOCK_RETRIES {
-        match start {
-            Start::Busy {
-                journal,
-                dependencies,
-            } => {
-                std::thread::sleep(LOCK_RETRY_INTERVAL);
-                start = Coordinator::start(
-                    journal,
-                    &database,
-                    epoch.clone(),
-                    config.clone(),
-                    *dependencies,
-                )
-                .map_err(|_| unavailable())?;
-            }
-            Start::Coordinating(_) => break,
-        }
-    }
+    let start = start_coordinator(input.environment, &database, &epoch, dependencies)?;
     match start {
         Start::Coordinating(mut coordinator) => {
+            // The client read the authority record before the approval
+            // question, and a different client can change the record
+            // while the question waits. The admission uses the record
+            // that the journal has now, read with the coordinator lock.
+            let authority_revision: u64 =
+                match read_authority_record(coordinator.journal(), &authority) {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        release(coordinator);
+                        return Err(error);
+                    }
+                };
             // The operations of an earlier executor lifetime are
             // reconciled before a new admission.
             let mut steps: u32 = 0;
@@ -343,8 +371,8 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
                         clock,
                         operation_id,
                         authority,
-                        // The first step reads the record again.
-                        authority_revision: 0,
+                        authority_revision,
+                        authority_read_at: Instant::now(),
                     })))
                 }
                 ApplyOutcome::Existing { operation } => {
@@ -379,6 +407,46 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
     }
 }
 
+/// The longest time in which a transient coordinator waits for an
+/// authority record that it cannot read again. It runs no step in that
+/// time, and after it the coordinator has no authority.
+const AUTHORITY_READ_GRACE: Duration = Duration::from_secs(2);
+
+/// The time before a transient coordinator reads the authority record
+/// again after a read that failed.
+const AUTHORITY_READ_RETRY: Duration = Duration::from_millis(50);
+
+/// Reads the authority record of the journal into the records of the
+/// coordinator and returns the revision of the record.
+///
+/// A journal with no record, or with a record of a different user, gives
+/// the coordinator no authority: it then refuses each step.
+fn read_authority_record(
+    journal: &OperationJournal,
+    authority: &SharedAuthority,
+) -> Result<u64, ErrorBody> {
+    let stored = journal
+        .agent_record::<AuthorityState>(AgentRecord::Authority)
+        .map_err(|error| journal_error(&error))?;
+    match stored {
+        Some(stored) if stored.record.principal == session::current_uid() => {
+            authority.records().state = Some(stored.record);
+            Ok(stored.revision)
+        }
+        Some(stored) => {
+            authority.records().state = None;
+            Ok(stored.revision)
+        }
+        None => {
+            authority.records().state = None;
+            // A journal with no record has the revision 0, so the first
+            // record that a client writes changes the revision and is
+            // read.
+            Ok(0)
+        }
+    }
+}
+
 /// Releases the registration of a coordinator that has no operation. An
 /// operation that is not settled keeps the registration, so that the next
 /// coordinator reconciles it.
@@ -395,6 +463,9 @@ pub(crate) struct Running {
     authority: SharedAuthority,
     /// The revision of the authority record that the coordinator has.
     authority_revision: u64,
+    /// The time of the last read of the authority record that had a
+    /// result.
+    authority_read_at: Instant,
 }
 
 impl Running {
@@ -423,29 +494,53 @@ impl Running {
     /// Does one unit of work and waits for the next one when there is
     /// none now.
     fn advance(&mut self) {
+        // The record is read before the step. A step does not run with a
+        // record that this read did not confirm.
+        if !self.refresh_authority() {
+            std::thread::sleep(AUTHORITY_READ_RETRY);
+            return;
+        }
         let progress: Progress = self.coordinator.step();
         if !progress.worked {
             ThreadIdle::new(Arc::clone(&self.clock)).idle(progress.wake_at);
         }
-        self.refresh_authority();
     }
 
     /// Reads the authority record again when its revision changed, as the
     /// agent does at each tick, so that a change of the policy revision
     /// by a different client stops the later steps.
-    fn refresh_authority(&mut self) {
+    ///
+    /// A record that cannot be read is not authority. After
+    /// [`AUTHORITY_READ_GRACE`] with no read, the coordinator has no
+    /// record and refuses each later step, until a read has a result.
+    ///
+    /// Returns false when the record was not read and the coordinator
+    /// still has an earlier record: the caller then runs no step.
+    fn refresh_authority(&mut self) -> bool {
         let journal: &OperationJournal = self.coordinator.journal();
-        let Ok(revision) = journal.agent_record_revision(AgentRecord::Authority) else {
-            return;
-        };
-        if revision == self.authority_revision {
-            return;
-        }
-        if let Ok(Some(stored)) = journal.agent_record::<AuthorityState>(AgentRecord::Authority)
-            && stored.record.principal == session::current_uid()
-        {
-            self.authority.records().state = Some(stored.record);
-            self.authority_revision = stored.revision;
+        let read: Result<(), ErrorBody> = journal
+            .agent_record_revision(AgentRecord::Authority)
+            .map_err(|error| journal_error(&error))
+            .and_then(|revision| {
+                if revision == self.authority_revision {
+                    return Ok(());
+                }
+                read_authority_record(journal, &self.authority).map(|revision| {
+                    self.authority_revision = revision;
+                })
+            });
+        match read {
+            Ok(()) => {
+                self.authority_read_at = Instant::now();
+                true
+            }
+            Err(_) if self.authority_read_at.elapsed() >= AUTHORITY_READ_GRACE => {
+                self.authority.records().state = None;
+                // The next read that has a result sets the record again.
+                self.authority_revision = u64::MAX;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -493,6 +588,10 @@ impl Running {
         // that work before it stops: an operation that it leaves is never
         // dispatched again.
         while started.elapsed() < MAX_COMPLETION_TIME {
+            if !self.refresh_authority() {
+                std::thread::sleep(AUTHORITY_READ_RETRY);
+                continue;
+            }
             let progress: Progress = self.coordinator.step();
             if !progress.worked && progress.wake_at.is_none() {
                 break;
@@ -500,7 +599,6 @@ impl Running {
             if !progress.worked {
                 ThreadIdle::new(Arc::clone(&self.clock)).idle(progress.wake_at);
             }
-            self.refresh_authority();
         }
         release(self.coordinator);
         report
@@ -551,6 +649,28 @@ impl Queued {
         }
     }
 
+    /// The error of a journal read that failed during the wait. It names
+    /// the plan and, when the request was admitted, the operation: the
+    /// request or the operation continues, and only this client has no
+    /// result.
+    fn read_failure(&self, error: ErrorBody, last: Option<&OperationReport>) -> ErrorBody {
+        let Some(report) = last else {
+            return error.with_plan(self.plan_id.as_str());
+        };
+        ErrorBody::new(
+            "operation_record_unavailable",
+            ErrorFamily::Outcome,
+            ErrorStage::Execution,
+            format!(
+                "the journal cannot be read now ({}); the operation was admitted and continues, and its result is not known to this response; query it with `svalnir operations show`",
+                error.code
+            ),
+        )
+        .with_plan(self.plan_id.as_str())
+        .with_operation(report.operation_id.as_str())
+        .with_next_action(NextAction::QueryOperation)
+    }
+
     /// Waits for the result of the request. With `admission_only`, the
     /// wait ends when the operation exists.
     pub(crate) fn wait(
@@ -563,6 +683,7 @@ impl Queued {
         let started: Instant = Instant::now();
         let mut last: Option<OperationReport> = None;
         let mut reads: u32 = 0;
+        let mut failed_reads: u32 = 0;
         loop {
             reads = reads.wrapping_add(1);
             let state = self.state();
@@ -585,8 +706,17 @@ impl Queued {
                     .with_next_action(NextAction::RefreshObservation),
                 );
             }
+            if state.is_ok() {
+                failed_reads = 0;
+            }
             match state {
-                Err(error) => return WaitEnd::Failed(error),
+                // A busy journal is read again: a different process
+                // writes to it.
+                Err(error) if &*error.code == "journal_busy" && failed_reads < BUSY_READS => {
+                    failed_reads = failed_reads.saturating_add(1);
+                    drop(error);
+                }
+                Err(error) => return WaitEnd::Failed(self.read_failure(error, last.as_ref())),
                 Ok(QueueState::Rejected(error)) => return WaitEnd::Rejected(error),
                 Ok(QueueState::Operation(operation)) => {
                     let report = OperationReport::of_record(&operation, None);

@@ -42,6 +42,7 @@ pub(super) mod policy_id {
 
 /// The policy revision in effect and the scope that it gives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveRevision {
     /// The revision record.
     pub revision: PolicyRevision,
@@ -51,6 +52,7 @@ pub struct ActiveRevision {
 
 /// The standing authority of one guard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuardAuthority {
     /// The guard.
     #[serde(with = "policy_id")]
@@ -59,10 +61,12 @@ pub struct GuardAuthority {
     pub enabled: bool,
     /// The action grant of the guard. One guard has one grant; each change
     /// makes a larger generation.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub grant: Option<ActionGrant>,
     /// The scope that the latest acceptance reviewed, or the narrower scope
     /// that an activation carried the grant to. The grant covers no scope
     /// that is wider than this one.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub reviewed: Option<PolicyScope>,
 }
 
@@ -83,14 +87,17 @@ impl GuardAuthority {
 /// this module, and writes the `next` record of the [`Change`] in one
 /// transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityState {
     /// The user that the record belongs to.
     pub principal: Uid,
     /// The policy revision in effect. `None` before the first activation.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub active: Option<ActiveRevision>,
     /// The guards. A guard with no entry has no authority.
     pub guards: Vec<GuardAuthority>,
     /// The pause of automatic intervention.
+    #[serde(deserialize_with = "crate::authority::required_option::deserialize")]
     pub pause: Option<Pause>,
 }
 

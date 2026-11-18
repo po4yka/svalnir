@@ -1,8 +1,15 @@
 //! The interrupt request of the user (Ctrl+C).
 //!
 //! `scan` and `monitor` read this flag between two bounded steps, write what
-//! they have, and end with exit status 130. The flag disconnects the client
-//! only: it changes no agent, policy, or operation.
+//! they have, and end with exit status 130. `clean apply`, `processes stop`,
+//! and `operations wait` read it to end the client wait. The flag ends a
+//! read or a wait only: it changes no agent and no policy, and it cancels
+//! no operation.
+//!
+//! A client that executes an operation as a transient coordinator arms the
+//! flag before the admission and keeps it armed: from the admission on,
+//! Ctrl+C must not end the process that is the executor of the operation
+//! (`docs/INTERFACES.md` section 4).
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -38,8 +45,9 @@ impl Interrupt {
     /// Makes Ctrl+C set this flag and not end the process.
     ///
     /// Only a command that reads the flag between bounded steps calls this
-    /// function (`scan` and `monitor`). For each other command Ctrl+C ends
-    /// the process at once. If the handler cannot be installed, the default
+    /// function: `scan`, `monitor`, the apply flow of `clean apply` and
+    /// `processes stop`, and `operations wait`. For each other command
+    /// Ctrl+C ends the process at once. If the handler cannot be installed, the default
     /// action stays in effect.
     pub(crate) fn arm(&self) {
         match &self.source {

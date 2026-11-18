@@ -11,6 +11,7 @@
 //! largest directories below the scan root. The plan builder leaves out a
 //! protected, excluded, or overlapping entry and states the reason.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +19,7 @@ use serde::Serialize;
 use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::platform::volume;
 use svalnir_agent::scan::ScanResult;
-use svalnir_core::action::{FileObjectType, Plan, WorkCharge};
+use svalnir_core::action::{FileObjectType, Plan, TargetBinding, WorkCharge};
 use svalnir_core::authority::AuthorityBinding;
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{OperationId, PlanId, RootId, ScanId, StepId, TargetId};
@@ -84,16 +85,22 @@ pub(crate) struct PlanView {
     pub(crate) stale_entries: Vec<StaleEntry>,
     /// The operation of the plan, when it was applied.
     pub(crate) operation_id: Option<OperationId>,
-    /// False when this client has no plan document: the display paths and
-    /// the estimates are then not known.
+    /// The cleanup roots of the plan: the executor changes no entry that
+    /// is not below one of them. Empty when the plan has no file target or
+    /// this client has no usable plan document.
+    pub(crate) cleanup_roots: Vec<LosslessPath>,
+    /// False when this client has no usable plan document: the display
+    /// paths and the estimates are then not known.
     pub(crate) has_plan_document: bool,
+    /// `used`, `absent`, `not_readable`, or `disagrees_with_plan`.
+    pub(crate) plan_document: &'static str,
     pub(crate) note: &'static str,
 }
 
 impl PlanView {
     pub(crate) fn render(&self) -> String {
         let mut out = String::new();
-        plan_view::render(&self.explanation, &mut out);
+        plan_view::render(&self.explanation, &self.cleanup_roots, &mut out);
         if !self.stale_entries.is_empty() {
             put_line!(
                 out,
@@ -111,9 +118,17 @@ impl PlanView {
             put_line!(out, "\nApplied: operation {operation_id}");
         }
         if !self.has_plan_document {
-            out.push_str(
-                "\nThis client has no plan document for the plan, so the paths and the estimates are not known.\n",
-            );
+            out.push_str(match self.plan_document {
+                "not_readable" => {
+                    "\nThe plan document of this client cannot be read, so the paths and the estimates are not known.\n"
+                }
+                "disagrees_with_plan" => {
+                    "\nThe plan document of this client does not agree with the stored plan and is not used, so the paths and the estimates are not known.\n"
+                }
+                _ => {
+                    "\nThis client has no plan document for the plan, so the paths and the estimates are not known.\n"
+                }
+            });
         }
         put_line!(out, "\n{}", escape(self.note));
         out
@@ -218,17 +233,50 @@ fn root_id_of(
 }
 
 /// Whether a plan document agrees with the sealed plan of the journal:
-/// the same digest, the same plan, and cleanup roots whose identities are
-/// those that the plan binds.
+/// the same digest, the same plan, and cleanup roots that are exactly
+/// those that the file targets of the plan bind, each with the identity
+/// that its values give.
+///
+/// A root that no target binds is refused: the approved roots of the
+/// executor are then never wider than the plan.
 fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
     let roots_agree = || {
-        document.roots.iter().all(|root| {
-            root_id_of(&root.path, root.object, &root.volume).as_ref() == Some(&root.root_id)
-        })
+        let bound: BTreeSet<&RootId> = plan
+            .targets
+            .iter()
+            .filter_map(|target| match &target.binding {
+                TargetBinding::File(binding) => Some(&binding.root_id),
+                TargetBinding::Application(_) => None,
+            })
+            .collect();
+        let named: BTreeSet<&RootId> = document.roots.iter().map(|root| &root.root_id).collect();
+        named == bound
+            && named.len() == document.roots.len()
+            && document.roots.iter().all(|root| {
+                root_id_of(&root.path, root.object, &root.volume).as_ref() == Some(&root.root_id)
+            })
     };
     &document.digest == plan.digest()
         && document.outcome.plan.as_ref() == Some(plan)
         && roots_agree()
+}
+
+/// The display path of each file target of a stored plan: the path of its
+/// cleanup root and its relative entry, which the sealed plan binds. The
+/// path text of the document is not used.
+pub(crate) fn bound_paths(
+    plan: &Plan,
+    document: &PlanDocument,
+) -> BTreeMap<TargetId, LosslessPath> {
+    plan.targets
+        .iter()
+        .filter_map(|target| match &target.binding {
+            TargetBinding::File(binding) => {
+                Some((target.target_id.clone(), bound_path(document, binding)?))
+            }
+            TargetBinding::Application(_) => None,
+        })
+        .collect()
 }
 
 /// The path of a file target: the path of its cleanup root and its
@@ -589,7 +637,7 @@ pub(crate) fn plan(
             .map_err(|error| journal_error(&error))?;
         let mut document =
             PlanDocument::new(plan_id.clone(), plan.digest().clone(), outcome.clone());
-        document.roots = vec![root];
+        document.roots = vec![root.clone()];
         document.scan_id = Some(scan.scan_id.clone());
         plan_store::save_plan(environment, &document)?;
         plan_store::prune(environment);
@@ -599,20 +647,70 @@ pub(crate) fn plan(
         explanation: explain(&outcome, &now.clock),
         stale_entries: selection.stale,
         operation_id: None,
+        cleanup_roots: if has_plan {
+            vec![root.path]
+        } else {
+            Vec::new()
+        },
         has_plan_document: has_plan,
+        plan_document: if has_plan { "used" } else { "absent" },
         note: if has_plan { PLAN_NOTE } else { EMPTY_PLAN_NOTE },
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
     Ok(ExitStatus::Success)
 }
 
-/// The stored plan and the plan document of this client. A document whose
-/// digest is not that of the stored plan is not used.
+/// What this client has as the plan document of a stored plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocumentState {
+    /// The document agrees with the stored plan and is used.
+    Used,
+    /// There is no document.
+    Absent,
+    /// The document cannot be read or decoded.
+    NotReadable,
+    /// The document does not agree with the stored plan.
+    Disagrees,
+}
+
+impl DocumentState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Used => "used",
+            Self::Absent => "absent",
+            Self::NotReadable => "not_readable",
+            Self::Disagrees => "disagrees_with_plan",
+        }
+    }
+}
+
+/// The stored plan and the plan document of this client. A document that
+/// does not agree with the stored plan is not used.
 pub(crate) struct StoredPlan {
     pub(crate) plan: Plan,
     pub(crate) document: Option<PlanDocument>,
+    pub(crate) document_state: DocumentState,
 }
 
+impl StoredPlan {
+    /// The cleanup roots of the plan, from the document that agrees with
+    /// it.
+    pub(crate) fn cleanup_roots(&self) -> Vec<LosslessPath> {
+        self.document.as_ref().map_or_else(Vec::new, |document| {
+            document
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect()
+        })
+    }
+}
+
+/// Reads the stored plan and the plan document of this client.
+///
+/// A document that cannot be read is not an error of this function: the
+/// journal has the plan and its operation, and a result that needs no
+/// document is not lost. [`StoredPlan::document_state`] has the reason.
 pub(crate) fn load_plan(
     journal: Option<&OperationJournal>,
     environment: &Environment,
@@ -623,9 +721,31 @@ pub(crate) fn load_plan(
         .try_plan(plan_id)
         .map_err(|error| journal_error(&error))?
         .ok_or_else(|| plan_not_found(plan_id.as_str()))?;
-    let document: Option<PlanDocument> = plan_store::load_plan(environment, plan_id)?
-        .filter(|document| document_agrees(document, &plan));
-    Ok(StoredPlan { plan, document })
+    let (document, document_state): (Option<PlanDocument>, DocumentState) =
+        match plan_store::load_plan(environment, plan_id) {
+            Ok(Some(document)) if document_agrees(&document, &plan) => {
+                (Some(document), DocumentState::Used)
+            }
+            Ok(Some(_)) => (None, DocumentState::Disagrees),
+            Ok(None) => (None, DocumentState::Absent),
+            Err(_) => (None, DocumentState::NotReadable),
+        };
+    Ok(StoredPlan {
+        plan,
+        document,
+        document_state,
+    })
+}
+
+/// The stored plan of an operation for a report, when the journal has it.
+/// A plan or a document that cannot be read gives a report with no
+/// display path and no measurement.
+pub(crate) fn load_for_report(
+    journal: &OperationJournal,
+    environment: &Environment,
+    plan_id: &PlanId,
+) -> Option<StoredPlan> {
+    load_plan(Some(journal), environment, plan_id).ok()
 }
 
 /// The builder result of a stored plan: that of the plan document, or a
@@ -636,7 +756,7 @@ pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> 
         // the sealed plan binds, not from the text of the document.
         let mut outcome: PlanOutcome = document.outcome.clone();
         for preview in &mut outcome.preview.targets {
-            if let Some(svalnir_core::action::TargetBinding::File(binding)) = stored
+            if let Some(TargetBinding::File(binding)) = stored
                 .plan
                 .target(&preview.target_id)
                 .map(|target| &target.binding)
@@ -698,7 +818,9 @@ pub(crate) fn show(
         explanation: explain(&outcome_of(&stored)?, &now.clock),
         stale_entries: Vec::new(),
         operation_id,
+        cleanup_roots: stored.cleanup_roots(),
         has_plan_document: stored.document.is_some(),
+        plan_document: stored.document_state.as_str(),
         note: "This command changed nothing.",
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
@@ -737,25 +859,37 @@ pub(crate) fn apply(
         None => false,
     };
     if stored.document.is_none() && !applied_before {
-        return Err(ErrorBody::new(
-            "plan_document_missing",
-            ErrorFamily::Evidence,
-            ErrorStage::Storage,
-            "this client has no plan document for the plan, so the cleanup roots are not known; prepare a new plan; the command made no change",
-        )
-        .with_plan(plan_id.as_str())
-        .with_next_action(NextAction::PrepareNewPlan)
-        .into());
+        let (code, message): (&'static str, &'static str) = match stored.document_state {
+            DocumentState::NotReadable => (
+                "plan_document_not_usable",
+                "the plan document of this client cannot be read, so the cleanup roots are not known; prepare a new plan; the command made no change",
+            ),
+            DocumentState::Disagrees => (
+                "plan_document_not_usable",
+                "the plan document of this client does not agree with the stored plan, so it gives no cleanup root; prepare a new plan; the command made no change",
+            ),
+            DocumentState::Absent | DocumentState::Used => (
+                "plan_document_missing",
+                "this client has no plan document for the plan, so the cleanup roots are not known; prepare a new plan; the command made no change",
+            ),
+        };
+        return Err(
+            ErrorBody::new(code, ErrorFamily::Evidence, ErrorStage::Storage, message)
+                .with_plan(plan_id.as_str())
+                .with_next_action(NextAction::PrepareNewPlan)
+                .into(),
+        );
     }
     drop(journal);
-    let summary: String = match Host::open().and_then(|host| Now::read(&host)) {
-        Ok(now) => {
-            let mut out = String::new();
-            plan_view::render(&explain(&outcome_of(&stored)?, &now.clock), &mut out);
-            out
-        }
-        Err(_) => String::new(),
-    };
+    // The question has each target and the cleanup roots. A clock that
+    // cannot be read gives no question with a part of the scope.
+    let now: Now = Now::read(&Host::open()?)?;
+    let mut summary: String = String::new();
+    plan_view::render_question(
+        &explain(&outcome_of(&stored)?, &now.clock),
+        &stored.cleanup_roots(),
+        &mut summary,
+    );
     apply::run(
         ApplyFlow {
             plan: &stored.plan,

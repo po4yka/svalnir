@@ -2556,7 +2556,7 @@ type UnsupportedCase = (
 
 #[test]
 fn a_tree_with_an_entry_that_is_not_supported_is_refused_as_a_whole() {
-    let cases: [UnsupportedCase; 2] = [
+    let cases: [UnsupportedCase; 3] = [
         (
             "/tree/a/one.bin",
             |metadata| metadata.kind = Kind::Other,
@@ -2568,6 +2568,13 @@ fn a_tree_with_an_entry_that_is_not_supported_is_refused_as_a_whole() {
             |metadata| metadata.dataless = true,
             &ErrorFamily::Eligibility,
             code::DATALESS_DIRECTORY,
+        ),
+        // A cloud placeholder file in the tree.
+        (
+            "/tree/a/b/two.bin",
+            |metadata| metadata.dataless = true,
+            &ErrorFamily::Eligibility,
+            code::DATALESS_OBJECT,
         ),
     ];
     for (suffix, change, family, expected) in cases {
@@ -2591,6 +2598,76 @@ fn a_tree_with_an_entry_that_is_not_supported_is_refused_as_a_whole() {
         assert_eq!(listing(&tree), before);
         fixture.assert_outside_unchanged();
     }
+}
+
+#[test]
+fn a_dataless_file_target_is_refused_with_no_call() {
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("placeholder.bin");
+    fs::write(&file, b"data").unwrap();
+    for class in PERMANENT {
+        let envelope = fixture.envelope(class, "placeholder.bin");
+        // A test cannot make a real dataless file: the hook gives the
+        // measurement the flag `SF_DATALESS`.
+        let hook: MetadataHook = Box::new(|path: &[u8], metadata: &mut Metadata| {
+            if path.ends_with(b"/placeholder.bin") {
+                metadata.dataless = true;
+            }
+        });
+        let outcome = run(
+            &fixture.executor_with(metadata_injection(hook)),
+            &fixture.roots(),
+            &envelope,
+        );
+        assert_skipped(&outcome, &ErrorFamily::Eligibility, code::DATALESS_OBJECT);
+        assert!(file.exists());
+    }
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_tree_file_that_becomes_dataless_after_the_measurement_stays_and_the_removal_is_partial() {
+    use std::sync::Arc;
+
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    // The file becomes a placeholder after the measurement, before its
+    // comparison.
+    let measured = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&measured);
+    let injection = Injection {
+        metadata: Some(Box::new(move |path: &[u8], metadata: &mut Metadata| {
+            if seen.load(Ordering::SeqCst) && path.ends_with(b"/tree/a/b/two.bin") {
+                metadata.dataless = true;
+            }
+        })),
+        checkpoint: Some(Box::new(move |checkpoint: Checkpoint, _path: &[u8]| {
+            if checkpoint == Checkpoint::TreeEnumerated {
+                measured.store(true, Ordering::SeqCst);
+            }
+        })),
+        ..Injection::default()
+    };
+
+    let outcome = run(
+        &fixture.executor_with(injection),
+        &fixture.roots(),
+        &envelope,
+    );
+
+    // The placeholder got no call. The other entries were removed, and
+    // the directories above the placeholder stay: a partial removal.
+    let result: &TargetResult = &outcome.result;
+    assert_eq!(result.effect, TargetEffect::UnknownOutcome);
+    assert_eq!(result.attribution, Attribution::Possible);
+    assert_eq!(failure_code(result), code::DATALESS_OBJECT);
+    assert!(tree.join("a/b/two.bin").exists());
+    assert!(!tree.join("a/b/three.bin").exists());
+    assert!(!tree.join("top.bin").exists());
+    assert!(outcome.work.removed_entries > EntryCount::ZERO);
+    assert!(outcome.work.remaining_entries > EntryCount::ZERO);
+    fixture.assert_outside_unchanged();
 }
 
 #[test]

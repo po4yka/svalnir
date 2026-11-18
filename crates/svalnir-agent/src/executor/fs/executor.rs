@@ -400,6 +400,11 @@ impl FsExecutor {
             return self.move_to_trash(&located);
         }
         match located.metadata.kind {
+            // A dataless file is a cloud placeholder. Its removal can remove
+            // the copy in the cloud, which the plan does not measure.
+            Kind::File if located.metadata.dataless => {
+                Draft::refused(Refusal::skipped(Cause::eligibility(code::DATALESS_OBJECT)))
+            }
             Kind::File | Kind::Symlink => {
                 let outcome: EntryOutcome = remove_file(&located, &self.injection);
                 let mut work = ProcessedWork::none();

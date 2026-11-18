@@ -108,8 +108,11 @@ pub mod code {
     pub const NO_SPACE: &str = "no_space";
     /// `EDQUOT`.
     pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
-    /// `EDEADLK`: the object is dataless and the thread does not
-    /// materialize it.
+    /// A regular file is a dataless placeholder (`SF_DATALESS`), as a target
+    /// or as an entry of a directory target, and gets no removal call: in
+    /// a File Provider or iCloud Drive domain, the removal of a placeholder
+    /// can remove the copy in the cloud. Also `EDEADLK`: the object is
+    /// dataless and the thread does not materialize it.
     pub const DATALESS_OBJECT: &str = "dataless_object";
     /// `EINTR`.
     pub const INTERRUPTED: &str = "interrupted";

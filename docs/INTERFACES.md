@@ -227,6 +227,7 @@ A refusal of the coordinator or of the authorization keeps its own code and fami
 | `approved_root_mismatch` | `evidence` | A root record of the executing process has the identity of the root of a file target and a different path or object. The target is skipped with no call |
 | `root_not_local` | `eligibility` | From the filesystem executor: the mount table reports the filesystem of the root of a file target as not local (a network filesystem or an automounter map). The target is skipped with no call ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7) |
 | `root_locality_unknown` | `evidence` | From the filesystem executor: the mount table cannot be read, or it has no mount for the path or the device of the root of a file target. The target is skipped with no call |
+| `dataless_object` | `eligibility` | From the filesystem executor: a regular file of a permanent removal is a cloud placeholder (`SF_DATALESS`). A file target is skipped with no call; a directory target with such a file is refused whole at its measurement, or keeps the file when it became dataless later ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7) |
 
 A plan explanation gives the reason `link_count_unknown` (family `evidence`) for an entry of a rule that skips hard-linked objects when the link count of the entry is not known. The `next_action` values of this build are `none`, `correct_request`, `refresh_observation`, `resolve_authority`, `respect_limits`, `prepare_new_plan`, `query_operation`, and `reconcile`.
 

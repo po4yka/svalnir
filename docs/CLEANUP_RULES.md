@@ -109,6 +109,8 @@ The following families are outside generic automatic cache eviction:
 | Svalnir policy, grants, operation journals, and recovery state | Never selected by Svalnir's temporary-data rule |
 | Unknown objects, special files, links, and unsupported filesystem behavior | Skip unless a specific reviewed rule supports them |
 
+A dataless object, a cloud placeholder whose content is not on the disk, is an unsupported filesystem behavior of the last row: the filesystem executor removes no dataless file or directory, as a target or in a tree ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7), and the scanner reads only its metadata.
+
 A path exclusion applies to the object selected and its descendants. Parent-directory deletion must not erase an excluded child. The adapter must select disjoint supported children or skip the indivisible parent.
 
 These exclusions have two levels. OS-managed protected storage, swapfiles, and Svalnir's control-plane/recovery roots are hard exclusions for cleanup actions. Personal documents, media, archives, and similar user data are excluded from rule-mediated automatic eviction; a user may separately select eligible user-owned files for a manual Trash or explicitly authorized permanent-removal action under [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md). That manual selection is outside this automatic rule catalog. User-configured protections apply in their declared scope: global `[protections]` includes manual actions, while `[disk_guard.exclusions]` governs automatic disk-guard work. Mandatory exclusions of a particular rule apply whenever that rule executes. A cleanup-rule grant or force flag cannot override the rule's exclusions or hard protected roots.

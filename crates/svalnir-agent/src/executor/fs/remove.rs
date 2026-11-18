@@ -6,7 +6,7 @@
 //! 1. The measurement reads the tree through descriptors and keeps the
 //!    name, the device, the inode, and the type of each entry. It issues no
 //!    mutation. A tree that does not fit the depth, entry, or descriptor
-//!    bound, that has a mount point, a dataless directory, an entry of
+//!    bound, that has a mount point, a dataless directory or file, an entry of
 //!    another owner than the target, or a type that is not supported, is
 //!    refused as a whole: nothing is removed.
 //! 2. The removal goes bottom-up through the measured entries only. It
@@ -355,6 +355,11 @@ impl Measure<'_> {
                         code::UNSUPPORTED_FILE_TYPE,
                     )));
                 }
+                // A cloud placeholder: its removal can remove the copy in
+                // the cloud. The measurement reads only its metadata.
+                Kind::File if metadata.dataless => {
+                    return Err(Refusal::skipped(Cause::eligibility(code::DATALESS_OBJECT)));
+                }
                 Kind::Directory
                     if identity_of(&metadata)
                         .is_some_and(|object| self.home.has_object(object)) =>
@@ -598,6 +603,15 @@ impl Removal<'_> {
             || current.kind != snapshot.metadata.kind
         {
             return changed();
+        }
+        // A file that became a cloud placeholder after the measurement gets
+        // no call. The directories above it stay, and the result follows
+        // the rules of a partial removal.
+        if current.kind == Kind::File && current.dataless {
+            return (
+                Attempt::NotAttempted(Refusal::skipped(Cause::eligibility(code::DATALESS_OBJECT))),
+                None,
+            );
         }
         self.injection.reach(Checkpoint::EntryChecked, path);
         let is_directory: bool = snapshot.metadata.kind == Kind::Directory;

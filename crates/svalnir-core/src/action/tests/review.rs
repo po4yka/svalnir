@@ -303,7 +303,7 @@ fn two_targets_do_not_bind_one_object() {
 fn first_entry(target: &PlanTarget) -> crate::file::LosslessPath {
     match &target.binding {
         TargetBinding::File(file) => file.relative_entry.clone(),
-        TargetBinding::Application(_) => panic!("a file target"),
+        _ => panic!("a file target"),
     }
 }
 
@@ -725,4 +725,262 @@ fn a_plan_of_the_first_schema_version_is_refused_and_no_field_gets_a_default() {
     let mut envelope = file_envelope();
     envelope.schema_version = 1;
     assert!(Checked::new(envelope).is_err());
+}
+
+/// A process of the user with no verified membership, with executable
+/// evidence.
+fn single_process(generation: &str, pid: i32) -> crate::process::ProcessIdentity {
+    crate::process::ProcessIdentity {
+        executable: Some(crate::process::ExecutableIdentity {
+            path: crate::file::LosslessPath::from_bytes("/Users/a/bin/worker").unwrap(),
+            file: None,
+            code_signature: None,
+        }),
+        association: ProcessAssociation::Unattributed,
+        ..member(generation, pid)
+    }
+}
+
+/// A manual stop plan of one process with the force strategy `escalation`.
+fn process_content(escalation: Escalation) -> PlanContent {
+    let mut content = application_content(escalation);
+    content.targets[0].binding = TargetBinding::Process(crate::action::ProcessBinding {
+        process: single_process("proc_9", 4_299),
+    });
+    content
+}
+
+/// Changes the process of a process plan and seals the plan.
+fn sealed_process(
+    change: impl FnOnce(&mut crate::process::ProcessIdentity),
+) -> Result<Plan, PlanError> {
+    let mut content = process_content(Escalation::None);
+    let TargetBinding::Process(binding) = &mut content.targets[0].binding else {
+        panic!("the target is a process target");
+    };
+    change(&mut binding.process);
+    Plan::seal(content)
+}
+
+#[test]
+fn a_process_target_is_one_process_of_the_user_in_a_manual_plan() {
+    use crate::process::{Pid, Uid};
+    for escalation in [
+        Escalation::None,
+        Escalation::ForceAfterGrace,
+        Escalation::ImmediateForce,
+    ] {
+        seal(process_content(escalation));
+    }
+
+    // A guard selects an application or a job instance, never one process.
+    let mut automatic = process_content(Escalation::None);
+    automatic.trigger = super::automatic(TriggerClass::GlobalCriticalMemory);
+    automatic.principal.role = ClientRole::Agent;
+    automatic.authority.action_grants = vec![super::grant_ref()];
+    assert_eq!(sealed_error(automatic), PlanError::Trigger);
+
+    // The protections of a member apply to the one process.
+    let binding =
+        |change: &dyn Fn(&mut crate::process::ProcessIdentity)| sealed_process(change).unwrap_err();
+    // A process of another user, a process of root, and `launchd`.
+    assert_eq!(
+        binding(&|process| process.uid = Uid::new(502)),
+        PlanError::Binding
+    );
+    assert_eq!(
+        binding(&|process| process.pid = Pid::new(1).unwrap()),
+        PlanError::Binding
+    );
+    let mut root = process_content(Escalation::None);
+    root.principal.uid = Uid::new(0);
+    if let TargetBinding::Process(binding) = &mut root.targets[0].binding {
+        binding.process.uid = Uid::new(0);
+    }
+    assert_eq!(sealed_error(root), PlanError::Binding);
+    // No executable evidence: an executor cannot revalidate the identity.
+    assert_eq!(
+        binding(&|process| process.executable = None),
+        PlanError::Binding
+    );
+    // A member of an application is a target through its instance only.
+    assert_eq!(
+        binding(&|process| process.association = member("proc_9", 4_299).association),
+        PlanError::Binding
+    );
+    // The process-control surface has the user executor only.
+    let mut helper = process_content(Escalation::None);
+    helper.executor = crate::action::ExecutorRole::Helper;
+    helper.authority.privilege_grant = Some(super::privilege_ref());
+    assert_eq!(sealed_error(helper), PlanError::Binding);
+
+    // The steps agree with the force strategy, as for an application.
+    let mut content = process_content(Escalation::None);
+    content.steps = vec![step("force", ActionClass::ForceApplicationExit, "app")];
+    assert_eq!(sealed_error(content), PlanError::Steps);
+    // A process target has no filesystem step.
+    let mut content = process_content(Escalation::None);
+    content.steps = vec![step("s1", ActionClass::MoveToTrash, "app")];
+    assert!(Plan::seal(content).is_err());
+}
+
+#[test]
+fn one_process_generation_is_one_target() {
+    let two_targets = |second: TargetBinding| {
+        let mut content = process_content(Escalation::None);
+        content.targets.push(PlanTarget {
+            target_id: target_id("other"),
+            binding: second,
+        });
+        content.steps.push(step(
+            "graceful_2",
+            ActionClass::RequestApplicationExit,
+            "other",
+        ));
+        Plan::seal(content)
+    };
+    let process = |generation: &str, pid: i32| {
+        TargetBinding::Process(crate::action::ProcessBinding {
+            process: single_process(generation, pid),
+        })
+    };
+    two_targets(process("proc_8", 4_298)).unwrap();
+    // The same generation two times.
+    assert_eq!(
+        two_targets(process("proc_9", 4_299)).unwrap_err(),
+        PlanError::Duplicate
+    );
+    // The same generation as a member of an application target.
+    let mut application = application_binding();
+    application.members[0].generation_id = ProcessGenerationId::new("proc_9").unwrap();
+    assert_eq!(
+        two_targets(TargetBinding::Application(application)).unwrap_err(),
+        PlanError::Duplicate
+    );
+}
+
+#[test]
+fn a_process_binding_has_its_own_kind_and_is_not_read_as_an_application() {
+    let plan = seal(process_content(Escalation::None));
+    let value = serde_json::to_value(&plan).unwrap();
+    assert_eq!(
+        value["content"]["targets"][0]["binding"]["kind"],
+        json!("process")
+    );
+    assert_eq!(serde_json::from_value::<Plan>(value.clone()).unwrap(), plan);
+    // The content of a process binding under each other kind is not a
+    // plan: a build that does not know the kind refuses it.
+    for kind in ["application", "file", "job"] {
+        let mut changed = value.clone();
+        changed["content"]["targets"][0]["binding"]["kind"] = json!(kind);
+        assert!(serde_json::from_value::<Plan>(changed).is_err(), "{kind}");
+    }
+    // A member list is not a part of the binding.
+    let mut changed = value;
+    changed["content"]["targets"][0]["binding"]["members"] = json!([]);
+    assert!(serde_json::from_value::<Plan>(changed).is_err());
+}
+
+#[test]
+fn the_hard_protections_of_the_catalog_apply_to_a_process_target() {
+    use crate::policy::{ControlPlaneProcess, ProtectionContext, ProtectionFact};
+    let control_plane = [ControlPlaneProcess {
+        pid: crate::process::Pid::new(700).unwrap(),
+        start_time: member("x", 700).start_time,
+    }];
+    let context = ProtectionContext {
+        principal: crate::process::Uid::new(501),
+        control_plane: Some(&control_plane),
+    };
+    let protection = |change: &dyn Fn(&mut crate::process::ProcessIdentity)| {
+        let mut process = single_process("proc_9", 4_299);
+        change(&mut process);
+        crate::action::ProcessBinding { process }.hard_protection(&context)
+    };
+    assert_eq!(protection(&|_| {}), ProtectionFact::NotProtected);
+    // A process of the operating system, a process of the control plane,
+    // and a process that claims a protected bundle identifier.
+    assert_eq!(
+        protection(&|process| {
+            process.executable.as_mut().unwrap().path =
+                crate::file::LosslessPath::from_bytes("/usr/libexec/worker").unwrap();
+        }),
+        ProtectionFact::Protected
+    );
+    assert_eq!(
+        protection(&|process| process.pid = crate::process::Pid::new(700).unwrap()),
+        ProtectionFact::Protected
+    );
+    assert_eq!(
+        protection(&|process| {
+            process.association = ProcessAssociation::Application {
+                instance_id: ApplicationInstanceId::new("app_9").unwrap(),
+                bundle_identifier: "com.apple.finder".to_owned(),
+                attribution: crate::process::AttributionMethod::from_wire("name_match"),
+            };
+        }),
+        ProtectionFact::Protected
+    );
+    assert_eq!(
+        protection(&|process| process.uid = crate::process::Uid::new(502)),
+        ProtectionFact::Protected
+    );
+    // With no known control plane, the protection is not known.
+    let unknown = ProtectionContext {
+        principal: crate::process::Uid::new(501),
+        control_plane: None,
+    };
+    let binding = crate::action::ProcessBinding {
+        process: single_process("proc_9", 4_299),
+    };
+    assert_eq!(binding.hard_protection(&unknown), ProtectionFact::Unknown);
+}
+
+#[test]
+fn the_envelope_of_a_process_step_repeats_the_checks_of_its_plan() {
+    let plan = seal(process_content(Escalation::None));
+    let envelope = || EnvelopeContent {
+        principal: plan.principal.clone(),
+        authority: plan.authority.clone(),
+        trigger: plan.trigger.clone(),
+        target: plan.targets[0].clone(),
+        leases: vec![lease(LeaseResource::ProcessGeneration(
+            ProcessGenerationId::new("proc_9").unwrap(),
+        ))],
+        limits: crate::action::StepLimits {
+            reservation: crate::action::Reservation::ApplicationSlot { incident_id: None },
+            ..application_envelope(TriggerClass::GlobalCriticalMemory, RecordingMode::Durable)
+                .limits
+        },
+        ..application_envelope(TriggerClass::GlobalCriticalMemory, RecordingMode::Durable)
+    };
+    Checked::new(envelope()).unwrap();
+
+    // The lease is for the generation of the process.
+    let mut other_lease = envelope();
+    other_lease.leases = vec![lease(LeaseResource::ProcessGeneration(
+        ProcessGenerationId::new("proc_1").unwrap(),
+    ))];
+    assert_eq!(envelope_error(other_lease), EnvelopeError::Lease);
+    // The binding rules of the plan apply to the copy of the target.
+    let mut other_user = envelope();
+    if let TargetBinding::Process(binding) = &mut other_user.target.binding {
+        binding.process.uid = crate::process::Uid::new(502);
+    }
+    assert_eq!(envelope_error(other_user), EnvelopeError::Target);
+    // An automatic step has no process target.
+    let mut automatic = envelope();
+    automatic.trigger = super::automatic(TriggerClass::GlobalCriticalMemory);
+    automatic.principal.role = ClientRole::Agent;
+    automatic.authority.action_grants = vec![super::grant_ref()];
+    automatic.limits.reservation = crate::action::Reservation::ApplicationSlot {
+        incident_id: automatic.trigger.incident_id.clone(),
+    };
+    assert_eq!(envelope_error(automatic), EnvelopeError::Trigger);
+    // A work reservation is for a file target.
+    let mut work = envelope();
+    work.limits.reservation = crate::action::Reservation::Work {
+        charge: charge(1, 1),
+    };
+    assert_eq!(envelope_error(work), EnvelopeError::Target);
 }

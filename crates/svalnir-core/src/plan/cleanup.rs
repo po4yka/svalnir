@@ -795,7 +795,7 @@ pub fn split_batches(plan: &PlanContent, batch: &WorkCharge) -> Result<Vec<PlanB
     let has_application: bool = plan
         .targets
         .iter()
-        .any(|target| matches!(target.binding, TargetBinding::Application(_)));
+        .any(|target| !matches!(target.binding, TargetBinding::File(_)));
     if has_application {
         return Ok(Vec::new());
     }
@@ -805,7 +805,9 @@ pub fn split_batches(plan: &PlanContent, batch: &WorkCharge) -> Result<Vec<PlanB
         let target: &PlanTarget = plan.target(&step.target_id).ok_or(BatchError::Content)?;
         let charge: WorkCharge = match &target.binding {
             TargetBinding::File(file) => file.charge,
-            TargetBinding::Application(_) => return Err(BatchError::Content),
+            TargetBinding::Application(_) | TargetBinding::Process(_) => {
+                return Err(BatchError::Content);
+            }
         };
         if !charge.fits_in(batch) {
             return Err(BatchError::ExceedsBatch);

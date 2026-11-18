@@ -191,7 +191,7 @@ fn a_target_of_a_trash_plan_has_no_estimate_of_reclaimable_bytes() {
 fn first_binding(outcome: &PlanOutcome) -> FileBinding {
     match &outcome.plan.as_ref().unwrap().targets[0].binding {
         TargetBinding::File(file) => file.clone(),
-        TargetBinding::Application(_) => panic!("the target is a file target"),
+        _ => panic!("the target is a file target"),
     }
 }
 

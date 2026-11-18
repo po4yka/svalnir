@@ -519,6 +519,10 @@ impl StepCheck<'_> {
                 }
                 self.check_rule_mode(rule, &RuleMode::AutomaticEviction)
             }
+            // A guard selects an application or a job instance and never
+            // one process. A sealed plan with a process target is manual,
+            // so no sealed plan reaches this arm.
+            TargetBinding::Process(_) => Err(RefusalReason::UnsupportedValue),
             TargetBinding::Application(_) => {
                 let escalation: &Escalation = &self.request.plan.limits.escalation;
                 // A force step belongs to a force strategy. A plan with

@@ -2,17 +2,18 @@
 
 use svalnir_core::action::{
     ActionClass, ErrorFamily, Escalation, ExecutorRole, Journal as _, OperationState,
-    PermittedNextStep, Plan, PlanContent, TargetBinding,
+    PermittedNextStep, Plan, PlanContent, ProcessBinding, TargetBinding,
 };
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::id::{PolicyRevisionId, RuleId, RuleRevisionId};
 use svalnir_core::policy::ProtectionFact;
+use svalnir_core::process::ProcessAssociation;
 use svalnir_core::rule::RuleRef;
 
 use super::super::{ApplyOutcome, ApplyRequest, Start, code};
 use super::support::{
-    Bench, NoRules, SECOND, admitted, approval, cleanup_content, cleanup_plan, open_journal,
-    principal, queued, refusal, run, stop_content, stop_plan, stored_request,
+    Bench, NoRules, SECOND, admitted, approval, cleanup_content, cleanup_plan, member,
+    open_journal, principal, queued, refusal, run, stop_content, stop_plan, stored_request,
 };
 use crate::journal::{RequestBody, RequestCompletion, RequestStatus};
 use crate::rules::{
@@ -384,4 +385,36 @@ fn two_operations_on_different_processes_wait_in_sequence() {
     assert_eq!(view.operation.state(), &OperationState::Completed);
     let first_view = coordinator.operation(&first_id).unwrap().unwrap();
     assert_eq!(first_view.operation.state(), &OperationState::Completed);
+}
+
+#[test]
+fn a_plan_with_a_target_of_one_process_is_refused_and_no_call_is_issued() {
+    // The process executor of this build has no step for one process with
+    // no application membership, and the protection port is for an
+    // application binding. The plan is refused before a reservation.
+    let mut bench = Bench::new();
+    let spawned = bench.host.spawn(4_242);
+    for escalation in [
+        Escalation::None,
+        Escalation::ForceAfterGrace,
+        Escalation::ImmediateForce,
+    ] {
+        let name = format!("plan_{}", escalation.as_str());
+        let mut content: PlanContent =
+            stop_content(&name, vec![member(4_242)], escalation, bench.clock.now());
+        let mut process = spawned.clone();
+        process.association = ProcessAssociation::Unattributed;
+        content.targets[0].binding = TargetBinding::Process(ProcessBinding { process });
+        let plan = Plan::seal(content).unwrap();
+        bench.store(&plan);
+        let mut coordinator = bench.start();
+        let error = refusal(&mut coordinator, stored_request(&plan));
+        assert_eq!(error.code.as_str(), code::PROCESS_TARGET_NOT_AVAILABLE);
+        assert_eq!(error.family, ErrorFamily::Request);
+        drop(coordinator);
+        assert_eq!(bench.intents(), 0);
+        assert_eq!(bench.host.calls(), Vec::new());
+        let journal = open_journal(&bench.tree.database);
+        assert_eq!(journal.unsettled_operation_count().unwrap(), 0);
+    }
 }

@@ -337,6 +337,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     incident_id: plan.trigger.incident_id.clone(),
                 },
             ),
+            // Admission refuses a plan with a process target, so no step
+            // of one gets an envelope.
+            TargetBinding::Process(_) => return Err(Fault),
         };
         Checked::new(EnvelopeContent {
             schema_version: PLAN_SCHEMA_VERSION,
@@ -1233,7 +1236,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                         volumes.push(file.volume_id.clone());
                     }
                 }
-                TargetBinding::Application(_) => has_application = true,
+                TargetBinding::Application(_) | TargetBinding::Process(_) => {
+                    has_application = true;
+                }
             }
         }
         for volume in volumes {

@@ -326,23 +326,51 @@ impl ApplicationBinding {
     }
 }
 
+/// The binding of a process target: one process that has no verified
+/// membership in an application or a managed job, for example a process
+/// that a shell started.
+///
+/// The binding has the identity evidence of the process and nothing else.
+/// It has no member list: a child, a process with a similar name, and a
+/// process group are not targets. A process with a verified membership is
+/// a target only through its instance ([`ApplicationBinding`]), so that
+/// the member rules of the instance apply to it.
+///
+/// Only a manual plan has this binding. A guard selects an application or
+/// a job instance and never one process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBinding {
+    /// The process: its generation identity, its process ID, its start
+    /// time, its owner, its boot, and its executable.
+    pub process: ProcessIdentity,
+}
+
+impl ProcessBinding {
+    /// The hard protection of the process, from the catalog of the policy
+    /// module. It is the protection of an instance with this one member:
+    /// only `NotProtected` permits a step.
+    pub fn hard_protection(&self, context: &ProtectionContext<'_>) -> ProtectionFact {
+        hard_protection(std::slice::from_ref(&self.process), context)
+    }
+}
+
 /// The verified identity that a target is bound to.
 ///
 /// JSON encodes the binding as an object with a `kind` field. An unknown
 /// `kind` is rejected: a plan with a target that this build cannot bind is
-/// not executable.
+/// not executable. A build that does not know the kind `process` thus
+/// refuses a plan with a process target; it does not read the target as an
+/// application.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a plan has file targets only or application targets only, so a list does not mix \
-              the two sizes, and a box would add one allocation for each file target"
-)]
 pub enum TargetBinding {
     /// A file object.
     File(FileBinding),
     /// An application or a managed job.
     Application(ApplicationBinding),
+    /// One process with no verified membership.
+    Process(ProcessBinding),
 }
 
 /// One target of a plan.
@@ -430,12 +458,14 @@ pub enum PlanError {
     /// no step.
     #[error("a step and a target do not refer to each other")]
     StepTarget,
-    /// The trigger cannot select an action class of the plan, or the
-    /// trigger identities do not agree with the trigger class.
+    /// The trigger cannot select an action class of the plan, the trigger
+    /// identities do not agree with the trigger class, or an automatic
+    /// plan has a process target.
     #[error("the trigger does not agree with the action classes")]
     Trigger,
     /// The steps mix action classes that one plan cannot have, or the
-    /// steps of an application do not agree with the force strategy.
+    /// steps of an application or of a process do not agree with the force
+    /// strategy.
     #[error("the steps do not agree with each other or with the force strategy")]
     Steps,
     /// The binding of a target does not agree with the action class of its
@@ -553,6 +583,47 @@ pub(super) fn check_application_binding(
     Ok(())
 }
 
+/// The process ID of `launchd`.
+const LAUNCHD_PID: i32 = 1;
+
+/// The user ID of root.
+const ROOT_UID: u32 = 0;
+
+/// Checks the binding of a process target for a plan with the trigger
+/// `trigger`. These are the rules that need no observation; the catalog of
+/// hard protections applies in addition, at each boundary.
+///
+/// - The plan is manual, and the executor is the user executor.
+/// - The process has no verified membership.
+/// - The process is a process of `principal`, is not a process of root,
+///   and is not `launchd`.
+/// - The process has executable evidence: an executor cannot show that a
+///   process with the same process ID is the planned one without it.
+pub(super) fn check_process_binding(
+    binding: &ProcessBinding,
+    principal: Uid,
+    executor: &ExecutorRole,
+    trigger: &TriggerClass,
+) -> Result<(), PlanError> {
+    if !matches!(trigger, TriggerClass::Manual) {
+        return Err(PlanError::Trigger);
+    }
+    let process: &ProcessIdentity = &binding.process;
+    let is_single: bool = process.association.verified_membership().is_none();
+    let owner_agrees: bool = process.uid == principal && process.uid.get() != ROOT_UID;
+    let is_launchd: bool = process.pid.get() == LAUNCHD_PID;
+    if matches!(executor, ExecutorRole::User)
+        && is_single
+        && owner_agrees
+        && !is_launchd
+        && process.executable.is_some()
+    {
+        Ok(())
+    } else {
+        Err(PlanError::Binding)
+    }
+}
+
 /// Whether a step of `class` agrees with the force strategy and the grace
 /// period: a graceful step with `none` or `force_after_grace`, a force
 /// step with `force_after_grace` or `immediate_force`, and a grace period
@@ -625,6 +696,10 @@ impl PlanContent {
                             .iter()
                             .all(|member| generations.insert(member.generation_id.as_str()))
                 }
+                // A process is one target, as a member or by itself.
+                TargetBinding::Process(binding) => {
+                    generations.insert(binding.process.generation_id.as_str())
+                }
             };
             if !is_new {
                 return Err(PlanError::Duplicate);
@@ -674,7 +749,7 @@ impl PlanContent {
                 check_file_binding(class, file, self.principal.uid, &self.executor)?;
                 Ok(file.charge)
             }
-            TargetBinding::Application(application) => {
+            binding @ (TargetBinding::Application(_) | TargetBinding::Process(_)) => {
                 use ActionClass::{ForceApplicationExit, RequestApplicationExit};
                 let steps_agree: bool = match (&self.limits.escalation, classes.as_slice()) {
                     (Escalation::Unrecognized(_), _) => return Err(PlanError::Unrecognized),
@@ -690,7 +765,16 @@ impl PlanContent {
                 if !steps_agree {
                     return Err(PlanError::Steps);
                 }
-                check_application_binding(application, self.principal.uid, &self.executor)?;
+                let uid: Uid = self.principal.uid;
+                match binding {
+                    TargetBinding::Application(application) => {
+                        check_application_binding(application, uid, &self.executor)?;
+                    }
+                    TargetBinding::Process(process) => {
+                        check_process_binding(process, uid, &self.executor, &self.trigger.class)?;
+                    }
+                    TargetBinding::File(_) => return Err(PlanError::Binding),
+                }
                 Ok(WorkCharge::ZERO)
             }
         }

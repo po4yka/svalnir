@@ -247,7 +247,7 @@ fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
                 .iter()
                 .filter_map(|target| match &target.binding {
                     TargetBinding::File(binding) => Some(binding),
-                    TargetBinding::Application(_) => None,
+                    TargetBinding::Application(_) | TargetBinding::Process(_) => None,
                 })
         };
         let bound: BTreeSet<&RootId> = bindings().map(|binding| &binding.root_id).collect();
@@ -286,7 +286,7 @@ pub(crate) fn bound_paths(
             TargetBinding::File(binding) => {
                 Some((target.target_id.clone(), bound_path(document, binding)?))
             }
-            TargetBinding::Application(_) => None,
+            TargetBinding::Application(_) | TargetBinding::Process(_) => None,
         })
         .collect()
 }

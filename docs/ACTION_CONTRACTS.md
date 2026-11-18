@@ -77,6 +77,17 @@ The schema version of a plan and of a request envelope is 2. Version 2 added the
 
 Process bindings include PID, start identity, UID, executable identity, application/job association, and explicitly attributed members.
 
+A target has one of three bindings: a file, an application or managed-job instance with its members, or one process. The binding of one process is for a process that has no verified membership in an application or a managed job. It has the identity evidence of that process and no member list: a child, a process with a similar name, and a process group are not targets. These rules apply to it in the sealed plan and again in the envelope of each step:
+
+- Only a manual plan has it. A guard selects an application or a job instance and never one process.
+- The executor is the user executor.
+- The process has no verified membership. A member of an application or of a job is a target only through its instance, so that the member rules of section 8 apply to it.
+- The process is a process of the principal, is not a process of root, and is not `launchd`.
+- The process has executable evidence, so that an executor can revalidate its identity.
+- One process generation is one target: it is not a second target of the plan and not a member of an application target of the plan.
+
+The hard protections of section 8 apply to the one process as they apply to an instance with one member, and only a process with no protection is a target. In the serialized form the kind of this binding is `process`. A reader that does not know a binding kind rejects the plan and does not read the target as a different kind. The Milestone 2 build has the binding and its checks, and it executes no step for it (`docs/INTERFACES.md` section 4).
+
 The envelope of a step repeats the checks of its plan, because it has its own copy of the target: the binding of the target, the trigger identities, and the agreement of the action class with the force strategy and the grace period. An automatic trigger has an incident identity and a decision identity, and a manual trigger has none. The application slot of an automatic step is a slot of the incident of its trigger. A plan or an envelope of the helper executor names a `PrivilegeGrant`, and one of the user executor names none. The initial process-control surface has the user executor only, so an application plan with the helper executor is rejected. The helper condition of the critical-memory exception in section 12 applies when a later surface gives the helper a step of an application intervention.
 
 Absent native evidence is represented as absent. A path string, bundle name, parent PID, or previously successful probe must not substitute for missing evidence required by the adapter.

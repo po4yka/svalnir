@@ -135,6 +135,16 @@ fn render_target(target: &TargetExplanation, out: &mut String) {
                 );
             }
         }
+        TargetExplanation::Process { process, .. } => put_line!(
+            out,
+            "  process {}  pid {}  {}",
+            process.generation_id,
+            process.pid.get(),
+            process.executable.as_ref().map_or_else(
+                || "no executable evidence".to_owned(),
+                LosslessPath::display_label
+            ),
+        ),
     }
 }
 

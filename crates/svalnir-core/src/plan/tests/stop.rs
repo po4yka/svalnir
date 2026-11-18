@@ -357,6 +357,16 @@ fn hard_protection_cases() -> Vec<ProtectionCase> {
             |candidate| candidate.processes[1].association = ProcessAssociation::Unattributed,
             vec![Reason::MembershipNotVerified],
         ),
+        // The binding for one process exists, and this builder makes no
+        // plan with it: this build has no executor step for it.
+        ProtectionCase::of(
+            "one process with no membership",
+            |candidate| {
+                candidate.processes.truncate(1);
+                candidate.processes[0].association = ProcessAssociation::Unattributed;
+            },
+            vec![Reason::MembershipNotVerified],
+        ),
         ProtectionCase::of(
             "attribution method that this build does not recognize",
             |candidate| {

@@ -341,6 +341,7 @@ fn envelope_content(plan: &Plan, operation: &Operation, step: &str) -> EnvelopeC
                 RecordingMode::Durable
             },
         ),
+        TargetBinding::Process(_) => panic!("no fixture has a process target"),
     };
     EnvelopeContent {
         schema_version: PLAN_SCHEMA_VERSION,

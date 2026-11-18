@@ -16,7 +16,7 @@ use super::class::ActionClass;
 use super::journal::critical_exception_applies;
 use super::plan::{
     ClientRole, Escalation, ExecutorRole, PLAN_SCHEMA_VERSION, PlanError, PlanTarget, Principal,
-    TargetBinding, Trigger, check_application_binding, check_file_binding,
+    TargetBinding, Trigger, check_application_binding, check_file_binding, check_process_binding,
     check_trigger_identities, step_agrees_with_escalation,
 };
 use crate::authority::AuthorityBinding;
@@ -224,6 +224,37 @@ impl Check for EnvelopeContent {
         ) {
             return Err(EnvelopeError::Escalation);
         }
+        self.check_target()?;
+        let is_helper: bool = matches!(self.executor, ExecutorRole::Helper);
+        if self.authority.privilege_grant.is_some() != is_helper {
+            return Err(EnvelopeError::Authority);
+        }
+        if self.evidence.observed_at >= self.evidence.valid_until {
+            return Err(EnvelopeError::Evidence);
+        }
+        let lease_agrees = |lease: &ResourceLease| {
+            lease.owner == self.correlation.operation_id
+                && lease.executor_epoch == self.evidence.executor_epoch
+        };
+        if self.leases.is_empty() || !self.leases.iter().all(lease_agrees) {
+            return Err(EnvelopeError::Lease);
+        }
+        if !self.holds_target_domain() {
+            return Err(EnvelopeError::Lease);
+        }
+        if matches!(self.recording, RecordingMode::VolatileCriticalException)
+            && !critical_exception_applies(&self.action_class, &self.trigger.class)
+        {
+            return Err(EnvelopeError::Recording);
+        }
+        Ok(())
+    }
+}
+
+impl EnvelopeContent {
+    /// Checks the copy of the target with the binding rules of the plan,
+    /// and the reservation of the step with the kind of the target.
+    fn check_target(&self) -> Result<(), EnvelopeError> {
         // The same binding rules as the plan: an envelope has its own copy
         // of the target.
         let uid = self.principal.uid;
@@ -248,29 +279,32 @@ impl Check for EnvelopeContent {
                 self.action_class.is_application_intervention()
                     && incident_id == &self.trigger.incident_id
             }
+            (TargetBinding::Process(process), Reservation::ApplicationSlot { incident_id }) => {
+                check_process_binding(process, uid, &self.executor, &self.trigger.class).map_err(
+                    |error| match error {
+                        PlanError::Trigger => EnvelopeError::Trigger,
+                        other => binding_error(other),
+                    },
+                )?;
+                // A process target is manual, so its slot has no incident.
+                self.action_class.is_application_intervention()
+                    && incident_id == &self.trigger.incident_id
+            }
             _ => false,
         };
         if !target_agrees {
             return Err(EnvelopeError::Target);
         }
-        let is_helper: bool = matches!(self.executor, ExecutorRole::Helper);
-        if self.authority.privilege_grant.is_some() != is_helper {
-            return Err(EnvelopeError::Authority);
-        }
-        if self.evidence.observed_at >= self.evidence.valid_until {
-            return Err(EnvelopeError::Evidence);
-        }
-        let lease_agrees = |lease: &ResourceLease| {
-            lease.owner == self.correlation.operation_id
-                && lease.executor_epoch == self.evidence.executor_epoch
-        };
-        if self.leases.is_empty() || !self.leases.iter().all(lease_agrees) {
-            return Err(EnvelopeError::Lease);
-        }
+        Ok(())
+    }
+
+    /// Whether a lease of the envelope is for the conflict domain of the
+    /// target.
+    fn holds_target_domain(&self) -> bool {
         // A lease is for the conflict domain of the target: the cleanup
-        // root of a file target, or a member generation of an application
-        // target. A lease on a different domain coordinates nothing for
-        // this step.
+        // root of a file target, a member generation of an application
+        // target, or the generation of a process target. A lease on a
+        // different domain coordinates nothing for this step.
         //
         // TODO(npochaev): require a lease for each member generation. The
         // coordinator acquires one for each member; the envelope fixtures
@@ -278,22 +312,16 @@ impl Check for EnvelopeContent {
         // first member only.
         let holds =
             |resource: &LeaseResource| self.leases.iter().any(|lease| &lease.resource == resource);
-        let domain_held: bool = match &self.target.binding {
+        match &self.target.binding {
             TargetBinding::File(file) => holds(&LeaseResource::CleanupRoot(file.root_id.clone())),
             TargetBinding::Application(application) => application.members.iter().any(|member| {
                 holds(&LeaseResource::ProcessGeneration(
                     member.generation_id.clone(),
                 ))
             }),
-        };
-        if !domain_held {
-            return Err(EnvelopeError::Lease);
+            TargetBinding::Process(binding) => holds(&LeaseResource::ProcessGeneration(
+                binding.process.generation_id.clone(),
+            )),
         }
-        if matches!(self.recording, RecordingMode::VolatileCriticalException)
-            && !critical_exception_applies(&self.action_class, &self.trigger.class)
-        {
-            return Err(EnvelopeError::Recording);
-        }
-        Ok(())
     }
 }

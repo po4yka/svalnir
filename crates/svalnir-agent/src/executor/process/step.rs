@@ -1156,9 +1156,10 @@ impl Observation {
                 .settle(pending.index, &pending.member, Some(state), outcome)?;
         }
         let ended: bool = if let Ok(now) = now {
-            // The clock gave no value after the first call. This later
-            // reading is the submission time: the grace period then ends
-            // later, and not earlier, than the true one.
+            // The clock gave no value after the last call that left a
+            // member possibly running. This later reading is the
+            // submission time: the grace period then ends later, and not
+            // earlier, than the true one.
             if self.work.submitted_at.is_none() {
                 self.work.submitted_at = Some(now);
                 self.window_ends_at = window_end(Some(now), self.window);

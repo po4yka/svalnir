@@ -20,7 +20,7 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 use thiserror::Error;
 
 use super::state::HelperClock;
-use crate::request::StepCorrelation;
+use crate::request::{LoginSessionId, StepCorrelation};
 
 /// The largest capacity of the record, in requests.
 pub const MAX_RECORD_CAPACITY: usize = 4096;
@@ -31,6 +31,12 @@ pub const MAX_RECORD_CAPACITY: usize = 4096;
 /// The user comes from the [`CallerIdentity`](crate::request::CallerIdentity)
 /// of the transport. Thus one user cannot read or repeat the step of
 /// another user, and cannot make a record that hides it.
+///
+/// The login session is not a part of the key. One user has one record of
+/// a step identity, and [`ConsumedRequest::login_session`] binds that record
+/// to one login session. A second login session of the same user thus
+/// cannot make a second record of the same step, and the helper refuses
+/// each of its requests for that step.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StepKey {
     /// The authenticated user.
@@ -46,6 +52,9 @@ pub struct StepKey {
 pub struct ConsumedRequest {
     /// The deduplication identity.
     pub key: StepKey,
+    /// The login session of the caller that the helper accepted. Each later
+    /// request for the step must come from this login session.
+    pub login_session: LoginSessionId,
     /// The transport identity of the request that the helper accepted.
     pub request_id: RequestId,
     /// The plan, the operation, and the step of the request.

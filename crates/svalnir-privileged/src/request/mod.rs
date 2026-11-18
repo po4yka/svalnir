@@ -31,9 +31,10 @@
 //! # The identity of the caller
 //!
 //! [`CallerIdentity`] is not a part of the request. Only the transport of
-//! this crate can make it, from the code-signing identity and the audited
-//! user of the live connection. A request body has no field for a user ID
-//! or a process ID, and decoding rejects a body that has one.
+//! this crate can make it, from the code-signing identity, the audited
+//! user, and the login session of the live connection. A request body has
+//! no field for a user ID, a session, or a process ID, and decoding rejects
+//! a body that has one.
 //!
 //! # The encoded form
 //!
@@ -52,7 +53,9 @@ mod identity;
 mod operation;
 
 pub use decode::{DecodeError, MAX_ENCODED_REQUEST_BYTES, MAX_NESTING_DEPTH, decode_request};
-pub use identity::{CallerIdentity, CodeIdentity, CodeIdentityError, MAX_CODE_IDENTITY_BYTES};
+pub use identity::{
+    CallerIdentity, CodeIdentity, CodeIdentityError, LoginSessionId, MAX_CODE_IDENTITY_BYTES,
+};
 pub use operation::{
     EntryTarget, EvictEntries, HelperOperation, HelperRequest, MAX_TARGETS_PER_REQUEST,
     OperationKind, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolMismatch, ProtocolVersion,

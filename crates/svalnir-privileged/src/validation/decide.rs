@@ -17,8 +17,8 @@ use super::state::{
     SUPPORTED_ACTION_CLASS,
 };
 use crate::request::{
-    CallerIdentity, EvictEntries, HelperOperation, HelperRequest, MAX_TARGETS_PER_REQUEST,
-    OperationKind, RequestValidity, StepCorrelation,
+    CallerIdentity, EvictEntries, HelperOperation, HelperRequest, LoginSessionId,
+    MAX_TARGETS_PER_REQUEST, OperationKind, RequestValidity, StepCorrelation,
 };
 
 /// One entry of an accepted eviction.
@@ -45,6 +45,8 @@ pub struct BoundedEntry {
 pub struct BoundedEviction {
     /// The deduplication identity of the step.
     pub key: StepKey,
+    /// The login session of the caller. The record binds the step to it.
+    pub login_session: LoginSessionId,
     /// The plan, the operation, and the step.
     pub correlation: StepCorrelation,
     /// The grant and the generation that cover the step.
@@ -170,13 +172,15 @@ struct RequestContent<'request> {
 /// The checks, in sequence:
 ///
 /// 1. The protocol version.
-/// 2. The code-signing identity and the role of the caller.
+/// 2. The code-signing identity, the role, and the login session of the
+///    caller.
 /// 3. For a status query: the validity, then the recorded state of the
-///    step of the authenticated user.
-/// 4. The record of consumed requests: the same step with the same
-///    content gives its recorded state, and with a different content gives
-///    a refusal. A recorded transport identity for a different step gives
-///    a refusal.
+///    step of the authenticated user. A step of a different login session
+///    gives a refusal.
+/// 4. The record of consumed requests: a step of a different login
+///    session gives a refusal. The same step with the same content gives
+///    its recorded state, and with a different content gives a refusal. A
+///    recorded transport identity for a different step gives a refusal.
 /// 5. The validity: the timeline, the expiry, and the longest validity.
 /// 6. The grant: its user, its generation, its revocation, and its expiry.
 ///    The grant must apply for the full validity of the request.
@@ -246,8 +250,8 @@ impl HelperState {
     /// states. The function is pure: it reads no clock and no file, and it
     /// changes nothing. The checks, in sequence:
     ///
-    /// 1. The record has the step, and the step is `DispatchConsumed` or
-    ///    `Verifying`.
+    /// 1. The record has the step for the login session of the operation,
+    ///    and the step is `DispatchConsumed` or `Verifying`.
     /// 2. The clock is on the timeline of the record, and it is before the
     ///    deadline of the operation.
     /// 3. The grant is known for the user of the step, it has the
@@ -271,6 +275,9 @@ impl HelperState {
             .consumed
             .find(key)
             .ok_or(RefusalReason::StepNotRecorded)?;
+        if recorded.login_session != eviction.login_session {
+            return Err(RefusalReason::LoginSessionMismatch);
+        }
         if !matches!(
             recorded.state,
             StepState::DispatchConsumed | StepState::Verifying
@@ -346,7 +353,8 @@ fn evaluate(
     clock: &HelperClock,
 ) -> Result<Evaluation, RefusalReason> {
     state.config.protocols.check(request.protocol)?;
-    check_caller(&state.config, caller, request.operation.kind())?;
+    let login_session: LoginSessionId =
+        check_caller(&state.config, caller, request.operation.kind())?;
     // The user of the key is the audited user of the connection. The
     // request has no field that can replace it.
     let key: StepKey = StepKey {
@@ -361,13 +369,16 @@ fn evaluate(
                 .consumed
                 .find(&key)
                 .ok_or(RefusalReason::StepNotRecorded)?;
+            if recorded.login_session != login_session {
+                return Err(RefusalReason::LoginSessionMismatch);
+            }
             if recorded.correlation != request.correlation {
                 return Err(RefusalReason::ConflictingDuplicate);
             }
             Ok(Evaluation::Known(recorded.status()))
         }
         HelperOperation::EvictEntries(eviction) => {
-            evaluate_eviction(state, caller, request, eviction, key, clock)
+            evaluate_eviction(state, caller, login_session, request, eviction, key, clock)
         }
     }
 }
@@ -375,6 +386,7 @@ fn evaluate(
 fn evaluate_eviction(
     state: &HelperState,
     caller: &CallerIdentity,
+    login_session: LoginSessionId,
     request: &HelperRequest,
     eviction: &EvictEntries,
     key: StepKey,
@@ -394,8 +406,14 @@ fn evaluate_eviction(
     // only after its request is expired and its retention is complete; a
     // later request for the same step identity is then a new step, with
     // each check of freshness, authority, and rate.
+    //
+    // The login session comes before the content: a step of a different
+    // login session gives one reason for a repeat and for a different
+    // content, so that session learns nothing about the step.
     if let Some(recorded) = state.consumed.find(&key) {
-        return if recorded.content == content {
+        return if recorded.login_session != login_session {
+            Err(RefusalReason::LoginSessionMismatch)
+        } else if recorded.content == content {
             Ok(Evaluation::Known(recorded.status()))
         } else {
             Err(RefusalReason::ConflictingDuplicate)
@@ -447,6 +465,7 @@ fn evaluate_eviction(
 
     let operation: BoundedOperation = BoundedOperation::EvictEntries(BoundedEviction {
         key: key.clone(),
+        login_session,
         correlation: request.correlation.clone(),
         grant: record.grant().reference(),
         root: root.clone(),
@@ -457,6 +476,7 @@ fn evaluate_eviction(
     });
     let consumed: ConsumedRequest = ConsumedRequest {
         key,
+        login_session,
         request_id: request.request_id.clone(),
         correlation: request.correlation.clone(),
         content,
@@ -475,15 +495,17 @@ fn evaluate_eviction(
     })
 }
 
-/// Checks the code-signing identity and the role of the caller.
+/// Checks the code-signing identity, the role, and the login session of the
+/// caller. Returns the login session.
 ///
 /// Each operation is for the agent only. The command-line client and the
-/// GPUI client use the agent; they do not call the helper.
+/// GPUI client use the agent; they do not call the helper. Each request
+/// needs a login session, because the record binds each step to one.
 fn check_caller(
     config: &HelperConfig,
     caller: &CallerIdentity,
     kind: OperationKind,
-) -> Result<(), RefusalReason> {
+) -> Result<LoginSessionId, RefusalReason> {
     if caller.code() != &config.agent {
         return Err(RefusalReason::CallerNotPermitted);
     }
@@ -494,11 +516,12 @@ fn check_caller(
             ClientRole::Cli | ClientRole::Gui | ClientRole::Unrecognized(_),
         ) => false,
     };
-    if permitted {
-        Ok(())
-    } else {
-        Err(RefusalReason::RoleNotPermitted)
+    if !permitted {
+        return Err(RefusalReason::RoleNotPermitted);
     }
+    caller
+        .login_session()
+        .ok_or(RefusalReason::LoginSessionMissing)
 }
 
 /// Checks that the request is current on the clock of the helper.

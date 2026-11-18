@@ -63,6 +63,15 @@ pub enum RefusalReason {
     /// The role of the caller cannot request the operation.
     #[error("the role of the caller cannot request the operation")]
     RoleNotPermitted,
+    /// The connection of the caller has no login session.
+    #[error("the caller has no login session")]
+    LoginSessionMissing,
+    /// The record has the step for a different login session of the same
+    /// user. The reason is the same for a status query, a repeat, and a
+    /// different content, so the caller learns no state and no content of
+    /// the step.
+    #[error("the step is recorded for a different login session")]
+    LoginSessionMismatch,
     /// The helper has no grant with this identity for the authenticated
     /// user. A grant of a different user gives the same reason.
     #[error("the helper has no such grant for the user")]
@@ -140,7 +149,7 @@ pub enum RefusalReason {
 
 impl RefusalReason {
     /// Each reason. A path reason is there one time, with one defect.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 37] = [
         Self::ProtocolMajor,
         Self::ProtocolMinor,
         Self::ContentNotEncodable,
@@ -156,6 +165,8 @@ impl RefusalReason {
         Self::ValidityEmpty,
         Self::CallerNotPermitted,
         Self::RoleNotPermitted,
+        Self::LoginSessionMissing,
+        Self::LoginSessionMismatch,
         Self::GrantUnknown,
         Self::GrantGenerationStale,
         Self::GrantGenerationUnknown,
@@ -196,6 +207,8 @@ impl RefusalReason {
             | Self::ValidityEmpty => ErrorFamily::Request,
             Self::CallerNotPermitted
             | Self::RoleNotPermitted
+            | Self::LoginSessionMissing
+            | Self::LoginSessionMismatch
             | Self::GrantUnknown
             | Self::GrantGenerationStale
             | Self::GrantGenerationUnknown
@@ -236,6 +249,8 @@ impl RefusalReason {
             Self::ValidityEmpty => "helper_validity_empty",
             Self::CallerNotPermitted => "helper_caller_not_permitted",
             Self::RoleNotPermitted => "helper_role_not_permitted",
+            Self::LoginSessionMissing => "helper_login_session_missing",
+            Self::LoginSessionMismatch => "helper_login_session_mismatch",
             Self::GrantUnknown => "helper_grant_unknown",
             Self::GrantGenerationStale => "helper_grant_generation_stale",
             Self::GrantGenerationUnknown => "helper_grant_generation_unknown",

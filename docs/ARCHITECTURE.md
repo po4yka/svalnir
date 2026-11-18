@@ -236,7 +236,7 @@ Force quit can lose unsaved work. Standing policy must make that consequence and
 
 The signed distribution uses authenticated local XPC endpoints. Select supported public code-identity APIs against the deployment target; `NSXPCConnection.setCodeSigningRequirement` is documented for macOS 13 and later and must be configured before resuming the connection. [Apple's API contract][xpc-requirement] also requires handling malformed requirements and identity failures.
 
-Validate both client and server identities using the expected product signing identifiers and signer requirements. Team identity alone is too broad. Enforce verified user/session identity and protocol role with supported platform metadata. Never derive authority from caller-provided UID or PID fields.
+Validate both client and server identities using the expected product signing identifiers and signer requirements. Team identity alone is too broad. Enforce verified user/session identity and protocol role with supported platform metadata. Never derive authority from caller-provided UID or PID fields. The privileged helper binds each delegated step to the user and the login session of the caller that it accepted. On macOS, the planned helper transport reads the login session as the audit session identifier of the live peer. The helper refuses a request with no login session, and it refuses each request for a recorded step from another login session of the same user ([INTERFACES.md](INTERFACES.md) section 10).
 
 The conceptual API separates:
 

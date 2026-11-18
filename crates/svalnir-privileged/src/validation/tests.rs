@@ -3,6 +3,7 @@
 //! The tests make values only. No test reads or changes a file, starts a
 //! process, or uses the identity of a real user.
 
+use std::num::NonZeroU32;
 use std::path::{Component, Path};
 
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use svalnir_core::digest::ContentDigest;
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{
     BootId, ClockDomainId, OperationId, PlanId, PrivilegeGrantId, RequestId, RootId, RuleId,
-    RuleRevisionId, SessionId, StepId,
+    RuleRevisionId, StepId,
 };
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
@@ -30,15 +31,19 @@ use super::{
 };
 use crate::request::{
     CallerIdentity, CodeIdentity, DecodeError, EntryTarget, EvictEntries, HelperOperation,
-    HelperRequest, MAX_ENCODED_REQUEST_BYTES, MAX_NESTING_DEPTH, MAX_TARGETS_PER_REQUEST,
-    OperationKind, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolVersion, QueryStepStatus,
-    RequestValidity, StepCorrelation, SupportedProtocols, decode_request,
+    HelperRequest, LoginSessionId, MAX_ENCODED_REQUEST_BYTES, MAX_NESTING_DEPTH,
+    MAX_TARGETS_PER_REQUEST, OperationKind, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolVersion,
+    QueryStepStatus, RequestValidity, StepCorrelation, SupportedProtocols, decode_request,
 };
 
 // The fixture: one user, one grant with one root, and a clock.
 
 const USER: u32 = 501;
 const OTHER_USER: u32 = 502;
+/// The login session of the fixture caller.
+const SESSION: u32 = 100_001;
+/// A second login session of the same user.
+const OTHER_SESSION: u32 = 100_002;
 /// The monotonic time of the fixture clock.
 const NOW: u64 = 1_000;
 /// The wall-clock time of the fixture clock, in seconds.
@@ -80,12 +85,22 @@ fn agent_code() -> CodeIdentity {
     CodeIdentity::new("io.svalnir.agent", "TEAM123456").unwrap()
 }
 
+fn login_session(audit_session: u32) -> LoginSessionId {
+    LoginSessionId::new(NonZeroU32::new(audit_session).unwrap())
+}
+
 fn caller_with(code: CodeIdentity, uid: u32, role: ClientRole) -> CallerIdentity {
+    CallerIdentity::from_transport(code, Uid::new(uid), Some(login_session(SESSION)), role)
+}
+
+/// The agent of the fixture user in another login session, or with no
+/// login session.
+fn caller_in(session: Option<u32>) -> CallerIdentity {
     CallerIdentity::from_transport(
-        code,
-        Uid::new(uid),
-        Some(SessionId::new("session-1").unwrap()),
-        role,
+        agent_code(),
+        Uid::new(USER),
+        session.map(login_session),
+        ClientRole::Agent,
     )
 }
 
@@ -514,7 +529,17 @@ fn refuses_each_role_other_than_the_agent_for_each_operation() {
 #[test]
 fn a_forged_identity_field_in_the_body_is_rejected() {
     // At the top level of the request.
-    for field in ["uid", "pid", "principal", "caller", "role", "audited_uid"] {
+    for field in [
+        "uid",
+        "pid",
+        "principal",
+        "caller",
+        "role",
+        "audited_uid",
+        "session",
+        "login_session",
+        "audit_session",
+    ] {
         let mut value: Value = encode(&request("step-1"));
         value[field] = json!(0);
         assert_eq!(decode(&value), Err(DecodeError::Malformed), "{field}");
@@ -1937,7 +1962,7 @@ fn a_code_identity_is_bounded_visible_text() {
     assert_eq!(caller.code().team_identifier(), "TEAM123456");
     assert_eq!(caller.audited_uid(), Uid::new(USER));
     assert_eq!(caller.role(), &ClientRole::Agent);
-    assert_eq!(caller.session().map(SessionId::as_str), Some("session-1"));
+    assert_eq!(caller.login_session(), Some(login_session(SESSION)));
 }
 
 // The encoded form.
@@ -2515,3 +2540,5 @@ fn a_key_two_times_in_a_nested_record_is_rejected() {
         Err(DecodeError::Malformed)
     );
 }
+
+mod session;

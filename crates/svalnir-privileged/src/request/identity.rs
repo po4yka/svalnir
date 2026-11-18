@@ -1,12 +1,13 @@
 //! The identity of the caller, as the transport supplies it.
 //!
 //! `docs/ARCHITECTURE.md` section 10 and `docs/INTERFACES.md` section 9 own
-//! the rule: the user, the session, and the role come from the live
+//! the rule: the user, the login session, and the role come from the live
 //! transport, and authority is never derived from a user ID or a process ID
 //! that the caller supplies.
 
+use std::num::NonZeroU32;
+
 use svalnir_core::action::ClientRole;
-use svalnir_core::id::SessionId;
 use svalnir_core::process::Uid;
 use thiserror::Error;
 
@@ -73,12 +74,34 @@ fn is_identity_part(text: &str) -> bool {
         && text.bytes().all(|byte: u8| byte.is_ascii_graphic())
 }
 
+/// The identity of one login session of the host.
+///
+/// On macOS the value is the audit session identifier of the live peer,
+/// which the transport reads from the connection. The value zero is the
+/// default audit session of the host and is not a login session: for that
+/// value, the transport supplies no login session. The value is a name. It
+/// is the login session of a caller only inside a [`CallerIdentity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoginSessionId(NonZeroU32);
+
+impl LoginSessionId {
+    /// Makes the identity from the audit session identifier.
+    pub const fn new(audit_session: NonZeroU32) -> Self {
+        Self(audit_session)
+    }
+
+    /// The audit session identifier.
+    pub const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
 /// The identity of the caller of one request.
 ///
 /// Only the transport of this crate makes the value, from the live
 /// connection: the code-signing identity that the operating system
-/// verified, the audited user, the session, and the role that the handshake
-/// selected. The type has no public constructor, no default value, and no
+/// verified, the audited user, the login session, and the role that the
+/// handshake selected. The type has no public constructor, no default value, and no
 /// decoder, so a request body cannot supply it:
 ///
 /// ```compile_fail
@@ -98,7 +121,7 @@ fn is_identity_part(text: &str) -> bool {
 pub struct CallerIdentity {
     code: CodeIdentity,
     audited_uid: Uid,
-    session: Option<SessionId>,
+    login_session: Option<LoginSessionId>,
     role: ClientRole,
 }
 
@@ -107,7 +130,9 @@ impl CallerIdentity {
     ///
     /// The caller of this function is the transport. Each argument must be
     /// a value that the operating system reported for the connection, and
-    /// not a value that the peer sent.
+    /// not a value that the peer sent. `login_session` is `None` when the
+    /// connection has no login session; the helper refuses each request of
+    /// such a caller.
     #[cfg_attr(
         not(test),
         expect(
@@ -118,13 +143,13 @@ impl CallerIdentity {
     pub(crate) fn from_transport(
         code: CodeIdentity,
         audited_uid: Uid,
-        session: Option<SessionId>,
+        login_session: Option<LoginSessionId>,
         role: ClientRole,
     ) -> Self {
         Self {
             code,
             audited_uid,
-            session,
+            login_session,
             role,
         }
     }
@@ -139,9 +164,9 @@ impl CallerIdentity {
         self.audited_uid
     }
 
-    /// The session of the connection, when the transport has one.
-    pub fn session(&self) -> Option<&SessionId> {
-        self.session.as_ref()
+    /// The login session of the connection, when the transport has one.
+    pub fn login_session(&self) -> Option<LoginSessionId> {
+        self.login_session
     }
 
     /// The role that the handshake selected.

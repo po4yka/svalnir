@@ -403,7 +403,7 @@ Ctrl+C disconnects the waiting/streaming client. It does not uninstall the agent
 
 The signed distribution uses local XPC with typed method interfaces and constrained decoded classes. JSON is the public machine-output representation; this document does not require sending arbitrary JSON dictionaries through the privileged boundary.
 
-Authenticate both client and server with supported code-identity mechanisms appropriate to the deployment target. Require the expected product signing identity and permitted role, rather than accepting every executable from a signing team. Bind user/session identity from the live transport using supported platform metadata.
+Authenticate both client and server with supported code-identity mechanisms appropriate to the deployment target. Require the expected product signing identity and permitted role, rather than accepting every executable from a signing team. Bind user/session identity from the live transport using supported platform metadata. At the helper boundary, the session is the login session of the peer: on macOS, the planned transport reads the audit session identifier of the connection. Section 10 binds each delegated step to it.
 
 Apple's [NSXPC code-signing requirement API][xpc] requires setup before the connection is resumed. Requirements must come from reviewed product policy, not caller-provided expressions. Exact signing requirements, OS availability, failure behavior, and update compatibility remain native validation gates.
 
@@ -457,6 +457,8 @@ Paginate or reject an oversized response instead of bypassing limits. Rate-limit
 ## 10. Helper boundary
 
 The helper receives a supported delegated step with its parent operation, authenticated principal, exact action type, grant generation, resource scope, target evidence, deadline, and deduplication identity.
+
+The helper binds each delegated step to the user and the login session of the caller that it accepted. Neither value is a field of the request; the transport supplies both from the live connection. The helper refuses a request with no login session (`helper_login_session_missing`). For a recorded step, a status query, a repeat, and a request with a different content from another login session of the same user get one refusal (`helper_login_session_mismatch`). The refusal has no state and no content of the step, and it is the same for a repeat and a different content. It is a refusal and not `helper_step_not_recorded`: the helper must refuse an eviction request for a recorded step identity in any case, so a "not recorded" answer to a query would hide nothing.
 
 It independently resolves and validates the authority-bearing parts. Agent-supplied paths, measured pressure, rule labels, approval flags, catalog rows, and budget claims cannot widen a `PrivilegeGrant`.
 

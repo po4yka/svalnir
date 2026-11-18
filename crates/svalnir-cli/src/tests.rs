@@ -997,6 +997,51 @@ mod host {
         );
         // A diagnostic creates nothing.
         assert!(!directory.path().join("state").exists());
+        assert_eq!(envelope["result"]["agent_start_failure"]["state"], "none");
+    }
+
+    #[test]
+    fn agent_status_and_doctor_show_the_start_failure_of_the_agent() {
+        use svalnir_agent::runtime::start_failure::{
+            StartFailure, StartFailureReason, write_start_failure,
+        };
+        use svalnir_core::time::WallTime;
+
+        let (environment, directory) = environment();
+        let state = directory.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let failed_at = WallTime::from_unix(1_800_000_000, 0).unwrap();
+        let record = StartFailure::new(StartFailureReason::HomeMismatch, Some(failed_at));
+        write_start_failure(&state, &record).unwrap();
+        // No agent runs, and the state directory has no journal.
+        for arguments in [&["agent", "status"][..], &["doctor"]] {
+            let mut json: Vec<&str> = arguments.to_vec();
+            json.extend(["--format", "json"]);
+            let outcome = run_with(&environment, &json);
+            assert_eq!(outcome.status, ExitStatus::Success, "{arguments:?}");
+            let view = &outcome.envelope()["result"]["agent_start_failure"];
+            assert_eq!(view["state"], "recorded", "{arguments:?}");
+            assert_eq!(view["reason"], "home_mismatch");
+            assert_eq!(view["message"], StartFailureReason::HomeMismatch.message());
+            assert_eq!(view["failed_at"], failed_at.to_string());
+            assert_eq!(view["agent_version"], env!("CARGO_PKG_VERSION"));
+            let text = run_with(&environment, arguments);
+            assert_eq!(text.status, ExitStatus::Success, "{arguments:?}");
+            assert!(
+                text.stdout.contains(&format!(
+                    "Agent start failure: home_mismatch at {failed_at}"
+                )),
+                "{}",
+                text.stdout
+            );
+        }
+        // A record that this build cannot read is named, not hidden.
+        std::fs::write(state.join("agent-start-failure.json"), b"not a record").unwrap();
+        let outcome = run_with(&environment, &["agent", "status", "--format", "json"]);
+        assert_eq!(
+            outcome.envelope()["result"]["agent_start_failure"]["state"],
+            "not_readable"
+        );
     }
 
     #[test]

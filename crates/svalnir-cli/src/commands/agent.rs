@@ -24,6 +24,7 @@ use svalnir_core::time::WallTime;
 
 use super::authority::AuthorityView;
 use super::session::{self, CoordinatorPresence, Now, coordinator_presence, journal_error};
+use super::start_failure::StartFailureView;
 use super::{CommandFailure, Invocation};
 use crate::cli::AgentServiceArgs;
 use crate::environment::Environment;
@@ -197,6 +198,8 @@ impl AgentSummary {
 struct StatusView {
     #[serde(flatten)]
     summary: AgentSummary,
+    /// The latest permanent start error of the agent.
+    agent_start_failure: StartFailureView,
     service: ServiceView,
     note: &'static str,
 }
@@ -252,6 +255,7 @@ impl StatusView {
                 lifecycle.unclean_stops
             );
         }
+        self.agent_start_failure.render(&mut out);
         out.push_str("Standing authority\n");
         match &self.summary.authority {
             Some(authority) => authority.render(&mut out),
@@ -295,6 +299,7 @@ pub(crate) fn status(invocation: &mut Invocation<'_>) -> Result<ExitStatus, Comm
     let host: Arc<dyn ServiceHost> = environment.seams.service_host();
     let view = StatusView {
         summary,
+        agent_start_failure: StartFailureView::read(environment),
         service: ServiceView {
             label: LAUNCH_AGENT_LABEL,
             definition_present: path.as_ref().map(|path| host.definition_exists(path)),

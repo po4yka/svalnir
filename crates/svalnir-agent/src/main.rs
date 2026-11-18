@@ -12,7 +12,10 @@
 //!
 //! The process runs in the foreground until `SIGINT` or `SIGTERM`. It
 //! registers no service: a `LaunchAgent` definition starts it with the
-//! same arguments. The log is structured text on the standard error
+//! same arguments. A permanent start error writes the start-failure record
+//! of `svalnir_agent::runtime::start_failure` and exits with status 0,
+//! which that definition does not restart; a transient one exits with
+//! status 1. The log is structured text on the standard error
 //! stream; it has no secret, no path of user data, and no process
 //! argument.
 
@@ -153,9 +156,13 @@ mod agent {
         StopSignal, request_main_run_loop_stop, run_main_run_loop_until_stop,
     };
     use svalnir_agent::runtime::host::{SystemParts, system_parts};
+    use svalnir_agent::runtime::start_failure::{
+        PERMANENT_START_ERROR_STATUS, StartFailure, StartFailureReason, remove_start_failure,
+        write_start_failure,
+    };
     use svalnir_agent::runtime::{
-        AgentClock, Driver, DriverSettings, DriverStart, ServiceSettings, ShutdownReport,
-        StopHandle, run as run_service,
+        AgentClock, Driver, DriverError, DriverSettings, DriverStart, ServiceSettings,
+        ShutdownReport, StopHandle, run as run_service,
     };
     use svalnir_agent::store::{Store, StoreOptions};
     use svalnir_core::config::{MAX_DOCUMENT_BYTES, ValidatedConfig, parse_and_validate};
@@ -163,6 +170,7 @@ mod agent {
     use svalnir_core::id::{AdapterId, ExecutorEpochId};
     use svalnir_core::process::Uid;
     use svalnir_core::quantity::{Bytes, Nanoseconds};
+    use svalnir_core::time::WallTime;
 
     use super::Options;
 
@@ -180,7 +188,7 @@ mod agent {
 
     /// The configuration that the agent evaluates with no policy revision
     /// in effect: the file of `--config`, or the template values.
-    pub(super) fn proposal(path: Option<&Path>) -> Result<ValidatedConfig, String> {
+    pub(super) fn proposal(path: Option<&Path>) -> Result<ValidatedConfig, StartFailureReason> {
         let text: String = match path {
             None => "schema_version = 1\n".to_owned(),
             Some(path) => {
@@ -204,17 +212,17 @@ mod agent {
                             Err(std::io::ErrorKind::InvalidInput.into())
                         }
                     })
-                    .map_err(|_| "the configuration file is not readable")?;
+                    .map_err(|_| StartFailureReason::ConfigurationNotReadable)?;
                 if text.len() > MAX_DOCUMENT_BYTES {
-                    return Err("the configuration file is too large".to_owned());
+                    return Err(StartFailureReason::ConfigurationNotReadable);
                 }
                 text
             }
         };
-        parse_and_validate(&text).config().cloned().ok_or_else(|| {
-            "the configuration is not valid; `svalnir config validate` shows the findings"
-                .to_owned()
-        })
+        parse_and_validate(&text)
+            .config()
+            .cloned()
+            .ok_or(StartFailureReason::ConfigurationInvalid)
     }
 
     /// Makes the state directory when it does not exist, for this user
@@ -248,13 +256,11 @@ mod agent {
     /// The home directory of the user as a canonical path: `HOME`, when
     /// it is the home directory of the account record of the effective
     /// user.
-    fn home_directory() -> Result<LosslessPath, String> {
-        let home = verify_process_home().map_err(|error| {
-            // The message of the error has no path.
-            format!("{} ({})", error, error.code())
-        })?;
+    fn home_directory() -> Result<LosslessPath, StartFailed> {
+        let home = verify_process_home()
+            .map_err(|error| StartFailed::Permanent(StartFailureReason::of_home(&error)))?;
         LosslessPath::from_path(&home)
-            .map_err(|_| "the home directory is not a usable path".to_owned())
+            .map_err(|_| StartFailed::Transient("the home directory is not a usable path"))
     }
 
     fn settings(
@@ -313,12 +319,19 @@ mod agent {
         settings: DriverSettings,
     }
 
-    /// Reads the configuration and makes the parts of the running system.
-    /// The message of an error has no path.
-    fn prepare(options: &Options) -> Result<Prepared, String> {
-        let config: ValidatedConfig = proposal(options.config.as_deref())?;
-        state_directory(&options.state_directory)
-            .map_err(|_| "the state directory is not usable")?;
+    /// Why the agent did not start.
+    enum StartFailed {
+        /// A new start with the same inputs fails again.
+        Permanent(StartFailureReason),
+        /// A start can pass later. The message has no path.
+        Transient(&'static str),
+    }
+
+    /// Reads the configuration and makes the parts of the running system,
+    /// in the state directory that [`state_directory`] accepted.
+    fn prepare(options: &Options) -> Result<Prepared, StartFailed> {
+        let config: ValidatedConfig =
+            proposal(options.config.as_deref()).map_err(StartFailed::Permanent)?;
         let home: LosslessPath = home_directory()?;
         // SAFETY: `geteuid` has no argument, changes nothing, and does
         // not fail.
@@ -327,8 +340,9 @@ mod agent {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let epoch: ExecutorEpochId =
-            ExecutorEpochId::new(format!("agent-{}-{started:x}", std::process::id()))
-                .map_err(|_| "the identity of the executor lifetime is not valid")?;
+            ExecutorEpochId::new(format!("agent-{}-{started:x}", std::process::id())).map_err(
+                |_| StartFailed::Transient("the identity of the executor lifetime is not valid"),
+            )?;
         // Retained samples are optional: with no store the agent keeps
         // none.
         let store: Option<Store> = Store::open(
@@ -340,14 +354,17 @@ mod agent {
         .ok();
         let parts: SystemParts =
             // The text of the error can have a path of the user.
-            system_parts(&epoch, principal, &home, store).map_err(|error| error.cause())?;
+            system_parts(&epoch, principal, &home, store)
+                .map_err(|error| StartFailed::Transient(error.cause()))?;
         let service: ServiceSettings = ServiceSettings {
             sample_interval: config.agent().sample_interval,
             pressure_sample_interval: config.agent().pressure_sample_interval,
             idle_interval: IDLE_INTERVAL,
         };
-        let settings: DriverSettings =
-            settings(principal, home, config).ok_or("a setting of the agent is not valid")?;
+        // The settings come from the intervals of the configuration.
+        let settings: DriverSettings = settings(principal, home, config).ok_or(
+            StartFailed::Permanent(StartFailureReason::ConfigurationInvalid),
+        )?;
         Ok(Prepared {
             epoch,
             parts,
@@ -372,18 +389,76 @@ mod agent {
         }
     }
 
+    /// Ends a start with a permanent error: writes the start-failure
+    /// record and one line on the standard error stream, and gives the
+    /// status that the service manager does not restart.
+    fn end_permanently(state: &Path, reason: StartFailureReason) -> ExitCode {
+        let failed_at: Option<WallTime> = WallTime::try_from(std::time::SystemTime::now()).ok();
+        let recorded: bool = reason != StartFailureReason::StateDirectoryRefused
+            && write_start_failure(state, &StartFailure::new(reason, failed_at)).is_ok();
+        tracing::error!(
+            reason = reason.code(),
+            recorded,
+            "the agent did not start: {}; the cause is permanent, so the agent ends with status {PERMANENT_START_ERROR_STATUS} and the service manager does not start it again",
+            reason.message()
+        );
+        ExitCode::from(PERMANENT_START_ERROR_STATUS)
+    }
+
+    /// Checks the state directory and prepares the start. `Err`: the
+    /// exit status of a start that failed.
+    fn checked_prepare(options: &Options) -> Result<Prepared, ExitCode> {
+        let state: &Path = &options.state_directory;
+        if let Err(error) = state_directory(state) {
+            // A refused directory stays refused. The record cannot go to
+            // it, so the line on the standard error stream is the report.
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return Err(end_permanently(
+                    state,
+                    StartFailureReason::StateDirectoryRefused,
+                ));
+            }
+            tracing::error!(
+                cause = %error.kind(),
+                "the agent did not start: the state directory is not usable"
+            );
+            return Err(ExitCode::FAILURE);
+        }
+        prepare(options).map_err(|failure| match failure {
+            StartFailed::Permanent(reason) => end_permanently(state, reason),
+            StartFailed::Transient(message) => {
+                tracing::error!(message, "the agent did not start");
+                ExitCode::FAILURE
+            }
+        })
+    }
+
+    /// The exit status of a start error of the driver.
+    fn driver_failure(state: &Path, error: &DriverError) -> ExitCode {
+        if let Some(reason) = StartFailureReason::of_driver(error) {
+            return end_permanently(state, reason);
+        }
+        // The text of a journal error can have a path.
+        let cause: &str = match error {
+            DriverError::Journal(_) => "journal",
+            DriverError::Coordinator(_) => "coordinator",
+            DriverError::Clock => "clock",
+            DriverError::Reconciliation => "reconciliation",
+        };
+        tracing::error!(cause, "the agent did not start");
+        ExitCode::FAILURE
+    }
+
     pub(super) fn run(options: &Options) -> ExitCode {
+        let state: &Path = &options.state_directory;
         let Prepared {
             epoch,
             parts,
             service,
             settings,
-        } = match prepare(options) {
+        } = match checked_prepare(options) {
             Ok(prepared) => prepared,
-            Err(message) => {
-                tracing::error!(message, "the agent did not start");
-                return ExitCode::FAILURE;
-            }
+            Err(status) => return status,
         };
         let (subscription, events) = pressure_events(&parts);
         let SystemParts {
@@ -392,13 +467,16 @@ mod agent {
             clock,
             context: _context,
         } = parts;
-        let driver: Box<Driver> = match Driver::start(
-            &options.state_directory,
-            epoch.clone(),
-            settings,
-            driver_parts,
-        ) {
-            Ok(DriverStart::Running(driver)) => driver,
+        let driver: Box<Driver> = match Driver::start(state, epoch.clone(), settings, driver_parts)
+        {
+            Ok(DriverStart::Running(driver)) => {
+                // The start succeeded: the record of an earlier permanent
+                // start error is not current.
+                if remove_start_failure(state).is_err() {
+                    tracing::warn!("the start-failure record of an earlier start was not removed");
+                }
+                driver
+            }
             Ok(DriverStart::Busy {
                 holder: CoordinatorRole::Agent,
             }) => {
@@ -419,17 +497,7 @@ mod agent {
                 );
                 return ExitCode::FAILURE;
             }
-            Err(error) => {
-                // The text of a journal error can have a path.
-                let cause: &str = match error {
-                    svalnir_agent::runtime::DriverError::Journal(_) => "journal",
-                    svalnir_agent::runtime::DriverError::Coordinator(_) => "coordinator",
-                    svalnir_agent::runtime::DriverError::Clock => "clock",
-                    svalnir_agent::runtime::DriverError::Reconciliation => "reconciliation",
-                };
-                tracing::error!(cause, "the agent did not start");
-                return ExitCode::FAILURE;
-            }
+            Err(error) => return driver_failure(state, &error),
         };
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),

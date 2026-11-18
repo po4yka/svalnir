@@ -632,6 +632,7 @@ Lifecycle requirements:
 - Preserve an explicit pause across client restarts; report its expiry.
 - Honor a background item disabled by the user; do not silently re-enable it.
 - Use restart backoff and retain a compact reason for degraded operation.
+- Do not restart after a permanent start error, such as an invalid configuration; record its reason for `agent status` and `doctor`.
 - Avoid keeping the Mac awake solely for routine resource monitoring.
 - Drain or checkpoint work on shutdown and reconcile unfinished operations on restart.
 - Uninstall Svalnir's own registered services and helper cleanly; offer a separate choice for deleting retained history and configuration.

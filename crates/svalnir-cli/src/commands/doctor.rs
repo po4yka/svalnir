@@ -1,10 +1,13 @@
-//! `doctor`: the capability report of this process.
+//! `doctor`: the capability report of this process, and the latest
+//! permanent start error of the agent.
 //!
 //! A denied or unknown capability is a successful diagnostic, so the exit
 //! status is 0 for each verdict (`docs/INTERFACES.md` section 8).
 
+use serde::Serialize;
 use svalnir_agent::capability::{self, CapabilityReport, WorkerRole};
 
+use super::start_failure::StartFailureView;
 use super::{CommandFailure, Invocation};
 use crate::output::{ExitStatus, Kind};
 use crate::text::{escape, put_line, table};
@@ -78,9 +81,28 @@ pub(crate) fn render(report: &CapabilityReport) -> String {
     out
 }
 
+/// The result of `doctor`: the capability report of this process and the
+/// latest permanent start error of the agent.
+#[derive(Debug, Serialize)]
+struct DoctorView {
+    #[serde(flatten)]
+    report: CapabilityReport,
+    agent_start_failure: StartFailureView,
+}
+
+fn render_view(view: &DoctorView) -> String {
+    let mut out: String = render(&view.report);
+    out.push('\n');
+    view.agent_start_failure.render(&mut out);
+    out
+}
+
 pub(crate) fn run(invocation: &mut Invocation<'_>) -> Result<ExitStatus, CommandFailure> {
-    let report: CapabilityReport = capability::diagnose(WorkerRole::Cli);
-    invocation.emit(Kind::Report, &report, render)?;
+    let view = DoctorView {
+        report: capability::diagnose(WorkerRole::Cli),
+        agent_start_failure: StartFailureView::read(invocation.environment),
+    };
+    invocation.emit(Kind::Report, &view, render_view)?;
     Ok(ExitStatus::Success)
 }
 

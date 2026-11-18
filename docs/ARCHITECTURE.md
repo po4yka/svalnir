@@ -324,6 +324,8 @@ Before it opens the journal, the agent checks its inputs: the state directory, t
 
 Respect user-disabled background items. Service failure produces degraded capability and restart backoff; it must not silently re-enable a user-disabled component.
 
+A start error is permanent when a new start with the same inputs fails again: an invalid or unreadable configuration, a `HOME` that fails its check, a refused state directory, or a journal of a different version or that is not a journal. The agent then writes one start-failure record in its state directory and exits with a status that the `KeepAlive` condition of its `LaunchAgent` definition does not restart, so `launchd` does not start it again each throttle interval. `agent status` and `doctor` show the reason. Each other start error is transient: the agent exits with failure, and `launchd` starts it again ([INTERFACES.md](INTERFACES.md) section 4).
+
 Upgrade handling must quiesce new mutations, resolve or preserve in-flight state, validate protocol compatibility, and apply versioned migrations. Storage-constrained startup must not attempt an unbounded migration or silently discard the journal. An older binary must reject an incompatible state version safely. Rollback of binaries does not imply rollback of performed actions.
 
 The supported macOS minimum, hardware matrix, Rust toolchain, GPUI revision, signing requirements, and packaging channel remain release decisions. macOS 13 availability of selected APIs is not a claim that every dependency supports that deployment target.
@@ -341,6 +343,7 @@ The supported macOS minimum, hardware matrix, Rust toolchain, GPUI revision, sig
 | Capacity does not improve | Record measured result; apply no-effect backoff and incident limits |
 | Client disappears | Continue admitted bounded work unless explicitly canceled; retain queryable status |
 | Crash during an external operation | Reconcile; preserve partial/unknown outcome; no blind replay |
+| Permanent start error of the agent | Record the reason; exit with a status that the service definition does not restart; report it in the client |
 | Queue or storage bound reached | Shed reconstructible telemetry first; preserve control responsiveness and action admission limits |
 
 ## 16. Verification and unresolved release decisions

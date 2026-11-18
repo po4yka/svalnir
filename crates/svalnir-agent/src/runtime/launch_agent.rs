@@ -78,7 +78,10 @@ pub const fn throttle_interval_seconds() -> u64 {
 /// The job starts the agent in the foreground at the load of the job
 /// (`RunAtLoad`). `KeepAlive` has `SuccessfulExit` false: `launchd` starts
 /// the agent again only after an exit that was not a success, so a stop
-/// that the user requested stays a stop. `ThrottleInterval` is the base of
+/// that the user requested stays a stop, and so does a permanent start
+/// error, which exits with
+/// [`PERMANENT_START_ERROR_STATUS`](super::start_failure::PERMANENT_START_ERROR_STATUS).
+/// `ThrottleInterval` is the base of
 /// the restart backoff, so `launchd` does not start the agent more often
 /// than the agent permits automatic work again. `ProcessType` is
 /// `Background`. The definition has no key that keeps the host awake.
@@ -215,6 +218,30 @@ mod tests {
             "EnvironmentVariables",
             "StandardOutPath",
         ] {
+            assert!(!text.contains(key), "{key}");
+        }
+    }
+
+    /// `launchd.plist(5)`: with `SuccessfulExit` false, the job is started
+    /// again only after an exit status that is not zero. The agent ends a
+    /// permanent start error with status zero, so the job stays stopped. A
+    /// `KeepAlive` of `true` or a `Crashed` key would change that.
+    #[test]
+    fn the_definition_does_not_restart_the_status_of_a_permanent_start_error() {
+        let text: String = render(&definition()).unwrap();
+        assert_eq!(
+            crate::runtime::start_failure::PERMANENT_START_ERROR_STATUS,
+            0
+        );
+        assert!(text.contains(concat!(
+            "\t<key>KeepAlive</key>\n",
+            "\t<dict>\n",
+            "\t\t<key>SuccessfulExit</key>\n",
+            "\t\t<false/>\n",
+            "\t</dict>\n",
+        )));
+        assert_eq!(text.matches("<key>KeepAlive</key>").count(), 1);
+        for key in ["Crashed", "OnDemand", "PathState", "AfterInitialDemand"] {
             assert!(!text.contains(key), "{key}");
         }
     }

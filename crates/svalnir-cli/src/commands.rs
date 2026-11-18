@@ -55,6 +55,7 @@ pub(crate) mod processes;
 pub(crate) mod resources;
 pub(crate) mod scan;
 pub(crate) mod session;
+mod start_failure;
 #[cfg(target_os = "macos")]
 pub(crate) mod stop;
 

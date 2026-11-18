@@ -21,6 +21,7 @@
 //! | [`run`] | The threads of the agent: the driver on the calling thread and one collector thread. |
 //! | [`AgentStatus`], [`LifecycleRecord`] | The records that the agent writes to the journal. A client reads [`AgentStatus`] with [`OperationJournal::agent_record`](crate::journal::OperationJournal::agent_record) and [`AgentRecord::Status`](crate::journal::AgentRecord). |
 //! | [`launch_agent::render`] | The property list of a conventional per-user `LaunchAgent`, as text. Nothing here installs it. |
+//! | [`start_failure`] | The classes of start errors, and the record of the latest permanent start error in the state directory. |
 //! | [`Collector`], [`CandidateSource`], [`AgentClock`], [`Notifier`], [`SelfFootprint`] | The interfaces that a test replaces. `host` has the implementations for the running system. |
 //!
 //! # Concurrency design
@@ -79,6 +80,11 @@
 //!
 //! # Lifecycle
 //!
+//! - **Start error.** A permanent start error, for example an invalid
+//!   configuration, writes one record and exits with a status that the
+//!   `LaunchAgent` definition does not restart ([`start_failure`]). A
+//!   transient one exits with failure, and `launchd` starts the agent
+//!   again after its throttle interval.
 //! - **Start.** A capability check, the coordinator lock, the
 //!   reconciliation, the lifecycle record, the state of the controller,
 //!   the authority record, and then the first sample. Each qualification
@@ -124,6 +130,7 @@ pub mod launch_agent;
 mod ports;
 mod record;
 mod service;
+pub mod start_failure;
 #[cfg(test)]
 mod tests;
 

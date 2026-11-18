@@ -1969,7 +1969,7 @@ fn a_client_with_no_plan_document_reads_the_observations_from_the_journal() {
     assert!(
         !text
             .stdout
-            .contains("Observed capacity change: not recorded"),
+            .contains("Observed capacity change: not in this view"),
         "{}",
         text.stdout
     );

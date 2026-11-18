@@ -172,7 +172,7 @@ impl HistoryRecord {
             );
         }
         match &self.resource_effects {
-            None => out.push_str("    Observed capacity change: not recorded\n"),
+            None => out.push_str("    Observed capacity change: not in this view (no record, or a record that could not be read)\n"),
             Some(effects) => {
                 for effect in effects {
                     if let ResourceEffect::Capacity(capacity) = effect {

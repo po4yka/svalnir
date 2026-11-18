@@ -35,7 +35,7 @@ pub(crate) const TRASH_NOTE: &str = "An entry that was moved to Trash still uses
 pub(crate) const CAPACITY_NOTE: &str = "The observed capacity change is the available capacity of the volume after the operation minus the value before it. Other activity on the volume contributes to it, so it is not the reclaimed size.";
 
 /// The statement about a view that has no measurement.
-const NO_MEASUREMENT_NOTE: &str = "The journal has no resource observation for this operation: its executor recorded none. A value that is not recorded is not a measurement of no change.";
+const NO_MEASUREMENT_NOTE: &str = "This view has no resource observation for the operation: the journal has no record of one, or the record could not be read. A value that is not in the view is not a measurement of no change.";
 
 /// The statement about a record that the durable journal does not have.
 const DEGRADED_NOTE: &str = "A record of this operation is not in the durable journal. The state is that of the executing process; a restart reconciles the operation from fresh evidence.";

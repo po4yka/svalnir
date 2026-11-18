@@ -595,7 +595,7 @@ impl Bench {
     /// dropped a moment before, and the lock stays held for that instant.
     /// The start is thus tried again for a short time.
     fn start(&mut self) -> Box<Driver> {
-        for _ in 0..500 {
+        for _ in 0..200 {
             match self.try_start() {
                 DriverStart::Running(driver) => return driver,
                 DriverStart::Busy { .. } => std::thread::sleep(Duration::from_millis(10)),

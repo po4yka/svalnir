@@ -1477,7 +1477,7 @@ impl Bench {
     /// dropped a moment before, and the lock stays held for that instant.
     /// The start is thus tried again for a short time.
     pub(super) fn start(&mut self) -> Box<TestCoordinator> {
-        for _ in 0..500 {
+        for _ in 0..200 {
             match self.try_start() {
                 Start::Coordinating(coordinator) => return coordinator,
                 Start::Busy { .. } => std::thread::sleep(std::time::Duration::from_millis(10)),

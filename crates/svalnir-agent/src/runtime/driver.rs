@@ -294,11 +294,13 @@ struct RecordHealth {
 impl RecordHealth {
     /// The health after the writes of a start. `unavailable` is true when
     /// the journal did not take the lifecycle record or the controller
-    /// record.
+    /// record. No later write is a write of the lifecycle record, so the
+    /// condition stays until the journal takes the two records of a
+    /// tick: the state of the controller and the status.
     const fn at_start(unavailable: bool) -> Self {
         Self {
             controller_unrecorded: unavailable,
-            status_unrecorded: false,
+            status_unrecorded: unavailable,
         }
     }
 
@@ -900,6 +902,14 @@ impl Driver {
         // a step: a pause, a disabled guard, or a revoked grant that is in
         // the journal applies to the work of this tick.
         let authority_changed: bool = self.load_authority();
+        // A floor of a different boot or clock domain is not a time of
+        // this timeline. It is removed, so that the floor of the instance
+        // is always a floor of the current timeline or none.
+        if self.unseen_change_floor.as_ref().is_some_and(|floor| {
+            floor.clock_domain != time.clock.clock_domain || floor.boot_id != time.clock.boot_id
+        }) {
+            self.unseen_change_floor = None;
+        }
         if std::mem::take(&mut self.authority_states_unseen) {
             // "Resuming always refreshes measurements": a sample of
             // before this tick supports no automatic action.
@@ -908,6 +918,12 @@ impl Driver {
                 clock_domain: time.clock.clock_domain.clone(),
                 boot_id: time.clock.boot_id.clone(),
             });
+            // The authorization of the coordinator reads the inhibition
+            // of the records. It gets the floor before the coordinator
+            // dispatches a step in this tick, and not only after the
+            // evaluation of the controller.
+            let inhibition: InstanceInhibition = self.inhibition();
+            self.authority.records().inhibition = inhibition;
         }
         self.measure_self();
         let has_new_sample: bool = sample.is_some();
@@ -1312,10 +1328,18 @@ mod record_health_tests {
         assert!(health.unavailable());
         health.status_written(true);
         assert!(!health.unavailable());
-        // A failed write at the start stays until the controller record
-        // is written.
+        // A failed write at the start stays until the journal takes the
+        // two records, in each sequence.
         let mut started = RecordHealth::at_start(true);
         started.status_written(true);
         assert!(started.unavailable());
+        started.controller_written(true);
+        assert!(!started.unavailable());
+        let mut started = RecordHealth::at_start(true);
+        started.controller_written(true);
+        assert!(started.unavailable());
+        started.status_written(true);
+        assert!(!started.unavailable());
+        assert!(!RecordHealth::at_start(false).unavailable());
     }
 }

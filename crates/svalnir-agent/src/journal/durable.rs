@@ -143,9 +143,14 @@ fn earlier_admission(
     })
 }
 
-/// Checks that `operation` is the new durable admission of `plan`: the
-/// steps of the plan, each one `Admitted` with no call and no result.
-fn check_new_admission(plan: &Plan, operation: &Operation) -> Result<(), OperationJournalError> {
+/// Whether `operation` has the steps and the trigger class of `plan`: the
+/// same number of steps, and for each step the same identity, action
+/// class, and target, in the sequence of the plan.
+///
+/// The plan identity and the digest of an operation name a plan. They do
+/// not show that the steps of the operation are the steps of that plan,
+/// so each record of an operation with its plan uses this comparison.
+pub(super) fn steps_are_of_plan(plan: &Plan, operation: &Operation) -> bool {
     let same_steps: bool = operation.steps().len() == plan.steps.len()
         && operation
             .steps()
@@ -156,7 +161,13 @@ fn check_new_admission(plan: &Plan, operation: &Operation) -> Result<(), Operati
                     && step.action_class() == &planned.action_class
                     && step.target_id() == &planned.target_id
             });
-    if !same_steps || operation.trigger_class() != &plan.trigger.class {
+    same_steps && operation.trigger_class() == &plan.trigger.class
+}
+
+/// Checks that `operation` is the new durable admission of `plan`: the
+/// steps of the plan, each one `Admitted` with no call and no result.
+fn check_new_admission(plan: &Plan, operation: &Operation) -> Result<(), OperationJournalError> {
+    if !steps_are_of_plan(plan, operation) {
         return Err(OperationJournalError::Conflict);
     }
     let is_new = |step: &Step| {

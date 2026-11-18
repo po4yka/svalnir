@@ -146,14 +146,17 @@ fn a_plan_for_the_helper_and_a_protected_target_are_refused() {
         bench.clock.now(),
     );
     content.executor = ExecutorRole::Helper;
-    // A helper plan is not sealed without a privilege grant, so the test
-    // gives the content to the coordinator through a sealed user plan
-    // only when the seal accepts it.
-    if let Ok(plan) = Plan::seal(content) {
-        bench.store(&plan);
-        let error = refusal(&mut coordinator, stored_request(&plan));
-        assert_eq!(error.code.as_str(), code::HELPER_NOT_AVAILABLE);
-    }
+    // A helper plan is sealed only with a privilege grant.
+    content.authority.privilege_grant = Some(svalnir_core::authority::PrivilegeGrantRef {
+        grant_id: svalnir_core::id::PrivilegeGrantId::new("privilege_1").unwrap(),
+        generation: svalnir_core::authority::Generation::new(1),
+    });
+    let plan = Plan::seal(content).unwrap();
+    bench.store(&plan);
+    let error = refusal(&mut coordinator, stored_request(&plan));
+    assert_eq!(error.code.as_str(), code::HELPER_NOT_AVAILABLE);
+    assert_eq!(error.family, ErrorFamily::Request);
+    assert_eq!(bench.intents(), 0);
     assert!(file.exists());
 }
 

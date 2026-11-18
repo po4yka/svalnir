@@ -634,25 +634,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             Ok(Some(existing)) => return existing,
             Err(error) => return refused(*error),
         }
-        // The plan of the controller is stored after the checks of the
-        // request. A refusal of the admission after this point (a budget,
-        // a lease, the queue bound) leaves the plan record, with no
-        // consumption: the plan can be applied again before its expiry.
-        let mut journal_failed: bool = false;
-        if request.plan.is_some() {
-            match self.journal.record_plan(&plan) {
-                Ok(()) => {}
-                Err(error) if error.family() == ErrorFamily::Recording => journal_failed = true,
-                Err(_) => {
-                    return refused(admission_error(
-                        code::PLAN_CONFLICT,
-                        ErrorFamily::Request,
-                        &plan_id,
-                    ));
-                }
-            }
-        }
-        self.admit(plan, request, &time, journal_failed)
+        // The plan of the controller is stored with the admission record,
+        // after the reservation and the leases (`record_admission`). A
+        // refusal before that point (a budget, a lease, the queue bound,
+        // the roots) leaves no plan record.
+        self.admit(plan, request, &time)
     }
 
     /// The checks of an apply request that reserve nothing. `Ok(Some)` is
@@ -900,13 +886,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     }
 
     /// Reserves, takes the leases, and records the admission.
-    fn admit(
-        &mut self,
-        plan: Plan,
-        request: ApplyRequest,
-        time: &TimeReading,
-        journal_failed: bool,
-    ) -> ApplyOutcome {
+    fn admit(&mut self, plan: Plan, request: ApplyRequest, time: &TimeReading) -> ApplyOutcome {
         let plan_id: PlanId = plan.plan_id.clone();
         let limits = |text: &str| refused(admission_error(text, ErrorFamily::Limits, &plan_id));
         let Ok(total) = total_charge(&plan) else {
@@ -949,7 +929,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             }
         };
         let admitted: Result<(Operation, bool), Box<ApplyOutcome>> =
-            self.record_admission(&plan, &request, &operation_id, time, journal_failed);
+            self.record_admission(&plan, &request, &operation_id, time);
         let (operation, volatile) = match admitted {
             Ok(admitted) => admitted,
             Err(outcome) => {
@@ -1000,22 +980,39 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         ApplyOutcome::Admitted { operation_id }
     }
 
-    /// Records the admission in the durable journal, or in the volatile
-    /// record when the journal failed and the critical-memory exception
-    /// is authorized for each step of the plan. The second value is true
-    /// for the volatile record.
+    /// Records the plan of the controller and the admission in the
+    /// durable journal, or the admission in the volatile record when the
+    /// journal failed and the critical-memory exception is authorized for
+    /// each step of the plan. The second value is true for the volatile
+    /// record.
+    ///
+    /// The plan record is written here and not before the reservation, so
+    /// that a plan whose admission was refused for a limit leaves no
+    /// record. The caller releases the reservation and the leases for
+    /// each error of this function.
     fn record_admission(
         &mut self,
         plan: &Plan,
         request: &ApplyRequest,
         operation_id: &OperationId,
         time: &TimeReading,
-        journal_failed: bool,
     ) -> Result<(Operation, bool), Box<ApplyOutcome>> {
         let plan_id: &PlanId = &plan.plan_id;
         let request_error =
             |text: &str, family: ErrorFamily| refused(admission_error(text, family, plan_id));
-        let mut storage_failed: bool = journal_failed;
+        let mut storage_failed: bool = false;
+        if request.plan.is_some() {
+            match self.journal.record_plan(plan) {
+                Ok(()) => {}
+                Err(error) if error.family() == ErrorFamily::Recording => storage_failed = true,
+                Err(_) => {
+                    return Err(Box::new(request_error(
+                        code::PLAN_CONFLICT,
+                        ErrorFamily::Request,
+                    )));
+                }
+            }
+        }
         if !storage_failed {
             let operation: Operation = Operation::admit(
                 plan,

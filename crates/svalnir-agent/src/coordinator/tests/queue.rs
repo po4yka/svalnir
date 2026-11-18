@@ -129,3 +129,66 @@ fn a_queued_cancel_stops_the_operation_with_a_durable_fence() {
     assert_eq!(view.operation.state(), &OperationState::Partial);
     assert!(second.exists());
 }
+
+#[test]
+fn a_request_that_a_pending_reconciliation_stopped_is_held_and_executed_after_it() {
+    let mut bench = Bench::new();
+    let file = bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut client = open_journal(&bench.tree.database);
+    let apply = RequestBody::Apply {
+        approval: approval(&plan),
+    };
+    client
+        .enqueue_request(&queued("request_1", apply, bench.clock.now()))
+        .unwrap();
+    let cancel = RequestBody::Cancel {
+        operation_id: OperationId::new("operation_none").unwrap(),
+    };
+    client
+        .enqueue_request(&queued("request_2", cancel, bench.clock.now()))
+        .unwrap();
+    let database = bench.tree.database.clone();
+    let status = |request: &str| {
+        open_journal(&database)
+            .request_status(&RequestId::new(request).unwrap())
+            .unwrap()
+    };
+    let mut coordinator = bench.start();
+    // The journal reports a pending reconciliation at the admission. The
+    // request is not rejected: it stays claimed with no completion.
+    bench.fail(super::support::FailPoint::AdmitSequence);
+    assert!(coordinator.serve_queue());
+    assert!(coordinator.reconciliation_pending());
+    assert!(!matches!(
+        status("request_1"),
+        Some(RequestStatus::Completed { .. })
+    ));
+    // The held request is first: no later request is claimed before it.
+    assert!(!coordinator.serve_queue());
+    assert_eq!(status("request_2"), Some(RequestStatus::Queued));
+    assert!(file.exists());
+
+    bench.heal();
+    // The reconciliation completes, and then this lifetime executes the
+    // held request.
+    for _ in 0..4 {
+        coordinator.step();
+    }
+    let RequestCompletion::Operation { operation_id } = completion(&bench, "request_1") else {
+        panic!("the held request has no operation");
+    };
+    run(&mut coordinator, &bench.clock, &operation_id);
+    assert!(!file.exists());
+    assert!(matches!(
+        status("request_2"),
+        Some(RequestStatus::Completed { .. })
+    ));
+}

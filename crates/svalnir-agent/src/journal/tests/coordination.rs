@@ -194,6 +194,40 @@ fn a_lock_path_that_is_a_symbolic_link_is_refused() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_lock_taken_through_a_link_to_the_directory_is_the_lock_of_the_resolved_database() {
+    let fixture = Fixture::new();
+    let real = std::fs::canonicalize(fixture.directory.path()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let link = outside.path().join("state");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // The path is resolved one time: the lock, its file, and the journal
+    // name the same database.
+    let lock =
+        CoordinatorLock::try_acquire(&link.join("operations.sqlite"), CoordinatorRole::Client)
+            .unwrap();
+    assert_eq!(lock.database(), real.join("operations.sqlite"));
+    assert!(coordinator_lock_path(lock.database()).exists());
+    assert!(
+        !outside
+            .path()
+            .join("operations.sqlite.coordinator-lock")
+            .exists()
+    );
+    assert!(matches!(
+        CoordinatorLock::try_acquire(&fixture.path(), CoordinatorRole::Client),
+        Err(CoordinatorLockError::Held)
+    ));
+    // The journal that was opened through the real path accepts the lock.
+    assert!(
+        fixture
+            .open()
+            .begin_coordination(&lock, &epoch("epoch_1"), wall(0))
+            .is_ok()
+    );
+}
+
 #[test]
 fn a_clean_stop_needs_no_reconciliation() {
     let fixture = Fixture::new();

@@ -1101,6 +1101,10 @@ pub(super) fn stored_request(plan: &Plan) -> ApplyRequest {
 pub(super) enum FailPoint {
     RecordPlan,
     Admit,
+    /// `admit` returns `Sequence`: the journal has a pending
+    /// reconciliation.
+    AdmitSequence,
+    HasStopFence,
     CommitIntent,
     ConsumeDispatch,
     RecordStep,
@@ -1165,6 +1169,14 @@ impl Journal for FailingJournal {
         operation: &Operation,
     ) -> Result<Admission, JournalError> {
         self.check(FailPoint::Admit)?;
+        if self
+            .failing
+            .lock()
+            .unwrap()
+            .contains(&FailPoint::AdmitSequence)
+        {
+            return Err(JournalError::Sequence);
+        }
         self.inner.admit(approval, principal, operation)
     }
 
@@ -1221,6 +1233,7 @@ impl Journal for FailingJournal {
     }
 
     fn has_stop_fence(&self, operation_id: &OperationId) -> Result<bool, JournalError> {
+        self.check(FailPoint::HasStopFence)?;
         self.inner.has_stop_fence(operation_id)
     }
 }

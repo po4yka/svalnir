@@ -455,3 +455,32 @@ fn a_new_incident_does_not_remove_the_cooldown_of_an_earlier_one() {
     assert_eq!(error.code.as_str(), code::COOLDOWN_ACTIVE);
     assert!(coordinator.operation(&holder_id).unwrap().is_some());
 }
+
+#[test]
+fn a_stop_fence_that_cannot_be_read_is_an_error_and_not_no_fence() {
+    let mut bench = Bench::new();
+    bench.tree.file("a");
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    run(&mut coordinator, &bench.clock, &operation_id);
+    assert!(coordinator.shutdown().is_ok());
+    // A second lifetime has the operation only in the journal.
+    let coordinator = bench.start();
+    bench.fail(FailPoint::HasStopFence);
+    assert!(matches!(
+        coordinator.operation(&operation_id),
+        Err(CoordinatorError::Record(_))
+    ));
+    bench.heal();
+    let view = coordinator.operation(&operation_id).unwrap().unwrap();
+    assert_eq!(view.stop, None);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+}

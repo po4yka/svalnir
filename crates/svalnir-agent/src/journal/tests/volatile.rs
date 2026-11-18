@@ -468,6 +468,36 @@ fn the_volatile_records_are_written_to_the_durable_journal_later() {
 }
 
 #[test]
+fn a_record_whose_operation_has_a_step_that_its_plan_does_not_have_is_not_written() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.open();
+    let plan = critical("plan_1", Escalation::None);
+    // An operation with the identity and the digest of the plan and a
+    // step that the plan does not have.
+    let mut altered: serde_json::Value =
+        serde_json::to_value(volatile_operation(&plan, "operation_1", "epoch_2")).unwrap();
+    let step: &mut serde_json::Value = &mut altered["steps"][0];
+    assert!(step["target_id"].is_string(), "{step}");
+    step["target_id"] = serde_json::Value::String("target_that_the_plan_does_not_have".into());
+    let other_steps = super::super::VolatileOperationRecord {
+        plan: plan.clone(),
+        principal: plan.principal.clone(),
+        operation: serde_json::from_value(altered).unwrap(),
+        intents: Vec::new(),
+    };
+    assert!(matches!(
+        journal.persist_volatile(&other_steps),
+        Err(OperationJournalError::Conflict)
+    ));
+    assert!(
+        journal
+            .operation(other_steps.operation.operation_id())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn a_record_that_is_not_a_volatile_record_is_not_written() {
     let fixture = Fixture::new();
     let mut journal = fixture.open();

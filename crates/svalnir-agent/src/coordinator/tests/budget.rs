@@ -64,6 +64,15 @@ fn an_exhausted_incident_allowance_refuses_the_next_intervention() {
     assert_eq!(error.family, ErrorFamily::Limits);
     assert_eq!(bench.host.calls().len(), 1);
     assert!(bench.host.world().processes.contains_key(&4343));
+    // A refusal changes nothing: the plan of the controller has no record
+    // in the journal. The plan that was admitted has one.
+    {
+        use svalnir_core::action::Journal as _;
+        let journal = super::support::open_journal(&bench.tree.database);
+        assert!(journal.plan(&second.plan_id).unwrap().is_none());
+        let first = svalnir_core::id::PlanId::new("plan_4242").unwrap();
+        assert!(journal.plan(&first).unwrap().is_some());
+    }
 
     // A manual operation uses its own one-shot limit: it is admitted, and
     // it does not spend or reset the incident counter.

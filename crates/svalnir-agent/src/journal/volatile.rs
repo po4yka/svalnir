@@ -77,8 +77,12 @@ impl VolatileOperationRecord {
                 .intents
                 .iter()
                 .all(|intent| envelope_agrees(operation, intent));
+        // The steps and the trigger of the operation are those of the
+        // plan. The fields of the record are public, so a caller other
+        // than `VolatileRecord::register` can make one.
         if operation.plan_id() == &self.plan.plan_id
             && operation.plan_digest() == self.plan.digest()
+            && super::durable::steps_are_of_plan(&self.plan, operation)
             && intents_agree
         {
             Ok(())

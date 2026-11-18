@@ -1104,6 +1104,7 @@ pub(super) fn automatic_stop_plan(
         class,
         incident_id: Some(incident.clone()),
         decision_id: Some(DecisionId::new(format!("{plan}_decision")).unwrap()),
+        budget_generation: Some(Generation::new(1)),
     };
     content.principal.role = ClientRole::Agent;
     content.authority.action_grants = vec![authority.memory_grant()];
@@ -1323,8 +1324,9 @@ impl CoordinatorJournal for FailingJournal {
     fn incident_usage(
         &self,
         incident_id: &IncidentId,
+        generation: Generation,
     ) -> Result<Option<IncidentUsage>, OperationJournalError> {
-        self.inner.incident_usage(incident_id)
+        self.inner.incident_usage(incident_id, generation)
     }
 
     fn acknowledge_unknown_outcome(

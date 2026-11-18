@@ -1,22 +1,26 @@
 //! The consumed budget of each incident.
 //!
-//! The journal keeps one `incident_usage` row for each incident that has a
-//! consumed dispatch. The consumption of a dispatch changes the row in its
-//! own transaction, so the row and the consumed steps always agree. The
-//! row does not go with an operation: a prune removes the settled
-//! operations of an open incident and keeps its row, so a restart reads
-//! the usage of the incident with no dependence on the retention
+//! The journal keeps one `incident_usage` row for each budget generation of
+//! an incident that has a consumed dispatch. The consumption of a dispatch
+//! changes the row of the generation of its operation in its own
+//! transaction, so the rows and the consumed steps always agree. A row does
+//! not go with an operation: a prune removes the settled operations of an
+//! open incident and keeps each of its rows, so a restart reads the usage
+//! of the current generation with no dependence on the retention, and the
+//! usage of each earlier generation stays recorded
 //! (`docs/ACTION_CONTRACTS.md` section 12).
 
 use rusqlite::{Connection, OptionalExtension, params};
 use svalnir_core::action::{RequestEnvelope, Reservation, WorkCharge};
+use svalnir_core::authority::Generation;
 use svalnir_core::id::{IncidentId, StepId};
 use svalnir_core::quantity::{Bytes, EntryCount};
 
 use super::error::OperationJournalError;
 use super::{OperationJournal, row};
 
-/// The consumed budget of one incident, as the journal records it.
+/// The consumed budget of one budget generation of an incident, as the
+/// journal records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IncidentUsage {
     /// The operations of the incident with a consumed application step. A
@@ -40,12 +44,14 @@ fn invalid(column: &'static str) -> OperationJournalError {
 fn read_row(
     connection: &Connection,
     incident_id: &str,
+    generation: i64,
 ) -> Result<Option<UsageRow>, OperationJournalError> {
     Ok(connection
         .prepare_cached(
-            "SELECT slots, work_bytes, items FROM incident_usage WHERE incident_id = ?1",
+            "SELECT slots, work_bytes, items FROM incident_usage \
+             WHERE incident_id = ?1 AND generation = ?2",
         )?
-        .query_row([incident_id], |row| {
+        .query_row(params![incident_id, generation], |row| {
             Ok(UsageRow {
                 slots: row.get(0)?,
                 work_bytes: row.get(1)?,
@@ -56,8 +62,8 @@ fn read_row(
 }
 
 /// Charges the consumed dispatch of the step `step_id` of the operation
-/// row `seq` to the usage of the incident of the operation. An operation
-/// with no incident changes nothing.
+/// row `seq` to the usage of the budget generation of the incident of the
+/// operation. An operation with no incident changes nothing.
 ///
 /// The caller marked the dispatch as consumed in the same transaction. An
 /// application step uses a slot only when no other consumed step of the
@@ -66,20 +72,26 @@ fn read_row(
 /// # Errors
 ///
 /// Returns [`OperationJournalError::InvalidRow`] when the step has no
-/// intent or when a sum is larger than a stored integer can hold, and a
-/// storage error. The caller then writes nothing: the consumption fails
+/// intent, when an operation of an incident has no budget generation, or
+/// when a sum is larger than a stored integer can hold, and a storage
+/// error. The caller then writes nothing: the consumption fails
 /// closed, and no external call follows it.
 pub(super) fn charge(
     connection: &Connection,
     seq: i64,
     step_id: &StepId,
 ) -> Result<(), OperationJournalError> {
-    let (incident_id, admitted): (Option<String>, i64) = connection
-        .prepare_cached("SELECT incident_id, admitted_unix_s FROM operation WHERE seq = ?1")?
-        .query_row([seq], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let (incident_id, generation, admitted): (Option<String>, Option<i64>, i64) = connection
+        .prepare_cached(
+            "SELECT incident_id, budget_generation, admitted_unix_s FROM operation WHERE seq = ?1",
+        )?
+        .query_row([seq], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
     let Some(incident_id) = incident_id else {
         return Ok(());
     };
+    // The generation that the consumption is charged to must be known:
+    // with none, the consumption fails closed.
+    let generation: i64 = generation.ok_or(invalid("generation"))?;
     let mut charge: Option<&Reservation> = None;
     let mut slot_used: bool = false;
     let intents: Vec<(StepId, Option<RequestEnvelope>, bool)> = row::load_intents(connection, seq)?;
@@ -102,7 +114,7 @@ pub(super) fn charge(
     };
     let to_i64 =
         |value: u64, column: &'static str| i64::try_from(value).map_err(|_| invalid(column));
-    let before: UsageRow = read_row(connection, &incident_id)?.unwrap_or(UsageRow {
+    let before: UsageRow = read_row(connection, &incident_id, generation)?.unwrap_or(UsageRow {
         slots: 0,
         work_bytes: 0,
         items: 0,
@@ -121,14 +133,15 @@ pub(super) fn charge(
     connection
         .prepare_cached(
             "INSERT INTO incident_usage \
-             (incident_id, slots, work_bytes, items, last_admitted_unix_s) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT (incident_id) DO UPDATE SET \
+             (incident_id, generation, slots, work_bytes, items, last_admitted_unix_s) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (incident_id, generation) DO UPDATE SET \
              slots = excluded.slots, work_bytes = excluded.work_bytes, items = excluded.items, \
              last_admitted_unix_s = max(last_admitted_unix_s, excluded.last_admitted_unix_s)",
         )?
         .execute(params![
             incident_id,
+            generation,
             after.slots,
             after.work_bytes,
             after.items,
@@ -137,9 +150,11 @@ pub(super) fn charge(
     Ok(())
 }
 
-/// Removes the usage rows of the incidents that are not in `open` and
+/// Removes each usage row of the incidents that are not in `open` and
 /// whose latest operation was admitted before `cutoff`, to a maximum of
-/// `limit` rows. Returns the number of removed rows.
+/// `limit` incidents. The rows of one incident go together, so the journal
+/// never has the rows of some generations of an incident and not of the
+/// others. Returns the number of removed rows.
 pub(super) fn prune(
     connection: &Connection,
     cutoff: i64,
@@ -149,8 +164,9 @@ pub(super) fn prune(
     // The open incidents can take `open.len()` rows of the selection.
     let open_rows: i64 = i64::try_from(open.len()).unwrap_or(i64::MAX);
     let mut statement = connection.prepare(
-        "SELECT incident_id FROM incident_usage WHERE last_admitted_unix_s < ?1 \
-         ORDER BY last_admitted_unix_s LIMIT ?2",
+        "SELECT incident_id FROM incident_usage GROUP BY incident_id \
+         HAVING max(last_admitted_unix_s) < ?1 \
+         ORDER BY max(last_admitted_unix_s), incident_id LIMIT ?2",
     )?;
     let rows = statement.query_map(params![cutoff, limit.saturating_add(open_rows)], |row| {
         row.get::<_, String>(0)
@@ -166,22 +182,28 @@ pub(super) fn prune(
         }
         closed.push(incident_id);
     }
+    let mut removed: usize = 0;
     for incident_id in &closed {
-        connection
-            .prepare_cached("DELETE FROM incident_usage WHERE incident_id = ?1")?
-            .execute([incident_id])?;
+        removed = removed.saturating_add(
+            connection
+                .prepare_cached("DELETE FROM incident_usage WHERE incident_id = ?1")?
+                .execute([incident_id])?,
+        );
     }
-    Ok(closed.len())
+    Ok(removed)
 }
 
 impl OperationJournal {
-    /// Reads the consumed budget of one incident. `None` means that the
-    /// journal has no consumed dispatch of the incident, or that the
-    /// retention removed the row of the incident after it closed.
+    /// Reads the consumed budget of the budget generation `generation` of
+    /// one incident. `None` means that the journal has no consumed
+    /// dispatch of that generation, or that the retention removed the rows
+    /// of the incident after it closed. The usage of a different
+    /// generation is not in the value: a rearm gives a generation with no
+    /// usage, and each earlier generation keeps its own row.
     ///
-    /// A restart reads this value to know the usage of an incident that
-    /// continues, so that the restart does not give the incident a slot or
-    /// work that it used before.
+    /// A restart reads this value to know the usage of the current
+    /// generation of an incident that continues, so that the restart does
+    /// not give the incident a slot or work that it used before.
     ///
     /// # Errors
     ///
@@ -190,8 +212,10 @@ impl OperationJournal {
     pub fn incident_usage(
         &self,
         incident_id: &IncidentId,
+        generation: Generation,
     ) -> Result<Option<IncidentUsage>, OperationJournalError> {
-        let Some(stored) = read_row(&self.connection, incident_id.as_str())? else {
+        let generation: i64 = i64::try_from(generation.get()).map_err(|_| invalid("generation"))?;
+        let Some(stored) = read_row(&self.connection, incident_id.as_str(), generation)? else {
             return Ok(None);
         };
         let unsigned =

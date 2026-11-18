@@ -207,3 +207,17 @@ fn a_rearm_of_a_disabled_revoked_or_paused_guard_leaves_the_generation_unchanged
         );
     }
 }
+
+#[test]
+fn a_restart_restores_the_rearmed_generation_from_the_durable_record() {
+    let mut bench = exhausted();
+    let authority: AuthorityState = bench.authority.clone().unwrap();
+    rearm(&mut bench, &authority).unwrap();
+    // The record that the journal has, read by the next lifetime.
+    let stored: ControllerState = bench.state.durable_view();
+    let restored = ControllerState::restore(super::super::PriorState::Recorded(Box::new(stored)));
+    let record = restored.memory_incident.clone().unwrap();
+    assert_eq!(record.budget.generation, Generation::new(2));
+    assert_eq!(record.budget.history.len(), 2);
+    assert_eq!(restored.policy.memory.incident.unwrap().consumed_slots, 0);
+}

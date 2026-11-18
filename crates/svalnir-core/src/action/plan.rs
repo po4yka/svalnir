@@ -23,7 +23,7 @@ use super::budget::WorkCharge;
 use super::checked::{Check, Checked};
 use super::class::{ActionClass, TriggerClass};
 use super::state::PlanState;
-use crate::authority::{AuthorityBinding, required_option};
+use crate::authority::{AuthorityBinding, Generation, required_option};
 use crate::digest::ContentDigest;
 use crate::encoding::wire_enum;
 use crate::file::{FileObjectEvidence, LosslessPath};
@@ -126,6 +126,10 @@ pub struct Trigger {
     pub incident_id: Option<IncidentId>,
     /// The policy decision of an automatic trigger.
     pub decision_id: Option<DecisionId>,
+    /// The budget generation of the incident that the plan uses. An
+    /// automatic trigger has it; a manual trigger has none. The journal
+    /// charges the consumption of a step to this generation.
+    pub budget_generation: Option<Generation>,
 }
 
 impl Trigger {
@@ -135,6 +139,7 @@ impl Trigger {
             class: TriggerClass::Manual,
             incident_id: None,
             decision_id: None,
+            budget_generation: None,
         }
     }
 }
@@ -515,13 +520,21 @@ pub enum PlanError {
 }
 
 /// Checks that the identities of a trigger agree with its class: a manual
-/// trigger has no incident and no decision, and an automatic trigger has
-/// the two.
+/// trigger has no incident, no decision, and no budget generation, and an
+/// automatic trigger has the three.
 pub(super) fn check_trigger_identities(trigger: &Trigger) -> Result<(), PlanError> {
     let identities_agree: bool = match trigger.class {
-        TriggerClass::Manual => trigger.incident_id.is_none() && trigger.decision_id.is_none(),
+        TriggerClass::Manual => {
+            trigger.incident_id.is_none()
+                && trigger.decision_id.is_none()
+                && trigger.budget_generation.is_none()
+        }
         TriggerClass::Unrecognized(_) => return Err(PlanError::Unrecognized),
-        _ => trigger.incident_id.is_some() && trigger.decision_id.is_some(),
+        _ => {
+            trigger.incident_id.is_some()
+                && trigger.decision_id.is_some()
+                && trigger.budget_generation.is_some()
+        }
     };
     if identities_agree {
         Ok(())

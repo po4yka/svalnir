@@ -41,14 +41,15 @@ pub(super) const APPLICATION_ID: i64 = 0x5356_4C4A;
 ///   its steps increases.
 /// - `step`: one row for each step, with the intent (the request
 ///   envelope) and the dispatch consumption.
-/// - `incident_usage`: the consumed budget of each incident: the number of
-///   operations with a consumed application step (`slots`) and the sum of
-///   the work charges of the consumed filesystem steps (`work_bytes`,
-///   `items`). The consumption of a dispatch changes the row in its own
-///   transaction. `last_admitted_unix_s` is the admission time of the
-///   latest operation that changed the row, for retention only. The row
-///   does not go with an operation: the retention removes it only when its
-///   incident is not open.
+/// - `incident_usage`: the consumed budget of each budget generation of an
+///   incident (`generation`): the number of operations with a consumed
+///   application step (`slots`) and the sum of the work charges of the
+///   consumed filesystem steps (`work_bytes`, `items`). The consumption of
+///   a dispatch changes the row of the generation of its operation in its
+///   own transaction. `last_admitted_unix_s` is the admission time of the
+///   latest operation that changed the row, for retention only. A row does
+///   not go with an operation: the retention removes the rows of an
+///   incident only when the incident is not open, and then each of them.
 /// - `revision`: the policy revisions, the action grants, and the rule
 ///   revisions that operations bind to.
 /// - `request`: the request queue between a client and the coordinator.
@@ -92,6 +93,7 @@ CREATE TABLE operation (
     plan_id TEXT NOT NULL UNIQUE,
     executor_epoch TEXT NOT NULL,
     incident_id TEXT,
+    budget_generation INTEGER CHECK (budget_generation IS NULL OR budget_generation >= 1),
     state TEXT NOT NULL,
     settled INTEGER NOT NULL CHECK (settled IN (0, 1)),
     stop_fence INTEGER NOT NULL DEFAULT 0 CHECK (stop_fence IN (0, 1)),
@@ -116,11 +118,13 @@ CREATE TABLE step (
     CHECK (dispatch_consumed = 0 OR intent IS NOT NULL)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE incident_usage (
-    incident_id TEXT NOT NULL PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 1),
     slots INTEGER NOT NULL CHECK (slots >= 0),
     work_bytes INTEGER NOT NULL CHECK (work_bytes >= 0),
     items INTEGER NOT NULL CHECK (items >= 0),
-    last_admitted_unix_s INTEGER NOT NULL
+    last_admitted_unix_s INTEGER NOT NULL,
+    PRIMARY KEY (incident_id, generation)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX incident_usage_by_time ON incident_usage (last_admitted_unix_s);
 CREATE TABLE revision (

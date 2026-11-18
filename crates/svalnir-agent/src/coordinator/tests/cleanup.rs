@@ -351,6 +351,7 @@ fn an_automatic_plan_gets_no_root_from_its_own_content() {
         class: TriggerClass::DiskPressure,
         incident_id: Some(incident_id("incident_1")),
         decision_id: Some(DecisionId::new("decision_1").unwrap()),
+        budget_generation: Some(svalnir_core::authority::Generation::new(1)),
     };
     content.principal.role = ClientRole::Agent;
     content.authority.action_grants = vec![bench.authority.memory_grant()];

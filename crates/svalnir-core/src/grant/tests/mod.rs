@@ -392,6 +392,7 @@ fn automatic_trigger(class: TriggerClass) -> Trigger {
         class,
         incident_id: Some(incident_id()),
         decision_id: Some(DecisionId::new("decision_1").unwrap()),
+        budget_generation: Some(crate::authority::Generation::new(1)),
     }
 }
 

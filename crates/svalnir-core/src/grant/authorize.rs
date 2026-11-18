@@ -606,7 +606,12 @@ impl StepCheck<'_> {
             .request
             .incident
             .ok_or(RefusalReason::IncidentRecordMissing)?;
-        if incident.policy != policy || Some(&incident.incident_id) != trigger.incident_id.as_ref()
+        // The plan uses the current budget generation of the incident: a
+        // plan of an earlier generation is not charged to a generation
+        // that a rearm authorized after it.
+        if incident.policy != policy
+            || Some(&incident.incident_id) != trigger.incident_id.as_ref()
+            || Some(incident.generation) != trigger.budget_generation
         {
             return Err(RefusalReason::IncidentMismatch);
         }

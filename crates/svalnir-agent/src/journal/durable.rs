@@ -342,7 +342,7 @@ impl OperationJournal {
         check_new_admission(&plan, operation)?;
         coordination::check_work_gate(&transaction, operation.executor_epoch())?;
         check_admission_capacity(&transaction, path, limits)?;
-        row::insert_operation(&transaction, operation, plan.trigger.incident_id.as_ref())?;
+        row::insert_operation(&transaction, operation, &plan.trigger)?;
         insert_consumption(
             &transaction,
             &approval.plan_id,
@@ -772,7 +772,7 @@ impl OperationJournal {
                     None,
                     operation.admitted_at().unix_seconds(),
                 )?;
-                row::insert_operation(&transaction, operation, plan.trigger.incident_id.as_ref())?
+                row::insert_operation(&transaction, operation, &plan.trigger)?
             }
             Some(stored) => {
                 // The stored consumption is the consumption of this

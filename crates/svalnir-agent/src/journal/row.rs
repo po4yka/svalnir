@@ -8,7 +8,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
-use svalnir_core::action::{Operation, RequestEnvelope, Step};
+use svalnir_core::action::{Operation, RequestEnvelope, Step, Trigger};
 use svalnir_core::id::{IncidentId, OperationId, StepId};
 
 use super::error::OperationJournalError;
@@ -101,21 +101,29 @@ pub(super) fn load_operation(
     serde_json::from_value(value).map_err(OperationJournalError::decode("operation"))
 }
 
-/// Inserts `operation` and its steps and returns the row identity.
+/// Inserts `operation` and its steps and returns the row identity. The row
+/// has the incident and the budget generation of the trigger of the plan.
 pub(super) fn insert_operation(
     connection: &Connection,
     operation: &Operation,
-    incident: Option<&IncidentId>,
+    trigger: &Trigger,
 ) -> Result<i64, OperationJournalError> {
+    let generation: Option<i64> = trigger
+        .budget_generation
+        .map(|generation| i64::try_from(generation.get()))
+        .transpose()
+        .map_err(|_| OperationJournalError::row("operation", "budget_generation"))?;
     connection.execute(
         "INSERT INTO operation \
-         (operation_id, plan_id, executor_epoch, incident_id, state, settled, admitted_unix_s, header) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (operation_id, plan_id, executor_epoch, incident_id, budget_generation, state, settled, \
+         admitted_unix_s, header) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             operation.operation_id().as_str(),
             operation.plan_id().as_str(),
             operation.executor_epoch().as_str(),
-            incident.map(IncidentId::as_str),
+            trigger.incident_id.as_ref().map(IncidentId::as_str),
+            generation,
             operation.state().as_str(),
             operation.state().is_settled(),
             operation.admitted_at().unix_seconds(),

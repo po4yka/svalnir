@@ -8,6 +8,7 @@
 use std::fmt::Debug;
 
 use svalnir_core::action::{Journal, Plan, Principal, ResourceEffect, StopFence, TargetBinding};
+use svalnir_core::authority::Generation;
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
 use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
@@ -383,6 +384,7 @@ pub trait CoordinatorJournal: Journal {
     fn incident_usage(
         &self,
         incident_id: &IncidentId,
+        generation: Generation,
     ) -> Result<Option<IncidentUsage>, OperationJournalError>;
 
     /// Records the acknowledgment of an `UnknownOutcome` operation. See
@@ -522,8 +524,9 @@ impl CoordinatorJournal for OperationJournal {
     fn incident_usage(
         &self,
         incident_id: &IncidentId,
+        generation: Generation,
     ) -> Result<Option<IncidentUsage>, OperationJournalError> {
-        Self::incident_usage(self, incident_id)
+        Self::incident_usage(self, incident_id, generation)
     }
 
     fn acknowledge_unknown_outcome(

@@ -129,6 +129,7 @@ fn automatic(class: TriggerClass) -> Trigger {
         class,
         incident_id: Some(IncidentId::new("incident_1").unwrap()),
         decision_id: Some(DecisionId::new("decision_1").unwrap()),
+        budget_generation: Some(Generation::new(1)),
     }
 }
 

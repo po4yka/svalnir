@@ -866,11 +866,16 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             .reserve_incident(incident_id, total, time.clock.now)
     }
 
-    /// The consumed work of an incident that the journal has: its usage
-    /// row, which the consumption of each dispatch changes and which the
-    /// retention keeps while the incident is open.
+    /// The consumed work of the current budget generation of an incident
+    /// that the journal has: the usage row of the generation, which the
+    /// consumption of each dispatch changes and which the retention keeps
+    /// while the incident is open. The usage of an earlier generation does
+    /// not count against the allowance of a rearmed generation.
     fn journal_usage(&self, given: &IncidentAllowance) -> JournalUsage {
-        match self.journal.incident_usage(&given.incident_id) {
+        match self
+            .journal
+            .incident_usage(&given.incident_id, given.generation)
+        {
             Ok(Some(usage)) => JournalUsage::Known {
                 slots: usage.slots,
                 work: usage.work,

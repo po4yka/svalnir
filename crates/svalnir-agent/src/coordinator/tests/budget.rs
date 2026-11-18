@@ -263,3 +263,104 @@ fn a_refused_request_keeps_the_reservation_of_an_admitted_operation() {
     assert_eq!(bench.host.calls().len(), 1);
     assert_eq!(coordinator.remaining_slots(&incident), Some(1));
 }
+
+/// `plan` with the trigger of the budget generation `generation`.
+fn of_generation(plan: &Plan, generation: svalnir_core::authority::Generation) -> Plan {
+    let mut content: svalnir_core::action::PlanContent =
+        svalnir_core::action::PlanContent::clone(plan);
+    content.trigger.budget_generation = Some(generation);
+    Plan::seal(content).unwrap()
+}
+
+#[test]
+fn a_rearmed_generation_survives_a_restart_with_its_own_allowance_only() {
+    use svalnir_core::authority::Generation;
+
+    let mut bench = Bench::new();
+    let incident = incident_id("incident_1");
+    bench.authority.open_incident(&incident, bench.clock.now());
+    bench.measurements.0.lock().unwrap().pressure = ["critical", "normal"].into();
+    let mut coordinator = bench.start();
+    let first_epoch = coordinator.executor_epoch().clone();
+    // The first generation uses its one slot.
+    run_plan(&bench, &mut coordinator, &incident, &first_epoch, 4242, 1);
+    assert_eq!(coordinator.remaining_slots(&incident), Some(0));
+    // A rearm in this lifetime authorizes the second generation, and the
+    // controller records it. Then the agent stops and starts again.
+    let second = Generation::new(2);
+    bench
+        .authority
+        .records()
+        .incidents
+        .get_mut(&incident)
+        .unwrap()
+        .generation = second;
+    assert!(coordinator.shutdown().is_ok());
+
+    // A new journal handle and a new coordinator. The controller gives
+    // the second generation, which started in the first lifetime, with no
+    // usage. The journal has the usage of the first generation only.
+    let mut coordinator = bench.start();
+    let allowance_of = || {
+        let mut given = allowance(&incident, &first_epoch, 1);
+        given.generation = second;
+        given
+    };
+    let next = of_generation(&plan_for(&bench, &incident, 4343), second);
+    let request = || automatic_request(&next, allowance_of());
+    // An incident that continues starts with its longest cooldown.
+    assert_eq!(
+        refusal(&mut coordinator, request()).code.as_str(),
+        code::COOLDOWN_ACTIVE
+    );
+    bench.clock.advance(101 * SECOND);
+    // One more action is permitted: the usage of the first generation
+    // does not count against the second one.
+    assert_eq!(coordinator.remaining_slots(&incident), Some(1));
+    let operation_id = admitted(&mut coordinator, request());
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert_eq!(coordinator.remaining_slots(&incident), Some(0));
+    // The next one is beyond the ceiling of the second generation.
+    bench.clock.advance(101 * SECOND);
+    let third = of_generation(&plan_for(&bench, &incident, 4444), second);
+    let error = refusal(&mut coordinator, automatic_request(&third, allowance_of()));
+    assert_eq!(error.code.as_str(), code::BUDGET_EXHAUSTED);
+    assert_eq!(bench.host.calls().len(), 2);
+    // The usage of each generation stays recorded.
+    let journal = super::support::open_journal(&bench.tree.database);
+    let used = |generation| {
+        journal
+            .incident_usage(&incident, generation)
+            .unwrap()
+            .unwrap()
+            .slots
+    };
+    assert_eq!((used(Generation::new(1)), used(second)), (1, 1));
+}
+
+#[test]
+fn a_plan_of_an_earlier_generation_is_refused_after_a_rearm() {
+    use svalnir_core::authority::Generation;
+
+    let mut bench = Bench::new();
+    let incident = incident_id("incident_1");
+    bench.authority.open_incident(&incident, bench.clock.now());
+    let mut coordinator = bench.start();
+    let epoch = coordinator.executor_epoch().clone();
+    bench
+        .authority
+        .records()
+        .incidents
+        .get_mut(&incident)
+        .unwrap()
+        .generation = Generation::new(2);
+    // The plan names the first generation, and the record of the
+    // incident has the second one.
+    let plan = plan_for(&bench, &incident, 4242);
+    let mut given = allowance(&incident, &epoch, 1);
+    given.generation = Generation::new(2);
+    let error = refusal(&mut coordinator, automatic_request(&plan, given));
+    assert_eq!(error.code.as_str(), "incident_mismatch");
+    assert_eq!(bench.host.calls().len(), 0);
+}

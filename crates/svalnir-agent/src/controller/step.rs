@@ -11,7 +11,7 @@ use svalnir_core::action::{
     ActionClass, BudgetScope, ClientRole, Plan, PlanContent, Principal, ScopedAllowance,
     SlotAllowance, Trigger, WorkAllowance, WorkBudget, WorkCharge,
 };
-use svalnir_core::authority::{ActionGrant, AuthorityBinding};
+use svalnir_core::authority::{ActionGrant, AuthorityBinding, Generation};
 use svalnir_core::grant::{
     AuthorityState, ControlClock, GuardStanding, IncidentBudget, PauseStatus, guard_standing,
     measurement_floor, pause_status,
@@ -949,13 +949,15 @@ impl<'a> Run<'a> {
 
     /// Makes the automatic plan from the plan of a builder: the same
     /// targets, steps, limits, and validity, with the trigger of the
-    /// incident and the current grant of the guard.
+    /// incident, its current budget generation, and the current grant of
+    /// the guard.
     fn automatic_plan(
         &mut self,
         guard: Guard,
         built: &Plan,
         trigger: &TriggerKey,
         incident_id: &IncidentId,
+        generation: Generation,
     ) -> Result<Plan, String> {
         let grant: &ActionGrant = self
             .grant(guard)
@@ -969,6 +971,7 @@ impl<'a> Run<'a> {
             class: trigger.class(),
             incident_id: Some(incident_id.clone()),
             decision_id: Some(decision_id),
+            budget_generation: Some(generation),
         };
         content.authority.action_grants = vec![grant.reference()];
         Plan::seal(content).map_err(|error| error.to_string())
@@ -1049,7 +1052,13 @@ impl<'a> Run<'a> {
             }
         };
         let plan: Result<Plan, String> = self.build_stop(&selection).and_then(|built| {
-            self.automatic_plan(guard, &built, &selection.trigger, &record.incident_id)
+            self.automatic_plan(
+                guard,
+                &built,
+                &selection.trigger,
+                &record.incident_id,
+                record.budget.generation,
+            )
         });
         match plan {
             Ok(plan) => self.commit_memory(plan, selection, record),
@@ -1382,9 +1391,15 @@ impl<'a> Run<'a> {
         let key: TriggerKey = TriggerKey::Disk {
             volume_id: volume_id.clone(),
         };
-        let plan: Result<Plan, String> = self
-            .build_eviction(&batch)
-            .and_then(|built| self.automatic_plan(guard, &built, &key, &record.incident_id));
+        let plan: Result<Plan, String> = self.build_eviction(&batch).and_then(|built| {
+            self.automatic_plan(
+                guard,
+                &built,
+                &key,
+                &record.incident_id,
+                record.budget.generation,
+            )
+        });
         match plan {
             Ok(plan) => self.commit_disk(plan, &batch, record, key),
             Err(detail) => self.block(guard, BlockedReason::PlanNotBuilt { detail }),

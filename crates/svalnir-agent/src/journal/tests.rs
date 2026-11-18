@@ -247,6 +247,7 @@ fn application_plan(plan: &str, class: TriggerClass, escalation: Escalation) -> 
             class,
             incident_id: Some(incident()),
             decision_id: Some(DecisionId::new("decision_1").unwrap()),
+            budget_generation: Some(Generation::new(1)),
         },
         authority: AuthorityBinding {
             action_grants: vec![ActionGrantRef {

@@ -61,8 +61,8 @@ pub use guard::{
 };
 pub use pause::{
     ControlClock, MeasurementFloor, Pause, PauseBasis, PauseDeadline, PauseRefusal, PauseReport,
-    PauseRequest, PauseStatus, ResumeRefusal, ResumeReport, ResumeRequest, pause, pause_status,
-    resume,
+    PauseRequest, PauseStatus, ResumeRefusal, ResumeReport, ResumeRequest, measurement_floor,
+    pause, pause_status, resume,
 };
 pub use rearm::{
     BudgetGenerationRecord, GenerationBasis, IncidentBudget, IncidentCondition, IncidentUsage,

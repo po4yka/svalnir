@@ -334,7 +334,7 @@ Deduplicate by principal, operation/step identity, and executor context. The sam
 
 Record durable dispatch consumption before normal external submission. Duplicate apply/dispatch messages return status and must not create a second native call. Keep consumption records for at least the request's full validity window; after retention expires, reject an old request rather than treating it as new.
 
-Agent and helper maintain their own consumption state. The helper associates a delegated step with its authenticated principal and parent operation. A missing helper reply causes a status query and reconciliation, not a second deletion or signal.
+Agent and helper maintain their own consumption state. The helper associates a delegated step with its authenticated principal and parent operation. A missing helper reply causes a status query and reconciliation, not a second deletion or signal. When the helper starts again, a delegated step that its earlier lifetime consumed and did not settle has an unknown outcome: the call was possibly submitted, and no executor has the step now. The helper records that state for the step, and its storage layer writes the changed record back. The step stays consumed, so the same request gets the recorded state and no second acceptance. The agent thus expects `unknown_outcome` from a status query after a restart of the helper, and it reconciles the step before it reports a result.
 
 ### Cancellation
 

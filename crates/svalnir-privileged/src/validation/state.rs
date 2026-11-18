@@ -17,7 +17,7 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 use thiserror::Error;
 
 use super::path::{PathDefect, RootPath};
-use super::record::{ConsumedRequest, ConsumedRequests, RecordError};
+use super::record::{ConsumedRequest, ConsumedRequests, RecordError, Restored};
 use crate::request::{CodeIdentity, MAX_TARGETS_PER_REQUEST, SupportedProtocols};
 
 /// The largest number of privilege grants in the state.
@@ -306,11 +306,15 @@ impl HelperState {
     /// Returns a [`StateError`] when the settings and the grants do not
     /// agree. See [`HelperState::restore`].
     pub fn new(config: HelperConfig, grants: Vec<HelperGrant>) -> Result<Self, StateError> {
-        Self::restore(config, grants, Vec::new())
+        Self::restore(config, grants, Vec::new()).map(|restored| restored.state)
     }
 
     /// Makes the state with the consumed requests of an earlier lifetime
-    /// of the helper.
+    /// of the helper. A step that the earlier lifetime left in work gets
+    /// the state `UnknownOutcome`: the result names each such step in
+    /// [`Restored::changed`], and the storage layer writes those records
+    /// back. The agent gets `unknown_outcome` from a status query for such
+    /// a step after a restart of the helper.
     ///
     /// # Errors
     ///
@@ -323,7 +327,7 @@ impl HelperState {
         config: HelperConfig,
         grants: Vec<HelperGrant>,
         consumed: Vec<ConsumedRequest>,
-    ) -> Result<Self, StateError> {
+    ) -> Result<Restored<Self>, StateError> {
         if grants.len() > MAX_GRANTS {
             return Err(StateError::Grants);
         }
@@ -342,15 +346,20 @@ impl HelperState {
         {
             return Err(StateError::Retention);
         }
-        let consumed: ConsumedRequests =
-            ConsumedRequests::restore(config.record_capacity, config.retention, consumed)?;
+        let Restored {
+            state: consumed,
+            changed,
+        } = ConsumedRequests::restore(config.record_capacity, config.retention, consumed)?;
         if config.principal_quota == 0 || config.principal_quota > config.record_capacity {
             return Err(StateError::Quota);
         }
-        Ok(Self {
-            config,
-            grants,
-            consumed,
+        Ok(Restored {
+            state: Self {
+                config,
+                grants,
+                consumed,
+            },
+            changed,
         })
     }
 

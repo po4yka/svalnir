@@ -1437,7 +1437,10 @@ fn the_record_has_a_bounded_capacity() {
         ConsumedRequests::restore(4, retention, requests().chain(requests())),
         Err(RecordError::Duplicate)
     );
-    let restored: ConsumedRequests = ConsumedRequests::restore(2, retention, requests()).unwrap();
+    let restored = ConsumedRequests::restore(2, retention, requests()).unwrap();
+    // The two steps were in work, so the restore changed the two.
+    assert_eq!(restored.changed, [key("step-1"), key("step-2")]);
+    let restored: ConsumedRequests = restored.state;
     assert_eq!(restored.len(), 2);
 
     // A restored state refuses the replay of a restored step.
@@ -1446,7 +1449,8 @@ fn the_record_has_a_bounded_capacity() {
         vec![helper_grant(grant_for("grant-1", USER, "root-a"), limits())],
         requests().collect(),
     )
-    .unwrap();
+    .unwrap()
+    .state;
     assert!(matches!(
         admit(&mut restored_state, &request("step-1")),
         Admission::Known(_)
@@ -2231,12 +2235,26 @@ fn a_restored_step_that_was_in_work_has_an_outcome_that_is_not_known() {
 
         // The helper starts again with its durable record.
         let consumed: Vec<_> = first.consumed().requests().cloned().collect();
-        let mut restored: HelperState = HelperState::restore(
+        let restored = HelperState::restore(
             config(),
             vec![helper_grant(grant_for("grant-1", USER, "root-a"), limits())],
             consumed,
         )
         .unwrap();
+        // The restore names the step that it changed, and only that step:
+        // the storage layer writes its record back.
+        assert_eq!(restored.changed, [key("step-1")]);
+        let mut restored: HelperState = restored.state;
+        // The record of the changed step has the new state. A second
+        // restore of it changes nothing more.
+        let again = HelperState::restore(
+            config(),
+            vec![helper_grant(grant_for("grant-1", USER, "root-a"), limits())],
+            restored.consumed().requests().cloned().collect(),
+        )
+        .unwrap();
+        assert_eq!(again.changed, Vec::new());
+        assert_eq!(again.state.consumed(), restored.consumed());
         let status = |state: &HelperState, step: &str| match validate(
             state,
             &caller(),

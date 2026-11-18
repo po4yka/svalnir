@@ -44,8 +44,8 @@ pub use path::{
     EntryPath, MAX_COMPONENT_BYTES, MAX_PATH_BYTES, MAX_PATH_DEPTH, PathDefect, RootPath,
 };
 pub use record::{
-    ConsumedRequest, ConsumedRequests, MAX_RECORD_CAPACITY, RateUsage, RecordError, StepKey,
-    StepStatus,
+    ConsumedRequest, ConsumedRequests, MAX_RECORD_CAPACITY, RateUsage, RecordError, Restored,
+    StepKey, StepStatus,
 };
 pub use refusal::{Refusal, RefusalReason};
 pub use state::{

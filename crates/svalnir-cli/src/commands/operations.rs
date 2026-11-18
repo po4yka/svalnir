@@ -404,6 +404,20 @@ pub(crate) fn acknowledge(
         execution::Acknowledgment::Refused(error) => {
             return Err(session::action_error(&error, "the acknowledgment").into());
         }
+        execution::Acknowledgment::Stopped(signal) => {
+            return Err(ErrorBody::new(
+                "stopped_by_signal",
+                ErrorFamily::Outcome,
+                ErrorStage::Dispatch,
+                format!(
+                    "{} stopped this process before it recorded the acknowledgment; the acknowledgment is not recorded; send the command again",
+                    signal.name()
+                ),
+            )
+            .with_operation(operation_id.as_str())
+            .with_next_action(NextAction::QueryOperation)
+            .into());
+        }
     };
     let operation: Operation = read(&journal, &operation_id)?;
     let view = AcknowledgeView {

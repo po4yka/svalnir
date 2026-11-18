@@ -1670,6 +1670,87 @@ fn a_cancel_stops_the_force_step_of_a_stop() {
     );
 }
 
+/// A stop signal of a transient coordinator stops it as the agent stops:
+/// the operation gets the stop at the next safe point, no force step is
+/// dispatched, the result is recorded, the coordinator is released, and
+/// the exit status is `128` plus the number of the signal.
+#[test]
+fn a_stop_signal_stops_a_transient_coordinator_before_the_force_step() {
+    let mut world = world_for_stop();
+    let (interrupt, _flag, signal) = crate::interrupt::Interrupt::manual_with_stop_signal();
+    world.environment.interrupt = interrupt;
+    let mut child: ChildGuard = spawn_child(true);
+    let target: String = child.target();
+    let environment: Environment = world.environment.clone();
+    let stopper = std::thread::spawn({
+        let target = target.clone();
+        move || {
+            json(
+                &environment,
+                &[
+                    "processes",
+                    "stop",
+                    "--target",
+                    &target,
+                    "--grace",
+                    "3s",
+                    "--force-after-timeout",
+                    "--yes",
+                ],
+            )
+        }
+    });
+    let limit: Instant = Instant::now() + Duration::from_secs(10);
+    let operation: String = loop {
+        let history = json(&world.environment, &["history"]);
+        let submitted: Option<String> = history.result()["records"][0]["operation_id"]
+            .as_str()
+            .map(str::to_owned)
+            .filter(|operation| {
+                let show = json(
+                    &world.environment,
+                    &["operations", "show", "--operation", operation],
+                );
+                show.result()["operation"]["dispatch"] == "submitted"
+            });
+        if let Some(operation) = submitted {
+            break operation;
+        }
+        assert!(Instant::now() < limit, "the request was not submitted");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The graceful request was submitted. The stop signal comes before
+    // the end of the grace period.
+    signal.store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+
+    let stop = stopper.join().unwrap();
+    assert_eq!(stop.status, ExitStatus::Terminated, "{}", stop.stdout);
+    assert_eq!(ExitStatus::Terminated.code(), 143);
+    let result = stop.result();
+    assert_eq!(result["wait"], "stopped_by_sigterm", "{}", stop.stdout);
+    assert_eq!(result["executor"], "transient_coordinator");
+    assert_eq!(
+        result["operation"]["state"], "Incomplete",
+        "{}",
+        stop.stdout
+    );
+    // No force step: the child that ignores `SIGTERM` stays.
+    assert!(!child.has_exited());
+    let show = json(
+        &world.environment,
+        &["operations", "show", "--operation", &operation],
+    );
+    assert_eq!(show.result()["operation"]["state"], "Incomplete");
+    assert_eq!(
+        show.result()["operation"]["stop"]["durable_stop_fence"],
+        true
+    );
+    // The coordinator released its lock and its registration: the next
+    // coordinator has no reconciliation.
+    let status = json(&world.environment, &["agent", "status"]);
+    assert_eq!(status.result()["lock_holder"], "none", "{}", status.stdout);
+}
+
 #[test]
 fn a_stop_refuses_a_protected_process_and_a_process_that_is_absent() {
     let world = world_for_stop();

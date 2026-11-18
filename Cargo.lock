@@ -6228,6 +6228,7 @@ dependencies = [
  "serde_json",
  "svalnir-agent",
  "svalnir-core",
+ "tempfile",
 ]
 
 [[package]]

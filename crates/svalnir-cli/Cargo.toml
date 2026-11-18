@@ -24,9 +24,18 @@ serde_json.workspace = true
 svalnir-agent.workspace = true
 svalnir-core.workspace = true
 
-# The interrupt flag of `scan` and `monitor` installs a `SIGINT` handler.
+# The interrupt flag of `scan` and `monitor` installs a `SIGINT` handler,
+# and a transient coordinator installs the handlers of `SIGTERM` and
+# `SIGHUP`.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# A binary test sets the home directory of the account record of the
+# client with `SVALNIR_TEST_ACCOUNT_HOME`, which only a build with
+# `test-support` reads.
+[dev-dependencies]
+svalnir-agent = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

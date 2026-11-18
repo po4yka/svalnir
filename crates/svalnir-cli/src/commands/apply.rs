@@ -20,6 +20,7 @@ use super::operation_view::OperationReport;
 use super::plan_store::{self, PlanDocument};
 use super::session::{self, journal_error};
 use super::{CommandFailure, Invocation};
+use crate::interrupt::StopSignal;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction};
 use crate::seams::Confirmation;
 use crate::text::put_line;
@@ -33,6 +34,8 @@ const QUEUED_NOTE: &str = "A different process holds the coordinator lock. The r
 const TIMEOUT_NOTE: &str = "The client wait ended before a final result. Nothing was canceled: the operation continues. The result is not known to this response; query it with `svalnir operations show`.";
 
 const INTERRUPT_NOTE: &str = "The client was interrupted. Nothing was canceled: the operation continues. Cancel it only with `svalnir operations cancel`.";
+
+const STOP_SIGNAL_NOTE: &str = "A stop signal stopped this process, which executed the operation as a transient coordinator. It claimed no further request and stopped the operation at the next safe point; no later step was dispatched. Query the result with `svalnir operations show`.";
 
 /// Asks for the approval of a plan. `--yes` gives it with no question.
 ///
@@ -137,8 +140,10 @@ impl AcceptedView {
 /// The response of a command that waited for an operation.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ApplyView {
-    /// `finished`, `timed_out`, `interrupted`, `no_coordinator`, or, for
-    /// an existing operation that is not at its end, `not_waited`.
+    /// `finished`, `timed_out`, `interrupted`, `no_coordinator`, for a
+    /// transient coordinator that a stop signal stopped
+    /// `stopped_by_sigterm` or `stopped_by_sighup`, or, for an existing
+    /// operation that is not at its end, `not_waited`.
     pub(crate) wait: &'static str,
     /// True when the plan was applied before this request. No second
     /// operation was made.
@@ -183,9 +188,22 @@ impl ApplyView {
     pub(crate) fn status(&self) -> ExitStatus {
         match (self.wait, &self.operation) {
             ("interrupted", _) => ExitStatus::Interrupted,
+            (STOPPED_BY_SIGTERM, _) => StopSignal::Terminate.exit_status(),
+            (STOPPED_BY_SIGHUP, _) => StopSignal::HangUp.exit_status(),
             ("finished", Some(operation)) => operation.waited_status(),
             _ => ExitStatus::Conflict,
         }
+    }
+}
+
+/// The `wait` value of a transient coordinator that a stop signal stopped.
+const STOPPED_BY_SIGTERM: &str = "stopped_by_sigterm";
+const STOPPED_BY_SIGHUP: &str = "stopped_by_sighup";
+
+const fn stopped_wait(signal: StopSignal) -> &'static str {
+    match signal {
+        StopSignal::Terminate => STOPPED_BY_SIGTERM,
+        StopSignal::HangUp => STOPPED_BY_SIGHUP,
     }
 }
 
@@ -324,6 +342,9 @@ fn wait_parts(
         WaitEnd::Finished(report) => Ok(("finished", Some(report), None)),
         WaitEnd::TimedOut(report) => Ok(("timed_out", report, Some(TIMEOUT_NOTE))),
         WaitEnd::Interrupted(report) => Ok(("interrupted", report, Some(INTERRUPT_NOTE))),
+        WaitEnd::Stopped(signal, report) => {
+            Ok((stopped_wait(signal), report, Some(STOP_SIGNAL_NOTE)))
+        }
         WaitEnd::Rejected(error) => Err(session::action_error(&error, what)),
         WaitEnd::Failed(error) => Err(error),
     }
@@ -406,7 +427,7 @@ fn run_transient(
     // The response is complete before the remaining work, so a reader of
     // a pipe has it at once.
     drop(invocation.stdout.flush());
-    let last: Option<OperationReport> = running.complete();
+    let last: Option<OperationReport> = running.complete(&invocation.environment.interrupt);
     if let (Some(document), Some(measurements)) = (
         &mut flow.document,
         last.as_ref().and_then(OperationReport::measurements),
@@ -414,6 +435,9 @@ fn run_transient(
         document.measurements = Some(measurements);
         drop(plan_store::save_plan(invocation.environment, document));
     }
+    // A stop signal after the response, for example after `--no-wait` or
+    // the end of the client wait, still gives the exit status of the
+    // signal: `run_in` reads it at the end.
     response
 }
 

@@ -426,7 +426,7 @@ Manual commands use the same identity validation and hard protections as automat
 - Partial scans preserve successful results while identifying unreadable or stale areas.
 - Stream cancellation disconnects the client; it does not implicitly uninstall the agent or cancel an unrelated background operation.
 
-Proposed exit codes are `0` for success, `1` for an operation failure, `2` for invalid arguments/configuration, `3` for missing capability or authorization, `4` for partial results or a partial or incomplete operation, `5` for stale/conflicting state or an unknown outcome, and `130` for user interruption. A policy simulation can succeed while reporting that all candidates were skipped. A status query exits with `0` when the query succeeds, even if the operation that it reports failed. [INTERFACES.md](docs/INTERFACES.md) has the full exit-status contract.
+Proposed exit codes are `0` for success, `1` for an operation failure, `2` for invalid arguments/configuration, `3` for missing capability or authorization, `4` for partial results or a partial or incomplete operation, `5` for stale/conflicting state or an unknown outcome, `130` for user interruption, and `143` or `129` for a client that executed an operation as a transient coordinator and stopped on `SIGTERM` or `SIGHUP`. A policy simulation can succeed while reporting that all candidates were skipped. A status query exits with `0` when the query succeeds, even if the operation that it reports failed. [INTERFACES.md](docs/INTERFACES.md) has the full exit-status contract.
 
 ## Configuration and policies
 

@@ -49,7 +49,7 @@ use svalnir_core::volume::VolumeIdentity;
 use super::operation_view::OperationReport;
 use super::session::{self, journal_error, open_journal};
 use crate::environment::Environment;
-use crate::interrupt::Interrupt;
+use crate::interrupt::{Interrupt, StopSignal};
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 
 /// The largest number of steps that a transient coordinator uses to
@@ -77,6 +77,12 @@ pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(10);
 /// The longest time for which a transient coordinator continues after the
 /// client wait ended. The execution deadline of the plan is shorter.
 const MAX_COMPLETION_TIME: Duration = Duration::from_hours(2);
+
+/// The longest time for which a transient coordinator continues after a
+/// stop signal, as the stop bound of the agent. An operation that is not
+/// settled then keeps the registration, and the next coordinator
+/// reconciles it.
+const STOP_SIGNAL_BOUND: Duration = Duration::from_secs(10);
 
 /// What executes the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -128,6 +134,9 @@ pub(crate) enum WaitEnd {
     TimedOut(Option<OperationReport>),
     /// The user interrupted the client. Nothing was canceled.
     Interrupted(Option<OperationReport>),
+    /// A stop signal stopped the transient coordinator: it claimed no
+    /// further request and stopped its operations at the next safe point.
+    Stopped(StopSignal, Option<OperationReport>),
     /// The coordinator refused the queued request.
     Rejected(ActionError),
     /// The journal gave no answer.
@@ -362,6 +371,9 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
     let start = start_coordinator(input.environment, &database, &epoch, dependencies)?;
     match start {
         Start::Coordinating(mut coordinator) => {
+            // From now on this process is a coordinator: a stop signal
+            // stops it as it stops the agent.
+            input.environment.interrupt.arm_stop_signals();
             // The client read the authority record before the approval
             // question, and a different client can change the record
             // while the question waits. The admission uses the record
@@ -396,6 +408,7 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
                         authority,
                         authority_revision,
                         authority_read_at: Instant::now(),
+                        stop: None,
                     })))
                 }
                 ApplyOutcome::Existing { operation } => {
@@ -444,6 +457,9 @@ pub(crate) enum Acknowledgment {
     },
     /// The coordinator refused the request. Nothing changed.
     Refused(ActionError),
+    /// A stop signal stopped the transient coordinator before the
+    /// acknowledgment. Nothing was recorded.
+    Stopped(StopSignal),
 }
 
 /// The longest wait for the coordinator that serves a queued
@@ -483,10 +499,25 @@ pub(crate) fn acknowledge(
     let database = environment.journal_path()?;
     match start_coordinator(environment, &database, &epoch, dependencies)? {
         Start::Coordinating(mut coordinator) => {
+            environment.interrupt.arm_stop_signals();
+            let mut stopped: bool = false;
             let mut steps: u32 = 0;
             while coordinator.reconciliation_pending() && steps < MAX_RECONCILIATION_STEPS {
+                // The reconciliation dispatches no step. After a stop
+                // signal, the coordinator claims no request of the queue.
+                if !stopped && environment.interrupt.stop_signal().is_some() {
+                    stop_coordinator(&mut coordinator);
+                    stopped = true;
+                }
                 steps = steps.saturating_add(1);
                 coordinator.step();
+            }
+            // A stop signal before this point records no acknowledgment:
+            // the coordinator starts no new work after it.
+            if let Some(signal) = environment.interrupt.stop_signal() {
+                stop_coordinator(&mut coordinator);
+                release(coordinator);
+                return Ok(Acknowledgment::Stopped(signal));
             }
             let result = coordinator.acknowledge(operation_id, &principal);
             release(coordinator);
@@ -743,6 +774,14 @@ fn read_authority_record(
     }
 }
 
+/// Stops a coordinator as the agent stops at a stop signal: it claims no
+/// further request of the queue, and each operation that it executes or
+/// that waits gets the stop request, so that no later step is dispatched.
+fn stop_coordinator(coordinator: &mut Coordinator<OperationJournal>) {
+    coordinator.stop_claims();
+    drop(coordinator.cancel_active());
+}
+
 /// Releases the registration of a coordinator that has no operation. An
 /// operation that is not settled keeps the registration, so that the next
 /// coordinator reconciles it.
@@ -762,6 +801,9 @@ pub(crate) struct Running {
     /// The time of the last read of the authority record that had a
     /// result.
     authority_read_at: Instant,
+    /// The stop signal that stopped the coordinator, with the end of its
+    /// bound.
+    stop: Option<(StopSignal, Instant)>,
 }
 
 impl Running {
@@ -777,6 +819,24 @@ impl Running {
             .ok()
             .flatten()
             .map(|view| OperationReport::of_view(&view))
+    }
+
+    /// Stops the coordinator at the first stop signal. Returns the signal
+    /// after a stop.
+    fn read_stop_signal(&mut self, interrupt: &Interrupt) -> Option<StopSignal> {
+        if self.stop.is_none()
+            && let Some(signal) = interrupt.stop_signal()
+        {
+            stop_coordinator(&mut self.coordinator);
+            self.stop = Some((signal, Instant::now() + STOP_SIGNAL_BOUND));
+        }
+        self.stop.map(|(signal, _)| signal)
+    }
+
+    /// Whether the bound after a stop signal ended.
+    fn stop_bound_ended(&self) -> bool {
+        self.stop
+            .is_some_and(|(_, give_up_at)| Instant::now() >= give_up_at)
     }
 
     fn is_finished(&self) -> bool {
@@ -843,10 +903,20 @@ impl Running {
     /// Executes the operation until it is finished, the time of the
     /// client ends, or the user interrupts the client. The operation
     /// continues after each of the last two: call [`Running::complete`].
+    ///
+    /// A stop signal stops the coordinator: the wait then ends when the
+    /// operation is finished or the stop bound ends, with
+    /// [`WaitEnd::Stopped`].
     pub(crate) fn wait(&mut self, timeout: Option<Duration>, interrupt: &Interrupt) -> WaitEnd {
         interrupt.arm();
         let started: Instant = Instant::now();
         loop {
+            let stopped: Option<StopSignal> = self.read_stop_signal(interrupt);
+            if let Some(signal) = stopped
+                && (self.is_finished() || self.stop_bound_ended())
+            {
+                return WaitEnd::Stopped(signal, self.report());
+            }
             if self.is_finished() {
                 return match self.report() {
                     Some(report) => WaitEnd::Finished(report),
@@ -860,10 +930,11 @@ impl Running {
                     .with_next_action(NextAction::QueryOperation)),
                 };
             }
-            if interrupt.is_requested() {
+            // After a stop signal, the wait ends with the stop.
+            if stopped.is_none() && interrupt.is_requested() {
                 return WaitEnd::Interrupted(self.report());
             }
-            if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            if stopped.is_none() && timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
                 return WaitEnd::TimedOut(self.report());
             }
             self.advance();
@@ -873,9 +944,17 @@ impl Running {
     /// Executes the operation to its end with no client wait, then each
     /// request that this coordinator claimed from the queue, and releases
     /// the coordinator. Returns the last view of the operation.
-    pub(crate) fn complete(mut self) -> Option<OperationReport> {
+    ///
+    /// After a stop signal the coordinator claims no further request,
+    /// stops each of its operations at the next safe point, and continues
+    /// at most [`STOP_SIGNAL_BOUND`].
+    pub(crate) fn complete(mut self, interrupt: &Interrupt) -> Option<OperationReport> {
         let started: Instant = Instant::now();
-        while !self.is_finished() && started.elapsed() < MAX_COMPLETION_TIME {
+        let ended = |running: &mut Self| {
+            running.read_stop_signal(interrupt);
+            started.elapsed() >= MAX_COMPLETION_TIME || running.stop_bound_ended()
+        };
+        while !self.is_finished() && !ended(&mut self) {
             self.advance();
         }
         let report: Option<OperationReport> = self.report();
@@ -883,7 +962,7 @@ impl Running {
         // have admitted the request of a different client. It executes
         // that work before it stops: an operation that it leaves is never
         // dispatched again.
-        while started.elapsed() < MAX_COMPLETION_TIME {
+        while !ended(&mut self) {
             if !self.refresh_authority() {
                 std::thread::sleep(AUTHORITY_READ_RETRY);
                 continue;

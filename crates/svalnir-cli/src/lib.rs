@@ -22,7 +22,7 @@
 //! | `commands` | The dispatcher and one module for each command family |
 //! | `environment` | The state directory, the home directory, and the invocation directory |
 //! | `host` | The collection context of this process |
-//! | `interrupt` | The Ctrl+C flag of `scan`, `monitor`, and a wait for an operation |
+//! | `interrupt` | The Ctrl+C flag of `scan`, `monitor`, and a wait for an operation, and the stop signals of a transient coordinator |
 //! | `seams` | The terminal question, the Trash operation, and the service manager, which a test replaces |
 //! | `text` | Escaping and formatting of the human-readable output |
 
@@ -100,7 +100,8 @@ where
             return finish(written, ExitStatus::Usage, stderr);
         }
     };
-    match commands::execute(&cli, &request_id, environment, stdout, stderr) {
+    let status: ExitStatus = match commands::execute(&cli, &request_id, environment, stdout, stderr)
+    {
         Ok(status) => finish(stdout.flush(), status, stderr),
         // The user interrupted a result write that blocked.
         Err(CommandFailure::Output(error))
@@ -148,7 +149,14 @@ where
             );
             finish(written, status, stderr)
         }
-    }
+    };
+    // A transient coordinator that a stop signal stopped exits with `128`
+    // plus the number of the signal, after it recorded the result. Only a
+    // transient coordinator arms the handler of a stop signal.
+    environment
+        .interrupt
+        .stop_signal()
+        .map_or(status, interrupt::StopSignal::exit_status)
 }
 
 fn report_error(

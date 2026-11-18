@@ -27,6 +27,10 @@ pub enum ExitStatus {
     Conflict,
     /// The user interrupted the client.
     Interrupted,
+    /// A transient coordinator stopped on `SIGTERM`.
+    Terminated,
+    /// A transient coordinator stopped on `SIGHUP`.
+    HungUp,
 }
 
 impl ExitStatus {
@@ -40,6 +44,8 @@ impl ExitStatus {
             Self::Partial => 4,
             Self::Conflict => 5,
             Self::Interrupted => 130,
+            Self::Terminated => 143,
+            Self::HungUp => 129,
         }
     }
 }

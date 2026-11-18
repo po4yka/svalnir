@@ -7,7 +7,8 @@ use crate::{
     viz::{
         alloc::allocate_cells,
         dial::{DIAL_SIZE, dot_center, ring_progress},
-        led::{CellTone, LedStyle, cell_tone, lit_color},
+        ghost::{Change, growth_cells},
+        led::{CellTone, LedStyle, cell_tone_at, lit_color, lit_share, lit_threshold},
         storage_layouts::ChartItem,
     },
 };
@@ -163,6 +164,10 @@ struct RingPaint {
     spans: RingSpans,
     colors: Vec<Hsla>,
     dimmed: Vec<bool>,
+    /// The lit threshold of each item, from its density.
+    thresholds: Vec<u32>,
+    /// The last steps of each span that the scan ghost hatches.
+    growth: Vec<usize>,
     dim_alpha: f32,
     empty: Hsla,
     sweep: Option<f32>,
@@ -193,13 +198,21 @@ fn paint_ring(paint: &RingPaint, bounds: Bounds<Pixels>, window: &mut Window) {
                 if step >= reach {
                     break;
                 }
+                // The hatched steps keep every second dot empty.
+                let hatched: bool = step + paint.growth[index] >= span.start + span.len;
+                if hatched && (step + ring) % 2 == 1 {
+                    continue;
+                }
                 let tone: CellTone = if paint.dimmed[index] {
                     CellTone::Dim
+                } else if hatched {
+                    CellTone::Lit
                 } else {
-                    cell_tone(
+                    cell_tone_at(
                         u16::try_from(step).unwrap_or(0),
                         u16::try_from(ring).unwrap_or(0),
                         seed,
+                        paint.thresholds[index],
                     )
                 };
                 let fill_color: Hsla = match tone {
@@ -309,6 +322,10 @@ impl CellRing {
 }
 
 impl RenderOnce for CellRing {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one build of the ring and its hit area"
+    )]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
         let style: LedStyle = LedStyle::for_dark(dark);
@@ -322,6 +339,31 @@ impl RenderOnce for CellRing {
                 .iter()
                 .enumerate()
                 .map(|(index, item)| item.inert || self.focus.is_some_and(|f| f != index))
+                .collect(),
+            thresholds: self
+                .items
+                .iter()
+                .map(|i| lit_threshold(i.density.map(|d| lit_share(Some(d)))))
+                .collect(),
+            growth: self
+                .items
+                .iter()
+                .zip(&spans.items)
+                .map(|(item, span)| match item.change {
+                    Some(Change::Larger(diff)) => {
+                        let all: u64 = weights
+                            .iter()
+                            .fold(self.free_bytes.unwrap_or(0), |a, w| a.saturating_add(*w));
+                        let per_step: u64 = all.div_ceil(u64::try_from(STEPS).unwrap_or(1)).max(1);
+                        usize::try_from(growth_cells(
+                            diff,
+                            per_step,
+                            u32::try_from(span.len).unwrap_or(u32::MAX),
+                        ))
+                        .unwrap_or(0)
+                    }
+                    _ => 0,
+                })
                 .collect(),
             dim_alpha: style.dim_alpha,
             empty: style.lattice,

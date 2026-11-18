@@ -21,6 +21,18 @@ use svalnir_core::{grant::GuardStanding, policy::PolicyId};
 
 const GB: u64 = 1_000_000_000;
 
+/// The folders of the scan fixture: the name, the size in tenths of a GB, and
+/// the density (allocated over logical) in percent.
+const FOLDERS: [(&str, u64, u64); 7] = [
+    ("Library", 614, 80),
+    ("Developer", 482, 55),
+    ("Pictures", 729, 100),
+    ("Documents", 273, 95),
+    ("Movies", 316, 100),
+    ("Music", 98, 100),
+    (".Trash", 141, 70),
+];
+
 /// A named fixture scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureScenario {
@@ -87,6 +99,8 @@ pub struct FixtureSource {
     step: Arc<AtomicUsize>,
     /// The time of the first call, the origin of the `drift` times.
     base: Arc<OnceLock<SystemTime>>,
+    /// The number of scans that started, for the changed sizes of a later scan.
+    scans: Arc<AtomicUsize>,
 }
 
 /// The time between two readings of the `drift` sequence.
@@ -154,6 +168,7 @@ impl FixtureSource {
             lead: 0,
             step: Arc::new(AtomicUsize::new(0)),
             base: Arc::new(OnceLock::new()),
+            scans: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -372,23 +387,36 @@ impl DataSource for FixtureSource {
         if self.scenario == FixtureScenario::Unavailable {
             return Err("the scan root is not readable in this fixture".to_owned());
         }
-        let big: [(&str, bool, u64); 7] = [
-            ("Library", true, 614),
-            ("Developer", true, 482),
-            ("Pictures", true, 729),
-            ("Documents", true, 273),
-            ("Movies", true, 316),
-            ("Music", true, 98),
-            (".Trash", true, 141),
-        ];
+        // The first scan, and then each later scan with changed sizes: a
+        // larger folder, a smaller one, a new one, and one that is gone.
+        let later: bool = self.scans.fetch_add(1, Ordering::Relaxed) > 0;
+        let mut big: Vec<(&str, u64, u64)> = FOLDERS
+            .iter()
+            .map(|(name, tenth_gb, percent)| (*name, *tenth_gb, *percent))
+            .collect();
+        if later {
+            big.retain(|(name, _, _)| *name != ".Trash");
+            for (name, tenth_gb, _) in &mut big {
+                match *name {
+                    "Developer" => *tenth_gb += 21,
+                    "Movies" => *tenth_gb -= 8,
+                    _ => {}
+                }
+            }
+            big.push(("Downloads", 12, 100));
+        }
         let mut children: Vec<ChildSize> = big
             .iter()
-            .map(|(name, is_directory, tenth_gb)| ChildSize {
-                name: (*name).to_owned(),
-                path: root.join(name),
-                is_directory: *is_directory,
-                logical: tenth_gb * GB / 10,
-                allocated: tenth_gb * GB / 10 + GB / 100,
+            .map(|(name, tenth_gb, percent)| {
+                let allocated: u64 = tenth_gb * GB / 10 + GB / 100;
+                ChildSize {
+                    name: (*name).to_owned(),
+                    path: root.join(name),
+                    is_directory: true,
+                    // The density of the folder is allocated over logical.
+                    logical: allocated * 100 / percent,
+                    allocated,
+                }
             })
             .collect();
         for index in 0..12_u64 {
@@ -462,6 +490,36 @@ impl DataSource for FixtureSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_of(source: &FixtureSource) -> ScanSummary {
+        let cancel = CancellationToken::new();
+        let Ok(summary) = source.scan(Path::new("/r"), &cancel, &|_| {}) else {
+            panic!("the fixture scan must end");
+        };
+        summary
+    }
+
+    #[test]
+    fn folders_differ_in_density_and_later_scans_change() {
+        let source = FixtureSource::new(FixtureScenario::Healthy);
+        let first = scan_of(&source);
+        let named = |s: &ScanSummary, n: &str| s.children.iter().find(|c| c.name == n).cloned();
+        let library = named(&first, "Library").expect("library");
+        assert!(library.logical > library.allocated, "density below 1");
+        let pictures = named(&first, "Pictures").expect("pictures");
+        assert!(pictures.logical <= pictures.allocated);
+        assert!(named(&first, ".Trash").is_some());
+        let second = scan_of(&source);
+        assert!(named(&second, ".Trash").is_none());
+        assert!(named(&second, "Downloads").is_some());
+        let before = named(&first, "Developer").expect("developer").allocated;
+        let after = named(&second, "Developer").expect("developer").allocated;
+        assert_eq!(after - before, 21 * GB / 10);
+        let movies_before = named(&first, "Movies").expect("movies").allocated;
+        let movies_after = named(&second, "Movies").expect("movies").allocated;
+        assert_eq!(movies_before - movies_after, 8 * GB / 10);
+        assert_eq!(scan_of(&source).children, second.children, "stable later");
+    }
 
     #[test]
     fn names_round_trip() {

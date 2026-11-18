@@ -28,10 +28,11 @@ use crate::{
         capacity_grid::{capacity_label, known_capacity},
         dial::{
             DialColors, DialDetail, DialKey, DialLegend, DialModel, HeadMove, HeadroomDial,
-            dial_model, level_sector, lit_of, names_hidden, share_percent_text, share_ppm,
-            sweep_total, with_lit_counts,
+            dial_model, dial_model_with, level_sector, lit_of, names_hidden, share_percent_text,
+            share_ppm, sweep_total, with_lit_counts,
         },
         led::{LedChart, LedField, LedSegment},
+        runway::{self, Estimate},
         session::{LEFT_GUTTER, RIGHT_GUTTER, SessionChart, live_progress, session_model},
         treemap::CellRect,
     },
@@ -481,6 +482,7 @@ fn headroom_card(
     lit_counts: Option<[Option<usize>; 3]>,
     focus: [FocusHandle; 3],
     on_pick: impl Fn(Option<usize>, &mut Window, &mut gpui_kit::App) + 'static,
+    estimate: Option<&Estimate>,
     tokens: &Tokens,
     dark: bool,
 ) -> AnyElement {
@@ -489,7 +491,7 @@ fn headroom_card(
         View::Loading => (skeleton_value(), None),
         View::Failed(reason) => (unavailable_body("headroom-value", reason, tokens), None),
         View::Data { host, stale } => {
-            let model: DialModel = dial_model(host);
+            let model: DialModel = dial_model_with(host, estimate);
             let shown: DialModel =
                 lit_counts.map_or_else(|| model.clone(), |counts| with_lit_counts(&model, counts));
             let pill: (&'static str, Tone) = pressure_pill(&host.pressure);
@@ -593,6 +595,10 @@ fn session_card(
                     .child(MonoTag::new("session-tag-range", tags.range))
                     .child(MonoTag::new("session-tag-events", tags.events))
                     .child(MonoTag::new("session-tag-state", tags.state))
+                    .children(
+                        tags.runway
+                            .map(|text| MonoTag::new("session-tag-runway", text)),
+                    )
                     .into_any_element(),
             );
             v_flex()
@@ -843,6 +849,7 @@ impl Render for OverviewScreen {
             },
         };
         let history: Vec<HostSample> = model.history.iter().cloned().collect();
+        let estimate: Option<Estimate> = runway::estimate(&history);
         let agent: Loadable<AgentSnapshot> = model.agent.clone();
         let service: Loadable<ServiceSnapshot> = model.service.clone();
         self.last_render = Instant::now();
@@ -952,6 +959,7 @@ impl Render for OverviewScreen {
                         }
                     });
                 },
+                estimate.as_ref(),
                 tokens,
                 cx.theme().is_dark(),
             ),

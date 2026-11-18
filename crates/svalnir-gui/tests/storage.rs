@@ -81,7 +81,7 @@ fn fixture_scan_reaches_done_with_the_total(cx: &mut TestAppContext) {
         summary.children.iter().map(|c| c.logical).sum::<u64>()
     );
     assert_eq!(summary.entries_examined, 120_000);
-    assert!(summary.total_allocated > summary.total_logical);
+    assert!(summary.total_logical > summary.total_allocated);
     assert!(
         summary
             .children
@@ -546,4 +546,106 @@ fn the_ring_layout_can_be_selected_and_has_a_label(cx: &mut TestAppContext) {
     assert!(legend.starts_with("Pictures: "), "{legend}");
     let scale = label_of(handle, "storage-band-scale", cx).expect("scale");
     assert!(scale.starts_with("1 step = "), "{scale}");
+}
+
+fn click(handle: AnyWindowHandle, id: &'static str, cx: &mut TestAppContext) {
+    cx.update_window(handle, |_, window, cx| window.click(id, cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn open_storage_scanned(cx: &mut TestAppContext) -> AnyWindowHandle {
+    let handle = open(FixtureScenario::Healthy, cx);
+    cx.update_window(handle, |_, window, cx| window.press("cmd-2", cx))
+        .unwrap();
+    cx.run_until_parked();
+    click(handle, "scan-start", cx);
+    handle
+}
+
+#[gpui_kit::test]
+fn the_density_key_and_the_dense_text_show_after_a_scan(cx: &mut TestAppContext) {
+    let handle = open_storage_scanned(cx);
+    let key = label_of(handle, "storage-density-key", cx).expect("density key");
+    assert_eq!(key, "Lit cells: allocated size \u{f7} logical size");
+    // Library has a density of 80%, Developer 55%; Pictures fills its size.
+    assert_eq!(
+        label_of(handle, "storage-legend-row-1-density", cx).as_deref(),
+        Some("80% dense")
+    );
+    assert_eq!(
+        label_of(handle, "storage-legend-row-2-density", cx).as_deref(),
+        Some("55% dense")
+    );
+    assert!(label_of(handle, "storage-legend-row-0-density", cx).is_none());
+    let row = label_of(handle, "storage-legend-row-1", cx).expect("row");
+    assert!(row.contains("80% dense"), "{row}");
+    // No ghost after one scan.
+    assert!(label_of(handle, "storage-ghost-caption", cx).is_none());
+    assert!(label_of(handle, "storage-legend-row-2-delta", cx).is_none());
+}
+
+#[gpui_kit::test]
+fn a_second_scan_shows_the_changes_against_the_first(cx: &mut TestAppContext) {
+    // `--rescan`: the model starts a second scan when the first has a result.
+    cx.update(gpui_kit::init);
+    cx.update(nav::bind_keys);
+    let (handle, view) = cx.update(|cx| {
+        open_main_window(
+            Bounds::new(Point::default(), size(px(1120.0), px(720.0))),
+            Arc::new(FixtureSource::new(FixtureScenario::Healthy)),
+            None,
+            cx,
+        )
+        .expect("open test window")
+    });
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.press("cmd-2", cx))
+        .unwrap();
+    let model = cx.read(|cx| view.read(cx).model().clone());
+    let root = cx
+        .read(|cx| model.read(cx).default_scan_root())
+        .expect("root");
+    model.update(cx, |model, cx| {
+        model.set_rescan_once(true);
+        model.start_scan(&root, cx);
+    });
+    cx.run_until_parked();
+    let mut deltas: Vec<String> = Vec::new();
+    for index in 0..8 {
+        let id: &'static str =
+            Box::leak(format!("storage-legend-row-{index}-delta").into_boxed_str());
+        if let Some(text) = label_of(handle, id, cx) {
+            deltas.push(text);
+        }
+    }
+    assert!(deltas.contains(&"+2.1 GB".to_owned()), "{deltas:?}");
+    assert!(
+        deltas.contains(&"\u{2212}800.0 MB".to_owned()),
+        "{deltas:?}"
+    );
+    assert!(deltas.contains(&"new".to_owned()), "{deltas:?}");
+    let gone = label_of(handle, "storage-ghost-gone", cx).expect("gone line");
+    assert_eq!(gone, "Not in this scan: .Trash (14.1 GB)");
+    let caption = label_of(handle, "storage-ghost-caption", cx).expect("caption");
+    assert!(
+        caption.starts_with("Compared with the scan of "),
+        "{caption}"
+    );
+    assert!(caption.ends_with(" UTC"), "{caption}");
+    let mut texts: Vec<String> = deltas;
+    texts.push(gone);
+    texts.push(caption);
+    for index in 0..8 {
+        let id: &'static str = Box::leak(format!("storage-legend-row-{index}").into_boxed_str());
+        texts.extend(label_of(handle, id, cx));
+    }
+    texts.extend(label_of(handle, "storage-band", cx));
+    for text in texts {
+        let lower = text.to_lowercase();
+        assert!(
+            !lower.contains("freed") && !lower.contains("reclaimed"),
+            "{text}"
+        );
+    }
 }

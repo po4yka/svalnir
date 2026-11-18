@@ -219,12 +219,44 @@ The storage charts and the volume strip are LED matrices. This is the signature 
 
 - One lattice of small square cells covers the chart: a 4.5 px cell with a 1 px radius and a 1.5 px gap. An empty cell uses `border` at half strength, so the lattice shows in the whole chart.
 - A segment is a rectangle of lattice cells with a 1.5 px outline (radius 6 px) in its color, a fill of the color at 8%, and a glow of the color: blur 14 px, alpha 0.45 in the dark theme and 0.22 in the light theme.
-- In a segment, each cell is lit (the color mixed 15% toward white) or dim (the color at 28%, or 22% in the light theme). A hash of the cell position and of the segment selects the state, so the pattern has clumps and does not change between frames. About 45% of the cells are lit. The pattern is texture: it has no meaning, and the area of the segment carries the quantity.
+- In a segment, each cell is lit (the color mixed 15% toward white) or dim (the color at 28%, or 22% in the light theme). A hash of the cell position and of the segment selects the state, so the pattern has clumps and does not change between frames. About 45% of the cells are lit. In a chart of folder sizes the lit share is the density of the folder (see "Density texture"). In each other segment the pattern has no meaning. The area of the segment carries the quantity.
 - A label in a tile dims the cells under its text only.
 - Free space is a region with a dashed 1 px outline (`muted-foreground` at 35%), a label, and sparse bright points. It is not a segment.
 - A segment that has no focus while a different one has it shows all its cells dim, its outline at 35%, and no glow.
 - The head of a fill is three lattice columns of white at 100%, 60%, and 30% with a white glow.
 - Do not draw the glow when Reduce Transparency or Increase Contrast is on, or while the memory pressure state is not normal.
+
+### Density, change, and direction
+
+These three marks show what the client measures and a size chart does not show: how dense a folder is on disk, how it changed between two scans, and where the available space goes.
+
+**Density texture.** In a chart of folder sizes, the share of lit cells in a segment is the density of the folder: its allocated size divided by its logical size, at most 1.
+
+- The lit share is 20% plus 70% of the density. A folder of sparse, compressed, or cloned data has few lit cells. A folder that fills its logical size has 90%.
+- The hash of the cell position selects the cells, so the pattern has clumps and does not change between frames. A higher density adds lit cells and does not move the others.
+- A segment with a logical size of 0, the "Not scanned" segment, and a segment that is not a folder keep the default share of 45% or their own rule.
+- "Other" uses the sum of the allocated sizes divided by the sum of the logical sizes of its items.
+- The cell ring uses the same rule for its dots.
+- A key is below the chart: a sparse swatch and a dense swatch with the text "Lit cells: allocated size ÷ logical size". The legend row of a folder with a density below 0.9 shows the density as a percentage in mono text ("64% dense").
+- The density is not a statement that space can be reclaimed.
+
+**Scan ghost.** After a second scan of one folder, the chart compares each item with the scan before it, in the size metric of the chart. The client keeps one earlier result for each scan root.
+
+- An item that is larger shows the difference as a hatched part at the end of its segment: a checkerboard of lit and empty cells, with an area of the difference. A difference below half a cell has no hatched part.
+- An item that is smaller shows a dashed 1 px line in `muted-foreground` along the end edge of its segment.
+- The legend row shows the difference in mono text with a sign ("+2.1 GB", "−800.0 MB"), in `foreground` for a larger item and `muted-foreground` for a smaller one. A new item shows "new". The colors `positive` and `negative` are not used: a change of size is not good or bad.
+- An item of the earlier scan that this scan does not have is one line below the legend: "Not in this scan:" with the names and the earlier sizes.
+- A caption states the reference: "Compared with the scan of 12:04". Do not use the words "freed" or "reclaimed" for a difference (§7).
+- The ghost is not drawn when the earlier scan or this scan is partial for a different reason, when the metric of the earlier result is not available, or during a scan.
+
+**Runway.** The runway is the time until the available space of the startup volume is 0 if the trend of this session continues. It is an estimate, and each text of it starts with "≈".
+
+- The trend is a least-squares line through the measured readings of the available space among the newest 60 readings. It needs 12 or more measured readings over 60 s or more, with at most one third of the readings unavailable.
+- The runway shows only when the line falls and the fall over the readings is 0.05% of the volume or more. With a level or rising line the text is "steady". Without enough readings no runway text shows.
+- The text uses one unit: "≈ 40 min", "≈ 3 h", "≈ 2 d". Above 7 days the text is "more than 7 d".
+- The session chart draws the trend line as dots of 2 px in `muted-foreground` through the curve, over the columns that the trend uses. The footer has a tag "runway ≈ 3 h".
+- The disk ring of the dial shows the space that the trend takes in the next hour as dots of 2 px in the ring color after the head, at most to the end of the ring. The detail panel of the disk has a row "Runway" with the text and the note "estimate from N readings".
+- A runway value does not roll, does not animate, and is not a headline value (§6 "Limits"). It is not an input of a guard.
 
 ### Dot rings and the session chart
 
@@ -447,6 +479,7 @@ The first client in `crates/svalnir-gui` applies sections 2 to 6 and section 8 t
 | Storage breakdown (§5, §10) | The resource model defines no storage categories, and the scanner reports none. The Storage screen shows the direct children of the scan root in palette order by size. At the default scan root the chart has the scale of the volume, with the free space and a "Not scanned" segment |
 | Linked focus (§5) | Hover on a legend row dims the other segments, in the tiles, band, columns, and ring layouts, and picks a ring of the headroom dial. Keyboard focus on a dial row picks its ring and blur clears the pick, like hover; a click on a dial row picks its ring. The cell ring selects and hovers a segment by its whole arc |
 | Charts (§5) | Built: LED tiles, band, and columns; the headroom dial; the session chart; the cell ring; the history track label of the pressure row; the legend. The tick gauge, the value line, and the sparkline were removed from the Overview. Differences: the radial marker of the dial is painted as eight small squares along the radius; the dots of the cell ring are 3 px, because the inner ring has 3.45 px between two steps; a segment of the cell ring is hit by one test of the pointer angle and radius (the ring radii plus or minus 3 px), and every two neighbour segments keep a gap of one step, which a segment of one step takes from its larger neighbour; the session chart shows local time, and it shows UTC with the mark "UTC" for a reading with no known zone offset; its "min" label is wider than the right gutter and reaches into the padding of the card, and it is left out when the newest value is at the same row; the stat row of the Headroom card and of the folder chart is built, and the Storage row is below the legend; the Overview puts the dial card and the session card in one row from a content width of 1150 px, so a window of 1300 px shows them one below the other; a curve of one value shows its dot in the middle row. Not built: budget meter, tick track of an operation, rate graph with interventions, step timeline, stat grid (the stat row is built), dot histogram, dot clock |
+| Density, change, and direction (§5) | Built: the density texture in the tiles, band, columns, and ring layouts of the folder chart, with the key and the "NN% dense" text of a legend row; the scan ghost (hatched growth, dashed line for a smaller item, signed legend text, the "Not in this scan" line, and the caption), which needs two finished scans of one root in one session; the runway (trend dots in the session chart, the footer tag, the next-hour dots of the disk ring, the "Runway" row and note of the detail panel). Differences and limits: the client keeps one earlier result for each of at most 8 scan roots, in memory; a cancelled scan keeps the earlier result and has no ghost; "Other" and a new item have no hatched part or dashed line, and a new item shows "new" in the legend; the hatched growth is the last cells of the segment along its end edge (the rightmost columns in the tiles, band, and ring, the top rows in the columns layout), and a smaller item in the ring layout has no mark; two scans are comparable only when neither was cancelled and both are complete, or both are partial for the same causes and ended the same way; the runway needs a measured newest reading, and the volume size is the used plus the available space of that reading. Not built: a check on screen in both themes and with Reduce Motion on, and a test of the pixels of any of the three marks |
 | Motion (§6) | Built: scan fill with a head, rolling number, fill-in of a finished chart, idle field in the free region, card entry, sliding pill, the ring sweep of the dial (with each entry of the Overview cards) and of the cell ring, the move of a dial ring head to a new reading in 250 ms (`FRONT_EASE`, `ease-ui-out`, a lit count that ends at the measured count; it runs per frame and only without Reduce Motion), the ring of the live head (1.6 s period from its own start instant, per frame, and it stops with the other continuous effects). Not built: removal, phase header, outcome line, range change, expand, peak marker |
 | History (§5) | The history track and the value line show the readings of this window since it opened, at most 180. The client reads no stored samples |
 | Screens (§11) | Overview and Storage are built without a state-changing action. The other five screens show a placeholder. No menu bar item exists |

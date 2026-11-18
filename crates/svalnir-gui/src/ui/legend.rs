@@ -29,6 +29,11 @@ pub struct LegendRow {
     pub color: Hsla,
     /// Whether the row can be activated (a directory).
     pub activatable: bool,
+    /// The density as text, such as "64% dense"; shown before the size.
+    pub density: Option<SharedString>,
+    /// The change since an earlier scan as signed text, with whether the
+    /// item is larger (`foreground`) or smaller (`muted-foreground`).
+    pub delta: Option<(SharedString, bool)>,
 }
 
 /// The number of columns for a width.
@@ -85,7 +90,15 @@ impl Legend {
     }
 }
 
+impl Legend {
+    /// The element id of row `index`.
+    fn id_of(&self, index: usize) -> String {
+        format!("{}-row-{index}", self.id)
+    }
+}
+
 impl RenderOnce for Legend {
+    #[expect(clippy::too_many_lines, reason = "one build of the rows")]
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let mono: SharedString = cx.theme().mono_font_family.clone();
@@ -108,7 +121,14 @@ impl RenderOnce for Legend {
                             select(index, window, cx);
                         }
                     });
-                let label: String = format!("{}: {}", row.name, row.size);
+                let mut label: String = format!("{}: {}", row.name, row.size);
+                if let Some(density) = &row.density {
+                    label = format!("{label}, {density}");
+                }
+                if let Some((text, _)) = &row.delta {
+                    label = format!("{label}, {text} since the earlier scan");
+                }
+                let foreground: Hsla = to_hsla(tokens.foreground);
                 h_flex()
                     .id(row_id)
                     .test_support()
@@ -153,6 +173,26 @@ impl RenderOnce for Legend {
                         row.activatable
                             .then(|| Icon::new(IconName::ChevronRight).size_3().text_color(muted)),
                     )
+                    .children(row.density.clone().map(|text| {
+                        div()
+                            .id(SharedString::from(format!("{}-density", self.id_of(index))))
+                            .test_support()
+                            .aria_label(text.clone())
+                            .font_family(mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(muted)
+                            .child(text)
+                    }))
+                    .children(row.delta.clone().map(|(text, larger)| {
+                        div()
+                            .id(SharedString::from(format!("{}-delta", self.id_of(index))))
+                            .test_support()
+                            .aria_label(text.clone())
+                            .font_family(mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(if larger { foreground } else { muted })
+                            .child(text)
+                    }))
                     .child(
                         div()
                             .font_family(mono.clone())

@@ -15,6 +15,7 @@ use crate::{
     viz::{
         dial::DialColors,
         led::lit_color,
+        runway::{self, Estimate, Trend},
         tick_track::{TickState, state_of, track_label},
     },
 };
@@ -82,6 +83,9 @@ pub struct Column {
     pub state: TickState,
     /// The dots of the change strip, 0 to 3.
     pub change: u8,
+    /// The row of the trend dot from the bottom, `0..CURVE_ROWS`; `None`
+    /// outside the readings that the trend uses.
+    pub trend: Option<usize>,
 }
 
 /// What an event is.
@@ -145,6 +149,8 @@ pub struct SessionModel {
     pub axis: Vec<AxisLabel>,
     /// Whether the times of the axis are UTC and not local time.
     pub axis_utc: bool,
+    /// The runway estimate of the readings; `None` without enough readings.
+    pub runway: Option<Estimate>,
 }
 
 /// The range of the measured values of `values`.
@@ -229,6 +235,8 @@ pub fn session_model(
     let disk: Option<(u64, u64)> = measured(|s| &s.disk_used);
     let swap: Option<(u64, u64)> = measured(|s| &s.swap_used);
     let mut columns: Vec<Column> = Vec::with_capacity(visible.len());
+    let fit: Option<Trend> = runway::trend(samples);
+    let trend_from: usize = samples.len().saturating_sub(runway::WINDOW);
     for (index, sample) in visible.iter().enumerate() {
         let previous: Option<&HostSample> = if index == 0 {
             before
@@ -265,6 +273,16 @@ pub fn session_model(
             },
             state: state_of(&sample.pressure),
             change,
+            trend: fit
+                .as_ref()
+                .zip(available)
+                .filter(|_| start + index >= trend_from)
+                .map(|(line, range)| {
+                    let value: f64 = line
+                        .value_at(sample.at)
+                        .clamp(value_f64(range.0), value_f64(range.1));
+                    step_in(whole_bytes(value), range, CURVE_ROWS - 1)
+                }),
             at: sample.at,
             utc_offset: sample.utc_offset,
         });
@@ -351,7 +369,24 @@ pub fn session_model(
         newest,
         axis,
         axis_utc,
+        runway: runway::estimate(samples),
     }
+}
+
+/// A byte count as a float for the trend; the precision is enough to place a dot.
+#[expect(clippy::cast_precision_loss, reason = "the value places a dot")]
+const fn value_f64(bytes: u64) -> f64 {
+    bytes as f64
+}
+
+/// A non-negative float as whole bytes, saturating.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to the range of the readings first"
+)]
+fn whole_bytes(value: f64) -> u64 {
+    value.max(0.0) as u64
 }
 
 fn bytes_text(bytes: u64) -> String {
@@ -402,8 +437,11 @@ impl SessionModel {
         let min: String = self.min.map_or_else(String::new, |min| {
             format!(", min {}", bytes_text(min.value))
         });
+        let runway: String = self
+            .runway_text()
+            .map_or_else(String::new, |text| format!(", runway {text} (an estimate)"));
         format!(
-            "Session chart: {}, {}, pressure {} normal, {} warning, {} critical{min}, {}",
+            "Session chart: {}, {}, pressure {} normal, {} warning, {} critical{min}, {}{runway}",
             readings_text(self.columns.len()),
             range_caption(self.range),
             count(TickState::Normal),
@@ -411,6 +449,13 @@ impl SessionModel {
             count(TickState::Critical),
             events_text(self.events.len()),
         )
+    }
+
+    /// The text of the runway, such as "≈ 3 h" or "steady"; `None` without an
+    /// estimate.
+    #[must_use]
+    pub fn runway_text(&self) -> Option<String> {
+        self.runway.map(|e| e.text())
     }
 
     /// The first slot of the newest reading, from the left.
@@ -629,6 +674,8 @@ pub struct SessionTags {
     pub events: String,
     /// "now STATE".
     pub state: String,
+    /// "runway ≈ 3 h" or "runway steady"; `None` without an estimate.
+    pub runway: Option<String>,
 }
 
 /// "260.0-310.2 GB", or the two values with their units.
@@ -782,6 +829,7 @@ impl SessionModel {
                 self.newest
                     .map_or(UNAVAILABLE_TEXT, |newest| state_word(newest.state))
             ),
+            runway: self.runway_text().map(|text| format!("runway {text}")),
         }
     }
 }
@@ -947,6 +995,24 @@ fn paint_session(paint: &SessionPaint, bounds: Bounds<Pixels>, window: &mut Wind
                 }
                 None => hollow(window, slot, top + MATRIX_DOTS - 1),
             }
+        }
+    }
+    // The trend line: dots of 2 px through the curve, over the columns that
+    // the trend uses.
+    for (index, column) in model.columns.iter().enumerate() {
+        if let Some(value) = column.trend {
+            window.paint_quad(
+                fill(
+                    dot_at(
+                        origin,
+                        slot_x(model.offset() + index),
+                        row_y(CURVE_ROWS - 1 - value),
+                        2.0,
+                    ),
+                    paint.muted_ink.opacity(rest),
+                )
+                .corner_radii(Corners::all(px(1.0))),
+            );
         }
     }
     // The dashed line of the lowest value on screen.

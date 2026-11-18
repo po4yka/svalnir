@@ -440,10 +440,16 @@ pub(crate) fn policy_enable(
     if reviewed.is_none() && arguments.expected_revision.is_some() {
         return Err(revision_conflict(None, Some(&active), "").into());
     }
-    // With no reviewed revision, an interactive user reviews the revision
-    // in effect and the action classes here.
-    let mut interactive: bool = false;
-    if reviewed.is_none() && arguments.expected_revision.is_none() {
+    // With no named revision, an interactive user reviews the revision in
+    // effect and the action classes here. The request then binds the
+    // revision that the question showed. `persist` writes the record only
+    // when it is still the record that was read before the question, so a
+    // revision that became active in the meantime is not bound. With no
+    // terminal, the request names no revision, and the grant logic refuses
+    // it.
+    let reviewed: Option<PolicyRevisionId> = if arguments.expected_revision.is_some() {
+        reviewed
+    } else {
         let question: String = format!(
             "Enable {} for revision {} with the standing action classes: {}?\nEligible incidents then proceed with no further question.",
             policy.as_str(),
@@ -455,7 +461,7 @@ pub(crate) fn policy_enable(
             .seams
             .confirm(invocation.stderr, &question)
         {
-            Confirmation::Approved => interactive = true,
+            Confirmation::Approved => Some(active.clone()),
             Confirmation::Declined => {
                 return Err(ErrorBody::new(
                     "approval_declined",
@@ -466,15 +472,14 @@ pub(crate) fn policy_enable(
                 .with_next_action(NextAction::None)
                 .into());
             }
-            Confirmation::NotInteractive => {}
+            Confirmation::NotInteractive => None,
         }
-    }
+    };
     let request = EnableRequest {
         principal: session::current_uid(),
         policy,
         accepted,
         reviewed_revision: reviewed,
-        interactive,
         grant_id: ActionGrantId::new(session::new_id("grant"))
             .map_err(|_| session::identity_error())?,
         now,

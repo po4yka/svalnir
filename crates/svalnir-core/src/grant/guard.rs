@@ -197,13 +197,12 @@ pub struct EnableRequest {
     /// The action classes that the user accepted. Use
     /// [`Acceptance::classes_of`] for the flags of a command.
     pub accepted: Vec<ActionClass>,
-    /// The policy revision that the user reviewed. A noninteractive request
-    /// must name it.
+    /// The policy revision that the user reviewed. Each request must name
+    /// it: a client that shows the revision in effect to a person gives the
+    /// identity that it showed, and a noninteractive request gives the
+    /// identity that its caller supplied. A request with `None` is refused,
+    /// so a grant is never bound to a revision that nobody saw.
     pub reviewed_revision: Option<PolicyRevisionId>,
-    /// True when the client showed the scope of the revision in effect and
-    /// the consequence to a person before the request. Such a request can
-    /// omit `reviewed_revision`; it then binds the revision in effect.
-    pub interactive: bool,
     /// The identity of a new grant. The function uses it only when the
     /// guard has no grant, or when the generation of its grant cannot
     /// become larger.
@@ -221,9 +220,8 @@ pub enum EnableRefusal {
     /// No policy revision is in effect, so there is no scope to accept.
     #[error("no policy revision is in effect")]
     NoActiveRevision,
-    /// A noninteractive request did not name the revision that was
-    /// reviewed.
-    #[error("a noninteractive request must name the reviewed policy revision")]
+    /// The request did not name the revision that was reviewed.
+    #[error("a request must name the reviewed policy revision")]
     ReviewedRevisionRequired,
     /// The reviewed revision is not the revision in effect. The user must
     /// review the revision in effect; nothing is overwritten.
@@ -375,14 +373,14 @@ pub fn enable(
         .as_ref()
         .ok_or(EnableRefusal::NoActiveRevision)?;
     match &request.reviewed_revision {
-        None if !request.interactive => return Err(EnableRefusal::ReviewedRevisionRequired),
+        None => return Err(EnableRefusal::ReviewedRevisionRequired),
         Some(reviewed) if reviewed != &active.revision.revision_id => {
             return Err(EnableRefusal::RevisionConflict {
                 reviewed: reviewed.clone(),
                 active: active.revision.revision_id.clone(),
             });
         }
-        _ => {}
+        Some(_) => {}
     }
     let policy: PolicyId = request.policy;
     if !active.scope.profile_permits_intervention() {

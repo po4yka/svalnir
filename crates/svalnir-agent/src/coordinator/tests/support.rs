@@ -282,7 +282,6 @@ impl TestAuthority {
             policy: PolicyId::MemoryGuard,
             accepted: Acceptance::classes_of(&[Acceptance::ForceQuit]),
             reviewed_revision: Some(PolicyRevisionId::new("policy_1").unwrap()),
-            interactive: false,
             grant_id: ActionGrantId::new("grant_memory").unwrap(),
             now: wall(0),
         };

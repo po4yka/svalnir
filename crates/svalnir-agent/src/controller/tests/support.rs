@@ -288,7 +288,6 @@ fn with_acceptance(
         policy,
         accepted: Acceptance::classes_of(&[acceptance]),
         reviewed_revision: Some(PolicyRevisionId::new("policy_1").unwrap()),
-        interactive: false,
         grant_id: ActionGrantId::new(grant).unwrap(),
         now: wall(0),
     };

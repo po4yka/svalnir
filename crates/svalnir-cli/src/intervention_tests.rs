@@ -738,6 +738,74 @@ fn a_guard_is_enabled_only_with_its_acceptance_and_its_revision() {
     assert_eq!(result["coordinator"], "not_running");
 }
 
+/// An interactive enable names no revision in its arguments. The request
+/// binds the revision that the question showed.
+#[test]
+fn an_interactive_enable_binds_the_revision_that_the_question_showed() {
+    let mut world = World::new();
+    let revision: String = world.activate(BALANCED_CONFIG, "none");
+    world.environment.seams.test.answers =
+        Some(Arc::new(Mutex::new(VecDeque::from(["yes".to_owned()]))));
+    let enabled = json(
+        &world.environment,
+        &[
+            "policy",
+            "enable",
+            "disk-guard",
+            "--accept-permanent-eviction",
+        ],
+    );
+    assert_eq!(enabled.status, ExitStatus::Success, "{}", enabled.stdout);
+    assert!(enabled.stderr.contains(&revision), "{}", enabled.stderr);
+    let result = enabled.result();
+    assert_eq!(result["report"]["policy_revision"], revision);
+    assert_eq!(result["report"]["standing"], "active");
+}
+
+/// A different client activates a new revision while the question of an
+/// interactive enable waits. The user saw the earlier revision, so the
+/// enable binds nothing and no guard gets a grant.
+#[test]
+fn a_revision_that_changes_while_the_question_waits_refuses_the_enable() {
+    let mut world = World::new();
+    let revision: String = world.activate(BALANCED_CONFIG, "none");
+    let config: PathBuf = world.path("later.toml");
+    std::fs::write(&config, BALANCED_CONFIG.replace("balanced", "aggressive")).unwrap();
+    let other_client: Environment = world.environment.clone();
+    world.environment.seams.test.answers =
+        Some(Arc::new(Mutex::new(VecDeque::from(["yes".to_owned()]))));
+    world.environment.seams.test.while_asked =
+        Some(crate::seams::WhileAsked(Arc::new(move || {
+            let outcome = json(
+                &other_client,
+                &[
+                    "config",
+                    "apply",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--expected-revision",
+                    &revision,
+                ],
+            );
+            assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+        })));
+    let enabled = json(
+        &world.environment,
+        &[
+            "policy",
+            "enable",
+            "disk-guard",
+            "--accept-permanent-eviction",
+        ],
+    );
+    assert_eq!(enabled.status, ExitStatus::Conflict, "{}", enabled.stdout);
+    world.environment.seams.test.while_asked = None;
+    let status = json(&world.environment, &["agent", "status"]);
+    let guard = &status.result()["authority"]["guards"][0];
+    assert_eq!(guard["policy"], "disk-guard");
+    assert_eq!(guard["grant"], Value::Null, "{}", status.stdout);
+}
+
 #[test]
 fn an_enabled_guard_is_in_the_status_and_a_disable_removes_its_standing() {
     let world = World::new();

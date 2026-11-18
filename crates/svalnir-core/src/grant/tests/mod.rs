@@ -322,7 +322,6 @@ fn enable_request(
             .active
             .as_ref()
             .map(|active| active.revision.revision_id.clone()),
-        interactive: false,
         grant_id: grant_id(match policy {
             PolicyId::DiskGuard => "grant_disk",
             PolicyId::MemoryGuard => "grant_memory",

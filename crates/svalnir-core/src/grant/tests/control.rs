@@ -561,41 +561,38 @@ fn the_grant_records_the_critical_memory_exception_of_the_reviewed_revision() {
 }
 
 #[test]
-fn a_noninteractive_enable_must_name_the_reviewed_revision() {
+fn an_enable_must_name_the_reviewed_revision() {
     let state = active_state(&base_config());
+    // A request that names no revision binds nothing: the revision in
+    // effect is not used in its place, also not for a client with a terminal.
     let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
     request.reviewed_revision = None;
     assert_eq!(
         enable(&state, &request).unwrap_err(),
         EnableRefusal::ReviewedRevisionRequired
     );
-    // An interactive client showed the revision in effect.
-    request.interactive = true;
+    // The revision that the client showed is the revision of the grant.
+    request.reviewed_revision = Some(revision_id("policy_1"));
     let next = durable(enable(&state, &request).unwrap()).state;
     assert_eq!(grant(&next, DISK).policy_revision, revision_id("policy_1"));
 
-    // A reviewed revision that is not in effect is a conflict, also for an
-    // interactive client.
-    for interactive in [false, true] {
-        let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
-        request.reviewed_revision = Some(revision_id("policy_0"));
-        request.interactive = interactive;
-        assert_eq!(
-            enable(&state, &request).unwrap_err(),
-            EnableRefusal::RevisionConflict {
-                reviewed: revision_id("policy_0"),
-                active: revision_id("policy_1"),
-            }
-        );
-    }
+    // A reviewed revision that is not in effect is a conflict.
+    let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
+    request.reviewed_revision = Some(revision_id("policy_0"));
+    assert_eq!(
+        enable(&state, &request).unwrap_err(),
+        EnableRefusal::RevisionConflict {
+            reviewed: revision_id("policy_0"),
+            active: revision_id("policy_1"),
+        }
+    );
 }
 
 #[test]
 fn an_enable_is_refused_without_a_usable_revision() {
     let accept = [Acceptance::PermanentEviction];
     let empty = AuthorityState::new(USER);
-    let mut request = enable_request(&empty, DISK, &accept);
-    request.interactive = true;
+    let request = enable_request(&empty, DISK, &accept);
     assert_eq!(
         enable(&empty, &request).unwrap_err(),
         EnableRefusal::NoActiveRevision

@@ -3,10 +3,11 @@
 pub mod alloc;
 pub mod breakdown;
 pub mod capacity_grid;
+pub mod cell_ring;
 pub mod cells;
+pub mod dial;
 pub mod led;
-pub mod spark;
+pub mod session;
 pub mod storage_layouts;
-pub mod tick_gauge;
 pub mod tick_track;
 pub mod treemap;

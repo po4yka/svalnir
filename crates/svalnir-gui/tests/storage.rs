@@ -514,3 +514,28 @@ fn arrow_keys_on_the_layout_control_change_the_layout(cx: &mut TestAppContext) {
     let chart = label_of(handle, "storage-band", cx).expect("chart");
     assert!(chart.starts_with("Band layout"), "{chart}");
 }
+
+#[gpui_kit::test]
+fn the_ring_layout_can_be_selected_and_has_a_label(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    cx.update_window(handle, |_, window, cx| window.press("cmd-2", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.click("scan-start", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        label_of(handle, "layout-ring", cx).is_some(),
+        "the Ring option exists"
+    );
+    cx.update_window(handle, |_, window, cx| window.click("layout-ring", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let chart = label_of(handle, "storage-band", cx).expect("ring chart label");
+    assert!(chart.starts_with("Ring layout, breakdown of"), "{chart}");
+    assert!(chart.contains("Pictures: "), "{chart}");
+    let legend = label_of(handle, "storage-legend-row-0", cx).expect("same legend");
+    assert!(legend.starts_with("Pictures: "), "{legend}");
+    let scale = label_of(handle, "storage-band-scale", cx).expect("scale");
+    assert!(scale.starts_with("1 step = "), "{scale}");
+}

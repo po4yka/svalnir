@@ -1,4 +1,4 @@
-//! Three layouts of the Storage chart over the same segments.
+//! The layouts of the Storage chart over the same segments.
 
 use crate::{
     ui::data_state::format_bytes,
@@ -36,9 +36,15 @@ pub enum StorageLayout {
     Band,
     /// One column for each segment.
     Columns,
+    /// Four rings of dots. `CellRing` paints it; `layout_field` treats it
+    /// like the band.
+    Ring,
 }
 
 impl StorageLayout {
+    /// Each layout, in the order of the control.
+    pub const ALL: [Self; 4] = [Self::Tiles, Self::Band, Self::Columns, Self::Ring];
+
     /// The name for labels.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -46,6 +52,7 @@ impl StorageLayout {
             Self::Tiles => "Tiles",
             Self::Band => "Band",
             Self::Columns => "Columns",
+            Self::Ring => "Ring",
         }
     }
 }
@@ -124,7 +131,7 @@ pub fn layout_field(
                 .map(CellRect::gapped)
                 .collect()
         }
-        StorageLayout::Band => {
+        StorageLayout::Band | StorageLayout::Ring => {
             let mut parts: Vec<u64> = weights.clone();
             parts.push(free.unwrap_or(0));
             let all: u64 = total_bytes.saturating_add(free.unwrap_or(0));
@@ -163,7 +170,7 @@ pub fn layout_field(
         }
         let (show_text, place): (bool, LabelPlace) = match layout {
             StorageLayout::Tiles => (big, LabelPlace::Inside),
-            StorageLayout::Band => (false, LabelPlace::Inside),
+            StorageLayout::Band | StorageLayout::Ring => (false, LabelPlace::Inside),
             StorageLayout::Columns => (true, LabelPlace::Below),
         };
         labels.push(TileLabel {

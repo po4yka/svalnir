@@ -195,6 +195,16 @@ impl MainWindow {
         self.screens.get(screen.index()).map(AnyView::entity_id)
     }
 
+    /// Selects the layout of the folder chart of the Storage screen.
+    pub fn set_storage_layout(
+        &mut self,
+        layout: crate::viz::storage_layouts::StorageLayout,
+        cx: &mut Context<Self>,
+    ) {
+        self.storage
+            .update(cx, |storage, cx| storage.set_layout(layout, cx));
+    }
+
     /// Shows `screen`.
     pub fn select(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if self.active != screen {

@@ -225,7 +225,8 @@ impl LedStyle {
 }
 
 /// The color mixed 15% toward white.
-fn lit_color(color: Hsla) -> Hsla {
+#[must_use]
+pub fn lit_color(color: Hsla) -> Hsla {
     let white: Hsla = hsla(0.0, 0.0, 1.0, color.a);
     let mixed = color.to_rgb();
     let target = white.to_rgb();

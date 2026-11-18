@@ -214,10 +214,40 @@ The storage charts and the volume strip are LED matrices. This is the signature 
 - The head of a fill is three lattice columns of white at 100%, 60%, and 30% with a white glow.
 - Do not draw the glow when Reduce Transparency or Increase Contrast is on, or while the memory pressure state is not normal.
 
+### Dot rings and the session chart
+
+These charts use round dots on the 6 px pitch of the LED matrix. A dot has a diameter of 4 px.
+
+**Headroom dial.** Three concentric rings of dots in a square of 196 px. Each ring is one resource. A ring starts at the top and goes clockwise; the full turn is the capacity of the resource.
+
+- The radii are 90, 76, and 62 px, with 96, 80, and 64 dots. From the outside: the used space of the startup volume, the used swap, and the memory pressure state.
+- A dot of the used part is lit: the ring color mixed 15% toward white. A dot of the remaining part is empty: `border` at half strength.
+- Space that is available but not free (the system can reclaim it) is the soft part of the disk ring: each second dot in the ring color at 28%. The legend names it.
+- The pressure ring has three sectors with a gap of one dot: Normal, Warning, and Critical. The sector of the current state is lit in `positive`, `warning`, or `negative`. The sectors below it are dim, and the sectors above it are empty. The legend states the state as text.
+- The last lit dot of a ring is the head: white, with a white glow by the rule of the LED matrix.
+- One ring is picked out: the pressure ring while the state is not normal, and otherwise the ring with the largest used share. The picked ring has full strength and a radial marker of 1.5 px by 8 px at its head. The other rings show their lit dots at 55%. Hover or keyboard focus on a legend row picks that ring.
+- The center shows the value of the picked ring as a display value and a caption of one line.
+- A ring with an unavailable reading shows each second dot empty and no other dot. Its legend row shows an em dash, or the "Unavailable" pill for the pressure ring, and the reason.
+
+**Session chart.** One inset with a value curve and a sample matrix on one time axis. A column of the 6 px pitch is one reading; the newest reading is at the right.
+
+- The curve part has 10 rows. A column shows one dot at the row of the value in the range of the readings on screen, and the dots below it in the series color at 12%. The caption states the range.
+- A column with an unavailable reading shows one empty dot on the lowest row.
+- An event is a 1 px vertical line through the chart with a flag at its top: a tinted pill with text. Events are a change of the memory pressure state and the admission of the latest operation. At most four flags show their text; an older event keeps its line only.
+- The newest column is the live head: a white dot with a glow, and a ring that expands from 4 px to 14 px and fades in 1.6 s. The ring is a continuous effect (§6).
+- The sample matrix is below the curve: one row for each series (disk used, swap used, memory pressure). A row is 4 dots high. A column shows 1 to 4 dots: the quarter of the value in the range of that row, or 1, 2, and 4 dots for Normal, Warning, and Critical. A row with one value in its range shows 1 dot in each column.
+- A column whose reading has a pressure state that is not normal is picked out: its dots use `warning` or `negative` in each row. The other columns use the row color at 60%.
+- The top strip is the change count: 0 to 3 dots for the number of series with a value larger than in the reading before.
+- The caption states the scale: "1 column = 1 reading".
+
+**Cell ring.** The ring layout of a storage chart: four concentric rings of dots with radii from 66 to 84 px, and 120 angular steps. A segment covers the steps of its share on the four rings, with a gap of one step. Free space shows each second dot empty. The center shows the used value. Focus dims the other segments by the rule of the LED matrix.
+
 ### Components
 
 | Component | Use in Svalnir |
 | --- | --- |
+| **Headroom dial** | Disk, swap, and memory pressure as three rings of dots with the nearest limit picked out. The first card of the Overview |
+| **Session chart** | The available space of the startup volume since the window opened, with event flags and a live head, over a sample matrix of disk, swap, and pressure |
 | **Capacity grid** | Volume capacity as 100 cells at 1% each, filled by category. The warning and critical zones of the disk policy are tinted cells at the end. The inline variant is one row of 20 cells |
 | **Cell band** | One horizontal band of cells, split into category segments. The default storage summary |
 | **Cell ring, columns, tiles** | Alternative layouts of the same data: share of the volume, comparison between categories, and a treemap. All use one data model and one legend |
@@ -274,6 +304,8 @@ An element exits faster than it enters. An action from the keyboard skips the sl
 | **Expand** | A card grows in position to show a breakdown. The other cards move; they do not jump |
 | **Peak marker** | A thin line stays at the maximum of a column and then falls to the current value |
 | **Idle field** | Sparse points fade in and out in the empty area of a cell chart |
+| **Ring sweep** | When a dial or a cell ring enters, each ring fills clockwise from the top to its measured value in `slow`, with 80 ms between rings. A new reading moves the head to the new value in 250 ms |
+| **Live head** | The newest column of the session chart has a ring that expands and fades. A new reading moves each column one step to the left in one frame; the head stays at the right |
 
 ### Limits
 
@@ -281,7 +313,7 @@ An element exits faster than it enters. An action from the keyboard skips the sl
 - Progress shows completed steps. If the total is not known, use an indeterminate state: the head cell and the elapsed time.
 - An animation does not suggest that an operation can be reversed. A removal has no reverse animation.
 - The idle field and other continuous effects run only in a visible, active window. They stop when the system reports memory pressure, when Low Power Mode is on, and when an incident is open.
-- With Reduce Motion on, replace movement with a 150 ms opacity change, apply fills in one step, and turn off the idle field, the particle effect, and the peak marker.
+- With Reduce Motion on, replace movement with a 150 ms opacity change, apply fills in one step, and turn off the idle field, the particle effect, the peak marker, the ring sweep, and the ring of the live head.
 - Limit continuous rendering to the cards on screen. Paint cells as plain quads in one custom element; a chart does not need one view per cell.
 - The interface has no sound.
 
@@ -365,8 +397,8 @@ The component base and the icon set were accepted after that date, with the chan
 
 | Screen | Primary components |
 | --- | --- |
-| Overview | Stat grid, inline capacity grid, tick gauge for memory pressure, last intervention as a phase header |
-| Storage | Cell band or tiles, legend, suggestion footer, approval queue |
+| Overview | Headroom dial, session chart, volume strip, guards, last intervention as a phase header |
+| Storage | Tiles, cell band, columns, or cell ring; legend, suggestion footer, approval queue |
 | Memory | Rate graph with intervention markers, tick gauge, data table of application footprints |
 | Applications | Data table, budget meters, protection controls, dot histogram of the footprint samples of the selected application |
 | Automation | Policy forms, range sliders for thresholds, budget meters, pause control |
@@ -386,9 +418,9 @@ The first client in `crates/svalnir-gui` applies sections 2 to 6 and section 8 t
 | Controls (§4) | The segmented control and the action button are custom. The segmented control estimates the width of an option from its text length |
 | LED matrix (§5) | Built for tiles, band, columns, and the volume strip. The glow turns off for Reduce Transparency, Increase Contrast, and a memory pressure state that is not normal; the client reads the two display settings when its window becomes active. The width of a tile label is an estimate |
 | Storage breakdown (§5, §10) | The resource model defines no storage categories, and the scanner reports none. The Storage screen shows the direct children of the scan root in palette order by size. At the default scan root the chart has the scale of the volume, with the free space and a "Not scanned" segment |
-| Linked focus (§5) | Hover on a legend row dims the other segments. Keyboard focus does not |
-| Charts (§5) | Built: LED tiles, band, and columns, the tick gauge as a line with a head, the history track, the value line, and the legend. Not built: cell ring, budget meter, tick track of an operation, rate graph with interventions, step timeline, stat grid, dot histogram, dot clock |
-| Motion (§6) | Built: scan fill with a head, rolling number, fill-in of a finished chart, idle field in the free region, card entry, sliding pill. Not built: removal, phase header, outcome line, range change, expand, peak marker |
+| Linked focus (§5) | Hover on a legend row dims the other segments, in the tiles, band, columns, and ring layouts, and picks a ring of the headroom dial. Keyboard focus does not; a click on a dial row picks its ring |
+| Charts (§5) | Built: LED tiles, band, and columns; the headroom dial; the session chart; the cell ring; the history track label of the pressure row; the legend. The tick gauge, the value line, and the sparkline were removed from the Overview. Differences: the radial marker of the dial is painted as eight small squares along the radius; the dots of the cell ring are 3 px, because the inner ring has 3.45 px between two steps; a segment of the cell ring is selected through a 24 px hit area at its middle; the session chart has no row names beside the rows, a caption lists them; a curve of one value shows its dot in the middle row. Not built: budget meter, tick track of an operation, rate graph with interventions, step timeline, stat grid, dot histogram, dot clock |
+| Motion (§6) | Built: scan fill with a head, rolling number, fill-in of a finished chart, idle field in the free region, card entry, sliding pill, the ring sweep of the dial (with each entry of the Overview cards) and of the cell ring, the ring of the live head (it follows the twinkle tick at about 12 Hz and stops with the other continuous effects). Not built: the move of a ring head to a new reading in 250 ms, removal, phase header, outcome line, range change, expand, peak marker |
 | History (§5) | The history track and the value line show the readings of this window since it opened, at most 180. The client reads no stored samples |
 | Screens (§11) | Overview and Storage are built without a state-changing action. The other five screens show a placeholder. No menu bar item exists |
 | Accessibility (§9) | Each chart has a text label and each state has text. Increase Contrast, Reduce Transparency, and a screen reader are not checked |

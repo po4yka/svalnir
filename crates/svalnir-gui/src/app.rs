@@ -12,6 +12,7 @@ use crate::{
         window::MainWindow,
     },
     theme::{apply, fonts},
+    viz::storage_layouts::StorageLayout,
 };
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Entity, Pixels, WindowAppearance, WindowBounds,
@@ -33,6 +34,8 @@ Options:
   --screen NAME        Open on a screen (overview, storage, memory,
                        applications, automation, history, diagnostics)
   --size WxH           Set the window size in points, for example 1120x720
+  --layout NAME        Open the folder chart of Storage in a layout
+                       (tiles, band, columns, ring)
   --scan PATH          Start a size scan of the directory PATH at launch.
                        The scan reads sizes only
   --help               Print this text
@@ -71,6 +74,8 @@ pub struct LaunchOptions {
     pub screen: Option<Screen>,
     /// The directory of a scan that starts at launch.
     pub scan: Option<PathBuf>,
+    /// The layout of the folder chart; `None` is the default layout.
+    pub layout: Option<StorageLayout>,
     /// The window size in points; `None` is the default size.
     pub size: Option<(u16, u16)>,
     /// Whether `--help` was given.
@@ -137,6 +142,17 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                         .ok_or_else(|| {
                             format!("`--size` needs WxH of 720x480 or more, not `{text}`")
                         })?,
+                );
+            }
+            "--layout" => {
+                let name: String = args
+                    .next()
+                    .ok_or_else(|| "`--layout` needs a name".to_owned())?;
+                options.layout = Some(
+                    StorageLayout::ALL
+                        .into_iter()
+                        .find(|layout| layout.name().eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| format!("unknown layout `{name}`"))?,
                 );
             }
             "--scan" => {
@@ -240,6 +256,9 @@ pub fn run() -> ExitCode {
             if let Some(screen) = options.screen {
                 view.update(cx, |view, cx| view.select(screen, cx));
             }
+            if let Some(layout) = options.layout {
+                view.update(cx, |view, cx| view.set_storage_layout(layout, cx));
+            }
             if let Some(root) = &options.scan {
                 let model: Entity<AppModel> = view.read(cx).model().clone();
                 model.update(cx, |model, cx| model.start_scan(root, cx));
@@ -278,6 +297,8 @@ mod tests {
             "/tmp/a",
             "--size",
             "1200x900",
+            "--layout",
+            "ring",
             "--help",
         ]);
         assert_eq!(
@@ -289,6 +310,7 @@ mod tests {
                 screen: Some(Screen::Storage),
                 scan: Some(PathBuf::from("/tmp/a")),
                 size: Some((1200, 900)),
+                layout: Some(StorageLayout::Ring),
                 help: true,
             })
         );
@@ -307,5 +329,6 @@ mod tests {
         assert!(parse(&["--scan"]).is_err());
         assert!(parse(&["--size", "100x100"]).is_err());
         assert!(parse(&["--size", "wide"]).is_err());
+        assert!(parse(&["--layout", "spiral"]).is_err());
     }
 }

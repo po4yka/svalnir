@@ -162,3 +162,62 @@ fn the_tick_track_counts_a_sample_per_refresh(cx: &mut TestAppContext) {
     let first = label(handle, "pressure-track", cx).expect("tick track");
     assert!(first.contains("1 warning"), "{first}");
 }
+
+#[gpui_kit::test]
+fn the_dial_states_the_three_values_in_words(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    let dial = label(handle, "headroom-dial", cx).expect("dial label");
+    assert!(dial.contains("Disk: "), "{dial}");
+    assert!(dial.contains("Swap: "), "{dial}");
+    assert!(dial.contains("Memory pressure: Normal"), "{dial}");
+    assert!(label(handle, "dial-row-disk", cx).is_some());
+    assert!(label(handle, "dial-row-swap", cx).is_some());
+    assert!(label(handle, "dial-row-pressure", cx).is_some());
+}
+
+#[gpui_kit::test]
+fn the_dial_follows_the_pressure_state(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Pressure, cx);
+    let dial = label(handle, "headroom-dial", cx).expect("dial label");
+    assert!(dial.contains("Memory pressure: Warning"), "{dial}");
+    assert_eq!(
+        label(handle, "dial-center-value", cx).as_deref(),
+        Some("Warning"),
+        "the pressure ring is picked"
+    );
+}
+
+#[gpui_kit::test]
+fn an_unavailable_dial_has_dashes_and_no_zero(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Unavailable, cx);
+    let dial = label(handle, "headroom-dial", cx).expect("dial label");
+    assert!(dial.contains('\u{2014}'), "{dial}");
+    assert!(!dial.contains("0 B"), "{dial}");
+    let row = label(handle, "dial-row-disk", cx).expect("disk row");
+    assert!(row.contains('\u{2014}') && !row.contains("0 B"), "{row}");
+}
+
+#[gpui_kit::test]
+fn the_session_chart_counts_one_reading_then_two(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Healthy, cx);
+    let first = label(handle, "session-chart", cx).expect("session chart");
+    assert!(first.contains("1 reading,"), "{first}");
+    assert_eq!(
+        label(handle, "session-scale", cx).as_deref(),
+        Some("1 column = 1 reading")
+    );
+    cx.update_window(handle, |_, window, cx| window.press("cmd-r", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let second = label(handle, "session-chart", cx).expect("session chart");
+    assert!(second.contains("2 readings"), "{second}");
+    assert!(second.contains("2 normal"), "{second}");
+}
+
+#[gpui_kit::test]
+fn an_unavailable_session_has_no_range_and_no_zero(cx: &mut TestAppContext) {
+    let handle = open(FixtureScenario::Unavailable, cx);
+    let chart = label(handle, "session-chart", cx).expect("session chart");
+    assert!(chart.contains('\u{2014}'), "{chart}");
+    assert!(!chart.contains("0 B"), "{chart}");
+}

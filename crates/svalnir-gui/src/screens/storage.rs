@@ -27,6 +27,8 @@ use crate::{
     viz::{
         breakdown::{DEFAULT_SEGMENTS, Segment, breakdown},
         capacity_grid::CapacityGrid,
+        cell_ring::{CellRing, STEPS},
+        dial::sweep_total,
         led::{FillAxis, LedChart, LedField, LedHead, LedSegment, TileLabel},
         storage_layouts::{
             BAND_ROWS, CHART_ROWS, ChartItem, STRIP_ROWS, StorageLayout, apply_focus,
@@ -545,6 +547,37 @@ impl StorageScreen {
         }
     }
 
+    /// The progress of the entry sweep of the ring layout, or `None` for the
+    /// final state (Reduce Motion, or the sweep is over).
+    fn ring_sweep(
+        &mut self,
+        summary: &ScanSummary,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<f32> {
+        let key = FillKey {
+            finished_at: summary.finished_at,
+            root: summary.root.clone(),
+            layout: self.layout,
+            metric: self.metric,
+        };
+        let now: Instant = self.clock.now();
+        if self.fill_key.as_ref() != Some(&key) {
+            self.fill_key = Some(key);
+            self.fill_start = now;
+        }
+        if !self.gate(window, cx).transitions() {
+            return None;
+        }
+        let total: Duration = sweep_total(4);
+        let elapsed: Duration = now.saturating_duration_since(self.fill_start);
+        if elapsed >= total {
+            return None;
+        }
+        window.request_animation_frame();
+        Some(elapsed.as_secs_f32() / total.as_secs_f32())
+    }
+
     fn metric_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let metrics: [(&'static str, &'static str, SizeMetric); 2] = [
@@ -573,12 +606,21 @@ impl StorageScreen {
         .into_any_element()
     }
 
+    /// Selects the layout of the folder chart.
+    pub fn set_layout(&mut self, layout: StorageLayout, cx: &mut Context<Self>) {
+        if self.layout != layout {
+            self.layout = layout;
+            cx.notify();
+        }
+    }
+
     fn layout_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
-        let layouts: [(&'static str, StorageLayout); 3] = [
+        let layouts: [(&'static str, StorageLayout); 4] = [
             ("layout-tiles", StorageLayout::Tiles),
             ("layout-band", StorageLayout::Band),
             ("layout-columns", StorageLayout::Columns),
+            ("layout-ring", StorageLayout::Ring),
         ];
         let active: usize = layouts.iter().position(|l| l.1 == self.layout).unwrap_or(0);
         let entity = cx.entity();
@@ -898,7 +940,41 @@ impl StorageScreen {
             CHART_ROWS
         };
         let chart: AnyElement = if total_items == 0 {
+            self.twinkle = None;
             caption("storage-band-scale", scale_caption(0, 0), tokens)
+        } else if self.layout == StorageLayout::Ring {
+            // The ring has no idle field, so the twinkle timer stops.
+            self.twinkle = None;
+            let sweep: Option<f32> = self.ring_sweep(summary, window, cx);
+            let label: String =
+                chart_label(self.layout, &summary.root.display().to_string(), &items);
+            let chart_open = Rc::clone(&open);
+            let (used_text, used_unit) = format_bytes(total_items);
+            // Round up: a step of a chart that has bytes is not 0 B.
+            let step_bytes: u64 = total_items
+                .saturating_add(free_bytes.unwrap_or(0))
+                .div_ceil(u64::try_from(STEPS).unwrap_or(1).max(1));
+            let (step_text, step_unit) = format_bytes(step_bytes);
+            v_flex()
+                .gap(px(8.0))
+                .child(
+                    CellRing::new(
+                        items.clone(),
+                        free_bytes,
+                        "storage-band",
+                        label,
+                        (format!("{used_text} {used_unit}"), "used".to_owned()),
+                    )
+                    .focus(self.focused)
+                    .sweep(sweep)
+                    .on_select(move |index, _, app| chart_open(index, app)),
+                )
+                .child(caption(
+                    "storage-band-scale",
+                    format!("1 step = {step_text} {step_unit}"),
+                    tokens,
+                ))
+                .into_any_element()
         } else {
             let (mut field, labels): (LedField, Vec<TileLabel>) = layout_field(
                 &items,

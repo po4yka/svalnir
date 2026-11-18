@@ -1,11 +1,11 @@
-//! The Overview screen: disk headroom, memory pressure, swap, the agent, the
-//! policies, and the latest intervention.
+//! The Overview screen: the headroom dial, the session chart, the startup
+//! volume, the agent, the policies, and the latest intervention.
 
 use crate::{
     data::{
         model::{
             AgentSnapshot, AgentState, GuardState, HostSample, HostSnapshot, Loadable, Measured,
-            OperationPhase, PressureLevel, ServiceSnapshot,
+            OperationPhase, OperationRow, PressureLevel, ServiceSnapshot,
         },
         store::AppModel,
     },
@@ -25,10 +25,9 @@ use crate::{
     viz::{
         alloc::count_f32,
         capacity_grid::{capacity_label, known_capacity},
+        dial::{DialLegend, DialModel, HeadroomDial, dial_model, sweep_total},
         led::{LedChart, LedField, LedSegment},
-        spark::{Sparkline, level_changes},
-        tick_gauge::{PRESSURE_TICKS, PressureTone, TickGauge, pressure_gauge},
-        tick_track::{TRACK_TICKS, TickTrack, track_states},
+        session::{SessionChart, live_progress, session_model},
         treemap::CellRect,
     },
 };
@@ -46,6 +45,10 @@ use std::{
 };
 
 const MIN_CARD_WIDTH: f32 = 320.0;
+/// The width of the dial card when it shares a row with the session chart.
+const DIAL_CARD_WIDTH: f32 = 520.0;
+/// The least content width at which the two cards share a row.
+const PAIR_MIN_WIDTH: f32 = 980.0;
 /// The sidebar width at full size and collapsed, and the content padding.
 const SIDEBAR_FULL: f32 = 256.0;
 const SIDEBAR_COLLAPSED: f32 = 49.0;
@@ -126,7 +129,8 @@ enum View {
 pub struct OverviewScreen {
     model: Entity<AppModel>,
     roll_disk: Entity<RollingNumber>,
-    roll_swap: Entity<RollingNumber>,
+    dial_pick: Option<usize>,
+    sweep_start: Option<Instant>,
     activation: u64,
     phase: f32,
     last_render: Instant,
@@ -140,7 +144,8 @@ impl OverviewScreen {
         Self {
             model,
             roll_disk: RollingNumber::new("disk-value-roll", cx),
-            roll_swap: RollingNumber::new("swap-value-roll", cx),
+            dial_pick: None,
+            sweep_start: None,
             activation: 1,
             phase: 0.0,
             last_render: Instant::now(),
@@ -178,6 +183,8 @@ impl OverviewScreen {
     /// Marks a new activation of the screen: the cards enter again.
     pub fn activate(&mut self, cx: &mut Context<Self>) {
         self.activation += 1;
+        // The dial sweeps again with the entry of the cards.
+        self.sweep_start = None;
         cx.notify();
     }
 }
@@ -228,14 +235,6 @@ fn card(header: ShellHeader, body: impl IntoElement) -> AnyElement {
         .child(header)
         .child(Panel::new().child(v_flex().gap(px(12.0)).child(body)))
         .into_any_element()
-}
-
-fn tone_color(tone: PressureTone, tokens: &Tokens) -> Hsla {
-    to_hsla(match tone {
-        PressureTone::Positive => tokens.positive,
-        PressureTone::Warning => tokens.warning,
-        PressureTone::Negative => tokens.negative,
-    })
 }
 
 /// The LED field of the hero chart: the used capacity as one `brand`
@@ -356,43 +355,52 @@ fn hero_card(
     card(header, body)
 }
 
-fn pressure_card(view: &View, history: &[HostSample], tokens: &Tokens) -> AnyElement {
-    let mut header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Memory pressure");
+/// The Headroom card: the dial, its legend, and the provenance line.
+fn headroom_card(
+    view: &View,
+    pick: Option<usize>,
+    sweep: Option<f32>,
+    on_pick: impl Fn(Option<usize>, &mut Window, &mut gpui_kit::App) + 'static,
+    tokens: &Tokens,
+) -> AnyElement {
+    let header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Headroom");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
-        View::Failed(reason) => unavailable_body("pressure-value", reason, tokens),
+        View::Failed(reason) => unavailable_body("headroom-value", reason, tokens),
         View::Data { host, stale } => {
-            let (text, tone) = pressure_pill(&host.pressure);
-            header = header.aside(StatusPill::new(text, tone).id("pressure-pill"));
-            let gauge: Option<(usize, PressureTone)> =
-                pressure_gauge(&host.pressure, PRESSURE_TICKS);
-            let mut tick_gauge: TickGauge = TickGauge::new(gauge.map(|g| g.0), PRESSURE_TICKS)
-                .id("pressure-gauge")
-                .label(format!("Memory pressure: {text}"))
-                .threshold(PRESSURE_TICKS / 3, "Warning")
-                .threshold(PRESSURE_TICKS * 2 / 3, "Critical");
-            if let Some((_, tone)) = gauge {
-                tick_gauge = tick_gauge.tone(tone_color(tone, tokens));
-            }
-            let note: String = match &host.pressure {
-                Measured::Unavailable(reason) => reason.clone(),
-                Measured::Value(_) => {
-                    "System memory pressure state, as macOS reports it.".to_owned()
-                }
-            };
+            let model: DialModel = dial_model(host);
+            let pill: (&'static str, Tone) = pressure_pill(&host.pressure);
             v_flex()
                 .gap(px(12.0))
-                .child(tick_gauge)
-                .child(TickTrack::new(
-                    "pressure-track",
-                    track_states(history.iter(), TRACK_TICKS),
-                    history.len(),
-                ))
-                .child(caption("pressure-caption", note, tokens))
-                .children(stale.then(|| caption("pressure-stale", stale_caption(host), tokens)))
                 .child(
-                    ProvenanceLine::new(host.source, host.captured_at, "host memory")
-                        .id("pressure-provenance"),
+                    h_flex()
+                        .flex_wrap()
+                        .items_start()
+                        .gap(px(24.0))
+                        .child(
+                            HeadroomDial::new(model.clone())
+                                .picked(pick)
+                                .sweep(sweep)
+                                .muted(*stale),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(240.0))
+                                .gap(px(12.0))
+                                .child(DialLegend::new(model, pill).muted(*stale).on_pick(on_pick))
+                                .children(stale.then(|| {
+                                    caption("headroom-stale", stale_caption(host), tokens)
+                                }))
+                                .child(
+                                    ProvenanceLine::new(
+                                        host.source,
+                                        host.captured_at,
+                                        "startup volume and host memory",
+                                    )
+                                    .id("headroom-provenance"),
+                                ),
+                        ),
                 )
                 .into_any_element()
         }
@@ -400,89 +408,43 @@ fn pressure_card(view: &View, history: &[HostSample], tokens: &Tokens) -> AnyEle
     card(header, body)
 }
 
-fn swap_spark(host: &HostSnapshot, history: &[HostSample], tokens: &Tokens) -> AnyElement {
-    let values: Vec<Option<u64>> = history
-        .iter()
-        .map(|s| match &s.swap_used {
-            Measured::Value(v) => Some(*v),
-            Measured::Unavailable(_) => None,
-        })
-        .collect();
-    if values.iter().flatten().count() < 2 {
-        return caption("swap-spark-note", "Collecting samples\u{2026}", tokens);
-    }
-    let largest: u64 = values.iter().flatten().copied().max().unwrap_or(0);
-    let max: u64 = match &host.swap_total {
-        Measured::Value(total) => (*total).max(largest),
-        Measured::Unavailable(_) => largest,
-    }
-    .max(1);
-    let (text, unit) = format_bytes(max);
-    v_flex()
-        .gap(px(6.0))
-        .child(
-            div()
-                .id("swap-spark")
-                .test_support()
-                .aria_label(format!("Swap in use over {} samples", values.len()))
-                .child(Sparkline::new(
-                    values,
-                    max,
-                    level_changes(history),
-                    to_hsla(tokens.brand),
-                )),
-        )
-        .child(caption(
-            "swap-spark-scale",
-            format!("0 \u{2013} {text} {unit}"),
-            tokens,
-        ))
-        .into_any_element()
+/// The columns of the session chart that fit `width` pixels.
+#[must_use]
+pub fn session_slots(width: f32) -> usize {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is clamped to 1..=180 first"
+    )]
+    let slots: usize = ((width + 1.5) / 6.0).floor().clamp(1.0, 180.0) as usize;
+    slots
 }
 
-fn swap_card(
+/// The This session card: the session chart of the readings of this window.
+fn session_card(
     view: &View,
     history: &[HostSample],
-    roll: &Entity<RollingNumber>,
+    operation: Option<&OperationRow>,
+    width: f32,
+    live: Option<f32>,
     tokens: &Tokens,
 ) -> AnyElement {
-    let header: ShellHeader = ShellHeader::new(IconName::MemoryStick, "Swap");
+    let header: ShellHeader = ShellHeader::new(IconName::HardDrive, "This session")
+        .subtitle("Readings since this window opened");
     let body: AnyElement = match view {
         View::Loading => skeleton_value(),
-        View::Failed(reason) => unavailable_body("swap-value", reason, tokens),
+        View::Failed(reason) => unavailable_body("session-value", reason, tokens),
         View::Data { host, stale } => {
-            let value: DisplayValue = match &host.swap_used {
-                Measured::Value(used) => {
-                    let (text, unit) = format_bytes(*used);
-                    let value: DisplayValue = DisplayValue::new(text, unit)
-                        .id("swap-value")
-                        .rolling(roll.clone())
-                        .muted(*stale);
-                    match &host.swap_total {
-                        Measured::Value(total) => {
-                            let (total_text, total_unit) = format_bytes(*total);
-                            value.context(format!("of {total_text} {total_unit} allocated"))
-                        }
-                        Measured::Unavailable(_) => value,
-                    }
-                }
-                Measured::Unavailable(reason) => {
-                    DisplayValue::unavailable(reason.clone()).id("swap-value")
-                }
-            };
+            // The card, panel, and inset take 72 px of the width.
+            let slots: usize = session_slots((width - 72.0).max(0.0));
+            let model = session_model(history, operation, slots);
             v_flex()
                 .gap(px(12.0))
-                .child(value)
-                .child(swap_spark(host, history, tokens))
-                .child(caption(
-                    "swap-caption",
-                    "Swap in use. Nonzero swap alone is not a problem.",
-                    tokens,
-                ))
-                .children(stale.then(|| caption("swap-stale", stale_caption(host), tokens)))
+                .child(SessionChart::new(model).live(live).muted(*stale))
+                .children(stale.then(|| caption("session-stale", stale_caption(host), tokens)))
                 .child(
-                    ProvenanceLine::new(host.source, host.captured_at, "host memory")
-                        .id("swap-provenance"),
+                    ProvenanceLine::new(host.source, host.captured_at, "host readings")
+                        .id("session-provenance"),
                 )
                 .into_any_element()
         }
@@ -705,6 +667,7 @@ fn intervention_card(
 }
 
 impl Render for OverviewScreen {
+    #[expect(clippy::too_many_lines, reason = "one build of the screen")]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let model: &AppModel = self.model.read(cx);
@@ -738,6 +701,27 @@ impl Render for OverviewScreen {
             None
         };
         let mono: SharedString = cx.theme().mono_font_family.clone();
+        let live: Option<f32> = gate.continuous().then(|| live_progress(self.phase));
+        // The ring sweep runs once, when the screen first shows data.
+        let sweep: Option<f32> = if matches!(view, View::Data { .. }) {
+            // The start is set also with Reduce Motion on, so a later change
+            // of that setting does not replay the sweep.
+            let start: Instant = *self.sweep_start.get_or_insert_with(Instant::now);
+            let total = sweep_total(3);
+            let elapsed = start.elapsed();
+            if gate.transitions() && elapsed < total {
+                window.request_animation_frame();
+                Some(elapsed.as_secs_f32() / total.as_secs_f32())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let operation: Option<OperationRow> = service
+            .value()
+            .and_then(|snapshot| snapshot.latest_operation.clone());
+        let this: Entity<Self> = cx.entity();
 
         let viewport: f32 = window.viewport_size().width.into();
         let sidebar: f32 = if viewport < 900.0 {
@@ -754,7 +738,36 @@ impl Render for OverviewScreen {
 
         let glow_on: bool = crate::theme::glow::enabled(cx);
         let full_width: Pixels = px(content.max(MIN_CARD_WIDTH));
+        // On a wide window the dial and the session chart share one row.
+        let paired: bool = content >= PAIR_MIN_WIDTH;
+        let (dial_width, session_width): (f32, f32) = if paired {
+            (DIAL_CARD_WIDTH, content - gap - DIAL_CARD_WIDTH)
+        } else {
+            (content.max(MIN_CARD_WIDTH), content.max(MIN_CARD_WIDTH))
+        };
         let cards: Vec<AnyElement> = vec![
+            headroom_card(
+                &view,
+                self.dial_pick,
+                sweep,
+                move |index, _, app| {
+                    this.update(app, |screen, cx| {
+                        if screen.dial_pick != index {
+                            screen.dial_pick = index;
+                            cx.notify();
+                        }
+                    });
+                },
+                tokens,
+            ),
+            session_card(
+                &view,
+                &history,
+                operation.as_ref(),
+                session_width,
+                live,
+                tokens,
+            ),
             hero_card(
                 phase,
                 &view,
@@ -763,8 +776,6 @@ impl Render for OverviewScreen {
                 content.max(MIN_CARD_WIDTH),
                 &mono,
             ),
-            pressure_card(&view, &history, tokens),
-            swap_card(&view, &history, &self.roll_swap, tokens),
             agent_card(&agent, glow_on, tokens),
             policies_card(&service, &mono, glow_on, tokens),
             intervention_card(&service, &mono, tokens),
@@ -793,7 +804,12 @@ impl Render for OverviewScreen {
             .child(div().flex().flex_wrap().gap(tokens::GRID_GAP).children(
                 cards.into_iter().enumerate().map(|(index, card)| {
                     div()
-                        .w(if index == 0 { full_width } else { card_width })
+                        .w(match index {
+                            0 => px(dial_width),
+                            1 => px(session_width),
+                            2 => full_width,
+                            _ => card_width,
+                        })
                         .min_w(px(MIN_CARD_WIDTH))
                         .flex_shrink_0()
                         .child(card)

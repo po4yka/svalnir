@@ -45,6 +45,8 @@ pub struct HostSample {
     pub swap_used: Measured<u64>,
     /// The available capacity of the startup volume.
     pub disk_available: Measured<u64>,
+    /// The used capacity of the startup volume: total minus available.
+    pub disk_used: Measured<u64>,
 }
 
 impl HostSample {
@@ -56,6 +58,7 @@ impl HostSample {
             pressure: host.pressure.clone(),
             swap_used: host.swap_used.clone(),
             disk_available: host.disk_available.clone(),
+            disk_used: crate::ui::data_state::used_capacity(&host.disk_total, &host.disk_available),
         }
     }
 }
@@ -85,6 +88,7 @@ mod history_tests {
                 pressure: Measured::Value(PressureLevel::Normal),
                 swap_used: Measured::Value(n),
                 disk_available: Measured::Unavailable("x".into()),
+                disk_used: Measured::Unavailable("x".into()),
             };
             push_bounded(&mut history, sample, 3);
         }

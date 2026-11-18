@@ -149,7 +149,16 @@ impl ProbeSubject {
 /// The account home directory of the effective user ID.
 #[cfg(target_os = "macos")]
 fn account_home_lookup() -> Result<PathBuf, String> {
-    native::account_home().map_err(|error| format!("getpwuid_r: {error}"))
+    use crate::platform::account::{AccountSource as _, PasswordDatabase};
+
+    match PasswordDatabase.home_directory() {
+        Ok(Some(home)) => Ok(home),
+        Ok(None) => Err(
+            "getpwuid_r: the account database has no entry with a home directory for the user ID"
+                .to_owned(),
+        ),
+        Err(error) => Err(format!("getpwuid_r: {error}")),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -696,7 +705,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_account_home_is_an_absolute_path() {
-        let home = native::account_home().unwrap();
+        let home = account_home_lookup().unwrap();
         assert!(home.is_absolute());
     }
 

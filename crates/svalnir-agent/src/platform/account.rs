@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 pub const TEST_ACCOUNT_HOME_VARIABLE: &str = "SVALNIR_TEST_ACCOUNT_HOME";
 
 /// The largest buffer for one account record, in bytes.
-const MAX_RECORD_BUFFER: usize = 1024 * 1024;
+const MAX_RECORD_BUFFER: usize = 64 * 1024;
 
 /// The first buffer for one account record, in bytes.
 const INITIAL_RECORD_BUFFER: usize = 1024;

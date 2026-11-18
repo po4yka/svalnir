@@ -7,8 +7,6 @@
 use std::ffi::CStr;
 use std::io;
 use std::mem::{MaybeUninit, size_of};
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 use std::ptr;
 
 use super::probe::SourceFinding;
@@ -196,67 +194,5 @@ pub(super) fn own_process() -> SourceFinding {
         SourceFinding::Failed {
             detail: format!("The query returned {written} bytes, not {size}."),
         }
-    }
-}
-
-/// The largest buffer that [`account_home`] gives to `getpwuid_r`.
-const MAX_PASSWD_BUFFER: usize = 64 * 1024;
-
-/// The home directory that the account database records for the effective
-/// user ID of this process. The `HOME` variable does not change it.
-pub(super) fn account_home() -> io::Result<PathBuf> {
-    // SAFETY: `geteuid` has no argument, no failure mode, and no effect.
-    let uid = unsafe { libc::geteuid() };
-    let mut buffer: Vec<u8> = vec![0; 1024];
-    loop {
-        let mut record = MaybeUninit::<libc::passwd>::zeroed();
-        let mut found: *mut libc::passwd = ptr::null_mut();
-        // SAFETY: `record` is valid for a write of one `passwd`. `buffer` is
-        // valid for writes of `buffer.len()` bytes, and `getpwuid_r` writes
-        // no more. `found` is a live pointer slot. The call reads the account
-        // database and changes no state.
-        let code = unsafe {
-            libc::getpwuid_r(
-                uid,
-                record.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &raw mut found,
-            )
-        };
-        if code == libc::ERANGE && buffer.len() < MAX_PASSWD_BUFFER {
-            let doubled: usize = buffer.len().saturating_mul(2).min(MAX_PASSWD_BUFFER);
-            buffer = vec![0; doubled];
-            continue;
-        }
-        if code != 0 {
-            return Err(io::Error::from_raw_os_error(code));
-        }
-        if found.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "the account database has no entry for the user ID",
-            ));
-        }
-        // SAFETY: `getpwuid_r` returned 0 and a non-null `found`, so it
-        // initialized `record`.
-        let record = unsafe { record.assume_init_ref() };
-        if record.pw_dir.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the account entry has no home directory",
-            ));
-        }
-        // SAFETY: `pw_dir` is non-null and points to a NUL-terminated string
-        // in `buffer`, which lives until the end of this iteration; the bytes
-        // are copied before that.
-        let bytes: &[u8] = unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes();
-        if bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the account entry has an empty home directory",
-            ));
-        }
-        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
     }
 }

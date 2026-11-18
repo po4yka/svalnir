@@ -136,6 +136,13 @@ pub enum NativeResult {
     Refused,
     /// The call was, or possibly was, issued and its result is not known.
     Unavailable,
+    /// No call was issued for this member of an application target: the
+    /// request to the application covers it. The record of the member has
+    /// the dispatch state `submitted`, because the request to its
+    /// application was submitted. Only a result of one member has this
+    /// value. A build that does not know the value reads it as
+    /// `Unrecognized`.
+    CoveredByApplicationRequest,
     /// A result kind that this build does not recognize.
     #[serde(other)]
     Unrecognized,
@@ -321,6 +328,20 @@ impl Check for TargetResultRecord {
             _ => called && (!has_trash_item || matches!(self.effect, TargetEffect::Trashed)),
         };
         if !evidence_agrees {
+            return Err(OutcomeError::Evidence);
+        }
+        // A covered member is one member of an application target whose
+        // application got the request. The value is not possible for a
+        // whole target, for a file effect, or for a call that possibly was
+        // not submitted.
+        let is_covered: bool = matches!(
+            self.evidence.native,
+            NativeResult::CoveredByApplicationRequest
+        );
+        let covered_agrees: bool = self.member.is_some()
+            && matches!(self.dispatch, Submitted)
+            && !matches!(self.effect, TargetEffect::Trashed | TargetEffect::Removed);
+        if is_covered && !covered_agrees {
             return Err(OutcomeError::Evidence);
         }
         Ok(())

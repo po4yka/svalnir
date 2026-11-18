@@ -10,10 +10,10 @@ use super::{
 };
 use crate::action::{
     ActionClass, BudgetScope, Checked, ClientRole, DispatchState, Durability, EnvelopeContent,
-    EnvelopeError, ErrorFamily, Escalation, LeaseResource, Operation, OperationError, OutcomeError,
-    PlanContent, PlanError, PlanTarget, RecordingMode, ResourceLease, ScopedAllowance, StepState,
-    StopReason, TargetBinding, TargetEffect, TargetResult, TargetResultRecord, TriggerClass,
-    WorkAllowance,
+    EnvelopeError, ErrorFamily, Escalation, LeaseResource, NativeResult, Operation, OperationError,
+    OutcomeError, PlanContent, PlanError, PlanTarget, RecordingMode, ResourceLease,
+    ScopedAllowance, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
+    TargetResultRecord, TriggerClass, WorkAllowance,
 };
 use crate::id::{ApplicationInstanceId, ExecutorEpochId, OperationId, ProcessGenerationId, RootId};
 use crate::process::ProcessAssociation;
@@ -506,5 +506,69 @@ fn an_uncertain_submission_does_not_settle_as_a_definite_failure_or_as_no_action
                 Durability::Durable
             )
             .is_ok()
+    );
+}
+
+#[test]
+fn a_covered_member_is_a_submitted_member_result_and_is_not_a_native_call() {
+    let covered = |edit: &dyn Fn(&mut TargetResultRecord)| {
+        let mut record = record("a", TargetEffect::StillRunning);
+        record.member = Some(ProcessGenerationId::new("proc_2").unwrap());
+        record.evidence.native = NativeResult::CoveredByApplicationRequest;
+        edit(&mut record);
+        Checked::new(record).map(|_: TargetResult| ())
+    };
+    // A helper of an application that got the graceful request: no call
+    // was issued for the helper, and the record says so.
+    assert_eq!(covered(&|_| {}), Ok(()));
+    assert_eq!(
+        covered(&|record| {
+            record.effect = TargetEffect::ExitVerified;
+            record.attribution = crate::action::Attribution::Possible;
+            record.stop_reason = StopReason::Completed;
+        }),
+        Ok(())
+    );
+    // The value is for one member only, and only for a submitted request.
+    assert_eq!(
+        covered(&|record| record.member = None),
+        Err(OutcomeError::Evidence)
+    );
+    assert_eq!(
+        covered(&|record| {
+            record.effect = TargetEffect::UnknownOutcome;
+            record.attribution = crate::action::Attribution::Possible;
+            record.dispatch = DispatchState::SubmissionUncertain;
+        }),
+        Err(OutcomeError::Evidence)
+    );
+    assert_eq!(
+        covered(&|record| {
+            record.effect = TargetEffect::Skipped;
+            record.dispatch = DispatchState::NotSubmitted;
+            record.stop_reason = StopReason::Canceled;
+        }),
+        Err(OutcomeError::Evidence)
+    );
+    // A file effect has no application request.
+    assert_eq!(
+        covered(&|record| {
+            record.effect = TargetEffect::Removed;
+            record.attribution = crate::action::Attribution::Established;
+            record.stop_reason = StopReason::Completed;
+        }),
+        Err(OutcomeError::Evidence)
+    );
+
+    // The wire name is stable, and a name that this build does not know is
+    // not read as this value or as a call.
+    assert_eq!(
+        serde_json::to_value(NativeResult::CoveredByApplicationRequest).unwrap(),
+        json!({ "kind": "covered_by_application_request" })
+    );
+    assert_eq!(
+        serde_json::from_value::<NativeResult>(json!({ "kind": "covered_by_job_request" }))
+            .unwrap(),
+        NativeResult::Unrecognized
     );
 }

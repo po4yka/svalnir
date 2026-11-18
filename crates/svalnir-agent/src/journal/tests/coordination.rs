@@ -593,7 +593,7 @@ fn a_request_is_enqueued_one_time_and_claimed_by_one_claimer() {
     );
 
     // A prune removes the completed requests.
-    assert_eq!(client.prune(wall(100), 10).unwrap().requests, 2);
+    assert_eq!(client.prune(wall(100), 10, &[]).unwrap().requests, 2);
     assert_eq!(client.request_status(&first.request_id).unwrap(), None);
 }
 
@@ -731,7 +731,7 @@ fn a_prune_keeps_a_plan_that_an_open_request_names() {
         .enqueue_request(&apply_request("request_1", "plan_1"))
         .unwrap();
 
-    assert_eq!(journal.prune(wall(100), 10).unwrap().unused_plans, 1);
+    assert_eq!(journal.prune(wall(100), 10, &[]).unwrap().unused_plans, 1);
     assert_eq!(journal.plan(&named.plan_id), Ok(Some(named)));
     assert_eq!(journal.plan(&unused.plan_id), Ok(None));
     // The request stays open.

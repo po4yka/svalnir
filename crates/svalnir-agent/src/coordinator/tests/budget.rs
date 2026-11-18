@@ -154,6 +154,44 @@ fn a_restart_does_not_replenish_the_allowance_of_an_incident() {
 }
 
 #[test]
+fn a_prune_and_a_restart_do_not_replenish_the_allowance_of_an_open_incident() {
+    let mut bench = Bench::new();
+    let incident = incident_id("incident_1");
+    bench.authority.open_incident(&incident, bench.clock.now());
+    bench.measurements.0.lock().unwrap().pressure = ["critical", "normal"].into();
+    let mut coordinator = bench.start();
+    let first_epoch = coordinator.executor_epoch().clone();
+    run_plan(&bench, &mut coordinator, &incident, &first_epoch, 4242, 2);
+    // The process stops with no release, so the controller record can be
+    // behind the journal.
+    drop(coordinator);
+
+    // The retention removes the settled operation of the incident. The
+    // incident is open, so its usage row stays.
+    let mut journal = super::support::open_journal(&bench.tree.database);
+    let cutoff = svalnir_core::time::WallTime::from_unix(4_000_000_000, 0).unwrap();
+    let report = journal
+        .prune(cutoff, 16, std::slice::from_ref(&incident))
+        .unwrap();
+    assert_eq!(report.operations, 1);
+    drop(journal);
+
+    // The controller gives the allowance with no usage. The usage row
+    // has the slot of the first operation.
+    let mut coordinator = bench.start();
+    let second = plan_for(&bench, &incident, 4343);
+    let request = || automatic_request(&second, allowance(&incident, &first_epoch, 2));
+    let error = refusal(&mut coordinator, request());
+    assert_eq!(error.code.as_str(), code::COOLDOWN_ACTIVE);
+    assert_eq!(coordinator.remaining_slots(&incident), Some(1));
+    bench.clock.advance(101 * SECOND);
+    let operation_id = admitted(&mut coordinator, request());
+    run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(coordinator.remaining_slots(&incident), Some(0));
+    assert_eq!(bench.host.calls().len(), 2);
+}
+
+#[test]
 fn an_unclean_restart_with_the_volatile_exception_exhausts_the_slots() {
     for clean in [true, false] {
         let mut bench = Bench::with(true, TrashMode::Move);

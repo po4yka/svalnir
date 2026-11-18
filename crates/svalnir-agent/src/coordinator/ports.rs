@@ -25,7 +25,7 @@ use crate::executor::process::{
     ProcessExecutor, StepClock, StepInput, StepRun, StopRequest,
 };
 use crate::journal::{
-    ClaimedRequest, ConsumedDispatch, CoordinationStart, CoordinatorLock, OperationJournal,
+    ClaimedRequest, CoordinationStart, CoordinatorLock, IncidentUsage, OperationJournal,
     OperationJournalError, RecoveryRecord, RequestCompletion, VolatilePersistReport,
     VolatileRecord,
 };
@@ -374,16 +374,16 @@ pub trait CoordinatorJournal: Journal {
     /// Returns the error of the journal.
     fn recovery_records(&self, limit: usize) -> Result<Vec<RecoveryRecord>, OperationJournalError>;
 
-    /// The consumed dispatches of an incident.
+    /// The consumed budget of an incident. See
+    /// [`OperationJournal::incident_usage`].
     ///
     /// # Errors
     ///
     /// Returns the error of the journal.
-    fn consumed_dispatches(
+    fn incident_usage(
         &self,
         incident_id: &IncidentId,
-        limit: usize,
-    ) -> Result<Vec<ConsumedDispatch>, OperationJournalError>;
+    ) -> Result<Option<IncidentUsage>, OperationJournalError>;
 
     /// Claims the oldest queued request.
     ///
@@ -494,12 +494,11 @@ impl CoordinatorJournal for OperationJournal {
         Self::resource_effects(self, operation_id)
     }
 
-    fn consumed_dispatches(
+    fn incident_usage(
         &self,
         incident_id: &IncidentId,
-        limit: usize,
-    ) -> Result<Vec<ConsumedDispatch>, OperationJournalError> {
-        Self::consumed_dispatches(self, incident_id, limit)
+    ) -> Result<Option<IncidentUsage>, OperationJournalError> {
+        Self::incident_usage(self, incident_id)
     }
 
     fn claim_next_request(

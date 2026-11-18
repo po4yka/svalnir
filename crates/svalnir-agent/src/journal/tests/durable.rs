@@ -20,7 +20,7 @@ use svalnir_core::rule::{
     RuleExclusions, RuleMode, RuleOwner, RuleRef,
 };
 
-use super::super::migration::{APPLICATION_ID, MIGRATIONS, Migration};
+use super::super::schema::APPLICATION_ID;
 use super::super::{
     JOURNAL_VERSION, JournalOptions, MAX_REVISION_SOURCE_BYTES, OperationJournal,
     OperationJournalError, RecoveryPosition, SequenceViolation,
@@ -38,7 +38,7 @@ fn pragma(journal: &OperationJournal, name: &str) -> i64 {
         .unwrap()
 }
 
-// Open, settings, and migrations.
+// Open, settings, and versions.
 
 #[test]
 fn the_open_sets_and_verifies_the_writer_settings() {
@@ -135,50 +135,6 @@ fn a_database_that_is_not_a_journal_is_refused() {
         "{error:?}"
     );
     assert_eq!(error.to_journal_error(), JournalError::Corrupt);
-}
-
-#[test]
-fn a_failed_migration_keeps_the_previous_version() {
-    let fixture = Fixture::new();
-    let defective = [
-        MIGRATIONS[0],
-        Migration {
-            version: 2,
-            sql: "CREATE TABLE extra (value TEXT); CREATE TABLE plan (value TEXT);",
-        },
-    ];
-    let error = OperationJournal::open_with_migrations(&fixture.path(), &options(), &defective)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        OperationJournalError::Migration { version: 2, .. }
-    ));
-    // An open with only the first migration reads the version that the
-    // failed step left.
-    let journal =
-        OperationJournal::open_with_migrations(&fixture.path(), &options(), &MIGRATIONS[..1])
-            .unwrap();
-    assert_eq!(journal.version().unwrap(), 1);
-    let extra: i64 = journal
-        .connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'extra'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(extra, 0);
-
-    let out_of_order = [Migration {
-        version: 2,
-        sql: "",
-    }];
-    let error = OperationJournal::open_with_migrations(&fixture.path(), &options(), &out_of_order)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        OperationJournalError::MigrationOrder { version: 2 }
-    ));
 }
 
 // Plans and admission.
@@ -1104,16 +1060,16 @@ fn a_prune_removes_settled_records_and_an_old_request_is_rejected() {
 
     // A cutoff before the records removes nothing.
     assert_eq!(
-        journal.prune(wall(-10), 100).unwrap(),
+        journal.prune(wall(-10), 100, &[]).unwrap(),
         super::super::PruneReport::default()
     );
-    let report = journal.prune(wall(100), 100).unwrap();
+    let report = journal.prune(wall(100), 100, &[]).unwrap();
     assert_eq!(
         (report.operations, report.rejections, report.unused_plans),
         (1, 1, 1)
     );
     assert_eq!(
-        journal.prune(wall(100), 100).unwrap(),
+        journal.prune(wall(100), 100, &[]).unwrap(),
         super::super::PruneReport::default()
     );
 

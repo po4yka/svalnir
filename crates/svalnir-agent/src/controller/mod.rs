@@ -72,8 +72,8 @@ pub use self::model::{
     CONTROLLER_STATUS_VERSION, CandidateSet, ControllerState, ControllerStatus, DiskIncidentRecord,
     Guard, GuardPhase, GuardStatus, Health, IncidentStatus, Intent, MAX_APPLICATION_COOLDOWNS,
     MAX_PREPARED_CANDIDATES, MAX_REPORTS, MAX_STATUS_REASONS, MemoryIncidentRecord, MonotonicMark,
-    Notification, Observations, OpenIncidents, OperationResult, Outstanding, PreparationMode,
-    PreparedCandidate, PriorState, QuietMark, ReduceReason, ReportedCondition, RuleUsage,
-    StepInput, StepOutput, Summary, TriggerKey, TriggerRecord,
+    Notification, Observations, OperationResult, Outstanding, PreparationMode, PreparedCandidate,
+    PriorState, QuietMark, ReduceReason, ReportedCondition, RuleUsage, StepInput, StepOutput,
+    Summary, TriggerKey, TriggerRecord,
 };
 pub use self::step::step;

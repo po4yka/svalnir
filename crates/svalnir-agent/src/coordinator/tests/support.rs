@@ -63,7 +63,7 @@ use crate::executor::process::{
     StepClock,
 };
 use crate::journal::{
-    ClaimedRequest, ConsumedDispatch, CoordinationStart, CoordinatorLock, JournalOptions,
+    ClaimedRequest, CoordinationStart, CoordinatorLock, IncidentUsage, JournalOptions,
     OperationJournal, OperationJournalError, QueuedRequest, RecoveryRecord, RequestBody,
     RequestCompletion, VolatilePersistReport, VolatileRecord,
 };
@@ -1267,12 +1267,11 @@ impl CoordinatorJournal for FailingJournal {
         self.inner.recovery_records(limit)
     }
 
-    fn consumed_dispatches(
+    fn incident_usage(
         &self,
         incident_id: &IncidentId,
-        limit: usize,
-    ) -> Result<Vec<ConsumedDispatch>, OperationJournalError> {
-        self.inner.consumed_dispatches(incident_id, limit)
+    ) -> Result<Option<IncidentUsage>, OperationJournalError> {
+        self.inner.incident_usage(incident_id)
     }
 
     fn record_resource_effects(

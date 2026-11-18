@@ -51,10 +51,6 @@ pub const MAX_MEASURED_VOLUMES: usize = 8;
 /// plans of its unfinished and volatile operations in memory.
 pub const MAX_KNOWN_PLANS: usize = 1024;
 
-/// The largest number of consumed dispatches of one incident that a
-/// restart reads from the journal. A longer list exhausts the budget.
-pub const MAX_INCIDENT_DISPATCHES: usize = 8192;
-
 /// The settings of a coordinator.
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
@@ -853,36 +849,21 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             .reserve_incident(incident_id, total, time.clock.now)
     }
 
-    /// The consumed work of an incident that the journal has.
+    /// The consumed work of an incident that the journal has: its usage
+    /// row, which the consumption of each dispatch changes and which the
+    /// retention keeps while the incident is open.
     fn journal_usage(&self, given: &IncidentAllowance) -> JournalUsage {
-        use svalnir_core::action::Reservation;
-
-        let Ok(dispatches) = self
-            .journal
-            .consumed_dispatches(&given.incident_id, MAX_INCIDENT_DISPATCHES)
-        else {
-            return JournalUsage::Unknown;
-        };
-        if dispatches.len() >= MAX_INCIDENT_DISPATCHES {
-            return JournalUsage::Unknown;
+        match self.journal.incident_usage(&given.incident_id) {
+            Ok(Some(usage)) => JournalUsage::Known {
+                slots: usage.slots,
+                work: usage.work,
+            },
+            Ok(None) => JournalUsage::Known {
+                slots: 0,
+                work: WorkCharge::ZERO,
+            },
+            Err(_) => JournalUsage::Unknown,
         }
-        let mut operations: BTreeSet<&OperationId> = BTreeSet::new();
-        let mut work = WorkCharge::ZERO;
-        for dispatch in &dispatches {
-            match &dispatch.intent.limits.reservation {
-                Reservation::Work { charge } => match work.checked_add(*charge) {
-                    Some(sum) => work = sum,
-                    None => return JournalUsage::Unknown,
-                },
-                Reservation::ApplicationSlot { .. } => {
-                    operations.insert(&dispatch.operation_id);
-                }
-            }
-        }
-        u32::try_from(operations.len()).map_or(JournalUsage::Unknown, |slots| JournalUsage::Known {
-            slots,
-            work,
-        })
     }
 
     /// Reserves, takes the leases, and records the admission.

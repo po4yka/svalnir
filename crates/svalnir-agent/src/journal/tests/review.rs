@@ -144,54 +144,35 @@ fn a_rejection_for_a_digest_that_is_not_the_stored_digest_records_nothing() {
 }
 
 #[test]
-fn a_journal_of_the_second_version_gets_the_table_of_the_third_and_keeps_its_records() {
-    use super::super::migration::MIGRATIONS;
+fn a_journal_of_an_earlier_version_is_refused_and_not_changed() {
     use super::super::{JOURNAL_VERSION, OperationJournal, OperationJournalError};
-    use super::{complete, dispatch, options};
+    use super::options;
 
-    assert_eq!(JOURNAL_VERSION, 3);
     let fixture = Fixture::new();
-    let plan = file_plan("plan_1", 1);
-    // A database that a build of version 2 made, with one settled
-    // operation.
-    let operation_id = {
-        let mut old =
-            OperationJournal::open_with_migrations(&fixture.path(), &options(), &MIGRATIONS[..2])
-                .unwrap();
-        assert_eq!(old.version().unwrap(), 2);
-        let mut operation = admit(&mut old, &plan, "operation_1", "epoch_1");
-        dispatch(&mut old, &plan, &mut operation, "s0");
-        complete(&mut old, &mut operation, "s0", "t0");
-        // Version 2 has no table for the observations.
-        assert!(matches!(
-            old.resource_effects(operation.operation_id()),
-            Err(OperationJournalError::Sqlite(_))
-        ));
-        operation.operation_id().clone()
+    drop(fixture.open());
+    // The journal has no migration: a file of an earlier version, which
+    // has a different schema, is not opened.
+    let raw = rusqlite::Connection::open(fixture.path()).unwrap();
+    raw.pragma_update(None, "user_version", JOURNAL_VERSION - 1)
+        .unwrap();
+    let objects = |raw: &rusqlite::Connection| -> i64 {
+        raw.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap()
     };
+    let before: i64 = objects(&raw);
 
-    // This build migrates the file forward and changes no record.
-    let journal = fixture.open();
-    assert_eq!(journal.version().unwrap(), JOURNAL_VERSION);
-    let stored = journal.operation(&operation_id).unwrap().unwrap();
-    assert_eq!(stored.steps().len(), 1);
-    assert_eq!(journal.plan(&plan.plan_id), Ok(Some(plan)));
-    // An operation of version 2 has no recorded observation.
-    assert_eq!(journal.resource_effects(&operation_id).unwrap(), Vec::new());
-    drop(journal);
-
-    // A build of version 2 refuses the migrated file and does not change
-    // it.
-    let refused =
-        OperationJournal::open_with_migrations(&fixture.path(), &options(), &MIGRATIONS[..2]);
+    let error = OperationJournal::open(&fixture.path(), &options()).unwrap_err();
     assert!(matches!(
-        refused,
-        Err(OperationJournalError::NewerVersion {
-            found: 3,
-            supported: 2
-        })
+        error,
+        OperationJournalError::OlderVersion { found, supported }
+            if found == JOURNAL_VERSION - 1 && supported == JOURNAL_VERSION
     ));
-    assert_eq!(fixture.open().version().unwrap(), JOURNAL_VERSION);
+    assert_eq!(error.to_journal_error(), JournalError::Unavailable);
+    let version: i64 = raw
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, i64::from(JOURNAL_VERSION - 1));
+    assert_eq!(objects(&raw), before);
 }
 
 #[test]
@@ -245,7 +226,7 @@ fn the_observations_of_an_operation_are_recorded_and_go_with_it() {
     assert_eq!(journal.resource_effects(&id).unwrap(), second);
 
     // The retention removes the record with its operation.
-    let report = journal.prune(wall(1_000_000), 16).unwrap();
+    let report = journal.prune(wall(1_000_000), 16, &[]).unwrap();
     assert_eq!(report.operations, 1);
     assert_eq!(journal.resource_effects(&id).unwrap(), Vec::new());
     let rows: i64 = rusqlite::Connection::open(fixture.path())

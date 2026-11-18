@@ -7,12 +7,18 @@
 //! marker, so the markers grow with the number of consumed plans. A
 //! completed request leaves no marker: the same request again is a new
 //! request, and the marker of its plan rejects it at admission.
+//!
+//! The usage row of an incident (`incident_usage`) does not go with the
+//! operations of the incident. A prune keeps the row while the caller
+//! names the incident as open, so the budget of an open incident survives
+//! the removal of its settled operations.
 
 use rusqlite::{Connection, params};
+use svalnir_core::id::IncidentId;
 use svalnir_core::time::WallTime;
 
 use super::error::OperationJournalError;
-use super::{OperationJournal, commit};
+use super::{OperationJournal, commit, incident};
 
 /// What one prune call removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,6 +32,8 @@ pub struct PruneReport {
     pub unused_plans: usize,
     /// The completed requests that were removed.
     pub requests: usize,
+    /// The usage rows of closed incidents that were removed.
+    pub incident_usage: usize,
 }
 
 /// Reads the plan identities that `statement` selects for the cutoff and
@@ -69,9 +77,14 @@ impl OperationJournal {
     ///   plan can be stored again, and the admission checks of the
     ///   coordinator then find that its validity is over.
     /// - A completed request that was made before `cutoff`.
+    /// - The usage row of an incident that is not in `open_incidents`,
+    ///   when the latest operation that changed it was admitted before
+    ///   `cutoff`.
     ///
     /// An operation that is not settled, which includes `UnknownOutcome`,
-    /// and a request that is not completed are never removed. The
+    /// a request that is not completed, and the usage row of an incident
+    /// in `open_incidents` are never removed. The settled operations of an
+    /// open incident are removed: its usage row keeps its budget. The
     /// revisions that operations bind to are never removed.
     ///
     /// The caller gives a `cutoff` that is older than the validity of each
@@ -89,6 +102,7 @@ impl OperationJournal {
         &mut self,
         cutoff: WallTime,
         limit: u32,
+        open_incidents: &[IncidentId],
     ) -> Result<PruneReport, OperationJournalError> {
         let Self {
             connection,
@@ -143,12 +157,14 @@ impl OperationJournal {
              ORDER BY seq LIMIT ?2)",
             params![cutoff, limit],
         )?;
+        let incident_usage: usize = incident::prune(&transaction, cutoff, open_incidents, limit)?;
         commit(transaction, commit_fault)?;
         Ok(PruneReport {
             operations: settled.len(),
             rejections: rejected.len(),
             unused_plans,
             requests,
+            incident_usage,
         })
     }
 }

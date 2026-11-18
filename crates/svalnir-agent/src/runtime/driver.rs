@@ -31,8 +31,8 @@ use super::record::{
 };
 use crate::controller::{
     ApplyReport, AuthorityRecords, AutomaticApply, ControllerState, ControllerStatus, Guard,
-    GuardPhase, Health, Intent, Observations, OpenIncidents, OperationResult, PreparationMode,
-    PriorState, SharedAuthority, StepInput, StepOutput, TriggerKey, step,
+    GuardPhase, Health, Intent, Observations, OperationResult, PreparationMode, PriorState,
+    SharedAuthority, StepInput, StepOutput, TriggerKey, step,
 };
 use crate::coordinator::{
     ApplicationExecutor, ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies,
@@ -182,31 +182,6 @@ pub struct ShutdownReport {
     /// True when each operation was settled, the coordinator released its
     /// registration, and the records of a clean stop were written.
     pub clean: bool,
-}
-
-/// The cutoff of a journal prune: the retention cutoff, and not later than
-/// the start of the oldest open incident.
-///
-/// A prune removes each settled operation that was admitted before its
-/// cutoff. The consumed dispatches of an open incident are the records of
-/// its operations, and a restart reads them to know the usage of the
-/// incident. With the lower cutoff, an incident that continues for longer
-/// than the retention time keeps that evidence, so a restart does not
-/// give the incident a slot or work that it used before. `None` means no
-/// prune: an incident is open and its start is not known.
-///
-/// The two times are wall-clock times. A wall clock that was set back by
-/// more than the age of the incident can still put an operation of the
-/// incident before the cutoff.
-pub(crate) fn journal_prune_cutoff(
-    retention_cutoff: WallTime,
-    state: &ControllerState,
-) -> Option<WallTime> {
-    match state.open_incidents() {
-        OpenIncidents::None => Some(retention_cutoff),
-        OpenIncidents::Since(start) => Some(retention_cutoff.min(start)),
-        OpenIncidents::Unknown => None,
-    }
 }
 
 /// The single-threaded core of the agent.
@@ -1170,9 +1145,13 @@ impl Driver {
             0,
         )
         .ok();
-        if let Some(cutoff) =
-            retention_cutoff.and_then(|cutoff| journal_prune_cutoff(cutoff, &self.state))
-            && self.records.prune(cutoff, PRUNE_LIMIT).is_err()
+        // The usage row of an open incident stays, so the prune keeps the
+        // budget of the incident when it removes its settled operations.
+        if let Some(cutoff) = retention_cutoff
+            && self
+                .records
+                .prune(cutoff, PRUNE_LIMIT, &self.state.open_incident_ids())
+                .is_err()
         {
             self.sample_degraded.push("journal_retention".to_owned());
         }

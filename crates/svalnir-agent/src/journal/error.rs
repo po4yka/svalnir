@@ -142,25 +142,22 @@ pub enum OperationJournalError {
         /// The newest version that this build can read and write.
         supported: u32,
     },
+    /// An earlier build wrote the database. The journal has no migration,
+    /// and this build did not change its content.
+    #[error(
+        "the operation journal has version {found}, and this build supports version {supported} \
+         only; the journal has no migration"
+    )]
+    OlderVersion {
+        /// The version that the database records.
+        found: u32,
+        /// The version that this build can read and write.
+        supported: u32,
+    },
     /// The file is an `SQLite` database that is not an operation journal.
     /// This build did not change its content.
     #[error("the database is not a Svalnir operation journal")]
     NotAJournal,
-    /// The statements of a migration failed and were rolled back.
-    #[error("the migration to journal version {version} failed and was rolled back")]
-    Migration {
-        /// The version that the failed migration makes.
-        version: u32,
-        /// The cause.
-        #[source]
-        source: Box<OperationJournalError>,
-    },
-    /// The migration list of the build is not `1, 2, 3, ...` in order.
-    #[error("the migration list is not in order at version {version}")]
-    MigrationOrder {
-        /// The version that is out of order.
-        version: u32,
-    },
     /// The path is empty or is the `SQLite` name `:memory:`, which does not
     /// open a durable file. Nothing was opened.
     #[error("the journal path `{0}` does not name a durable file")]
@@ -219,7 +216,6 @@ impl OperationJournalError {
             Self::Conflict => JournalError::Conflict,
             Self::Expired => JournalError::Expired,
             Self::Sequence(_) => JournalError::Sequence,
-            Self::Migration { source, .. } => source.to_journal_error(),
             _ => JournalError::Unavailable,
         }
     }

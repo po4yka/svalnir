@@ -14,7 +14,8 @@
 //! # Use
 //!
 //! [`OperationJournal::open`] opens the database at the path that the
-//! caller gives and migrates it to [`JOURNAL_VERSION`]. The journal does
+//! caller gives and makes the schema of [`JOURNAL_VERSION`] in a new
+//! database. The journal has no migration. The journal does
 //! not find a default path and does not make a directory. An
 //! `OperationJournal` is one connection; it is `Send` and not `Sync`.
 //!
@@ -140,13 +141,14 @@ mod coordination;
 mod durable;
 mod effects;
 mod error;
-mod migration;
+mod incident;
 mod record;
 mod recovery;
 mod request;
 mod retention;
 mod revision;
 mod row;
+mod schema;
 #[cfg(test)]
 mod tests;
 mod transition;
@@ -168,8 +170,7 @@ pub use self::coordination::{
 };
 pub use self::effects::MAX_RESOURCE_EFFECTS_BYTES;
 pub use self::error::{AdmissionStop, OperationJournalError, SequenceViolation};
-pub use self::migration::JOURNAL_VERSION;
-use self::migration::{MIGRATIONS, Migration};
+pub use self::incident::IncidentUsage;
 pub use self::record::{AgentRecord, MAX_AGENT_RECORD_BYTES, StoredAgentRecord};
 pub use self::recovery::{ConsumedDispatch, RecoveryPosition, RecoveryRecord, StepRecovery};
 pub use self::request::{
@@ -178,6 +179,7 @@ pub use self::request::{
 };
 pub use self::retention::PruneReport;
 pub use self::revision::MAX_REVISION_SOURCE_BYTES;
+pub use self::schema::JOURNAL_VERSION;
 pub use self::volatile::{VolatileOperationRecord, VolatilePersistReport, VolatileRecord};
 
 /// The size to which the write-ahead log file is cut after a checkpoint.
@@ -381,31 +383,21 @@ fn decode<T: DeserializeOwned>(
 }
 
 impl OperationJournal {
-    /// Opens the journal file at `path` and migrates it to
-    /// [`JOURNAL_VERSION`]. A file that does not exist is made; its
-    /// directory must exist.
+    /// Opens the journal file at `path`. A file that does not exist is
+    /// made with the schema of [`JOURNAL_VERSION`]; its directory must
+    /// exist.
     ///
     /// # Errors
     ///
     /// Returns [`OperationJournalError::InvalidPath`] for an empty path or
-    /// `:memory:`. Returns [`OperationJournalError::NewerVersion`] or
+    /// `:memory:`. Returns [`OperationJournalError::NewerVersion`],
+    /// [`OperationJournalError::OlderVersion`], or
     /// [`OperationJournalError::NotAJournal`] for a database that this
     /// build must not use; the content of the database is then not changed.
     /// Returns [`OperationJournalError::WalUnavailable`] or
     /// [`OperationJournalError::Setting`] when a required setting is not in
-    /// effect, [`OperationJournalError::Migration`] when a migration fails,
-    /// or a storage error.
+    /// effect, or a storage error.
     pub fn open(path: &Path, options: &JournalOptions) -> Result<Self, OperationJournalError> {
-        Self::open_with_migrations(path, options, MIGRATIONS)
-    }
-
-    fn open_with_migrations(
-        path: &Path,
-        options: &JournalOptions,
-        migrations: &[Migration],
-    ) -> Result<Self, OperationJournalError> {
-        // Refuse a defective migration list before the open makes a file.
-        let supported: u32 = migration::supported_version(migrations)?;
         if path.as_os_str().is_empty() || path.as_os_str() == ":memory:" {
             return Err(OperationJournalError::InvalidPath(
                 path.display().to_string(),
@@ -413,9 +405,9 @@ impl OperationJournal {
         }
         let mut connection: Connection = Connection::open_with_flags(path, open_flags())?;
         connection.busy_timeout(options.busy_timeout)?;
-        // Refuse a database of a newer build or of a different application
-        // before a setting can change the file.
-        migration::recorded_version(&connection, supported)?;
+        // Refuse a database of a different build or of a different
+        // application before a setting can change the file.
+        schema::recorded_version(&connection)?;
         apply_settings(&connection, options)?;
 
         let page_size: u64 = pragma_u64(&connection, "page_size")?.max(1);
@@ -431,7 +423,7 @@ impl OperationJournal {
         let page_limit: u64 = u64::try_from(applied)
             .map_err(|_| OperationJournalError::row("pragma", "max_page_count"))?;
 
-        migration::migrate(&mut connection, migrations)?;
+        schema::create(&mut connection)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),

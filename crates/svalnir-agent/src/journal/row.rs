@@ -243,7 +243,8 @@ pub(super) fn write_intent(
     one_row(changed, "step", "intent")
 }
 
-/// Writes the dispatch consumption of one step that has an intent.
+/// Writes the dispatch consumption of one step that has an intent, and
+/// charges it to the usage of the incident of the operation.
 pub(super) fn write_dispatch_consumed(
     connection: &Connection,
     seq: i64,
@@ -256,7 +257,10 @@ pub(super) fn write_dispatch_consumed(
              AND dispatch_consumed = 0 AND intent IS NOT NULL",
         )?
         .execute(params![seq, step_id.as_str()])?;
-    one_row(changed, "step", "dispatch_consumed")
+    one_row(changed, "step", "dispatch_consumed")?;
+    // The budget charge of the incident is in the transaction of the
+    // consumption.
+    super::incident::charge(connection, seq, step_id)
 }
 
 /// Reads the intents of the operation row `seq`, in step sequence: for

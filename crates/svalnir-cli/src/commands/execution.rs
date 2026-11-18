@@ -532,18 +532,18 @@ impl Running {
                     self.authority_revision = revision;
                 })
             });
-        match read {
-            Ok(()) => {
+        match authority_after_read(read.is_ok(), self.authority_read_at.elapsed()) {
+            AuthorityRead::Fresh => {
                 self.authority_read_at = Instant::now();
                 true
             }
-            Err(_) if self.authority_read_at.elapsed() >= AUTHORITY_READ_GRACE => {
+            AuthorityRead::Withdrawn => {
                 self.authority.records().state = None;
                 // The next read that has a result sets the record again.
                 self.authority_revision = u64::MAX;
                 true
             }
-            Err(_) => false,
+            AuthorityRead::Unconfirmed => false,
         }
     }
 
@@ -657,21 +657,11 @@ impl Queued {
     /// request or the operation continues, and only this client has no
     /// result.
     fn read_failure(&self, error: ErrorBody, last: Option<&OperationReport>) -> ErrorBody {
-        let Some(report) = last else {
-            return error.with_plan(self.plan_id.as_str());
-        };
-        ErrorBody::new(
-            "operation_record_unavailable",
-            ErrorFamily::Outcome,
-            ErrorStage::Execution,
-            format!(
-                "the journal cannot be read now ({}); the operation was admitted and continues, and its result is not known to this response; query it with `svalnir operations show`",
-                error.code
-            ),
+        read_failure(
+            &self.plan_id,
+            error,
+            last.map(|report| &report.operation_id),
         )
-        .with_plan(self.plan_id.as_str())
-        .with_operation(report.operation_id.as_str())
-        .with_next_action(NextAction::QueryOperation)
     }
 
     /// Waits for the result of the request. With `admission_only`, the
@@ -743,5 +733,111 @@ impl Queued {
             }
             std::thread::sleep(QUEUE_POLL);
         }
+    }
+}
+
+/// What a read of the authority record gives to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityRead {
+    /// The record was read.
+    Fresh,
+    /// The read failed for longer than [`AUTHORITY_READ_GRACE`]: the record
+    /// is cleared and the coordinator refuses each step.
+    Withdrawn,
+    /// The read failed inside the grace period: no step runs.
+    Unconfirmed,
+}
+
+/// The decision after a read of the authority record. A record that cannot
+/// be read is not authority after [`AUTHORITY_READ_GRACE`].
+fn authority_after_read(read_ok: bool, since_last_read: Duration) -> AuthorityRead {
+    if read_ok {
+        AuthorityRead::Fresh
+    } else if since_last_read >= AUTHORITY_READ_GRACE {
+        AuthorityRead::Withdrawn
+    } else {
+        AuthorityRead::Unconfirmed
+    }
+}
+
+/// The error of a journal read that failed during the wait of a request.
+/// It names the plan and, when the request was admitted, the operation.
+fn read_failure(
+    plan_id: &svalnir_core::id::PlanId,
+    error: ErrorBody,
+    operation: Option<&OperationId>,
+) -> ErrorBody {
+    let Some(operation_id) = operation else {
+        return error.with_plan(plan_id.as_str());
+    };
+    ErrorBody::new(
+        "operation_record_unavailable",
+        ErrorFamily::Outcome,
+        ErrorStage::Execution,
+        format!(
+            "the journal cannot be read now ({}); the operation was admitted and continues, and its result is not known to this response; query it with `svalnir operations show`",
+            error.code
+        ),
+    )
+    .with_plan(plan_id.as_str())
+    .with_operation(operation_id.as_str())
+    .with_next_action(NextAction::QueryOperation)
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use std::time::Duration;
+
+    use svalnir_core::id::{OperationId, PlanId};
+
+    use super::{
+        AUTHORITY_READ_GRACE, AuthorityRead, ErrorBody, ErrorFamily, ErrorStage, NextAction,
+        authority_after_read, read_failure,
+    };
+
+    #[test]
+    fn a_record_that_cannot_be_read_is_not_authority_after_the_grace_period() {
+        let before: Duration = AUTHORITY_READ_GRACE.saturating_sub(Duration::from_millis(1));
+        assert_eq!(
+            authority_after_read(false, before),
+            AuthorityRead::Unconfirmed
+        );
+        assert_eq!(
+            authority_after_read(false, AUTHORITY_READ_GRACE),
+            AuthorityRead::Withdrawn
+        );
+        assert_eq!(
+            authority_after_read(false, AUTHORITY_READ_GRACE * 5),
+            AuthorityRead::Withdrawn
+        );
+        assert_eq!(
+            authority_after_read(true, AUTHORITY_READ_GRACE * 5),
+            AuthorityRead::Fresh
+        );
+    }
+
+    #[test]
+    fn a_failed_read_after_the_admission_names_the_operation() {
+        let plan = PlanId::new("plan_1").unwrap();
+        let operation = OperationId::new("op_1").unwrap();
+        let cause = || {
+            ErrorBody::new(
+                "journal_busy",
+                ErrorFamily::Recording,
+                ErrorStage::Storage,
+                "busy",
+            )
+        };
+        let before = read_failure(&plan, cause(), None);
+        assert_eq!(&*before.code, "journal_busy");
+        assert_eq!(before.plan_id.as_deref(), Some("plan_1"));
+        assert!(before.operation_id.is_none());
+
+        let after = read_failure(&plan, cause(), Some(&operation));
+        assert_eq!(&*after.code, "operation_record_unavailable");
+        assert_eq!(after.family, ErrorFamily::Outcome);
+        assert_eq!(after.plan_id.as_deref(), Some("plan_1"));
+        assert_eq!(after.operation_id.as_deref(), Some("op_1"));
+        assert_eq!(after.next_action, NextAction::QueryOperation);
     }
 }

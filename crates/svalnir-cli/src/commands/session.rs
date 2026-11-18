@@ -130,7 +130,12 @@ pub(crate) fn wall_now() -> WallTime {
 /// Returns `clock_unavailable` when the clock has no value that a record
 /// can hold: a record must not get the epoch as its time.
 pub(crate) fn record_time() -> Result<WallTime, ErrorBody> {
-    WallTime::try_from(SystemTime::now()).map_err(|_| {
+    record_time_of(SystemTime::now())
+}
+
+/// The record time of `time`. See [`record_time`].
+fn record_time_of(time: SystemTime) -> Result<WallTime, ErrorBody> {
+    WallTime::try_from(time).map_err(|_| {
         ErrorBody::new(
             "clock_unavailable",
             ErrorFamily::Native,
@@ -449,4 +454,21 @@ pub(crate) fn invalid_identifier(
         format!("the {what} is not valid; use the ID that Svalnir printed"),
     )
     .with_fields(fields)
+}
+
+#[cfg(test)]
+mod record_time_tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::record_time_of;
+
+    #[test]
+    fn a_clock_value_that_a_record_cannot_hold_is_an_error_and_not_the_epoch() {
+        let far: SystemTime = UNIX_EPOCH
+            .checked_add(Duration::from_secs(300_000_000_001))
+            .unwrap();
+        let error = record_time_of(far).unwrap_err();
+        assert_eq!(&*error.code, "clock_unavailable");
+        assert!(record_time_of(UNIX_EPOCH + Duration::from_secs(1)).is_ok());
+    }
 }

@@ -1037,3 +1037,80 @@ mod host {
         );
     }
 }
+
+/// A writer that takes `first` bytes at its first call, sets the flag, and
+/// then fails the test if it gets a second call.
+struct ShortWriter {
+    first: usize,
+    calls: usize,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::io::Write for ShortWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        assert_eq!(
+            self.calls, 1,
+            "the write was tried again after the interrupt"
+        );
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.first.min(bytes.len()))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_short_write_after_an_interrupt_ends_the_write() {
+    let (interrupt, flag) = crate::interrupt::Interrupt::manual();
+    let mut writer = ShortWriter {
+        first: 3,
+        calls: 0,
+        flag,
+    };
+    let error =
+        crate::commands::write_interruptible(&mut writer, b"0123456789", &interrupt).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(writer.calls, 1);
+}
+
+#[test]
+fn a_short_write_with_no_interrupt_is_written_to_the_end() {
+    let (interrupt, _flag) = crate::interrupt::Interrupt::manual();
+    let mut out: Vec<u8> = Vec::new();
+    crate::commands::write_interruptible(&mut out, b"0123456789", &interrupt).unwrap();
+    assert_eq!(out, b"0123456789");
+}
+
+/// A writer whose each write fails with `EINTR` after it sets the flag.
+struct InterruptedWriter(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl std::io::Write for InterruptedWriter {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(std::io::ErrorKind::Interrupted.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn an_interrupted_result_write_has_status_130() {
+    let (mut environment, _directory) = environment();
+    let (interrupt, flag) = crate::interrupt::Interrupt::manual();
+    environment.interrupt = interrupt;
+    let mut stdout = InterruptedWriter(flag);
+    let mut stderr: Vec<u8> = Vec::new();
+    let status = run_in(
+        ["svalnir", "--format", "json", "license"],
+        request_id(),
+        &environment,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(status, ExitStatus::Interrupted);
+}

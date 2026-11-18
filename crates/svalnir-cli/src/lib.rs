@@ -102,6 +102,13 @@ where
     };
     match commands::execute(&cli, &request_id, environment, stdout, stderr) {
         Ok(status) => finish(stdout.flush(), status, stderr),
+        // The user interrupted a result write that blocked.
+        Err(CommandFailure::Output(error))
+            if error.kind() == io::ErrorKind::Interrupted
+                && environment.interrupt.is_requested() =>
+        {
+            ExitStatus::Interrupted
+        }
         // A closed pipe keeps the success status; another write error does not.
         Err(CommandFailure::Output(error)) => finish(Err(error), ExitStatus::Success, stderr),
         // The result of an operation has its own status. A closed pipe

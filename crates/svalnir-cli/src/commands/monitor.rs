@@ -14,7 +14,7 @@ use svalnir_agent::platform::memory::VmStatistics;
 use svalnir_core::time::WallTime;
 
 use super::resources::{self, DiskView, HostReading, MemoryView, SwapView};
-use super::{CommandFailure, Invocation, json_line};
+use super::{CommandFailure, Invocation, json_line, write_interruptible};
 use crate::cli::{Format, MonitorArgs};
 use crate::host::{Host, ScopeCoverage};
 use crate::interrupt::Interrupt;
@@ -106,31 +106,6 @@ impl Sampler for HostSampler {
             remaining = remaining.saturating_sub(step);
         }
     }
-}
-
-/// Writes all of `bytes`. The user can interrupt a write that blocks.
-///
-/// `write_all` retries a write that `EINTR` ended, so a blocked write to a
-/// full pipe would never return after Ctrl+C. This function reads the flag
-/// at each such point and ends with `ErrorKind::Interrupted` when it is set.
-fn write_interruptible(
-    stdout: &mut dyn Write,
-    mut bytes: &[u8],
-    interrupt: &Interrupt,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        match stdout.write(bytes) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                if interrupt.is_requested() {
-                    return Err(error);
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 /// Flushes `stdout`. A flush that `EINTR` ended is tried again until the

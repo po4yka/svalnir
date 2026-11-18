@@ -29,6 +29,7 @@ use crate::cli::{
     OperationsCommand, PolicyCommand, ProcessesCommand, SwapCommand,
 };
 use crate::environment::Environment;
+use crate::interrupt::Interrupt;
 use crate::output::{
     Envelope, ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind, NextAction, RequestId, Warning,
 };
@@ -125,12 +126,21 @@ impl Invocation<'_> {
                 for warning in &warnings {
                     writeln!(self.stderr, "warning: {}", warning.message)?;
                 }
-                self.stdout.write_all(text(view).as_bytes())
+                write_interruptible(
+                    self.stdout,
+                    text(view).as_bytes(),
+                    &self.environment.interrupt,
+                )
             }
-            Format::Json | Format::Ndjson => write_json(
-                self.stdout,
-                &Envelope::result(self.request_id.clone(), kind, view).with_warnings(warnings),
-            ),
+            Format::Json | Format::Ndjson => {
+                let envelope =
+                    Envelope::result(self.request_id.clone(), kind, view).with_warnings(warnings);
+                write_interruptible(
+                    self.stdout,
+                    &json_line(&envelope)?,
+                    &self.environment.interrupt,
+                )
+            }
         }
     }
 
@@ -350,6 +360,40 @@ fn waits_for_an_operation(command: &Command) -> bool {
 /// leaves no partial line in `stdout`.
 pub(crate) fn write_json<T: Serialize>(stdout: &mut dyn Write, value: &T) -> io::Result<()> {
     stdout.write_all(&json_line(value)?)
+}
+
+/// Writes all of `bytes`. The user can interrupt a write that blocks.
+///
+/// `write_all` retries a write that `EINTR` ended, so a blocked write to a
+/// full pipe would never return after Ctrl+C. A write that the signal cut
+/// short returns the count of the bytes that it took, with no error. This
+/// function reads the flag after such a write and at each `EINTR`, and ends
+/// with `ErrorKind::Interrupted` when the flag is set. The flag is never set
+/// in a command that did not arm it, so there the behavior is that of
+/// `write_all`.
+pub(crate) fn write_interruptible(
+    stdout: &mut dyn Write,
+    mut bytes: &[u8],
+    interrupt: &Interrupt,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stdout.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => {
+                bytes = &bytes[written..];
+                if !bytes.is_empty() && interrupt.is_requested() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if interrupt.is_requested() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// The bytes of one JSON value and a newline.

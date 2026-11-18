@@ -15,12 +15,12 @@ use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber};
 use svalnir_core::id::{MountId, RootId, RuleRevisionId, VolumeId};
 use svalnir_core::policy::{ActivityFact, OwnerFact, ProtectionFact, RuleReadiness};
 use svalnir_core::process::Uid;
-use svalnir_core::quantity::EntryCount;
+use svalnir_core::quantity::{EntryCount, Nanoseconds};
 use svalnir_core::rule::{
     Fact, LifecycleState, Rule, RuleCandidate, RuleCandidateRecord, RuleDeclaration, RuleMode,
     RuleRef, RuleRefusal, RuleRegistry,
 };
-use svalnir_core::time::WallTime;
+use svalnir_core::time::{MonotonicNanos, WallTime};
 use tempfile::TempDir;
 
 use super::expired_temporary::{
@@ -46,14 +46,18 @@ use crate::scan::{CancellationToken, ScanClock, ScanTimestamp};
 const DAY_SECONDS: i64 = 86_400;
 const PROJECT: &str = "App-abcdefghijklmnopqrstuvwxyzab";
 
-/// A clock with a fixed wall-clock time, or with none.
+/// The monotonic time of [`FixedClock`].
+const MONOTONIC_NOW: MonotonicNanos = MonotonicNanos::new(1_000_000_000_000);
+
+/// A clock with a fixed wall-clock time, or with none, and with the fixed
+/// monotonic time [`MONOTONIC_NOW`].
 struct FixedClock(Option<WallTime>);
 
 impl ScanClock for FixedClock {
     fn now(&self) -> ScanTimestamp {
         ScanTimestamp {
             wall: self.0,
-            monotonic_ns: None,
+            monotonic_ns: Some(MONOTONIC_NOW),
         }
     }
 }
@@ -1137,6 +1141,7 @@ fn xcode_fixture() -> (Fixture, PathBuf) {
 
 const NOT_RUNNING: XcodeEvidence = XcodeEvidence {
     producer_processes: ProducerProcesses::NotRunning,
+    observed_at: MONOTONIC_NOW,
 };
 
 /// A clock 30 days after the real time: each unit of [`add_project`] is
@@ -1150,7 +1155,7 @@ fn discover_xcode_with(
     fixture: &Fixture,
     evidence: XcodeEvidence,
     mode: DiscoveryMode<'_>,
-    clock: &FixedClock,
+    clock: &dyn ScanClock,
 ) -> Result<Discovery, DiscoveryError> {
     let cancel = CancellationToken::new();
     let control = DiscoveryControl {
@@ -1474,6 +1479,99 @@ fn lock_query_fails(_: &File) -> io::Result<bool> {
     Err(io::Error::other("the query failed"))
 }
 
+/// A clock with the wall-clock time of [`month_later_clock`] and no
+/// monotonic time.
+struct WallOnlyClock;
+
+impl ScanClock for WallOnlyClock {
+    fn now(&self) -> ScanTimestamp {
+        ScanTimestamp {
+            wall: month_later_clock().0,
+            monotonic_ns: None,
+        }
+    }
+}
+
+/// A process inventory with no process of the producer shows inactivity
+/// only for `evidence_expiry` of the rule. Older evidence, evidence with a
+/// time after the time of the assessment, and evidence that cannot be
+/// compared with a monotonic time give no candidate.
+#[test]
+fn process_evidence_that_is_older_than_its_expiry_does_not_show_inactivity() {
+    let (fixture, _project) = xcode_fixture();
+    let clock = month_later_clock();
+    let name = unit("Build/Intermediates.noindex");
+    let rule = XcodeDerivedDataRule::with_lock_probe(lock_free).unwrap();
+    let expiry: Nanoseconds = rule.rule().activity.evidence_expiry;
+    let not_running_at = |observed_at: MonotonicNanos| XcodeEvidence {
+        producer_processes: ProducerProcesses::NotRunning,
+        observed_at,
+    };
+    let at_expiry = MonotonicNanos::new(MONOTONIC_NOW.get() - expiry.get());
+    let expired = MonotonicNanos::new(at_expiry.get() - 1);
+    let later = MonotonicNanos::new(MONOTONIC_NOW.get() + 1);
+
+    // Evidence at the limit of the expiry is current.
+    let current = discover_xcode_with(
+        &rule,
+        &fixture,
+        not_running_at(at_expiry),
+        DiscoveryMode::Full,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(found_blockers(&current, &name), []);
+
+    for stale in [expired, MonotonicNanos::new(0), later] {
+        let discovery = discover_xcode_with(
+            &rule,
+            &fixture,
+            not_running_at(stale),
+            DiscoveryMode::Full,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(discovery.candidates.len(), 0, "{stale:?}");
+        let skipped = skip_of(&discovery, &name);
+        assert_eq!(skipped.reasons, [SkipReason::ActivityUnknown], "{stale:?}");
+        assert_eq!(skipped.eligibility.age_and_inactivity, Fact::Unknown);
+        assert_eq!(skipped.eligibility.protocols_valid, Fact::Unknown);
+    }
+
+    // A clock with no monotonic time cannot show that the evidence is
+    // current.
+    let no_monotonic = discover_xcode_with(
+        &rule,
+        &fixture,
+        NOT_RUNNING,
+        DiscoveryMode::Full,
+        &WallOnlyClock,
+    )
+    .unwrap();
+    assert_eq!(no_monotonic.candidates.len(), 0);
+    assert_eq!(
+        skip_of(&no_monotonic, &name).reasons,
+        [SkipReason::ActivityUnknown]
+    );
+
+    // Evidence of a running producer does not expire into inactivity.
+    let running = discover_xcode_with(
+        &rule,
+        &fixture,
+        XcodeEvidence {
+            producer_processes: ProducerProcesses::Running,
+            observed_at: expired,
+        },
+        DiscoveryMode::Full,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(
+        found_blockers(&running, &name),
+        [SkipReason::ActiveProducer]
+    );
+}
+
 #[test]
 fn the_producer_processes_and_the_lock_decide_the_activity() {
     let (fixture, project) = xcode_fixture();
@@ -1483,6 +1581,7 @@ fn the_producer_processes_and_the_lock_decide_the_activity() {
         let rule = XcodeDerivedDataRule::with_lock_probe(probe).unwrap();
         let evidence = XcodeEvidence {
             producer_processes: processes,
+            observed_at: MONOTONIC_NOW,
         };
         discover_xcode_with(&rule, &fixture, evidence, DiscoveryMode::Full, &clock).unwrap()
     };
@@ -1674,6 +1773,7 @@ fn known_units_are_examined_again_with_no_measurement() {
     // discovery blocks each known unit.
     let active = known(XcodeEvidence {
         producer_processes: ProducerProcesses::Running,
+        observed_at: MONOTONIC_NOW,
     });
     assert_eq!(active.candidates.len(), 3);
     assert!(

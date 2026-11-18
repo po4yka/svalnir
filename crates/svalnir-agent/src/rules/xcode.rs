@@ -62,7 +62,7 @@ use svalnir_core::rule::{
     LifecycleState, OwnerAttribution, Retention, RootBase, Rule, RuleBudget, RuleDeclaration,
     RuleExclusions, RuleMode, RuleOwner, RuleRef,
 };
-use svalnir_core::time::WallTime;
+use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::model::{
     DiscoveredCandidate, Discovery, DiscoveryCompletion, DiscoveryControl, DiscoveryError,
@@ -183,6 +183,33 @@ impl ProducerProcesses {
 pub struct XcodeEvidence {
     /// Whether a process of the producer runs.
     pub producer_processes: ProducerProcesses,
+    /// The time of the process inventory, on the monotonic timeline of the
+    /// clock of the discovery ([`DiscoveryControl::clock`]). The rule
+    /// compares it with the time of the assessment of each unit: evidence
+    /// that is older than `evidence_expiry` of the rule does not show that
+    /// no process of the producer runs.
+    pub observed_at: MonotonicNanos,
+}
+
+impl XcodeEvidence {
+    /// The process evidence at `now`, the monotonic time of the assessment
+    /// of one unit. [`ProducerProcesses::NotRunning`] is evidence of
+    /// inactivity only for `expiry` after its observation. After that time,
+    /// with no monotonic time, or with a time before the observation (a
+    /// different clock domain or boot), the result is
+    /// [`ProducerProcesses::Unknown`]. The other two values permit no
+    /// candidate, so they do not expire.
+    fn processes_at(self, now: Option<MonotonicNanos>, expiry: Nanoseconds) -> ProducerProcesses {
+        if self.producer_processes != ProducerProcesses::NotRunning {
+            return self.producer_processes;
+        }
+        let age: Option<Nanoseconds> =
+            now.and_then(|now| now.checked_duration_since(self.observed_at));
+        match age {
+            Some(age) if age <= expiry => ProducerProcesses::NotRunning,
+            _ => ProducerProcesses::Unknown,
+        }
+    }
 }
 
 /// The lock query of a build database.
@@ -429,7 +456,7 @@ impl XcodeDerivedDataRule {
             rule: self,
             root: &root,
             scope,
-            processes: evidence.producer_processes,
+            evidence,
             after_measurement,
         };
         let completion: DiscoveryCompletion = match mode {
@@ -448,7 +475,7 @@ struct UnitContext<'a> {
     rule: &'a XcodeDerivedDataRule,
     root: &'a RootView,
     scope: &'a DiscoveryScope<'a>,
-    processes: ProducerProcesses,
+    evidence: XcodeEvidence,
     after_measurement: &'a mut dyn FnMut(&Path),
 }
 
@@ -900,7 +927,19 @@ impl UnitContext<'_> {
             return Ok(Outcome::Stopped(stopped));
         }
         (self.after_measurement)(&path);
-        self.assess_activity(&mut assessment, project, &before, collector.observed_at());
+        // The process evidence is examined at the time of this unit and
+        // not at the start of the discovery: a measurement can be long.
+        let processes: ProducerProcesses = self.evidence.processes_at(
+            collector.bounds.monotonic_now(),
+            self.rule.rule.activity.evidence_expiry,
+        );
+        self.assess_activity(
+            &mut assessment,
+            project,
+            &before,
+            processes,
+            collector.observed_at(),
+        );
 
         // The evidence snapshot: the unit, the project directory, and
         // `info.plist` are the objects that the assessment examined.
@@ -924,6 +963,7 @@ impl UnitContext<'_> {
         assessment: &mut Assessment,
         project: &Project,
         before: &ObjectSnapshot,
+        processes: ProducerProcesses,
         now: Option<WallTime>,
     ) {
         // Predicates 5 and 6: the producer processes, the lock of the
@@ -931,10 +971,9 @@ impl UnitContext<'_> {
         // measurement, so that it is as late as the discovery permits.
         let (lock, database_modified) = self.build_database_state(project);
         let content_change: Option<WallTime> = assessment.newest_content_change;
-        let is_active: bool =
-            self.processes == ProducerProcesses::Running || lock == LockState::Held;
+        let is_active: bool = processes == ProducerProcesses::Running || lock == LockState::Held;
         let is_unknown: bool =
-            self.processes == ProducerProcesses::Unknown || lock == LockState::Unknown;
+            processes == ProducerProcesses::Unknown || lock == LockState::Unknown;
         let times: [Option<WallTime>; 4] = [
             Some(project.info.last_accessed),
             project.snapshot.modified(),

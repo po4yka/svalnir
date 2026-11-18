@@ -27,7 +27,7 @@ use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
 use svalnir_core::rule::{
     CandidateEligibility, Fact, LayoutSupport, Rule, RuleCandidate, RuleCandidateRecord, RuleMode,
 };
-use svalnir_core::time::WallTime;
+use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::model::{
     ChangeStamp, DiscoveredCandidate, Discovery, DiscoveryCompletion, DiscoveryControl,
@@ -403,6 +403,12 @@ impl<'a> Bounds<'a> {
     /// The wall-clock time now, when the clock gives one.
     pub(super) fn wall_now(&self) -> Option<WallTime> {
         self.control.clock.now().wall
+    }
+
+    /// The time now on the monotonic timeline of the clock, when the clock
+    /// gives one.
+    pub(super) fn monotonic_now(&self) -> Option<MonotonicNanos> {
+        self.control.clock.now().monotonic_ns
     }
 
     fn deadline(&self) -> Option<Instant> {

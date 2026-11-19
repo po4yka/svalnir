@@ -210,6 +210,10 @@ impl Requirement {
 pub enum WorkerRole {
     /// The command-line client.
     Cli,
+    /// The graphical client: a window process of `Svalnir.app`. It runs the
+    /// same probes as the command-line client and has the same
+    /// requirements, because its screens show the same readings.
+    Window,
     /// The user-session agent.
     Agent,
     /// The privileged helper.
@@ -221,6 +225,7 @@ impl WorkerRole {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Cli => "cli",
+            Self::Window => "window",
             Self::Agent => "agent",
             Self::Helper => "helper",
         }
@@ -487,6 +492,11 @@ fn scope_note(role: WorkerRole) -> &'static str {
             "The results apply to this command-line process and to the application that \
              started it, for example a terminal. They do not show the access of the \
              background agent or of the privileged helper."
+        }
+        WorkerRole::Window => {
+            "The results apply to this window process of the graphical client. They do not \
+             show the access of the background agent, of a terminal, or of the privileged \
+             helper."
         }
         WorkerRole::Agent => {
             "The results apply to the background agent process. They do not show the access \
@@ -817,6 +827,11 @@ fn full_disk_access_entry(
                  Settings > Privacy & Security > Full Disk Access and add the application that \
                  starts the command, for example your terminal. Then start that application \
                  again. This does not give the access to the background agent."
+            }
+            WorkerRole::Window => {
+                "Optional. To scan privacy-protected locations from this window, open System \
+                 Settings > Privacy & Security > Full Disk Access and add Svalnir. Then open \
+                 Svalnir again. This does not give the access to the background agent."
             }
             WorkerRole::Agent | WorkerRole::Helper => {
                 "Optional. To scan privacy-protected locations, open System Settings > Privacy \

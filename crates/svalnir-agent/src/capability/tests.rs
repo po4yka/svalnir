@@ -527,6 +527,10 @@ fn the_full_disk_access_hint_names_the_tested_process() {
     assert!(hint_for(WorkerRole::Cli).contains("terminal"));
     assert!(hint_for(WorkerRole::Cli).contains("does not give the access to the background agent"));
     assert!(!hint_for(WorkerRole::Agent).contains("terminal"));
+    let window: String = hint_for(WorkerRole::Window);
+    assert!(!window.contains("terminal"), "{window}");
+    assert!(window.contains("add Svalnir"), "{window}");
+    assert!(window.contains("does not give the access to the background agent"));
 
     let mut available = InjectedProbes::healthy();
     available.protected = vec![ProtectedReadOutcome::Listed];
@@ -712,10 +716,29 @@ fn a_state_that_this_build_does_not_recognize_is_not_available() {
 }
 
 #[test]
+fn a_window_has_the_requirements_and_the_verdict_of_a_command() {
+    // The window shows the readings of the commands, so the same
+    // capabilities are required, and a denied one blocks it the same way.
+    let mut probes = InjectedProbes::healthy();
+    let window = build_report(subject(WorkerRole::Window), None, &probes);
+    let cli = build_report(subject(WorkerRole::Cli), None, &probes);
+    assert_eq!(window.summary, cli.summary);
+    assert_eq!(serde_json::to_value(window.subject.role).unwrap(), "window");
+    probes.protected = vec![ProtectedReadOutcome::NotPermitted];
+    let denied = build_report(subject(WorkerRole::Window), None, &probes);
+    assert_eq!(
+        denied.entry(CapabilityId::FullDiskAccess).unwrap().state,
+        CapabilityState::Denied
+    );
+    assert_eq!(denied.summary.verdict, cli.summary.verdict);
+}
+
+#[test]
 fn the_report_names_the_tested_process() {
     let probes = InjectedProbes::healthy();
     for (role, text) in [
         (WorkerRole::Cli, "command-line process"),
+        (WorkerRole::Window, "window process of the graphical client"),
         (WorkerRole::Agent, "background agent process"),
         (WorkerRole::Helper, "privileged helper process"),
     ] {
@@ -788,7 +811,12 @@ fn the_enumerations_have_the_text_of_their_json_spelling() {
             requirement.as_str()
         );
     }
-    for role in [WorkerRole::Cli, WorkerRole::Agent, WorkerRole::Helper] {
+    for role in [
+        WorkerRole::Cli,
+        WorkerRole::Window,
+        WorkerRole::Agent,
+        WorkerRole::Helper,
+    ] {
         assert_eq!(serde_json::to_value(role).unwrap(), role.as_str());
     }
     for verdict in [Verdict::Ready, Verdict::Unverified, Verdict::Blocked] {

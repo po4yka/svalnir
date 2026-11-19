@@ -46,7 +46,8 @@ pub use report::{
 /// Runs each probe on the real host under the identity of this process.
 ///
 /// `role` states which component the calling process is. The function
-/// cannot establish the role itself; the CLI passes [`WorkerRole::Cli`].
+/// cannot establish the role itself; the CLI passes [`WorkerRole::Cli`], and a
+/// window of the graphical client passes [`WorkerRole::Window`].
 pub fn diagnose(role: WorkerRole) -> CapabilityReport {
     build_report(ProbeSubject::current(role), host::now(), &HostProbes::new())
 }

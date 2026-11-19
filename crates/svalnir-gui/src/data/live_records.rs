@@ -1383,7 +1383,7 @@ eligible_groups = ["background-user-applications", "managed-jobs"]
             .unwrap_or_else(|error| panic!("{error}"));
         // One admitted stop operation, with a resource observation of a kind
         // that this build does not know.
-        let mut child = Child::sleeper(directory.path());
+        let mut child = Child::start();
         let plan = stop_plan(&mut child, "plan-live-1", Duration::from_secs(1));
         let lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent)
             .unwrap_or_else(|error| panic!("{error}"));

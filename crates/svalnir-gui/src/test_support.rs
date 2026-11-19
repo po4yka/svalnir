@@ -4,8 +4,9 @@
 
 use crate::data::live_records::collect_processes;
 use std::{
-    path::Path,
-    time::{Duration, SystemTime},
+    path::PathBuf,
+    process::Stdio,
+    time::{Duration, Instant, SystemTime},
 };
 use svalnir_agent::{
     client::{self, StopMode},
@@ -22,18 +23,55 @@ use svalnir_core::{
     time::WallTime,
 };
 
+/// The environment variable that makes [`child_entry`] wait.
+const CHILD_VARIABLE: &str = "SVALNIR_TEST_GUI_CHILD";
+
+/// The full name of [`child_entry`] for the test harness.
+const CHILD_TEST: &str = "test_support::child_entry";
+
+/// The longest life of a child, so that a child that a failed test leaves
+/// does not stay.
+const CHILD_LIFE: Duration = Duration::from_secs(60);
+
+/// The body of a child process. Without the variable, which only
+/// [`Child::start`] sets, it does nothing.
+#[test]
+#[ignore = "the entry of a child process that the tests start"]
+fn child_entry() {
+    if std::env::var_os(CHILD_VARIABLE).is_none() {
+        return;
+    }
+    // The child ends when its life ends or when the test process that
+    // started it does not exist, so a test process that was killed leaves
+    // no child.
+    let parent: u32 = std::os::unix::process::parent_id();
+    let end: Instant = Instant::now() + CHILD_LIFE;
+    while Instant::now() < end && std::os::unix::process::parent_id() == parent {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A child process of the test.
 pub(crate) struct Child(pub(crate) std::process::Child);
 
 impl Child {
-    /// Starts a copy of `/bin/sleep` in `directory` for 30 s. The copy is
-    /// outside the system locations, which the catalog protects.
-    pub(crate) fn sleeper(directory: &Path) -> Self {
-        let sleeper = directory.join("sleeper");
-        std::fs::copy("/bin/sleep", &sleeper).unwrap_or_else(|error| panic!("{error}"));
+    /// Starts this test binary again as a child that runs only
+    /// [`child_entry`]. The test binary is outside the system locations,
+    /// which the catalog protects.
+    ///
+    /// The child is not a copy of a system program such as `/bin/sleep`:
+    /// the kernel can end a copy of a platform binary at a path outside
+    /// the system volume with `SIGKILL (Code Signature Invalid)` some time
+    /// after its start, before the test reads it.
+    pub(crate) fn start() -> Self {
+        let program: PathBuf = std::env::current_exe().unwrap_or_else(|error| panic!("{error}"));
         Self(
-            std::process::Command::new(&sleeper)
-                .arg("30")
+            std::process::Command::new(&program)
+                .args(["--ignored", "--exact", CHILD_TEST])
+                .env(CHILD_VARIABLE, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .unwrap_or_else(|error| panic!("{error}")),
         )

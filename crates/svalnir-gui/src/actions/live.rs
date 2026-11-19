@@ -1175,8 +1175,7 @@ mod tests {
 
     #[test]
     fn the_listed_targets_are_exactly_the_members_of_the_sealed_plan() {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
-        let mut child = Child::sleeper(directory.path());
+        let mut child = Child::start();
         let plan = stop_plan(&mut child, "plan-test-targets", Duration::from_secs(0));
         let members: Vec<(i32, u64, u32)> = plan
             .targets
@@ -1206,11 +1205,18 @@ mod tests {
             .iter()
             .find(|target| target.pid == pid)
             .unwrap_or_else(|| panic!("the child is not listed: {listed:?}"));
+        // The child is this test binary, started again.
+        let program = std::env::current_exe().unwrap_or_else(|error| panic!("{error}"));
+        let name: &str = program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("the test binary has no name"));
+        let name: String = format!("/{name}");
         assert!(
             target
                 .executable
                 .as_deref()
-                .is_some_and(|path| path.ends_with("/sleeper")),
+                .is_some_and(|path| path.ends_with(&name)),
             "{target:?}"
         );
         assert!(target.evidence().contains("user "), "{}", target.evidence());
@@ -1221,7 +1227,7 @@ mod tests {
         let (directory, path) = state_directory();
         let _lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent)
             .unwrap_or_else(|error| panic!("{error}"));
-        let mut child = Child::sleeper(directory.path());
+        let mut child = Child::start();
         let plan = stop_plan(&mut child, "plan-test-stale", Duration::from_secs(600));
         let plan_id = plan.plan_id.clone();
         let proposal = Arc::new(StopProposal {
@@ -1254,7 +1260,7 @@ mod tests {
     #[test]
     fn a_stop_that_is_not_admitted_in_the_wait_is_followed_until_its_admission() {
         let (directory, path) = state_directory();
-        let mut child = Child::sleeper(directory.path());
+        let mut child = Child::start();
         let plan = stop_plan(&mut child, "plan-test-late", Duration::from_secs(1));
         let (admit, admitted) = std::sync::mpsc::channel::<()>();
         // The test agent claims the request only after the wait of the

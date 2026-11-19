@@ -8,6 +8,7 @@ pub mod data;
 pub mod platform;
 pub mod screens;
 pub mod shell;
+pub mod status_item;
 #[cfg(test)]
 mod test_support;
 pub mod theme;

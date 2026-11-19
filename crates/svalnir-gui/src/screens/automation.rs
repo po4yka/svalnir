@@ -216,8 +216,8 @@ fn pause_controls(
     }
 }
 
-/// The length of the timed pause.
-const PAUSE_HOUR: Duration = Duration::from_secs(3600);
+/// The length of the timed pause. The menu bar item uses it too.
+pub const PAUSE_HOUR: Duration = Duration::from_secs(3600);
 
 fn state_card(
     automation: &Shown<AutomationSnapshot>,

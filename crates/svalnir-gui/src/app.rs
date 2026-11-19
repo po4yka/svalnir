@@ -25,7 +25,7 @@ use gpui_kit::{
     component::TitleBar,
     px, size,
 };
-use std::{path::PathBuf, process::ExitCode, sync::Arc};
+use std::{path::PathBuf, process::ExitCode, rc::Rc, sync::Arc};
 
 /// The usage text of `--help`.
 pub const USAGE: &str = "Usage: svalnir-gui [OPTIONS]
@@ -58,6 +58,8 @@ Options:
                        operation OPERATION on History
   --open-stop          With --fixture only: open the stop confirmation of
                        the first group that the catalog does not protect
+  --no-status-item     Add no item to the menu bar. The client then quits
+                       when its last window closes
   --help               Print this text
 ";
 
@@ -118,6 +120,8 @@ pub struct LaunchOptions {
     /// Whether the stop confirmation of the first group that the catalog
     /// does not protect opens at launch.
     pub open_stop: bool,
+    /// Whether the menu bar item is off.
+    pub no_status_item: bool,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -255,6 +259,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                 );
             }
             "--open-stop" => options.open_stop = true,
+            "--no-status-item" => options.no_status_item = true,
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -344,6 +349,22 @@ pub fn open_main_window_seeded(
     readings: usize,
     cx: &mut App,
 ) -> gpui_kit::Result<(AnyWindowHandle, Entity<MainWindow>)> {
+    let model: Entity<AppModel> = cx.new(|cx| AppModel::new_seeded(source, readings, cx));
+    open_main_window_with_model(bounds, model, appearance, cx)
+}
+
+/// Opens the main window with `bounds` on a model that already exists, so
+/// that a window that opens again shows the same readings and actions.
+///
+/// # Errors
+///
+/// Returns the platform error when the window cannot open.
+pub fn open_main_window_with_model(
+    bounds: Bounds<Pixels>,
+    model: Entity<AppModel>,
+    appearance: Option<ForcedAppearance>,
+    cx: &mut App,
+) -> gpui_kit::Result<(AnyWindowHandle, Entity<MainWindow>)> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
@@ -354,12 +375,54 @@ pub fn open_main_window_seeded(
             Some(forced) => apply::install_fixed(forced.window_appearance(), cx),
             None => apply::install(window, cx),
         }
-        let model: Entity<AppModel> = cx.new(|cx| AppModel::new_seeded(source, readings, cx));
         cx.new(|cx| MainWindow::new(model, window, cx))
     })
 }
 
-/// Runs the client until the last window closes. A bad argument prints the
+/// What the client does when its last window closed. With no menu bar item
+/// (`item` is false), it quits. With the item, it keeps running: no screen is
+/// in front, so the model reads only the host, the agent, and the standing
+/// topics of the item, at the inactive interval, and a stop dialog that was
+/// open closes with no record, as when the user closes it.
+pub fn after_last_window_closed(item: bool, model: &Entity<AppModel>, cx: &mut App) {
+    if !item {
+        cx.quit();
+        return;
+    }
+    model.update(cx, |model, cx| {
+        model.set_active(false, cx);
+        model.set_topics(&[], cx);
+        model.close_stop(cx);
+    });
+}
+
+/// Brings the main window to the front, or opens it again on `model` when
+/// no window is open.
+fn show_main_window(
+    model: &Entity<AppModel>,
+    appearance: Option<ForcedAppearance>,
+    window_size: (f32, f32),
+    cx: &mut App,
+) {
+    if let Some(handle) = cx.windows().first().copied() {
+        if handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_err()
+        {
+            tracing::debug!("the window closed before it came to the front");
+        }
+    } else {
+        let bounds = Bounds::centered(None, size(px(window_size.0), px(window_size.1)), cx);
+        if let Err(error) = open_main_window_with_model(bounds, model.clone(), appearance, cx) {
+            tracing::error!(%error, "cannot open the main window");
+            return;
+        }
+    }
+    cx.activate(true);
+}
+
+/// Runs the client until the last window closes, or with the menu bar
+/// item, until Quit Svalnir. A bad argument prints the
 /// reason and exits with code 2.
 pub fn run() -> ExitCode {
     let options: LaunchOptions = match parse_args(std::env::args().skip(1)) {
@@ -387,73 +450,82 @@ pub fn run() -> ExitCode {
         ),
         None => Arc::new(LiveSource::from_environment()),
     };
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx: &mut App| {
-            gpui_kit::init(cx);
-            if options.reduce_motion {
-                set_reduce_motion_preference(ReduceMotionPreference::Reduce, cx);
-            }
-            fonts::register(cx);
-            nav::bind_keys(cx);
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    // A launch of the application while it runs with no window open, for
+    // example from the Dock, opens the window that the menu bar item opens.
+    application.on_reopen(crate::status_item::show_window);
+    application.run(move |cx: &mut App| {
+        gpui_kit::init(cx);
+        if options.reduce_motion {
+            set_reduce_motion_preference(ReduceMotionPreference::Reduce, cx);
+        }
+        fonts::register(cx);
+        nav::bind_keys(cx);
 
-            cx.on_window_closed(|cx, _window_id| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
+        let (width, height): (f32, f32) = options
+            .size
+            .map_or(DEFAULT_SIZE, |(w, h)| (f32::from(w), f32::from(h)));
+        // The model belongs to the application, not to the window: the
+        // menu bar item reads it while no window is open.
+        let readings: usize = options.readings.unwrap_or(0);
+        let model: Entity<AppModel> = cx.new(|cx| AppModel::new_seeded(source, readings, cx));
 
-            let (width, height): (f32, f32) = options
-                .size
-                .map_or(DEFAULT_SIZE, |(w, h)| (f32::from(w), f32::from(h)));
-            let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-            let (handle, view) = match open_main_window_seeded(
-                bounds,
-                source,
-                options.appearance,
-                options.readings.unwrap_or(0),
-                cx,
-            ) {
-                Ok((handle, view)) => (handle, view),
-                Err(error) => {
-                    tracing::error!(%error, "cannot open the main window");
-                    cx.quit();
-                    return;
-                }
-            };
-            if let Some(screen) = options.screen {
-                view.update(cx, |view, cx| view.select(screen, cx));
+        let appearance: Option<ForcedAppearance> = options.appearance;
+        let item: bool = !options.no_status_item && {
+            let shown: Entity<AppModel> = model.clone();
+            let show: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                show_main_window(&shown, appearance, (width, height), cx);
+            });
+            crate::status_item::install(model.clone(), show, cx)
+        };
+        let closed: Entity<AppModel> = model.clone();
+        cx.on_window_closed(move |cx, _window_id| {
+            if cx.windows().is_empty() {
+                after_last_window_closed(item, &closed, cx);
             }
-            if options.sidebar_narrow.is_some() {
-                view.update(cx, |view, cx| {
-                    view.set_sidebar_choice(options.sidebar_narrow, cx);
-                });
+        })
+        .detach();
+        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+        let (handle, view) = match open_main_window_with_model(bounds, model, appearance, cx) {
+            Ok((handle, view)) => (handle, view),
+            Err(error) => {
+                tracing::error!(%error, "cannot open the main window");
+                cx.quit();
+                return;
             }
-            if let Some(layout) = options.layout {
-                view.update(cx, |view, cx| view.set_storage_layout(layout, cx));
-            }
-            if let Some(target) = options.focus {
-                request_launch_focus(target, cx);
-            }
-            if let Some(operation) = &options.detail {
-                view.update(cx, |view, cx| view.show_history_detail(operation, cx));
-            }
-            if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
-                open_fixture_stop(handle, &view, scenario, cx);
-            }
-            if let Some(root) = &options.scan {
-                let model: Entity<AppModel> = view.read(cx).model().clone();
-                let rescan: bool = options.rescan;
-                model.update(cx, |model, cx| {
-                    model.set_rescan_once(rescan);
-                    model.start_scan(root, cx);
-                });
-            }
-            // A window that is not in front gets no frame, so its values stay
-            // at the first paint.
-            cx.activate(true);
-        });
+        };
+        if let Some(screen) = options.screen {
+            view.update(cx, |view, cx| view.select(screen, cx));
+        }
+        if options.sidebar_narrow.is_some() {
+            view.update(cx, |view, cx| {
+                view.set_sidebar_choice(options.sidebar_narrow, cx);
+            });
+        }
+        if let Some(layout) = options.layout {
+            view.update(cx, |view, cx| view.set_storage_layout(layout, cx));
+        }
+        if let Some(target) = options.focus {
+            request_launch_focus(target, cx);
+        }
+        if let Some(operation) = &options.detail {
+            view.update(cx, |view, cx| view.show_history_detail(operation, cx));
+        }
+        if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
+            open_fixture_stop(handle, &view, scenario, cx);
+        }
+        if let Some(root) = &options.scan {
+            let model: Entity<AppModel> = view.read(cx).model().clone();
+            let rescan: bool = options.rescan;
+            model.update(cx, |model, cx| {
+                model.set_rescan_once(rescan);
+                model.start_scan(root, cx);
+            });
+        }
+        // A window that is not in front gets no frame, so its values stay
+        // at the first paint.
+        cx.activate(true);
+    });
     ExitCode::SUCCESS
 }
 
@@ -509,6 +581,7 @@ mod tests {
             "--detail",
             "op-1",
             "--open-stop",
+            "--no-status-item",
             "--help",
         ]);
         assert_eq!(
@@ -528,6 +601,7 @@ mod tests {
                 actions: Some(ActionScript::Refuse),
                 detail: Some("op-1".to_owned()),
                 open_stop: true,
+                no_status_item: true,
                 help: true,
             })
         );

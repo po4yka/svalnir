@@ -228,6 +228,9 @@ pub struct AppModel {
     pub diagnostics: Loadable<DiagnosticsSnapshot>,
     /// The topics that the screen in front shows.
     topics: Vec<Topic>,
+    /// The topics that a view outside the window, the menu bar item, reads
+    /// at each poll, also while no window is open.
+    standing: Vec<Topic>,
     /// The path of the state-changing actions.
     port: Arc<dyn ActionPort>,
     /// The state of each control after its last action, and the stop plans
@@ -304,6 +307,7 @@ impl AppModel {
             history_records: Loadable::Loading,
             diagnostics: Loadable::Loading,
             topics: Vec::new(),
+            standing: Vec::new(),
             scan: ScanState::Idle,
             scan_notice: None,
             default_root: None,
@@ -661,10 +665,30 @@ impl AppModel {
         &self.topics
     }
 
+    /// Sets the topics that the model reads at each poll whatever screen is
+    /// in front, and reads them now.
+    pub fn set_standing_topics(&mut self, topics: &[Topic], cx: &mut Context<Self>) {
+        self.standing = topics.to_vec();
+        self.refresh_topics(false, cx);
+    }
+
+    /// The topics that the model reads at each poll whatever screen is in
+    /// front.
+    #[must_use]
+    pub fn standing_topics(&self) -> &[Topic] {
+        &self.standing
+    }
+
     /// Starts the reads of the topics. The capability probes start a
     /// process, so they run only when `probes` is true.
     fn refresh_topics(&mut self, probes: bool, cx: &mut Context<Self>) {
-        for topic in self.topics.clone() {
+        let mut topics: Vec<Topic> = self.topics.clone();
+        for topic in &self.standing {
+            if !topics.contains(topic) {
+                topics.push(*topic);
+            }
+        }
+        for topic in topics {
             match topic {
                 Topic::Memory => start_read!(
                     self,

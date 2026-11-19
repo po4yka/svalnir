@@ -17,9 +17,12 @@ name = "svalnir-gui"
 path = "src/main.rs"
 
 [dependencies]
+block2.workspace = true
 gpui-kit.workspace = true
 libc.workspace = true
+objc2.workspace = true
 objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
 svalnir-agent.workspace = true
 svalnir-core.workspace = true
 tracing.workspace = true

@@ -313,7 +313,7 @@ fn operation_table(
                     origin,
                     tokens,
                 ),
-                3,
+                4,
                 false,
             ))
             .child(cell(classes, 4, false))
@@ -328,7 +328,7 @@ fn operation_table(
             TableHeader::new().child(
                 TableRow::new()
                     .child(head("Operation", 3, false, tokens))
-                    .child(head("Trigger", 3, false, tokens))
+                    .child(head("Trigger", 4, false, tokens))
                     .child(head("Action classes", 4, false, tokens))
                     .child(head("Steps", 3, false, tokens))
                     .child(head("State", 3, false, tokens))

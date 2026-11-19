@@ -106,32 +106,38 @@ fn a_stale_expected_revision_is_a_conflict_and_overwrites_nothing() {
     );
     // The client expects an earlier revision.
     request.expected_revision = Some(revision_id("policy_0"));
-    assert!(matches!(
+    assert_eq!(
         activate(&state, &request, &registry()),
         Err(ActivationRefusal::RevisionConflict {
+            expected: Some(revision_id("policy_0")),
+            active: Some(revision_id("policy_1")),
             content_is_active: false,
-            ..
         })
-    ));
+    );
     // A client that lost the reply of its apply sees that its content is
     // in effect.
     let mut retry = activation(&state, &config, "policy_2");
     retry.expected_revision = None;
-    assert!(matches!(
+    assert_eq!(
         activate(&state, &retry, &registry()),
         Err(ActivationRefusal::RevisionConflict {
+            expected: None,
+            active: Some(revision_id("policy_1")),
             content_is_active: true,
-            ..
         })
-    ));
+    );
     // A client expects a revision, and none is in effect.
     let empty = AuthorityState::new(USER);
     let mut request = activation(&empty, &config, "policy_1");
     request.expected_revision = Some(revision_id("policy_1"));
-    assert!(matches!(
+    assert_eq!(
         activate(&empty, &request, &registry()),
-        Err(ActivationRefusal::RevisionConflict { active: None, .. })
-    ));
+        Err(ActivationRefusal::RevisionConflict {
+            expected: Some(revision_id("policy_1")),
+            active: None,
+            content_is_active: false,
+        })
+    );
 }
 
 #[test]
@@ -1012,4 +1018,225 @@ fn the_durable_record_refuses_an_unknown_key_and_an_absent_optional_key() {
             .is_some()
     );
     assert!(serde_json::from_value::<AuthorityState>(no_expiry).is_err());
+}
+
+// Limits of the generation, shared identities, and the order of the checks.
+
+#[test]
+fn a_disable_at_the_largest_generation_revokes_the_grant_and_keeps_the_generation() {
+    let mut state = enabled_state();
+    state.guards[0].grant.as_mut().unwrap().generation = Generation::MAX;
+    let acknowledged = durable(disable(&state, &disable_request(DISK)).unwrap());
+    let next = acknowledged.state;
+    assert_eq!(grant(&next, DISK).generation, Generation::MAX);
+    assert!(grant(&next, DISK).revoked);
+    assert_eq!(
+        acknowledged.report.grant.unwrap().generation,
+        Generation::MAX
+    );
+    // The identity cannot continue: a new enable needs a new identity.
+    assert_eq!(
+        enable(
+            &next,
+            &enable_request(&next, DISK, &[Acceptance::PermanentEviction])
+        )
+        .unwrap_err(),
+        EnableRefusal::GrantIdInUse
+    );
+
+    // One step below the largest generation, the grant is not revoked.
+    let mut state = enabled_state();
+    let below = Generation::new(u64::MAX - 1);
+    state.guards[0].grant.as_mut().unwrap().generation = below;
+    let next = durable(disable(&state, &disable_request(DISK)).unwrap()).state;
+    assert_eq!(grant(&next, DISK).generation, Generation::MAX);
+    assert!(!grant(&next, DISK).revoked);
+}
+
+#[test]
+fn a_revocation_restricts_each_guard_that_has_the_grant_identity() {
+    let mut state = enabled_state();
+    state.guards[1].grant.as_mut().unwrap().grant_id = grant_id("grant_disk");
+    let change = revoke(&state, &revoke_request("grant_disk")).unwrap();
+    assert_eq!(change.report.policy, DISK);
+    let acknowledged = durable(change);
+    assert!(!acknowledged.report.unchanged);
+    let next = acknowledged.state;
+    for policy in [DISK, MEMORY] {
+        assert!(grant(&next, policy).revoked, "{policy:?}");
+        assert_eq!(grant(&next, policy).generation, Generation::new(2));
+        assert_eq!(standing(&next, policy), GuardStanding::GrantRevoked);
+    }
+
+    // When the write fails, the instance inhibits both guards.
+    let failed = revoke(&state, &revoke_request("grant_disk"))
+        .unwrap()
+        .acknowledge(&none(), Persistence::Failed);
+    assert_eq!(
+        failed.inhibition.guards,
+        [
+            InhibitedGuard {
+                policy: DISK,
+                cause: InhibitionCause::Revoke,
+            },
+            InhibitedGuard {
+                policy: MEMORY,
+                cause: InhibitionCause::Revoke,
+            },
+        ]
+    );
+    assert_eq!(failed.state, state);
+}
+
+#[test]
+fn an_activation_at_the_largest_generation_leaves_the_grant_bound_to_the_earlier_revision() {
+    let mut state = enabled_state();
+    state.guards[0].grant.as_mut().unwrap().generation = Generation::MAX;
+    let (next, report) = activated(&state, &config_without_force(), "policy_2");
+    assert_eq!(report.guards[0].effect, ScopeEffect::Neutral);
+    assert_eq!(report.guards[0].standing, GuardStanding::AcceptanceRequired);
+    assert_eq!(report.guards[0].uncovered, []);
+    assert_eq!(grant(&next, DISK).generation, Generation::MAX);
+    assert_eq!(grant(&next, DISK).policy_revision, revision_id("policy_1"));
+    assert_eq!(standing(&next, DISK), GuardStanding::AcceptanceRequired);
+    // The other guard continues.
+    assert_eq!(grant(&next, MEMORY).generation, Generation::new(2));
+    assert_eq!(standing(&next, MEMORY), GuardStanding::Active);
+}
+
+#[test]
+fn a_grant_with_an_expiry_after_now_is_active() {
+    let mut state = enabled_state();
+    state.guards[0].grant.as_mut().unwrap().expires_at = Some(wall(31));
+    assert_eq!(standing(&state, DISK), GuardStanding::Active);
+}
+
+#[test]
+fn a_duplicated_guard_entry_is_unchanged_by_a_disable_and_replaced_by_an_enable() {
+    let mut state = enabled_state();
+    let duplicate = state.guard(DISK).unwrap().clone();
+    state.guards.push(duplicate);
+    let change = disable(&state, &disable_request(DISK)).unwrap();
+    assert!(change.report.unchanged);
+    assert_eq!(change.report.grant, None);
+    // The identity of the duplicated grants is in use.
+    let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
+    assert_eq!(
+        enable(&state, &request).unwrap_err(),
+        EnableRefusal::GrantIdInUse
+    );
+    request.grant_id = grant_id("grant_disk_2");
+    let next = durable(enable(&state, &request).unwrap()).state;
+    let entries = next.guards.iter().filter(|one| one.policy == DISK).count();
+    assert_eq!(entries, 1);
+    assert_eq!(grant(&next, DISK).grant_id, grant_id("grant_disk_2"));
+    assert_eq!(grant(&next, DISK).generation, Generation::new(1));
+    assert_eq!(standing(&next, DISK), GuardStanding::Active);
+}
+
+#[test]
+fn a_disable_of_a_guard_with_no_entry_changes_nothing() {
+    let state = active_state(&base_config());
+    let change = disable(&state, &disable_request(DISK)).unwrap();
+    assert!(change.report.unchanged);
+    assert_eq!(change.report.grant, None);
+    assert!(!change.needs_persistence());
+}
+
+#[test]
+fn a_disable_of_an_enabled_guard_with_no_grant_clears_the_enabled_flag() {
+    let mut state = enabled_state();
+    state.guards[0].grant = None;
+    let change = disable(&state, &disable_request(DISK)).unwrap();
+    assert!(!change.report.unchanged);
+    assert_eq!(change.report.grant, None);
+    let next = durable(change).state;
+    assert!(!next.guard(DISK).unwrap().enabled);
+    assert_eq!(standing(&next, DISK), GuardStanding::Disabled);
+}
+
+#[test]
+fn an_accepted_class_that_occurs_two_times_counts_one_time() {
+    let state = active_state(&base_config());
+    let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
+    request.accepted.push(ActionClass::from_wire("EmptyTrash"));
+    request.accepted.push(ActionClass::from_wire("EmptyTrash"));
+    assert_eq!(
+        enable(&state, &request).unwrap_err(),
+        EnableRefusal::AcceptanceMismatch {
+            missing: Vec::new(),
+            excess: vec![ActionClass::from_wire("EmptyTrash")],
+        }
+    );
+    let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
+    request.accepted = vec![
+        ActionClass::EvictRegenerableData,
+        ActionClass::EvictRegenerableData,
+    ];
+    let next = durable(enable(&state, &request).unwrap()).state;
+    assert_eq!(
+        grant(&next, DISK).action_classes,
+        [ActionClass::EvictRegenerableData]
+    );
+}
+
+#[test]
+fn an_enable_replaces_an_expired_grant_with_a_larger_generation_and_no_expiry() {
+    let mut state = enabled_state();
+    state.guards[0].grant.as_mut().unwrap().expires_at = Some(wall(10));
+    assert_eq!(standing(&state, DISK), GuardStanding::GrantExpired);
+    let change = enable(
+        &state,
+        &enable_request(&state, DISK, &[Acceptance::PermanentEviction]),
+    )
+    .unwrap();
+    assert!(!change.report.unchanged);
+    let next = durable(change).state;
+    assert_eq!(grant(&next, DISK).grant_id, grant_id("grant_disk"));
+    assert_eq!(grant(&next, DISK).generation, Generation::new(2));
+    assert_eq!(grant(&next, DISK).expires_at, None);
+    assert_eq!(standing(&next, DISK), GuardStanding::Active);
+}
+
+#[test]
+fn an_enable_replaces_the_principal_of_a_grant_of_another_user() {
+    let mut state = enabled_state();
+    state.guards[0].grant.as_mut().unwrap().principal = Uid::new(502);
+    assert_eq!(standing(&state, DISK), GuardStanding::AcceptanceRequired);
+    let next = enabled(&state, DISK, &[Acceptance::PermanentEviction]);
+    assert_eq!(grant(&next, DISK).principal, USER);
+    assert_eq!(grant(&next, DISK).generation, Generation::new(2));
+    assert_eq!(standing(&next, DISK), GuardStanding::Active);
+}
+
+#[test]
+fn the_profile_is_checked_before_the_request_of_the_guard_by_an_enable_only() {
+    let config = config(&[
+        (r#"profile = "balanced""#, r#"profile = "observe""#),
+        (
+            "[disk_guard]\nenabled = true",
+            "[disk_guard]\nenabled = false",
+        ),
+    ]);
+    let state = active_state(&config);
+    assert_eq!(
+        enable(
+            &state,
+            &enable_request(&state, DISK, &[Acceptance::PermanentEviction])
+        )
+        .unwrap_err(),
+        EnableRefusal::ObserveProfile
+    );
+    assert_eq!(standing(&state, DISK), GuardStanding::NotRequested);
+}
+
+#[test]
+fn an_enable_checks_the_principal_before_the_active_revision() {
+    let state = AuthorityState::new(USER);
+    let mut request = enable_request(&state, DISK, &[Acceptance::PermanentEviction]);
+    request.principal = Uid::new(502);
+    assert_eq!(
+        enable(&state, &request).unwrap_err(),
+        EnableRefusal::WrongPrincipal
+    );
 }

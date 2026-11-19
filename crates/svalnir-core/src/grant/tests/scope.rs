@@ -5,8 +5,8 @@ use super::super::{
     ScopeDifferenceKind, ScopeEffect, ScopeError, ScopeSubject, difference, effect_on,
 };
 use super::{
-    DERIVED_DATA, LAYOUT, Registry, TEMPORARY, automatic, base_config, config, declaration,
-    registry, rule, rule_ref,
+    DERIVED_DATA, Registry, TEMPORARY, automatic, base_config, config, declaration, registry, rule,
+    rule_ref,
 };
 use crate::action::{ActionClass, Checked, Escalation};
 use crate::config::ValidatedConfig;
@@ -133,7 +133,6 @@ fn a_rule_that_the_registry_cannot_resolve_gives_no_scope() {
     // refuses its automatic use.
     let proposed = super::registry_with(&LifecycleState::Proposed);
     assert_eq!(PolicyScope::of(&config, &proposed).unwrap(), scope(&config));
-    assert_eq!(LAYOUT, "layout-v1");
 }
 
 #[test]
@@ -647,4 +646,95 @@ fn the_effect_on_a_guard_is_the_widest_effect_that_applies_to_it() {
         serde_json::from_value::<ScopeDifference>(json).unwrap(),
         *exception
     );
+}
+
+/// The differences from the base configuration with `changes` to the base
+/// configuration: the opposite direction of [`changed`].
+fn reversed(changes: &[(&str, &str)]) -> Vec<ScopeDifference> {
+    difference(&scope(&config(changes)), &scope(&base_config()))
+}
+
+#[test]
+fn a_difference_in_the_opposite_direction_has_the_opposite_effect() {
+    let groups = reversed(&[(
+        r#"["background-user-applications", "managed-jobs"]"#,
+        r#"["managed-jobs"]"#,
+    )]);
+    let one = only(&groups);
+    assert_eq!(one.kind, ScopeDifferenceKind::EligibleRoot);
+    assert_eq!(one.change, ScopeChange::Added);
+    assert_eq!(one.effect, ScopeEffect::Widening);
+
+    let budget = reversed(&[(
+        "restart = \"never\"\n",
+        "restart = \"never\"\n\n[[memory_guard.app_budgets]]\nid = \"render\"\n\
+         bundle_id = \"com.example.Render\"\nfootprint_soft = \"1GiB\"\n\
+         footprint_stop = \"2GiB\"\nover_limit_for = \"30s\"\ncooldown = \"10m\"\n",
+    )]);
+    let one = only(&budget);
+    assert_eq!(
+        one.subject,
+        ScopeSubject::AppBudget {
+            budget: "render=com.example.Render".to_owned()
+        }
+    );
+    assert_eq!(one.change, ScopeChange::Removed);
+    assert_eq!(one.effect, ScopeEffect::Narrowing);
+}
+
+#[test]
+fn a_protection_that_is_added_narrows_and_a_protection_that_is_removed_widens() {
+    let bundle = changed(&[(
+        r#"protected_bundle_ids = ["com.example.Protected"]"#,
+        r#"protected_bundle_ids = ["com.example.Protected", "com.example.Other"]"#,
+    )]);
+    let one = only(&bundle);
+    assert_eq!(one.change, ScopeChange::Added);
+    assert_eq!(one.effect, ScopeEffect::Narrowing);
+    assert_eq!(one.guards, AffectedGuards::MemoryGuard);
+
+    let executable = changed(&[(
+        r#"protected_executable_paths = ["/Applications/Keep.app"]"#,
+        "protected_executable_paths = []",
+    )]);
+    let one = only(&executable);
+    assert_eq!(one.change, ScopeChange::Removed);
+    assert_eq!(one.effect, ScopeEffect::Widening);
+    assert_eq!(one.guards, AffectedGuards::MemoryGuard);
+
+    let foreground = reversed(&[("protect_foreground = true", "protect_foreground = false")]);
+    let one = only(&foreground);
+    assert_eq!(one.subject, ScopeSubject::ForegroundProtection);
+    assert_eq!(one.effect, ScopeEffect::Narrowing);
+}
+
+#[test]
+fn the_critical_memory_exception_that_is_removed_is_narrowing() {
+    let differences = reversed(&[(
+        "allow_volatile_journal_on_critical = false",
+        "allow_volatile_journal_on_critical = true",
+    )]);
+    let one = only(&differences);
+    assert_eq!(one.kind, ScopeDifferenceKind::RecordingException);
+    assert_eq!(one.subject, ScopeSubject::VolatileJournalOnCritical);
+    assert_eq!(one.effect, ScopeEffect::Narrowing);
+}
+
+#[test]
+fn a_larger_recovery_threshold_is_widening_like_a_smaller_one() {
+    let differences = changed(&[(
+        r#"footprint_recover = "3GiB""#,
+        r#"footprint_recover = "4GiB""#,
+    )]);
+    let one = only(&differences);
+    assert_eq!(
+        one.subject,
+        threshold("memory_guard.app_budgets[build-worker].footprint_recover")
+    );
+    assert_eq!(one.effect, ScopeEffect::Widening);
+}
+
+#[test]
+fn two_scopes_of_no_configuration_have_no_difference() {
+    assert_eq!(difference(&PolicyScope::none(), &PolicyScope::none()), []);
 }

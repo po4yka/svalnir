@@ -1,5 +1,10 @@
 //! Screens of the client.
 
+pub mod applications;
+pub mod automation;
+pub mod common;
+pub mod diagnostics;
+pub mod history;
+pub mod memory;
 pub mod overview;
-pub mod placeholder;
 pub mod storage;

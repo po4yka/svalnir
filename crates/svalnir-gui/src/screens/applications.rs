@@ -1,0 +1,397 @@
+//! The Applications screen: the application and job groups with their
+//! verified members, their footprint, and their hard protection. The screen
+//! shows state only; it has no control that stops an application.
+
+use super::common::{
+    CardWidth, Shown, body_line, bytes_text, caption, card, cell, fact, failed_body, head,
+    mono_text, screen, shown, skeleton_rows, stale_line,
+};
+use crate::{
+    data::{
+        model::Measured,
+        records::{ApplicationRow, Foreground, ProcessesSnapshot, Protection},
+        store::AppModel,
+    },
+    theme::tokens::{self, Tokens},
+    ui::{
+        pill::{MonoTag, StatusPill, Tone},
+        provenance::ProvenanceLine,
+        surface::ShellHeader,
+    },
+};
+use gpui_kit::{
+    AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
+    TestSupportExt as _, Window,
+    component::{
+        ActiveTheme as _, IconName, Sizable as _, h_flex,
+        table::{Table, TableBody, TableHeader, TableRow},
+        v_flex,
+    },
+    div,
+    prelude::*,
+};
+use std::time::SystemTime;
+
+/// The pill text and tone of a hard protection. `Unknown` is a warning: the
+/// lookup gave no result, and automation skips such a target.
+#[must_use]
+pub const fn protection_pill(protection: Protection) -> (&'static str, Tone) {
+    match protection {
+        Protection::Protected => ("Protected", Tone::Brand),
+        Protection::NotProtected => ("Not protected", Tone::Neutral),
+        Protection::Unknown => ("Unknown", Tone::Warning),
+    }
+}
+
+/// The text of a foreground state. `Unknown` is not `Background`.
+#[must_use]
+pub const fn foreground_text(foreground: Foreground) -> &'static str {
+    match foreground {
+        Foreground::Foreground => "Foreground",
+        Foreground::Background => "Background",
+        Foreground::Unknown => "Not known",
+    }
+}
+
+/// The footprint text of a group and whether the sum is partial: a member
+/// with no footprint value is not in the sum.
+#[must_use]
+pub fn group_footprint(row: &ApplicationRow) -> (String, bool) {
+    (
+        bytes_text(&row.footprint),
+        matches!(row.footprint, Measured::Value(_)) && row.unmeasured_members > 0,
+    )
+}
+
+/// The accessible sentence of one group row.
+#[must_use]
+pub fn group_label(row: &ApplicationRow) -> String {
+    let (footprint, partial) = group_footprint(row);
+    let footprint: String = match (&row.footprint, partial) {
+        (Measured::Unavailable(reason), _) => format!("footprint not available: {reason}"),
+        (Measured::Value(_), true) => format!(
+            "footprint {footprint}, partial: {} of {} processes have no value",
+            row.unmeasured_members, row.members
+        ),
+        (Measured::Value(_), false) => format!("footprint {footprint}"),
+    };
+    format!(
+        "{}, {}, {} processes, {footprint}, protection: {}",
+        row.name,
+        row.kind.label(),
+        row.members,
+        protection_pill(row.protection).0
+    )
+}
+
+/// The sentence that says how many groups the table shows.
+#[must_use]
+pub fn group_summary(snapshot: &ProcessesSnapshot) -> String {
+    format!(
+        "{} of {} groups with a verified member. {} of {} processes of this user have no verified group and are in no row.",
+        snapshot.applications.len(),
+        snapshot.application_count,
+        snapshot.unattributed,
+        snapshot.process_count
+    )
+}
+
+/// The Applications screen entity.
+#[derive(Debug)]
+pub struct ApplicationsScreen {
+    model: Entity<AppModel>,
+    activation: u64,
+}
+
+impl ApplicationsScreen {
+    /// Creates the screen and observes the model.
+    pub fn new(model: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&model, |_, _, cx| cx.notify()).detach();
+        Self {
+            model,
+            activation: 1,
+        }
+    }
+
+    /// Marks a new activation of the screen: the cards enter again.
+    pub fn activate(&mut self, cx: &mut Context<Self>) {
+        self.activation += 1;
+        cx.notify();
+    }
+}
+
+fn group_table(
+    snapshot: &ProcessesSnapshot,
+    stale: bool,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let rows = snapshot.applications.iter().map(|row| {
+        let (footprint, partial) = group_footprint(row);
+        let (protection, tone) = protection_pill(row.protection);
+        let mut size = h_flex()
+            .gap(tokens::SPACE_2)
+            .items_center()
+            .child(mono_text(footprint, mono, stale, tokens));
+        if partial {
+            size = size.child(MonoTag::new(
+                SharedString::from(format!("applications-partial-{}", row.instance)),
+                "partial",
+            ));
+        }
+        TableRow::new()
+            .id(SharedString::from(format!(
+                "applications-row-{}",
+                row.instance
+            )))
+            .child(cell(
+                div()
+                    .id(SharedString::from(format!(
+                        "applications-name-{}",
+                        row.instance
+                    )))
+                    .test_support()
+                    .aria_label(group_label(row))
+                    .min_w_0()
+                    .child(mono_text(row.name.clone(), mono, false, tokens)),
+                4,
+                false,
+            ))
+            .child(cell(row.kind.label(), 2, false))
+            .child(cell(
+                mono_text(row.members.to_string(), mono, true, tokens),
+                1,
+                true,
+            ))
+            .child(cell(size, 2, true))
+            .child(cell(foreground_text(row.foreground), 2, false))
+            .child(cell(
+                StatusPill::new(protection, tone).id(SharedString::from(format!(
+                    "applications-protection-{}",
+                    row.instance
+                ))),
+                2,
+                false,
+            ))
+    });
+    Table::new()
+        .small()
+        .accessibility_label("Application and job groups by physical footprint")
+        .child(
+            TableHeader::new().child(
+                TableRow::new()
+                    .child(head("Application or job", 4, false, tokens))
+                    .child(head("Kind", 2, false, tokens))
+                    .child(head("Processes", 1, true, tokens))
+                    .child(head("Footprint", 2, true, tokens))
+                    .child(head("Foreground", 2, false, tokens))
+                    .child(head("Hard protection", 2, false, tokens)),
+            ),
+        )
+        .child(TableBody::new().children(rows))
+        .into_any_element()
+}
+
+fn groups_card(
+    processes: &Shown<ProcessesSnapshot>,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let header: ShellHeader = ShellHeader::new(IconName::Cpu, "Applications and jobs")
+        .subtitle("Sum of the physical footprint of the verified members");
+    let body: AnyElement = match processes {
+        Shown::Loading => skeleton_rows(6),
+        Shown::Failed(reason) => failed_body("applications-value", reason, tokens),
+        Shown::Data { value, stale_age } => {
+            let mut body = v_flex().gap(tokens::SPACE_3);
+            if value.applications.is_empty() {
+                body = body.child(body_line(
+                    "applications-empty",
+                    "The reading has no application or job with a verified member.",
+                    true,
+                    tokens,
+                ));
+            } else {
+                body = body.child(group_table(value, stale_age.is_some(), mono, tokens));
+            }
+            body = body.child(caption(
+                "applications-summary",
+                group_summary(value),
+                tokens,
+            ));
+            if let Some(age) = stale_age {
+                body = body.child(stale_line("applications-stale", age, tokens));
+            }
+            body = body.child(
+                ProvenanceLine::new(value.source, value.captured_at, "processes of this user")
+                    .id("applications-provenance"),
+            );
+            body.into_any_element()
+        }
+    };
+    card(header, body)
+}
+
+fn attribution_card(
+    processes: &Shown<ProcessesSnapshot>,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let header: ShellHeader = ShellHeader::new(IconName::Network, "Attribution")
+        .subtitle("Only positive evidence makes a process a member");
+    let body: AnyElement = match processes {
+        Shown::Loading => skeleton_rows(4),
+        Shown::Failed(reason) => failed_body("attribution-value", reason, tokens),
+        Shown::Data { value, stale_age } => {
+            let stale: bool = stale_age.is_some();
+            let mut body = v_flex().gap(tokens::SPACE_2);
+            for (id, label, count) in [
+                ("attribution-groups", "Groups", value.application_count),
+                (
+                    "attribution-processes",
+                    "Processes of this user",
+                    value.process_count,
+                ),
+                (
+                    "attribution-unattributed",
+                    "With no verified group",
+                    value.unattributed,
+                ),
+                (
+                    "attribution-other-user",
+                    "Of other users, not recorded",
+                    value.other_user,
+                ),
+                (
+                    "attribution-not-readable",
+                    "Not readable",
+                    value.not_readable,
+                ),
+            ] {
+                body = body.child(fact(id, label, count.to_string(), mono, stale, tokens));
+            }
+            for (index, note) in value.notes.iter().enumerate() {
+                body = body.child(caption(
+                    SharedString::from(format!("attribution-note-{index}")),
+                    note.clone(),
+                    tokens,
+                ));
+            }
+            body.into_any_element()
+        }
+    };
+    card(header, body)
+}
+
+fn control_card(tokens: &Tokens) -> AnyElement {
+    let header: ShellHeader = ShellHeader::new(IconName::Info, "Protection and control")
+        .subtitle("What this screen shows and does not show");
+    let lines: [(&str, &str); 4] = [
+        (
+            "applications-protection-note",
+            "\"Protected\" comes from the catalog of hard protections. Automation does not stop a protected group.",
+        ),
+        (
+            "applications-unknown-note",
+            "\"Unknown\" means that the lookup gave no result. Automation skips such a group.",
+        ),
+        (
+            "applications-read-only-note",
+            "This window sends no request, so it has no control that stops an application. Use the command `svalnir processes stop`.",
+        ),
+        (
+            "applications-restart-note",
+            "Restart history and budget status are not shown: this window has no read for them.",
+        ),
+    ];
+    let mut body = v_flex().gap(tokens::SPACE_2);
+    for (id, text) in lines {
+        body = body.child(caption(id, text, tokens));
+    }
+    card(header, body)
+}
+
+impl Render for ApplicationsScreen {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        let mono: SharedString = cx.theme().mono_font_family.clone();
+        let model: &AppModel = self.model.read(cx);
+        let processes = shown(&model.processes, SystemTime::now(), |processes| {
+            processes.captured_at
+        });
+        let cards: Vec<(CardWidth, AnyElement)> = vec![
+            (CardWidth::Full, groups_card(&processes, &mono, tokens)),
+            (
+                CardWidth::Share,
+                attribution_card(&processes, &mono, tokens),
+            ),
+            (CardWidth::Share, control_card(tokens)),
+        ];
+        screen("Applications", cards, self.activation, cx.reduce_motion())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::records::GroupKind;
+
+    fn row(footprint: Measured<u64>, unmeasured: usize) -> ApplicationRow {
+        ApplicationRow {
+            instance: "i".to_owned(),
+            name: "com.example.app".to_owned(),
+            kind: GroupKind::Application,
+            members: 3,
+            footprint,
+            unmeasured_members: unmeasured,
+            foreground: Foreground::Unknown,
+            protection: Protection::Unknown,
+        }
+    }
+
+    #[test]
+    fn unknown_protection_is_a_warning_and_not_not_protected() {
+        assert_eq!(
+            protection_pill(Protection::Unknown),
+            ("Unknown", Tone::Warning)
+        );
+        assert_eq!(
+            protection_pill(Protection::NotProtected),
+            ("Not protected", Tone::Neutral)
+        );
+        assert_eq!(
+            protection_pill(Protection::Protected),
+            ("Protected", Tone::Brand)
+        );
+        assert_eq!(foreground_text(Foreground::Unknown), "Not known");
+    }
+
+    #[test]
+    fn a_sum_with_a_member_with_no_value_is_partial() {
+        assert_eq!(
+            group_footprint(&row(Measured::Value(2_000_000_000), 0)),
+            ("2.0 GB".to_owned(), false)
+        );
+        assert_eq!(
+            group_footprint(&row(Measured::Value(2_000_000_000), 1)),
+            ("2.0 GB".to_owned(), true)
+        );
+        // No member has a value: the sum is unavailable, not a partial zero.
+        assert_eq!(
+            group_footprint(&row(Measured::Unavailable("x".into()), 3)),
+            ("\u{2014}".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn the_label_of_a_group_states_partial_and_unavailable() {
+        assert_eq!(
+            group_label(&row(Measured::Value(2_000_000_000), 1)),
+            "com.example.app, Application, 3 processes, footprint 2.0 GB, partial: 1 of 3 processes have no value, protection: Unknown"
+        );
+        assert_eq!(
+            group_label(&row(Measured::Unavailable("denied".into()), 3)),
+            "com.example.app, Application, 3 processes, footprint not available: denied, protection: Unknown"
+        );
+    }
+}

@@ -8,10 +8,14 @@ use super::nav::{
 use crate::{
     data::{
         model::{AgentState, Loadable, Measured, PressureLevel, ScanState},
-        store::AppModel,
+        store::{AppModel, Topic},
     },
     platform::DisplayAccessibility,
-    screens::{overview::OverviewScreen, placeholder::Placeholder, storage::StorageScreen},
+    screens::{
+        applications::ApplicationsScreen, automation::AutomationScreen,
+        diagnostics::DiagnosticsScreen, history::HistoryScreen, memory::MemoryScreen,
+        overview::OverviewScreen, storage::StorageScreen,
+    },
     theme::{
         glow,
         tokens::{self, Tokens, to_hsla},
@@ -45,6 +49,11 @@ pub struct MainWindow {
     display: DisplayAccessibility,
     overview: Entity<OverviewScreen>,
     storage: Entity<StorageScreen>,
+    memory: Entity<MemoryScreen>,
+    applications: Entity<ApplicationsScreen>,
+    automation: Entity<AutomationScreen>,
+    history: Entity<HistoryScreen>,
+    diagnostics: Entity<DiagnosticsScreen>,
     /// The choice of the user for the sidebar width: `Some(true)` is narrow.
     sidebar_choice: Option<bool>,
     /// The window width at the last render.
@@ -65,17 +74,24 @@ impl MainWindow {
         let nav: NavLayout = NavLayout::default();
         overview.update(cx, |screen, _| screen.set_nav(nav.clone()));
         storage.update(cx, |screen, _| screen.set_nav(nav.clone()));
+        let memory: Entity<MemoryScreen> = cx.new(|cx| MemoryScreen::new(model.clone(), cx));
+        let applications: Entity<ApplicationsScreen> =
+            cx.new(|cx| ApplicationsScreen::new(model.clone(), cx));
+        let automation: Entity<AutomationScreen> =
+            cx.new(|cx| AutomationScreen::new(model.clone(), cx));
+        let history: Entity<HistoryScreen> = cx.new(|cx| HistoryScreen::new(model.clone(), cx));
+        let diagnostics: Entity<DiagnosticsScreen> =
+            cx.new(|cx| DiagnosticsScreen::new(model.clone(), cx));
         let screens: Vec<AnyView> = Screen::ALL
             .iter()
-            .map(|&screen| {
-                if screen == Screen::Overview {
-                    AnyView::from(overview.clone())
-                } else if screen == Screen::Storage {
-                    AnyView::from(storage.clone())
-                } else {
-                    let view: Entity<Placeholder> = cx.new(|_| Placeholder::new(screen));
-                    AnyView::from(view)
-                }
+            .map(|&screen| match screen {
+                Screen::Overview => AnyView::from(overview.clone()),
+                Screen::Storage => AnyView::from(storage.clone()),
+                Screen::Memory => AnyView::from(memory.clone()),
+                Screen::Applications => AnyView::from(applications.clone()),
+                Screen::Automation => AnyView::from(automation.clone()),
+                Screen::History => AnyView::from(history.clone()),
+                Screen::Diagnostics => AnyView::from(diagnostics.clone()),
             })
             .collect();
         let focus: FocusHandle = cx.focus_handle();
@@ -109,6 +125,11 @@ impl MainWindow {
             display,
             overview,
             storage,
+            memory,
+            applications,
+            automation,
+            history,
+            diagnostics,
             sidebar_choice: None,
             last_width: f32::from(window.viewport_size().width),
             scroll: ScrollHandle::new(),
@@ -321,8 +342,15 @@ impl MainWindow {
             match screen {
                 Screen::Overview => self.overview.update(cx, OverviewScreen::activate),
                 Screen::Storage => self.storage.update(cx, StorageScreen::activate),
-                _ => {}
+                Screen::Memory => self.memory.update(cx, MemoryScreen::activate),
+                Screen::Applications => self.applications.update(cx, ApplicationsScreen::activate),
+                Screen::Automation => self.automation.update(cx, AutomationScreen::activate),
+                Screen::History => self.history.update(cx, HistoryScreen::activate),
+                Screen::Diagnostics => self.diagnostics.update(cx, DiagnosticsScreen::activate),
             }
+            // The model reads the topics of a screen only while it is in front.
+            self.model
+                .update(cx, |model, cx| model.set_topics(topics_of(screen), cx));
             cx.notify();
         }
     }
@@ -468,6 +496,20 @@ impl MainWindow {
         } else {
             row.child(text).into_any_element()
         }
+    }
+}
+
+/// The reads that only `screen` needs. The capability probes of Diagnostics
+/// run when the screen comes to the front and at an explicit refresh.
+#[must_use]
+pub const fn topics_of(screen: Screen) -> &'static [Topic] {
+    match screen {
+        Screen::Overview | Screen::Storage => &[],
+        Screen::Memory => &[Topic::Memory, Topic::Processes],
+        Screen::Applications => &[Topic::Processes],
+        Screen::Automation => &[Topic::Automation],
+        Screen::History => &[Topic::History],
+        Screen::Diagnostics => &[Topic::Diagnostics],
     }
 }
 

@@ -3366,3 +3366,104 @@ fn a_resume_writes_the_floor_and_an_old_authority_record_is_refused() {
         assert_eq!(refused.status.code(), 1);
     }
 }
+
+/// The notification capability of the agent is a row of `doctor`: a
+/// denied center is a reported state, not a failure of the command.
+#[test]
+fn doctor_shows_the_notification_capability_of_the_agent() {
+    use svalnir_agent::journal::{AgentRecord, JournalOptions, OperationJournal};
+    use svalnir_agent::notify::{CenterAuthorization, NotificationCounts, NotificationStatus};
+    use svalnir_agent::runtime::{
+        AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, PolicySource, RunState, SelfLimits,
+    };
+    use svalnir_core::state::CapabilityState;
+    use svalnir_core::time::WallTime;
+
+    let world = World::new();
+    std::fs::create_dir_all(world.path("state")).unwrap();
+    let path: PathBuf = world.path("state").join("operations.sqlite");
+    let mut journal = OperationJournal::open(&path, &JournalOptions::default()).unwrap();
+    let now: WallTime = WallTime::try_from(std::time::SystemTime::now()).unwrap();
+    let status = |notifications: Option<NotificationStatus>| AgentStatus {
+        schema_version: AGENT_STATUS_VERSION,
+        executor_epoch: svalnir_core::id::ExecutorEpochId::new("epoch_1").unwrap(),
+        process_id: 4242,
+        started_at: now,
+        written_at: now,
+        state: RunState::Running,
+        controller: None,
+        policy: PolicySource {
+            revision: None,
+            problem: None,
+        },
+        capabilities: Some(CapabilitySummary {
+            verdict: "ready".to_owned(),
+            required_not_available: Vec::new(),
+            probed_at: Some(now),
+            lines: Vec::new(),
+            notifications,
+        }),
+        limits: SelfLimits {
+            footprint_bytes: None,
+            budget_bytes: 64 * 1024 * 1024,
+            over_budget: false,
+            optional_work_reduced: false,
+        },
+        degraded: Vec::new(),
+        unclean_stops: 0,
+        restart_backoff: false,
+    };
+    // A status record with a summary and no notification capability.
+    journal
+        .put_agent_record(AgentRecord::Status, &status(None), None, now)
+        .unwrap();
+    let outcome = json(&world.environment, &["doctor"]);
+    assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+    assert_eq!(
+        outcome.result()["agent_notifications"]["reading"],
+        "not_recorded",
+        "{}",
+        outcome.stdout
+    );
+
+    let revision: u64 = journal
+        .agent_record::<AgentStatus>(AgentRecord::Status)
+        .unwrap()
+        .unwrap()
+        .revision;
+    let denied = NotificationStatus {
+        state: CapabilityState::Denied,
+        authorization: CenterAuthorization::Denied,
+        detail: "The user turned the notifications off.".to_owned(),
+        counts: NotificationCounts {
+            not_authorized: 3,
+            ..NotificationCounts::default()
+        },
+    };
+    journal
+        .put_agent_record(
+            AgentRecord::Status,
+            &status(Some(denied)),
+            Some(revision),
+            now,
+        )
+        .unwrap();
+    drop(journal);
+    let outcome = json(&world.environment, &["doctor"]);
+    assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+    let row = &outcome.result()["agent_notifications"];
+    assert_eq!(row["reading"], "recorded", "{row}");
+    assert_eq!(row["state"], "denied", "{row}");
+    assert_eq!(row["authorization"], "denied", "{row}");
+    assert_eq!(row["counts"]["not_authorized"], 3, "{row}");
+    assert_eq!(row["freshness"]["freshness"], "current", "{row}");
+    let text = run(&world.environment, &["doctor"]);
+    assert_eq!(text.status, ExitStatus::Success);
+    assert!(
+        text.stdout.contains("agent.notifications"),
+        "{}",
+        text.stdout
+    );
+    assert!(text.stdout.contains("State: denied"), "{}", text.stdout);
+    assert!(text.stdout.contains("3 not authorized"), "{}", text.stdout);
+}

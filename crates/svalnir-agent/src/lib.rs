@@ -35,6 +35,7 @@
 //! | [`protection`] | The catalog of protected file locations for the paths of the host, for a client, a discovery, and the coordinator at admission |
 //! | [`coordinator`] | The operation coordinator: admission, serialization, dispatch records, the approved roots of a manual operation from its sealed plan, cancellation, the queue service, the stop of new claims at a shutdown, and reconciliation |
 //! | [`controller`] | The guard controller: the decisions of the disk guard and the memory guard from the authority record, and the open incidents that bound the retention of the journal |
+//! | [`notify`] | The system notifications of the agent: the notices of the meaningful changes of state, the rate gate, the bounded queue with one worker thread, and the notification capability |
 //! | [`runtime`] | The agent process: the driver loop, the agent clock with the sleep continuity of the host, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |
 
 pub mod capability;
@@ -43,6 +44,7 @@ pub mod controller;
 pub mod coordinator;
 pub mod executor;
 pub mod journal;
+pub mod notify;
 pub mod observe;
 pub mod platform;
 pub mod protection;

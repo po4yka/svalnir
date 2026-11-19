@@ -33,15 +33,15 @@ use thiserror::Error;
 
 use super::candidates::RuleCandidateSource;
 use super::driver::DriverParts;
-use super::ports::{AgentClock, Collector, Notifier, Sample, SelfFootprint};
+use super::ports::{AgentClock, Collector, Sample, SelfFootprint};
 use super::record::CapabilitySummary;
 use crate::capability::{CapabilityReport, WorkerRole, diagnose_in};
-use crate::controller::Notification;
 use crate::coordinator::{IdSource, Measurements, SystemProbe, TimeReading};
 use crate::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
 use crate::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
+use crate::notify::{AgentNotifier, UnavailableCenter};
 use crate::platform::memory::context::{Clock as HostClock, CollectionContext};
 use crate::platform::memory::{collect_memory_snapshot, collect_pressure};
 use crate::platform::process::{
@@ -517,21 +517,6 @@ impl Collector for SystemCollector {
     }
 }
 
-/// Writes each notification to the structured log. A notification has
-/// identities and reason names; it has no path and no process argument.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LogNotifier;
-
-impl Notifier for LogNotifier {
-    fn notify(&mut self, notification: &Notification) {
-        if let Ok(event) = serde_json::to_string(notification) {
-            tracing::info!(%event, "controller notification");
-        } else {
-            tracing::warn!("a controller notification was not encoded");
-        }
-    }
-}
-
 /// The physical footprint of this process.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessFootprint;
@@ -649,7 +634,9 @@ pub fn system_parts(
         probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
         candidates: Box::new(candidates),
         environment,
-        notifier: Box::new(LogNotifier),
+        // This build has no native notification center
+        // ([`crate::notify`]): the capability is reported as unsupported.
+        notifier: Box::new(AgentNotifier::new(Box::new(UnavailableCenter))),
         footprint: Box::new(ProcessFootprint),
         store,
         capabilities: Some(capability_summary(state_directory)),

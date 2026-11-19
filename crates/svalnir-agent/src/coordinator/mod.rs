@@ -112,8 +112,8 @@ pub use self::board::{
 };
 pub use self::core::{
     ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies, Idle,
-    MAX_KNOWN_PLANS, MAX_MEASURED_VOLUMES, MAX_WAITING_OPERATIONS, Progress, Start,
-    approved_roots_of,
+    MAX_KNOWN_PLANS, MAX_MEASURED_VOLUMES, MAX_SETTLED_OPERATIONS, MAX_WAITING_OPERATIONS,
+    Progress, SettledOperation, Start, approved_roots_of,
 };
 pub use self::error::{CoordinatorError, StartError, code, rearm_rejection};
 pub use self::ledger::{IncidentAllowance, MAX_INCIDENTS, MAX_LEASES, Pacing};

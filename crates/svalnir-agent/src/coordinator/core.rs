@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use svalnir_core::action::{
     ActionError, ActionStage, Admission, DispatchState, Durability, ErrorFamily, ExecutorRole,
-    JournalError, LeaseResource, Operation, Plan, PlanApproval, Principal, RecordingMode,
-    ResourceEffect, ResourceLease, StopFence, StopReason, TargetBinding, TargetResult,
-    VolatileJournalError, WorkCharge, critical_exception_applies,
+    JournalError, LeaseResource, Operation, OperationState, Plan, PlanApproval, Principal,
+    RecordingMode, ResourceEffect, ResourceLease, StopFence, StopReason, TargetBinding,
+    TargetResult, VolatileJournalError, WorkCharge, critical_exception_applies,
 };
 use svalnir_core::grant::{ActionRequest, EvidenceStamp, IncidentBudget};
 use svalnir_core::id::{
@@ -262,6 +262,25 @@ impl Active {
     }
 }
 
+/// The largest number of settled operations that a coordinator keeps for
+/// [`Coordinator::take_settled`].
+pub const MAX_SETTLED_OPERATIONS: usize = 16;
+
+/// An operation that the coordinator settled, for a notification.
+///
+/// It has identities and states only: no path and no process argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledOperation {
+    /// The operation.
+    pub operation_id: OperationId,
+    /// True when the plan has an automatic trigger.
+    pub automatic: bool,
+    /// True when the plan stops an application or a process.
+    pub stops_application: bool,
+    /// The settled state.
+    pub state: OperationState,
+}
+
 /// The operation coordinator of one executor lifetime.
 ///
 /// See the [module documentation](super) for the interface and the
@@ -292,6 +311,10 @@ pub struct Coordinator<J: CoordinatorJournal> {
     /// The operations that this lifetime left unsettled. Their leases and
     /// reservations stay until a reconciliation settles them.
     pub(super) parked: BTreeMap<OperationId, Box<Active>>,
+    /// The operations that this lifetime settled and that the caller did
+    /// not take yet ([`Coordinator::take_settled`]). At most
+    /// [`MAX_SETTLED_OPERATIONS`]; the oldest goes first.
+    pub(super) settled: VecDeque<SettledOperation>,
     pub(super) reconciliation_pending: bool,
     pub(super) start: CoordinationStart,
     /// A claimed request that a pending reconciliation stopped.
@@ -539,6 +562,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             waiting: VecDeque::new(),
             plans: BTreeMap::new(),
             parked: BTreeMap::new(),
+            settled: VecDeque::new(),
             reconciliation_pending: start.reconciliation_pending || unsettled,
             start,
             held_request: None,
@@ -1451,6 +1475,30 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             wake_at = Some(wake_at.map_or(at, |wake| wake.min(at)));
         }
         Progress { worked, wake_at }
+    }
+
+    /// Takes the operations that this lifetime settled since the last call,
+    /// oldest first. A caller that does not call it loses the oldest
+    /// entries above [`MAX_SETTLED_OPERATIONS`], not a settled state.
+    pub fn take_settled(&mut self) -> Vec<SettledOperation> {
+        self.settled.drain(..).collect()
+    }
+
+    /// Keeps `active` for [`Coordinator::take_settled`].
+    pub(super) fn keep_settled(&mut self, active: &Active) {
+        if self.settled.len() >= MAX_SETTLED_OPERATIONS {
+            self.settled.pop_front();
+        }
+        self.settled.push_back(SettledOperation {
+            operation_id: active.operation.operation_id().clone(),
+            automatic: active.plan.trigger.class.is_automatic(),
+            stops_application: active
+                .plan
+                .targets
+                .iter()
+                .any(|target| target.binding.processes().is_some()),
+            state: active.operation.state().clone(),
+        });
     }
 
     /// Claims one request of the journal queue and executes it. Returns

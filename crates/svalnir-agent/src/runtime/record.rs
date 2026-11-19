@@ -13,6 +13,7 @@ use svalnir_core::time::WallTime;
 
 use crate::capability::{CapabilityEntry, CapabilityId, CapabilityReport, Requirement};
 use crate::controller::ControllerStatus;
+use crate::notify::NotificationStatus;
 use svalnir_core::state::CapabilityState;
 
 /// The version of the [`AgentStatus`] record.
@@ -75,6 +76,11 @@ pub struct CapabilitySummary {
     /// One line for each capability, in report order. At most
     /// [`CapabilityId::ALL`] lines.
     pub lines: Vec<CapabilityLine>,
+    /// The notification capability of the agent and the counts of its
+    /// notices, at the time of the status record. Unlike the lines, the
+    /// agent reads it again at each status write. `None` when the agent
+    /// has no notification service.
+    pub notifications: Option<NotificationStatus>,
 }
 
 /// One capability of the agent process, as the status record keeps it.
@@ -129,6 +135,7 @@ impl CapabilitySummary {
                 .take(CapabilityId::ALL.len())
                 .map(CapabilityLine::of)
                 .collect(),
+            notifications: None,
         }
     }
 }

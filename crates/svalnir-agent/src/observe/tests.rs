@@ -382,6 +382,7 @@ fn the_capability_summary_of_the_agent_has_the_freshness_of_its_status() {
             detail: "The system refused the query: injected".to_owned(),
             remediation: None,
         }],
+        notifications: None,
     };
     let mut status: AgentStatus = agent_status(100, RunState::Running, None);
     status.capabilities = Some(summary.clone());

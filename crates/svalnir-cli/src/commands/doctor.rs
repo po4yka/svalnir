@@ -1,4 +1,5 @@
-//! `doctor`: the capability report of this process, and the latest
+//! `doctor`: the capability report of this process, the notification
+//! capability of the agent from its status record, and the latest
 //! permanent start error of the agent.
 //!
 //! A denied or unknown capability is a successful diagnostic, so the exit
@@ -6,6 +7,9 @@
 
 use serde::Serialize;
 use svalnir_agent::capability::{self, CapabilityReport, WorkerRole};
+use svalnir_agent::notify::NotificationStatus;
+use svalnir_agent::observe::{self, AgentCapabilityReading, Freshness};
+use svalnir_core::time::WallTime;
 
 use super::start_failure::StartFailureView;
 use super::{CommandFailure, Invocation};
@@ -108,17 +112,124 @@ pub(crate) fn render(report: &CapabilityReport) -> String {
     out
 }
 
-/// The result of `doctor`: the capability report of this process and the
-/// latest permanent start error of the agent.
+/// The notification capability of the agent, as its status record has
+/// it. A client process does not post notifications, so this capability
+/// is of the agent process only.
+#[derive(Debug, Serialize)]
+#[serde(tag = "reading", rename_all = "snake_case")]
+enum AgentNotificationsView {
+    /// The state directory has no journal, or no status record.
+    NoStatus,
+    /// The journal or the status record cannot be read.
+    Unreadable { reason: String },
+    /// The status record has no notification capability.
+    NotRecorded { freshness: Freshness },
+    /// The capability.
+    Recorded {
+        freshness: Freshness,
+        #[serde(flatten)]
+        notifications: NotificationStatus,
+    },
+}
+
+impl AgentNotificationsView {
+    fn read(invocation: &Invocation<'_>) -> Self {
+        let journal = match super::session::open_existing_journal(invocation.environment) {
+            Ok(Some(journal)) => journal,
+            Ok(None) => return Self::NoStatus,
+            Err(error) => {
+                return Self::Unreadable {
+                    reason: error.message,
+                };
+            }
+        };
+        let now: WallTime =
+            WallTime::try_from(std::time::SystemTime::now()).unwrap_or(WallTime::UNIX_EPOCH);
+        match observe::agent_capabilities(&observe::read_status(&journal, now)) {
+            AgentCapabilityReading::NoStatus => Self::NoStatus,
+            AgentCapabilityReading::Unreadable { reason } => Self::Unreadable { reason },
+            AgentCapabilityReading::NotRecorded { freshness } => Self::NotRecorded { freshness },
+            AgentCapabilityReading::Recorded { summary, freshness } => {
+                match summary.notifications {
+                    Some(notifications) => Self::Recorded {
+                        freshness,
+                        notifications,
+                    },
+                    None => Self::NotRecorded { freshness },
+                }
+            }
+        }
+    }
+
+    fn render(&self, out: &mut String) {
+        out.push_str(
+            "Agent notifications (agent.notifications, from the status record of the agent)\n",
+        );
+        match self {
+            Self::NoStatus => out.push_str(
+                "  No status record of the agent: no agent ran on this state directory.\n",
+            ),
+            Self::Unreadable { reason } => {
+                put_line!(
+                    out,
+                    "  The status record cannot be read: {}",
+                    escape(reason)
+                );
+            }
+            Self::NotRecorded { .. } => {
+                out.push_str("  The status record has no notification capability of the agent.\n");
+            }
+            Self::Recorded {
+                freshness,
+                notifications,
+            } => {
+                put_line!(
+                    out,
+                    "  State: {} ({})",
+                    escape(notifications.state.as_str()),
+                    freshness_text(freshness)
+                );
+                put_line!(out, "  {}", escape(&notifications.detail));
+                let counts = &notifications.counts;
+                put_line!(
+                    out,
+                    "  Notices of this agent lifetime: {} posted, {} not authorized, {} failed, {} dropped, {} rate limited, {} coalesced",
+                    counts.posted,
+                    counts.not_authorized,
+                    counts.failed,
+                    counts.dropped,
+                    counts.rate_limited,
+                    counts.coalesced
+                );
+            }
+        }
+    }
+}
+
+fn freshness_text(freshness: &Freshness) -> &'static str {
+    match freshness {
+        Freshness::Current { .. } => "current status record",
+        Freshness::Stale { .. } => "stale status record: the agent does not write now",
+        Freshness::Stopped => "the agent stopped",
+        Freshness::Unknown => "the age of the status record is not known",
+    }
+}
+
+/// The result of `doctor`: the capability report of this process, the
+/// notification capability of the agent, and the latest permanent start
+/// error of the agent.
 #[derive(Debug, Serialize)]
 struct DoctorView {
     #[serde(flatten)]
     report: CapabilityReport,
+    agent_notifications: AgentNotificationsView,
     agent_start_failure: StartFailureView,
 }
 
 fn render_view(view: &DoctorView) -> String {
     let mut out: String = render(&view.report);
+    out.push('\n');
+    view.agent_notifications.render(&mut out);
     out.push('\n');
     view.agent_start_failure.render(&mut out);
     out
@@ -143,6 +254,7 @@ pub(crate) fn run(invocation: &mut Invocation<'_>) -> Result<ExitStatus, Command
     };
     let view = DoctorView {
         report,
+        agent_notifications: AgentNotificationsView::read(invocation),
         agent_start_failure: StartFailureView::read(invocation.environment),
     };
     invocation.emit(Kind::Report, &view, render_view)?;

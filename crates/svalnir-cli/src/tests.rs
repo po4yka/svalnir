@@ -1055,6 +1055,13 @@ mod host {
         // A diagnostic creates nothing.
         assert!(!directory.path().join("state").exists());
         assert_eq!(envelope["result"]["agent_start_failure"]["state"], "none");
+        // With no journal, the agent has no status record; the row says so.
+        assert_eq!(
+            envelope["result"]["agent_notifications"]["reading"],
+            "no_status"
+        );
+        // Reading the status record made no journal.
+        assert!(!directory.path().join("state").exists());
     }
 
     /// An invalid state directory is a warning of `doctor`, not a report

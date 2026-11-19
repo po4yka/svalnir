@@ -1533,6 +1533,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
         self.board.publish(active.view(Phase::Finished));
         self.board.set_recorded(&operation_id, recorded);
+        self.keep_settled(&active);
         if unknown || !recorded {
             // The leases and the reservation stay: a conflicting step
             // needs a reconciliation first.

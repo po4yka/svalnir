@@ -47,9 +47,9 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 use tempfile::TempDir;
 
 use super::{
-    AgentClock, AgentStatus, CandidateSource, Collector, Driver, DriverParts, DriverSettings,
-    DriverStart, LifecycleRecord, Notifier, Preparation, RunState, Sample, SelfFootprint,
-    ServiceSettings, ShutdownReport, StopHandle, journal_path, run,
+    AgentClock, AgentStatus, CandidateSource, CapabilitySummary, Collector, Driver, DriverParts,
+    DriverSettings, DriverStart, LifecycleRecord, Notifier, Preparation, RunState, Sample,
+    SelfFootprint, ServiceSettings, ShutdownReport, StopHandle, journal_path, run,
 };
 use crate::controller::tests::support::{
     CandidateSpec, GIBIBYTE, MOUNT, ROOT_ID, Registry, SECOND, VOLUME, application, boot, capacity,
@@ -429,11 +429,23 @@ impl CandidateSource for TempCandidates {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Notes(Arc<Mutex<Vec<Notification>>>);
+struct Notes(
+    Arc<Mutex<Vec<Notification>>>,
+    Arc<Mutex<Vec<crate::coordinator::SettledOperation>>>,
+    Arc<Mutex<Vec<Option<PressureState>>>>,
+);
 
 impl Notifier for Notes {
-    fn notify(&mut self, notification: &Notification) {
+    fn notify(&mut self, notification: &Notification, _at: MonotonicNanos) {
         self.0.lock().unwrap().push(notification.clone());
+    }
+
+    fn settled(&mut self, operation: &crate::coordinator::SettledOperation, _at: MonotonicNanos) {
+        self.1.lock().unwrap().push(operation.clone());
+    }
+
+    fn pressure(&mut self, reading: Option<&PressureState>, _at: MonotonicNanos) {
+        self.2.lock().unwrap().push(reading.cloned());
     }
 }
 
@@ -486,6 +498,9 @@ struct Bench {
     pressure: Arc<Mutex<PressureState>>,
     modes: Arc<Mutex<Vec<PreparationMode>>>,
     notes: Notes,
+    /// When set, the driver has the notifier of the agent with this
+    /// center, and a capability summary, in place of [`Notes`].
+    center: Option<crate::notify::fake::FakeCenter>,
     footprint: Arc<AtomicU64>,
     /// Runs one time at the next measurement of the footprint of the
     /// agent: after the tick read the authority record and before the
@@ -520,6 +535,7 @@ impl Bench {
             pressure: Arc::new(Mutex::new(PressureState::Normal)),
             modes: Arc::new(Mutex::new(Vec::new())),
             notes: Notes::default(),
+            center: None,
             footprint: Arc::new(AtomicU64::new(10 * 1024 * 1024)),
             footprint_hook: Hook::default(),
             busy_timeout: None,
@@ -635,13 +651,24 @@ impl Bench {
                 modes: Arc::clone(&self.modes),
             }),
             environment: Arc::new(TestRuleEnvironment(FixtureEnvironment::days_later(0))),
-            notifier: Box::new(self.notes.clone()),
+            notifier: match &self.center {
+                Some(center) => {
+                    Box::new(crate::notify::AgentNotifier::new(Box::new(center.clone())))
+                }
+                None => Box::new(self.notes.clone()),
+            },
             footprint: Box::new(Footprint(
                 Arc::clone(&self.footprint),
                 self.footprint_hook.clone(),
             )),
             store: None,
-            capabilities: None,
+            capabilities: self.center.as_ref().map(|_| CapabilitySummary {
+                verdict: "ready".to_owned(),
+                required_not_available: Vec::new(),
+                probed_at: None,
+                lines: Vec::new(),
+                notifications: None,
+            }),
         }
     }
 
@@ -818,6 +845,64 @@ fn with_no_authority_record_the_agent_only_observes_and_reports_it() {
     assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
 }
 
+/// A notification center that denies is a capability in the status
+/// record, not an error: the agent runs and observes, and posts nothing.
+#[test]
+fn a_denied_notification_center_is_reported_in_the_status_record() {
+    use crate::notify::CenterAuthorization;
+    use crate::notify::fake::FakeCenter;
+    use svalnir_core::state::CapabilityState;
+
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    let center = FakeCenter::new(CenterAuthorization::Denied);
+    bench.center = Some(center.clone());
+    let mut driver = bench.start();
+    let mut notifications = None;
+    for _ in 0..200 {
+        driver.tick(Some(bench.sample(
+            5 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(30 * SECOND);
+        notifications = bench
+            .status()
+            .capabilities
+            .and_then(|summary| summary.notifications)
+            .filter(|status| status.authorization == CenterAuthorization::Denied);
+        if notifications.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let notifications = notifications.expect("the status has the capability");
+    assert_eq!(notifications.state, CapabilityState::Denied);
+    assert_eq!(bench.status().state, RunState::Running);
+    assert!(center.with(|state| state.posted.is_empty()));
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
+}
+
+/// A status record of a driver with no capability summary has no
+/// notification capability either; a client reads that as "not
+/// recorded" (`observe::agent_capabilities`).
+#[test]
+fn a_status_record_with_no_summary_has_no_notification_capability() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    let mut driver = bench.start();
+    driver.tick(Some(bench.sample(
+        5 * GIBIBYTE,
+        PressureState::Normal,
+        Vec::new(),
+    )));
+    assert_eq!(bench.status().capabilities, None);
+    // The pressure reading of each sample reaches the notifier.
+    assert_eq!(
+        *bench.notes.2.lock().unwrap(),
+        [Some(PressureState::Normal)]
+    );
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
+}
+
 #[test]
 fn an_automatic_eviction_removes_the_candidates_of_the_test_rule_and_recovers() {
     let mut bench = Bench::new(TestClock::fixed(), validated_registry());
@@ -877,6 +962,22 @@ fn an_automatic_eviction_removes_the_candidates_of_the_test_rule_and_recovers() 
         ),
         "{finished:?}"
     );
+    // The coordinator gave the settled operation to the notifier, as an
+    // automatic one, which has its notice from the controller only.
+    let settled = bench.notes.1.lock().unwrap().clone();
+    assert!(
+        matches!(
+            settled.as_slice(),
+            [crate::coordinator::SettledOperation {
+                automatic: true,
+                stops_application: false,
+                state: OperationState::Completed,
+                ..
+            }]
+        ),
+        "{settled:?}"
+    );
+    assert_eq!(crate::notify::settled_notice(&settled[0]), None);
     let journal = bench.journal();
     assert_eq!(journal.unsettled_operation_count().unwrap(), 0);
     let recorded: ControllerState = bench.controller_record();

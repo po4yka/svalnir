@@ -13,8 +13,13 @@ use svalnir_core::id::VolumeId;
 use svalnir_core::policy::ControlPlaneProcess;
 use svalnir_core::quantity::Bytes;
 
+use svalnir_core::state::PressureState;
+use svalnir_core::time::MonotonicNanos;
+
 use crate::controller::{CandidateSet, Notification, Observations, PreparationMode};
+use crate::coordinator::SettledOperation;
 use crate::coordinator::{Clock, TimeReading};
+use crate::notify::NotificationStatus;
 
 /// The clocks of the agent, with the record of a clock discontinuity.
 pub trait AgentClock: Debug + Send + Sync {
@@ -108,10 +113,29 @@ pub trait CandidateSource: Send {
     fn cancel(&mut self) {}
 }
 
-/// The receiver of the notifications of the controller.
+/// The receiver of the changes of state that a person can want to know:
+/// the notifications of the controller, the operations that the
+/// coordinator settled, and the memory pressure readings.
+///
+/// A call must not wait for a notification center: the driver calls it on
+/// the thread of the controller and the coordinator. `at` is the
+/// monotonic time of the agent, for a rate bound.
 pub trait Notifier: Send {
-    /// Takes one notification.
-    fn notify(&mut self, notification: &Notification);
+    /// Takes one notification of the controller.
+    fn notify(&mut self, notification: &Notification, at: MonotonicNanos);
+
+    /// Takes one operation that the coordinator settled.
+    fn settled(&mut self, _operation: &SettledOperation, _at: MonotonicNanos) {}
+
+    /// Takes the memory pressure reading of a new sample. `None` is a
+    /// reading that is not a value.
+    fn pressure(&mut self, _reading: Option<&PressureState>, _at: MonotonicNanos) {}
+
+    /// The notification capability, for the status record. `None` when
+    /// the receiver posts no system notification.
+    fn status(&self) -> Option<NotificationStatus> {
+        None
+    }
 }
 
 /// The measurement of the physical footprint of the agent process.

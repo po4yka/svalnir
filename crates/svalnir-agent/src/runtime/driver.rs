@@ -906,6 +906,18 @@ impl Driver {
         (worked, wake_at)
     }
 
+    /// Gives the operations that the coordinator settled to the notifier.
+    /// The coordinator also settles an operation in the second run of a
+    /// tick; that one goes to the notifier in the next tick.
+    fn notify_settled(&mut self, time: &TimeReading) {
+        let Some(coordinator) = self.coordinator.as_mut() else {
+            return;
+        };
+        for operation in coordinator.take_settled() {
+            self.notifier.settled(&operation, time.clock.now);
+        }
+    }
+
     /// Decides the rearm request that the coordinator claimed, when it has
     /// one, and records its completion. Returns `true` when a request was
     /// decided.
@@ -1012,6 +1024,14 @@ impl Driver {
         }
         let candidates = self.observations.candidates.take();
         self.observations = sample.observations;
+        self.notifier.pressure(
+            self.observations
+                .memory
+                .pressure
+                .as_ref()
+                .and_then(|pressure| pressure.value()),
+            time.clock.now,
+        );
         self.observations.candidates = candidates;
         self.sample_degraded = sample.degraded;
         self.has_sample = true;
@@ -1098,6 +1118,7 @@ impl Driver {
             time = after;
         }
         let (mut worked, mut wake_at) = self.run_coordinator();
+        self.notify_settled(&time);
         let rearmed: bool = self.serve_rearm(&time);
         worked |= rearmed;
         self.collect_finished(&time);
@@ -1208,7 +1229,9 @@ impl Driver {
                         acted = true;
                     }
                 }
-                Intent::Notify(notification) => self.notifier.notify(&notification),
+                Intent::Notify(notification) => {
+                    self.notifier.notify(&notification, time.clock.now);
+                }
                 Intent::ReduceOptionalWork(_) => {
                     self.optional_reduced = true;
                     // A discovery that runs now is optional work.
@@ -1285,7 +1308,10 @@ impl Driver {
             state,
             controller: self.last_status.clone(),
             policy: self.policy.clone(),
-            capabilities: self.capabilities.clone(),
+            capabilities: self.capabilities.clone().map(|mut summary| {
+                summary.notifications = self.notifier.status();
+                summary
+            }),
             limits: SelfLimits {
                 footprint_bytes: self.last_footprint.map(Bytes::get),
                 budget_bytes: self.settings.self_budget.get(),

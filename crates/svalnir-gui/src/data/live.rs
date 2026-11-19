@@ -11,7 +11,8 @@ use super::{
 use super::{
     live_records,
     records::{
-        AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
+        AutomationSnapshot, ControllerSnapshot, DiagnosticsSnapshot, HistorySnapshot,
+        MemorySnapshot, ProcessesSnapshot,
     },
 };
 use std::{
@@ -23,8 +24,8 @@ use std::{
 };
 use svalnir_agent::{
     journal::AgentRecord,
-    observe::{self, DiskReading, Host},
-    platform::volume,
+    observe::{self, ClientClock, DiskReading, Host},
+    platform::{process::ProcessSnapshot, volume},
     runtime::{AgentStatus, journal_path},
     scan::{
         CancellationToken, DirectoryRecord, EntryKind, EntryRecord, RegionCause, ScanCompletion,
@@ -46,6 +47,9 @@ const DEFAULT_STATE_DIRECTORY: &str = "Library/Application Support/Svalnir";
 #[derive(Debug)]
 pub struct LiveSource {
     host: Mutex<Option<Host>>,
+    /// The process snapshot of the previous read of the processes, for the
+    /// footprint growth. Only one snapshot is kept.
+    previous_processes: Mutex<Option<ProcessSnapshot>>,
     state_directory: Option<PathBuf>,
 }
 
@@ -56,6 +60,7 @@ impl LiveSource {
     pub fn new(state_directory: Option<PathBuf>) -> Self {
         Self {
             host: Mutex::new(None),
+            previous_processes: Mutex::new(None),
             state_directory,
         }
     }
@@ -70,6 +75,11 @@ impl LiveSource {
             Some(host) => read(host),
             None => Err("the host is not open".to_owned()),
         }
+    }
+
+    /// The clocks of this process, read as the agent reads them.
+    fn client_clock(&self) -> Result<ClientClock, String> {
+        self.with_host(|host| ClientClock::read(host).map_err(|error| error.to_string()))
     }
 
     /// Creates the source for the state directory of the environment.
@@ -253,11 +263,15 @@ impl DataSource for LiveSource {
     }
 
     fn processes(&self) -> Result<ProcessesSnapshot, String> {
-        self.with_host(live_records::processes)
+        self.with_host(|host| live_records::processes(host, &self.previous_processes))
     }
 
     fn automation(&self) -> AutomationSnapshot {
-        live_records::automation(self.state_directory.as_deref())
+        live_records::automation(self.state_directory.as_deref(), self.client_clock())
+    }
+
+    fn controller(&self) -> ControllerSnapshot {
+        live_records::controller(self.state_directory.as_deref(), self.client_clock())
     }
 
     fn history(&self) -> HistorySnapshot {

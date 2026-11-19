@@ -6,11 +6,14 @@ use super::{
     fixture::FixtureScenario,
     model::{GuardRow, Measured, OperationPhase},
     records::{
-        AgentStatusRow, ApplicationRow, AutomationSnapshot, CapabilityLevel, CapabilityRow,
-        DiagnosticsSnapshot, EffectRow, Foreground, GrantRow, GroupKind, GuardDetail,
-        HistorySnapshot, IncidentRow, JournalRow, MemorySnapshot, Need, OperationDetail, PauseRow,
-        ProcessRow, ProcessesSnapshot, Protection, RevisionRow, StartFailureRow, Verdict,
-        rank_applications, rank_processes,
+        AgentStatusRow, ApplicationRow, AutomationSnapshot, BudgetRow, CapabilityLevel,
+        CapabilityRow, ControllerRows, ControllerSnapshot, CooldownRow, CooldownState,
+        CooldownSubject, DiagnosticsSnapshot, EffectRow, Foreground, FreshMeasurement,
+        GenerationRow, GrantRow, GroupKind, Growth, GuardDetail, HistorySnapshot, IncidentRow,
+        IncidentUsage, JournalRow, JournalUsageRow, MemorySnapshot, Need, OperationDetail,
+        PauseKind, PauseRow, ProcessRow, ProcessesSnapshot, Protection, ProtectionReason,
+        RevisionRow, StartFailureRow, StatusAge, ThresholdRow, TriggerRow, UnknownCause, UsageRow,
+        Verdict, rank_applications, rank_processes,
     },
 };
 use std::{
@@ -110,6 +113,30 @@ const PROCESSES: [FixtureProcess; 12] = [
 /// protection.
 type FixtureGroup = (&'static str, GroupKind, Foreground, Protection);
 
+/// The footprint change of a fixture process since the previous reading, in
+/// MB, over 5 s. `None`: the process is new since that reading.
+fn fixture_growth(pid: i32, scale: u64) -> Measured<Growth> {
+    let megabytes: i128 = match pid {
+        412 => 24,
+        418 => 6,
+        731 => -3,
+        742 => 18,
+        2231 => 140,
+        2210 => 0,
+        // A process that started after the previous reading.
+        377 => {
+            return Measured::Unavailable(
+                "the process is new since the previous reading".to_owned(),
+            );
+        }
+        _ => 1,
+    };
+    Measured::Value(Growth {
+        delta: megabytes * i128::from(MB) * i128::from(scale),
+        elapsed: Duration::from_secs(5),
+    })
+}
+
 const GROUPS: [FixtureGroup; 6] = [
     (
         "com.apple.dt.Xcode",
@@ -127,19 +154,25 @@ const GROUPS: [FixtureGroup; 6] = [
         "com.apple.finder",
         GroupKind::Application,
         Foreground::Background,
-        Protection::Protected,
+        Protection::Protected {
+            reason: ProtectionReason::SessionApplication,
+        },
     ),
     (
         "com.apple.Terminal",
         GroupKind::Application,
         Foreground::Background,
-        Protection::Unknown,
+        Protection::Unknown {
+            cause: UnknownCause::NoExecutableEvidence,
+        },
     ),
     (
         "dev.svalnir.gui",
         GroupKind::Application,
         Foreground::Background,
-        Protection::Protected,
+        Protection::Protected {
+            reason: ProtectionReason::ControlPlaneBundle,
+        },
     ),
     (
         "com.example.sync.agent",
@@ -175,6 +208,11 @@ pub(super) fn processes(scenario: FixtureScenario) -> Result<ProcessesSnapshot, 
             } else {
                 Measured::Unavailable("the process exited during the reading".to_owned())
             },
+            growth: if footprint.is_some() {
+                fixture_growth(*pid, scale)
+            } else {
+                Measured::Unavailable("the process exited during the reading".to_owned())
+            },
         })
         .collect();
     let applications: Vec<ApplicationRow> = GROUPS
@@ -188,7 +226,22 @@ pub(super) fn processes(scenario: FixtureScenario) -> Result<ProcessesSnapshot, 
                 .iter()
                 .filter_map(|row| row.footprint.value().copied())
                 .collect();
+            let changes: Vec<Growth> = members
+                .iter()
+                .filter_map(|row| row.growth.value().copied())
+                .collect();
             ApplicationRow {
+                growth: if changes.is_empty() {
+                    Measured::Unavailable(
+                        "the process is new since the previous reading".to_owned(),
+                    )
+                } else {
+                    Measured::Value(Growth {
+                        delta: changes.iter().map(|change| change.delta).sum(),
+                        elapsed: Duration::from_secs(5),
+                    })
+                },
+                growth_missing: members.len() - changes.len(),
                 instance: format!("fixture-{name}"),
                 name: (*name).to_owned(),
                 kind: *kind,
@@ -231,25 +284,77 @@ fn standing(scenario: FixtureScenario, policy: PolicyId) -> GuardStanding {
     }
 }
 
-fn thresholds(policy: PolicyId) -> Vec<(String, u64)> {
-    // A size is in bytes and a time is in nanoseconds, as in a policy scope.
+fn thresholds(policy: PolicyId) -> Vec<ThresholdRow> {
+    // The stored values of a policy scope: a size in bytes, a time in
+    // nanoseconds. The row takes the unit of the configuration field.
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MINUTE: u64 = 60_000_000_000;
     let pairs: &[(&str, u64)] = if policy == PolicyId::DiskGuard {
         &[
-            ("disk_guard.warning_below", 40 * GB),
-            ("disk_guard.reclaim_below", 25 * GB),
-            ("disk_guard.emergency_below", 10 * GB),
-            ("disk_guard.recover_above", 50 * GB),
+            ("disk_guard.warn_below", 40 * GIB),
+            ("disk_guard.reclaim_below", 25 * GIB),
+            ("disk_guard.emergency_below", 10 * GIB),
+            ("disk_guard.recover_above", 50 * GIB),
+            ("disk_guard.sustain_for", 2 * MINUTE),
+            ("disk_guard.max_passes_per_incident", 3),
         ]
     } else {
         &[
-            ("memory_guard.sustained_for", 120 * GB),
-            ("memory_guard.restart_cooldown", 900 * GB),
+            ("memory_guard.sustain_for", 2 * MINUTE),
+            ("memory_guard.grace_period", 10_000_000_000),
+            ("memory_guard.max_applications_per_incident", 2),
+            (
+                "memory_guard.app_budgets[build-worker].footprint_stop",
+                6 * GIB,
+            ),
+            (
+                "memory_guard.app_budgets[build-worker].cooldown",
+                15 * MINUTE,
+            ),
         ]
     };
     pairs
         .iter()
-        .map(|(key, value)| ((*key).to_owned(), *value))
+        .map(|(key, value)| ThresholdRow::of(key, *value))
         .collect()
+}
+
+/// The pause and the problems of `scenario`.
+fn fixture_pause(snapshot: &mut AutomationSnapshot, scenario: FixtureScenario) {
+    let captured_at: SystemTime = snapshot.captured_at;
+    match scenario {
+        FixtureScenario::Pressure => {
+            snapshot.pause = Some(PauseRow::Paused {
+                since: back(captured_at, 600),
+                remaining: Some(Duration::from_mins(20)),
+                until: Some(captured_at + Duration::from_mins(20)),
+                kind: PauseKind::Timed,
+            });
+        }
+        FixtureScenario::Stale => {
+            snapshot.pause = Some(PauseRow::Paused {
+                since: back(captured_at, 7200),
+                remaining: None,
+                until: None,
+                kind: PauseKind::Indefinite,
+            });
+        }
+        FixtureScenario::Drift => {
+            snapshot.pause = Some(PauseRow::Expired {
+                since: back(captured_at, 3700),
+            });
+            snapshot.measurement = FreshMeasurement::Awaiting;
+        }
+        FixtureScenario::Unavailable => {
+            snapshot.revision = None;
+            snapshot.guards.clear();
+            snapshot.pause = None;
+            snapshot
+                .problems
+                .push("The authority record cannot be read in this fixture.".to_owned());
+        }
+        _ => {}
+    }
 }
 
 /// The authority record of `scenario`.
@@ -328,26 +433,194 @@ pub(super) fn automation(scenario: FixtureScenario) -> AutomationSnapshot {
             })
             .collect(),
         pause: Some(PauseRow::NotPaused),
+        measurement: FreshMeasurement::NotNeeded,
         problems: Vec::new(),
     };
-    match scenario {
-        FixtureScenario::Pressure => {
-            snapshot.pause = Some(PauseRow::Paused {
-                since: back(captured_at, 600),
-                until: Some(captured_at + Duration::from_mins(20)),
-            });
-        }
-        FixtureScenario::Unavailable => {
-            snapshot.revision = None;
-            snapshot.guards.clear();
-            snapshot.pause = None;
-            snapshot
-                .problems
-                .push("The authority record cannot be read in this fixture.".to_owned());
-        }
-        _ => {}
-    }
+    fixture_pause(&mut snapshot, scenario);
     snapshot
+}
+
+fn budget(id: &str, latched: bool, trigger: Option<TriggerRow>) -> BudgetRow {
+    BudgetRow {
+        id: id.to_owned(),
+        latched,
+        trigger,
+    }
+}
+
+fn relaunch(application: &str, state: CooldownState) -> CooldownRow {
+    CooldownRow {
+        subject: CooldownSubject::Relaunch {
+            application: application.to_owned(),
+        },
+        cause: "Relaunch cooldown",
+        state,
+    }
+}
+
+/// The controller rows under memory pressure: an open memory incident with
+/// a rearmed generation.
+fn pressure_rows(captured_at: SystemTime) -> ControllerRows {
+    ControllerRows {
+        written_at: Some(back(captured_at, 40)),
+        budgets: vec![
+            budget("build-worker", true, Some(TriggerRow::Qualifying)),
+            budget("browser", false, Some(TriggerRow::Acting)),
+        ],
+        cooldowns: vec![
+            relaunch(
+                "com.apple.Safari",
+                CooldownState::Active {
+                    remaining: Duration::from_secs(540),
+                },
+            ),
+            relaunch("com.example.indexer", CooldownState::EarlierBoot),
+            CooldownRow {
+                subject: CooldownSubject::ObserveAfterAction {
+                    incident: "inc-fixture-memory-1".to_owned(),
+                },
+                cause: "Pass pacing",
+                state: CooldownState::Active {
+                    remaining: Duration::from_secs(40),
+                },
+            },
+        ],
+        incidents: vec![IncidentUsage {
+            id: "inc-fixture-memory-1".to_owned(),
+            policy: PolicyId::MemoryGuard,
+            generation: 2,
+            established: true,
+            unknown_outcome: false,
+            current: Some(UsageRow::Memory {
+                consumed_slots: 1,
+                reserved_slots: 1,
+            }),
+            generations: vec![
+                GenerationRow {
+                    generation: 1,
+                    rearmed: false,
+                    started_at: back(captured_at, 1800),
+                    final_usage: Some(UsageRow::Memory {
+                        consumed_slots: 2,
+                        reserved_slots: 0,
+                    }),
+                    journal: JournalUsageRow::Recorded {
+                        slots: 2,
+                        work_bytes: 0,
+                        items: 0,
+                    },
+                },
+                GenerationRow {
+                    generation: 2,
+                    rearmed: true,
+                    started_at: back(captured_at, 300),
+                    final_usage: None,
+                    journal: JournalUsageRow::NoConsumedDispatch,
+                },
+            ],
+        }],
+        truncated: false,
+    }
+}
+
+/// The controller rows of a disk incident with one pass.
+fn drift_rows(captured_at: SystemTime) -> ControllerRows {
+    ControllerRows {
+        written_at: Some(back(captured_at, 90)),
+        budgets: vec![budget("build-worker", false, Some(TriggerRow::Normal))],
+        cooldowns: vec![CooldownRow {
+            subject: CooldownSubject::DiskPass {
+                incident: Some("inc-fixture-disk-1".to_owned()),
+            },
+            cause: "Pass pacing",
+            state: CooldownState::Active {
+                remaining: Duration::from_secs(150),
+            },
+        }],
+        incidents: vec![IncidentUsage {
+            id: "inc-fixture-disk-1".to_owned(),
+            policy: PolicyId::DiskGuard,
+            generation: 1,
+            established: true,
+            unknown_outcome: false,
+            current: Some(UsageRow::Disk {
+                consumed_bytes: 3 * GB,
+                reserved_bytes: 0,
+                consumed_items: 1_240,
+                reserved_items: 0,
+                passes: 1,
+            }),
+            generations: vec![GenerationRow {
+                generation: 1,
+                rearmed: false,
+                started_at: back(captured_at, 900),
+                final_usage: None,
+                journal: JournalUsageRow::Recorded {
+                    slots: 0,
+                    work_bytes: 3 * GB,
+                    items: 1_240,
+                },
+            }],
+        }],
+        truncated: false,
+    }
+}
+
+/// The controller rows with no incident.
+fn quiet_rows(captured_at: SystemTime) -> ControllerRows {
+    ControllerRows {
+        written_at: Some(back(captured_at, 3 * 3600)),
+        budgets: vec![
+            budget("build-worker", false, Some(TriggerRow::Normal)),
+            budget("browser", false, Some(TriggerRow::Advisory)),
+        ],
+        cooldowns: vec![
+            relaunch(
+                "com.example.sync.agent",
+                CooldownState::Active {
+                    remaining: Duration::from_secs(240),
+                },
+            ),
+            relaunch("com.apple.Safari", CooldownState::Elapsed),
+        ],
+        incidents: Vec::new(),
+        truncated: false,
+    }
+}
+
+/// The controller record of `scenario`.
+pub(super) fn controller(scenario: FixtureScenario) -> ControllerSnapshot {
+    let captured_at: SystemTime = reading_time(scenario);
+    let rows: ControllerRows = match scenario {
+        FixtureScenario::Unavailable => {
+            return ControllerSnapshot {
+                captured_at,
+                status_age: StatusAge::Unknown,
+                rows: Measured::Unavailable(not_in_fixture("the controller record")),
+            };
+        }
+        FixtureScenario::AgentAbsent => {
+            return ControllerSnapshot {
+                captured_at,
+                status_age: StatusAge::Unknown,
+                rows: Measured::Unavailable("No journal exists in the state directory.".to_owned()),
+            };
+        }
+        FixtureScenario::Pressure => pressure_rows(captured_at),
+        FixtureScenario::Drift => drift_rows(captured_at),
+        FixtureScenario::Healthy | FixtureScenario::Stale => quiet_rows(captured_at),
+    };
+    ControllerSnapshot {
+        captured_at,
+        status_age: if scenario == FixtureScenario::Stale {
+            StatusAge::Stale {
+                age: Duration::from_mins(12),
+            }
+        } else {
+            StatusAge::Current
+        },
+        rows: Measured::Value(rows),
+    }
 }
 
 fn names(items: &[&str]) -> Vec<String> {

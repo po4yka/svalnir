@@ -14,7 +14,8 @@ use crate::actions::{
 };
 use model::{AgentSnapshot, HostSnapshot, ScanProgress, ScanSummary, ServiceSnapshot};
 use records::{
-    AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
+    AutomationSnapshot, ControllerSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot,
+    ProcessesSnapshot,
 };
 use std::{
     fmt::Debug,
@@ -57,6 +58,11 @@ pub trait DataSource: Send + Sync + Debug {
     /// Reads the authority record of the journal: the revision, the guards
     /// with their grants, and the pause.
     fn automation(&self) -> AutomationSnapshot;
+
+    /// Reads the controller record of the agent: the application budgets,
+    /// the cooldowns, and the usage of each open incident, with the age of
+    /// the status record.
+    fn controller(&self) -> ControllerSnapshot;
 
     /// Reads the latest operations of the journal.
     fn history(&self) -> HistorySnapshot;

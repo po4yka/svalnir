@@ -7,8 +7,8 @@ use super::{
         ScanState, ScanSummary, ServiceSnapshot,
     },
     records::{
-        AutomationSnapshot, Captured, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot,
-        ProcessesSnapshot,
+        AutomationSnapshot, Captured, ControllerSnapshot, DiagnosticsSnapshot, HistorySnapshot,
+        MemorySnapshot, ProcessesSnapshot,
     },
 };
 use crate::actions::{Action, ActionBook, ActionPort, ActionState, Proposal, Slot};
@@ -100,6 +100,7 @@ struct InFlight {
     memory: bool,
     processes: bool,
     automation: bool,
+    controller: bool,
     history: bool,
     diagnostics: bool,
 }
@@ -114,6 +115,8 @@ pub enum Topic {
     Processes,
     /// The authority record.
     Automation,
+    /// The controller record of the agent.
+    Controller,
     /// The latest operations.
     History,
     /// The capability probes and the service records. The model reads it
@@ -215,6 +218,8 @@ pub struct AppModel {
     pub processes: Loadable<ProcessesSnapshot>,
     /// The authority record. `Loading` until a screen asks.
     pub automation: Loadable<AutomationSnapshot>,
+    /// The controller record of the agent. `Loading` until a screen asks.
+    pub controller: Loadable<ControllerSnapshot>,
     /// The latest operations. `Loading` until a screen asks.
     pub history_records: Loadable<HistorySnapshot>,
     /// The capability probes and the service records. `Loading` until a
@@ -295,6 +300,7 @@ impl AppModel {
             memory: Loadable::Loading,
             processes: Loadable::Loading,
             automation: Loadable::Loading,
+            controller: Loadable::Loading,
             history_records: Loadable::Loading,
             diagnostics: Loadable::Loading,
             topics: Vec::new(),
@@ -588,15 +594,38 @@ impl AppModel {
         cx.notify();
     }
 
-    /// Reads the operation of each stop that waits for the exit, and records
-    /// a final phase. A wait longer than [`STOP_WAIT_LIMIT`] ends as "exit
-    /// not confirmed", so that the control takes a new request.
+    /// Reads the request of each stop that waits for admission, and the
+    /// operation of each stop that waits for the exit, and records their
+    /// answers. A wait longer than [`STOP_WAIT_LIMIT`] for the exit ends as
+    /// "exit not confirmed", and a wait for admission after the expiry of
+    /// its plan ends as "not answered", so that the control takes a new
+    /// request.
     fn read_waiting_stops(&mut self, cx: &mut Context<Self>) {
         if self
             .actions
             .end_long_waits(SystemTime::now(), STOP_WAIT_LIMIT)
         {
             cx.notify();
+        }
+        for (slot, request) in self.actions.admissions() {
+            let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let id: String = request.clone();
+                let state = cx
+                    .background_spawn(async move { port.admission_state(&id) })
+                    .await;
+                if let Some(state) = state
+                    && this
+                        .update(cx, |model, cx| {
+                            model.actions.admit(&slot, &request, state);
+                            cx.notify();
+                        })
+                        .is_err()
+                {
+                    tracing::debug!("the model closed before the read finished");
+                }
+            })
+            .detach();
         }
         for (slot, operation) in self.actions.waiting() {
             let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
@@ -657,6 +686,13 @@ impl AppModel {
                     automation,
                     |source: &dyn DataSource| source.automation(),
                     |model: &mut Self, result| model.automation = Loadable::Ready(Arc::new(result))
+                ),
+                Topic::Controller => start_read!(
+                    self,
+                    cx,
+                    controller,
+                    |source: &dyn DataSource| source.controller(),
+                    |model: &mut Self, result| model.controller = Loadable::Ready(Arc::new(result))
                 ),
                 Topic::History => start_read!(
                     self,
@@ -786,6 +822,7 @@ impl AppModel {
         age(&mut self.memory, now, interval);
         age(&mut self.processes, now, interval);
         age(&mut self.automation, now, interval);
+        age(&mut self.controller, now, interval);
         age(&mut self.history_records, now, interval);
     }
 }

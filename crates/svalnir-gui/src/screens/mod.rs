@@ -1,5 +1,6 @@
 //! Screens of the client.
 
+pub mod agent_state;
 pub mod applications;
 pub mod automation;
 pub mod common;

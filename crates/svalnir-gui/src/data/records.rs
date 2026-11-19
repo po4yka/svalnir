@@ -6,7 +6,10 @@
 //! [`Measured::Unavailable`] with a reason, or a sentence in `problems`.
 
 use super::model::{GuardState, Measured, OperationPhase};
-use std::{path::PathBuf, time::SystemTime};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 use svalnir_core::{action::ActionClass, policy::PolicyId};
 
 /// The most process rows that a snapshot keeps.
@@ -58,6 +61,9 @@ pub struct ProcessRow {
     pub footprint: Measured<u64>,
     /// The resident size, in bytes. It is a different quantity.
     pub resident: Measured<u64>,
+    /// The footprint change since the previous reading of this window.
+    /// `Unavailable` on the first reading and for a new process.
+    pub growth: Measured<Growth>,
 }
 
 /// The kind of an application group.
@@ -95,11 +101,91 @@ pub enum Foreground {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protection {
     /// The catalog protects the group.
-    Protected,
+    Protected {
+        /// The catalog entry that matched the first protected member.
+        reason: ProtectionReason,
+    },
     /// The catalog does not protect the group.
     NotProtected,
     /// The lookup gave no result. Automation skips such a target.
-    Unknown,
+    Unknown {
+        /// Why the catalog cannot classify the first member with no class.
+        cause: UnknownCause,
+    },
+}
+
+/// The entry of the catalog of hard protections that protects a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionReason {
+    /// A member is a process of a different user.
+    DifferentOwner,
+    /// A member runs as root.
+    RootOwner,
+    /// A member is `launchd`.
+    Launchd,
+    /// The group is an application of the login session.
+    SessionApplication,
+    /// The group is Svalnir or one of its components.
+    ControlPlaneBundle,
+    /// A member is this window or one of its parent processes.
+    ControlPlaneProcess,
+    /// The executable of a member is in a system location.
+    SystemLocation,
+    /// The executable of a member has the name of a Svalnir executable.
+    ControlPlaneExecutable,
+}
+
+impl ProtectionReason {
+    /// The sentence of the reason.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::DifferentOwner => "A member is a process of a different user",
+            Self::RootOwner => "A member runs as root",
+            Self::Launchd => "A member is launchd",
+            Self::SessionApplication => "An application of the login session",
+            Self::ControlPlaneBundle => "Svalnir or one of its components",
+            Self::ControlPlaneProcess => "This window or one of its parent processes",
+            Self::SystemLocation => "The executable is in a system location",
+            Self::ControlPlaneExecutable => "The executable has the name of a Svalnir executable",
+        }
+    }
+}
+
+/// Why the catalog of hard protections cannot classify a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownCause {
+    /// The group has no member.
+    NoMember,
+    /// A member has no executable evidence.
+    NoExecutableEvidence,
+    /// The executable path of a member cannot be classified.
+    PathNotClassified,
+    /// The processes of this window were not found in the reading.
+    ControlPlaneNotKnown,
+}
+
+impl UnknownCause {
+    /// The sentence of the cause.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::NoMember => "The group has no member",
+            Self::NoExecutableEvidence => "A member has no executable evidence",
+            Self::PathNotClassified => "The executable path of a member cannot be classified",
+            Self::ControlPlaneNotKnown => "The processes of this window were not found",
+        }
+    }
+}
+
+/// The footprint change of one process or group between the two latest
+/// readings of this window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Growth {
+    /// The change in bytes. A negative value is a decrease.
+    pub delta: i128,
+    /// The time between the two samples.
+    pub elapsed: Duration,
 }
 
 /// One application or job instance with its verified members.
@@ -122,6 +208,12 @@ pub struct ApplicationRow {
     pub foreground: Foreground,
     /// The hard protection.
     pub protection: Protection,
+    /// The sum of the footprint changes of the members since the previous
+    /// reading. `Unavailable` when no member has a change value.
+    pub growth: Measured<Growth>,
+    /// The number of members with no change value. The sum does not
+    /// include them.
+    pub growth_missing: usize,
 }
 
 /// The processes of the current user and their application groups.
@@ -219,25 +311,101 @@ pub struct GuardDetail {
     pub requested: Option<bool>,
     /// The action grant, when the guard has one.
     pub grant: Option<GrantRow>,
-    /// The thresholds of the guard in the revision in effect: the key of
-    /// the configuration and the value in its base unit.
-    pub thresholds: Vec<(String, u64)>,
+    /// The thresholds of the guard in the revision in effect.
+    pub thresholds: Vec<ThresholdRow>,
 }
 
-/// The pause that the authority record has.
+/// A threshold value with the unit of its configuration field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThresholdQuantity {
+    /// A size, in bytes.
+    Bytes(u64),
+    /// A time, in nanoseconds.
+    Nanoseconds(u64),
+    /// A count.
+    Count(u64),
+    /// This build does not know the unit of the key. The number has no
+    /// known meaning.
+    NoUnit(u64),
+}
+
+/// One threshold of a guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThresholdRow {
+    /// The key path of the configuration.
+    pub key: String,
+    /// The value with its unit.
+    pub value: ThresholdQuantity,
+}
+
+impl ThresholdRow {
+    /// The row of `key` with the stored number `value`, with the unit that
+    /// the configuration field of `key` has.
+    #[must_use]
+    pub fn of(key: &str, value: u64) -> Self {
+        use svalnir_core::grant::{ThresholdUnit, threshold_unit};
+        Self {
+            key: key.to_owned(),
+            value: match threshold_unit(key) {
+                Some(ThresholdUnit::Bytes) => ThresholdQuantity::Bytes(value),
+                Some(ThresholdUnit::Nanoseconds) => ThresholdQuantity::Nanoseconds(value),
+                Some(ThresholdUnit::Count) => ThresholdQuantity::Count(value),
+                None => ThresholdQuantity::NoUnit(value),
+            },
+        }
+    }
+}
+
+/// What decides the end of a pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseKind {
+    /// The pause has no end time.
+    Indefinite,
+    /// The monotonic clock of the boot of the pause decides the end.
+    Timed,
+    /// The pause is of an earlier boot, so its end cannot be established.
+    /// It stays until a resume.
+    Retained,
+}
+
+/// The pause of the authority record, as the agent decides it at the time
+/// of the reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PauseRow {
     /// No pause is recorded.
     NotPaused,
-    /// A pause is recorded.
+    /// The pause inhibits automatic intervention.
     Paused {
         /// When the pause started.
         since: SystemTime,
-        /// The wall-clock time of the deadline. `None`: no deadline. The
-        /// agent ends a pause on its monotonic clock, so this time is for
-        /// display only.
+        /// The time that remained at the reading. `None` with no end time
+        /// or for a retained pause.
+        remaining: Option<Duration>,
+        /// The wall-clock end, for display. `None` with no end time or for
+        /// a retained pause.
         until: Option<SystemTime>,
+        /// What decides the end.
+        kind: PauseKind,
     },
+    /// The pause reached its end on the monotonic clock. It inhibits
+    /// nothing; the record stays until the agent or a resume removes it.
+    Expired {
+        /// When the pause started.
+        since: SystemTime,
+    },
+}
+
+/// Whether automatic work waits for a measurement that is newer than the
+/// end of a pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshMeasurement {
+    /// No pause ended, and the latest step of the agent did not wait.
+    NotNeeded,
+    /// The latest step of the agent, in a current status, waited for it.
+    Awaiting,
+    /// A pause ended, and the journal does not record whether the agent
+    /// has a newer measurement.
+    NotKnown,
 }
 
 /// What the journal says about automation.
@@ -253,6 +421,8 @@ pub struct AutomationSnapshot {
     pub guards: Vec<GuardDetail>,
     /// The recorded pause. `None` when the authority record was not read.
     pub pause: Option<PauseRow>,
+    /// Whether automatic work waits for a fresh measurement after a pause.
+    pub measurement: FreshMeasurement,
     /// A sentence for each read that failed.
     pub problems: Vec<String>,
 }
@@ -260,6 +430,260 @@ pub struct AutomationSnapshot {
 impl Captured for AutomationSnapshot {
     fn captured_at(&self) -> SystemTime {
         self.captured_at
+    }
+}
+
+/// How old the status record of the agent is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAge {
+    /// The agent wrote its status at most 90 s before the reading.
+    Current,
+    /// The status is older: the agent does not run, or it does not write.
+    /// The controller rows are the state at the time of that status.
+    Stale {
+        /// The age of the status.
+        age: Duration,
+    },
+    /// The status says that the agent stopped. The controller rows are the
+    /// state that its next start restores.
+    Stopped,
+    /// The journal has no usable status record.
+    Unknown,
+}
+
+/// The incident state of the trigger of an application budget at the latest
+/// step of the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerRow {
+    /// No pressure.
+    Normal,
+    /// The footprint is over the soft limit.
+    Advisory,
+    /// The footprint is over the stop limit, and evidence accumulates.
+    Qualifying,
+    /// The trigger qualified.
+    Ready,
+    /// An intervention runs.
+    Acting,
+    /// The footprint is below the recovery limit, and evidence accumulates.
+    Recovering,
+    /// A state that this build does not know.
+    Other,
+}
+
+impl TriggerRow {
+    /// The label of the state.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Advisory => "Advisory",
+            Self::Qualifying => "Qualifying",
+            Self::Ready => "Ready",
+            Self::Acting => "Acting",
+            Self::Recovering => "Recovering",
+            Self::Other => "Not known",
+        }
+    }
+}
+
+/// One application budget of the memory guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetRow {
+    /// The identifier of the budget in the configuration.
+    pub id: String,
+    /// True when the budget had a trigger episode that did not recover.
+    pub latched: bool,
+    /// The trigger state at the latest step of the agent. `None` when the
+    /// status record has no entry for the budget.
+    pub trigger: Option<TriggerRow>,
+}
+
+/// What a cooldown inhibits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CooldownSubject {
+    /// A new stop of one application or job after an intervention.
+    Relaunch {
+        /// The bundle identifier or the job label.
+        application: String,
+    },
+    /// The next pass of a disk incident.
+    DiskPass {
+        /// The incident, when the record has one.
+        incident: Option<String>,
+    },
+    /// The next action of an incident: the observation after an action.
+    ObserveAfterAction {
+        /// The incident.
+        incident: String,
+    },
+    /// The next target of the memory incident after an action with a low
+    /// benefit or a failure.
+    MemoryBackoff {
+        /// The incident.
+        incident: String,
+    },
+}
+
+/// The status of a cooldown at the time of the reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownState {
+    /// The cooldown is in effect.
+    Active {
+        /// The time that remained at the reading.
+        remaining: Duration,
+    },
+    /// The cooldown ended.
+    Elapsed,
+    /// The cooldown is of an earlier boot. The agent treats it as active.
+    EarlierBoot,
+}
+
+/// One cooldown of the controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownRow {
+    /// What the cooldown inhibits.
+    pub subject: CooldownSubject,
+    /// The cause, as a label.
+    pub cause: &'static str,
+    /// The status.
+    pub state: CooldownState,
+}
+
+/// The usage of a budget generation in the controller record, with the
+/// reserved charges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageRow {
+    /// The usage of a disk incident.
+    Disk {
+        /// The consumed bytes.
+        consumed_bytes: u64,
+        /// The reserved bytes.
+        reserved_bytes: u64,
+        /// The consumed items.
+        consumed_items: u64,
+        /// The reserved items.
+        reserved_items: u64,
+        /// The passes that the incident started.
+        passes: u32,
+    },
+    /// The usage of a memory incident.
+    Memory {
+        /// The consumed application slots.
+        consumed_slots: u32,
+        /// The reserved application slots.
+        reserved_slots: u32,
+    },
+}
+
+/// The consumed usage that the journal records for a budget generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalUsageRow {
+    /// The usage row of the generation.
+    Recorded {
+        /// The operations with a consumed application step.
+        slots: u32,
+        /// The charged bytes of the consumed filesystem steps.
+        work_bytes: u64,
+        /// The charged items of the consumed filesystem steps.
+        items: u64,
+    },
+    /// The journal has no usage row: no dispatch of the generation was
+    /// consumed.
+    NoConsumedDispatch,
+    /// The row cannot be read.
+    Unreadable(String),
+}
+
+/// One budget generation of an incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRow {
+    /// The generation.
+    pub generation: u64,
+    /// True when a person rearmed the incident to start the generation.
+    pub rearmed: bool,
+    /// When the generation started.
+    pub started_at: SystemTime,
+    /// The usage at the rearm that ended the generation. `None` for the
+    /// current generation.
+    pub final_usage: Option<UsageRow>,
+    /// The consumed usage of the journal.
+    pub journal: JournalUsageRow,
+}
+
+/// One open incident of the controller with its budget generations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncidentUsage {
+    /// The incident identity.
+    pub id: String,
+    /// The guard of the incident.
+    pub policy: PolicyId,
+    /// The current budget generation.
+    pub generation: u64,
+    /// False when a restart could not establish the usage: the incident
+    /// permits no automatic work until it closes or a person rearms it.
+    pub established: bool,
+    /// True when an operation of the incident has an effect that is not
+    /// known.
+    pub unknown_outcome: bool,
+    /// The usage of the current generation. `None` when the policy state
+    /// has no entry for the incident.
+    pub current: Option<UsageRow>,
+    /// Each budget generation, oldest first.
+    pub generations: Vec<GenerationRow>,
+}
+
+/// The rows of the controller record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerRows {
+    /// When the agent wrote the record. It writes the record only when the
+    /// state changes, so an old time is not evidence of a stopped agent.
+    pub written_at: Option<SystemTime>,
+    /// The application budgets.
+    pub budgets: Vec<BudgetRow>,
+    /// The cooldowns.
+    pub cooldowns: Vec<CooldownRow>,
+    /// The open incidents.
+    pub incidents: Vec<IncidentUsage>,
+    /// True when the record had more rows than the reading keeps.
+    pub truncated: bool,
+}
+
+/// The controller state that the agent records in the journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerSnapshot {
+    /// When the snapshot was read.
+    pub captured_at: SystemTime,
+    /// The age of the status record of the agent.
+    pub status_age: StatusAge,
+    /// The rows. `Unavailable` has the reason that there are none.
+    pub rows: Measured<ControllerRows>,
+}
+
+impl Captured for ControllerSnapshot {
+    fn captured_at(&self) -> SystemTime {
+        self.captured_at
+    }
+}
+
+impl ControllerSnapshot {
+    /// The cooldown of the relaunch of the application `name`, when the
+    /// record has one.
+    #[must_use]
+    pub fn relaunch_cooldown(&self, name: &str) -> Option<&CooldownRow> {
+        self.rows.value()?.cooldowns.iter().find(|row| {
+            matches!(&row.subject, CooldownSubject::Relaunch { application } if application == name)
+        })
+    }
+
+    /// The incident `id`, when the record has it.
+    #[must_use]
+    pub fn incident(&self, id: &str) -> Option<&IncidentUsage> {
+        self.rows
+            .value()?
+            .incidents
+            .iter()
+            .find(|incident| incident.id == id)
     }
 }
 
@@ -545,6 +969,7 @@ mod tests {
             group: None,
             footprint,
             resident: Measured::Unavailable("x".into()),
+            growth: Measured::Unavailable("x".into()),
         }
     }
 
@@ -579,7 +1004,11 @@ mod tests {
             footprint,
             unmeasured_members: 0,
             foreground: Foreground::Unknown,
-            protection: Protection::Unknown,
+            protection: Protection::Unknown {
+                cause: UnknownCause::NoMember,
+            },
+            growth: Measured::Unavailable("x".into()),
+            growth_missing: 1,
         };
         let rows = rank_applications(vec![
             group("b", Measured::Value(5)),

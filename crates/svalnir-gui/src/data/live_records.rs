@@ -5,38 +5,51 @@
 use super::{
     model::{GuardRow, Measured, OperationPhase},
     records::{
-        AgentStatusRow, ApplicationRow, AutomationSnapshot, CapabilityLevel, CapabilityRow,
-        DiagnosticsSnapshot, EffectRow, Foreground, GrantRow, GroupKind, GuardDetail,
-        HISTORY_ROWS_MAX, HistorySnapshot, IncidentRow, JournalRow, MemorySnapshot, Need,
-        OperationDetail, PauseRow, ProcessRow, ProcessesSnapshot, Protection, RevisionRow,
-        StartFailureRow, Verdict, rank_applications, rank_processes, refine_phase,
+        AgentStatusRow, ApplicationRow, AutomationSnapshot, BudgetRow, CapabilityLevel,
+        CapabilityRow, ControllerRows, ControllerSnapshot, CooldownRow, CooldownState,
+        CooldownSubject, DiagnosticsSnapshot, EffectRow, Foreground, FreshMeasurement,
+        GenerationRow, GrantRow, GroupKind, Growth, GuardDetail, HISTORY_ROWS_MAX, HistorySnapshot,
+        IncidentRow, IncidentUsage, JournalRow, JournalUsageRow, MemorySnapshot, Need,
+        OperationDetail, PauseKind, PauseRow, ProcessRow, ProcessesSnapshot, Protection,
+        ProtectionReason, RevisionRow, StartFailureRow, StatusAge, ThresholdQuantity, ThresholdRow,
+        TriggerRow, UnknownCause, UsageRow, Verdict, rank_applications, rank_processes,
+        refine_phase,
     },
 };
 use std::{
     collections::HashMap,
     path::Path,
+    sync::{Mutex, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use svalnir_agent::{
     capability::{self, Requirement, WorkerRole},
     journal::{AgentRecord, OperationJournal},
-    observe::{self, Host},
+    observe::{
+        self, AgentRecordsReading, ClientClock, ControllerReading, CooldownReading, Freshness,
+        GenerationReading, Host, IncidentReading, JournalReading, JournalUsage, PauseReading,
+        PauseUnknown, RecordReading, StatusReading,
+    },
     platform::{
         memory::collect_memory_snapshot,
         process::{
-            CollectionContext as ProcessContext, DarwinProcessSource, ForegroundState,
-            ProcessCollector, ProcessRecord, ProcessSnapshot, control_plane_of_this_process,
+            CollectionContext as ProcessContext, DarwinProcessSource, DerivedMetrics,
+            ForegroundState, ProcessCollector, ProcessRecord, ProcessSnapshot,
+            control_plane_of_this_process, derive_between,
         },
     },
     runtime::{AgentStatus, RunState, journal_path, start_failure::read_start_failure},
 };
 use svalnir_core::{
     action::{Operation, ResourceEffect},
-    grant::AuthorityState,
+    grant::{AuthorityState, GenerationBasis, PauseBasis, PauseStatus, Threshold, ThresholdValue},
     observation::{Observation, Reading},
-    policy::{PolicyId, ProtectionContext, ProtectionFact, hard_protection},
+    policy::{
+        CooldownCause, CooldownStatus, HardProtectionEntry, HardProtectionExplanation, PolicyId,
+        ProtectionContext, ProtectionUnknownCause, TriggerState, explain_hard_protection,
+    },
     process::{ProcessIdentity, VerifiedMembership},
-    quantity::Bytes,
+    quantity::{Bytes, Nanoseconds},
     state::{CapabilityState, PressureState},
     time::WallTime,
 };
@@ -98,7 +111,92 @@ struct Group<'a> {
     members: Vec<&'a ProcessRecord>,
 }
 
-fn group_row(group: &Group<'_>, context: &ProtectionContext<'_>) -> ApplicationRow {
+/// The row of a hard protection with the entry or the cause that decided it.
+fn protection_row(identities: &[ProcessIdentity], context: &ProtectionContext<'_>) -> Protection {
+    match explain_hard_protection(identities, context) {
+        HardProtectionExplanation::NotProtected => Protection::NotProtected,
+        HardProtectionExplanation::Protected { entry, .. } => Protection::Protected {
+            reason: match entry {
+                HardProtectionEntry::DifferentOwner => ProtectionReason::DifferentOwner,
+                HardProtectionEntry::RootOwner => ProtectionReason::RootOwner,
+                HardProtectionEntry::Launchd => ProtectionReason::Launchd,
+                HardProtectionEntry::SessionApplication => ProtectionReason::SessionApplication,
+                HardProtectionEntry::ControlPlaneBundle => ProtectionReason::ControlPlaneBundle,
+                HardProtectionEntry::ControlPlaneProcess => ProtectionReason::ControlPlaneProcess,
+                HardProtectionEntry::SystemLocation => ProtectionReason::SystemLocation,
+                HardProtectionEntry::ControlPlaneExecutable => {
+                    ProtectionReason::ControlPlaneExecutable
+                }
+            },
+        },
+        HardProtectionExplanation::Unknown { cause, .. } => Protection::Unknown {
+            cause: match cause {
+                ProtectionUnknownCause::NoMember => UnknownCause::NoMember,
+                ProtectionUnknownCause::NoExecutableEvidence => UnknownCause::NoExecutableEvidence,
+                ProtectionUnknownCause::PathNotClassified => UnknownCause::PathNotClassified,
+                ProtectionUnknownCause::ControlPlaneNotKnown => UnknownCause::ControlPlaneNotKnown,
+            },
+        },
+    }
+}
+
+/// The footprint change of `record` between the previous snapshot of this
+/// window and the current one.
+fn record_growth(record: &ProcessRecord, derived: Option<&DerivedMetrics>) -> Measured<Growth> {
+    let Some(derived) = derived else {
+        return Measured::Unavailable(
+            "the first reading of this window has no earlier sample".to_owned(),
+        );
+    };
+    match derived.growth.get(&record.identity.generation_id) {
+        Some(Ok(growth)) => Measured::Value(Growth {
+            delta: growth.delta.get(),
+            elapsed: Duration::from_nanos(growth.elapsed.get()),
+        }),
+        Some(Err(reason)) => Measured::Unavailable(reason.to_string()),
+        None => Measured::Unavailable("the process is new since the previous reading".to_owned()),
+    }
+}
+
+/// The sum of the footprint changes of the members, and the number of
+/// members with no change value. The elapsed time is the longest of the
+/// members.
+fn group_growth(
+    members: &[&ProcessRecord],
+    derived: Option<&DerivedMetrics>,
+) -> (Measured<Growth>, usize) {
+    let mut sum: i128 = 0;
+    let mut elapsed: Duration = Duration::ZERO;
+    let mut measured: usize = 0;
+    let mut first_reason: Option<String> = None;
+    for member in members {
+        match record_growth(member, derived) {
+            Measured::Value(growth) => {
+                sum = sum.saturating_add(growth.delta);
+                elapsed = elapsed.max(growth.elapsed);
+                measured += 1;
+            }
+            Measured::Unavailable(reason) => {
+                first_reason.get_or_insert(reason);
+            }
+        }
+    }
+    let growth: Measured<Growth> = if measured == 0 {
+        Measured::Unavailable(first_reason.unwrap_or_else(|| "the group has no member".to_owned()))
+    } else {
+        Measured::Value(Growth {
+            delta: sum,
+            elapsed,
+        })
+    };
+    (growth, members.len() - measured)
+}
+
+fn group_row(
+    group: &Group<'_>,
+    context: &ProtectionContext<'_>,
+    derived: Option<&DerivedMetrics>,
+) -> ApplicationRow {
     let mut sum: u64 = 0;
     let mut measured: usize = 0;
     for member in &group.members {
@@ -127,6 +225,7 @@ fn group_row(group: &Group<'_>, context: &ProtectionContext<'_>) -> ApplicationR
         .iter()
         .map(|member| member.identity.clone())
         .collect();
+    let (growth, growth_missing) = group_growth(&group.members, derived);
     ApplicationRow {
         instance: group.instance.clone(),
         name: group.name.clone(),
@@ -139,17 +238,21 @@ fn group_row(group: &Group<'_>, context: &ProtectionContext<'_>) -> ApplicationR
         },
         unmeasured_members: group.members.len() - measured,
         foreground,
-        protection: match hard_protection(&identities, context) {
-            ProtectionFact::Protected => Protection::Protected,
-            ProtectionFact::NotProtected => Protection::NotProtected,
-            ProtectionFact::Unknown => Protection::Unknown,
-        },
+        protection: protection_row(&identities, context),
+        growth,
+        growth_missing,
     }
 }
 
 /// Makes the rows of a process snapshot. Only a verified membership makes a
-/// process a member of a group.
-fn process_rows(snapshot: &ProcessSnapshot) -> ProcessesSnapshot {
+/// process a member of a group. `previous` is the earlier snapshot of this
+/// window, for the footprint growth.
+fn process_rows(
+    snapshot: &ProcessSnapshot,
+    previous: Option<&ProcessSnapshot>,
+) -> ProcessesSnapshot {
+    let derived: Option<DerivedMetrics> =
+        previous.map(|previous| derive_between(previous, snapshot));
     let mut groups: Vec<Group<'_>> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut unattributed: usize = 0;
@@ -194,6 +297,7 @@ fn process_rows(snapshot: &ProcessSnapshot) -> ProcessesSnapshot {
             group: name.map(str::to_owned),
             footprint: observed_bytes(&record.metrics.footprint),
             resident: observed_bytes(&record.metrics.resident),
+            growth: record_growth(record, derived.as_ref()),
         });
     }
     let control_plane = control_plane_of_this_process(snapshot);
@@ -203,7 +307,7 @@ fn process_rows(snapshot: &ProcessSnapshot) -> ProcessesSnapshot {
     };
     let applications: Vec<ApplicationRow> = groups
         .iter()
-        .map(|group| group_row(group, &context))
+        .map(|group| group_row(group, &context, derived.as_ref()))
         .collect();
     let mut notes: Vec<String> = Vec::new();
     if let Some(reason) = &snapshot.launch_services_unavailable {
@@ -246,9 +350,18 @@ fn process_rows(snapshot: &ProcessSnapshot) -> ProcessesSnapshot {
     }
 }
 
-/// Reads the processes of the current user.
-pub(super) fn processes(host: &Host) -> Result<ProcessesSnapshot, String> {
-    collect_processes(host).map(|snapshot| process_rows(&snapshot))
+/// Reads the processes of the current user. `previous` holds the snapshot
+/// of the previous read of this window: the growth is the change since
+/// that read, and the new snapshot replaces it. Only one snapshot is kept.
+pub(super) fn processes(
+    host: &Host,
+    previous: &Mutex<Option<ProcessSnapshot>>,
+) -> Result<ProcessesSnapshot, String> {
+    let snapshot: ProcessSnapshot = collect_processes(host)?;
+    let mut kept = previous.lock().unwrap_or_else(PoisonError::into_inner);
+    let rows: ProcessesSnapshot = process_rows(&snapshot, kept.as_ref());
+    *kept = Some(snapshot);
+    Ok(rows)
 }
 
 /// Reads the process snapshot of the current user, for the rows of a
@@ -357,17 +470,75 @@ fn guard_details(
                         revoked: grant.revoked,
                         in_effect: grant.is_in_effect(now),
                     }),
-                thresholds: thresholds
-                    .iter()
-                    .map(|threshold| (threshold.key.clone(), threshold.value))
-                    .collect(),
+                thresholds: thresholds.iter().map(threshold_row).collect(),
             }
         })
         .collect()
 }
 
-/// Reads the authority record.
-pub(super) fn automation(state_directory: Option<&Path>) -> AutomationSnapshot {
+/// The row of a threshold with its typed value.
+fn threshold_row(threshold: &Threshold) -> ThresholdRow {
+    ThresholdRow {
+        key: threshold.key.clone(),
+        value: match threshold.typed_value() {
+            Some(ThresholdValue::Bytes(bytes)) => ThresholdQuantity::Bytes(bytes.get()),
+            Some(ThresholdValue::Nanoseconds(time)) => ThresholdQuantity::Nanoseconds(time.get()),
+            Some(ThresholdValue::Count(count)) => ThresholdQuantity::Count(count),
+            None => ThresholdQuantity::NoUnit(threshold.value),
+        },
+    }
+}
+
+fn duration(value: Nanoseconds) -> Duration {
+    Duration::from_nanos(value.get())
+}
+
+/// The pause row of `reading`, with the start time of the record.
+fn pause_row(reading: &PauseReading, since: Option<WallTime>) -> PauseRow {
+    let since: SystemTime = since.map_or(UNIX_EPOCH, system_time);
+    match reading.status {
+        PauseStatus::NotPaused => PauseRow::NotPaused,
+        PauseStatus::Paused {
+            remaining,
+            until,
+            basis,
+        } => PauseRow::Paused {
+            since,
+            remaining: remaining.map(duration),
+            until: until.map(system_time),
+            kind: match basis {
+                PauseBasis::Indefinite => PauseKind::Indefinite,
+                PauseBasis::Monotonic => PauseKind::Timed,
+                PauseBasis::Retained => PauseKind::Retained,
+            },
+        },
+        PauseStatus::Expired { .. } => PauseRow::Expired { since },
+    }
+}
+
+/// Whether automatic work waits for a fresh measurement. Only a current
+/// status of the agent shows that it waits.
+fn fresh_measurement(reading: &PauseReading) -> FreshMeasurement {
+    if !reading.unknown.contains(&PauseUnknown::FreshMeasurement) {
+        return FreshMeasurement::NotNeeded;
+    }
+    match &reading.agent_step {
+        Some(step)
+            if step.awaiting_fresh_measurement
+                && matches!(step.freshness, Freshness::Current { .. }) =>
+        {
+            FreshMeasurement::Awaiting
+        }
+        _ => FreshMeasurement::NotKnown,
+    }
+}
+
+/// Reads the authority record. `clock` is the clock of this window, read
+/// as the agent reads it; the pause is decided on it.
+pub(super) fn automation(
+    state_directory: Option<&Path>,
+    clock: Result<ClientClock, String>,
+) -> AutomationSnapshot {
     let captured_at: SystemTime = SystemTime::now();
     let mut snapshot = AutomationSnapshot {
         captured_at,
@@ -375,15 +546,20 @@ pub(super) fn automation(state_directory: Option<&Path>) -> AutomationSnapshot {
         revision: None,
         guards: Vec::new(),
         pause: None,
+        measurement: FreshMeasurement::NotNeeded,
         problems: Vec::new(),
     };
     let uid = observe::current_uid();
-    let Ok(now) = WallTime::try_from(captured_at) else {
-        snapshot
-            .problems
-            .push("The system clock has no usable value, so the guards are not shown.".to_owned());
-        return snapshot;
+    let clock: ClientClock = match clock {
+        Ok(clock) => clock,
+        Err(reason) => {
+            snapshot.problems.push(format!(
+                "The clocks of this window have no usable value ({reason}), so the guards and the pause are not shown."
+            ));
+            return snapshot;
+        }
     };
+    let now: WallTime = clock.wall;
     let journal = match open_journal(state_directory) {
         Ok(Some(journal)) => journal,
         Ok(None) => {
@@ -407,21 +583,205 @@ pub(super) fn automation(state_directory: Option<&Path>) -> AutomationSnapshot {
                 profile: active.scope.profile.clone(),
             });
             snapshot.guards = guard_details(state, now, &open_incidents(&journal));
-            snapshot.pause = Some(state.pause.as_ref().map_or(PauseRow::NotPaused, |pause| {
-                PauseRow::Paused {
-                    since: system_time(pause.started_wall),
-                    until: pause
-                        .deadline
-                        .as_ref()
-                        .map(|deadline| system_time(deadline.wall)),
-                }
-            }));
+            let status: RecordReading<StatusReading> = observe::read_status(&journal, now);
+            let reading: PauseReading = observe::pause_reading(state, status.recorded(), &clock);
+            snapshot.pause = Some(pause_row(
+                &reading,
+                state.pause.as_ref().map(|pause| pause.started_wall),
+            ));
+            snapshot.measurement = fresh_measurement(&reading);
         }
         Err(error) => snapshot
             .problems
             .push(format!("The authority record cannot be read: {error}.")),
     }
     snapshot
+}
+
+fn status_age(status: &RecordReading<StatusReading>) -> StatusAge {
+    match status.recorded().map(|reading| reading.freshness) {
+        Some(Freshness::Current { .. }) => StatusAge::Current,
+        Some(Freshness::Stale { age }) => StatusAge::Stale { age: duration(age) },
+        Some(Freshness::Stopped) => StatusAge::Stopped,
+        Some(Freshness::Unknown) | None => StatusAge::Unknown,
+    }
+}
+
+fn trigger_row(trigger: TriggerState) -> TriggerRow {
+    match trigger {
+        TriggerState::Normal => TriggerRow::Normal,
+        TriggerState::Advisory => TriggerRow::Advisory,
+        TriggerState::Qualifying => TriggerRow::Qualifying,
+        TriggerState::Ready => TriggerRow::Ready,
+        TriggerState::Acting => TriggerRow::Acting,
+        TriggerState::Recovering => TriggerRow::Recovering,
+        _ => TriggerRow::Other,
+    }
+}
+
+const fn cause_label(cause: CooldownCause) -> &'static str {
+    match cause {
+        CooldownCause::PassPacing => "Pass pacing",
+        CooldownCause::NoEffectBackoff => "Back-off after no effect",
+        CooldownCause::ApplicationRelaunch => "Relaunch cooldown",
+    }
+}
+
+fn cooldown_row(reading: &CooldownReading) -> CooldownRow {
+    CooldownRow {
+        subject: match &reading.subject {
+            observe::CooldownSubject::Application { application } => CooldownSubject::Relaunch {
+                application: application.clone(),
+            },
+            observe::CooldownSubject::DiskIncident { incident_id } => CooldownSubject::DiskPass {
+                incident: incident_id.as_ref().map(ToString::to_string),
+            },
+            observe::CooldownSubject::ObserveAfterAction { incident_id } => {
+                CooldownSubject::ObserveAfterAction {
+                    incident: incident_id.to_string(),
+                }
+            }
+            observe::CooldownSubject::MemoryBackoff { incident_id } => {
+                CooldownSubject::MemoryBackoff {
+                    incident: incident_id.to_string(),
+                }
+            }
+        },
+        cause: cause_label(reading.cause),
+        state: match reading.status {
+            CooldownStatus::Active { remaining } => CooldownState::Active {
+                remaining: duration(remaining),
+            },
+            CooldownStatus::Elapsed => CooldownState::Elapsed,
+            CooldownStatus::Unknown => CooldownState::EarlierBoot,
+        },
+    }
+}
+
+fn usage_row(usage: &svalnir_core::grant::IncidentUsage) -> UsageRow {
+    match usage {
+        svalnir_core::grant::IncidentUsage::Disk {
+            usage,
+            passes_started,
+        } => UsageRow::Disk {
+            consumed_bytes: usage.consumed_bytes.get(),
+            reserved_bytes: usage.reserved_bytes.get(),
+            consumed_items: usage.consumed_items.get(),
+            reserved_items: usage.reserved_items.get(),
+            passes: *passes_started,
+        },
+        svalnir_core::grant::IncidentUsage::Memory {
+            consumed_slots,
+            reserved_slots,
+        } => UsageRow::Memory {
+            consumed_slots: *consumed_slots,
+            reserved_slots: *reserved_slots,
+        },
+    }
+}
+
+fn generation_row(reading: &GenerationReading) -> GenerationRow {
+    GenerationRow {
+        generation: reading.generation.get(),
+        rearmed: reading.basis == GenerationBasis::Rearmed,
+        started_at: system_time(reading.started_at),
+        final_usage: reading.final_usage.as_ref().map(usage_row),
+        journal: match &reading.journal {
+            JournalUsage::Recorded(usage) => JournalUsageRow::Recorded {
+                slots: usage.slots,
+                work_bytes: usage.work.work_bytes.get(),
+                items: usage.work.items.get(),
+            },
+            JournalUsage::NoConsumedDispatch => JournalUsageRow::NoConsumedDispatch,
+            JournalUsage::Unreadable { reason } => JournalUsageRow::Unreadable(reason.clone()),
+        },
+    }
+}
+
+fn incident_usage(reading: &IncidentReading) -> IncidentUsage {
+    IncidentUsage {
+        id: reading.incident_id.to_string(),
+        policy: reading.guard.policy(),
+        generation: reading.generation.get(),
+        established: reading.established,
+        unknown_outcome: reading.unknown_outcome,
+        current: reading.current_usage.as_ref().map(usage_row),
+        generations: reading.generations.iter().map(generation_row).collect(),
+    }
+}
+
+fn controller_rows(reading: &ControllerReading) -> ControllerRows {
+    ControllerRows {
+        written_at: reading.written_at.map(system_time),
+        budgets: reading
+            .budgets
+            .iter()
+            .map(|budget| BudgetRow {
+                id: budget.budget_id.clone(),
+                latched: budget.latched,
+                trigger: budget.trigger.map(trigger_row),
+            })
+            .collect(),
+        cooldowns: reading.cooldowns.iter().map(cooldown_row).collect(),
+        incidents: reading.incidents.iter().map(incident_usage).collect(),
+        truncated: reading.truncated,
+    }
+}
+
+/// The controller snapshot of the agent records of one journal.
+fn controller_snapshot(
+    captured_at: SystemTime,
+    records: &AgentRecordsReading,
+) -> ControllerSnapshot {
+    ControllerSnapshot {
+        captured_at,
+        status_age: status_age(&records.status),
+        rows: match &records.controller {
+            RecordReading::Recorded(reading) => Measured::Value(controller_rows(reading)),
+            RecordReading::Absent => Measured::Unavailable(
+                "The journal has no controller record: no agent recorded its state.".to_owned(),
+            ),
+            RecordReading::Unreadable { reason } => {
+                Measured::Unavailable(format!("The controller record cannot be read: {reason}."))
+            }
+        },
+    }
+}
+
+/// Reads the controller record and the status record of the agent at the
+/// clock of this window.
+pub(super) fn controller(
+    state_directory: Option<&Path>,
+    clock: Result<ClientClock, String>,
+) -> ControllerSnapshot {
+    let captured_at: SystemTime = SystemTime::now();
+    let unavailable = |reason: String| ControllerSnapshot {
+        captured_at,
+        status_age: StatusAge::Unknown,
+        rows: Measured::Unavailable(reason),
+    };
+    let Some(directory) = state_directory else {
+        return unavailable(
+            "The state directory is not known, so the journal was not read.".to_owned(),
+        );
+    };
+    let clock: ClientClock = match clock {
+        Ok(clock) => clock,
+        Err(reason) => {
+            return unavailable(format!(
+                "The clocks of this window have no usable value: {reason}."
+            ));
+        }
+    };
+    match observe::read_agent_records_at(&journal_path(directory), observe::current_uid(), &clock) {
+        JournalReading::Absent => {
+            unavailable("No journal exists in the state directory.".to_owned())
+        }
+        JournalReading::Unreadable { reason } => {
+            unavailable(format!("The journal cannot be read: {reason}."))
+        }
+        JournalReading::Read(records) => controller_snapshot(captured_at, &records),
+    }
 }
 
 fn pressure_text(observation: &Observation<PressureState>) -> Measured<String> {
@@ -569,6 +929,9 @@ fn agent_row(status: &AgentStatus) -> AgentStatusRow {
 pub(super) fn diagnostics(state_directory: Option<&Path>) -> DiagnosticsSnapshot {
     // The report has no role for a window. A window is a client process, as
     // the CLI is, so the probes run with the role of the CLI.
+    // TODO(npochaev): use `WorkerRole::Window` when `svalnir-agent` adds it,
+    // so that the scope note and the Full Disk Access remediation name the
+    // application and not the terminal.
     let report = capability::diagnose(WorkerRole::Cli);
     let capabilities: Vec<CapabilityRow> = report
         .capabilities
@@ -669,30 +1032,617 @@ pub(super) fn diagnostics(state_directory: Option<&Path>) -> DiagnosticsSnapshot
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Child, stop_plan};
+    use svalnir_agent::{
+        client,
+        controller::{
+            CONTROLLER_STATUS_VERSION, ControllerState, ControllerStatus, Guard, GuardPhase,
+            GuardStatus, IncidentStatus, MemoryIncidentRecord, Summary,
+        },
+        journal::{CoordinatorLock, CoordinatorRole, JournalOptions},
+        runtime::{AGENT_STATUS_VERSION, PolicySource, SelfLimits},
+    };
+    use svalnir_core::{
+        action::{ClientRole, Durability, PlanApproval},
+        authority::Generation,
+        config::parse_and_validate,
+        digest::ContentDigest,
+        grant::{
+            Acceptance, ActivationRequest, BudgetGenerationRecord, EnableRequest, IncidentBudget,
+            InstanceInhibition, Pause, PauseDeadline, Persistence, activate, enable,
+        },
+        id::{
+            ActionGrantId, BootId, ClockDomainId, ExecutorEpochId, IncidentId, OperationId,
+            PolicyRevisionId,
+        },
+        policy::{
+            ApplicationCooldown, BudgetState, ContinuityGeneration, Cooldown, EvaluationClock,
+            MemoryIncident, QualificationWindow,
+        },
+        rule::{Rule, RuleRegistry},
+        time::MonotonicNanos,
+    };
+
+    const SECOND: u64 = 1_000_000_000;
+    const DOMAIN: &str = "macos.clock_monotonic_raw";
+    const BOOT: &str = "boot-test";
+
+    /// The configuration of the test: the memory guard is requested with
+    /// force quit, and the disk guard is not requested.
+    const CONFIG: &str = r#"
+schema_version = 1
+
+[agent]
+profile = "balanced"
+
+[memory_guard]
+enabled = true
+global_trigger = "critical"
+sustain_for = "15s"
+grace_period = "10s"
+recovery_stable_for = "60s"
+max_applications_per_incident = 3
+protect_foreground = true
+allow_force_quit = true
+eligible_groups = ["background-user-applications", "managed-jobs"]
+"#;
+
+    fn wall(seconds: i64) -> WallTime {
+        WallTime::from_unix(1_800_000_000 + seconds, 0).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The clock of the window: `monotonic` seconds in the boot of the
+    /// records, at the wall-clock time `wall_seconds`.
+    fn clock(monotonic: u64, wall_seconds: i64) -> ClientClock {
+        ClientClock {
+            clock: EvaluationClock {
+                now: MonotonicNanos::new(monotonic * SECOND),
+                clock_domain: ClockDomainId::new(DOMAIN).unwrap_or_else(|error| panic!("{error}")),
+                boot_id: BootId::new(BOOT).unwrap_or_else(|error| panic!("{error}")),
+                continuity: ContinuityGeneration::new(0),
+                last_discontinuity: None,
+            },
+            wall: wall(wall_seconds),
+        }
+    }
+
+    fn cooldown(boot: &str, until_seconds: u64) -> Cooldown {
+        Cooldown {
+            cause: CooldownCause::ApplicationRelaunch,
+            until: MonotonicNanos::new(until_seconds * SECOND),
+            clock_domain: ClockDomainId::new(DOMAIN).unwrap_or_else(|error| panic!("{error}")),
+            boot_id: BootId::new(boot).unwrap_or_else(|error| panic!("{error}")),
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoRules;
+
+    impl RuleRegistry for NoRules {
+        fn rules(&self) -> Vec<&Rule> {
+            Vec::new()
+        }
+    }
+
+    /// The authority record: the test configuration in effect as `rev-1`,
+    /// the memory guard enabled with force quit accepted, and a pause that
+    /// ends at 400 s on the monotonic clock of the boot of the test.
+    fn authority() -> AuthorityState {
+        let uid = observe::current_uid();
+        let config = parse_and_validate(CONFIG)
+            .config()
+            .cloned()
+            .unwrap_or_else(|| panic!("the test configuration is not valid"));
+        let none = InstanceInhibition::default();
+        let request = ActivationRequest {
+            principal: uid,
+            config: &config,
+            content: ContentDigest::of_bytes(CONFIG.as_bytes()),
+            expected_revision: None,
+            revision_id: PolicyRevisionId::new("rev-1").unwrap_or_else(|error| panic!("{error}")),
+            now: wall(0),
+        };
+        let state: AuthorityState = activate(&AuthorityState::new(uid), &request, &NoRules)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .acknowledge(&none, Persistence::Durable)
+            .state;
+        let request = EnableRequest {
+            principal: uid,
+            policy: PolicyId::MemoryGuard,
+            accepted: Acceptance::classes_of(&[Acceptance::ForceQuit]),
+            reviewed_revision: Some(
+                PolicyRevisionId::new("rev-1").unwrap_or_else(|error| panic!("{error}")),
+            ),
+            grant_id: ActionGrantId::new("grant-memory").unwrap_or_else(|error| panic!("{error}")),
+            now: wall(0),
+        };
+        let mut state: AuthorityState = enable(&state, &none, &request)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .acknowledge(&none, Persistence::Durable)
+            .state;
+        state.pause = Some(Pause {
+            started_wall: wall(10),
+            deadline: Some(PauseDeadline {
+                monotonic: MonotonicNanos::new(400 * SECOND),
+                clock_domain: ClockDomainId::new(DOMAIN).unwrap_or_else(|error| panic!("{error}")),
+                boot_id: BootId::new(BOOT).unwrap_or_else(|error| panic!("{error}")),
+                wall: wall(400),
+            }),
+        });
+        state
+    }
+
+    fn incident_id() -> IncidentId {
+        IncidentId::new("incident-m").unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The status record of a running agent, written at `written_at`, with
+    /// the open memory incident and the trigger of one budget.
+    fn status(written_at: i64) -> AgentStatus {
+        AgentStatus {
+            schema_version: AGENT_STATUS_VERSION,
+            executor_epoch: ExecutorEpochId::new("epoch-test")
+                .unwrap_or_else(|error| panic!("{error}")),
+            process_id: 4242,
+            started_at: wall(0),
+            written_at: wall(written_at),
+            state: RunState::Running,
+            controller: Some(ControllerStatus {
+                schema_version: CONTROLLER_STATUS_VERSION,
+                evaluated_at: wall(written_at),
+                summary: Summary::Normal,
+                paused: true,
+                paused_until: Some(wall(400)),
+                observation_only: false,
+                guards: vec![GuardStatus {
+                    guard: Guard::Memory,
+                    standing: "active".to_owned(),
+                    phase: GuardPhase::Normal,
+                    triggers: vec!["budget.build-worker:qualifying".to_owned()],
+                    blocked: Vec::new(),
+                    incidents: vec![IncidentStatus {
+                        incident_id: incident_id(),
+                        generation: 2,
+                        established: true,
+                        work_bytes: None,
+                        passes_started: None,
+                        slots_used: Some(2),
+                        slots_remaining: Some(1),
+                    }],
+                }],
+                outstanding_plan: None,
+                outstanding_operation: None,
+                degraded: Vec::new(),
+                optional_work_reduced: false,
+            }),
+            policy: PolicySource {
+                revision: None,
+                problem: None,
+            },
+            capabilities: None,
+            limits: SelfLimits {
+                footprint_bytes: Some(80_000_000),
+                budget_bytes: 64 * 1024 * 1024,
+                over_budget: false,
+                optional_work_reduced: false,
+            },
+            degraded: Vec::new(),
+            unclean_stops: 0,
+            restart_backoff: false,
+        }
+    }
+
+    /// The controller record: one latched budget, three relaunch cooldowns
+    /// (active, ended, and of an earlier boot), and the memory incident with
+    /// two budget generations.
+    fn controller_state() -> ControllerState {
+        let mut state = ControllerState::default();
+        state.policy.memory.budgets = vec![BudgetState {
+            budget_id: "build-worker".to_owned(),
+            stop_window: QualificationWindow::Idle,
+            recovery_window: QualificationWindow::Idle,
+            latched: true,
+        }];
+        state.policy.memory.cooldowns = vec![
+            ApplicationCooldown {
+                application: "com.example.Active".to_owned(),
+                cooldown: cooldown(BOOT, 400),
+            },
+            ApplicationCooldown {
+                application: "com.example.Ended".to_owned(),
+                cooldown: cooldown(BOOT, 50),
+            },
+            ApplicationCooldown {
+                application: "com.example.EarlierBoot".to_owned(),
+                cooldown: cooldown("boot-earlier", 50),
+            },
+        ];
+        state.policy.memory.incident = Some(MemoryIncident {
+            consumed_slots: 1,
+            reserved_slots: 1,
+            outstanding_operation: false,
+        });
+        state.memory_incident = Some(MemoryIncidentRecord {
+            incident_id: incident_id(),
+            budget: IncidentBudget {
+                incident_id: incident_id(),
+                policy: PolicyId::MemoryGuard,
+                generation: Generation::new(2),
+                history: vec![
+                    BudgetGenerationRecord {
+                        generation: Generation::new(1),
+                        basis: GenerationBasis::IncidentOpened,
+                        authorized_by: None,
+                        started_at: wall(0),
+                        final_usage: Some(svalnir_core::grant::IncidentUsage::Memory {
+                            consumed_slots: 3,
+                            reserved_slots: 0,
+                        }),
+                    },
+                    BudgetGenerationRecord {
+                        generation: Generation::new(2),
+                        basis: GenerationBasis::Rearmed,
+                        authorized_by: Some(observe::current_uid()),
+                        started_at: wall(50),
+                        final_usage: None,
+                    },
+                ],
+                volatile_exception_at_open: false,
+            },
+            opened_in: ExecutorEpochId::new("epoch-test").unwrap_or_else(|error| panic!("{error}")),
+            established: false,
+            unknown_outcome: true,
+            observe_until: None,
+            backoff: Some(Cooldown {
+                cause: CooldownCause::NoEffectBackoff,
+                ..cooldown(BOOT, 130)
+            }),
+            last_refusal: None,
+            refusals: 0,
+        });
+        state
+    }
+
+    /// A state directory with a journal that has the authority, status,
+    /// and controller records and one admitted stop operation of a child of
+    /// the test.
+    struct World {
+        directory: tempfile::TempDir,
+        operation: String,
+        _child: Child,
+    }
+
+    fn world() -> World {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let path = journal_path(directory.path());
+        let options = JournalOptions {
+            full_fsync: false,
+            ..JournalOptions::default()
+        };
+        let mut journal =
+            OperationJournal::open(&path, &options).unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .put_agent_record(AgentRecord::Authority, &authority(), None, wall(20))
+            .unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .put_agent_record(AgentRecord::Status, &status(90), None, wall(90))
+            .unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .put_agent_record(AgentRecord::Controller, &controller_state(), None, wall(60))
+            .unwrap_or_else(|error| panic!("{error}"));
+        // One admitted stop operation, with a resource observation of a kind
+        // that this build does not know.
+        let mut child = Child::sleeper(directory.path());
+        let plan = stop_plan(&mut child, "plan-live-1", Duration::from_secs(1));
+        let lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let epoch = ExecutorEpochId::new("epoch-test").unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .begin_coordination(&lock, &epoch, wall(1))
+            .unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .complete_reconciliation(&epoch)
+            .unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .try_record_plan(&plan)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let operation = Operation::admit(
+            &plan,
+            OperationId::new("op-live-1").unwrap_or_else(|error| panic!("{error}")),
+            epoch,
+            Durability::Durable,
+            wall(30),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"));
+        let approval = PlanApproval {
+            plan_id: plan.plan_id.clone(),
+            digest: plan.digest().clone(),
+        };
+        journal
+            .try_admit(&approval, &client::principal(ClientRole::Gui), &operation)
+            .unwrap_or_else(|error| panic!("{error}"));
+        journal
+            .record_resource_effects(operation.operation_id(), &[ResourceEffect::Unrecognized])
+            .unwrap_or_else(|error| panic!("{error}"));
+        drop(journal);
+        drop(lock);
+        World {
+            operation: operation.operation_id().to_string(),
+            directory,
+            _child: child,
+        }
+    }
+
+    #[test]
+    fn the_authority_record_maps_to_the_automation_view() {
+        let world: World = world();
+        let directory: &Path = world.directory.path();
+
+        // Automation: the revision, the guard with its grant and its open
+        // incident, the typed thresholds, and the pause on the monotonic
+        // clock: 300 s remain at 100 s, although the wall clock is later.
+        let paused: AutomationSnapshot = automation(Some(directory), Ok(clock(100, 95)));
+        assert_eq!(paused.problems, Vec::<String>::new());
+        assert!(paused.journal_present);
+        assert_eq!(
+            paused
+                .revision
+                .as_ref()
+                .map(|revision| revision.id.as_str()),
+            Some("rev-1")
+        );
+        assert_eq!(
+            paused.pause,
+            Some(PauseRow::Paused {
+                since: system_time(wall(10)),
+                remaining: Some(Duration::from_secs(300)),
+                until: Some(system_time(wall(400))),
+                kind: PauseKind::Timed,
+            })
+        );
+        assert_eq!(paused.measurement, FreshMeasurement::NotNeeded);
+        let memory: &GuardDetail = paused
+            .guards
+            .iter()
+            .find(|guard| guard.policy == PolicyId::MemoryGuard)
+            .unwrap_or_else(|| panic!("no memory guard"));
+        assert!(memory.enabled);
+        assert_eq!(memory.requested, Some(true));
+        assert_eq!(
+            memory.incidents,
+            vec![IncidentRow {
+                id: "incident-m".to_owned(),
+                generation: 2,
+            }]
+        );
+        let grant: &GrantRow = memory.grant.as_ref().unwrap_or_else(|| panic!("no grant"));
+        assert_eq!(grant.id, "grant-memory");
+        assert!(grant.in_effect && !grant.revoked);
+        assert!(
+            grant
+                .action_classes
+                .iter()
+                .any(|class| class == "ForceApplicationExit"),
+            "{:?}",
+            grant.action_classes
+        );
+        let sustain = memory
+            .thresholds
+            .iter()
+            .find(|threshold| threshold.key == "memory_guard.sustain_for")
+            .unwrap_or_else(|| panic!("no sustain threshold: {:?}", memory.thresholds));
+        assert_eq!(sustain.value, ThresholdQuantity::Nanoseconds(15 * SECOND));
+        let slots = memory
+            .thresholds
+            .iter()
+            .find(|threshold| threshold.key == "memory_guard.max_applications_per_incident")
+            .unwrap_or_else(|| panic!("no slot threshold"));
+        assert_eq!(slots.value, ThresholdQuantity::Count(3));
+
+        // At 500 s the pause is expired, and the window does not know
+        // whether the agent has a newer measurement.
+        let later: AutomationSnapshot = automation(Some(directory), Ok(clock(500, 95)));
+        assert_eq!(
+            later.pause,
+            Some(PauseRow::Expired {
+                since: system_time(wall(10)),
+            })
+        );
+        assert_eq!(later.measurement, FreshMeasurement::NotKnown);
+    }
+
+    #[test]
+    fn the_controller_record_maps_to_the_controller_view() {
+        let world: World = world();
+        let directory: &Path = world.directory.path();
+        // Controller: budgets with the trigger of the status, cooldowns at
+        // the clock of the window, and the usage of each generation.
+        let records: ControllerSnapshot = controller(Some(directory), Ok(clock(100, 95)));
+        assert_eq!(records.status_age, StatusAge::Current);
+        let rows: &ControllerRows = records
+            .rows
+            .value()
+            .unwrap_or_else(|| panic!("no rows: {:?}", records.rows));
+        assert_eq!(rows.written_at, Some(system_time(wall(60))));
+        assert_eq!(
+            rows.budgets,
+            vec![BudgetRow {
+                id: "build-worker".to_owned(),
+                latched: true,
+                trigger: Some(TriggerRow::Qualifying),
+            }]
+        );
+        let relaunch = |application: &str| CooldownSubject::Relaunch {
+            application: application.to_owned(),
+        };
+        assert_eq!(
+            rows.cooldowns,
+            vec![
+                CooldownRow {
+                    subject: relaunch("com.example.Active"),
+                    cause: "Relaunch cooldown",
+                    state: CooldownState::Active {
+                        remaining: Duration::from_secs(300),
+                    },
+                },
+                CooldownRow {
+                    subject: relaunch("com.example.Ended"),
+                    cause: "Relaunch cooldown",
+                    state: CooldownState::Elapsed,
+                },
+                CooldownRow {
+                    subject: relaunch("com.example.EarlierBoot"),
+                    cause: "Relaunch cooldown",
+                    state: CooldownState::EarlierBoot,
+                },
+                CooldownRow {
+                    subject: CooldownSubject::MemoryBackoff {
+                        incident: "incident-m".to_owned(),
+                    },
+                    cause: "Back-off after no effect",
+                    state: CooldownState::Active {
+                        remaining: Duration::from_secs(30),
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            rows.incidents,
+            vec![IncidentUsage {
+                id: "incident-m".to_owned(),
+                policy: PolicyId::MemoryGuard,
+                generation: 2,
+                established: false,
+                unknown_outcome: true,
+                current: Some(UsageRow::Memory {
+                    consumed_slots: 1,
+                    reserved_slots: 1,
+                }),
+                generations: vec![
+                    GenerationRow {
+                        generation: 1,
+                        rearmed: false,
+                        started_at: system_time(wall(0)),
+                        final_usage: Some(UsageRow::Memory {
+                            consumed_slots: 3,
+                            reserved_slots: 0,
+                        }),
+                        journal: JournalUsageRow::NoConsumedDispatch,
+                    },
+                    GenerationRow {
+                        generation: 2,
+                        rearmed: true,
+                        started_at: system_time(wall(50)),
+                        final_usage: None,
+                        journal: JournalUsageRow::NoConsumedDispatch,
+                    },
+                ],
+            }]
+        );
+        assert!(!rows.truncated);
+        // A status that is older than 90 s is stale; the rows stay.
+        let stale: ControllerSnapshot = controller(Some(directory), Ok(clock(100, 290)));
+        assert_eq!(
+            stale.status_age,
+            StatusAge::Stale {
+                age: Duration::from_secs(200),
+            }
+        );
+        assert!(stale.rows.value().is_some());
+    }
+
+    #[test]
+    fn the_operations_and_the_status_map_to_the_history_and_diagnostics_views() {
+        let world: World = world();
+        let directory: &Path = world.directory.path();
+        // History: the admitted operation with its step states and its
+        // observation of an unknown kind.
+        let operations: HistorySnapshot = history(Some(directory));
+        assert_eq!(operations.problems, Vec::<String>::new());
+        let operation: &OperationDetail = operations
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == world.operation)
+            .unwrap_or_else(|| panic!("no operation: {:?}", operations.operations));
+        assert_eq!(operation.phase, OperationPhase::Pending);
+        assert_eq!(operation.admitted_at, system_time(wall(30)));
+        assert!(!operation.automatic);
+        assert!(
+            operation.steps.iter().all(|step| step == "Admitted"),
+            "{:?}",
+            operation.steps
+        );
+        assert_eq!(operation.resources, vec![EffectRow::Unrecognized]);
+        assert_eq!(operation.effects, Vec::new());
+
+        // Diagnostics: the status record of the agent.
+        let service: DiagnosticsSnapshot = diagnostics(Some(directory));
+        let agent: &AgentStatusRow = service
+            .agent
+            .value()
+            .unwrap_or_else(|| panic!("no status: {:?}", service.agent));
+        assert_eq!(agent.process_id, 4242);
+        assert_eq!(agent.run_state, "running");
+        assert_eq!(agent.footprint, Measured::Value(80_000_000));
+        assert!(service.journal.present);
+        assert!(service.start_failure.is_none());
+    }
+
+    #[test]
+    fn a_journal_with_no_controller_record_has_no_rows_and_no_zero() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        drop(
+            OperationJournal::open(&journal_path(directory.path()), &JournalOptions::default())
+                .unwrap_or_else(|error| panic!("{error}")),
+        );
+        let snapshot: ControllerSnapshot = controller(Some(directory.path()), Ok(clock(100, 95)));
+        assert_eq!(snapshot.status_age, StatusAge::Unknown);
+        assert!(
+            matches!(&snapshot.rows, Measured::Unavailable(reason) if reason.contains("no controller record")),
+            "{:?}",
+            snapshot.rows
+        );
+        // No journal is a different reason, and the read makes no file.
+        let empty = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let snapshot: ControllerSnapshot = controller(Some(empty.path()), Ok(clock(100, 95)));
+        assert!(
+            matches!(&snapshot.rows, Measured::Unavailable(reason) if reason.contains("No journal")),
+            "{:?}",
+            snapshot.rows
+        );
+        assert!(!journal_path(empty.path()).exists());
+        // A clock with no value shows nothing, not a pause of zero.
+        let unread: AutomationSnapshot =
+            automation(Some(directory.path()), Err("no clock".to_owned()));
+        assert_eq!(unread.pause, None);
+        assert_eq!(unread.problems.len(), 1);
+    }
 
     #[test]
     fn an_unknown_state_directory_is_not_an_absent_journal() {
-        let automation: AutomationSnapshot = automation(None);
+        let unread: AutomationSnapshot = automation(None, Ok(clock(1, 1)));
         // The pause was not read: it is not "not paused".
-        assert_eq!(automation.pause, None);
-        assert_eq!(automation.guards, Vec::new());
-        assert!(!automation.journal_present);
-        assert_eq!(automation.problems.len(), 1);
-        let history: HistorySnapshot = history(None);
-        assert_eq!(history.operations, Vec::new());
-        assert_eq!(history.problems.len(), 1);
+        assert_eq!(unread.pause, None);
+        assert_eq!(unread.guards, Vec::new());
+        assert!(!unread.journal_present);
+        assert_eq!(unread.problems.len(), 1);
+        let operations: HistorySnapshot = history(None);
+        assert_eq!(operations.operations, Vec::new());
+        assert_eq!(operations.problems.len(), 1);
+        let records: ControllerSnapshot = controller(None, Ok(clock(1, 1)));
+        assert!(records.rows.value().is_none());
     }
 
     #[test]
     fn a_state_directory_with_no_journal_has_no_problem() {
         let directory = std::env::temp_dir().join("svalnir-gui-test-no-such-state-directory");
-        let automation: AutomationSnapshot = automation(Some(&directory));
-        assert_eq!(automation.pause, Some(PauseRow::NotPaused));
-        assert!(!automation.journal_present);
-        assert_eq!(automation.problems, Vec::<String>::new());
-        assert_eq!(automation.guards.len(), PolicyId::ALL.len());
-        let history: HistorySnapshot = history(Some(&directory));
-        assert_eq!(history.problems, Vec::<String>::new());
+        let empty: AutomationSnapshot = automation(Some(&directory), Ok(clock(1, 1)));
+        assert_eq!(empty.pause, Some(PauseRow::NotPaused));
+        assert!(!empty.journal_present);
+        assert_eq!(empty.problems, Vec::<String>::new());
+        assert_eq!(empty.guards.len(), PolicyId::ALL.len());
+        let operations: HistorySnapshot = history(Some(&directory));
+        assert_eq!(operations.problems, Vec::<String>::new());
         assert!(!directory.exists(), "a read makes no directory");
     }
 }

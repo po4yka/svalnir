@@ -19,7 +19,7 @@ pub enum ActionScript {
     Refuse,
     /// No agent holds the coordinator lock.
     Unavailable,
-    /// No answer comes.
+    /// No answer comes. A stop waits for an admission that does not come.
     Pending,
 }
 
@@ -83,7 +83,14 @@ impl ActionPort for FixturePort {
         match self.script {
             ActionScript::Refuse => ActionState::refused("policy_revision_changed"),
             ActionScript::Unavailable => ActionState::Unavailable(Unavailable::NoAgent),
-            ActionScript::Pending => ActionState::Pending,
+            ActionScript::Pending => match action {
+                Action::Stop { proposal, .. } => ActionState::AwaitingAdmission {
+                    request: "gui-request-fixture".to_owned(),
+                    since: SystemTime::now(),
+                    until: proposal.expires_at,
+                },
+                _ => ActionState::Pending,
+            },
             ActionScript::Accept => match action {
                 Action::Stop { .. } => ActionState::WaitingForExit {
                     operation: "op-fixture-stop".to_owned(),
@@ -133,6 +140,10 @@ impl ActionPort for FixturePort {
             ActionScript::Accept => Some(OperationPhase::Completed),
             _ => None,
         }
+    }
+
+    fn admission_state(&self, _request: &str) -> Option<ActionState> {
+        None
     }
 }
 

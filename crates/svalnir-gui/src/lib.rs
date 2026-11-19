@@ -9,6 +9,8 @@ pub mod notify;
 pub mod platform;
 pub mod screens;
 pub mod shell;
+#[cfg(test)]
+mod test_support;
 pub mod theme;
 pub mod ui;
 pub mod viz;

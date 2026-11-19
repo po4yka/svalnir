@@ -1,8 +1,11 @@
 //! The Applications screen: the application and job groups with their
-//! verified members, their footprint, and their hard protection. A group
-//! that the catalog does not protect has a stop control with a
-//! confirmation that shows the processes of the plan (`crate::actions`).
+//! verified members, their footprint and its growth, and their hard
+//! protection with its reason; the application budgets and the relaunch
+//! cooldowns of the controller record. A group that the catalog does not
+//! protect has a stop control with a confirmation that shows the processes
+//! of the plan (`crate::actions`).
 
+use super::agent_state::{budgets_card, controller_body, cooldown_facts, growth_text};
 use super::common::{
     CardWidth, Shown, body_line, bytes_text, caption, card, cell, fact, failed_body, head,
     mono_text, screen, shown, skeleton_rows, stale_line,
@@ -12,7 +15,10 @@ use crate::{
     actions::Slot,
     data::{
         model::Measured,
-        records::{ApplicationRow, Foreground, ProcessesSnapshot, Protection},
+        records::{
+            ApplicationRow, ControllerSnapshot, CooldownSubject, Foreground, ProcessesSnapshot,
+            Protection,
+        },
         store::AppModel,
     },
     theme::tokens::{self, Tokens},
@@ -27,7 +33,7 @@ use gpui_kit::{
     AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
     TestSupportExt as _, Window,
     component::{
-        ActiveTheme as _, IconName, Sizable as _, h_flex,
+        ActiveTheme as _, IconName, Sizable as _,
         table::{Table, TableBody, TableHeader, TableRow},
         v_flex,
     },
@@ -41,10 +47,31 @@ use std::time::SystemTime;
 #[must_use]
 pub const fn protection_pill(protection: Protection) -> (&'static str, Tone) {
     match protection {
-        Protection::Protected => ("Protected", Tone::Brand),
+        Protection::Protected { .. } => ("Protected", Tone::Brand),
         Protection::NotProtected => ("Not protected", Tone::Neutral),
-        Protection::Unknown => ("Unknown", Tone::Warning),
+        Protection::Unknown { .. } => ("Unknown", Tone::Warning),
     }
+}
+
+/// The reason of a protection or of an unknown result: the catalog entry
+/// that matched, or the cause that the catalog cannot classify the group.
+#[must_use]
+pub const fn protection_reason(protection: Protection) -> Option<&'static str> {
+    match protection {
+        Protection::Protected { reason } => Some(reason.text()),
+        Protection::NotProtected => None,
+        Protection::Unknown { cause } => Some(cause.text()),
+    }
+}
+
+/// The growth text of a group and whether the sum is partial: a member with
+/// no change value is not in the sum.
+#[must_use]
+pub fn group_growth(row: &ApplicationRow) -> (String, bool) {
+    (
+        growth_text(&row.growth),
+        matches!(row.growth, Measured::Value(_)) && row.growth_missing > 0,
+    )
 }
 
 /// The text of a foreground state. `Unknown` is not `Background`.
@@ -79,12 +106,23 @@ pub fn group_label(row: &ApplicationRow) -> String {
         ),
         (Measured::Value(_), false) => format!("footprint {footprint}"),
     };
+    let growth: String = match (&row.growth, group_growth(row)) {
+        (Measured::Unavailable(reason), _) => format!("growth not available: {reason}"),
+        (Measured::Value(_), (text, true)) => format!(
+            "growth {text}, partial: {} of {} processes have no value",
+            row.growth_missing, row.members
+        ),
+        (Measured::Value(_), (text, false)) => format!("growth {text}"),
+    };
+    let protection: String = match protection_reason(row.protection) {
+        Some(reason) => format!("{} ({reason})", protection_pill(row.protection).0),
+        None => protection_pill(row.protection).0.to_owned(),
+    };
     format!(
-        "{}, {}, {} processes, {footprint}, protection: {}",
+        "{}, {}, {} processes, {footprint}, {growth}, protection: {protection}",
         row.name,
         row.kind.label(),
         row.members,
-        protection_pill(row.protection).0
     )
 }
 
@@ -186,9 +224,33 @@ fn group_table(
     let rows = snapshot.applications.iter().map(|row| {
         let (footprint, partial) = group_footprint(row);
         let (protection, tone) = protection_pill(row.protection);
-        let mut size = h_flex()
-            .gap(tokens::SPACE_2)
-            .items_center()
+        let mut protection_cell = v_flex().gap(tokens::SPACE_1).items_start().child(
+            StatusPill::new(protection, tone).id(SharedString::from(format!(
+                "applications-protection-{}",
+                row.instance
+            ))),
+        );
+        if let Some(reason) = protection_reason(row.protection) {
+            protection_cell = protection_cell.child(caption(
+                SharedString::from(format!("applications-protection-reason-{}", row.instance)),
+                reason,
+                tokens,
+            ));
+        }
+        let (growth, growth_partial) = group_growth(row);
+        let mut change = v_flex()
+            .gap(tokens::SPACE_1)
+            .items_end()
+            .child(mono_text(growth, mono, true, tokens));
+        if growth_partial {
+            change = change.child(MonoTag::new(
+                SharedString::from(format!("applications-growth-partial-{}", row.instance)),
+                "partial",
+            ));
+        }
+        let mut size = v_flex()
+            .gap(tokens::SPACE_1)
+            .items_end()
             .child(mono_text(footprint, mono, stale, tokens));
         if partial {
             size = size.child(MonoTag::new(
@@ -220,16 +282,10 @@ fn group_table(
                 1,
                 true,
             ))
-            .child(cell(size, 2, true))
+            .child(cell(size, 3, true))
+            .child(cell(change, 3, true))
             .child(cell(foreground_text(row.foreground), 2, false))
-            .child(cell(
-                StatusPill::new(protection, tone).id(SharedString::from(format!(
-                    "applications-protection-{}",
-                    row.instance
-                ))),
-                2,
-                false,
-            ))
+            .child(cell(protection_cell, 3, false))
             .child(cell(stop_cell(row, entity, model, tokens), 2, false))
     });
     Table::new()
@@ -241,9 +297,10 @@ fn group_table(
                     .child(head("Application or job", 4, false, tokens))
                     .child(head("Kind", 2, false, tokens))
                     .child(head("Processes", 1, true, tokens))
-                    .child(head("Footprint", 2, true, tokens))
+                    .child(head("Footprint", 3, true, tokens))
+                    .child(head("Growth", 3, true, tokens))
                     .child(head("Foreground", 2, false, tokens))
-                    .child(head("Hard protection", 2, false, tokens))
+                    .child(head("Hard protection", 3, false, tokens))
                     .child(head("Stop", 2, false, tokens)),
             ),
         )
@@ -354,7 +411,7 @@ fn attribution_card(
 fn control_card(tokens: &Tokens) -> AnyElement {
     let header: ShellHeader = ShellHeader::new(IconName::Info, "Protection and control")
         .subtitle("What this screen shows and does not show");
-    let lines: [(&str, &str); 4] = [
+    let lines: [(&str, &str); 5] = [
         (
             "applications-protection-note",
             "\"Protected\" comes from the catalog of hard protections. Automation does not stop a protected group.",
@@ -368,14 +425,59 @@ fn control_card(tokens: &Tokens) -> AnyElement {
             "Stop makes a quit plan and a force-quit plan for the verified members of the group and shows the processes that they bind. The agent admits the plan that you confirm; with no agent, nothing is sent. A stop is done only when the agent confirms the exit.",
         ),
         (
+            "applications-growth-note",
+            "Growth is the footprint change since the previous reading of this window. A process that is new since then has no value.",
+        ),
+        (
             "applications-restart-note",
-            "Restart history and budget status are not shown: this window has no read for them.",
+            "No restart history exists: Svalnir does not start an application again, and the system does not record a relaunch. The relaunch cooldowns show when the memory guard can stop an application again.",
         ),
     ];
     let mut body = v_flex().gap(tokens::SPACE_2);
     for (id, text) in lines {
         body = body.child(caption(id, text, tokens));
     }
+    card(header, body)
+}
+
+/// The relaunch cooldowns of the controller record: after an intervention,
+/// the memory guard does not stop the same application again until the
+/// cooldown ends.
+fn relaunch_card(
+    controller: &Shown<ControllerSnapshot>,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let header: ShellHeader = ShellHeader::new(IconName::Info, "Relaunch cooldowns")
+        .subtitle("Controller record of the agent");
+    let body: AnyElement = controller_body(
+        "applications-relaunch",
+        controller,
+        tokens,
+        |rows, stale| {
+            let mut lines: Vec<AnyElement> = cooldown_facts(
+                "applications-relaunch",
+                &rows.cooldowns,
+                |subject| matches!(subject, CooldownSubject::Relaunch { .. }),
+                stale,
+                mono,
+                tokens,
+            );
+            if lines.is_empty() {
+                lines.push(caption(
+                    "applications-relaunch-empty",
+                    "The controller record has no relaunch cooldown.",
+                    tokens,
+                ));
+            }
+            lines.push(caption(
+                "applications-relaunch-note",
+                "A cooldown inhibits an automatic stop only. \"Active (earlier boot)\" is a cooldown that the agent recorded before the last start of the Mac; the agent treats it as active.",
+                tokens,
+            ));
+            lines
+        },
+    );
     card(header, body)
 }
 
@@ -388,6 +490,9 @@ impl Render for ApplicationsScreen {
         let processes = shown(&model.processes, SystemTime::now(), |processes| {
             processes.captured_at
         });
+        let controller = shown(&model.controller, SystemTime::now(), |controller| {
+            controller.captured_at
+        });
         let cards: Vec<(CardWidth, AnyElement)> = vec![
             (
                 CardWidth::Full,
@@ -397,6 +502,11 @@ impl Render for ApplicationsScreen {
                 CardWidth::Share,
                 attribution_card(&processes, &mono, tokens),
             ),
+            (
+                CardWidth::Share,
+                budgets_card(&controller, "applications-budgets", &mono, tokens),
+            ),
+            (CardWidth::Share, relaunch_card(&controller, &mono, tokens)),
             (CardWidth::Share, control_card(tokens)),
         ];
         screen("Applications", cards, self.activation, cx.reduce_motion())
@@ -406,7 +516,7 @@ impl Render for ApplicationsScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::records::GroupKind;
+    use crate::data::records::{GroupKind, Growth, ProtectionReason, UnknownCause};
 
     fn row(footprint: Measured<u64>, unmeasured: usize) -> ApplicationRow {
         ApplicationRow {
@@ -417,24 +527,37 @@ mod tests {
             footprint,
             unmeasured_members: unmeasured,
             foreground: Foreground::Unknown,
-            protection: Protection::Unknown,
+            protection: Protection::Unknown {
+                cause: UnknownCause::NoExecutableEvidence,
+            },
+            growth: Measured::Value(Growth {
+                delta: 4_000_000,
+                elapsed: std::time::Duration::from_secs(5),
+            }),
+            growth_missing: 1,
         }
     }
 
     #[test]
     fn unknown_protection_is_a_warning_and_not_not_protected() {
-        assert_eq!(
-            protection_pill(Protection::Unknown),
-            ("Unknown", Tone::Warning)
-        );
+        let unknown = Protection::Unknown {
+            cause: UnknownCause::NoMember,
+        };
+        assert_eq!(protection_pill(unknown), ("Unknown", Tone::Warning));
+        assert_eq!(protection_reason(unknown), Some("The group has no member"));
         assert_eq!(
             protection_pill(Protection::NotProtected),
             ("Not protected", Tone::Neutral)
         );
+        let protected = Protection::Protected {
+            reason: ProtectionReason::SessionApplication,
+        };
+        assert_eq!(protection_pill(protected), ("Protected", Tone::Brand));
         assert_eq!(
-            protection_pill(Protection::Protected),
-            ("Protected", Tone::Brand)
+            protection_reason(protected),
+            Some("An application of the login session")
         );
+        assert_eq!(protection_reason(Protection::NotProtected), None);
         assert_eq!(foreground_text(Foreground::Unknown), "Not known");
     }
 
@@ -459,11 +582,11 @@ mod tests {
     fn the_label_of_a_group_states_partial_and_unavailable() {
         assert_eq!(
             group_label(&row(Measured::Value(2_000_000_000), 1)),
-            "com.example.app, Application, 3 processes, footprint 2.0 GB, partial: 1 of 3 processes have no value, protection: Unknown"
+            "com.example.app, Application, 3 processes, footprint 2.0 GB, partial: 1 of 3 processes have no value, growth +4.0 MB in 5 s, partial: 1 of 3 processes have no value, protection: Unknown (A member has no executable evidence)"
         );
         assert_eq!(
             group_label(&row(Measured::Unavailable("denied".into()), 3)),
-            "com.example.app, Application, 3 processes, footprint not available: denied, protection: Unknown"
+            "com.example.app, Application, 3 processes, footprint not available: denied, growth +4.0 MB in 5 s, partial: 1 of 3 processes have no value, protection: Unknown (A member has no executable evidence)"
         );
     }
 }

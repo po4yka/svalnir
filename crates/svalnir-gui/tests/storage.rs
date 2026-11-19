@@ -226,6 +226,9 @@ impl DataSource for SubfolderFails {
     fn automation(&self) -> svalnir_gui::data::records::AutomationSnapshot {
         FixtureSource::new(FixtureScenario::Healthy).automation()
     }
+    fn controller(&self) -> svalnir_gui::data::records::ControllerSnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).controller()
+    }
     fn history(&self) -> svalnir_gui::data::records::HistorySnapshot {
         FixtureSource::new(FixtureScenario::Healthy).history()
     }
@@ -382,6 +385,9 @@ impl DataSource for WaitingSource {
     }
     fn automation(&self) -> svalnir_gui::data::records::AutomationSnapshot {
         FixtureSource::new(FixtureScenario::Healthy).automation()
+    }
+    fn controller(&self) -> svalnir_gui::data::records::ControllerSnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).controller()
     }
     fn history(&self) -> svalnir_gui::data::records::HistorySnapshot {
         FixtureSource::new(FixtureScenario::Healthy).history()

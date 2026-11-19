@@ -1,7 +1,11 @@
 //! The Memory screen: the pressure readings of this window, the memory and
-//! swap quantities of the host, and the processes with the largest footprint.
-//! The screen shows state only.
+//! swap quantities of the host, the processes with the largest footprint
+//! and their growth, and the application budgets and the memory incident of
+//! the controller record. The screen shows state only.
 
+use super::agent_state::{
+    budgets_card, controller_body, cooldown_facts, growth_text, incident_inset,
+};
 use super::common::{
     CardWidth, Shown, body_line, bytes_text, caption, card, cell, fact, failed_body, head,
     mono_text, screen, shown, skeleton_rows, stale_line,
@@ -9,7 +13,10 @@ use super::common::{
 use crate::{
     data::{
         model::{HostSample, HostSnapshot, Measured, PressureLevel},
-        records::{MemorySnapshot, ProcessRow, ProcessesSnapshot},
+        records::{
+            ControllerSnapshot, CooldownSubject, IncidentUsage, MemorySnapshot, ProcessRow,
+            ProcessesSnapshot,
+        },
         store::AppModel,
     },
     screens::overview::pressure_pill,
@@ -32,6 +39,7 @@ use gpui_kit::{
     px,
 };
 use std::time::SystemTime;
+use svalnir_core::policy::PolicyId;
 
 /// The number of readings of each pressure state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -116,7 +124,11 @@ pub fn process_label(row: &ProcessRow) -> String {
         Measured::Value(_) => format!("footprint {}", bytes_text(&row.footprint)),
         Measured::Unavailable(reason) => format!("footprint not available: {reason}"),
     };
-    format!("{name}, process {}, {footprint}", row.pid)
+    let growth: String = match &row.growth {
+        Measured::Value(_) => format!("growth {}", growth_text(&row.growth)),
+        Measured::Unavailable(reason) => format!("growth not available: {reason}"),
+    };
+    format!("{name}, process {}, {footprint}, {growth}", row.pid)
 }
 
 /// The Memory screen entity.
@@ -331,6 +343,11 @@ fn process_table(
                 true,
             ))
             .child(cell(
+                mono_text(growth_text(&row.growth), mono, true, tokens),
+                2,
+                true,
+            ))
+            .child(cell(
                 mono_text(bytes_text(&row.resident), mono, true, tokens),
                 2,
                 true,
@@ -346,6 +363,7 @@ fn process_table(
                     .child(head("PID", 1, true, tokens))
                     .child(head("Application or job", 3, false, tokens))
                     .child(head("Footprint", 2, true, tokens))
+                    .child(head("Growth", 2, true, tokens))
                     .child(head("Resident", 2, true, tokens)),
             ),
         )
@@ -381,8 +399,8 @@ fn processes_card(
                 tokens,
             ));
             body = body.child(caption(
-                "memory-budget-unavailable",
-                "Footprint growth and application budget status are not shown: this window has no read for them.",
+                "memory-growth-note",
+                "Growth is the footprint change since the previous reading of this window. A process that is new since then has no value. Growth alone is not evidence of a leak.",
                 tokens,
             ));
             if let Some(age) = stale_age {
@@ -398,6 +416,53 @@ fn processes_card(
     card(header, body)
 }
 
+/// The memory incident of the controller record with its budget
+/// generations, and the cooldowns of the memory guard.
+fn incident_card(
+    controller: &Shown<ControllerSnapshot>,
+    now: SystemTime,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let header: ShellHeader = ShellHeader::new(IconName::CircleAlert, "Memory incident")
+        .subtitle("Usage of each budget generation");
+    let body: AnyElement = controller_body("memory-incident", controller, tokens, |rows, stale| {
+        let mut lines: Vec<AnyElement> = Vec::new();
+        let incidents: Vec<&IncidentUsage> = rows
+            .incidents
+            .iter()
+            .filter(|incident| incident.policy == PolicyId::MemoryGuard)
+            .collect();
+        if incidents.is_empty() {
+            lines.push(caption(
+                "memory-incident-empty",
+                "The controller record has no open memory incident.",
+                tokens,
+            ));
+        }
+        for incident in &incidents {
+            lines.push(incident_inset("memory", incident, now, stale, mono, tokens));
+        }
+        // The cooldowns of the memory incident: its observation after an
+        // action and its back-off.
+        let of_memory = |id: &String| incidents.iter().any(|incident| incident.id == *id);
+        lines.extend(cooldown_facts(
+            "memory-incident",
+            &rows.cooldowns,
+            |subject| match subject {
+                CooldownSubject::MemoryBackoff { incident }
+                | CooldownSubject::ObserveAfterAction { incident } => of_memory(incident),
+                CooldownSubject::Relaunch { .. } | CooldownSubject::DiskPass { .. } => false,
+            },
+            stale,
+            mono,
+            tokens,
+        ));
+        lines
+    });
+    card(header, body)
+}
+
 impl Render for MemoryScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
@@ -407,12 +472,21 @@ impl Render for MemoryScreen {
         let host = shown(&model.host, now, |host| host.captured_at);
         let memory = shown(&model.memory, now, |memory| memory.captured_at);
         let processes = shown(&model.processes, now, |processes| processes.captured_at);
+        let controller = shown(&model.controller, now, |controller| controller.captured_at);
         let history: Vec<HostSample> = model.history.iter().cloned().collect();
         let cards: Vec<(CardWidth, AnyElement)> = vec![
             (CardWidth::Share, pressure_card(&host, &history, tokens)),
             (
                 CardWidth::Share,
                 quantities_card(&host, &memory, &mono, tokens),
+            ),
+            (
+                CardWidth::Share,
+                budgets_card(&controller, "memory-budgets", &mono, tokens),
+            ),
+            (
+                CardWidth::Share,
+                incident_card(&controller, now, &mono, tokens),
             ),
             (CardWidth::Full, processes_card(&processes, &mono, tokens)),
         ];
@@ -469,16 +543,21 @@ mod tests {
             group: None,
             footprint: Measured::Value(96_000_000),
             resident: Measured::Value(1),
+            growth: Measured::Value(crate::data::records::Growth {
+                delta: -2_000_000,
+                elapsed: std::time::Duration::from_secs(5),
+            }),
         };
         assert_eq!(
             process_label(&row),
-            "sync-agent, process 7, footprint 96.0 MB"
+            "sync-agent, process 7, footprint 96.0 MB, growth \u{2212}2.0 MB in 5 s"
         );
         row.footprint = Measured::Unavailable("exited".to_owned());
+        row.growth = Measured::Unavailable("exited".to_owned());
         row.name = None;
         assert_eq!(
             process_label(&row),
-            "Process with no name, process 7, footprint not available: exited"
+            "Process with no name, process 7, footprint not available: exited, growth not available: exited"
         );
     }
 

@@ -3,6 +3,9 @@
 //! control, the enable and disable of a guard, and the rearm of an open
 //! incident send their change to the agent (`crate::actions`).
 
+use super::agent_state::{
+    cooldown_facts, incident_block, span_left, status_age_text, threshold_text,
+};
 use super::common::{
     CardWidth, Shown, ago, body_line, caption, card, fact, failed_body, inset, problem_lines,
     screen, shown, skeleton_rows, stale_line, until,
@@ -11,8 +14,11 @@ use super::controls::{action_button, open_enable, open_rearm, slot_status};
 use crate::{
     actions::{Action, Slot},
     data::{
-        model::GuardState,
-        records::{AutomationSnapshot, GrantRow, GuardDetail, IncidentRow, PauseRow, RevisionRow},
+        model::{GuardState, Measured},
+        records::{
+            AutomationSnapshot, ControllerSnapshot, CooldownSubject, FreshMeasurement, GrantRow,
+            GuardDetail, IncidentRow, PauseKind, PauseRow, RevisionRow,
+        },
         store::AppModel,
     },
     theme::tokens::{self, Tokens},
@@ -26,13 +32,18 @@ use gpui_kit::{
     AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
     component::{ActiveTheme as _, IconName, h_flex, v_flex},
 };
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use svalnir_core::policy::PolicyId;
 
-/// The pill text, the tone, and the sentence of the recorded pause at `now`.
-/// `None` means that the authority record was not read: the state is not
-/// known, which is not "not paused".
+/// The pill text, the tone, and the sentence of the pause at `now`, as the
+/// agent decided it at `read_at`. `None` means that the authority record
+/// was not read: the state is not known, which is not "not paused".
 #[must_use]
-pub fn pause_summary(pause: Option<&PauseRow>, now: SystemTime) -> (&'static str, Tone, String) {
+pub fn pause_summary(
+    pause: Option<&PauseRow>,
+    read_at: SystemTime,
+    now: SystemTime,
+) -> (&'static str, Tone, String) {
     match pause {
         None => (
             "Unknown",
@@ -44,51 +55,67 @@ pub fn pause_summary(pause: Option<&PauseRow>, now: SystemTime) -> (&'static str
             Tone::Neutral,
             "No pause is recorded.".to_owned(),
         ),
-        Some(PauseRow::Paused { since, until: None }) => (
-            "Paused",
-            Tone::Warning,
+        Some(PauseRow::Paused {
+            since,
+            kind,
+            remaining,
+            until: deadline,
+        }) => {
+            let started: String = ago(*since, now);
+            let sentence: String = match (kind, remaining) {
+                (PauseKind::Indefinite, _) => {
+                    format!("Automation was paused {started}. The pause has no end time.")
+                }
+                (PauseKind::Retained, _) => format!(
+                    "Automation was paused {started}, before the last start of the Mac. Its end cannot be established, so it stays until you resume."
+                ),
+                (PauseKind::Timed, Some(remaining)) => {
+                    // The monotonic time that remained at the reading, less
+                    // the time since the reading.
+                    let left: Duration =
+                        remaining.saturating_sub(now.duration_since(read_at).unwrap_or_default());
+                    if left.as_secs() == 0 {
+                        format!("Automation was paused {started}. The pause ends now.")
+                    } else {
+                        format!(
+                            "Automation was paused {started}. The pause ends in {}.",
+                            span_left(left)
+                        )
+                    }
+                }
+                (PauseKind::Timed, None) => match deadline.and_then(|time| until(time, now)) {
+                    Some(text) => {
+                        format!("Automation was paused {started}. The pause ends {text}.")
+                    }
+                    None => format!("Automation was paused {started}. The pause has an end time."),
+                },
+            };
+            ("Paused", Tone::Warning, sentence)
+        }
+        Some(PauseRow::Expired { since }) => (
+            "Pause ended",
+            Tone::Neutral,
             format!(
-                "Automation was paused {}. The pause has no end time.",
+                "A pause from {} reached its end on the clock of the agent. It inhibits nothing, and the agent removes the record.",
                 ago(*since, now)
             ),
         ),
-        Some(PauseRow::Paused {
-            since,
-            until: Some(deadline),
-        }) => {
-            let started: String = ago(*since, now);
-            match until(*deadline, now) {
-                Some(remaining) => (
-                    "Paused",
-                    Tone::Warning,
-                    format!("Automation was paused {started}. The pause ends {remaining}."),
-                ),
-                // The agent ends a pause on its monotonic clock, so the
-                // record can stay after the wall-clock deadline.
-                None => (
-                    "Pause ended",
-                    Tone::Neutral,
-                    format!(
-                        "A pause from {started} is recorded and its end time has passed. The agent removes the record."
-                    ),
-                ),
-            }
-        }
     }
 }
 
-/// `value` with a space between each group of three digits.
+/// The sentence about a fresh measurement after the end of a pause. `None`
+/// when no pause ended.
 #[must_use]
-pub fn grouped(value: u64) -> String {
-    let digits: String = value.to_string();
-    let mut text: String = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            text.push('\u{2009}');
+pub const fn measurement_sentence(measurement: FreshMeasurement) -> Option<&'static str> {
+    match measurement {
+        FreshMeasurement::NotNeeded => None,
+        FreshMeasurement::Awaiting => {
+            Some("Automatic work waits for a measurement that is newer than the end of the pause.")
         }
-        text.push(digit);
+        FreshMeasurement::NotKnown => Some(
+            "Whether the agent has a measurement that is newer than the end of the pause is not known: the journal does not record it.",
+        ),
     }
-    text
 }
 
 /// The pill text and tone of a grant.
@@ -155,7 +182,8 @@ fn pause_controls(
     let busy: bool = model.actions.is_busy(&Slot::Pause);
     let row = h_flex().gap(tokens::SPACE_2);
     match pause? {
-        PauseRow::Paused { .. } => Some(
+        // An expired pause has a record that a resume removes.
+        PauseRow::Paused { .. } | PauseRow::Expired { .. } => Some(
             row.child(action_button(
                 "automation-resume",
                 "Resume automation",
@@ -191,7 +219,7 @@ fn pause_controls(
 }
 
 /// The length of the timed pause.
-const PAUSE_HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+const PAUSE_HOUR: Duration = Duration::from_secs(3600);
 
 fn state_card(
     automation: &Shown<AutomationSnapshot>,
@@ -208,10 +236,14 @@ fn state_card(
         Shown::Failed(reason) => failed_body("automation-value", reason, tokens),
         Shown::Data { value, stale_age } => {
             let stale: bool = stale_age.is_some();
-            let (text, tone, sentence) = pause_summary(value.pause.as_ref(), now);
+            let (text, tone, sentence) =
+                pause_summary(value.pause.as_ref(), value.captured_at, now);
             header = header.aside(StatusPill::new(text, tone).id("automation-pause-pill"));
             let mut body = v_flex().gap(tokens::SPACE_2);
             body = body.child(body_line("automation-pause", sentence, stale, tokens));
+            if let Some(sentence) = measurement_sentence(value.measurement) {
+                body = body.child(caption("automation-pause-measurement", sentence, tokens));
+            }
             body = body
                 .children(pause_controls(value.pause.as_ref(), entity, model))
                 .children(slot_status(
@@ -410,11 +442,17 @@ fn guard_controls(
 }
 
 /// One open incident with its rearm control.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a row builder takes the incident, its context, and the theme values"
+)]
 fn incident_row(
     guard: &GuardDetail,
     incident: &IncidentRow,
+    controller: &Shown<ControllerSnapshot>,
     entity: &Entity<AppModel>,
     model: &AppModel,
+    now: SystemTime,
     mono: &SharedString,
     tokens: &Tokens,
 ) -> AnyElement {
@@ -448,8 +486,82 @@ fn incident_row(
             &slot,
             SystemTime::now(),
             tokens,
-        ));
+        ))
+        .child(incident_usage(incident, controller, now, mono, tokens));
     inset(block, tokens)
+}
+
+/// The usage of an open incident from the controller record, or the
+/// reason that it is not shown.
+fn incident_usage(
+    incident: &IncidentRow,
+    controller: &Shown<ControllerSnapshot>,
+    now: SystemTime,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let id: &str = incident.id.as_str();
+    let missing = |text: String| {
+        caption(
+            SharedString::from(format!("automation-incident-usage-{id}")),
+            text,
+            tokens,
+        )
+    };
+    match controller {
+        Shown::Loading => skeleton_rows(1),
+        Shown::Failed(reason) => missing(format!("The usage is not shown: {reason}")),
+        Shown::Data { value, stale_age } => match (&value.rows, value.incident(id)) {
+            (Measured::Unavailable(reason), _) => {
+                missing(format!("The usage is not shown: {reason}"))
+            }
+            (Measured::Value(_), None) => missing(
+                "The controller record has no entry for this incident, so its usage is not shown."
+                    .to_owned(),
+            ),
+            (Measured::Value(_), Some(usage)) => v_flex()
+                .gap(tokens::SPACE_1)
+                .child(incident_block(
+                    "automation",
+                    usage,
+                    now,
+                    stale_age.is_some(),
+                    mono,
+                    tokens,
+                ))
+                .children(status_age_text(value.status_age).map(|text| {
+                    caption(
+                        SharedString::from(format!("automation-incident-age-{id}")),
+                        text,
+                        tokens,
+                    )
+                }))
+                .into_any_element(),
+        },
+    }
+}
+
+/// The pass cooldowns of the disk guard from the controller record.
+fn disk_cooldowns(
+    controller: &Shown<ControllerSnapshot>,
+    stale: bool,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> Vec<AnyElement> {
+    let Shown::Data { value, .. } = controller else {
+        return Vec::new();
+    };
+    let Measured::Value(rows) = &value.rows else {
+        return Vec::new();
+    };
+    cooldown_facts(
+        "automation-disk",
+        &rows.cooldowns,
+        |subject| matches!(subject, CooldownSubject::DiskPass { .. }),
+        stale,
+        mono,
+        tokens,
+    )
 }
 
 #[expect(
@@ -459,6 +571,7 @@ fn incident_row(
 fn guard_card(
     guard: &GuardDetail,
     revision: Option<&RevisionRow>,
+    controller: &Shown<ControllerSnapshot>,
     entity: &Entity<AppModel>,
     model: &AppModel,
     now: SystemTime,
@@ -496,7 +609,12 @@ fn guard_card(
         ))
         .child(guard_controls(guard, revision, entity, model, tokens));
     for incident in &guard.incidents {
-        body = body.child(incident_row(guard, incident, entity, model, mono, tokens));
+        body = body.child(incident_row(
+            guard, incident, controller, entity, model, now, mono, tokens,
+        ));
+    }
+    if guard.policy == PolicyId::DiskGuard {
+        body = body.children(disk_cooldowns(controller, stale, mono, tokens));
     }
     body = match &guard.grant {
         Some(grant) => body.child(grant_block(guard, grant, now, stale, mono, tokens)),
@@ -509,14 +627,15 @@ fn guard_card(
     if !guard.thresholds.is_empty() {
         let mut list = v_flex().gap(tokens::SPACE_1).child(caption(
             SharedString::from(format!("automation-thresholds-title-{name}")),
-            "Thresholds of the revision. A size is in bytes, a time is in nanoseconds, and a count is a number.",
+            "Thresholds of the revision, each with the unit of its configuration field.",
             tokens,
         ));
-        for (key, value) in &guard.thresholds {
+        for threshold in &guard.thresholds {
+            let key: &str = threshold.key.as_str();
             list = list.child(fact(
                 SharedString::from(format!("automation-threshold-{name}-{key}")),
                 key,
-                grouped(*value),
+                threshold_text(threshold.value),
                 mono,
                 stale,
                 tokens,
@@ -535,6 +654,7 @@ impl Render for AutomationScreen {
         let model: &AppModel = self.model.read(cx);
         let now: SystemTime = SystemTime::now();
         let automation = shown(&model.automation, now, |automation| automation.captured_at);
+        let controller = shown(&model.controller, now, |controller| controller.captured_at);
         let mut cards: Vec<(CardWidth, AnyElement)> = vec![(
             CardWidth::Full,
             state_card(&automation, &entity, model, now, &mono, tokens),
@@ -546,6 +666,7 @@ impl Render for AutomationScreen {
                     guard_card(
                         guard,
                         value.revision.as_ref(),
+                        &controller,
                         &entity,
                         model,
                         now,
@@ -583,42 +704,61 @@ mod tests {
 
     #[test]
     fn a_pause_that_was_not_read_is_unknown_and_not_not_paused() {
-        let (text, tone, _) = pause_summary(None, now());
+        let (text, tone, _) = pause_summary(None, now(), now());
         assert_eq!((text, tone), ("Unknown", Tone::Neutral));
-        let (text, _, sentence) = pause_summary(Some(&PauseRow::NotPaused), now());
+        let (text, _, sentence) = pause_summary(Some(&PauseRow::NotPaused), now(), now());
         assert_eq!(text, "Not paused");
         assert_eq!(sentence, "No pause is recorded.");
     }
 
+    fn paused(kind: PauseKind, remaining: Option<Duration>) -> PauseRow {
+        PauseRow::Paused {
+            since: now() - Duration::from_mins(10),
+            remaining,
+            until: remaining.map(|remaining| now() + remaining),
+            kind,
+        }
+    }
+
     #[test]
-    fn a_pause_states_its_start_and_its_end() {
-        let since: SystemTime = now() - Duration::from_mins(10);
+    fn a_pause_states_its_start_and_its_end_on_the_clock_of_the_agent() {
         let (text, tone, sentence) =
-            pause_summary(Some(&PauseRow::Paused { since, until: None }), now());
+            pause_summary(Some(&paused(PauseKind::Indefinite, None)), now(), now());
         assert_eq!((text, tone), ("Paused", Tone::Warning));
         assert_eq!(
             sentence,
             "Automation was paused 10 min ago. The pause has no end time."
         );
-        let (_, _, sentence) = pause_summary(
-            Some(&PauseRow::Paused {
-                since,
-                until: Some(now() + Duration::from_mins(20)),
-            }),
-            now(),
-        );
+        let timed = paused(PauseKind::Timed, Some(Duration::from_mins(20)));
+        let (_, _, sentence) = pause_summary(Some(&timed), now(), now());
         assert_eq!(
             sentence,
             "Automation was paused 10 min ago. The pause ends in 20 min."
         );
-        let (text, tone, _) = pause_summary(
-            Some(&PauseRow::Paused {
-                since,
-                until: Some(now() - Duration::from_secs(5)),
-            }),
-            now(),
+        // The time since the reading counts down the monotonic remainder.
+        let (_, _, sentence) = pause_summary(Some(&timed), now(), now() + Duration::from_mins(5));
+        assert!(
+            sentence.ends_with("The pause ends in 15 min."),
+            "{sentence}"
         );
+        let (_, _, sentence) = pause_summary(Some(&timed), now(), now() + Duration::from_mins(30));
+        assert!(sentence.ends_with("The pause ends now."), "{sentence}");
+        let (text, _, sentence) =
+            pause_summary(Some(&paused(PauseKind::Retained, None)), now(), now());
+        assert_eq!(text, "Paused");
+        assert!(sentence.contains("stays until you resume"), "{sentence}");
+    }
+
+    #[test]
+    fn an_expired_pause_inhibits_nothing() {
+        let expired = PauseRow::Expired {
+            since: now() - Duration::from_hours(2),
+        };
+        let (text, tone, _) = pause_summary(Some(&expired), now(), now());
         assert_eq!((text, tone), ("Pause ended", Tone::Neutral));
+        assert_eq!(measurement_sentence(FreshMeasurement::NotNeeded), None);
+        assert!(measurement_sentence(FreshMeasurement::NotKnown).is_some());
+        assert!(measurement_sentence(FreshMeasurement::Awaiting).is_some());
     }
 
     #[test]
@@ -644,17 +784,6 @@ mod tests {
                 now()
             ),
             "Expired 3 h ago"
-        );
-    }
-
-    #[test]
-    fn digits_are_in_groups_of_three() {
-        assert_eq!(grouped(0), "0");
-        assert_eq!(grouped(999), "999");
-        assert_eq!(grouped(1_000), "1\u{2009}000");
-        assert_eq!(
-            grouped(40_000_000_000),
-            "40\u{2009}000\u{2009}000\u{2009}000"
         );
     }
 }

@@ -505,9 +505,9 @@ impl MainWindow {
 pub const fn topics_of(screen: Screen) -> &'static [Topic] {
     match screen {
         Screen::Overview | Screen::Storage => &[],
-        Screen::Memory => &[Topic::Memory, Topic::Processes],
-        Screen::Applications => &[Topic::Processes],
-        Screen::Automation => &[Topic::Automation],
+        Screen::Memory => &[Topic::Memory, Topic::Processes, Topic::Controller],
+        Screen::Applications => &[Topic::Processes, Topic::Controller],
+        Screen::Automation => &[Topic::Automation, Topic::Controller],
         Screen::History => &[Topic::History],
         Screen::Diagnostics => &[Topic::Diagnostics],
     }

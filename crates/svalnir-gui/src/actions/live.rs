@@ -19,7 +19,7 @@ use svalnir_agent::{
     client::{self, ActiveConfig, ActiveConfigError, AgentPresence, StopMode, WaitError},
     journal::{
         JournalOptions, OperationJournal, OperationJournalError, QueuedRequest, RequestBody,
-        RequestCompletion,
+        RequestCompletion, RequestStatus,
     },
     observe::{self, AuthorityReadError, Host, StoredAuthority},
     platform::{
@@ -55,20 +55,38 @@ use svalnir_core::{
 /// The longest wait for the agent to decide a queued request.
 const DECISION_WAIT: Duration = Duration::from_secs(30);
 
-/// The longest wait for the agent to admit a stop plan.
+/// The wait for the agent to admit a stop plan before the window follows
+/// the request at each poll.
 const ADMISSION_WAIT: Duration = Duration::from_secs(10);
+
+/// The time after the expiry of a stop plan for which the window follows
+/// its request: the agent then refuses the plan, and its answer can need a
+/// step of the agent to arrive.
+const ADMISSION_GRACE: Duration = Duration::from_secs(30);
 
 /// The journal of the state directory.
 #[derive(Debug)]
 pub struct LivePort {
     state_directory: Option<PathBuf>,
+    admission_wait: Duration,
 }
 
 impl LivePort {
     /// Creates the port for the journal of `state_directory`.
     #[must_use]
     pub const fn new(state_directory: Option<PathBuf>) -> Self {
-        Self { state_directory }
+        Self {
+            state_directory,
+            admission_wait: ADMISSION_WAIT,
+        }
+    }
+
+    /// The port with a different wait for the admission of a stop, for the
+    /// tests.
+    #[cfg(test)]
+    const fn with_admission_wait(mut self, wait: Duration) -> Self {
+        self.admission_wait = wait;
+        self
     }
 
     /// The journal path, when the agent holds the lock of its journal and
@@ -269,24 +287,23 @@ impl LivePort {
             plan_id: plan.plan_id.clone(),
             digest: plan.digest().clone(),
         };
-        // TODO(npochaev): a stop that the agent does not admit in
-        // ADMISSION_WAIT shows "Not answered", and the window does not
-        // follow the request: the agent can admit the plan later, until it
-        // expires. Keep the request identity and read its completion at
-        // each poll, as `read_waiting_stops` does for an operation.
-        let completion: RequestCompletion = send_on(
-            &mut journal,
-            &path,
-            RequestBody::Apply { approval },
-            ADMISSION_WAIT,
-        )?;
-        Ok(match completion {
-            RequestCompletion::Operation { operation_id } => ActionState::WaitingForExit {
-                operation: operation_id.to_string(),
-                since: SystemTime::now(),
-            },
-            _ => ActionState::refused(UNEXPECTED_COMPLETION),
-        })
+        let request_id: RequestId = enqueue(&mut journal, RequestBody::Apply { approval })?;
+        let since: SystemTime = SystemTime::now();
+        match client::wait_for_completion(&journal, &path, &request_id, self.admission_wait) {
+            Ok(completion) => Ok(admission_of(completion, SystemTime::now())),
+            // The agent can admit the plan later, until it expires, so the
+            // window follows the request at each poll until then.
+            Err(WaitError::Pending | WaitError::CoordinatorStopped) => {
+                Ok(ActionState::AwaitingAdmission {
+                    request: request_id.to_string(),
+                    since,
+                    until: expiry_wall(plan)
+                        .checked_add(ADMISSION_GRACE)
+                        .unwrap_or_else(|| expiry_wall(plan)),
+                })
+            }
+            Err(WaitError::Journal(error)) => Err(journal_refusal(&error)),
+        }
     }
 
     /// Writes `body` to the queue and waits for its completion.
@@ -405,6 +422,20 @@ impl ActionPort for LivePort {
         })
     }
 
+    fn admission_state(&self, request: &str) -> Option<ActionState> {
+        let directory: &Path = self.state_directory.as_deref()?;
+        let journal = observe::open_existing_journal_read_only(&journal_path(directory)).ok()??;
+        match journal
+            .request_status(&RequestId::new(request).ok()?)
+            .ok()??
+        {
+            RequestStatus::Completed { completion } => {
+                Some(admission_of(completion, SystemTime::now()))
+            }
+            _ => None,
+        }
+    }
+
     fn operation_phase(&self, operation: &str) -> Option<OperationPhase> {
         let directory: &Path = self.state_directory.as_deref()?;
         let journal = observe::open_existing_journal_read_only(&journal_path(directory)).ok()??;
@@ -478,14 +509,9 @@ fn write<R>(
     })
 }
 
-/// Writes `body` to the queue of `journal` and waits for its completion.
-/// A rejection is a refusal with the code of the coordinator.
-fn send_on(
-    journal: &mut OperationJournal,
-    path: &Path,
-    body: RequestBody,
-    wait: Duration,
-) -> Result<RequestCompletion, ActionState> {
+/// Writes `body` to the queue of `journal` and gives the identity of the
+/// request.
+fn enqueue(journal: &mut OperationJournal, body: RequestBody) -> Result<RequestId, ActionState> {
     let request = QueuedRequest {
         request_id: RequestId::new(client::new_id("gui-request"))
             .map_err(|_| ActionState::refused("identity_unavailable"))?,
@@ -496,12 +522,36 @@ fn send_on(
     journal
         .enqueue_request(&request)
         .map_err(|error| journal_refusal(&error))?;
-    match client::wait_for_completion(journal, path, &request.request_id, wait) {
+    Ok(request.request_id)
+}
+
+/// Writes `body` to the queue of `journal` and waits for its completion.
+/// A rejection is a refusal with the code of the coordinator.
+fn send_on(
+    journal: &mut OperationJournal,
+    path: &Path,
+    body: RequestBody,
+    wait: Duration,
+) -> Result<RequestCompletion, ActionState> {
+    let request_id: RequestId = enqueue(journal, body)?;
+    match client::wait_for_completion(journal, path, &request_id, wait) {
         Ok(RequestCompletion::Rejected { error }) => Err(ActionState::refused(error.code.as_str())),
         Ok(completion) => Ok(completion),
         Err(WaitError::Pending) => Err(ActionState::Queued),
         Err(WaitError::CoordinatorStopped) => Err(ActionState::refused("coordinator_stopped")),
         Err(WaitError::Journal(error)) => Err(journal_refusal(&error)),
+    }
+}
+
+/// The state of a stop after the completion of its apply request at `now`.
+fn admission_of(completion: RequestCompletion, now: SystemTime) -> ActionState {
+    match completion {
+        RequestCompletion::Operation { operation_id } => ActionState::WaitingForExit {
+            operation: operation_id.to_string(),
+            since: now,
+        },
+        RequestCompletion::Rejected { error } => ActionState::refused(error.code.as_str()),
+        _ => ActionState::refused(UNEXPECTED_COMPLETION),
     }
 }
 
@@ -590,10 +640,11 @@ fn expiry_wall(plan: &Plan) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Child, stop_plan};
     use svalnir_agent::journal::{CoordinatorLock, CoordinatorRole};
     use svalnir_core::{
         action::{ActionError, ActionStage, DispatchState, ErrorCode, ErrorFamily},
-        id::ExecutorEpochId,
+        id::{ExecutorEpochId, OperationId},
     };
 
     /// A temporary state directory with a journal.
@@ -818,124 +869,13 @@ mod tests {
         assert_eq!(state, ActionState::refused("plan_not_buildable"));
     }
 
-    /// A child process of the test. The test never signals it; the drop
-    /// ends it, as the owner of the child.
-    struct Child(std::process::Child);
-
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _killed = self.0.kill();
-            let _waited = self.0.wait();
-        }
-    }
-
-    /// A real stop plan for the child `pid`, made with a clock ten minutes
-    /// in the past and a lifetime of one minute: it is expired now.
-    fn expired_plan(child: &mut std::process::Child) -> Plan {
-        let pid: u32 = child.id();
-        let host: Host = Host::open().unwrap_or_else(|error| panic!("{error}"));
-        let (clock, _wall) =
-            client::control_time(host.context()).unwrap_or_else(|error| panic!("{error}"));
-        let wall = WallTime::try_from(SystemTime::now() - Duration::from_secs(600))
-            .unwrap_or_else(|error| panic!("{error}"));
-        let pid = svalnir_core::process::Pid::new(
-            i32::try_from(pid).unwrap_or_else(|error| panic!("{error}")),
-        )
-        .unwrap_or_else(|error| panic!("{error:?}"));
-        // The inventory can read a new child only after its start; the
-        // test reads the processes again for at most 5 s.
-        let mut last: Option<String> = None;
-        let snapshot: ProcessSnapshot = (0..50)
-            .find_map(|_| {
-                let snapshot = collect_processes(&host).unwrap_or_else(|error| panic!("{error}"));
-                if snapshot.find_pid(pid).is_some() {
-                    return Some(snapshot);
-                }
-                last = Some(format!(
-                    "{:?}; child status: {:?}",
-                    snapshot.omissions,
-                    child.try_wait()
-                ));
-                std::thread::sleep(Duration::from_millis(100));
-                None
-            })
-            .unwrap_or_else(|| panic!("the child is not in the reading; omissions: {last:?}"));
-        let record = snapshot
-            .find_pid(pid)
-            .unwrap_or_else(|| panic!("the child is not in the reading"));
-        let candidate = ApplicationCandidate {
-            processes: vec![record.identity.clone()],
-            membership_snapshot: svalnir_core::id::MembershipSnapshotId::new("ms-test-1")
-                .unwrap_or_else(|error| panic!("{error}")),
-            foreground: svalnir_core::policy::ForegroundStatus::Background,
-            footprint: record.metrics.footprint.clone(),
-            hard_protection: ProtectionFact::NotProtected,
-        };
-        let control_plane = control_plane_of_this_process(&snapshot);
-        let protection = ProtectionContext {
-            principal: observe::current_uid(),
-            control_plane: control_plane.as_deref(),
-        };
-        let past = EvaluationClock {
-            now: svalnir_core::time::MonotonicNanos::new(
-                clock.now.get().saturating_sub(600_000_000_000),
-            ),
-            ..clock
-        };
-        let config = svalnir_core::config::parse_and_validate("schema_version = 1\n")
-            .config()
-            .cloned()
-            .unwrap_or_else(|| panic!("the minimal configuration is not valid"));
-        let context = PlanContext {
-            plan_id: PlanId::new("plan-test-stale").unwrap_or_else(|error| panic!("{error}")),
-            principal: client::principal(ClientRole::Gui),
-            authority: AuthorityBinding {
-                policy_revision: PolicyRevisionId::new("rev-test")
-                    .unwrap_or_else(|error| panic!("{error}")),
-                action_grants: Vec::new(),
-                privilege_grant: None,
-            },
-            clock: &past,
-            created_wall: wall,
-            lifetime: Nanoseconds::new(60_000_000_000),
-            protections: config.protections(),
-            home_directory: None,
-        };
-        let (strategy, limits) =
-            client::manual_stop(StopMode::Graceful, Nanoseconds::new(10_000_000_000));
-        let request = StopRequest {
-            target_id: TargetId::new("target-test").unwrap_or_else(|error| panic!("{error}")),
-            candidate: &candidate,
-            protection: &protection,
-            strategy,
-            steps: StopStepIds {
-                graceful: StepId::new("step-graceful").unwrap_or_else(|error| panic!("{error}")),
-                force: StepId::new("step-force").unwrap_or_else(|error| panic!("{error}")),
-            },
-            limits,
-        };
-        let outcome = build_stop_plan(&context, &request).unwrap_or_else(|error| panic!("{error}"));
-        let omitted = format!("{:?}", outcome.preview.omitted);
-        outcome
-            .plan
-            .unwrap_or_else(|| panic!("the plan builder made no plan: {omitted}"))
-    }
-
     #[test]
     fn a_stale_plan_is_refused_and_nothing_is_recorded() {
         let (directory, path) = state_directory();
         let _lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent)
             .unwrap_or_else(|error| panic!("{error}"));
-        // A copy outside the system locations, which the catalog protects.
-        let sleeper: PathBuf = directory.path().join("sleeper");
-        std::fs::copy("/bin/sleep", &sleeper).unwrap_or_else(|error| panic!("{error}"));
-        let mut child = Child(
-            std::process::Command::new(&sleeper)
-                .arg("30")
-                .spawn()
-                .unwrap_or_else(|error| panic!("{error}")),
-        );
-        let plan = expired_plan(&mut child.0);
+        let mut child = Child::sleeper(directory.path());
+        let plan = stop_plan(&mut child, "plan-test-stale", Duration::from_secs(600));
         let plan_id = plan.plan_id.clone();
         let proposal = Arc::new(StopProposal {
             instance: "test".to_owned(),
@@ -961,6 +901,85 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error}"))
                 .is_none()
         );
+        drop(child);
+    }
+
+    #[test]
+    fn a_stop_that_is_not_admitted_in_the_wait_is_followed_until_its_admission() {
+        let (directory, path) = state_directory();
+        let mut child = Child::sleeper(directory.path());
+        let plan = stop_plan(&mut child, "plan-test-late", Duration::from_secs(1));
+        let (admit, admitted) = std::sync::mpsc::channel::<()>();
+        // The test agent claims the request only after the wait of the
+        // client ended, and admits it as `op-late`.
+        let agent_path: PathBuf = path.clone();
+        let agent = std::thread::spawn(move || {
+            let mut journal = OperationJournal::open(&agent_path, &JournalOptions::default())
+                .unwrap_or_else(|error| panic!("{error}"));
+            let lock = CoordinatorLock::try_acquire(&agent_path, CoordinatorRole::Agent)
+                .unwrap_or_else(|error| panic!("{error}"));
+            let epoch =
+                ExecutorEpochId::new("agent-test").unwrap_or_else(|error| panic!("{error}"));
+            journal
+                .begin_coordination(&lock, &epoch, WallTime::UNIX_EPOCH)
+                .unwrap_or_else(|error| panic!("{error}"));
+            admitted
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|error| panic!("{error}"));
+            let claimed = journal
+                .claim_next_request(&epoch)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .unwrap_or_else(|| panic!("no request is in the queue"));
+            journal
+                .complete_request(
+                    &claimed.request.request_id,
+                    &epoch,
+                    &RequestCompletion::Operation {
+                        operation_id: OperationId::new("op-late")
+                            .unwrap_or_else(|error| panic!("{error}")),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+            // The lock stays held while the client reads.
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        wait_for_agent(&path);
+        let port = LivePort::new(Some(directory.path().to_owned()))
+            .with_admission_wait(Duration::from_millis(200));
+        let proposal = Arc::new(StopProposal {
+            instance: "test".to_owned(),
+            name: "sleep".to_owned(),
+            targets: Vec::new(),
+            expires_at: expiry_wall(&plan),
+            quit: Some(Arc::new(plan)),
+            force: None,
+        });
+        let state = port.submit(&Action::Stop {
+            proposal: Arc::clone(&proposal),
+            force: false,
+        });
+        let ActionState::AwaitingAdmission { request, until, .. } = state else {
+            panic!("the stop is not followed: {state:?}");
+        };
+        // The window follows the request until a short time after the plan
+        // expires.
+        assert_eq!(until, proposal.expires_at + ADMISSION_GRACE);
+        assert_eq!(port.admission_state(&request), None);
+        admit.send(()).unwrap_or_else(|error| panic!("{error}"));
+        let answer: Option<ActionState> = (0..100).find_map(|_| {
+            let answer = port.admission_state(&request);
+            if answer.is_none() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            answer
+        });
+        assert!(
+            matches!(&answer, Some(ActionState::WaitingForExit { operation, .. }) if operation == "op-late"),
+            "{answer:?}"
+        );
+        agent
+            .join()
+            .unwrap_or_else(|_| panic!("the test agent failed"));
         drop(child);
     }
 

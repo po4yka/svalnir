@@ -11,7 +11,8 @@ use super::{
 use super::{
     fixture_records,
     records::{
-        AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
+        AutomationSnapshot, ControllerSnapshot, DiagnosticsSnapshot, HistorySnapshot,
+        MemorySnapshot, ProcessesSnapshot,
     },
 };
 use crate::actions::{
@@ -409,6 +410,10 @@ impl DataSource for FixtureSource {
 
     fn automation(&self) -> AutomationSnapshot {
         fixture_records::automation(self.scenario)
+    }
+
+    fn controller(&self) -> ControllerSnapshot {
+        fixture_records::controller(self.scenario)
     }
 
     fn history(&self) -> HistorySnapshot {

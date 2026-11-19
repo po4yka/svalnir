@@ -226,6 +226,18 @@ pub enum ActionState {
         /// What is now true.
         detail: String,
     },
+    /// The plan of a stop is recorded and its request is in the queue, and
+    /// the agent did not admit it yet. The window reads the request again
+    /// at each poll until it has a result or `until` passes.
+    AwaitingAdmission {
+        /// The identity of the queued request.
+        request: String,
+        /// When the request was sent.
+        since: SystemTime,
+        /// When the window stops to follow the request: a short time after
+        /// the plan expires, when the agent can only refuse it.
+        until: SystemTime,
+    },
     /// The agent admitted the stop. The exit is not confirmed.
     WaitingForExit {
         /// The operation of the stop.
@@ -274,7 +286,10 @@ impl ActionState {
     /// request.
     #[must_use]
     pub const fn is_busy(&self) -> bool {
-        matches!(self, Self::Pending | Self::WaitingForExit { .. })
+        matches!(
+            self,
+            Self::Pending | Self::AwaitingAdmission { .. } | Self::WaitingForExit { .. }
+        )
     }
 
     /// The text, tone, and icon of the state pill. A state has two
@@ -284,6 +299,9 @@ impl ActionState {
         match self {
             Self::Pending => ("Sent", Tone::Brand, IconName::Loader),
             Self::Accepted { .. } => ("Accepted", Tone::Positive, IconName::CircleCheck),
+            Self::AwaitingAdmission { .. } => {
+                ("Waiting for admission", Tone::Brand, IconName::Loader)
+            }
             Self::WaitingForExit { .. } => ("Waiting for exit", Tone::Brand, IconName::Loader),
             Self::Settled { phase, .. } => match phase {
                 OperationPhase::Completed => ("Exited", Tone::Positive, IconName::CircleCheck),
@@ -305,6 +323,12 @@ impl ActionState {
         match self {
             Self::Pending => "The request is sent. The agent did not answer yet.".to_owned(),
             Self::Accepted { detail } => detail.clone(),
+            Self::AwaitingAdmission { since, .. } => {
+                let seconds: u64 = now.duration_since(*since).map_or(0, |age| age.as_secs());
+                format!(
+                    "The plan is recorded and the request is in the queue. The agent did not admit it yet: {seconds} s. The window follows the request until the plan expires."
+                )
+            }
             Self::WaitingForExit { operation, since } => {
                 let seconds: u64 = now.duration_since(*since).map_or(0, |age| age.as_secs());
                 format!("The agent admitted operation {operation}. Waiting for exit: {seconds} s.")
@@ -418,6 +442,11 @@ pub trait ActionPort: Send + Sync + Debug {
 
     /// The phase of the operation `operation`, when the journal has it.
     fn operation_phase(&self, operation: &str) -> Option<OperationPhase>;
+
+    /// The state of a stop whose request `request` waits for admission:
+    /// `WaitingForExit` when the agent admitted the plan, or the refusal.
+    /// `None` while the request has no completion or cannot be read now.
+    fn admission_state(&self, request: &str) -> Option<ActionState>;
 }
 
 /// The states of the controls, and the stop plans of the open dialog.
@@ -473,21 +502,58 @@ impl ActionBook {
     }
 
     /// Ends each wait for an exit that started more than `limit` before
-    /// `now` as [`ActionState::ExitNotConfirmed`]. Returns `true` when a
-    /// state changed.
+    /// `now` as [`ActionState::ExitNotConfirmed`], and each wait for an
+    /// admission after its `until` as [`ActionState::Queued`]. Returns
+    /// `true` when a state changed.
     pub fn end_long_waits(&mut self, now: SystemTime, limit: Duration) -> bool {
         let mut changed: bool = false;
         for state in self.states.values_mut() {
-            if let ActionState::WaitingForExit { operation, since } = state
-                && now.duration_since(*since).is_ok_and(|age| age > limit)
-            {
-                *state = ActionState::ExitNotConfirmed {
-                    operation: operation.clone(),
-                };
-                changed = true;
+            match state {
+                ActionState::WaitingForExit { operation, since }
+                    if now.duration_since(*since).is_ok_and(|age| age > limit) =>
+                {
+                    *state = ActionState::ExitNotConfirmed {
+                        operation: operation.clone(),
+                    };
+                    changed = true;
+                }
+                ActionState::AwaitingAdmission { until, .. } if now > *until => {
+                    *state = ActionState::Queued;
+                    changed = true;
+                }
+                _ => {}
             }
         }
         changed
+    }
+
+    /// The stops that wait for admission: the slot and the request.
+    #[must_use]
+    pub fn admissions(&self) -> Vec<(Slot, String)> {
+        self.states
+            .iter()
+            .filter_map(|(slot, state)| match state {
+                ActionState::AwaitingAdmission { request, .. } => {
+                    Some((slot.clone(), request.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Records the answer to the request `request` of a stop that waits for
+    /// admission. A slot that no longer waits for this request keeps its
+    /// state, and a state that is still a wait for admission changes
+    /// nothing.
+    pub fn admit(&mut self, slot: &Slot, request: &str, state: ActionState) {
+        if matches!(state, ActionState::AwaitingAdmission { .. }) {
+            return;
+        }
+        if let Some(current) = self.states.get_mut(slot)
+            && matches!(current, ActionState::AwaitingAdmission { request: waiting, .. } if waiting == request)
+        {
+            *current = state;
+        }
     }
 
     /// Each control with the state of its last action.
@@ -684,6 +750,45 @@ mod tests {
             Some("Exit not confirmed")
         );
         assert_eq!(book.waiting(), Vec::new());
+    }
+
+    #[test]
+    fn a_stop_that_waits_for_admission_is_followed_until_its_bound() {
+        let since: SystemTime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let until: SystemTime = since + Duration::from_secs(330);
+        let slot = Slot::Stop("app-1".to_owned());
+        let mut book = ActionBook::default();
+        let waiting = ActionState::AwaitingAdmission {
+            request: "req-1".to_owned(),
+            since,
+            until,
+        };
+        book.set(slot.clone(), waiting.clone());
+        assert!(book.is_busy(&slot));
+        assert_eq!(waiting.pill().0, "Waiting for admission");
+        assert_eq!(book.admissions(), vec![(slot.clone(), "req-1".to_owned())]);
+        // An answer to a different request changes nothing.
+        book.admit(&slot, "req-0", ActionState::refused("plan_expired"));
+        assert_eq!(book.state(&slot), Some(&waiting));
+        // The bound has not passed: the wait goes on.
+        assert!(!book.end_long_waits(until, Duration::from_secs(300)));
+        // The admission gives the wait for the exit.
+        book.admit(
+            &slot,
+            "req-1",
+            ActionState::WaitingForExit {
+                operation: "op-1".to_owned(),
+                since: until,
+            },
+        );
+        assert_eq!(book.admissions(), Vec::new());
+        assert_eq!(book.waiting(), vec![(slot.clone(), "op-1".to_owned())]);
+        // With no answer, the wait ends after the bound as "not answered",
+        // and the control takes a new request.
+        book.set(slot.clone(), waiting);
+        assert!(book.end_long_waits(until + Duration::from_secs(1), Duration::from_secs(300)));
+        assert_eq!(book.state(&slot), Some(&ActionState::Queued));
+        assert!(!book.is_busy(&slot));
     }
 
     #[test]

@@ -75,7 +75,10 @@ fn a_topic_is_read_only_when_its_screen_is_in_front(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| {
         let model = view.read(cx).model().read(cx);
-        assert_eq!(model.topics(), [Topic::Memory, Topic::Processes]);
+        assert_eq!(
+            model.topics(),
+            [Topic::Memory, Topic::Processes, Topic::Controller]
+        );
         assert!(matches!(model.processes, Loadable::Ready(_)));
         assert!(matches!(model.memory, Loadable::Ready(_)));
         // No screen asked for the probes.
@@ -107,12 +110,53 @@ fn memory_shows_the_quantities_and_the_processes(cx: &mut TestAppContext) {
     let track = label(handle, "memory-pressure-track", cx).expect("track");
     assert!(track.contains("readings of this window"), "{track}");
     let first = label(handle, "memory-process-name-412", cx).expect("row");
-    assert_eq!(first, "Xcode, process 412, footprint 3.8 GB");
+    assert_eq!(
+        first,
+        "Xcode, process 412, footprint 3.8 GB, growth +24.0 MB in 5 s"
+    );
+    // A process that is new since the previous reading has no growth value.
+    let new = label(handle, "memory-process-name-377", cx).expect("row");
+    assert!(
+        new.ends_with("growth not available: the process is new since the previous reading"),
+        "{new}"
+    );
+    assert_eq!(
+        label(handle, "memory-budgets-budget-browser", cx).as_deref(),
+        Some("browser: Advisory")
+    );
+    assert!(label(handle, "memory-incident-empty", cx).is_some());
+    assert_eq!(label(handle, "memory-budgets-status-age", cx), None);
     // A process with no footprint value is a row with a reason, not zero.
     let exited = label(handle, "memory-process-name-743", cx).expect("row");
     assert!(exited.contains("footprint not available"), "{exited}");
     let summary = label(handle, "memory-processes-summary", cx).expect("summary");
     assert!(summary.starts_with("12 of 12 processes"), "{summary}");
+}
+
+#[gpui_kit::test]
+fn memory_shows_the_incident_usage_of_each_generation(cx: &mut TestAppContext) {
+    let (handle, _view) = open(FixtureScenario::Pressure, Screen::Memory, cx);
+    assert_eq!(
+        label(handle, "memory-budgets-budget-build-worker", cx).as_deref(),
+        Some("build-worker: Qualifying · latched")
+    );
+    assert_eq!(
+        label(handle, "memory-usage-inc-fixture-memory-1", cx).as_deref(),
+        Some("Usage of the current generation: 1 application slots used, 1 reserved")
+    );
+    let first = label(handle, "memory-generation-inc-fixture-memory-1-1", cx).expect("generation");
+    assert!(
+        first.contains("Final: 2 application slots used, 0 reserved. Journal: 2 application slots"),
+        "{first}"
+    );
+    let second = label(handle, "memory-generation-inc-fixture-memory-1-2", cx).expect("generation");
+    assert!(
+        second.ends_with("Journal: No consumed dispatch"),
+        "{second}"
+    );
+    let (handle, _view) = open(FixtureScenario::Stale, Screen::Memory, cx);
+    let age = label(handle, "memory-budgets-status-age", cx).expect("age");
+    assert!(age.contains("12 min old"), "{age}");
 }
 
 #[gpui_kit::test]
@@ -194,6 +238,42 @@ fn applications_show_groups_protection_and_a_partial_sum(cx: &mut TestAppContext
     );
     let note = label(handle, "applications-stop-note", cx).expect("note");
     assert!(note.starts_with("Stop makes a quit plan"), "{note}");
+    // The reason of a protection and of an unknown result.
+    assert_eq!(
+        label(
+            handle,
+            "applications-protection-reason-fixture-com.apple.finder",
+            cx
+        )
+        .as_deref(),
+        Some("An application of the login session")
+    );
+    assert_eq!(
+        label(
+            handle,
+            "applications-protection-reason-fixture-com.apple.Terminal",
+            cx
+        )
+        .as_deref(),
+        Some("A member has no executable evidence")
+    );
+    assert_eq!(
+        label(
+            handle,
+            "applications-protection-reason-fixture-com.apple.dt.Xcode",
+            cx
+        ),
+        None
+    );
+    assert_eq!(
+        label(handle, "applications-relaunch-cooldown-0", cx).as_deref(),
+        Some("Stop of com.example.sync.agent: Active, 4 min left")
+    );
+    let restart = label(handle, "applications-restart-note", cx).expect("note");
+    assert!(
+        restart.starts_with("No restart history exists"),
+        "{restart}"
+    );
 }
 
 #[gpui_kit::test]
@@ -201,6 +281,10 @@ fn applications_unavailable_is_not_an_empty_list(cx: &mut TestAppContext) {
     let (handle, _view) = open(FixtureScenario::Unavailable, Screen::Applications, cx);
     assert!(label(handle, "applications-value-reason", cx).is_some());
     assert_eq!(label(handle, "applications-empty", cx), None);
+    // No controller record is a reason, not an empty list of budgets.
+    let reason = label(handle, "applications-budgets-reason", cx).expect("reason");
+    assert!(reason.contains("the controller record"), "{reason}");
+    assert_eq!(label(handle, "applications-budgets-empty", cx), None);
 }
 
 #[gpui_kit::test]
@@ -236,10 +320,51 @@ fn automation_shows_guards_grants_and_the_pause(cx: &mut TestAppContext) {
         label(handle, "automation-revision", cx).as_deref(),
         Some("Revision in effect: rev-fixture-1")
     );
+    // A threshold has the unit of its configuration field.
+    assert_eq!(
+        label(
+            handle,
+            "automation-threshold-disk-guard-disk_guard.reclaim_below",
+            cx
+        )
+        .as_deref(),
+        Some("disk_guard.reclaim_below: 25 GiB")
+    );
+    assert_eq!(
+        label(
+            handle,
+            "automation-threshold-disk-guard-disk_guard.sustain_for",
+            cx
+        )
+        .as_deref(),
+        Some("disk_guard.sustain_for: 2 min")
+    );
     let (handle, _view) = open(FixtureScenario::Pressure, Screen::Automation, cx);
     assert_eq!(
         label(handle, "automation-pause-pill", cx).as_deref(),
         Some("Paused")
+    );
+    let pause = label(handle, "automation-pause", cx).expect("pause");
+    assert!(pause.ends_with("The pause ends in 20 min."), "{pause}");
+    assert_eq!(
+        label(handle, "automation-usage-inc-fixture-memory-1", cx).as_deref(),
+        Some("Usage of the current generation: 1 application slots used, 1 reserved")
+    );
+    // An expired pause inhibits nothing, and the agent waits for a newer
+    // measurement.
+    let (handle, _view) = open(FixtureScenario::Drift, Screen::Automation, cx);
+    assert_eq!(
+        label(handle, "automation-pause-pill", cx).as_deref(),
+        Some("Pause ended")
+    );
+    let measurement = label(handle, "automation-pause-measurement", cx).expect("measurement");
+    assert!(
+        measurement.starts_with("Automatic work waits"),
+        "{measurement}"
+    );
+    assert_eq!(
+        label(handle, "automation-disk-cooldown-0", cx).as_deref(),
+        Some("Next pass of inc-fixture-disk-1: Active, 3 min left (pass pacing)")
     );
 }
 

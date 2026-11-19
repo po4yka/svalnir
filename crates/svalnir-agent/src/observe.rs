@@ -30,6 +30,18 @@ use crate::platform::volume::{
     self, FoundationCapacity, MountedVolume, VolumeCapacity, VolumeQueryError,
 };
 
+mod records;
+#[cfg(test)]
+mod tests;
+
+pub use self::records::{
+    AgentRecordsReading, AgentStepPause, BudgetReading, ClientClock, ControllerReading,
+    CooldownReading, CooldownSubject, Freshness, GenerationReading, IncidentReading,
+    JournalReading, JournalUsage, MAX_READ_INCIDENTS, OutstandingReading, PauseReading,
+    PauseUnknown, RecordReading, STATUS_MAX_AGE, StatusReading, freshness, pause_reading,
+    read_agent_records, read_agent_records_at, read_controller, read_status,
+};
+
 /// The mount point of the data volume of the startup volume group on macOS.
 const STARTUP_DATA_MOUNT_POINT: &str = "/System/Volumes/Data";
 

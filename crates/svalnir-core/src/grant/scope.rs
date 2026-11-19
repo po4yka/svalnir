@@ -176,7 +176,7 @@ pub enum ThresholdValue {
 /// the smallest, and its last factor is 1.
 fn exact_text(value: u64, units: &[(u64, &str)]) -> String {
     for (factor, unit) in units {
-        if value != 0 && value % factor == 0 {
+        if value != 0 && value.is_multiple_of(*factor) {
             return format!("{}{unit}", value / factor);
         }
     }

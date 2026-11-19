@@ -802,6 +802,8 @@ fn a_threshold_value_has_the_text_of_the_configuration_grammar() {
     use crate::byte_size::parse_byte_size;
     use crate::duration::parse_duration;
     use crate::quantity::{Bytes, Nanoseconds};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const SECOND: u64 = 1_000_000_000;
 
     let value = |key: &str, value: u64| {
         Threshold {
@@ -811,8 +813,6 @@ fn a_threshold_value_has_the_text_of_the_configuration_grammar() {
         .typed_value()
         .unwrap()
     };
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const SECOND: u64 = 1_000_000_000;
     assert_eq!(
         value("disk_guard.reclaim_below", 25 * GIB),
         ThresholdValue::Bytes(Bytes::new(25 * GIB))

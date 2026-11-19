@@ -81,28 +81,38 @@ pub struct ProtectionContext<'a> {
     pub control_plane: Option<&'a [ControlPlaneProcess]>,
 }
 
-/// The entry that the executable path matches. The outer `None` means that
-/// the path is not one that the catalog can classify; `Some(None)` means
-/// that the path matches no entry.
+/// The class of an executable path in the catalog.
+enum PathClass {
+    /// The path matches this entry.
+    Protected(HardProtectionEntry),
+    /// The path matches no entry.
+    NotProtected,
+    /// The path is not one that the catalog can classify.
+    NotClassified,
+}
+
+/// The class of the executable path.
 ///
 /// The comparison ignores ASCII case, because the default volume format of
 /// macOS does. A rule can only add a protection, so a match that a
 /// case-sensitive volume would not make is the safe direction.
-fn path_entry(path: &[u8]) -> Option<Option<HardProtectionEntry>> {
+fn path_class(path: &[u8]) -> PathClass {
     // The path must be absolute, with no empty, `.`, or `..` component: such
     // a component can make the text name a file outside its prefix.
     let mut components = path.split(|byte| *byte == b'/');
     if components.next() != Some(b"".as_slice()) {
-        return None;
+        return PathClass::NotClassified;
     }
     let mut file_name: Option<&[u8]> = None;
     for component in components {
         if component.is_empty() || component == b"." || component == b".." {
-            return None;
+            return PathClass::NotClassified;
         }
         file_name = Some(component);
     }
-    let file_name: &[u8] = file_name?;
+    let Some(file_name) = file_name else {
+        return PathClass::NotClassified;
+    };
     let has_prefix = |prefix: &str| {
         path.get(..prefix.len())
             .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
@@ -114,13 +124,13 @@ fn path_entry(path: &[u8]) -> Option<Option<HardProtectionEntry>> {
     let is_control_plane: bool = CONTROL_PLANE_EXECUTABLES
         .iter()
         .any(|name| file_name.eq_ignore_ascii_case(name.as_bytes()));
-    Some(if in_system_directory {
-        Some(HardProtectionEntry::SystemLocation)
+    if in_system_directory {
+        PathClass::Protected(HardProtectionEntry::SystemLocation)
     } else if is_control_plane {
-        Some(HardProtectionEntry::ControlPlaneExecutable)
+        PathClass::Protected(HardProtectionEntry::ControlPlaneExecutable)
     } else {
-        None
-    })
+        PathClass::NotProtected
+    }
 }
 
 /// The entry of the catalog that protects one process.
@@ -308,12 +318,16 @@ fn process_protection(
     let Some(executable) = process.executable.as_ref() else {
         return ProcessProtection::Unknown(ProtectionUnknownCause::NoExecutableEvidence);
     };
-    match (path_entry(executable.path.as_bytes()), in_control_plane) {
-        (Some(Some(entry)), _) => ProcessProtection::Protected(entry),
-        (Some(None), Some(false)) => ProcessProtection::NotProtected,
-        (None, _) => ProcessProtection::Unknown(ProtectionUnknownCause::PathNotClassified),
+    match (path_class(executable.path.as_bytes()), in_control_plane) {
+        (PathClass::Protected(entry), _) => ProcessProtection::Protected(entry),
+        (PathClass::NotProtected, Some(false)) => ProcessProtection::NotProtected,
+        (PathClass::NotClassified, _) => {
+            ProcessProtection::Unknown(ProtectionUnknownCause::PathNotClassified)
+        }
         // `Some(true)` returned before this point.
-        (Some(None), _) => ProcessProtection::Unknown(ProtectionUnknownCause::ControlPlaneNotKnown),
+        (PathClass::NotProtected, _) => {
+            ProcessProtection::Unknown(ProtectionUnknownCause::ControlPlaneNotKnown)
+        }
     }
 }
 

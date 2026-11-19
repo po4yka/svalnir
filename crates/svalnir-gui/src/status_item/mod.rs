@@ -15,7 +15,7 @@ mod native;
 use crate::{
     actions::{Action, Slot},
     data::{
-        model::{Loadable, Measured, PressureLevel},
+        model::{AgentSnapshot, AgentState, HostSnapshot, Loadable, Measured, PressureLevel},
         records::PauseRow,
         store::{AppModel, Topic},
     },
@@ -114,7 +114,7 @@ pub struct StatusView {
 
 /// The text of the memory pressure state, and whether the value is stale.
 /// A reading that failed or did not come yet is an em dash.
-fn pressure_text(host: &Loadable<crate::data::model::HostSnapshot>) -> (String, bool) {
+fn pressure_text(host: &Loadable<HostSnapshot>) -> (String, bool) {
     let (snapshot, stale) = match host {
         Loadable::Ready(snapshot) => (snapshot, false),
         Loadable::Stale(snapshot) => (snapshot, true),
@@ -124,6 +124,40 @@ fn pressure_text(host: &Loadable<crate::data::model::HostSnapshot>) -> (String, 
         Measured::Value(level) => (PressureLevel::label(*level).to_owned(), stale),
         Measured::Unavailable(_) => ("\u{2014}".to_owned(), stale),
     }
+}
+
+/// The sentence for an agent state that gives no protection that is known,
+/// as in the banner of the window.
+const NO_PROTECTION: &str =
+    "No recent status of an agent. No automatic protection is known to be active.";
+
+/// The line of the agent state, and the sentence of its tooltip. Only a
+/// current status record of a running agent (`Reporting`) has no warning: a
+/// stopped, silent, or absent agent, and a reading that failed or did not
+/// come, never read as a normal state.
+#[must_use]
+pub fn agent_line(agent: &Loadable<AgentSnapshot>) -> (String, Option<&'static str>) {
+    let (snapshot, stale) = match agent {
+        Loadable::Ready(snapshot) => (snapshot, false),
+        Loadable::Stale(snapshot) => (snapshot, true),
+        Loadable::Loading => return ("Agent: not read yet".to_owned(), None),
+        Loadable::Unavailable(_) => {
+            return (
+                "Agent: unavailable".to_owned(),
+                Some("The records of the agent cannot be read."),
+            );
+        }
+    };
+    let detail: Option<&'static str> = match snapshot.state {
+        AgentState::Reporting { .. } => None,
+        AgentState::NoJournal
+        | AgentState::NoRecord
+        | AgentState::Silent { .. }
+        | AgentState::Stopped { .. } => Some(NO_PROTECTION),
+        AgentState::Unknown(_) => Some("The records of the agent cannot be read."),
+    };
+    let suffix: &str = if stale { " (stale)" } else { "" };
+    (format!("Agent: {}{suffix}", snapshot.state.label()), detail)
 }
 
 /// The filled cells of the inline grid for `used` of `total`.
@@ -232,10 +266,25 @@ pub fn status_view(model: &AppModel, now: SystemTime) -> StatusView {
     };
     let stale_note: &str = if stale { " The reading is stale." } else { "" };
     let pressure_line: String = format!("Memory pressure: {pressure}");
+    let (agent, agent_detail): (String, Option<&'static str>) = agent_line(&model.agent);
+    let fixture: Option<String> = model
+        .fixture_name()
+        .map(|name| format!("Fixture data: {name}. Values are not measurements."));
 
-    let mut rows: Vec<MenuRow> = vec![
+    let mut rows: Vec<MenuRow> = Vec::new();
+    if let Some(fixture) = &fixture {
+        rows.push(MenuRow::Info {
+            title: fixture.clone(),
+            detail: None,
+        });
+    }
+    rows.extend([
         MenuRow::Info {
-            title: disk.clone(),
+            title: if stale {
+                format!("{disk} (stale)")
+            } else {
+                disk.clone()
+            },
             detail: None,
         },
         MenuRow::Info {
@@ -246,8 +295,12 @@ pub fn status_view(model: &AppModel, now: SystemTime) -> StatusView {
             },
             detail: None,
         },
+        MenuRow::Info {
+            title: agent.clone(),
+            detail: agent_detail.map(str::to_owned),
+        },
         MenuRow::Separator,
-    ];
+    ]);
 
     let pause_text: String = push_pause_rows(model, now, &mut rows);
     rows.push(MenuRow::Separator);
@@ -262,8 +315,11 @@ pub fn status_view(model: &AppModel, now: SystemTime) -> StatusView {
         enabled: true,
     });
 
-    let label: String =
-        format!("Svalnir. {disk}. {pressure_line}.{stale_note} Automation: {pause_text}.");
+    let fixture_note: String = fixture.map_or_else(String::new, |text| format!(" {text}"));
+    let protection_note: String = agent_detail.map_or_else(String::new, |text| format!(" {text}"));
+    let label: String = format!(
+        "Svalnir.{fixture_note} {disk}. {pressure_line}.{stale_note} {agent}.{protection_note} Automation: {pause_text}."
+    );
     StatusView {
         cells,
         title,
@@ -285,22 +341,35 @@ pub const fn pause_action(command: MenuCommand) -> Option<Action> {
     }
 }
 
-/// The installed item: the native surface, the model that it shows, and
-/// the function that opens or focuses the main window.
+/// The surface that draws a [`StatusView`]: the native item on macOS, or a
+/// test surface.
+pub trait Surface {
+    /// Shows `view`. Returns `false` when the surface cannot show all of it
+    /// now (the menu is open): the item applies the view again at the next
+    /// update.
+    fn apply(&self, view: &StatusView) -> bool;
+}
+
+/// The installed item: the surface, the model that it shows, and the
+/// function that opens or focuses the main window.
 struct StatusItem {
     model: Entity<AppModel>,
     show_window: Rc<dyn Fn(&mut App)>,
-    #[cfg(target_os = "macos")]
-    surface: native::StatusSurface,
+    surface: Box<dyn Surface>,
+    /// The last view that the surface showed in full.
     last: Option<StatusView>,
-    _observe: Option<Subscription>,
+    /// The last view that the surface got while its menu was open, so
+    /// that the same view is not drawn again at each poll.
+    pending: Option<StatusView>,
+    _observe: Subscription,
 }
 
 impl Global for StatusItem {}
 
 /// Runs `command` of the menu. The surface calls it in a later turn of the
-/// main run loop, never inside an update of the application.
-fn run_command(command: MenuCommand, cx: &mut App) {
+/// main run loop, never inside an update of the application. With no item
+/// installed it does nothing.
+pub fn run_command(command: MenuCommand, cx: &mut App) {
     let Some(item) = cx.try_global::<StatusItem>() else {
         return;
     };
@@ -329,22 +398,35 @@ pub fn show_window(cx: &mut App) {
 }
 
 /// Puts the view of the model on the surface when it changed.
-fn update_item(cx: &mut App) {
+pub fn update_item(cx: &mut App) {
     let Some(item) = cx.try_global::<StatusItem>() else {
         return;
     };
     let view: StatusView = status_view(item.model.read(cx), SystemTime::now());
-    if item.last.as_ref() == Some(&view) {
+    if item.last.as_ref() == Some(&view) || item.pending.as_ref() == Some(&view) {
         return;
     }
     let item: &mut StatusItem = cx.global_mut::<StatusItem>();
-    #[cfg(target_os = "macos")]
     let applied: bool = item.surface.apply(&view);
-    #[cfg(not(target_os = "macos"))]
-    let applied: bool = true;
     // A view that waits for the menu to close is not the last view, so the
     // update after the close applies it.
-    item.last = applied.then_some(view);
+    if applied {
+        item.last = Some(view);
+        item.pending = None;
+    } else {
+        item.last = None;
+        item.pending = Some(view);
+    }
+}
+
+/// Applies the view after the menu closed: the view that waited for the
+/// close, or a newer one.
+pub fn menu_closed(cx: &mut App) {
+    if !cx.has_global::<StatusItem>() {
+        return;
+    }
+    cx.global_mut::<StatusItem>().pending = None;
+    update_item(cx);
 }
 
 /// Adds the item to the menu bar for `model`. `show_window` opens the main
@@ -361,7 +443,7 @@ pub fn install(model: Entity<AppModel>, show_window: Rc<dyn Fn(&mut App)>, cx: &
             let app = closed_app.clone();
             closed_app
                 .foreground_executor()
-                .spawn(async move { app.update(update_item) })
+                .spawn(async move { app.update(menu_closed) })
                 .detach();
         });
         let on_command: Rc<dyn Fn(MenuCommand)> = Rc::new(move |command: MenuCommand| {
@@ -378,18 +460,7 @@ pub fn install(model: Entity<AppModel>, show_window: Rc<dyn Fn(&mut App)>, cx: &
             tracing::warn!("the menu bar item needs the main thread; it is not shown");
             return false;
         };
-        model.update(cx, |model, cx| {
-            model.set_standing_topics(&[Topic::Automation], cx);
-        });
-        let observe: Subscription = cx.observe(&model, |_, cx| update_item(cx));
-        cx.set_global(StatusItem {
-            model,
-            show_window,
-            surface,
-            last: None,
-            _observe: Some(observe),
-        });
-        update_item(cx);
+        install_surface(model, show_window, Box::new(surface), cx);
         true
     }
     #[cfg(not(target_os = "macos"))]
@@ -399,9 +470,89 @@ pub fn install(model: Entity<AppModel>, show_window: Rc<dyn Fn(&mut App)>, cx: &
     }
 }
 
+/// Installs the item on `surface`: the model reads the authority record at
+/// each poll, the surface shows each new view, and the item is removed when
+/// the application quits, before GPUI stops its executor, so that no menu
+/// callback reaches the application after that.
+pub fn install_surface(
+    model: Entity<AppModel>,
+    show_window: Rc<dyn Fn(&mut App)>,
+    surface: Box<dyn Surface>,
+    cx: &mut App,
+) {
+    model.update(cx, |model, cx| {
+        model.set_standing_topics(&[Topic::Automation], cx);
+    });
+    let observe: Subscription = cx.observe(&model, |_, cx| update_item(cx));
+    cx.set_global(StatusItem {
+        model,
+        show_window,
+        surface,
+        last: None,
+        pending: None,
+        _observe: observe,
+    });
+    cx.on_app_quit(|cx| {
+        remove(cx);
+        async {}
+    })
+    .detach();
+    update_item(cx);
+}
+
+/// Removes the item: the surface drops, which takes the native item off
+/// the menu bar. Returns whether an item was installed.
+pub fn remove(cx: &mut App) -> bool {
+    if cx.has_global::<StatusItem>() {
+        drop(cx.remove_global::<StatusItem>());
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether an item is installed.
+#[must_use]
+pub fn is_installed(cx: &App) -> bool {
+    cx.has_global::<StatusItem>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reading(state: AgentState, old: bool) -> Loadable<AgentSnapshot> {
+        let snapshot = std::sync::Arc::new(AgentSnapshot {
+            state,
+            captured_at: SystemTime::UNIX_EPOCH,
+        });
+        if old {
+            Loadable::Stale(snapshot)
+        } else {
+            Loadable::Ready(snapshot)
+        }
+    }
+
+    #[test]
+    fn only_a_reporting_agent_has_no_warning() {
+        let at = SystemTime::UNIX_EPOCH;
+        let (line, detail) = agent_line(&reading(AgentState::Stopped { at }, false));
+        assert_eq!(line, "Agent: stopped");
+        assert_eq!(detail, Some(NO_PROTECTION));
+        let (line, detail) = agent_line(&reading(AgentState::Silent { last: at }, true));
+        assert_eq!(line, "Agent: silent (stale)");
+        assert_eq!(detail, Some(NO_PROTECTION));
+        assert_eq!(
+            agent_line(&reading(AgentState::Reporting { since: at }, false)),
+            ("Agent: reporting".to_owned(), None)
+        );
+        assert!(
+            agent_line(&Loadable::Unavailable("x".to_owned()))
+                .1
+                .is_some()
+        );
+        assert_eq!(agent_line(&Loadable::Loading).0, "Agent: not read yet");
+    }
 
     #[test]
     fn a_tag_maps_back_to_its_command() {

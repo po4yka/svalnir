@@ -1,8 +1,13 @@
 //! Tests of the view of the menu bar item. The `AppKit` surface needs a real
 //! menu bar, so these tests check the view that the surface draws.
 
-use gpui_kit::{AppContext as _, Bounds, Entity, Point, TestAppContext, px, size};
-use std::{sync::Arc, time::SystemTime};
+use gpui_kit::{App, AppContext as _, Bounds, Entity, Point, TestAppContext, px, size};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+    time::SystemTime,
+};
 use svalnir_gui::{
     actions::fixture::ActionScript,
     app::{after_last_window_closed, open_main_window_with_model},
@@ -11,7 +16,10 @@ use svalnir_gui::{
         model::Loadable,
         store::{AppModel, INACTIVE_INTERVAL, Topic},
     },
-    status_item::{MenuCommand, MenuRow, StatusView, pause_action, status_view},
+    status_item::{
+        MenuCommand, MenuRow, StatusView, Surface, install_surface, is_installed, menu_closed,
+        pause_action, remove, run_command, status_view, update_item,
+    },
 };
 
 fn model(
@@ -160,8 +168,14 @@ fn a_pause_command_goes_through_the_model_action(cx: &mut TestAppContext) {
     cx.update(|cx| model.update(cx, |model, cx| model.run_action(action, cx)));
     cx.run_until_parked();
     let view = view(&model, cx);
+    // With no agent, the pause is written to the authority record
+    // directly, as the window and the CLI do, and the menu says so.
     assert!(
-        infos(&view).contains(&"Pause request: Unavailable".to_owned()),
+        view.rows.iter().any(|row| matches!(
+            row,
+            MenuRow::Info { title, detail: Some(detail) }
+                if title == "Pause request: Accepted" && detail.contains("Path: no agent runs")
+        )),
         "{:?}",
         view.rows
     );
@@ -195,9 +209,15 @@ fn the_model_keeps_reading_after_its_window_closes(cx: &mut TestAppContext) {
         assert_eq!(model.standing_topics(), &[Topic::Automation]);
         assert!(model.actions.stop.is_none(), "no stop dialog is open");
     });
+    let before: Option<SystemTime> = cx.update(|cx| model.read(cx).last_refresh());
     // The poll of the model runs on its own at the inactive interval.
     cx.executor().advance_clock(INACTIVE_INTERVAL * 2);
     cx.run_until_parked();
+    let after: Option<SystemTime> = cx.update(|cx| model.read(cx).last_refresh());
+    assert!(
+        after.is_some() && after != before,
+        "a poll ran after the window closed: {before:?} then {after:?}"
+    );
     let view = view(&model, cx);
     assert!(view.cells.is_some(), "the item still has the readings");
     assert_eq!(view.title, "Normal");
@@ -216,4 +236,150 @@ fn a_stale_pause_state_is_marked(cx: &mut TestAppContext) {
     assert_eq!(automation.len(), 1, "{:?}", view.rows);
     assert!(automation[0].ends_with("(stale)"), "{automation:?}");
     assert!(view.label.contains("(stale)"), "{}", view.label);
+}
+
+#[gpui_kit::test]
+fn an_absent_agent_is_not_shown_as_a_normal_state(cx: &mut TestAppContext) {
+    let model = model(FixtureScenario::AgentAbsent, ActionScript::Accept, true, cx);
+    let view = view(&model, cx);
+    assert!(
+        infos(&view).contains(&"Agent: no journal".to_owned()),
+        "{:?}",
+        view.rows
+    );
+    assert!(
+        view.label
+            .contains("No automatic protection is known to be active."),
+        "{}",
+        view.label
+    );
+}
+
+#[gpui_kit::test]
+fn fixture_values_are_marked_as_not_measured(cx: &mut TestAppContext) {
+    let model = model(FixtureScenario::Healthy, ActionScript::Accept, true, cx);
+    let view = view(&model, cx);
+    let first: Option<&MenuRow> = view.rows.first();
+    assert!(
+        matches!(first, Some(MenuRow::Info { title, .. }) if title.starts_with("Fixture data: healthy.")),
+        "{:?}",
+        view.rows
+    );
+    assert!(
+        view.label.contains("Values are not measurements."),
+        "{}",
+        view.label
+    );
+}
+
+/// A surface that records each view, with a menu that a test opens.
+#[derive(Default)]
+struct Recorder {
+    views: RefCell<Vec<StatusView>>,
+    menu_open: Cell<bool>,
+}
+
+struct RecordingSurface(Rc<Recorder>);
+
+impl Surface for RecordingSurface {
+    fn apply(&self, view: &StatusView) -> bool {
+        self.0.views.borrow_mut().push(view.clone());
+        !self.0.menu_open.get()
+    }
+}
+
+fn installed(
+    cx: &mut TestAppContext,
+    actions: ActionScript,
+) -> (Entity<AppModel>, Rc<Recorder>, Rc<Cell<usize>>) {
+    let model = model(FixtureScenario::Healthy, actions, false, cx);
+    let recorder: Rc<Recorder> = Rc::new(Recorder::default());
+    let shown: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let counter: Rc<Cell<usize>> = Rc::clone(&shown);
+    let show: Rc<dyn Fn(&mut App)> = Rc::new(move |_: &mut App| counter.set(counter.get() + 1));
+    let surface = RecordingSurface(Rc::clone(&recorder));
+    cx.update(|cx| install_surface(model.clone(), show, Box::new(surface), cx));
+    cx.run_until_parked();
+    (model, recorder, shown)
+}
+
+#[gpui_kit::test]
+fn the_item_draws_a_view_only_when_it_changes(cx: &mut TestAppContext) {
+    let (model, recorder, _) = installed(cx, ActionScript::Accept);
+    cx.update(|cx| {
+        assert!(is_installed(cx));
+        assert_eq!(model.read(cx).standing_topics(), &[Topic::Automation]);
+    });
+    let drawn: usize = recorder.views.borrow().len();
+    assert!(drawn >= 1, "the install draws the first view");
+    cx.update(update_item);
+    cx.update(update_item);
+    assert_eq!(
+        recorder.views.borrow().len(),
+        drawn,
+        "an equal view is not drawn again"
+    );
+}
+
+#[gpui_kit::test]
+fn a_view_that_waits_for_the_menu_is_drawn_when_the_menu_closes(cx: &mut TestAppContext) {
+    let (model, recorder, _) = installed(cx, ActionScript::Unavailable);
+    recorder.menu_open.set(true);
+    // A pause request changes the view while the menu is open.
+    let action = pause_action(MenuCommand::PauseHour).expect("a pause command");
+    cx.update(|cx| model.update(cx, |model, cx| model.run_action(action, cx)));
+    cx.run_until_parked();
+    let while_open: usize = recorder.views.borrow().len();
+    cx.update(update_item);
+    cx.update(update_item);
+    assert_eq!(
+        recorder.views.borrow().len(),
+        while_open,
+        "the same waiting view is not drawn at each poll"
+    );
+    recorder.menu_open.set(false);
+    cx.update(menu_closed);
+    let views = recorder.views.borrow();
+    assert_eq!(
+        views.len(),
+        while_open + 1,
+        "the close draws the waiting view"
+    );
+    let last: &StatusView = views.last().expect("a view");
+    assert!(
+        infos(last).contains(&"Pause request: Accepted".to_owned()),
+        "{:?}",
+        last.rows
+    );
+}
+
+#[gpui_kit::test]
+fn the_menu_commands_reach_the_window_and_the_model(cx: &mut TestAppContext) {
+    let (model, _recorder, shown) = installed(cx, ActionScript::Refuse);
+    cx.update(|cx| run_command(MenuCommand::OpenWindow, cx));
+    assert_eq!(shown.get(), 1, "Open Svalnir opens or focuses the window");
+    cx.update(|cx| run_command(MenuCommand::PauseOpen, cx));
+    cx.run_until_parked();
+    let view = view(&model, cx);
+    assert!(
+        infos(&view)
+            .iter()
+            .any(|title| title.starts_with("Pause request: ")),
+        "the refusal of the pause shows in the menu: {:?}",
+        view.rows
+    );
+}
+
+#[gpui_kit::test]
+fn a_removed_item_runs_no_command(cx: &mut TestAppContext) {
+    let (_model, _recorder, shown) = installed(cx, ActionScript::Accept);
+    cx.update(|cx| {
+        assert!(remove(cx));
+        assert!(!is_installed(cx));
+        run_command(MenuCommand::OpenWindow, cx);
+        update_item(cx);
+        menu_closed(cx);
+        assert!(!remove(cx));
+    });
+    assert_eq!(shown.get(), 0);
 }

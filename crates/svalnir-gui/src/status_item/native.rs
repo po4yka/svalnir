@@ -12,13 +12,13 @@
 //! rebuild under the pointer can move a row. The target is the delegate of
 //! the menu, and when the menu closes it asks for the latest view.
 
-use super::{MenuCommand, MenuRow, StatusView};
+use super::{MenuCommand, MenuRow, StatusView, Surface};
 use crate::viz::capacity_grid::INLINE_CELLS;
 use block2::RcBlock;
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
-    runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject},
+    runtime::{AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject},
     sel,
 };
 use objc2_app_kit::{
@@ -62,12 +62,11 @@ define_class!(
 
     impl MenuTarget {
         /// The action of each command item. The tag names the command.
-        // SAFETY: the selector takes one object argument, which can be nil
-        // or any object when a caller other than a menu item sends it, and
-        // returns nothing. The argument is optional, and only a menu item
-        // is read.
+        // SAFETY: the selector is `-(void)svalnirMenuCommand:(id)sender`.
+        // The argument is any object or nil (`Option<&AnyObject>`), and the
+        // method reads it only after a checked downcast to `NSMenuItem`.
         #[unsafe(method(svalnirMenuCommand:))]
-        fn menu_command(&self, sender: Option<&NSObject>) {
+        fn menu_command(&self, sender: Option<&AnyObject>) {
             let Some(item) = sender.and_then(|sender| sender.downcast_ref::<NSMenuItem>()) else {
                 return;
             };
@@ -155,28 +154,6 @@ impl StatusSurface {
         })
     }
 
-    /// Shows `view`: the grid image, the title, the label, and the menu.
-    /// While the menu is open, only the button changes, and the result is
-    /// `false`: apply the view again when the menu closes.
-    pub(super) fn apply(&self, view: &StatusView) -> bool {
-        if let Some(button) = self.item.button(self.mtm) {
-            let image: Option<Retained<NSImage>> = view.cells.map(grid_image);
-            button.setImage(image.as_deref());
-            button.setTitle(&NSString::from_str(&view.title));
-            let label: Retained<NSString> = NSString::from_str(&view.label);
-            button.setAccessibilityLabel(Some(&label));
-            button.setToolTip(Some(&label));
-        }
-        if self.target.ivars().open.get() {
-            return false;
-        }
-        self.menu.removeAllItems();
-        for row in &view.rows {
-            self.menu.addItem(&self.menu_item(row));
-        }
-        true
-    }
-
     fn menu_item(&self, row: &MenuRow) -> Retained<NSMenuItem> {
         match row {
             MenuRow::Separator => NSMenuItem::separatorItem(self.mtm),
@@ -213,8 +190,9 @@ impl StatusSurface {
                 };
                 item.setTag(command.tag());
                 item.setEnabled(*enabled);
-                // SAFETY: the surface owns the target for as long as the
-                // menu and its items exist.
+                // SAFETY: the target is a `MenuTarget`, which implements
+                // `svalnirMenuCommand:`, the action of this item. The
+                // property is weak, so a target that drops is nil.
                 unsafe { item.setTarget(Some(&self.target)) };
                 item
             }
@@ -222,8 +200,37 @@ impl StatusSurface {
     }
 }
 
+impl Surface for StatusSurface {
+    /// Shows `view`: the grid image, the title, the label, and the menu.
+    /// While the menu is open, only the button changes, and the result is
+    /// `false`: apply the view again when the menu closes.
+    fn apply(&self, view: &StatusView) -> bool {
+        if let Some(button) = self.item.button(self.mtm) {
+            let image: Option<Retained<NSImage>> = view.cells.map(grid_image);
+            button.setImage(image.as_deref());
+            button.setTitle(&NSString::from_str(&view.title));
+            let label: Retained<NSString> = NSString::from_str(&view.label);
+            button.setAccessibilityLabel(Some(&label));
+            button.setToolTip(Some(&label));
+        }
+        if self.target.ivars().open.get() {
+            return false;
+        }
+        self.menu.removeAllItems();
+        for row in &view.rows {
+            self.menu.addItem(&self.menu_item(row));
+        }
+        true
+    }
+}
+
 impl Drop for StatusSurface {
+    /// Takes the item off the menu bar and disconnects the menu from the
+    /// target, so that no callback reaches the target after it drops.
     fn drop(&mut self) {
+        self.menu.setDelegate(None);
+        self.menu.removeAllItems();
+        self.item.setMenu(None);
         NSStatusBar::systemStatusBar().removeStatusItem(&self.item);
     }
 }

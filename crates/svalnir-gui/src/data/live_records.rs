@@ -633,11 +633,11 @@ mod tests {
         let automation: AutomationSnapshot = automation(None);
         // The pause was not read: it is not "not paused".
         assert_eq!(automation.pause, None);
-        assert!(automation.guards.is_empty());
+        assert_eq!(automation.guards, Vec::new());
         assert!(!automation.journal_present);
         assert_eq!(automation.problems.len(), 1);
         let history: HistorySnapshot = history(None);
-        assert!(history.operations.is_empty());
+        assert_eq!(history.operations, Vec::new());
         assert_eq!(history.problems.len(), 1);
     }
 
@@ -647,10 +647,10 @@ mod tests {
         let automation: AutomationSnapshot = automation(Some(&directory));
         assert_eq!(automation.pause, Some(PauseRow::NotPaused));
         assert!(!automation.journal_present);
-        assert!(automation.problems.is_empty());
+        assert_eq!(automation.problems, Vec::<String>::new());
         assert_eq!(automation.guards.len(), PolicyId::ALL.len());
         let history: HistorySnapshot = history(Some(&directory));
-        assert!(history.problems.is_empty());
+        assert_eq!(history.problems, Vec::<String>::new());
         assert!(!directory.exists(), "a read makes no directory");
     }
 }

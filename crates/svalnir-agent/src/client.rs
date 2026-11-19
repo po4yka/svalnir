@@ -69,6 +69,79 @@ pub fn agent_presence(journal_path: &Path) -> AgentPresence {
     }
 }
 
+/// Why [`create_state_directory`] gives no state directory. The function
+/// made no record in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StateDirectoryError {
+    /// The directory cannot be made.
+    #[error("the state directory cannot be created: {0}")]
+    NotWritable(std::io::ErrorKind),
+    /// The path is a symbolic link or not a directory, has a different
+    /// owner, or permits access to the group or to other users.
+    #[error("the state directory is not a private directory of this user")]
+    NotPrivate,
+}
+
+/// Makes the state directory `directory` and its parents when they do not
+/// exist, for a client that must write a record in it.
+///
+/// The CLI and the GPUI client call this one function, so that both make
+/// the directory with the same mode and refuse the same directory. A new
+/// directory is readable only by its owner (mode `0700`), because the
+/// records can name private paths. A directory that exists must also be
+/// private ([`is_private_directory`]). The function makes no journal and
+/// takes no lock. The caller checks that `HOME` is the home directory of
+/// the account record before it calls this function.
+///
+/// # Errors
+///
+/// Returns [`StateDirectoryError::NotWritable`] when the directory cannot
+/// be made, and [`StateDirectoryError::NotPrivate`] when the path is not a
+/// private directory of this user.
+pub fn create_state_directory(directory: &Path) -> Result<(), StateDirectoryError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(directory)
+        .map_err(|error| StateDirectoryError::NotWritable(error.kind()))?;
+    // The builder sets the mode only of a directory that it makes. A
+    // directory that exists must also be private.
+    if is_private_directory(directory) {
+        Ok(())
+    } else {
+        Err(StateDirectoryError::NotPrivate)
+    }
+}
+
+/// Whether `path` is a directory, not a symbolic link, that the user of
+/// this process owns and that gives no access to the group or to other
+/// users.
+#[must_use]
+pub fn is_private_directory(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // The six low bits of the mode are the permissions of the group
+        // and of each other user. A private directory has none of them.
+        metadata.uid() == observe::current_uid().get() && metadata.mode().trailing_zeros() >= 6
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// The principal of a request of a client with the role `role`. The journal
 /// is same-user state: the principal is a record, not an authentication.
 #[must_use]
@@ -513,6 +586,72 @@ mod tests {
             },
             enqueued_at: WallTime::UNIX_EPOCH,
         }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_state_directory_is_made_private_with_its_parents() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let state: PathBuf = directory.path().join("parent").join("state");
+        assert_eq!(create_state_directory(&state), Ok(()));
+        assert_eq!(mode_of(&state), 0o700);
+        assert!(is_private_directory(&state));
+        // A second call finds the private directory and changes nothing.
+        assert_eq!(create_state_directory(&state), Ok(()));
+        assert_eq!(mode_of(&state), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_that_others_can_read_is_refused_and_not_changed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let state: PathBuf = directory.path().join("state");
+        std::fs::create_dir(&state).unwrap_or_else(|error| panic!("{error}"));
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o750))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            create_state_directory(&state),
+            Err(StateDirectoryError::NotPrivate)
+        );
+        assert_eq!(mode_of(&state), 0o750);
+        assert!(!is_private_directory(&state));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_through_a_symbolic_link_is_refused() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let target: PathBuf = directory.path().join("target");
+        assert_eq!(create_state_directory(&target), Ok(()));
+        let link: PathBuf = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            create_state_directory(&link),
+            Err(StateDirectoryError::NotPrivate)
+        );
+    }
+
+    #[test]
+    fn a_state_directory_below_a_file_cannot_be_made() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let file: PathBuf = directory.path().join("file");
+        std::fs::write(&file, b"").unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(
+            create_state_directory(&file.join("state")),
+            Err(StateDirectoryError::NotWritable(_))
+        ));
+        assert!(!is_private_directory(&file));
     }
 
     #[test]

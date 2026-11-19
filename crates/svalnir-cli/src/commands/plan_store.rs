@@ -218,7 +218,7 @@ fn plan_directory(environment: &Environment) -> Result<PathBuf, ErrorBody> {
         .map_err(|error| store_error(&format!("cannot be written: {}", error.kind())))?;
     // The directory of the documents is a private directory of the state
     // directory, not a link to a different place.
-    if !crate::environment::is_private_directory(&directory) {
+    if !svalnir_agent::client::is_private_directory(&directory) {
         return Err(store_error(
             "has a directory that is a link, has a different owner, or is not private",
         ));

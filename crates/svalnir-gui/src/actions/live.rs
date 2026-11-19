@@ -4,9 +4,11 @@
 //! Each action first checks that `HOME` is the home directory of the
 //! account record. A request of the queue also needs the agent that holds
 //! the coordinator lock; a change of the authority record is written with
-//! no agent too, as the CLI does. Then the action opens the existing
-//! journal for writes; it never makes the state directory or the journal,
-//! and it never takes the coordinator lock.
+//! no agent too, as the CLI does. A request of the queue opens the existing
+//! journal for writes and never makes the state directory or the journal.
+//! A pause, a resume, and a disable make them when they do not exist,
+//! through `client::create_state_directory`, as the CLI does. No action
+//! takes the coordinator lock.
 
 use super::{
     ADMISSION_GRACE, Action, ActionPort, ActionState, AuthorityPath, StopProposal, StopTarget,
@@ -19,7 +21,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 use svalnir_agent::{
-    client::{self, ActiveConfig, ActiveConfigError, AgentPresence, StopMode, WaitError},
+    client::{
+        self, ActiveConfig, ActiveConfigError, AgentPresence, StateDirectoryError, StopMode,
+        WaitError,
+    },
     journal::{
         JournalOptions, OperationJournal, OperationJournalError, QueuedRequest, RequestBody,
         RequestCompletion, RequestStatus,
@@ -131,13 +136,13 @@ impl LivePort {
     /// `client::write_authority`. Neither client takes a lock for it; the
     /// compare-and-set refuses a record that a different process changed
     /// after the read.
-    // TODO(npochaev): the CLI makes the state directory and the journal for
-    // a pause, a resume, and a disable when they do not exist. The window
-    // refuses these with `NoJournal`: the private state directory function
-    // is in `svalnir-cli` (`Environment::create_state_directory`). Move it
-    // to `svalnir_agent::client` and call it here.
+    ///
+    /// As the CLI does, a pause, a resume, and a disable make the state
+    /// directory (`client::create_state_directory`) and the journal when
+    /// they do not exist. An enable needs a revision in effect, which only a
+    /// journal records, so with no journal it is refused and makes nothing.
     fn authority_action(path: &Path, action: &Action) -> Result<(ActionState, bool), ActionState> {
-        let mut journal: OperationJournal = open_for_writes(path)?;
+        let mut journal: OperationJournal = open_for_authority(path, action)?;
         let stored: StoredAuthority = read_authority(&journal)?;
         let (clock, wall) = clocks()?;
         let control = ControlClock {
@@ -529,6 +534,37 @@ fn open_for_writes(path: &Path) -> Result<OperationJournal, ActionState> {
     }
 }
 
+/// Opens the journal at `path` for the authority change `action`. An enable
+/// with no journal is refused as `no_active_policy_revision`, as the CLI
+/// refuses it; a different change makes the journal ([`open_or_create`]).
+fn open_for_authority(path: &Path, action: &Action) -> Result<OperationJournal, ActionState> {
+    if matches!(action, Action::Enable { .. }) {
+        match open_for_writes(path) {
+            Err(ActionState::Unavailable(Unavailable::NoJournal)) => {
+                Err(ActionState::refused("no_active_policy_revision"))
+            }
+            other => other,
+        }
+    } else {
+        open_or_create(path)
+    }
+}
+
+/// Opens the journal at `path` for a write of the authority record. Makes
+/// the state directory, the parent of `path`, and the journal when they do
+/// not exist, through the function that the CLI also calls.
+fn open_or_create(path: &Path) -> Result<OperationJournal, ActionState> {
+    let directory: &Path = path
+        .parent()
+        .ok_or(ActionState::Unavailable(Unavailable::NoStateDirectory))?;
+    client::create_state_directory(directory).map_err(|error| match error {
+        StateDirectoryError::NotWritable(_) => ActionState::refused("state_directory_not_writable"),
+        StateDirectoryError::NotPrivate => ActionState::refused("state_directory_not_private"),
+    })?;
+    OperationJournal::open(path, &JournalOptions::default())
+        .map_err(|error| journal_refusal(&error))
+}
+
 fn read_authority(journal: &OperationJournal) -> Result<StoredAuthority, ActionState> {
     observe::read_authority(journal, observe::current_uid()).map_err(|error| match error {
         AuthorityReadError::DifferentUser => ActionState::refused("wrong_principal"),
@@ -718,9 +754,22 @@ mod tests {
         id::{ExecutorEpochId, OperationId},
     };
 
+    /// A temporary directory that is private, as a state directory must be.
+    /// The `tempfile` crate makes it with the mode of the umask.
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        directory
+    }
+
     /// A temporary state directory with a journal.
     fn state_directory() -> (tempfile::TempDir, PathBuf) {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let directory = private_tempdir();
         let path: PathBuf = journal_path(directory.path());
         OperationJournal::open(&path, &JournalOptions::default())
             .unwrap_or_else(|error| panic!("journal: {error}"));
@@ -872,16 +921,94 @@ mod tests {
     }
 
     #[test]
-    fn no_journal_is_unavailable_and_no_journal_is_made() {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    fn a_pause_with_no_state_directory_makes_it_and_the_journal_as_the_cli_does() {
+        let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        // The state directory of `SVALNIR_STATE_DIR` and its parent do not
+        // exist yet.
+        let directory: PathBuf = parent.path().join("missing").join("state");
+        let path: PathBuf = journal_path(&directory);
+        let port = LivePort::new(Some(directory.clone()));
+        let paused = port.submit(&Action::Pause { duration: None });
+        assert!(
+            accepted_detail(&paused).ends_with(AuthorityPath::NoAgent.sentence()),
+            "{paused:?}"
+        );
+        assert!(client::is_private_directory(&directory));
+        let stored = stored_authority(&path);
+        assert!(stored.state.pause.is_some(), "the pause reads back");
+        assert_eq!(stored.revision, 1);
+        // The window took no coordinator lock.
+        assert_eq!(client::agent_presence(&path), AgentPresence::Absent);
+    }
+
+    #[test]
+    fn a_resume_and_a_disable_with_no_journal_make_it_and_write_nothing_else() {
+        let directory = private_tempdir();
+        let path: PathBuf = journal_path(directory.path());
         let port = LivePort::new(Some(directory.path().to_owned()));
+        let resumed = port.submit(&Action::Resume);
+        assert!(
+            accepted_detail(&resumed).ends_with(super::super::NOTHING_WRITTEN),
+            "{resumed:?}"
+        );
+        assert!(path.exists());
+        let disabled = port.submit(&Action::Disable {
+            policy: PolicyId::DiskGuard,
+        });
+        assert!(
+            accepted_detail(&disabled).ends_with(super::super::NOTHING_WRITTEN),
+            "{disabled:?}"
+        );
+        assert_eq!(stored_authority(&path).revision, 0, "no record was written");
+    }
+
+    #[test]
+    fn no_journal_still_refuses_an_enable_and_each_queued_request_and_makes_nothing() {
+        let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let directory: PathBuf = parent.path().join("state");
+        let port = LivePort::new(Some(directory.clone()));
         assert_eq!(
-            port.submit(&Action::Resume),
-            ActionState::Unavailable(Unavailable::NoJournal)
+            port.submit(&Action::Enable {
+                policy: PolicyId::DiskGuard,
+                revision: "rev-1".to_owned(),
+                classes: Vec::new(),
+            }),
+            ActionState::refused("no_active_policy_revision")
         );
         assert_eq!(
+            port.submit(&Action::Cancel {
+                operation: "op-1".to_owned(),
+            }),
+            ActionState::Unavailable(Unavailable::NoAgent)
+        );
+        assert_eq!(
+            port.submit(&Action::Acknowledge {
+                operation: "op-1".to_owned(),
+            }),
+            ActionState::Unavailable(Unavailable::NoAgent)
+        );
+        assert_eq!(
+            port.submit(&Action::Rearm {
+                policy: PolicyId::MemoryGuard,
+                incident: "incident-1".to_owned(),
+                generation: 1,
+            }),
+            ActionState::Unavailable(Unavailable::NoAgent)
+        );
+        assert!(!directory.exists(), "no state directory was made");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_that_is_not_private_is_refused_and_no_journal_is_made() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let port = LivePort::new(Some(directory.path().to_owned()));
+        assert_eq!(
             port.submit(&Action::Pause { duration: None }),
-            ActionState::Unavailable(Unavailable::NoJournal)
+            ActionState::refused("state_directory_not_private")
         );
         assert!(!journal_path(directory.path()).exists());
     }

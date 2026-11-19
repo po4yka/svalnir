@@ -541,6 +541,10 @@ pub fn reason_of(code: &str) -> &'static str {
             "The agent answered with a result of a different kind, so its effect is not known here. See History"
         }
         "authority_record_not_readable" => "The authority record cannot be read",
+        "state_directory_not_writable" => "The state directory cannot be created",
+        "state_directory_not_private" => {
+            "The state directory is a symbolic link, has a different owner, or permits access to the group or to other users. Make it a directory of this user with mode 0700"
+        }
         _ => "The agent refused the request",
     }
 }

@@ -8,6 +8,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use svalnir_agent::client::{self, StateDirectoryError};
+
 use crate::interrupt::Interrupt;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 use crate::seams::Seams;
@@ -134,33 +136,26 @@ impl Environment {
             .map(|home| svalnir_agent::runtime::launch_agent::agent_log_path(home))
     }
 
-    /// Creates the state directory, for a command that must write.
+    /// Creates the state directory, for a command that must write, through
+    /// the function that the GPUI client also calls
+    /// ([`svalnir_agent::client::create_state_directory`]).
     ///
     /// A new directory is readable only by its owner, because the records can
     /// name private paths.
     pub(crate) fn create_state_directory(&self) -> Result<PathBuf, ErrorBody> {
         let directory: PathBuf = self.state_directory()?;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        builder.create(&directory).map_err(|error| ErrorBody {
-            code: "state_directory_not_writable".into(),
-            family: ErrorFamily::Recording,
-            stage: ErrorStage::Storage,
-            message: format!("the state directory cannot be created: {}", error.kind()),
-            fields: &[],
-            operation_id: None,
-            plan_id: None,
-            next_action: NextAction::None,
-        })?;
-        // The builder sets the mode only of a directory that it makes. A
-        // directory that exists must also be private.
-        if !is_private_directory(&directory) {
-            return Err(ErrorBody {
+        client::create_state_directory(&directory).map_err(|error| match error {
+            StateDirectoryError::NotWritable(kind) => ErrorBody {
+                code: "state_directory_not_writable".into(),
+                family: ErrorFamily::Recording,
+                stage: ErrorStage::Storage,
+                message: format!("the state directory cannot be created: {kind}"),
+                fields: &[],
+                operation_id: None,
+                plan_id: None,
+                next_action: NextAction::None,
+            },
+            StateDirectoryError::NotPrivate => ErrorBody {
                 code: "state_directory_not_private".into(),
                 family: ErrorFamily::Native,
                 stage: ErrorStage::Storage,
@@ -169,8 +164,8 @@ impl Environment {
                 operation_id: None,
                 plan_id: None,
                 next_action: NextAction::None,
-            });
-        }
+            },
+        })?;
         Ok(directory)
     }
 
@@ -202,29 +197,6 @@ impl Environment {
                 next_action: NextAction::CorrectRequest,
             }),
         }
-    }
-}
-
-/// Whether `path` is a directory, and not a symbolic link, that this user
-/// owns and that no other user can read, write, or search.
-pub(crate) fn is_private_directory(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !metadata.is_dir() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        // The six low bits of the mode are the permissions of the group
-        // and of each other user. A private directory has none of them.
-        metadata.uid() == crate::commands::session::current_uid().get()
-            && metadata.mode().trailing_zeros() >= 6
-    }
-    #[cfg(not(unix))]
-    {
-        true
     }
 }
 

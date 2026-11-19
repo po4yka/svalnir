@@ -65,9 +65,8 @@ const LOCK_RETRIES: u32 = 3;
 /// The time between two tries.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(60);
 
-/// The number of queue reads between two reads of the coordinator lock,
-/// and the time between two reads of the journal while a different process
-/// executes the request.
+// The number of queue reads between two reads of the coordinator lock, and
+// the time between two reads of the journal, which each client shares.
 use svalnir_agent::client::{PRESENCE_CHECK_INTERVAL, QUEUE_POLL};
 
 /// How long a `--no-wait` request waits for its admission by a different

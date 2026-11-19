@@ -78,6 +78,9 @@ pub const fn class_phrase(class: &ActionClass) -> &'static str {
 /// The consequence sentence of an enable with `classes`.
 #[must_use]
 pub fn enable_consequence(classes: &[ActionClass]) -> String {
+    if classes.is_empty() {
+        return "An eligible incident then proceeds with no further question.".to_owned();
+    }
     let phrases: Vec<&str> = classes.iter().map(class_phrase).collect();
     format!(
         "An eligible incident then proceeds with no further question. The guard can {}.",
@@ -152,6 +155,7 @@ pub fn open_enable(
         dialog
             .title(format!("Enable the {name}"))
             .overlay_closable(false)
+            .close_button(false)
             .child(
                 v_flex()
                     .gap(tokens::SPACE_2)
@@ -202,6 +206,7 @@ pub fn open_rearm(
         dialog
             .title(format!("Rearm incident {incident}"))
             .overlay_closable(false)
+            .close_button(false)
             .child(
                 v_flex()
                     .gap(tokens::SPACE_2)
@@ -302,6 +307,7 @@ pub fn open_stop(
         let dialog = dialog
             .title(format!("Stop {name}"))
             .overlay_closable(false)
+            .close_button(false)
             .on_close(move |_, _, cx| {
                 close_model.update(cx, AppModel::close_stop);
             });

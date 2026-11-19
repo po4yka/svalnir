@@ -49,7 +49,8 @@ use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, NextAction, 
 /// The wait for the lock file of a stop request when `--timeout` is absent.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
-/// The grace period when `--grace` is not given, and the longest one.
+// The grace period when `--grace` is not given, the longest one, and the
+// stop modes, which each client shares.
 use svalnir_agent::client::{
     DEFAULT_STOP_GRACE as DEFAULT_GRACE, MAX_STOP_GRACE as MAX_GRACE, StopMode,
 };

@@ -73,8 +73,13 @@ impl Notifier {
                 });
             }
         }
-        if let Some(state) = agent {
-            let reporting: bool = matches!(state, AgentState::Reporting { .. });
+        // A status that cannot be read is not a value.
+        let reporting: Option<bool> = agent.and_then(|state| match state {
+            AgentState::Reporting { .. } => Some(true),
+            AgentState::Silent { .. } | AgentState::NoJournal | AgentState::NoRecord => Some(false),
+            AgentState::Unknown(_) => None,
+        });
+        if let Some(reporting) = reporting {
             let before: Option<bool> = self.reporting.replace(reporting);
             if before == Some(true) && !reporting {
                 notes.push(Note {
@@ -84,6 +89,13 @@ impl Notifier {
                 });
             }
         }
+        // Only the operations that a control still shows stay in the set,
+        // so the set is bounded by the controls.
+        self.settled.retain(|operation| {
+            actions.entries().any(|(_, state)| {
+                matches!(state, ActionState::Settled { operation: shown, .. } if shown == operation)
+            })
+        });
         for (slot, state) in actions.entries() {
             match state {
                 ActionState::Settled { operation, .. } => {
@@ -253,6 +265,38 @@ mod tests {
         let notes = notifier.observe(None, Some(&silent()), &book);
         assert_eq!(notes.first().map(|note| note.tag.as_str()), Some(AGENT_TAG));
         assert_eq!(notifier.observe(None, Some(&silent()), &book), Vec::new());
+    }
+
+    #[test]
+    fn a_status_that_cannot_be_read_is_not_a_stop_of_the_agent() {
+        let mut notifier = Notifier::default();
+        let book = ActionBook::default();
+        assert_eq!(
+            notifier.observe(None, Some(&reporting()), &book),
+            Vec::new()
+        );
+        let unknown = AgentState::Unknown("the journal cannot be read".to_owned());
+        assert_eq!(notifier.observe(None, Some(&unknown), &book), Vec::new());
+        // The last value stays reporting, so a later silence is a transition.
+        assert_eq!(notifier.observe(None, Some(&silent()), &book).len(), 1);
+    }
+
+    #[test]
+    fn the_notified_operations_are_bounded_by_the_controls() {
+        let mut notifier = Notifier::default();
+        let mut book = ActionBook::default();
+        let slot = Slot::Stop("app-1".to_owned());
+        for operation in ["op-1", "op-2"] {
+            book.set(
+                slot.clone(),
+                ActionState::Settled {
+                    operation: operation.to_owned(),
+                    phase: OperationPhase::Completed,
+                },
+            );
+            assert_eq!(notifier.observe(None, None, &book).len(), 1);
+        }
+        assert_eq!(notifier.settled.len(), 1);
     }
 
     #[test]

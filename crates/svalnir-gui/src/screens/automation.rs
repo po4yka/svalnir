@@ -67,7 +67,7 @@ pub fn pause_summary(
                     format!("Automation was paused {started}. The pause has no end time.")
                 }
                 (PauseKind::Retained, _) => format!(
-                    "Automation was paused {started}, before the last start of the Mac. Its end cannot be established, so it stays until you resume."
+                    "Automation was paused {started}, in a different boot or clock of the agent. Its end cannot be established, so it stays until you resume."
                 ),
                 (PauseKind::Timed, Some(remaining)) => {
                     // The monotonic time that remained at the reading, less
@@ -548,20 +548,32 @@ fn disk_cooldowns(
     mono: &SharedString,
     tokens: &Tokens,
 ) -> Vec<AnyElement> {
-    let Shown::Data { value, .. } = controller else {
-        return Vec::new();
+    let note = |text: String| vec![caption("automation-disk-cooldown-note", text, tokens)];
+    let rows = match controller {
+        Shown::Loading => return vec![skeleton_rows(1)],
+        Shown::Failed(reason) => {
+            return note(format!("The pass cooldowns are not shown: {reason}"));
+        }
+        Shown::Data { value, .. } => match &value.rows {
+            Measured::Unavailable(reason) => {
+                return note(format!("The pass cooldowns are not shown: {reason}"));
+            }
+            Measured::Value(rows) => rows,
+        },
     };
-    let Measured::Value(rows) = &value.rows else {
-        return Vec::new();
-    };
-    cooldown_facts(
+    let facts: Vec<AnyElement> = cooldown_facts(
         "automation-disk",
         &rows.cooldowns,
         |subject| matches!(subject, CooldownSubject::DiskPass { .. }),
         stale,
         mono,
         tokens,
-    )
+    );
+    if facts.is_empty() {
+        note("The controller record has no pass cooldown.".to_owned())
+    } else {
+        facts
+    }
 }
 
 #[expect(

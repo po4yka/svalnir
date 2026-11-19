@@ -472,7 +472,7 @@ fn relaunch_card(
             }
             lines.push(caption(
                 "applications-relaunch-note",
-                "A cooldown inhibits an automatic stop only. \"Active (earlier boot)\" is a cooldown that the agent recorded before the last start of the Mac; the agent treats it as active.",
+                "A cooldown inhibits an automatic stop only. \"Active (other boot)\" is a cooldown of a different boot or clock of the agent, so its end cannot be established; the agent treats it as active.",
                 tokens,
             ));
             lines

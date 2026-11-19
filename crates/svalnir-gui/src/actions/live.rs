@@ -7,7 +7,8 @@
 //! the journal, and it never takes the coordinator lock.
 
 use super::{
-    Action, ActionPort, ActionState, StopProposal, StopTarget, UNEXPECTED_COMPLETION, Unavailable,
+    ADMISSION_GRACE, Action, ActionPort, ActionState, StopProposal, StopTarget,
+    UNEXPECTED_COMPLETION, Unavailable,
 };
 use crate::data::{live_records::collect_processes, model::OperationPhase};
 use std::{
@@ -58,11 +59,6 @@ const DECISION_WAIT: Duration = Duration::from_secs(30);
 /// The wait for the agent to admit a stop plan before the window follows
 /// the request at each poll.
 const ADMISSION_WAIT: Duration = Duration::from_secs(10);
-
-/// The time after the expiry of a stop plan for which the window follows
-/// its request: the agent then refuses the plan, and its answer can need a
-/// step of the agent to arrive.
-const ADMISSION_GRACE: Duration = Duration::from_secs(30);
 
 /// The journal of the state directory.
 #[derive(Debug)]
@@ -293,7 +289,9 @@ impl LivePort {
             Ok(completion) => Ok(admission_of(completion, SystemTime::now())),
             // The agent can admit the plan later, until it expires, so the
             // window follows the request at each poll until then.
-            Err(WaitError::Pending | WaitError::CoordinatorStopped) => {
+            // A read of the queue that failed after the write does not show
+            // that nothing changed: the request is in the queue.
+            Err(WaitError::Pending | WaitError::CoordinatorStopped | WaitError::Journal(_)) => {
                 Ok(ActionState::AwaitingAdmission {
                     request: request_id.to_string(),
                     since,
@@ -302,7 +300,6 @@ impl LivePort {
                         .unwrap_or_else(|| expiry_wall(plan)),
                 })
             }
-            Err(WaitError::Journal(error)) => Err(journal_refusal(&error)),
         }
     }
 

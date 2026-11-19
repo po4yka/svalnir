@@ -108,7 +108,7 @@ impl Notifier {
                         });
                     }
                 }
-                ActionState::Queued => {
+                ActionState::Queued | ActionState::NotAdmitted => {
                     if self.unanswered.insert(slot.clone()) {
                         notes.push(Note {
                             tag: format!("svalnir-request-{}", slot_key(slot)),

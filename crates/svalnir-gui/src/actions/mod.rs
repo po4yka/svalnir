@@ -261,6 +261,9 @@ pub enum ActionState {
     /// The wait ended with no answer. The request stays in the queue, and
     /// the agent can decide it later.
     Queued,
+    /// The window read no admission of a stop before its plan expired and
+    /// the grace after it ended. The agent refuses an expired plan.
+    NotAdmitted,
     /// The request was refused. Nothing changed.
     Refused {
         /// The error code.
@@ -311,7 +314,7 @@ impl ActionState {
                 _ => ("Unknown outcome", Tone::Warning, IconName::Info),
             },
             Self::ExitNotConfirmed { .. } => ("Exit not confirmed", Tone::Warning, IconName::Info),
-            Self::Queued => ("Not answered", Tone::Warning, IconName::Info),
+            Self::Queued | Self::NotAdmitted => ("Not answered", Tone::Warning, IconName::Info),
             Self::Refused { .. } => ("Refused", Tone::Negative, IconName::CircleX),
             Self::Unavailable(_) => ("Unavailable", Tone::Neutral, IconName::Info),
         }
@@ -326,7 +329,7 @@ impl ActionState {
             Self::AwaitingAdmission { since, .. } => {
                 let seconds: u64 = now.duration_since(*since).map_or(0, |age| age.as_secs());
                 format!(
-                    "The plan is recorded and the request is in the queue. The agent did not admit it yet: {seconds} s. The window follows the request until the plan expires."
+                    "The plan is recorded and the request is in the queue. The agent did not admit it yet: {seconds} s. The window follows the request until 30 s after the plan expires."
                 )
             }
             Self::WaitingForExit { operation, since } => {
@@ -344,6 +347,7 @@ impl ActionState {
             },
             Self::ExitNotConfirmed { operation } => format!("The window did not read the final record of operation {operation} in 5 min. The operation can still end; History shows its state."),
             Self::Queued => "The agent did not answer before the end of the wait. The request stays in the queue, and the agent can decide it later. See History.".to_owned(),
+            Self::NotAdmitted => "The window read no admission before the plan expired. The agent refuses an expired plan; History shows an operation only if the agent admitted it. Prepare a new plan to stop the group.".to_owned(),
             Self::Refused { code, reason } if code == UNEXPECTED_COMPLETION => {
                 format!("{reason} ({code}).")
             }
@@ -425,6 +429,11 @@ pub fn reason_of(code: &str) -> &'static str {
         _ => "The agent refused the request",
     }
 }
+
+/// The time after the expiry of a stop plan for which the window follows
+/// its request: the agent then refuses the plan, and its answer can need a
+/// step of the agent to arrive.
+pub const ADMISSION_GRACE: Duration = Duration::from_secs(30);
 
 /// The path from the client to the agent. Each method can block; the
 /// model calls them only from a background thread.
@@ -518,7 +527,7 @@ impl ActionBook {
                     changed = true;
                 }
                 ActionState::AwaitingAdmission { until, .. } if now > *until => {
-                    *state = ActionState::Queued;
+                    *state = ActionState::NotAdmitted;
                     changed = true;
                 }
                 _ => {}
@@ -787,7 +796,8 @@ mod tests {
         // and the control takes a new request.
         book.set(slot.clone(), waiting);
         assert!(book.end_long_waits(until + Duration::from_secs(1), Duration::from_secs(300)));
-        assert_eq!(book.state(&slot), Some(&ActionState::Queued));
+        assert_eq!(book.state(&slot), Some(&ActionState::NotAdmitted));
+        assert_eq!(ActionState::NotAdmitted.pill().0, "Not answered");
         assert!(!book.is_busy(&slot));
     }
 

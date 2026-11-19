@@ -135,7 +135,7 @@ pub fn cooldown_text(state: CooldownState) -> String {
     match state {
         CooldownState::Active { remaining } => format!("Active, {} left", span_left(remaining)),
         CooldownState::Elapsed => "Ended".to_owned(),
-        CooldownState::EarlierBoot => "Active (earlier boot)".to_owned(),
+        CooldownState::EarlierBoot => "Active (other boot)".to_owned(),
     }
 }
 
@@ -241,7 +241,7 @@ pub fn status_age_text(age: StatusAge) -> Option<String> {
                 .to_owned(),
         ),
         StatusAge::Unknown => Some(
-            "The journal has no usable status record of the agent, so the age of these rows is not known."
+            "The journal has no usable status record of the agent, or its time is later than the clock of this window, so the age of these rows is not known."
                 .to_owned(),
         ),
     }
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(cooldown_text(CooldownState::Elapsed), "Ended");
         assert_eq!(
             cooldown_text(CooldownState::EarlierBoot),
-            "Active (earlier boot)"
+            "Active (other boot)"
         );
     }
 

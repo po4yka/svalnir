@@ -550,21 +550,34 @@ pub(super) fn automation(
         problems: Vec::new(),
     };
     let uid = observe::current_uid();
-    let clock: ClientClock = match clock {
-        Ok(clock) => clock,
+    // The guards need the wall clock only; the pause needs the clocks of
+    // the agent.
+    let clock: Option<ClientClock> = match clock {
+        Ok(clock) => Some(clock),
         Err(reason) => {
             snapshot.problems.push(format!(
-                "The clocks of this window have no usable value ({reason}), so the guards and the pause are not shown."
+                "The clocks of this window have no usable value ({reason}), so the pause is not shown."
             ));
+            None
+        }
+    };
+    let now: WallTime = match (&clock, WallTime::try_from(captured_at)) {
+        (Some(clock), _) => clock.wall,
+        (None, Ok(now)) => now,
+        (None, Err(_)) => {
+            snapshot.problems.push(
+                "The system clock has no usable value, so the guards are not shown.".to_owned(),
+            );
             return snapshot;
         }
     };
-    let now: WallTime = clock.wall;
     let journal = match open_journal(state_directory) {
         Ok(Some(journal)) => journal,
         Ok(None) => {
             snapshot.guards = guard_details(&AuthorityState::new(uid), now, &[]);
-            snapshot.pause = Some(PauseRow::NotPaused);
+            if clock.is_some() {
+                snapshot.pause = Some(PauseRow::NotPaused);
+            }
             return snapshot;
         }
         Err(problem) => {
@@ -583,13 +596,15 @@ pub(super) fn automation(
                 profile: active.scope.profile.clone(),
             });
             snapshot.guards = guard_details(state, now, &open_incidents(&journal));
-            let status: RecordReading<StatusReading> = observe::read_status(&journal, now);
-            let reading: PauseReading = observe::pause_reading(state, status.recorded(), &clock);
-            snapshot.pause = Some(pause_row(
-                &reading,
-                state.pause.as_ref().map(|pause| pause.started_wall),
-            ));
-            snapshot.measurement = fresh_measurement(&reading);
+            if let Some(clock) = &clock {
+                let status: RecordReading<StatusReading> = observe::read_status(&journal, now);
+                let reading: PauseReading = observe::pause_reading(state, status.recorded(), clock);
+                snapshot.pause = Some(pause_row(
+                    &reading,
+                    state.pause.as_ref().map(|pause| pause.started_wall),
+                ));
+                snapshot.measurement = fresh_measurement(&reading);
+            }
         }
         Err(error) => snapshot
             .problems
@@ -615,6 +630,10 @@ fn trigger_row(trigger: TriggerState) -> TriggerRow {
         TriggerState::Ready => TriggerRow::Ready,
         TriggerState::Acting => TriggerRow::Acting,
         TriggerState::Recovering => TriggerRow::Recovering,
+        TriggerState::Held => TriggerRow::Held,
+        TriggerState::Cooldown => TriggerRow::Cooldown,
+        TriggerState::Exhausted => TriggerRow::Exhausted,
+        TriggerState::Blocked => TriggerRow::Blocked,
         _ => TriggerRow::Other,
     }
 }
@@ -1611,11 +1630,22 @@ eligible_groups = ["background-user-applications", "managed-jobs"]
             snapshot.rows
         );
         assert!(!journal_path(empty.path()).exists());
-        // A clock with no value shows nothing, not a pause of zero.
+        // A clock with no value shows no pause, not "not paused", and the
+        // guards stay.
         let unread: AutomationSnapshot =
             automation(Some(directory.path()), Err("no clock".to_owned()));
         assert_eq!(unread.pause, None);
         assert_eq!(unread.problems.len(), 1);
+        assert_eq!(unread.guards.len(), PolicyId::ALL.len());
+    }
+
+    #[test]
+    fn each_trigger_state_of_this_build_has_its_own_row() {
+        assert_eq!(trigger_row(TriggerState::Held), TriggerRow::Held);
+        assert_eq!(trigger_row(TriggerState::Cooldown), TriggerRow::Cooldown);
+        assert_eq!(trigger_row(TriggerState::Exhausted), TriggerRow::Exhausted);
+        assert_eq!(trigger_row(TriggerState::Blocked), TriggerRow::Blocked);
+        assert_eq!(TriggerRow::Blocked.label(), "Blocked");
     }
 
     #[test]

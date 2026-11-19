@@ -447,7 +447,8 @@ pub enum StatusAge {
     /// The status says that the agent stopped. The controller rows are the
     /// state that its next start restores.
     Stopped,
-    /// The journal has no usable status record.
+    /// The journal has no usable status record, or its time is later than
+    /// the clock of this window.
     Unknown,
 }
 
@@ -467,6 +468,14 @@ pub enum TriggerRow {
     Acting,
     /// The footprint is below the recovery limit, and evidence accumulates.
     Recovering,
+    /// The episode is latched, and its predicate is not true now.
+    Held,
+    /// The trigger qualified, and a cooldown inhibits further work.
+    Cooldown,
+    /// The trigger qualified, and a ceiling admits no further work.
+    Exhausted,
+    /// Required evidence is not usable. This state is not `Normal`.
+    Blocked,
     /// A state that this build does not know.
     Other,
 }
@@ -482,6 +491,10 @@ impl TriggerRow {
             Self::Ready => "Ready",
             Self::Acting => "Acting",
             Self::Recovering => "Recovering",
+            Self::Held => "Held",
+            Self::Cooldown => "Cooldown",
+            Self::Exhausted => "Exhausted",
+            Self::Blocked => "Blocked",
             Self::Other => "Not known",
         }
     }
@@ -535,7 +548,8 @@ pub enum CooldownState {
     },
     /// The cooldown ended.
     Elapsed,
-    /// The cooldown is of an earlier boot. The agent treats it as active.
+    /// The cooldown is of a different boot or clock domain, so its end
+    /// cannot be established. The agent treats it as active.
     EarlierBoot,
 }
 

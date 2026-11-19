@@ -87,7 +87,7 @@ impl ActionPort for FixturePort {
                 Action::Stop { proposal, .. } => ActionState::AwaitingAdmission {
                     request: "gui-request-fixture".to_owned(),
                     since: SystemTime::now(),
-                    until: proposal.expires_at,
+                    until: proposal.expires_at + super::ADMISSION_GRACE,
                 },
                 _ => ActionState::Pending,
             },

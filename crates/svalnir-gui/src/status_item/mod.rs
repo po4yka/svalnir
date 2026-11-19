@@ -16,18 +16,20 @@ use crate::{
     actions::{Action, Slot},
     data::{
         model::{AgentSnapshot, AgentState, HostSnapshot, Loadable, Measured, PressureLevel},
-        records::PauseRow,
+        records::{PauseRow, ThresholdQuantity},
         store::{AppModel, Topic},
     },
     screens::automation::{PAUSE_HOUR, pause_summary},
+    theme::tokens::Tokens,
     ui::data_state::used_capacity,
     viz::{
-        alloc::used_cells,
+        alloc::{used_cells, zone_start},
         capacity_grid::{INLINE_CELLS, capacity_label},
     },
 };
 use gpui_kit::{App, Entity, Global, Subscription};
 use std::{rc::Rc, time::SystemTime};
+use svalnir_core::policy::PolicyId;
 
 /// A command of the menu of the item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,13 +98,170 @@ pub enum MenuRow {
     Separator,
 }
 
+/// A tone of the item: a color token of `DESIGN.md` §2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemTone {
+    /// `brand`: used space outside a zone.
+    Brand,
+    /// `positive`: the Normal memory pressure.
+    Positive,
+    /// `warning`: the warning zone of the disk guard, and the Warning pressure.
+    Warning,
+    /// `negative`: the critical zone of the disk guard, and the Critical
+    /// pressure.
+    Negative,
+}
+
+/// How one cell of the inline grid is painted (`DESIGN.md` §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellPaint {
+    /// A used cell in the tone of its zone, or in `brand`.
+    Filled(ItemTone),
+    /// A free cell in a zone: a tint of the zone tone.
+    Tint(ItemTone),
+    /// A free cell outside the zones.
+    Empty,
+}
+
+/// The appearance that the menu bar draws the item in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuBarLook {
+    /// Whether the menu bar has the dark appearance.
+    pub dark: bool,
+    /// Whether Increase Contrast is on.
+    pub increase_contrast: bool,
+}
+
+/// The alpha of a tint and of an empty cell, and the same with Increase
+/// Contrast. A tint is 25% as in the window grid (`viz::cells`).
+const TINT_ALPHA: [f64; 2] = [0.25, 0.5];
+/// An empty cell is the color of the menu bar text at this alpha, so it is
+/// visible on the light and the dark menu bar.
+const EMPTY_ALPHA: [f64; 2] = [0.3, 0.55];
+
+/// The color of `tone` in the theme of `dark`, as red, green, blue.
+#[must_use]
+pub fn tone_rgb(tone: ItemTone, dark: bool) -> [f64; 3] {
+    let tokens: &Tokens = Tokens::for_dark(dark);
+    let color = match tone {
+        ItemTone::Brand => tokens.brand,
+        ItemTone::Positive => tokens.positive,
+        ItemTone::Warning => tokens.warning,
+        ItemTone::Negative => tokens.negative,
+    };
+    [f64::from(color.r), f64::from(color.g), f64::from(color.b)]
+}
+
+/// The color of `paint` on the menu bar `look`, as red, green, blue, alpha.
+#[must_use]
+pub fn paint_rgba(paint: CellPaint, look: MenuBarLook) -> [f64; 4] {
+    let contrast: usize = usize::from(look.increase_contrast);
+    match paint {
+        CellPaint::Filled(tone) => {
+            let [r, g, b] = tone_rgb(tone, look.dark);
+            [r, g, b, 1.0]
+        }
+        CellPaint::Tint(tone) => {
+            let [r, g, b] = tone_rgb(tone, look.dark);
+            [r, g, b, TINT_ALPHA[contrast]]
+        }
+        CellPaint::Empty => {
+            let text: f64 = if look.dark { 1.0 } else { 0.0 };
+            [text, text, text, EMPTY_ALPHA[contrast]]
+        }
+    }
+}
+
+/// The paint of the 20 cells for `used` of `total`, with the zones that
+/// start at the cells `warning` and `critical` (`DESIGN.md` §5: the zones of
+/// the disk policy are tinted cells at the end).
+#[must_use]
+pub fn grid_paints(
+    used: u64,
+    total: u64,
+    warning: Option<usize>,
+    critical: Option<usize>,
+) -> [CellPaint; INLINE_CELLS] {
+    let filled: usize = used_cells(used, total, INLINE_CELLS);
+    let mut paints: [CellPaint; INLINE_CELLS] = [CellPaint::Empty; INLINE_CELLS];
+    for (index, paint) in paints.iter_mut().enumerate() {
+        let zone: Option<ItemTone> = if critical.is_some_and(|start| index >= start) {
+            Some(ItemTone::Negative)
+        } else if warning.is_some_and(|start| index >= start) {
+            Some(ItemTone::Warning)
+        } else {
+            None
+        };
+        *paint = match (index < filled, zone) {
+            (true, zone) => CellPaint::Filled(zone.unwrap_or(ItemTone::Brand)),
+            (false, Some(zone)) => CellPaint::Tint(zone),
+            (false, None) => CellPaint::Empty,
+        };
+    }
+    paints
+}
+
+/// The first cell of the zone where less than `below` bytes of `total` are
+/// free; `None` when the zone is empty or the total is not known.
+#[must_use]
+pub fn free_zone_start(below: u64, total: u64) -> Option<usize> {
+    if total == 0 || below == 0 {
+        return None;
+    }
+    let below: u64 = below.min(total);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a share of the volume for a grid of 20 cells"
+    )]
+    let fraction: f32 = 1.0 - (below as f32 / total as f32);
+    Some(zone_start(fraction, INLINE_CELLS))
+}
+
+/// The bytes of the disk guard threshold `field` in the revision in effect,
+/// from the automation reading; `None` when it was not read.
+fn disk_threshold(model: &AppModel, field: &str) -> Option<u64> {
+    let snapshot = match &model.automation {
+        Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => snapshot,
+        Loadable::Loading | Loadable::Unavailable(_) => return None,
+    };
+    let key: String = format!("disk_guard.{field}");
+    snapshot
+        .guards
+        .iter()
+        .find(|guard| guard.policy == PolicyId::DiskGuard)?
+        .thresholds
+        .iter()
+        .find(|row| row.key == key)
+        .and_then(|row| match row.value {
+            ThresholdQuantity::Bytes(bytes) => Some(bytes),
+            ThresholdQuantity::Nanoseconds(_)
+            | ThresholdQuantity::Count(_)
+            | ThresholdQuantity::NoUnit(_) => None,
+        })
+}
+
+/// The tone of a measured pressure; `None` for a value that is not known or
+/// is stale, which has no tone.
+#[must_use]
+pub const fn pressure_tone(level: PressureLevel) -> ItemTone {
+    match level {
+        PressureLevel::Normal => ItemTone::Positive,
+        PressureLevel::Warning => ItemTone::Warning,
+        PressureLevel::Critical => ItemTone::Negative,
+    }
+}
+
 /// What the item shows. Two equal views draw the same item, so the item
 /// changes only when the view changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusView {
-    /// The filled state of each of the 20 cells of the inline capacity grid,
-    /// or `None` when the used capacity is not known (no grid is drawn).
-    pub cells: Option<[bool; INLINE_CELLS]>,
+    /// The paint of each of the 20 cells of the inline capacity grid, or
+    /// `None` when the used capacity is not known (no grid is drawn).
+    pub grid: Option<[CellPaint; INLINE_CELLS]>,
+    /// The tone of the dot of the pressure state beside the grid: the tone
+    /// and the text of [`Self::title`] are its two signals. `None` when the
+    /// pressure is not known or is stale: then the text alone shows it.
+    pub pressure: Option<ItemTone>,
     /// The text beside the grid: the memory pressure state.
     pub title: String,
     /// The accessible label and tooltip of the item: the whole state as text,
@@ -160,17 +319,6 @@ pub fn agent_line(agent: &Loadable<AgentSnapshot>) -> (String, Option<&'static s
     (format!("Agent: {}{suffix}", snapshot.state.label()), detail)
 }
 
-/// The filled cells of the inline grid for `used` of `total`.
-#[must_use]
-pub fn grid_cells(used: u64, total: u64) -> [bool; INLINE_CELLS] {
-    let filled: usize = used_cells(used, total, INLINE_CELLS);
-    let mut cells: [bool; INLINE_CELLS] = [false; INLINE_CELLS];
-    for cell in cells.iter_mut().take(filled) {
-        *cell = true;
-    }
-    cells
-}
-
 /// Adds the rows of the pause: its state, its commands, and the state of
 /// the last pause request. Returns the text of the pause state, with
 /// "(stale)" after a stale authority record.
@@ -226,6 +374,32 @@ fn push_pause_rows(model: &AppModel, now: SystemTime, rows: &mut Vec<MenuRow>) -
     pause_text
 }
 
+/// The paint of the grid and the tone of the pressure dot of `model`.
+fn grid_and_tone(
+    model: &AppModel,
+    used: &Measured<u64>,
+    total: &Measured<u64>,
+) -> (Option<[CellPaint; INLINE_CELLS]>, Option<ItemTone>) {
+    let grid: Option<[CellPaint; INLINE_CELLS]> = match (used, total) {
+        (Measured::Value(used), Measured::Value(total)) if *total > 0 => Some(grid_paints(
+            *used,
+            *total,
+            disk_threshold(model, "warn_below").and_then(|below| free_zone_start(below, *total)),
+            disk_threshold(model, "emergency_below")
+                .and_then(|below| free_zone_start(below, *total)),
+        )),
+        _ => None,
+    };
+    let pressure_level: Option<ItemTone> = match &model.host {
+        Loadable::Ready(snapshot) => match &snapshot.pressure {
+            Measured::Value(level) => Some(pressure_tone(*level)),
+            Measured::Unavailable(_) => None,
+        },
+        Loadable::Stale(_) | Loadable::Loading | Loadable::Unavailable(_) => None,
+    };
+    (grid, pressure_level)
+}
+
 /// The view of the item for `model` at `now`.
 #[must_use]
 pub fn status_view(model: &AppModel, now: SystemTime) -> StatusView {
@@ -251,12 +425,7 @@ pub fn status_view(model: &AppModel, now: SystemTime) -> StatusView {
             )
         },
     );
-    let cells: Option<[bool; INLINE_CELLS]> = match (&used, &total) {
-        (Measured::Value(used), Measured::Value(total)) if *total > 0 => {
-            Some(grid_cells(*used, *total))
-        }
-        _ => None,
-    };
+    let (grid, pressure_level) = grid_and_tone(model, &used, &total);
     let disk: String = capacity_label(&used, &total);
     let (pressure, stale): (String, bool) = pressure_text(&model.host);
     let title: String = if stale {
@@ -321,7 +490,8 @@ pub fn status_view(model: &AppModel, now: SystemTime) -> StatusView {
         "Svalnir.{fixture_note} {disk}. {pressure_line}.{stale_note} {agent}.{protection_note} Automation: {pause_text}."
     );
     StatusView {
-        cells,
+        grid,
+        pressure: pressure_level,
         title,
         label,
         rows,
@@ -564,13 +734,67 @@ mod tests {
         assert_eq!(MenuCommand::from_tag(6), None);
     }
 
+    fn filled(paints: &[CellPaint]) -> usize {
+        paints
+            .iter()
+            .filter(|paint| matches!(paint, CellPaint::Filled(_)))
+            .count()
+    }
+
     #[test]
     fn the_grid_fills_the_rounded_share() {
-        let cells = grid_cells(60, 100);
-        assert_eq!(cells.iter().filter(|cell| **cell).count(), 12);
-        assert!(cells[11] && !cells[12]);
-        assert!(grid_cells(0, 100).iter().all(|cell| !cell));
-        assert!(grid_cells(100, 100).iter().all(|cell| *cell));
+        let paints = grid_paints(60, 100, None, None);
+        assert_eq!(filled(&paints), 12);
+        assert_eq!(paints[11], CellPaint::Filled(ItemTone::Brand));
+        assert_eq!(paints[12], CellPaint::Empty);
+        assert_eq!(filled(&grid_paints(0, 100, None, None)), 0);
+        assert_eq!(filled(&grid_paints(100, 100, None, None)), INLINE_CELLS);
+    }
+
+    #[test]
+    fn the_zones_of_the_disk_guard_tint_the_end_of_the_grid() {
+        // 90% used; warning below 20% free (cell 16), critical below 5% free
+        // (cell 19).
+        let warning = free_zone_start(20, 100);
+        let critical = free_zone_start(5, 100);
+        assert_eq!((warning, critical), (Some(16), Some(19)));
+        let paints = grid_paints(90, 100, warning, critical);
+        assert_eq!(paints[15], CellPaint::Filled(ItemTone::Brand));
+        assert_eq!(paints[16], CellPaint::Filled(ItemTone::Warning));
+        assert_eq!(paints[17], CellPaint::Filled(ItemTone::Warning));
+        assert_eq!(paints[18], CellPaint::Tint(ItemTone::Warning));
+        assert_eq!(paints[19], CellPaint::Tint(ItemTone::Negative));
+        assert_eq!(free_zone_start(0, 100), None);
+        assert_eq!(free_zone_start(10, 0), None);
+    }
+
+    #[test]
+    fn each_paint_has_a_color_for_each_menu_bar() {
+        let light = MenuBarLook {
+            dark: false,
+            increase_contrast: false,
+        };
+        let dark = MenuBarLook {
+            dark: true,
+            increase_contrast: false,
+        };
+        let contrast = MenuBarLook {
+            dark: true,
+            increase_contrast: true,
+        };
+        // The tones of DESIGN.md §2: brand #0071E3 light, #0A84FF dark.
+        let brand_light = paint_rgba(CellPaint::Filled(ItemTone::Brand), light);
+        assert!((brand_light[2] - f64::from(0xe3_u8) / 255.0).abs() < 1e-3);
+        let brand_dark = paint_rgba(CellPaint::Filled(ItemTone::Brand), dark);
+        assert!((brand_dark[2] - 1.0).abs() < 1e-3);
+        // An empty cell has the color of the menu bar text.
+        assert_eq!(paint_rgba(CellPaint::Empty, light)[..3], [0.0, 0.0, 0.0]);
+        assert_eq!(paint_rgba(CellPaint::Empty, dark)[..3], [1.0, 1.0, 1.0]);
+        // Increase Contrast makes a tint and an empty cell stronger.
+        let tint = CellPaint::Tint(ItemTone::Warning);
+        assert!(paint_rgba(tint, contrast)[3] > paint_rgba(tint, dark)[3]);
+        assert!(paint_rgba(CellPaint::Empty, contrast)[3] > paint_rgba(CellPaint::Empty, dark)[3]);
+        assert_eq!(pressure_tone(PressureLevel::Critical), ItemTone::Negative);
     }
 
     #[test]

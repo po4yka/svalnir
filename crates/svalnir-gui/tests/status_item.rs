@@ -17,8 +17,8 @@ use svalnir_gui::{
         store::{AppModel, INACTIVE_INTERVAL, Topic},
     },
     status_item::{
-        MenuCommand, MenuRow, StatusView, Surface, install_surface, is_installed, menu_closed,
-        pause_action, remove, run_command, status_view, update_item,
+        CellPaint, ItemTone, MenuCommand, MenuRow, StatusView, Surface, install_surface,
+        is_installed, menu_closed, pause_action, remove, run_command, status_view, update_item,
     },
 };
 
@@ -78,9 +78,18 @@ fn infos(view: &StatusView) -> Vec<String> {
 fn a_healthy_host_shows_the_grid_the_pressure_and_the_pause_control(cx: &mut TestAppContext) {
     let model = model(FixtureScenario::Healthy, ActionScript::Accept, true, cx);
     let view = view(&model, cx);
-    let cells = view.cells.expect("the capacity is known");
-    assert!(cells.iter().any(|cell| *cell), "some space is used");
-    assert!(!cells.iter().all(|cell| *cell), "some space is free");
+    let grid = view.grid.expect("the capacity is known");
+    assert!(
+        grid.contains(&CellPaint::Filled(ItemTone::Brand)),
+        "some space is used: {grid:?}"
+    );
+    // The fixture disk guard warns below 40 GiB free of 512 GB: the last two
+    // cells are its tinted zone. Its emergency below 10 GiB free is 2% of the
+    // volume, less than half a cell, so it has no cell (`zone_start`).
+    assert_eq!(grid[17], CellPaint::Empty, "{grid:?}");
+    assert_eq!(grid[18], CellPaint::Tint(ItemTone::Warning), "{grid:?}");
+    assert_eq!(grid[19], CellPaint::Tint(ItemTone::Warning), "{grid:?}");
+    assert_eq!(view.pressure, Some(ItemTone::Positive));
     assert_eq!(view.title, "Normal");
     assert!(view.label.contains("Disk:"), "{}", view.label);
     assert!(
@@ -109,6 +118,7 @@ fn a_recorded_pause_offers_a_resume(cx: &mut TestAppContext) {
     let model = model(FixtureScenario::Pressure, ActionScript::Accept, true, cx);
     let view = view(&model, cx);
     assert_eq!(view.title, "Warning");
+    assert_eq!(view.pressure, Some(ItemTone::Warning), "tone and text");
     assert!(
         infos(&view).contains(&"Automation: Paused".to_owned()),
         "{:?}",
@@ -128,7 +138,8 @@ fn a_recorded_pause_offers_a_resume(cx: &mut TestAppContext) {
 fn an_unavailable_reading_draws_no_grid_and_no_value(cx: &mut TestAppContext) {
     let model = model(FixtureScenario::Unavailable, ActionScript::Accept, true, cx);
     let view = view(&model, cx);
-    assert_eq!(view.cells, None, "a failed read is not an empty grid");
+    assert_eq!(view.grid, None, "a failed read is not an empty grid");
+    assert_eq!(view.pressure, None, "a failed read has no tone");
     assert_eq!(view.title, "\u{2014}");
     assert!(
         view.label.contains("Memory pressure: \u{2014}"),
@@ -219,7 +230,7 @@ fn the_model_keeps_reading_after_its_window_closes(cx: &mut TestAppContext) {
         "a poll ran after the window closed: {before:?} then {after:?}"
     );
     let view = view(&model, cx);
-    assert!(view.cells.is_some(), "the item still has the readings");
+    assert!(view.grid.is_some(), "the item still has the readings");
     assert_eq!(view.title, "Normal");
 }
 

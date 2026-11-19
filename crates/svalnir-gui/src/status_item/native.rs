@@ -12,7 +12,10 @@
 //! rebuild under the pointer can move a row. The target is the delegate of
 //! the menu, and when the menu closes it asks for the latest view.
 
-use super::{MenuCommand, MenuRow, StatusView, Surface};
+use super::{
+    CellPaint, ItemTone, MenuBarLook, MenuCommand, MenuRow, StatusView, Surface, paint_rgba,
+    tone_rgb,
+};
 use crate::viz::capacity_grid::INLINE_CELLS;
 use block2::RcBlock;
 use objc2::{
@@ -22,10 +25,11 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSAccessibility as _, NSBezierPath, NSCellImagePosition, NSColor, NSImage, NSMenu,
-    NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAccessibility as _, NSAppearance, NSBezierPath, NSCellImagePosition, NSColor, NSImage,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSWorkspace,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 use std::{cell::Cell, rc::Rc};
 
 /// The width of one cell of the grid image, in points.
@@ -35,10 +39,10 @@ const CELL_GAP: f64 = 1.0;
 /// The height of the grid image, in points. The menu bar is 22 points high
 /// or more.
 const CELL_HEIGHT: f64 = 12.0;
-/// The alpha of an empty cell of the template image. The system draws a
-/// template image in the color of the menu bar, so an empty cell is a
-/// lighter cell of the same color, like the `border` color of a cell.
-const EMPTY_ALPHA: f64 = 0.3;
+/// The diameter of the dot of the pressure state, in points.
+const DOT: f64 = 6.0;
+/// The space between the grid and the dot, in points.
+const DOT_GAP: f64 = 4.0;
 
 /// The ivars of [`MenuTarget`].
 struct TargetIvars {
@@ -206,7 +210,7 @@ impl Surface for StatusSurface {
     /// `false`: apply the view again when the menu closes.
     fn apply(&self, view: &StatusView) -> bool {
         if let Some(button) = self.item.button(self.mtm) {
-            let image: Option<Retained<NSImage>> = view.cells.map(grid_image);
+            let image: Option<Retained<NSImage>> = grid_image(view.grid, view.pressure);
             button.setImage(image.as_deref());
             button.setTitle(&NSString::from_str(&view.title));
             let label: Retained<NSString> = NSString::from_str(&view.label);
@@ -235,28 +239,82 @@ impl Drop for StatusSurface {
     }
 }
 
-/// The template image of the inline capacity grid: one cell for each 5% of
-/// the volume, a filled cell opaque, an empty cell at [`EMPTY_ALPHA`].
-fn grid_image(cells: [bool; INLINE_CELLS]) -> Retained<NSImage> {
+/// The look of the menu bar at draw time: the appearance that `AppKit`
+/// draws the image in, and Increase Contrast.
+fn current_look() -> MenuBarLook {
+    // The names are the string values of `NSAppearanceNameAqua` and
+    // `NSAppearanceNameDarkAqua`; `bestMatchFromAppearancesWithNames:`
+    // compares names as strings, so no extern static is read.
+    let names: Retained<NSArray<NSString>> = NSArray::from_retained_slice(&[
+        NSString::from_str("NSAppearanceNameAqua"),
+        NSString::from_str("NSAppearanceNameDarkAqua"),
+    ]);
+    let dark: bool = NSAppearance::currentDrawingAppearance()
+        .bestMatchFromAppearancesWithNames(&names)
+        .is_some_and(|name| name.to_string() == "NSAppearanceNameDarkAqua");
+    let increase_contrast: bool =
+        NSWorkspace::sharedWorkspace().accessibilityDisplayShouldIncreaseContrast();
+    MenuBarLook {
+        dark,
+        increase_contrast,
+    }
+}
+
+fn set_color([r, g, b, a]: [f64; 4]) {
+    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a).set();
+}
+
+/// The image of the inline capacity grid in the tokens of `DESIGN.md`, with
+/// the dot of the pressure state after it. It is not a template image: the
+/// drawing handler runs each time `AppKit` draws the image, so it reads the
+/// appearance of the menu bar and Increase Contrast then, and the colors
+/// follow a change of either with no new view.
+fn grid_image(
+    paints: Option<[CellPaint; INLINE_CELLS]>,
+    pressure: Option<ItemTone>,
+) -> Option<Retained<NSImage>> {
+    if paints.is_none() && pressure.is_none() {
+        return None;
+    }
     let count: f64 = f64::from(u8::try_from(INLINE_CELLS).unwrap_or(u8::MAX));
-    let size: NSSize = NSSize::new(count * CELL_WIDTH + (count - 1.0) * CELL_GAP, CELL_HEIGHT);
+    let grid_width: f64 = if paints.is_some() {
+        count * CELL_WIDTH + (count - 1.0) * CELL_GAP
+    } else {
+        0.0
+    };
+    let dot_width: f64 = match (paints.is_some(), pressure.is_some()) {
+        (true, true) => DOT_GAP + DOT,
+        (false, true) => DOT,
+        (_, false) => 0.0,
+    };
+    let size: NSSize = NSSize::new(grid_width + dot_width, CELL_HEIGHT);
     let draw = RcBlock::new(move |_bounds: NSRect| -> Bool {
+        let look: MenuBarLook = current_look();
         let mut x: f64 = 0.0;
-        for filled in cells {
-            let alpha: f64 = if filled { 1.0 } else { EMPTY_ALPHA };
-            NSColor::colorWithWhite_alpha(0.0, alpha).set();
-            NSBezierPath::fillRect(NSRect::new(
-                NSPoint::new(x, 0.0),
-                NSSize::new(CELL_WIDTH, CELL_HEIGHT),
-            ));
-            x += CELL_WIDTH + CELL_GAP;
+        if let Some(paints) = paints {
+            for paint in paints {
+                set_color(paint_rgba(paint, look));
+                NSBezierPath::fillRect(NSRect::new(
+                    NSPoint::new(x, 0.0),
+                    NSSize::new(CELL_WIDTH, CELL_HEIGHT),
+                ));
+                x += CELL_WIDTH + CELL_GAP;
+            }
+            x += DOT_GAP - CELL_GAP;
+        }
+        if let Some(tone) = pressure {
+            let [r, g, b] = tone_rgb(tone, look.dark);
+            set_color([r, g, b, 1.0]);
+            NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                NSPoint::new(x.max(0.0), (CELL_HEIGHT - DOT) / 2.0),
+                NSSize::new(DOT, DOT),
+            ))
+            .fill();
         }
         Bool::YES
     });
     let image: Retained<NSImage> =
         NSImage::imageWithSize_flipped_drawingHandler(size, false, &draw);
-    // The system draws a template image in the color of the menu bar, for
-    // the light and dark menu bar and for Increase Contrast.
-    image.setTemplate(true);
-    image
+    image.setTemplate(false);
+    Some(image)
 }

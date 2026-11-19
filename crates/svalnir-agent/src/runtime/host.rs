@@ -550,15 +550,7 @@ impl SelfFootprint for ProcessFootprint {
 #[must_use]
 pub fn capability_summary(state_directory: &Path) -> CapabilitySummary {
     let report: CapabilityReport = diagnose_in(WorkerRole::Agent, state_directory);
-    CapabilitySummary {
-        verdict: report.summary.verdict.as_str().to_owned(),
-        required_not_available: report
-            .summary
-            .required_not_available
-            .iter()
-            .map(|capability| capability.as_str().to_owned())
-            .collect(),
-    }
+    CapabilitySummary::of(&report)
 }
 
 /// The parts of the agent on the running system.

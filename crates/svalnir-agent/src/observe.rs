@@ -35,11 +35,12 @@ mod records;
 mod tests;
 
 pub use self::records::{
-    AgentRecordsReading, AgentStepPause, BudgetReading, ClientClock, ControllerReading,
-    CooldownReading, CooldownSubject, Freshness, GenerationReading, IncidentReading,
-    JournalReading, JournalUsage, MAX_READ_INCIDENTS, OutstandingReading, PauseReading,
-    PauseUnknown, RecordReading, STATUS_MAX_AGE, StatusReading, freshness, pause_reading,
-    read_agent_records, read_agent_records_at, read_controller, read_status,
+    AgentCapabilityReading, AgentRecordsReading, AgentStepPause, BudgetReading, ClientClock,
+    ControllerReading, CooldownReading, CooldownSubject, Freshness, GenerationReading,
+    IncidentReading, JournalReading, JournalUsage, MAX_READ_INCIDENTS, OutstandingReading,
+    PauseReading, PauseUnknown, RecordReading, STATUS_MAX_AGE, StatusReading, agent_capabilities,
+    freshness, pause_reading, read_agent_records, read_agent_records_at, read_controller,
+    read_status,
 };
 
 /// The mount point of the data volume of the startup volume group on macOS.

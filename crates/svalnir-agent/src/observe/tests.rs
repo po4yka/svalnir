@@ -20,8 +20,9 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 use tempfile::TempDir;
 
 use super::{
-    ClientClock, ControllerReading, CooldownSubject, Freshness, JournalReading, JournalUsage,
-    PauseUnknown, RecordReading, STATUS_MAX_AGE, read_agent_records_at,
+    AgentCapabilityReading, ClientClock, ControllerReading, CooldownSubject, Freshness,
+    JournalReading, JournalUsage, PauseUnknown, RecordReading, STATUS_MAX_AGE,
+    read_agent_records_at,
 };
 use crate::controller::{
     BlockedReason, CONTROLLER_STATUS_VERSION, ControllerState, ControllerStatus, Guard, GuardPhase,
@@ -338,6 +339,69 @@ fn the_freshness_of_the_status_follows_its_age_and_state() {
     assert!(matches!(
         fixture.read(&clock(1, 100)).status,
         RecordReading::Unreadable { .. }
+    ));
+}
+
+#[test]
+fn the_capability_summary_of_the_agent_has_the_freshness_of_its_status() {
+    use crate::capability::{CapabilityId, Requirement};
+    use crate::runtime::{CapabilityLine, CapabilitySummary};
+    use svalnir_core::state::CapabilityState;
+
+    let fixture: Fixture = Fixture::new();
+    let capabilities = |wall_seconds: i64| {
+        super::agent_capabilities(&fixture.read(&clock(1, wall_seconds)).status)
+    };
+    // No status record: no agent wrote one.
+    assert_eq!(capabilities(100), AgentCapabilityReading::NoStatus);
+
+    // A status record with no summary is not a summary with no line.
+    fixture.put(
+        AgentRecord::Status,
+        &agent_status(100, RunState::Running, None),
+        100,
+    );
+    assert_eq!(
+        capabilities(130),
+        AgentCapabilityReading::NotRecorded {
+            freshness: Freshness::Current {
+                age: Nanoseconds::new(30 * SECOND)
+            }
+        }
+    );
+
+    let summary: CapabilitySummary = CapabilitySummary {
+        verdict: "blocked".to_owned(),
+        required_not_available: vec!["metrics.swap_usage".to_owned()],
+        probed_at: Some(wall(90)),
+        lines: vec![CapabilityLine {
+            id: CapabilityId::MetricsSwapUsage,
+            title: "Swap usage query".to_owned(),
+            requirement: Requirement::Required,
+            state: CapabilityState::Denied,
+            detail: "The system refused the query: injected".to_owned(),
+            remediation: None,
+        }],
+    };
+    let mut status: AgentStatus = agent_status(100, RunState::Running, None);
+    status.capabilities = Some(summary.clone());
+    fixture.put(AgentRecord::Status, &status, 100);
+    assert_eq!(
+        capabilities(400),
+        AgentCapabilityReading::Recorded {
+            summary: summary.clone(),
+            freshness: Freshness::Stale {
+                age: Nanoseconds::new(300 * SECOND)
+            }
+        }
+    );
+
+    // A record of a different schema version is not a summary.
+    status.schema_version = AGENT_STATUS_VERSION + 1;
+    fixture.put(AgentRecord::Status, &status, 100);
+    assert!(matches!(
+        capabilities(130),
+        AgentCapabilityReading::Unreadable { .. }
     ));
 }
 

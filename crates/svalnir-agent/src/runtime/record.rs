@@ -11,10 +11,12 @@ use svalnir_core::id::{ExecutorEpochId, PolicyRevisionId};
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::WallTime;
 
+use crate::capability::{CapabilityEntry, CapabilityId, CapabilityReport, Requirement};
 use crate::controller::ControllerStatus;
+use svalnir_core::state::CapabilityState;
 
 /// The version of the [`AgentStatus`] record.
-pub const AGENT_STATUS_VERSION: u32 = 1;
+pub const AGENT_STATUS_VERSION: u32 = 2;
 
 /// The version of the [`LifecycleRecord`].
 pub const LIFECYCLE_VERSION: u32 = 1;
@@ -56,12 +58,79 @@ pub struct PolicySource {
 }
 
 /// The result of the capability check at the start.
+///
+/// The agent runs the probes one time, at its start, under its own process
+/// identity. Access that the user gives later, for example Full Disk Access,
+/// applies to the agent only after a restart, so the start is the time of
+/// the probes. A client shows [`CapabilitySummary::probed_at`] with the
+/// lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilitySummary {
     /// `ready`, `unverified`, or `blocked`.
     pub verdict: String,
     /// The required capabilities that are not available.
     pub required_not_available: Vec<String>,
+    /// The time of the probes, when the clock gave a valid time.
+    pub probed_at: Option<WallTime>,
+    /// One line for each capability, in report order. At most
+    /// [`CapabilityId::ALL`] lines.
+    pub lines: Vec<CapabilityLine>,
+}
+
+/// One capability of the agent process, as the status record keeps it.
+///
+/// A line has no evidence facts: the facts name paths of the home
+/// directory, and the status record has no path of user data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityLine {
+    /// The stable identifier.
+    pub id: CapabilityId,
+    /// A short name for a table.
+    pub title: String,
+    /// The class of the capability.
+    pub requirement: Requirement,
+    /// The state under the identity of the agent process.
+    pub state: CapabilityState,
+    /// One line that summarizes the result.
+    pub detail: String,
+    /// A safe action for the user, when one applies.
+    pub remediation: Option<String>,
+}
+
+impl CapabilityLine {
+    fn of(entry: &CapabilityEntry) -> Self {
+        Self {
+            id: entry.id,
+            title: entry.title.clone(),
+            requirement: entry.requirement,
+            state: entry.state.clone(),
+            detail: entry.detail.clone(),
+            remediation: entry.remediation.clone(),
+        }
+    }
+}
+
+impl CapabilitySummary {
+    /// The summary of a capability report of the agent process.
+    #[must_use]
+    pub fn of(report: &CapabilityReport) -> Self {
+        Self {
+            verdict: report.summary.verdict.as_str().to_owned(),
+            required_not_available: report
+                .summary
+                .required_not_available
+                .iter()
+                .map(|capability| capability.as_str().to_owned())
+                .collect(),
+            probed_at: report.probed_at,
+            lines: report
+                .capabilities
+                .iter()
+                .take(CapabilityId::ALL.len())
+                .map(CapabilityLine::of)
+                .collect(),
+        }
+    }
 }
 
 /// The self-limits of the agent.

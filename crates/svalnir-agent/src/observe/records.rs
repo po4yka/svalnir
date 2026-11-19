@@ -40,7 +40,7 @@ use crate::controller::{
 };
 use crate::journal::{AgentRecord, IncidentUsage, OperationJournal, StoredAgentRecord};
 use crate::platform::memory::ClockError;
-use crate::runtime::{AGENT_STATUS_VERSION, AgentStatus, RunState};
+use crate::runtime::{AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, RunState};
 
 /// The age of the status record of the agent above which a client shows the
 /// records as stale: three status intervals of the agent binary, which
@@ -225,6 +225,58 @@ pub fn read_status(journal: &OperationJournal, now: WallTime) -> RecordReading<S
             revision: stored.revision,
             status: stored.record,
         }),
+    }
+}
+
+/// The capability summary of the agent process for a client.
+///
+/// The summary applies to the agent process, not to the client: a client
+/// shows it beside its own probes ([`crate::capability::diagnose`]), with a
+/// label for each list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCapabilityReading {
+    /// The journal has no status record: no agent wrote one in this state
+    /// directory.
+    NoStatus,
+    /// The status record cannot be read by this build.
+    Unreadable {
+        /// The cause.
+        reason: String,
+    },
+    /// The status record has no capability summary. The agent did not
+    /// record its probes.
+    NotRecorded {
+        /// The freshness of the status record.
+        freshness: Freshness,
+    },
+    /// The summary that the agent recorded.
+    Recorded {
+        /// The summary, with the time of the probes.
+        summary: CapabilitySummary,
+        /// The freshness of the status record that has the summary. A
+        /// stale or stopped status is the summary of an agent that does
+        /// not run now.
+        freshness: Freshness,
+    },
+}
+
+/// The capability summary of the agent from a status reading.
+#[must_use]
+pub fn agent_capabilities(status: &RecordReading<StatusReading>) -> AgentCapabilityReading {
+    match status {
+        RecordReading::Absent => AgentCapabilityReading::NoStatus,
+        RecordReading::Unreadable { reason } => AgentCapabilityReading::Unreadable {
+            reason: reason.clone(),
+        },
+        RecordReading::Recorded(reading) => match &reading.status.capabilities {
+            None => AgentCapabilityReading::NotRecorded {
+                freshness: reading.freshness,
+            },
+            Some(summary) => AgentCapabilityReading::Recorded {
+                summary: summary.clone(),
+                freshness: reading.freshness,
+            },
+        },
     }
 }
 

@@ -145,8 +145,8 @@ pub use self::ports::{
     SelfFootprint,
 };
 pub use self::record::{
-    AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, LIFECYCLE_VERSION, LifecycleRecord,
-    MAX_DEGRADED_REASONS, PolicySource, RESTART_BACKOFF_BASE, RESTART_BACKOFF_MAX, RunState,
-    SelfLimits, restart_backoff,
+    AGENT_STATUS_VERSION, AgentStatus, CapabilityLine, CapabilitySummary, LIFECYCLE_VERSION,
+    LifecycleRecord, MAX_DEGRADED_REASONS, PolicySource, RESTART_BACKOFF_BASE, RESTART_BACKOFF_MAX,
+    RunState, SelfLimits, restart_backoff,
 };
 pub use self::service::{ServiceSettings, StopHandle, ThreadIdle, run};

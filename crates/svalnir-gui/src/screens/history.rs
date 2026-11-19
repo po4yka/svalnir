@@ -18,6 +18,7 @@ use crate::{
     screens::overview::phase_pill,
     theme::tokens::{self, Tokens, to_hsla},
     ui::action_button::{ActionButton, ButtonSize, ButtonVariant},
+    ui::action_status::action_status_short,
     ui::{
         data_state::format_bytes,
         pill::{StatusPill, Tone},
@@ -540,8 +541,17 @@ fn state_cell(
             busy,
         ),
     });
-    // The width of the cell bounds the state line, so a long sentence wraps
-    // in the cell and does not cover the next column.
+    // The width of the cell bounds the state line, so its sentence wraps in
+    // the cell and does not cover the next column. The row shows the short
+    // line; the detail view of the row shows the full line.
+    let status: Option<AnyElement> = model.actions.state(&slot).map(|state| {
+        action_status_short(
+            SharedString::from(format!("history-action-{id}")),
+            state,
+            now,
+            tokens,
+        )
+    });
     v_flex()
         .w_full()
         .min_w_0()
@@ -549,13 +559,7 @@ fn state_cell(
         .items_start()
         .child(pill)
         .children(control)
-        .children(slot_status(
-            SharedString::from(format!("history-action-{id}")),
-            model,
-            &slot,
-            now,
-            tokens,
-        ))
+        .children(status)
         .into_any_element()
 }
 
@@ -707,7 +711,7 @@ fn operation_rows(operation: &OperationDetail, context: &TableContext<'_>) -> Ve
             TableRow::new()
                 .id(SharedString::from(format!("history-detail-row-{id}")))
                 .child(cell(
-                    detail_body(operation, context.screen, now, mono, tokens),
+                    detail_body(operation, context.screen, model, now, mono, tokens),
                     TABLE_SPAN,
                     false,
                 ))
@@ -1178,12 +1182,14 @@ fn detail_summary(
     ]
 }
 
-/// The detail of one operation, in an expanded row below its row: each
+/// The detail of one operation, in an expanded row below its row: the full
+/// state line of the last action of this window on the operation, each
 /// step with its state, each target result, the resource observations, the
 /// trigger, and the errors.
 fn detail_body(
     operation: &OperationDetail,
     screen: &Entity<HistoryScreen>,
+    model: &AppModel,
     now: SystemTime,
     mono: &SharedString,
     tokens: &Tokens,
@@ -1213,9 +1219,27 @@ fn detail_body(
         })
         .collect();
     let error_rows: Vec<AnyElement> = error_rows(operation, mono, tokens);
+    // The row shows at most two lines of the sentence; this line has all of
+    // it.
+    let last_action: Option<AnyElement> = slot_status(
+        SharedString::from(format!("history-detail-action-{}", operation.operation_id)),
+        model,
+        &Slot::Operation(operation.operation_id.clone()),
+        now,
+        tokens,
+    )
+    .map(|line| {
+        detail_section(
+            "history-detail-last-action",
+            "Last action",
+            vec![line],
+            tokens,
+        )
+    });
     let body = v_flex()
         .gap(tokens::SPACE_2)
         .children(summary)
+        .children(last_action)
         .child(detail_section(
             "history-detail-steps",
             "Steps",

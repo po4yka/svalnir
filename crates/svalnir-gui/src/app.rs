@@ -1,7 +1,7 @@
 //! Application bootstrap: gpui-kit, fonts, theme, key bindings, main window.
 
 use crate::{
-    actions::fixture::ActionScript,
+    actions::{Action, fixture::ActionScript},
     data::{
         DataSource,
         fixture::{FixtureScenario, FixtureSource},
@@ -56,7 +56,10 @@ Options:
                        writes nothing
   --detail OPERATION   With --fixture only: open the detail of the
                        operation OPERATION on History
-  --open-stop          With --fixture only: open the stop confirmation of
+  --cancel OPERATION   With --fixture only: send the cancel of the
+                       operation OPERATION at launch, so that its row on
+                       History shows the state line of the cancel
+  --open-stop         With --fixture only: open the stop confirmation of
                        the first group that the catalog does not protect
   --no-status-item     Add no item to the menu bar. The client then quits
                        when its last window closes
@@ -117,6 +120,8 @@ pub struct LaunchOptions {
     pub actions: Option<ActionScript>,
     /// The operation whose History detail opens at launch.
     pub detail: Option<String>,
+    /// The operation whose cancel the fixture answers at launch.
+    pub cancel: Option<String>,
     /// Whether the stop confirmation of the first group that the catalog
     /// does not protect opens at launch.
     pub open_stop: bool,
@@ -258,6 +263,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                         .ok_or_else(|| "`--detail` needs an operation".to_owned())?,
                 );
             }
+            "--cancel" => {
+                options.cancel = Some(
+                    args.next()
+                        .ok_or_else(|| "`--cancel` needs an operation".to_owned())?,
+                );
+            }
             "--open-stop" => options.open_stop = true,
             "--no-status-item" => options.no_status_item = true,
             "--help" | "-h" => options.help = true,
@@ -275,6 +286,11 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
     }
     if options.detail.is_some() && options.fixture.is_none() {
         return Err("`--detail` is valid only with `--fixture`".to_owned());
+    }
+    // A cancel of the live source writes the journal, so the launch option
+    // takes only a fixture, which writes nothing.
+    if options.cancel.is_some() && options.fixture.is_none() {
+        return Err("`--cancel` is valid only with `--fixture`".to_owned());
     }
     if options.open_stop && options.fixture.is_none() {
         return Err("`--open-stop` is valid only with `--fixture`".to_owned());
@@ -311,6 +327,17 @@ fn open_fixture_stop(
     if let Err(error) = opened {
         tracing::error!(%error, "cannot open the stop confirmation");
     }
+}
+
+/// Sends the cancel of `operation` through the model, as the Cancel button
+/// of its History row does, for a screenshot of the state line. Only a
+/// fixture source calls it, and the fixture path records nothing.
+fn send_fixture_cancel(view: &Entity<MainWindow>, operation: &str, cx: &mut App) {
+    let model: Entity<AppModel> = view.read(cx).model().clone();
+    let action = Action::Cancel {
+        operation: operation.to_owned(),
+    };
+    model.update(cx, |model, cx| model.run_action(action, cx));
 }
 
 /// The most readings that `--readings` takes.
@@ -531,6 +558,9 @@ pub fn run() -> ExitCode {
         if let Some(operation) = &options.detail {
             view.update(cx, |view, cx| view.show_history_detail(operation, cx));
         }
+        if let (Some(operation), Some(_)) = (&options.cancel, options.fixture) {
+            send_fixture_cancel(&view, operation, cx);
+        }
         if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
             open_fixture_stop(handle, &view, scenario, cx);
         }
@@ -568,7 +598,9 @@ mod tests {
     fn the_launch_dialogs_need_a_fixture() {
         assert!(parse(&["--detail", "op-1"]).is_err());
         assert!(parse(&["--open-stop"]).is_err());
+        assert!(parse(&["--cancel", "op-1"]).is_err());
         assert!(parse(&["--fixture", "healthy", "--detail"]).is_err());
+        assert!(parse(&["--fixture", "healthy", "--cancel"]).is_err());
         assert_eq!(
             parse(&["--fixture", "healthy", "--open-stop"]).map(|o| o.open_stop),
             Ok(true)
@@ -607,6 +639,8 @@ mod tests {
             "refuse",
             "--detail",
             "op-1",
+            "--cancel",
+            "op-2",
             "--open-stop",
             "--no-status-item",
             "--help",
@@ -627,6 +661,7 @@ mod tests {
                 focus: Some(FocusTarget::Dial),
                 actions: Some(ActionScript::Refuse),
                 detail: Some("op-1".to_owned()),
+                cancel: Some("op-2".to_owned()),
                 open_stop: true,
                 no_status_item: true,
                 help: true,

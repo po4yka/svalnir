@@ -540,10 +540,14 @@ fn the_stop_buttons_stay_inside_the_dialog_with_a_long_name(cx: &mut TestAppCont
 }
 
 /// Regression for D-10: the state line of a cancel overflowed the State
-/// column and covered the "Observed change" column.
+/// column and covered the "Observed change" column. A line that wraps in
+/// full made the row about ten lines tall, so the row shows at most two
+/// lines of the sentence. The text is not cut with no path to it: the
+/// accessible label of the row line and the line in the detail view, which
+/// the Details button of the row opens, have the full text.
 #[gpui_kit::test]
 fn the_state_line_of_a_cancel_stays_in_the_state_column(cx: &mut TestAppContext) {
-    let (handle, _view) = open(
+    let (handle, view) = open(
         FixtureSource::new(FixtureScenario::Pressure),
         Screen::History,
         cx,
@@ -556,5 +560,34 @@ fn the_state_line_of_a_cancel_stays_in_the_state_column(cx: &mut TestAppContext)
     assert!(
         line.right() <= observed.left(),
         "state line {line:?}, observed change {observed:?}"
+    );
+    // Two lines of 12 px text: the line height of the theme is less than
+    // 21 px. The full sentence of the fixture needs more than six lines in
+    // the State column.
+    let sentence =
+        bounds_of(handle, "history-action-op_fixture_0002-sentence", cx).expect("sentence");
+    assert!(
+        sentence.size.height <= px(42.0),
+        "the sentence of the row is not short: {sentence:?}"
+    );
+    let Some(ActionState::Accepted { detail }) =
+        state_of(&view, &Slot::Operation("op_fixture_0002".to_owned()), cx)
+    else {
+        panic!("the cancel is accepted");
+    };
+    let full: String = format!("Accepted: {detail}");
+    assert_eq!(
+        label(handle, "history-action-op_fixture_0002", cx).as_deref(),
+        Some(full.as_str())
+    );
+    // The keyboard path to the full text: the Details button of the row.
+    assert_eq!(
+        label(handle, "history-detail-action-op_fixture_0002", cx),
+        None
+    );
+    click(handle, "history-details-op_fixture_0002", cx);
+    assert_eq!(
+        label(handle, "history-detail-action-op_fixture_0002", cx).as_deref(),
+        Some(full.as_str())
     );
 }

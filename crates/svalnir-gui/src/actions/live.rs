@@ -819,7 +819,8 @@ mod tests {
 
     /// A real stop plan for the child `pid`, made with a clock ten minutes
     /// in the past and a lifetime of one minute: it is expired now.
-    fn expired_plan(pid: u32) -> Plan {
+    fn expired_plan(child: &mut std::process::Child) -> Plan {
+        let pid: u32 = child.id();
         let host: Host = Host::open().unwrap_or_else(|error| panic!("{error}"));
         let (clock, _wall) =
             client::control_time(host.context()).unwrap_or_else(|error| panic!("{error}"));
@@ -830,17 +831,23 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error:?}"));
         // The inventory can read a new child only after its start; the
-        // test reads the processes again for at most 2 s.
-        let snapshot: ProcessSnapshot = (0..20)
+        // test reads the processes again for at most 5 s.
+        let mut last: Option<String> = None;
+        let snapshot: ProcessSnapshot = (0..50)
             .find_map(|_| {
                 let snapshot = collect_processes(&host).unwrap_or_else(|error| panic!("{error}"));
                 if snapshot.find_pid(pid).is_some() {
                     return Some(snapshot);
                 }
+                last = Some(format!(
+                    "{:?}; child status: {:?}",
+                    snapshot.omissions,
+                    child.try_wait()
+                ));
                 std::thread::sleep(Duration::from_millis(100));
                 None
             })
-            .unwrap_or_else(|| panic!("the child is not in the reading"));
+            .unwrap_or_else(|| panic!("the child is not in the reading; omissions: {last:?}"));
         let record = snapshot
             .find_pid(pid)
             .unwrap_or_else(|| panic!("the child is not in the reading"));
@@ -910,13 +917,13 @@ mod tests {
         // A copy outside the system locations, which the catalog protects.
         let sleeper: PathBuf = directory.path().join("sleeper");
         std::fs::copy("/bin/sleep", &sleeper).unwrap_or_else(|error| panic!("{error}"));
-        let child = Child(
+        let mut child = Child(
             std::process::Command::new(&sleeper)
                 .arg("30")
                 .spawn()
                 .unwrap_or_else(|error| panic!("{error}")),
         );
-        let plan = expired_plan(child.0.id());
+        let plan = expired_plan(&mut child.0);
         let plan_id = plan.plan_id.clone();
         let proposal = Arc::new(StopProposal {
             instance: "test".to_owned(),

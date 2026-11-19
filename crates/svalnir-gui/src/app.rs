@@ -306,6 +306,7 @@ pub fn open_main_window_seeded(
             None => apply::install(window, cx),
         }
         let model: Entity<AppModel> = cx.new(|cx| AppModel::new_seeded(source, readings, cx));
+        crate::notify::watch(&model, cx);
         cx.new(|cx| MainWindow::new(model, window, cx))
     })
 }
@@ -347,6 +348,9 @@ pub fn run() -> ExitCode {
             }
             fonts::register(cx);
             nav::bind_keys(cx);
+            if options.no_notifications {
+                cx.set_global(crate::notify::NotificationsOff);
+            }
 
             cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {

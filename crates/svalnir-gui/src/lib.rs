@@ -5,6 +5,7 @@
 pub mod actions;
 pub mod app;
 pub mod data;
+pub mod notify;
 pub mod platform;
 pub mod screens;
 pub mod shell;

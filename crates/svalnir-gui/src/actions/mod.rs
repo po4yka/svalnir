@@ -420,6 +420,11 @@ impl ActionBook {
         self.states.insert(slot, state);
     }
 
+    /// Each control with the state of its last action.
+    pub fn entries(&self) -> impl Iterator<Item = (&Slot, &ActionState)> {
+        self.states.iter()
+    }
+
     /// Whether `slot` waits for an answer.
     #[must_use]
     pub fn is_busy(&self, slot: &Slot) -> bool {

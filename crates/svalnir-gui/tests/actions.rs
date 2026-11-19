@@ -362,3 +362,47 @@ fn a_protected_group_has_no_stop(cx: &mut TestAppContext) {
         Some("No stop")
     );
 }
+
+/// Opens Applications, stops the first group that is not protected with a
+/// force quit, and reads the final record of its operation.
+fn stop_until_settled(cx: &mut TestAppContext) {
+    let (handle, view) = open(
+        FixtureSource::new(FixtureScenario::Healthy),
+        Screen::Applications,
+        cx,
+    );
+    let (instance, _name) = stoppable_group(&view, cx);
+    click(handle, &format!("applications-stop-{instance}"), cx);
+    click(handle, "confirm-force", cx);
+    for _ in 0..2 {
+        cx.update_window(handle, |_, window, cx| window.press("cmd-r", cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn a_settled_stop_posts_one_notification(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_app_identity("dev.svalnir.test", "Svalnir"));
+    stop_until_settled(cx);
+    let shown = cx.shown_system_notifications();
+    let stops: Vec<_> = shown
+        .iter()
+        .filter(|note| note.tag.as_ref() == "svalnir-stop-op-fixture-stop")
+        .collect();
+    assert_eq!(stops.len(), 1, "{shown:?}");
+    assert_eq!(
+        stops.first().map(|note| note.title.as_ref()),
+        Some("Stop: Exited")
+    );
+}
+
+#[gpui_kit::test]
+fn the_off_switch_posts_no_notification(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_app_identity("dev.svalnir.test", "Svalnir");
+        cx.set_global(svalnir_gui::notify::NotificationsOff);
+    });
+    stop_until_settled(cx);
+    assert_eq!(cx.shown_system_notifications(), Vec::new());
+}

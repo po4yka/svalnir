@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Entitlements of this executable under the hardened runtime.
+	The dictionary is empty on purpose: the executable needs no exception of
+	the hardened runtime and no sandbox, and it must not get one by default.
+	Add a key only with a recorded reason in packaging/README.md.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

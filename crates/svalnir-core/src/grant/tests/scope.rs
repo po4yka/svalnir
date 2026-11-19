@@ -791,6 +791,13 @@ fn a_key_that_this_build_does_not_make_has_no_unit() {
         "protections.cooldown",
         // A budget identifier with a `.` does not change the field.
         "memory_guard.app_budgets[a.cooldown].unknown",
+        // A field of a different table.
+        "disk_guard.cooldown",
+        "agent.batch_limit",
+        "memory_guard.footprint_stop",
+        "memory_guard.app_budgets[x].sample_interval",
+        "memory_guard.app_budgets[x]cooldown",
+        "disk_guard.sustain_for.extra",
     ] {
         assert_eq!(threshold_unit(key), None, "{key}");
     }

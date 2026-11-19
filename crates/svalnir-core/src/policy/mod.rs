@@ -76,8 +76,7 @@ pub use memory::{
     ApplicationKind, BudgetState, BudgetTrigger, ConfiguredProtectionMatch, ConfiguredProtections,
     FirstIntervention, FootprintLevel, ForceEscalation, ForegroundStatus, GlobalPressureTrigger,
     InterventionPlan, InventoryEvidence, MemoryEvaluation, MemoryGuardState, MemoryIncident,
-    MemorySnapshot, ProtectionTable as ConfiguredProtectionTable, configured_protections,
-    evaluate_memory_guard, plan_intervention,
+    MemorySnapshot, configured_protections, evaluate_memory_guard, plan_intervention,
 };
 pub use protection::{
     CONTROL_PLANE_BUNDLE_IDENTIFIER, CONTROL_PLANE_EXECUTABLES, ControlPlaneProcess,

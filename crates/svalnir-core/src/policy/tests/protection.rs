@@ -232,8 +232,9 @@ fn missing_evidence_is_unknown_and_not_unprotected() {
 
 mod explanation {
     use super::super::super::{
-        ControlPlaneProcess, HardProtectionEntry, HardProtectionExplanation, ProtectionContext,
-        ProtectionMember, ProtectionUnknownCause, explain_hard_protection, hard_protection,
+        CONTROL_PLANE_BUNDLE_IDENTIFIER, ControlPlaneProcess, HardProtectionEntry,
+        HardProtectionExplanation, ProtectionContext, ProtectionMember, ProtectionUnknownCause,
+        explain_hard_protection, hard_protection,
     };
     use super::{USER, context, member, with_bundle, with_path};
     use crate::process::{Pid, ProcessIdentity, Uid};
@@ -279,7 +280,12 @@ mod explanation {
             HardProtectionEntry::SessionApplication
         );
         assert_eq!(
-            entry(&[with_bundle("dev.svalnir.gui")], &context(&[])),
+            entry(
+                &[with_bundle(&format!(
+                    "{CONTROL_PLANE_BUNDLE_IDENTIFIER}.gui"
+                ))],
+                &context(&[])
+            ),
             HardProtectionEntry::ControlPlaneBundle
         );
         assert_eq!(

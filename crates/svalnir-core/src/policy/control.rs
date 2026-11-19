@@ -200,7 +200,7 @@ impl EvaluationContext<'_> {
 }
 
 /// The incident state of one trigger (`docs/POLICY_SPEC.md` section 8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TriggerState {

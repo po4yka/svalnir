@@ -81,74 +81,69 @@ pub enum ThresholdUnit {
     Count,
 }
 
-/// The fields of the configuration schema that are a size in bytes.
-const SIZE_FIELDS: [&str; 10] = [
-    "warn_below",
-    "reclaim_below",
-    "emergency_below",
-    "recover_above",
-    "batch_limit",
-    "pass_limit",
-    "incident_limit",
-    "footprint_soft",
-    "footprint_stop",
-    "footprint_recover",
-];
+/// The unit of each field of each table that has a threshold. The table
+/// `memory_guard.app_budgets[]` stands for each application budget.
+const THRESHOLD_FIELDS: [(&str, &str, ThresholdUnit); 34] = {
+    use ThresholdUnit::{Bytes as B, Count as C, Nanoseconds as T};
+    [
+        ("agent", "sample_interval", T),
+        ("agent", "pressure_sample_interval", T),
+        ("agent", "decision_sample_max_age", T),
+        ("agent", "max_qualifying_sample_gap", T),
+        ("agent", "plan_ttl", T),
+        ("agent", "manual_plan_ttl", T),
+        ("disk_guard", "warn_below", B),
+        ("disk_guard", "reclaim_below", B),
+        ("disk_guard", "emergency_below", B),
+        ("disk_guard", "recover_above", B),
+        ("disk_guard", "sustain_for", T),
+        ("disk_guard", "emergency_sustain_for", T),
+        ("disk_guard", "recovery_stable_for", T),
+        ("disk_guard", "batch_limit", B),
+        ("disk_guard", "pass_limit", B),
+        ("disk_guard", "incident_limit", B),
+        ("disk_guard", "batch_item_limit", C),
+        ("disk_guard", "pass_item_limit", C),
+        ("disk_guard", "incident_item_limit", C),
+        ("disk_guard", "pass_time_limit", T),
+        ("disk_guard", "max_passes_per_incident", C),
+        ("disk_guard", "pass_cooldown", T),
+        ("disk_guard", "observe_after_action", T),
+        ("disk_guard", "no_effect_backoff", T),
+        ("memory_guard", "sustain_for", T),
+        ("memory_guard", "grace_period", T),
+        ("memory_guard", "observe_after_action", T),
+        ("memory_guard", "recovery_stable_for", T),
+        ("memory_guard", "max_applications_per_incident", C),
+        ("memory_guard.app_budgets[]", "footprint_soft", B),
+        ("memory_guard.app_budgets[]", "footprint_stop", B),
+        ("memory_guard.app_budgets[]", "footprint_recover", B),
+        ("memory_guard.app_budgets[]", "over_limit_for", T),
+        ("memory_guard.app_budgets[]", "cooldown", T),
+    ]
+};
 
-/// The fields of the configuration schema that are a time.
-const TIME_FIELDS: [&str; 16] = [
-    "sustain_for",
-    "emergency_sustain_for",
-    "recovery_stable_for",
-    "pass_time_limit",
-    "pass_cooldown",
-    "observe_after_action",
-    "no_effect_backoff",
-    "grace_period",
-    "over_limit_for",
-    "cooldown",
-    "sample_interval",
-    "pressure_sample_interval",
-    "decision_sample_max_age",
-    "max_qualifying_sample_gap",
-    "plan_ttl",
-    "manual_plan_ttl",
-];
-
-/// The fields of the configuration schema that are a count.
-const COUNT_FIELDS: [&str; 5] = [
-    "batch_item_limit",
-    "pass_item_limit",
-    "incident_item_limit",
-    "max_passes_per_incident",
-    "max_applications_per_incident",
-];
-
-/// The tables of the configuration schema that have a threshold.
-const THRESHOLD_TABLES: [&str; 3] = ["agent", "disk_guard", "memory_guard"];
+/// The prefix of the key of a threshold of an application budget.
+const BUDGET_PREFIX: &str = "memory_guard.app_budgets[";
 
 /// The unit of the threshold with the key path `key`. `None` when the key
 /// is not a key that [`PolicyScope::of`] makes: this build does not know the
 /// unit of its value.
 ///
-/// The unit comes from the field name, which is the text after the last
-/// `.` of the key path. The identifier of an application budget is in
-/// brackets before that point, so it has no effect.
+/// The key is `TABLE.FIELD`, or `memory_guard.app_budgets[ID].FIELD` for an
+/// application budget. The unit is the unit of that field in that table.
 pub fn threshold_unit(key: &str) -> Option<ThresholdUnit> {
-    let (table, _) = key.split_once('.')?;
-    if !THRESHOLD_TABLES.contains(&table) {
-        return None;
-    }
-    let (_, field) = key.rsplit_once('.')?;
-    if SIZE_FIELDS.contains(&field) {
-        Some(ThresholdUnit::Bytes)
-    } else if TIME_FIELDS.contains(&field) {
-        Some(ThresholdUnit::Nanoseconds)
-    } else if COUNT_FIELDS.contains(&field) {
-        Some(ThresholdUnit::Count)
-    } else {
-        None
-    }
+    let (table, field): (&str, &str) = match key.strip_prefix(BUDGET_PREFIX) {
+        Some(rest) => {
+            let (_, field) = rest.rsplit_once("].")?;
+            ("memory_guard.app_budgets[]", field)
+        }
+        None => key.split_once('.')?,
+    };
+    THRESHOLD_FIELDS
+        .iter()
+        .find(|(known_table, known_field, _)| *known_table == table && *known_field == field)
+        .map(|(_, _, unit)| *unit)
 }
 
 /// The value of a [`Threshold`] with its unit.

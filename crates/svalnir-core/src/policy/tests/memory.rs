@@ -1463,7 +1463,8 @@ fn a_stale_application_list_blocks_a_ready_budget_and_proves_no_absence() {
 #[test]
 fn the_configured_protections_of_an_instance_agree_with_the_decision() {
     use crate::file::LosslessPath;
-    use crate::policy::{ConfiguredProtectionTable, ConfiguredProtections, configured_protections};
+    use crate::grant::ProtectionTable;
+    use crate::policy::{ConfiguredProtections, configured_protections};
 
     let mut harness: Harness = Harness::new();
     let home: LosslessPath = LosslessPath::from_bytes("/Users/tester").unwrap();
@@ -1492,8 +1493,9 @@ fn the_configured_protections_of_an_instance_agree_with_the_decision() {
         assert_eq!(read, detail.into_iter().collect::<Vec<_>>(), "{name}");
         assert!(!reading.home_unresolved);
         assert!(!reading.executable_unknown);
+        assert!(!reading.path_not_canonical);
         if let Some(found) = reading.matches.first() {
-            assert_eq!(found.table, ConfiguredProtectionTable::MemoryGuard);
+            assert_eq!(found.table, ProtectionTable::MemoryGuard);
         }
     }
     let matched =

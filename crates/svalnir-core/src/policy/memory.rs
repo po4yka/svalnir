@@ -38,6 +38,7 @@ use crate::config::{
     AppBudget, BundleId, EligibleGroup, GlobalTrigger, MemoryGuard, ValidatedConfig,
 };
 use crate::file::LosslessPath;
+use crate::grant::ProtectionTable;
 use crate::id::{ApplicationInstanceId, MembershipSnapshotId};
 use crate::observation::{Coverage, MetricId, Observation, Sample, Scope, ScopeKind, metric};
 use crate::process::{ProcessAssociation, ProcessIdentity, VerifiedMembership};
@@ -361,17 +362,6 @@ fn protected_path_set(config: &ValidatedConfig, home: Option<&LosslessPath>) -> 
     )
 }
 
-/// The configuration table of a configured protection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtectionTable {
-    /// The `[protections]` table, which applies to each action.
-    Protections,
-    /// The `[memory_guard]` table, which applies to automatic memory
-    /// intervention.
-    MemoryGuard,
-}
-
 /// One configured protection that matches a process of an instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ConfiguredProtectionMatch {
@@ -400,6 +390,11 @@ pub struct ConfiguredProtections {
     /// [`ReasonDetail::ExecutableUnknown`]: no path match is not evidence of
     /// no protection.
     pub executable_unknown: bool,
+    /// True when an executable path is not absolute or has a `.` or `..`
+    /// component. A path entry is not applied to such a path, so no path
+    /// match is not evidence of no protection. The evaluation gives
+    /// [`ReasonDetail::PathNotCanonical`].
+    pub path_not_canonical: bool,
 }
 
 /// The configured protections that match `processes`: the bundle
@@ -463,6 +458,10 @@ pub fn configured_protections(
         || !guard.protected_executable_paths.is_empty();
     result.executable_unknown =
         has_paths && processes.iter().any(|process| process.executable.is_none());
+    result.path_not_canonical = !processes
+        .iter()
+        .filter_map(|process| process.executable.as_ref())
+        .all(|executable| is_canonical(&executable.path));
     result
 }
 

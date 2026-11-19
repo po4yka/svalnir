@@ -19,6 +19,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use svalnir_core::authority::Generation;
+use svalnir_core::config::MAX_APP_BUDGETS;
 use svalnir_core::grant::{
     AuthorityState, BudgetGenerationRecord, ControlClock, GenerationBasis, IncidentBudget,
     MAX_BUDGET_GENERATIONS, PauseStatus, pause_status,
@@ -379,7 +380,8 @@ pub struct ControllerReading {
     pub written_at: Option<WallTime>,
     /// True when a clean stop wrote the record.
     pub clean_stop: bool,
-    /// The application budgets, in the sequence of the record.
+    /// The application budgets, in the sequence of the record, at most
+    /// [`MAX_APP_BUDGETS`].
     pub budgets: Vec<BudgetReading>,
     /// The cooldowns, at most [`MAX_APPLICATION_COOLDOWNS`] of applications
     /// and one of each kind for each incident.
@@ -436,6 +438,7 @@ fn budget_triggers(status: Option<&ControllerStatus>) -> Vec<(String, Option<Tri
         .iter()
         .filter(|guard| guard.guard == Guard::Memory)
         .flat_map(|guard| guard.triggers.iter())
+        .take(MAX_APP_BUDGETS.saturating_add(1))
         .filter_map(|text| {
             let rest: &str = text.strip_prefix("budget.")?;
             let (budget_id, state) = rest.rsplit_once(':')?;
@@ -444,29 +447,10 @@ fn budget_triggers(status: Option<&ControllerStatus>) -> Vec<(String, Option<Tri
         .collect()
 }
 
-/// The trigger state with the JSON spelling `text`.
+/// The trigger state with the JSON spelling `text`. `None` for a text that
+/// is not a state of this build.
 fn trigger_state(text: &str) -> Option<TriggerState> {
-    use TriggerState as State;
-    [
-        State::Normal,
-        State::Advisory,
-        State::Qualifying,
-        State::Ready,
-        State::Acting,
-        State::Recovering,
-        State::Held,
-        State::Cooldown,
-        State::Exhausted,
-        State::Blocked,
-    ]
-    .into_iter()
-    .find(|state| {
-        serde_json::to_value(state)
-            .ok()
-            .as_ref()
-            .and_then(|value| value.as_str())
-            == Some(text)
-    })
+    serde_json::from_value(serde_json::Value::String(text.to_owned())).ok()
 }
 
 /// The application budgets of `state`, with the trigger state of each one
@@ -481,6 +465,7 @@ fn budget_readings(
         .memory
         .budgets
         .iter()
+        .take(MAX_APP_BUDGETS)
         .map(|budget| BudgetReading {
             budget_id: budget.budget_id.clone(),
             latched: budget.latched,
@@ -620,7 +605,7 @@ fn controller_reading(
     clock: &EvaluationClock,
 ) -> ControllerReading {
     let state: &ControllerState = &stored.record;
-    let mut truncated: bool = false;
+    let mut truncated: bool = state.policy.memory.budgets.len() > MAX_APP_BUDGETS;
     let mut cooldowns: Vec<CooldownReading> = policy_cooldowns(state, clock, &mut truncated);
     let (incidents, incident_cooldowns) = incident_readings(journal, state, clock, &mut truncated);
     cooldowns.extend(incident_cooldowns);
@@ -632,7 +617,12 @@ fn controller_reading(
         cooldowns,
         incidents,
         truncated,
-        held_until_recovery: state.held_until_recovery.clone(),
+        held_until_recovery: state
+            .held_until_recovery
+            .iter()
+            .take(Guard::ALL.len())
+            .copied()
+            .collect(),
         outstanding: state.outstanding.as_ref().map(|plan| OutstandingReading {
             guard: plan.guard,
             incident_id: plan.incident_id.clone(),
@@ -798,7 +788,10 @@ pub fn read_agent_records(
 }
 
 /// Opens the journal at `journal_path` for reads only and reads its agent
-/// records at `clock`. The function makes no file and writes nothing.
+/// records at `clock`. The function does not make the journal and does not
+/// change its main file. When the `-wal` and `-shm` files of the journal do
+/// not exist, the read makes both of them, and the `-wal` file is empty
+/// (see [`OperationJournal::open_read_only`]).
 #[must_use]
 pub fn read_agent_records_at(
     journal_path: &Path,

@@ -19,8 +19,8 @@ use crate::{
     },
 };
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Entity, Pixels, WindowAppearance, WindowBounds,
-    WindowOptions,
+    ActivationPolicy, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Pixels,
+    WindowAppearance, WindowBounds, WindowOptions,
     base::{ReduceMotionPreference, set_reduce_motion_preference},
     component::TitleBar,
     px, size,
@@ -379,9 +379,23 @@ pub fn open_main_window_with_model(
     })
 }
 
+/// The activation policy of the client with `windows` open windows: with
+/// the menu bar item and no window, the client is an accessory application,
+/// with no Dock icon and no entry in the application switcher (owner
+/// decision of 2026-11-19); else a regular application.
+#[must_use]
+pub const fn dock_policy(item: bool, windows: usize) -> ActivationPolicy {
+    if item && windows == 0 {
+        ActivationPolicy::Accessory
+    } else {
+        ActivationPolicy::Regular
+    }
+}
+
 /// What the client does when its last window closed. With no menu bar item
-/// (`item` is false), it quits. With the item, it keeps running: no screen is
-/// in front, so the model reads only the host, the agent, and the standing
+/// (`item` is false), it quits. With the item, it keeps running and leaves
+/// the Dock and the application switcher ([`dock_policy`]): no screen is in
+/// front, so the model reads only the host, the agent, and the standing
 /// topics of the item, at the inactive interval, and a stop dialog that was
 /// open closes with no record, as when the user closes it.
 pub fn after_last_window_closed(item: bool, model: &Entity<AppModel>, cx: &mut App) {
@@ -389,6 +403,7 @@ pub fn after_last_window_closed(item: bool, model: &Entity<AppModel>, cx: &mut A
         cx.quit();
         return;
     }
+    cx.set_activation_policy(dock_policy(item, 0));
     model.update(cx, |model, cx| {
         model.set_active(false, cx);
         model.set_topics(&[], cx);
@@ -412,6 +427,8 @@ fn show_main_window(
             tracing::debug!("the window closed before it came to the front");
         }
     } else {
+        // A window comes back, so the client is in the Dock again.
+        cx.set_activation_policy(dock_policy(true, 1));
         let bounds = Bounds::centered(None, size(px(window_size.0), px(window_size.1)), cx);
         if let Err(error) = open_main_window_with_model(bounds, model.clone(), appearance, cx) {
             tracing::error!(%error, "cannot open the main window");
@@ -535,6 +552,13 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<LaunchOptions, String> {
         parse_args(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    #[test]
+    fn the_client_leaves_the_dock_only_with_the_item_and_no_window() {
+        assert_eq!(dock_policy(true, 0), ActivationPolicy::Accessory);
+        assert_eq!(dock_policy(true, 1), ActivationPolicy::Regular);
+        assert_eq!(dock_policy(false, 0), ActivationPolicy::Regular);
     }
 
     #[test]

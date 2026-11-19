@@ -269,10 +269,9 @@ impl LivePort {
                 };
                 let completion: RequestCompletion = self.send(body, DECISION_WAIT)?;
                 Ok(match completion {
-                    RequestCompletion::Stopped { .. } => accepted(
-                        "The stop fence is recorded. The agent dispatches no further step. A call that was issued is not recalled, so the operation can end as Partial, Incomplete, or UnknownOutcome."
-                            .to_owned(),
-                    ),
+                    RequestCompletion::Stopped { .. } => {
+                        accepted(super::CANCEL_ACCEPTED.to_owned())
+                    }
                     _ => ActionState::refused(UNEXPECTED_COMPLETION),
                 })
             }

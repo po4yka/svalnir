@@ -101,6 +101,14 @@ pub fn agent_summary(state: &AgentState, now: SystemTime) -> (&'static str, Tone
                 age(*last)
             ),
         ),
+        AgentState::Stopped { at } => (
+            "Not running",
+            Tone::Warning,
+            format!(
+                "The agent recorded that it stopped {}. No automatic protection is active.",
+                age(*at)
+            ),
+        ),
         AgentState::NoRecord => (
             "Not running",
             Tone::Warning,
@@ -1125,6 +1133,9 @@ mod tests {
             sentence.starts_with("The agent wrote its status "),
             "{sentence}"
         );
+        let (text, _, sentence) = agent_summary(&AgentState::Stopped { at: now }, now);
+        assert_eq!(text, "Not running");
+        assert!(sentence.contains("recorded that it stopped"), "{sentence}");
         let (text, _, sentence) = agent_summary(&AgentState::Silent { last: now }, now);
         assert_eq!(text, "Not reporting");
         assert!(

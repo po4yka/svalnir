@@ -9,7 +9,7 @@
 )]
 
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Pixels, Point, TestAppContext, px, size,
     test::TestWindowExt as _,
 };
 use std::sync::Arc;
@@ -71,6 +71,16 @@ fn click(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.run_until_parked();
+}
+
+fn bounds_of(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> Option<Bounds<Pixels>> {
+    let mut found: Option<Bounds<Pixels>> = None;
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        found = window.try_find(id.to_owned()).map(|node| node.bounds());
+    })
+    .unwrap();
+    found
 }
 
 fn state_of(
@@ -262,14 +272,19 @@ fn an_unknown_outcome_has_an_acknowledgment_and_an_admitted_operation_a_cancel(
     );
     assert!(label(handle, "history-acknowledge-op_fixture_00zz", cx).is_some());
     assert_eq!(label(handle, "history-cancel-op_fixture_00zz", cx), None);
-    click(handle, "history-cancel-op_fixture_0002", cx);
-    let text = label(handle, "history-action-op_fixture_0002", cx).expect("state line");
-    assert!(text.starts_with("Accepted: Cancel is accepted."), "{text}");
+    // The acknowledgment first: the state line of the cancel wraps in its
+    // cell and moves the later rows down.
     click(handle, "history-acknowledge-op_fixture_00zz", cx);
     assert!(matches!(
         state_of(&view, &Slot::Operation("op_fixture_00zz".to_owned()), cx),
         Some(ActionState::Accepted { .. })
     ));
+    click(handle, "history-cancel-op_fixture_0002", cx);
+    let text = label(handle, "history-action-op_fixture_0002", cx).expect("state line");
+    assert!(
+        text.starts_with("Accepted: The stop fence is recorded."),
+        "{text}"
+    );
 }
 
 /// The first group that the catalog does not protect: its instance and
@@ -492,4 +507,54 @@ fn the_stop_confirmation_lists_each_bound_target_with_its_evidence(cx: &mut Test
         assert!(row.contains("start "), "{row}");
     }
     assert_eq!(label(handle, "confirm-more", cx), None);
+}
+
+/// Regression for D-9: the button row of the stop confirmation was wider
+/// than the dialog, so a button with a long application name was outside
+/// the left edge of the dialog.
+#[gpui_kit::test]
+fn the_stop_buttons_stay_inside_the_dialog_with_a_long_name(cx: &mut TestAppContext) {
+    let (handle, _view) = open(
+        FixtureSource::new(FixtureScenario::Healthy),
+        Screen::Applications,
+        cx,
+    );
+    let name = "com.example.sync.agent.background-transfer-service";
+    click(handle, &format!("applications-stop-fixture-{name}"), cx);
+    let object = bounds_of(handle, "confirm-object", cx).expect("object");
+    let footer = bounds_of(handle, "confirm-footer", cx).expect("footer");
+    assert!(
+        footer.left() >= object.left() - px(1.0) && footer.right() <= object.right() + px(1.0),
+        "footer {footer:?}, body {object:?}"
+    );
+    for id in ["confirm-cancel", "confirm-ok", "confirm-force"] {
+        let button = bounds_of(handle, id, cx).expect(id);
+        assert!(
+            button.left() >= footer.left() && button.right() <= footer.right(),
+            "{id} {button:?}, footer {footer:?}"
+        );
+    }
+    // The accessible label keeps the full name.
+    let force = label(handle, "confirm-force", cx).expect("force");
+    assert_eq!(force, format!("Force quit {name}"));
+}
+
+/// Regression for D-10: the state line of a cancel overflowed the State
+/// column and covered the "Observed change" column.
+#[gpui_kit::test]
+fn the_state_line_of_a_cancel_stays_in_the_state_column(cx: &mut TestAppContext) {
+    let (handle, _view) = open(
+        FixtureSource::new(FixtureScenario::Pressure),
+        Screen::History,
+        cx,
+    );
+    click(handle, "history-cancel-op_fixture_0002", cx);
+    let line = bounds_of(handle, "history-action-op_fixture_0002", cx).expect("state line");
+    let state = bounds_of(handle, "history-state-op_fixture_0002", cx).expect("pill");
+    let observed = bounds_of(handle, "history-observed-op_fixture_0002", cx).expect("observed");
+    assert!(line.left() >= state.left() - px(1.0), "{line:?} {state:?}");
+    assert!(
+        line.right() <= observed.left(),
+        "state line {line:?}, observed change {observed:?}"
+    );
 }

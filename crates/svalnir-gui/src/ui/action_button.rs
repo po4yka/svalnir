@@ -57,6 +57,7 @@ pub struct ActionButton {
     icon: Option<IconName>,
     disabled: bool,
     loading: bool,
+    fit: bool,
     on_click: Option<ClickHandler>,
 }
 
@@ -80,8 +81,18 @@ impl ActionButton {
             icon: None,
             disabled: false,
             loading: false,
+            fit: false,
             on_click: None,
         }
+    }
+
+    /// Lets the button shrink to the width of its container: a label that
+    /// does not fit ends with an ellipsis. The accessible label keeps the
+    /// full text.
+    #[must_use]
+    pub const fn fit(mut self) -> Self {
+        self.fit = true;
+        self
     }
 
     /// Shows a spinner in place of the icon and disables the button, while
@@ -135,6 +146,27 @@ fn darken(color: Hsla, amount: f32) -> Hsla {
         l: color.l * (1.0 - amount),
         ..color
     }
+}
+
+/// The focus ring: a gap in the surface color and a ring in the brand
+/// color.
+fn focus_ring(tokens: &Tokens) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: to_hsla(tokens.surface),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(2.0),
+            inset: false,
+        },
+        BoxShadow {
+            color: to_hsla(tokens.brand),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(4.0),
+            inset: false,
+        },
+    ]
 }
 
 /// The colors of a variant: the top and the bottom of the fill, the text,
@@ -198,22 +230,7 @@ impl RenderOnce for ActionButton {
                 linear_color_stop(to, 1.0),
             )
         };
-        let ring: Vec<BoxShadow> = vec![
-            BoxShadow {
-                color: to_hsla(tokens.surface),
-                offset: point(px(0.0), px(0.0)),
-                blur_radius: px(0.0),
-                spread_radius: px(2.0),
-                inset: false,
-            },
-            BoxShadow {
-                color: to_hsla(tokens.brand),
-                offset: point(px(0.0), px(0.0)),
-                blur_radius: px(0.0),
-                spread_radius: px(4.0),
-                inset: false,
-            },
-        ];
+        let ring: Vec<BoxShadow> = focus_ring(tokens);
         let handler: Option<ClickHandler> = self.on_click;
         let disabled: bool = self.disabled || self.loading;
         let reduce_motion: bool = cx.reduce_motion();
@@ -239,7 +256,6 @@ impl RenderOnce for ActionButton {
             .gap(tokens::SPACE_2)
             .items_center()
             .justify_center()
-            .flex_shrink_0()
             .rounded_full()
             .border_1()
             .border_color(edge)
@@ -271,6 +287,12 @@ impl RenderOnce for ActionButton {
                     .on_click(move |event, window, cx| handler(event, window, cx));
             }
         }
-        base.children(lead).child(div().child(self.label))
+        let label = div().child(self.label);
+        let (base, label) = if self.fit {
+            (base.min_w_0().max_w_full(), label.min_w_0().truncate())
+        } else {
+            (base.flex_shrink_0(), label)
+        };
+        base.children(lead).child(label)
     }
 }

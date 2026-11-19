@@ -31,6 +31,8 @@ pub fn action_status(
         .id(id.clone())
         .test_support()
         .aria_label(label)
+        .min_w_0()
+        .max_w_full()
         .gap(tokens::SPACE_1)
         .child(
             h_flex().child(

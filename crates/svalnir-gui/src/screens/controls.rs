@@ -113,9 +113,16 @@ pub fn enable_consequence(classes: &[ActionClass]) -> String {
     )
 }
 
+/// The button row of a dialog. A row that is wider than the dialog wraps,
+/// and a button that is wider than the dialog shrinks and truncates its
+/// label (the buttons use [`ActionButton::fit`]).
 fn footer(children: Vec<AnyElement>) -> AnyElement {
     h_flex()
+        .id("confirm-footer")
+        .test_support()
         .w_full()
+        .min_w_0()
+        .flex_wrap()
         .justify_end()
         .gap(tokens::SPACE_2)
         .children(children)
@@ -125,6 +132,7 @@ fn footer(children: Vec<AnyElement>) -> AnyElement {
 fn cancel_button(model: Option<Entity<AppModel>>) -> AnyElement {
     ActionButton::new("confirm-cancel", "Cancel")
         .variant(ButtonVariant::Secondary)
+        .fit()
         .on_click(move |_, window, cx| {
             if let Some(model) = &model {
                 model.update(cx, AppModel::close_stop);
@@ -143,6 +151,7 @@ fn confirm_button(
 ) -> AnyElement {
     ActionButton::new(id, label)
         .variant(variant)
+        .fit()
         .on_click(move |_, window, cx| {
             let action: Action = action.clone();
             model.update(cx, |model, cx| model.run_action(action, cx));
@@ -459,6 +468,7 @@ pub fn open_stop(
                         cancel_button(Some(model.clone())),
                         ActionButton::new("confirm-again", "Make new plans")
                             .variant(ButtonVariant::Secondary)
+                            .fit()
                             .on_click(move |_, _, cx| {
                                 again.update(cx, |model, cx| model.prepare_stop(&instance, &name, cx));
                             })

@@ -645,7 +645,7 @@ fn journal_card(
                 ))
                 .child(fact(
                     "diagnostics-journal-size",
-                    "Size of limit",
+                    "Size and size limit",
                     format!(
                         "{} of {}",
                         bytes_text(&journal.size),

@@ -141,6 +141,11 @@ impl ActionPort for FixturePort {
                     since: SystemTime::now(),
                 },
                 _ if is_authority(action) => AuthorityPath::Agent.annotate(accepted(action), true),
+                // The sentence of the live path, so that a fixture shows a
+                // state line of the real length.
+                Action::Cancel { .. } => ActionState::Accepted {
+                    detail: super::CANCEL_ACCEPTED.to_owned(),
+                },
                 _ => accepted(action),
             },
         };

@@ -486,6 +486,9 @@ const fn phase_name(phase: OperationPhase) -> &'static str {
 /// changed.
 pub const UNEXPECTED_COMPLETION: &str = "unexpected_completion";
 
+/// The sentence of an accepted cancel of an operation.
+pub const CANCEL_ACCEPTED: &str = "The stop fence is recorded. The agent dispatches no further step. A call that was issued is not recalled, so the operation can end as Partial, Incomplete, or UnknownOutcome.";
+
 /// The sentence of an error code of the coordinator, of the authority
 /// logic, or of this client.
 #[must_use]

@@ -176,6 +176,11 @@ pub enum AgentState {
         /// When the agent wrote the last status record.
         last: SystemTime,
     },
+    /// The status record says that the agent stopped, whatever its age.
+    Stopped {
+        /// When the agent wrote the status record.
+        at: SystemTime,
+    },
     /// The journal exists and has no status record.
     NoRecord,
     /// The records cannot be read; the text is the reason.
@@ -190,6 +195,7 @@ impl AgentState {
             Self::NoJournal => "no journal",
             Self::Reporting { .. } => "reporting",
             Self::Silent { .. } => "silent",
+            Self::Stopped { .. } => "stopped",
             Self::NoRecord => "no status",
             Self::Unknown(_) => "unknown",
         }
@@ -198,7 +204,10 @@ impl AgentState {
     /// Whether the records give no sign of a recent agent.
     #[must_use]
     pub const fn is_absent(&self) -> bool {
-        matches!(self, Self::NoJournal | Self::NoRecord | Self::Silent { .. })
+        matches!(
+            self,
+            Self::NoJournal | Self::NoRecord | Self::Silent { .. } | Self::Stopped { .. }
+        )
     }
 }
 

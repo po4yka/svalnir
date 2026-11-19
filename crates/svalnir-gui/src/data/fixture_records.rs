@@ -100,7 +100,7 @@ const PROCESSES: [FixtureProcess; 12] = [
     (
         377,
         "sync-agent",
-        Some("com.example.sync.agent"),
+        Some("com.example.sync.agent.background-transfer-service"),
         Some(96),
         70,
     ),
@@ -175,7 +175,7 @@ const GROUPS: [FixtureGroup; 6] = [
         },
     ),
     (
-        "com.example.sync.agent",
+        "com.example.sync.agent.background-transfer-service",
         GroupKind::ManagedJob,
         Foreground::Unknown,
         Protection::NotProtected,
@@ -579,7 +579,7 @@ fn quiet_rows(captured_at: SystemTime) -> ControllerRows {
         ],
         cooldowns: vec![
             relaunch(
-                "com.example.sync.agent",
+                "com.example.sync.agent.background-transfer-service",
                 CooldownState::Active {
                     remaining: Duration::from_secs(240),
                 },

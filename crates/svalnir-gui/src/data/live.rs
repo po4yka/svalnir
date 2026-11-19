@@ -26,7 +26,7 @@ use svalnir_agent::{
     journal::AgentRecord,
     observe::{self, ClientClock, DiskReading, Host},
     platform::{process::ProcessSnapshot, volume},
-    runtime::{AgentStatus, journal_path},
+    runtime::{AgentStatus, RunState, journal_path},
     scan::{
         CancellationToken, DirectoryRecord, EntryKind, EntryRecord, RegionCause, ScanCompletion,
         ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, WallScanClock, run_scan,
@@ -561,17 +561,24 @@ fn agent_state(journal_file: &Path) -> AgentState {
     };
     match journal.agent_record::<AgentStatus>(AgentRecord::Status) {
         Ok(None) => AgentState::NoRecord,
-        Ok(Some(stored)) => {
-            agent_state_from_status(system_time(stored.record.written_at), SystemTime::now())
-        }
+        Ok(Some(stored)) => agent_state_from_status(
+            stored.record.state,
+            system_time(stored.record.written_at),
+            SystemTime::now(),
+        ),
         Err(error) => AgentState::Unknown(format!("the status record cannot be read: {error}")),
     }
 }
 
-/// Classifies the age of the status record. A record dated ahead of `now`
-/// by at most `STATUS_FRESH` is clock skew and counts as fresh; a record
-/// dated further ahead is not trusted.
-fn agent_state_from_status(written: SystemTime, now: SystemTime) -> AgentState {
+/// Classifies the status record. A record whose run state is `stopped` is
+/// [`AgentState::Stopped`] at once, whatever its age. Any other record is
+/// classified by its age: a record dated ahead of `now` by at most
+/// `STATUS_FRESH` is clock skew and counts as fresh; a record dated further
+/// ahead is not trusted.
+fn agent_state_from_status(run: RunState, written: SystemTime, now: SystemTime) -> AgentState {
+    if run == RunState::Stopped {
+        return AgentState::Stopped { at: written };
+    }
     match now.duration_since(written) {
         Ok(age) if age < STATUS_FRESH => AgentState::Reporting { since: written },
         Ok(_) => AgentState::Silent { last: written },
@@ -608,22 +615,49 @@ mod tests {
     fn status_age_classification() {
         let now: SystemTime = UNIX_EPOCH + Duration::from_secs(10_000_000);
         let at = |back: u64| now - Duration::from_secs(back);
+        let running = RunState::Running;
         assert!(matches!(
-            agent_state_from_status(at(10), now),
+            agent_state_from_status(running, at(10), now),
             AgentState::Reporting { .. }
         ));
         assert!(matches!(
-            agent_state_from_status(at(120), now),
+            agent_state_from_status(running, at(120), now),
             AgentState::Silent { .. }
         ));
         assert!(matches!(
-            agent_state_from_status(now + Duration::from_secs(30), now),
+            agent_state_from_status(running, now + Duration::from_secs(30), now),
             AgentState::Reporting { .. }
         ));
         assert!(matches!(
-            agent_state_from_status(now + Duration::from_hours(24), now),
+            agent_state_from_status(running, now + Duration::from_hours(24), now),
             AgentState::Unknown(_)
         ));
+    }
+
+    /// Regression for D-11: a fresh record of a clean stop showed "Agent
+    /// reporting" for up to `STATUS_FRESH`.
+    #[test]
+    fn a_stopped_status_record_is_stopped_whatever_its_age() {
+        let now: SystemTime = UNIX_EPOCH + Duration::from_secs(10_000_000);
+        for written in [
+            now - Duration::from_secs(1),
+            now - Duration::from_secs(600),
+            now + Duration::from_secs(30),
+        ] {
+            assert_eq!(
+                agent_state_from_status(RunState::Stopped, written, now),
+                AgentState::Stopped { at: written }
+            );
+        }
+        for run in [RunState::Starting, RunState::Stopping] {
+            assert!(matches!(
+                agent_state_from_status(run, now - Duration::from_secs(1), now),
+                AgentState::Reporting { .. }
+            ));
+        }
+        let stopped = AgentState::Stopped { at: now };
+        assert_eq!(stopped.label(), "stopped");
+        assert!(stopped.is_absent());
     }
 
     fn record(

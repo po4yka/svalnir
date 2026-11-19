@@ -326,6 +326,25 @@ fn pragma_u64(connection: &Connection, name: &'static str) -> Result<u64, Operat
         .map_err(|_| OperationJournalError::row("pragma", name))
 }
 
+/// Sets `max_page_count` from [`JournalOptions::max_database_size`] and
+/// returns the limit in pages that is in effect. `SQLite` does not set a
+/// limit below the current page count; it returns the limit that is in
+/// effect.
+fn apply_page_limit(
+    connection: &Connection,
+    options: &JournalOptions,
+    page_size: u64,
+) -> Result<u64, OperationJournalError> {
+    let pages: u64 = (options.max_database_size.get() / page_size).clamp(1, MAX_PAGE_COUNT);
+    let applied: i64 = connection.pragma_update_and_check(
+        None,
+        "max_page_count",
+        i64::try_from(pages).unwrap_or(i64::MAX),
+        |row| row.get(0),
+    )?;
+    u64::try_from(applied).map_err(|_| OperationJournalError::row("pragma", "max_page_count"))
+}
+
 /// Sets one integer setting and checks that `SQLite` reports the value.
 fn set_checked(
     connection: &Connection,
@@ -413,17 +432,7 @@ impl OperationJournal {
         apply_settings(&connection, options)?;
 
         let page_size: u64 = pragma_u64(&connection, "page_size")?.max(1);
-        let pages: u64 = (options.max_database_size.get() / page_size).clamp(1, MAX_PAGE_COUNT);
-        // `SQLite` does not set a limit below the current page count; it
-        // returns the limit that is in effect.
-        let applied: i64 = connection.pragma_update_and_check(
-            None,
-            "max_page_count",
-            i64::try_from(pages).unwrap_or(i64::MAX),
-            |row| row.get(0),
-        )?;
-        let page_limit: u64 = u64::try_from(applied)
-            .map_err(|_| OperationJournalError::row("pragma", "max_page_count"))?;
+        let page_limit: u64 = apply_page_limit(&connection, options, page_size)?;
 
         schema::create(&mut connection)?;
         Ok(Self {
@@ -445,6 +454,10 @@ impl OperationJournal {
     /// Opens the existing journal file at `path` for reads only. The open
     /// does not make the file, makes no schema, and sets no pragma that
     /// writes; the connection is `SQLITE_OPEN_READ_ONLY` with `query_only`.
+    /// It sets `max_page_count` of the connection from
+    /// `JournalOptions::default()`, which each writer applies, so
+    /// [`Self::size`] reports the limit of the writer and not the default
+    /// limit of `SQLite`.
     /// A write method on the journal fails with a storage error.
     ///
     /// The database must have the current schema version. A file of zero
@@ -484,7 +497,11 @@ impl OperationJournal {
         }
         connection.pragma_update(None, "query_only", true)?;
         let page_size: u64 = pragma_u64(&connection, "page_size")?.max(1);
-        let page_limit: u64 = pragma_u64(&connection, "max_page_count")?;
+        // `max_page_count` is a setting of a connection and is not in the
+        // file. Each writer (the agent, the CLI, and the GPUI client) opens
+        // the journal with `JournalOptions::default()`, so this connection
+        // applies the same limit; the setting does not write to the file.
+        let page_limit: u64 = apply_page_limit(&connection, &options, page_size)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),

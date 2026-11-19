@@ -244,7 +244,10 @@ impl MainWindow {
             Loadable::Ready(snapshot) | Loadable::Stale(snapshot)
                 if matches!(
                     snapshot.state,
-                    AgentState::NoJournal | AgentState::NoRecord | AgentState::Silent { .. }
+                    AgentState::NoJournal
+                        | AgentState::NoRecord
+                        | AgentState::Silent { .. }
+                        | AgentState::Stopped { .. }
                 ) =>
             {
                 Some(
@@ -467,9 +470,10 @@ impl MainWindow {
                 match snapshot.state {
                     _ if matches!(model.agent, Loadable::Stale(_)) => tokens.muted_foreground,
                     AgentState::Reporting { .. } => tokens.positive,
-                    AgentState::NoJournal | AgentState::NoRecord | AgentState::Silent { .. } => {
-                        tokens.warning
-                    }
+                    AgentState::NoJournal
+                    | AgentState::NoRecord
+                    | AgentState::Silent { .. }
+                    | AgentState::Stopped { .. } => tokens.warning,
                     AgentState::Unknown(_) => tokens.muted_foreground,
                 },
             ),

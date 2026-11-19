@@ -276,7 +276,7 @@ fn applications_show_groups_protection_and_a_partial_sum(cx: &mut TestAppContext
     );
     assert_eq!(
         label(handle, "applications-relaunch-cooldown-0", cx).as_deref(),
-        Some("Stop of com.example.sync.agent: Active, 4 min left")
+        Some("Stop of com.example.sync.agent.background-transfer-service: Active, 4 min left")
     );
     let restart = label(handle, "applications-restart-note", cx).expect("note");
     assert!(

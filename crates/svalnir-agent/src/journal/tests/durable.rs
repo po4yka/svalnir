@@ -1146,6 +1146,30 @@ fn a_read_only_open_changes_no_main_file_and_makes_the_wal_siblings() {
     assert_eq!(wal.len(), 0);
 }
 
+/// Regression for D-8: a read-only connection reported the `SQLite`
+/// default `max_page_count` (about 17.6 TB) as the limit of the journal.
+#[test]
+fn a_read_only_open_reports_the_size_limit_of_the_writer() {
+    let fixture = Fixture::new();
+    let options = JournalOptions::default();
+    let writer = OperationJournal::open(&fixture.path(), &options).unwrap();
+    let written = writer.size().unwrap();
+    drop(writer);
+    let bytes_before = std::fs::read(fixture.path()).unwrap();
+
+    let reader = OperationJournal::open_read_only(&fixture.path()).unwrap();
+    let read = reader.size().unwrap();
+    drop(reader);
+
+    assert_eq!(read.limit, written.limit);
+    let page_size: u64 = read.page_size.get();
+    assert_eq!(
+        read.limit.get(),
+        options.max_database_size.get() / page_size * page_size
+    );
+    assert_eq!(std::fs::read(fixture.path()).unwrap(), bytes_before);
+}
+
 #[test]
 fn a_read_only_open_refuses_a_zero_byte_file() {
     let fixture = Fixture::new();

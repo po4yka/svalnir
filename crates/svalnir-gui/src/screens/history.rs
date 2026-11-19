@@ -540,7 +540,11 @@ fn state_cell(
             busy,
         ),
     });
+    // The width of the cell bounds the state line, so a long sentence wraps
+    // in the cell and does not cover the next column.
     v_flex()
+        .w_full()
+        .min_w_0()
         .gap(tokens::SPACE_1)
         .items_start()
         .child(pill)

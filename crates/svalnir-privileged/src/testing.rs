@@ -77,7 +77,7 @@ pub(crate) fn rule() -> RuleRef {
 }
 
 pub(crate) fn agent_code() -> CodeIdentity {
-    CodeIdentity::new("dev.svalnir.agent", "TEAM123456").unwrap()
+    CodeIdentity::new("dev.po4yka.svalnir.agent", "TEAM123456").unwrap()
 }
 
 pub(crate) fn session(audit_session: u32) -> NonZeroU32 {

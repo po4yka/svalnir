@@ -471,6 +471,29 @@ fn the_capacity_observations_of_an_operation_are_in_the_journal_for_each_client(
     assert_eq!(stored.resource_effects, view.resource_effects);
 }
 
+/// A client that waits for a queued request reads the journal. It must not
+/// read a settled record before the observations of the operation are
+/// there: it then shows a final result with no observation.
+#[test]
+fn the_journal_has_the_observations_before_the_settled_record() {
+    let mut bench = Bench::new();
+    bench.tree.file("a");
+    bench.measurements.0.lock().unwrap().capacity = [Some(1_000), Some(1_400)].into();
+    let plan = cleanup_plan(
+        "plan_1",
+        &bench.tree,
+        &ActionClass::DeleteSelectedFiles,
+        &["a"],
+        bench.clock.now(),
+    );
+    bench.store(&plan);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run(&mut coordinator, &bench.clock, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::Completed);
+    assert_eq!(*bench.observations_before_result.lock().unwrap(), [true]);
+}
+
 #[test]
 fn observations_that_the_journal_did_not_take_do_not_change_the_outcome() {
     let mut bench = Bench::new();

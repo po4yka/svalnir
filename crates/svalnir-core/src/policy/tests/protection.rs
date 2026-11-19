@@ -113,7 +113,11 @@ fn a_session_application_and_each_svalnir_component_are_protected() {
             "{bundle_identifier}"
         );
     }
-    for bundle_identifier in ["COM.APPLE.FINDER", "dev.svalnir", "dev.svalnir.gui"] {
+    for bundle_identifier in [
+        "COM.APPLE.FINDER",
+        "dev.po4yka.svalnir",
+        "dev.po4yka.svalnir.gui",
+    ] {
         assert_eq!(
             hard_protection(&[with_bundle(bundle_identifier)], &context(&[])),
             ProtectionFact::Protected,
@@ -122,7 +126,7 @@ fn a_session_application_and_each_svalnir_component_are_protected() {
     }
     // A prefix of the text is not a component of Svalnir.
     assert_eq!(
-        hard_protection(&[with_bundle("dev.svalnirx.tool")], &context(&[])),
+        hard_protection(&[with_bundle("dev.po4yka.svalnirx.tool")], &context(&[])),
         ProtectionFact::NotProtected
     );
     for path in [

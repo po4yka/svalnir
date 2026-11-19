@@ -38,7 +38,7 @@ pub const SESSION_BUNDLE_IDENTIFIERS: [&str; 10] = [
 
 /// The bundle identifier of Svalnir, and the prefix of the bundle
 /// identifiers of its components.
-pub const CONTROL_PLANE_BUNDLE_IDENTIFIER: &str = "dev.svalnir";
+pub const CONTROL_PLANE_BUNDLE_IDENTIFIER: &str = "dev.po4yka.svalnir";
 
 /// The file names of the Svalnir executables. The comparison ignores ASCII
 /// case.

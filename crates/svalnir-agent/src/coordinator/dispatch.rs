@@ -1518,11 +1518,8 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             drop(self.volatile.settle_operation(&operation_id));
             true
         } else {
-            self.flush(&mut active) && self.journal.record_operation(&active.operation).is_ok()
+            self.record_result(&mut active)
         };
-        if recorded && !active.volatile {
-            self.record_effects(&mut active);
-        }
         let unknown: bool = matches!(active.operation.state(), OperationState::UnknownOutcome);
         if let Some(stop) = &mut active.stop
             && !unknown
@@ -1543,6 +1540,22 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             return;
         }
         self.release(&mut active, time);
+    }
+
+    /// Writes the steps, the resource observations, and then the record of
+    /// an operation to the journal. Returns whether the journal has the
+    /// record of the operation.
+    ///
+    /// The observations are written before the record: a client that reads
+    /// a settled record from the journal then also reads the observations
+    /// of the operation. With the opposite sequence, a client can read the
+    /// result in the time between the two writes and show no observation.
+    fn record_result(&mut self, active: &mut Active) -> bool {
+        if !self.flush(active) {
+            return false;
+        }
+        self.record_effects(active);
+        self.journal.record_operation(&active.operation).is_ok()
     }
 
     /// Writes the resource observations of an operation to the journal,
@@ -1604,12 +1617,10 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             let Some(mut active) = self.parked.remove(&operation_id) else {
                 continue;
             };
-            let saved: bool =
-                self.flush(&mut active) && self.journal.record_operation(&active.operation).is_ok();
+            let saved: bool = self.record_result(&mut active);
             if saved {
                 active.unrecorded = false;
                 self.board.set_recorded(&operation_id, true);
-                self.record_effects(&mut active);
             }
             if saved && active.operation.state().is_settled() {
                 if let Some(stop) = &mut active.stop {

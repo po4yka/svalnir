@@ -51,5 +51,18 @@ pub fn diagnose(role: WorkerRole) -> CapabilityReport {
     build_report(ProbeSubject::current(role), host::now(), &HostProbes::new())
 }
 
+/// Runs each probe as [`diagnose`] does, for a process that uses
+/// `state_directory`.
+///
+/// The state-directory entry describes `state_directory`, which can be a
+/// directory other than the default one below the home directory.
+pub fn diagnose_in(role: WorkerRole, state_directory: &std::path::Path) -> CapabilityReport {
+    build_report(
+        ProbeSubject::current(role),
+        host::now(),
+        &HostProbes::new().with_state_directory(state_directory.to_path_buf()),
+    )
+}
+
 #[cfg(test)]
 mod tests;

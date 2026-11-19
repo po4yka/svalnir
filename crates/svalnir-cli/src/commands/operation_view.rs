@@ -318,11 +318,7 @@ impl OperationReport {
         if self.effects.moved_to_trash > 0 {
             notes.push(TRASH_NOTE);
         }
-        match &self.resource_effects {
-            Some(effects) if !effects.is_empty() => notes.push(CAPACITY_NOTE),
-            Some(_) => {}
-            None => notes.push(NO_MEASUREMENT_NOTE),
-        }
+        notes.extend(observation_note(self.resource_effects.as_deref()));
         if self.degraded_recording == Some(true) {
             notes.push(DEGRADED_NOTE);
         }
@@ -400,7 +396,7 @@ impl OperationReport {
             }
         }
         match &self.resource_effects {
-            None => out.push_str("  Observed capacity change: not recorded for this view\n"),
+            None => out.push_str("  Resource observation: not recorded for this view\n"),
             Some(effects) => {
                 for effect in effects {
                     render_effect(effect, out);
@@ -439,6 +435,23 @@ impl OperationReport {
         for note in &self.notes {
             put_line!(out, "  Note: {note}");
         }
+    }
+}
+
+/// The statement about the resource observations of a view. The capacity
+/// statement is only for a view with a capacity observation: a process
+/// stop has a memory-pressure observation and no capacity.
+fn observation_note(effects: Option<&[ResourceEffect]>) -> Option<&'static str> {
+    match effects {
+        Some(effects)
+            if effects
+                .iter()
+                .any(|effect| matches!(effect, ResourceEffect::Capacity(_))) =>
+        {
+            Some(CAPACITY_NOTE)
+        }
+        Some(_) => None,
+        None => Some(NO_MEASUREMENT_NOTE),
     }
 }
 
@@ -487,7 +500,19 @@ fn render_effect(effect: &ResourceEffect, out: &mut String) {
 mod tests {
     use svalnir_core::action::OperationState;
 
-    use super::EffectCounts;
+    use svalnir_core::action::ResourceEffect;
+
+    use super::{EffectCounts, NO_MEASUREMENT_NOTE, observation_note};
+
+    #[test]
+    fn only_a_capacity_observation_has_the_capacity_note() {
+        assert_eq!(observation_note(Some(&[])), None);
+        assert_eq!(
+            observation_note(Some(&[ResourceEffect::Unrecognized])),
+            None
+        );
+        assert_eq!(observation_note(None), Some(NO_MEASUREMENT_NOTE));
+    }
 
     #[test]
     fn an_empty_count_has_a_text() {

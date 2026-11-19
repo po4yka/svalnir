@@ -366,6 +366,42 @@ fn failure(failure: &ServiceFailure, effect: &str) -> ErrorBody {
     )
 }
 
+/// The time between two queries of the service manager after an unload.
+const UNLOAD_QUERY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The largest number of queries after an unload. With the interval, the
+/// command waits for no more than 5 s.
+const UNLOAD_QUERY_LIMIT: u32 = 50;
+
+/// Waits until the service manager no longer has the service.
+///
+/// The unload request returns before the service manager has removed the
+/// service, and a load in that time is refused. The wait has a bound: the
+/// command does not wait for a service that the service manager keeps.
+fn wait_until_unloaded(host: &dyn ServiceHost, uid: u32) -> Result<(), ErrorBody> {
+    for query in 0..UNLOAD_QUERY_LIMIT {
+        if query > 0 {
+            host.pause(UNLOAD_QUERY_INTERVAL);
+        }
+        let loaded: bool = host.is_loaded(uid, LAUNCH_AGENT_LABEL).map_err(|error| {
+            failure(
+                &error,
+                "the definition file is written, and the service manager got the request to unload an earlier registration; the command did not load the new definition; it loads at the next login, or run `svalnir agent install` again",
+            )
+        })?;
+        if !loaded {
+            return Ok(());
+        }
+    }
+    Err(service_error(
+        "service_unload_timeout",
+        format!(
+            "the service manager got the request to unload the earlier registration and did not remove it in {} s; the definition file is written, and the command did not load it; the earlier agent possibly runs until the service manager removes it; the new definition loads at the next login, or run `svalnir agent install` again",
+            (UNLOAD_QUERY_INTERVAL * UNLOAD_QUERY_LIMIT).as_secs()
+        ),
+    ))
+}
+
 /// The result of `agent install` and `agent uninstall`.
 #[derive(Debug, Clone, Serialize)]
 struct ServiceChangeView {
@@ -533,6 +569,7 @@ pub(crate) fn install(
             "the definition file is written, and an earlier registration was possibly not unloaded; the new definition loads at the next login",
         )
     })?;
+    wait_until_unloaded(host.as_ref(), uid)?;
     host.load(uid, &definition).map_err(|error| {
         failure(
             &error,

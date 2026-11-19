@@ -241,7 +241,7 @@ fn the_platform_check_verifies_a_peer_that_satisfies_its_requirement() {
     );
     let other: Served = Served::start(
         XpcTransport::anonymous(PeerPolicy::Require(agent_code()))
-            .with_requirement("identifier \"dev.svalnir.not-this-executable\""),
+            .with_requirement("identifier \"dev.po4yka.svalnir.not-this-executable\""),
         Arc::clone(&recorder) as Arc<dyn RequestHandler>,
     );
 

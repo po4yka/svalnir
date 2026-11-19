@@ -66,7 +66,7 @@ fn the_binary_exits_with_an_error_when_the_platform_refuses_the_registration() {
     assert!(stderr.starts_with("svalnir-privileged: "), "{stderr}");
     #[cfg(target_os = "macos")]
     assert!(
-        stderr.contains("refused the registration of the service `dev.svalnir.privileged`"),
+        stderr.contains("refused the registration of the service `dev.po4yka.svalnir.privileged`"),
         "{stderr}"
     );
     assert!(stderr.contains("The helper runs no operation."), "{stderr}");

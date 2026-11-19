@@ -120,6 +120,13 @@ fn main() -> ExitCode {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // The stream is a file when the service manager starts the agent:
+        // only a terminal gets the escape sequences of the colors, and not
+        // when `NO_COLOR` has a value.
+        .with_ansi(
+            std::io::IsTerminal::is_terminal(&std::io::stderr())
+                && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
+        )
         .with_writer(std::io::stderr)
         .init();
     agent::run(&options)

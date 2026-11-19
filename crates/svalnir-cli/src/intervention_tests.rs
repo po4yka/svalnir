@@ -1311,6 +1311,12 @@ struct RecordingHost {
     problem: ProgramProblem,
     calls: Mutex<Vec<String>>,
     fail_load: bool,
+    /// The number of queries after an unload that still find the service,
+    /// as the service manager of the host does for a short time. `None`:
+    /// the service is never removed.
+    late_removal: Option<u32>,
+    /// The queries since the last unload.
+    queries: Mutex<u32>,
 }
 
 impl Default for RecordingHost {
@@ -1320,6 +1326,8 @@ impl Default for RecordingHost {
             problem: ProgramProblem::NotFound,
             calls: Mutex::new(Vec::new()),
             fail_load: false,
+            late_removal: Some(0),
+            queries: Mutex::new(0),
         }
     }
 }
@@ -1359,7 +1367,18 @@ impl ServiceHost for RecordingHost {
 
     fn unload(&self, _uid: u32, label: &str) -> Result<(), ServiceFailure> {
         self.calls.lock().unwrap().push(format!("unload {label}"));
+        *self.queries.lock().unwrap() = 0;
         Ok(())
+    }
+
+    fn is_loaded(&self, _uid: u32, _label: &str) -> Result<bool, ServiceFailure> {
+        let mut queries = self.queries.lock().unwrap();
+        *queries += 1;
+        Ok(self.late_removal.is_none_or(|late| *queries <= late))
+    }
+
+    fn pause(&self, _interval: Duration) {
+        self.calls.lock().unwrap().push("pause".to_owned());
     }
 }
 
@@ -1378,7 +1397,7 @@ fn an_install_registers_an_observation_agent_through_the_service_host() {
     });
     let definition: PathBuf = world
         .path("home")
-        .join("Library/LaunchAgents/dev.svalnir.agent.plist");
+        .join("Library/LaunchAgents/dev.po4yka.svalnir.agent.plist");
     // No terminal and no `--yes`: no host effect.
     let refused = json(&world.environment, &["agent", "install"]);
     assert_eq!(refused.status, ExitStatus::Unavailable);
@@ -1399,7 +1418,7 @@ fn an_install_registers_an_observation_agent_through_the_service_host() {
     assert_eq!(result["service_manager"], "loaded");
     assert_eq!(
         *host.calls.lock().unwrap(),
-        ["write", "unload dev.svalnir.agent", "load"]
+        ["write", "unload dev.po4yka.svalnir.agent", "load"]
     );
     let text: String = std::fs::read_to_string(&definition).unwrap();
     assert!(
@@ -1631,7 +1650,7 @@ fn an_uninstall_unloads_the_service_and_removes_the_definition() {
     });
     let definition: PathBuf = world
         .path("home")
-        .join("Library/LaunchAgents/dev.svalnir.agent.plist");
+        .join("Library/LaunchAgents/dev.po4yka.svalnir.agent.plist");
     let installed = json(&world.environment, &["agent", "install", "--yes"]);
     assert_eq!(
         installed.status,
@@ -1651,7 +1670,7 @@ fn an_uninstall_unloads_the_service_and_removes_the_definition() {
     );
     assert_eq!(
         host.calls.lock().unwrap()[3..],
-        ["unload dev.svalnir.agent", "remove"]
+        ["unload dev.po4yka.svalnir.agent", "remove"]
     );
     assert!(!definition.exists());
     // The records of the state directory stay.
@@ -1696,8 +1715,60 @@ fn an_install_reports_a_missing_program_and_a_refused_load() {
     );
     assert_eq!(
         *host.calls.lock().unwrap(),
-        ["write", "unload dev.svalnir.agent", "load"]
+        ["write", "unload dev.po4yka.svalnir.agent", "load"]
     );
+}
+
+/// The service manager removes a service some time after the unload
+/// request returns, and it refuses a load in that time. A reinstall waits
+/// until the service is absent, and then loads the new definition.
+#[test]
+fn a_reinstall_waits_until_the_service_manager_removed_the_service() {
+    let (world, host) = world_with_host(RecordingHost {
+        program: Some(PathBuf::from("/opt/svalnir/bin/svalnir-agent")),
+        late_removal: Some(3),
+        ..RecordingHost::default()
+    });
+    let installed = json(&world.environment, &["agent", "install", "--yes"]);
+    assert_eq!(
+        installed.status,
+        ExitStatus::Success,
+        "{}",
+        installed.stdout
+    );
+    assert_eq!(
+        *host.calls.lock().unwrap(),
+        [
+            "write",
+            "unload dev.po4yka.svalnir.agent",
+            "pause",
+            "pause",
+            "pause",
+            "load"
+        ]
+    );
+}
+
+/// A service that the service manager keeps is not loaded again: the
+/// wait has a bound, and the error has its own code.
+#[test]
+fn a_reinstall_reports_a_service_that_the_service_manager_keeps() {
+    let (world, host) = world_with_host(RecordingHost {
+        program: Some(PathBuf::from("/opt/svalnir/bin/svalnir-agent")),
+        late_removal: None,
+        ..RecordingHost::default()
+    });
+    let refused = json(&world.environment, &["agent", "install", "--yes"]);
+    assert_eq!(
+        refused.status,
+        ExitStatus::Unavailable,
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.error_code(), "service_unload_timeout");
+    let calls = host.calls.lock().unwrap();
+    assert!(!calls.iter().any(|call| call == "load"), "{calls:?}");
+    assert_eq!(calls.iter().filter(|call| *call == "pause").count(), 49);
 }
 
 /// The body of a child process. Without the variable, which only the

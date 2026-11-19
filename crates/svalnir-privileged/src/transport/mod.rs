@@ -53,10 +53,10 @@ mod tests;
 
 /// The Mach service name of the helper. The launch daemon definition of
 /// the product registers this name; this crate registers nothing.
-pub const MACH_SERVICE_NAME: &str = "dev.svalnir.privileged";
+pub const MACH_SERVICE_NAME: &str = "dev.po4yka.svalnir.privileged";
 
 /// The signing identifier of the agent, the only caller of the helper.
-pub const AGENT_SIGNING_IDENTIFIER: &str = "dev.svalnir.agent";
+pub const AGENT_SIGNING_IDENTIFIER: &str = "dev.po4yka.svalnir.agent";
 
 /// The largest number of live peer connections of a transport.
 pub const MAX_PEER_CONNECTIONS: usize = 32;

@@ -35,7 +35,7 @@ use super::candidates::RuleCandidateSource;
 use super::driver::DriverParts;
 use super::ports::{AgentClock, Collector, Notifier, Sample, SelfFootprint};
 use super::record::CapabilitySummary;
-use crate::capability::{CapabilityReport, WorkerRole, diagnose};
+use crate::capability::{CapabilityReport, WorkerRole, diagnose_in};
 use crate::controller::Notification;
 use crate::coordinator::{IdSource, Measurements, SystemProbe, TimeReading};
 use crate::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
@@ -548,8 +548,8 @@ impl SelfFootprint for ProcessFootprint {
 
 /// The capability check of the start, as the status keeps it.
 #[must_use]
-pub fn capability_summary() -> CapabilitySummary {
-    let report: CapabilityReport = diagnose(WorkerRole::Agent);
+pub fn capability_summary(state_directory: &Path) -> CapabilitySummary {
+    let report: CapabilityReport = diagnose_in(WorkerRole::Agent, state_directory);
     CapabilitySummary {
         verdict: report.summary.verdict.as_str().to_owned(),
         required_not_available: report
@@ -660,7 +660,7 @@ pub fn system_parts(
         notifier: Box::new(LogNotifier),
         footprint: Box::new(ProcessFootprint),
         store,
-        capabilities: Some(capability_summary()),
+        capabilities: Some(capability_summary(state_directory)),
     };
     Ok(SystemParts {
         driver,

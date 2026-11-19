@@ -1254,6 +1254,9 @@ pub(super) struct FailingJournal {
     pub(super) failing: Arc<Mutex<BTreeSet<FailPoint>>>,
     /// The number of calls of `commit_intent` that reached the journal.
     pub(super) intents: Arc<AtomicU64>,
+    /// For each write of a settled operation record: whether the journal
+    /// had the resource observations of the operation before the write.
+    pub(super) observations_before_result: Arc<Mutex<Vec<bool>>>,
     /// Runs one time after the next dispatch consumption: after the
     /// intent and before the final check and the executor call.
     pub(super) after_consume: Arc<Mutex<Hook>>,
@@ -1333,6 +1336,16 @@ impl Journal for FailingJournal {
 
     fn record_operation(&mut self, operation: &Operation) -> Result<(), JournalError> {
         self.check(FailPoint::RecordOperation)?;
+        if operation.state().is_settled() {
+            let present: bool = self
+                .inner
+                .resource_effects(operation.operation_id())
+                .is_ok_and(|effects| !effects.is_empty());
+            self.observations_before_result
+                .lock()
+                .unwrap()
+                .push(present);
+        }
         self.inner.record_operation(operation)
     }
 
@@ -1530,6 +1543,8 @@ pub(super) struct Bench {
     pub(super) host: Host,
     pub(super) failing: Arc<Mutex<BTreeSet<FailPoint>>>,
     pub(super) intents: Arc<AtomicU64>,
+    /// The record of [`FailingJournal::observations_before_result`].
+    pub(super) observations_before_result: Arc<Mutex<Vec<bool>>>,
     pub(super) after_consume: Arc<Mutex<Hook>>,
     pub(super) trash_mode: TrashMode,
     /// The filesystem executor reports each submission as not certain.
@@ -1566,6 +1581,7 @@ impl Bench {
             clock,
             failing: Arc::new(Mutex::new(BTreeSet::new())),
             intents: Arc::new(AtomicU64::new(0)),
+            observations_before_result: Arc::new(Mutex::new(Vec::new())),
             after_consume: Arc::new(Mutex::new(Hook::default())),
             trash_mode,
             uncertain_submission: false,
@@ -1655,6 +1671,7 @@ impl Bench {
             inner: open_journal(&self.tree.database),
             failing: Arc::clone(&self.failing),
             intents: Arc::clone(&self.intents),
+            observations_before_result: Arc::clone(&self.observations_before_result),
             after_consume: Arc::clone(&self.after_consume),
         };
         let mut dependencies: Dependencies = self.dependencies(&prefix, &epoch);

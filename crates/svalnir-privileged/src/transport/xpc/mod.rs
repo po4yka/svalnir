@@ -75,7 +75,7 @@ pub const REQUEST_KEY: &CStr = c"request";
 pub const RESPONSE_KEY: &CStr = c"response";
 
 /// The label of the serial queue of the transport.
-const QUEUE_LABEL: &CStr = c"dev.svalnir.privileged.transport";
+const QUEUE_LABEL: &CStr = c"dev.po4yka.svalnir.privileged.transport";
 
 /// The code identity check of the transport.
 #[derive(Debug)]

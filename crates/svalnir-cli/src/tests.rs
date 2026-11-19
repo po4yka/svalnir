@@ -1038,6 +1038,53 @@ mod host {
         assert_eq!(envelope["result"]["agent_start_failure"]["state"], "none");
     }
 
+    /// An invalid state directory is a warning of `doctor`, not a report
+    /// of the default directory with no statement.
+    #[test]
+    fn doctor_warns_about_an_invalid_state_directory() {
+        let (mut environment, _directory) = environment();
+        environment.state_directory_override = Some("relative/state".into());
+        let outcome = run_with(&environment, &["doctor", "--format", "json"]);
+        assert_eq!(outcome.status, ExitStatus::Success);
+        let envelope = outcome.envelope();
+        assert_eq!(
+            envelope["warnings"][0]["code"], "invalid_state_directory",
+            "{envelope}"
+        );
+    }
+
+    /// The state-directory entry is for the directory of the invocation,
+    /// not for the default directory below the home directory.
+    #[test]
+    fn doctor_examines_the_state_directory_of_the_invocation() {
+        let (environment, _directory) = environment();
+        let state: std::path::PathBuf = environment.state_directory().unwrap();
+        let outcome = run_with(&environment, &["doctor", "--format", "json"]);
+        let envelope = outcome.envelope();
+        let entry = envelope["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "user.state_directory")
+            .unwrap();
+        let path = entry["evidence"]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fact| fact["name"] == "path")
+            .unwrap();
+        assert_eq!(path["value"], state.to_str().unwrap(), "{entry}");
+        let text = run_with(&environment, &["doctor"]);
+        assert!(
+            text.stdout.contains(&format!(
+                "Examined directories\n  user.state_directory: {}\n",
+                state.display()
+            )),
+            "{}",
+            text.stdout
+        );
+    }
+
     #[test]
     fn agent_status_and_doctor_show_the_start_failure_of_the_agent() {
         use svalnir_agent::runtime::start_failure::{

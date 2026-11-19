@@ -64,6 +64,10 @@ pub struct HostProbes {
     /// failed.
     account_home: Result<PathBuf, String>,
     root: PathBuf,
+    /// The state directory of this process, when it is not the default
+    /// directory below `home`: the directory of `SVALNIR_STATE_DIR` or of
+    /// the `--state-dir` option.
+    state_directory: Option<PathBuf>,
 }
 
 impl HostProbes {
@@ -97,7 +101,19 @@ impl HostProbes {
             home,
             account_home,
             root,
+            state_directory: None,
         }
+    }
+
+    /// Sets the state directory that the state-directory entry describes.
+    ///
+    /// The caller gives the directory that it uses, so the entry does not
+    /// describe the default directory when the process has a different
+    /// one. The log-directory entry does not change.
+    #[must_use]
+    pub fn with_state_directory(mut self, state_directory: PathBuf) -> Self {
+        self.state_directory = Some(state_directory);
+        self
     }
 
     /// Makes the probes for a different home directory and root directory.
@@ -113,6 +129,9 @@ impl HostProbes {
     }
 
     fn directory_path(&self, directory: UserDirectory) -> Option<PathBuf> {
+        if directory == UserDirectory::State && self.state_directory.is_some() {
+            return self.state_directory.clone();
+        }
         let home = self.home.as_ref()?;
         Some(match directory {
             UserDirectory::Home => home.clone(),
@@ -524,6 +543,41 @@ mod tests {
         HostProbes::with_roots(Some(temp.0.join("home")), temp.0.join("root"))
     }
 
+    /// A process with a state directory other than the default one gets
+    /// the entry for that directory. The log directory does not change.
+    #[test]
+    fn a_given_state_directory_replaces_the_default_one() {
+        let temp = TempDir::new("given-state");
+        fs::create_dir_all(temp.0.join("home")).unwrap();
+        fs::create_dir_all(temp.0.join("elsewhere/state")).unwrap();
+        let probes = probes_in(&temp).with_state_directory(temp.0.join("elsewhere/state"));
+
+        assert_eq!(
+            probes.user_directory(UserDirectory::State).finding,
+            DirectoryFinding::Present {
+                path: temp.0.join("elsewhere/state"),
+                is_directory: true,
+                readable: true,
+                writable: true,
+            }
+        );
+        assert_eq!(
+            probes.user_directory(UserDirectory::Logs).finding,
+            DirectoryFinding::Absent {
+                path: temp.0.join("home").join(LOG_DIRECTORY),
+                nearest_ancestor: temp.0.join("home"),
+                ancestor_writable: true,
+            }
+        );
+        // No home directory is necessary for a given state directory.
+        let probes = HostProbes::with_roots(None, temp.0.join("root"))
+            .with_state_directory(temp.0.join("elsewhere/state"));
+        assert!(matches!(
+            probes.user_directory(UserDirectory::State).finding,
+            DirectoryFinding::Present { .. }
+        ));
+    }
+
     #[test]
     fn an_absent_directory_is_reported_and_not_created() {
         let temp = TempDir::new("absent");
@@ -750,6 +804,46 @@ mod tests {
             protected_outcome(&io::Error::from_raw_os_error(libc::EIO)),
             ProtectedReadOutcome::Failed(_)
         ));
+    }
+
+    /// The service probe looks for names with the prefix, so the label and
+    /// the file name of the definition that `agent install` writes must
+    /// have it: with a different name, `doctor` does not see the agent.
+    #[test]
+    fn the_service_probe_finds_the_definition_of_the_installed_agent() {
+        use crate::runtime::launch_agent::{
+            LAUNCH_AGENT_FILE_NAME, LAUNCH_AGENT_LABEL, LaunchAgentDefinition, render,
+        };
+
+        let text: String = render(&LaunchAgentDefinition {
+            program: PathBuf::from("/opt/svalnir/bin/svalnir-agent"),
+            state_directory: PathBuf::from("/Users/example/state"),
+            config: None,
+            log: PathBuf::from("/Users/example/state/agent.log"),
+        })
+        .unwrap();
+        let label: &str = text
+            .split_once("<key>Label</key>\n\t<string>")
+            .and_then(|(_, rest)| rest.split_once("</string>"))
+            .map(|(label, _)| label)
+            .unwrap();
+        assert_eq!(label, LAUNCH_AGENT_LABEL);
+        assert!(label.starts_with(SERVICE_IDENTIFIER_PREFIX), "{label}");
+        assert_eq!(LAUNCH_AGENT_FILE_NAME, format!("{label}.plist"));
+
+        let temp = TempDir::new("installed-agent");
+        let user_agents = temp.0.join("home/Library/LaunchAgents");
+        fs::create_dir_all(&user_agents).unwrap();
+        fs::write(user_agents.join(LAUNCH_AGENT_FILE_NAME), text).unwrap();
+        let finding = probes_in(&temp)
+            .service(ServiceKind::BackgroundAgent)
+            .finding;
+        assert_eq!(
+            finding.locations.first().map(|location| &location.outcome),
+            Some(&ServiceLocationOutcome::Found(vec![
+                LAUNCH_AGENT_FILE_NAME.to_owned()
+            ]))
+        );
     }
 
     #[test]

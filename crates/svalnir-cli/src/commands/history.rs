@@ -3,9 +3,10 @@
 //! The view keeps apart, for each operation: the size estimates of its
 //! plan, the entries that were moved to Trash, the entries that were
 //! permanently removed, and the observed capacity change. The journal
-//! records the target results. The estimates and the capacity observations
-//! are in the plan document of the client that executed the operation, so
-//! a record of a different executor has none.
+//! records the target results and the resource observations of each
+//! operation, for each executor. The estimates are in the plan document of
+//! the client that prepared the plan, so a record of a plan with no
+//! document in this state directory has none.
 
 use serde::Serialize;
 use svalnir_agent::journal::OperationJournal;
@@ -31,7 +32,7 @@ pub(crate) const DEFAULT_LIMIT: usize = 20;
 /// The largest number of records of one query.
 pub(crate) const MAX_LIMIT: usize = 200;
 
-const HISTORY_NOTE: &str = "A size estimate is from the time of the plan and is not a result. A move to Trash is not reclaimed capacity. An observed capacity change includes other activity on the volume. The journal does not record the capacity observations: a record has them only for an operation that this client executed, and otherwise the value is not recorded. The journal is evidence for recovery; it is not an undo record.";
+const HISTORY_NOTE: &str = "A size estimate is from the time of the plan and is not a result. A move to Trash is not reclaimed capacity. An observed capacity change includes other activity on the volume. The coordinator that executed an operation records its resource observations in the journal, so a record has them for an operation of the agent and for an operation of a client; an operation with no observation in the journal shows the value as not in this view. The journal is evidence for recovery; it is not an undo record.";
 
 /// The size estimates of the plan of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

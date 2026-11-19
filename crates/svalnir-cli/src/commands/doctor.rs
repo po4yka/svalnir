@@ -58,6 +58,33 @@ pub(crate) fn render(report: &CapabilityReport) -> String {
             put_line!(out, "{hint}");
         }
     }
+    // The table has no path. A directory row shows which directory the
+    // probe examined: the state directory can be other than the default.
+    let directories: Vec<String> = report
+        .capabilities
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.id,
+                capability::CapabilityId::UserStateDirectory
+                    | capability::CapabilityId::UserLogDirectory
+            )
+        })
+        .filter_map(|entry| {
+            entry
+                .evidence
+                .facts
+                .iter()
+                .find(|fact| fact.name == "path")
+                .map(|fact| format!("  {}: {}", entry.id.as_str(), escape(&fact.value)))
+        })
+        .collect();
+    if !directories.is_empty() {
+        out.push_str("\nExamined directories\n");
+        for directory in directories {
+            put_line!(out, "{directory}");
+        }
+    }
     let not_available = |ids: &[capability::CapabilityId]| -> String {
         ids.iter()
             .map(|id| id.as_str())
@@ -98,8 +125,24 @@ fn render_view(view: &DoctorView) -> String {
 }
 
 pub(crate) fn run(invocation: &mut Invocation<'_>) -> Result<ExitStatus, CommandFailure> {
+    // The state-directory entry is for the directory that this invocation
+    // uses. With no usable state directory, the entry is for the default
+    // directory, and a warning says why: each other command refuses then.
+    let report: CapabilityReport = match invocation.environment.state_directory() {
+        Ok(state_directory) => capability::diagnose_in(WorkerRole::Cli, &state_directory),
+        Err(error) => {
+            invocation.warnings.push(crate::output::Warning {
+                code: error.code.clone(),
+                message: format!(
+                    "{}; the row `user.state_directory` is for the default directory, which the other commands do not use",
+                    error.message
+                ),
+            });
+            capability::diagnose(WorkerRole::Cli)
+        }
+    };
     let view = DoctorView {
-        report: capability::diagnose(WorkerRole::Cli),
+        report,
         agent_start_failure: StartFailureView::read(invocation.environment),
     };
     invocation.emit(Kind::Report, &view, render_view)?;

@@ -232,7 +232,7 @@ impl PressureSubscription {
         // A serial queue: the handlers of the source do not run at the same
         // time.
         let queue: DispatchRetained<DispatchQueue> =
-            DispatchQueue::new("dev.svalnir.agent.memory-pressure", None);
+            DispatchQueue::new("dev.po4yka.svalnir.agent.memory-pressure", None);
         let source_type: dispatch_source_type_t =
             (&raw const _dispatch_source_type_memorypressure).cast_mut();
         // SAFETY: the type is the memory-pressure source type of libdispatch,

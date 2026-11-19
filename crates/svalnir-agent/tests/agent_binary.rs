@@ -287,6 +287,11 @@ fn failure_line(lines: &[String], code: &str) {
         .collect();
     assert_eq!(failures.len(), 1, "{lines:?}");
     assert!(failures[0].contains(code), "{lines:?}");
+    // The stream is not a terminal: a log file gets no escape sequence.
+    assert!(
+        lines.iter().all(|line| !line.contains('\u{1b}')),
+        "{lines:?}"
+    );
 }
 
 #[test]

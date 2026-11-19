@@ -111,8 +111,8 @@ fn a_caller_that_is_not_the_agent_is_refused() {
     // helper settings: another executable of the team, and the agent
     // identifier of another team.
     for (identifier, team) in [
-        ("dev.svalnir.cli", "TEAM123456"),
-        ("dev.svalnir.agent", "OTHERTEAM1"),
+        ("dev.po4yka.svalnir.cli", "TEAM123456"),
+        ("dev.po4yka.svalnir.agent", "OTHERTEAM1"),
     ] {
         let other: FakePeer = FakePeer::verified(
             CodeIdentity::new(identifier, team).unwrap(),

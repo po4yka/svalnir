@@ -20,7 +20,7 @@ fn the_requirement_names_the_identifier_the_anchor_and_the_team() {
 
     assert_eq!(
         text,
-        "identifier \"dev.svalnir.agent\" and anchor apple generic \
+        "identifier \"dev.po4yka.svalnir.agent\" and anchor apple generic \
          and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
          and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
          and certificate leaf[subject.OU] = \"TEAM123456\""
@@ -32,11 +32,11 @@ fn an_identity_that_needs_an_escape_has_no_requirement() {
     // Each part is a permitted part of a code identity, and each has a
     // character that can change the meaning of a requirement text.
     for (identifier, team) in [
-        ("dev.svalnir.agent\"", "TEAM123456"),
-        ("dev.svalnir.agent", "TEAM\"or\"1"),
-        ("dev.svalnir.agent", "TEAM\\"),
-        ("dev.svalnir.*", "TEAM123456"),
-        ("dev.svalnir.agent", "TEAM=1"),
+        ("dev.po4yka.svalnir.agent\"", "TEAM123456"),
+        ("dev.po4yka.svalnir.agent", "TEAM\"or\"1"),
+        ("dev.po4yka.svalnir.agent", "TEAM\\"),
+        ("dev.po4yka.svalnir.*", "TEAM123456"),
+        ("dev.po4yka.svalnir.agent", "TEAM=1"),
     ] {
         let identity: CodeIdentity = CodeIdentity::new(identifier, team).unwrap();
         assert_eq!(
@@ -63,8 +63,8 @@ fn a_build_with_no_team_identifier_verifies_no_peer() {
 
 #[test]
 fn the_names_of_the_product_have_the_product_prefix() {
-    assert_eq!(MACH_SERVICE_NAME, "dev.svalnir.privileged");
-    assert_eq!(AGENT_SIGNING_IDENTIFIER, "dev.svalnir.agent");
+    assert_eq!(MACH_SERVICE_NAME, "dev.po4yka.svalnir.privileged");
+    assert_eq!(AGENT_SIGNING_IDENTIFIER, "dev.po4yka.svalnir.agent");
 }
 
 #[test]

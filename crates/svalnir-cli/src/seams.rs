@@ -139,6 +139,17 @@ pub(crate) trait ServiceHost: Debug + Send + Sync {
     /// the session of the user. A service that is not loaded is not an
     /// error.
     fn unload(&self, uid: u32, label: &str) -> Result<(), ServiceFailure>;
+    /// Whether the service manager has the service `label` in the session
+    /// of the user. The service manager removes a service some time after
+    /// [`ServiceHost::unload`] returns, and it refuses a load in that time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceFailure`] when the answer of the service manager
+    /// does not show whether it has the service.
+    fn is_loaded(&self, uid: u32, label: &str) -> Result<bool, ServiceFailure>;
+    /// Waits for `interval` between two queries of the service manager.
+    fn pause(&self, interval: std::time::Duration);
 }
 
 /// The service host of the running system: the file system and
@@ -272,6 +283,34 @@ impl ServiceHost for SystemServiceHost {
             })
         }
     }
+
+    fn is_loaded(&self, uid: u32, label: &str) -> Result<bool, ServiceFailure> {
+        let target: String = format!("gui/{uid}/{label}");
+        let status = Self::launchctl(&["print".as_ref(), target.as_ref()]).map_err(|detail| {
+            ServiceFailure {
+                step: "query",
+                detail,
+            }
+        })?;
+        // Status 113 ("could not find the service") is the answer for a
+        // service that is not loaded: a run on macOS 27.2 gave it. Status 3
+        // is the answer of `bootout` for the same condition.
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(3 | 113) => Ok(false),
+            code => Err(ServiceFailure {
+                step: "query",
+                detail: format!(
+                    "the service manager did not show whether the service is loaded (status {})",
+                    code.unwrap_or(-1)
+                ),
+            }),
+        }
+    }
+
+    fn pause(&self, interval: std::time::Duration) {
+        std::thread::sleep(interval);
+    }
 }
 
 /// An action of a test that runs while a question waits.
@@ -383,6 +422,12 @@ impl ServiceHost for RefusingServiceHost {
     fn unload(&self, _uid: u32, _label: &str) -> Result<(), ServiceFailure> {
         Err(Self::refusal("unload"))
     }
+
+    fn is_loaded(&self, _uid: u32, _label: &str) -> Result<bool, ServiceFailure> {
+        Err(Self::refusal("query"))
+    }
+
+    fn pause(&self, _interval: std::time::Duration) {}
 }
 
 /// The Trash of a test that set no Trash directory: it moves nothing, so
@@ -728,7 +773,7 @@ mod tests {
         let host = seams.service_host();
         assert_eq!(host.agent_program(), Err(ProgramProblem::NotFound));
         assert!(host.load(501, Path::new("/nonexistent")).is_err());
-        assert!(host.unload(501, "dev.svalnir.agent").is_err());
+        assert!(host.unload(501, "dev.po4yka.svalnir.agent").is_err());
         assert!(
             host.write_definition(Path::new("/nonexistent"), "")
                 .is_err()

@@ -11,10 +11,10 @@ use thiserror::Error;
 use super::record::RESTART_BACKOFF_BASE;
 
 /// The label of the agent job.
-pub const LAUNCH_AGENT_LABEL: &str = "dev.svalnir.agent";
+pub const LAUNCH_AGENT_LABEL: &str = "dev.po4yka.svalnir.agent";
 
 /// The file name of the definition in a `LaunchAgents` directory.
-pub const LAUNCH_AGENT_FILE_NAME: &str = "dev.svalnir.agent.plist";
+pub const LAUNCH_AGENT_FILE_NAME: &str = "dev.po4yka.svalnir.agent.plist";
 
 /// The inputs of the definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +174,7 @@ mod tests {
             "<plist version=\"1.0\">\n",
             "<dict>\n",
             "\t<key>Label</key>\n",
-            "\t<string>dev.svalnir.agent</string>\n",
+            "\t<string>dev.po4yka.svalnir.agent</string>\n",
             "\t<key>ProgramArguments</key>\n",
             "\t<array>\n",
             "\t\t<string>/opt/svalnir/bin/svalnir-agent</string>\n",
@@ -201,7 +201,7 @@ mod tests {
             "</plist>\n",
         );
         assert_eq!(text, expected);
-        assert_eq!(LAUNCH_AGENT_LABEL, "dev.svalnir.agent");
+        assert_eq!(LAUNCH_AGENT_LABEL, "dev.po4yka.svalnir.agent");
         assert_eq!(throttle_interval_seconds(), 10);
     }
 

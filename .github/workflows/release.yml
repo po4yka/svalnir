@@ -67,6 +67,9 @@ jobs:
     uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
     permissions:
       contents: read
+    with:
+      # The build job below runs the same script and the same artifact check.
+      package: false
 
   build:
     name: Build macOS artifacts
@@ -74,7 +77,13 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     # This job runs dependency build scripts. It gets no token that can sign
-    # attestations or write to the repository.
+    # attestations or write to the repository, and no signing identity: the
+    # script signs ad hoc.
+    # TODO(npochaev): when a Developer ID exists, add a job that gets the
+    # executables of this job, has the certificate from a protected
+    # environment, and runs scripts/package.sh with SVALNIR_BIN_DIR,
+    # SVALNIR_SIGNING=developer-id, and SVALNIR_NOTARIZE=1. Do not give the
+    # certificate to this job.
     permissions:
       contents: read
     steps:

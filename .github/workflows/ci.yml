@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      package:
+        description: Build the release artifacts and check them. A caller that builds them itself sets false.
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -34,6 +39,34 @@ jobs:
         run: xcrun -sdk macosx metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: scripts/check.sh fmt clippy test doc
+
+  artifacts:
+    name: Release artifacts (macOS, ad-hoc signature)
+    # A run of this workflow from its own triggers has no `inputs.package`.
+    # In a called run, `github.workflow` is the name of the caller.
+    if: github.workflow == 'CI' || inputs.package
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install the Metal toolchain for GPUI shaders
+        run: xcrun -sdk macosx metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-about@0.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: package
+      # The script builds the two artifacts, unpacks them into a temporary
+      # directory, checks the layout contract, and runs the read-only commands.
+      # It signs ad hoc: this job has no signing identity and no secret.
+      - run: scripts/package.sh
 
   dependencies:
     name: Dependency policy

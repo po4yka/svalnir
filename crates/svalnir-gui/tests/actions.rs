@@ -92,6 +92,10 @@ fn a_pause_with_an_agent_is_accepted(cx: &mut TestAppContext) {
     click(handle, "automation-pause-hour", cx);
     let text = label(handle, "automation-pause-state", cx).expect("state line");
     assert!(text.starts_with("Accepted: Pause is accepted."), "{text}");
+    assert!(
+        text.contains("Path: the agent holds the coordinator lock"),
+        "{text}"
+    );
     assert!(text.ends_with("(Fixture: nothing was written.)"), "{text}");
     assert!(matches!(
         state_of(&view, &Slot::Pause, cx),
@@ -100,14 +104,34 @@ fn a_pause_with_an_agent_is_accepted(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn with_no_agent_the_action_is_unavailable_and_names_the_cause(cx: &mut TestAppContext) {
-    let (handle, _view) = open(
+fn with_no_agent_a_pause_is_written_directly_and_names_the_path(cx: &mut TestAppContext) {
+    let (handle, view) = open(
         FixtureSource::new(FixtureScenario::AgentAbsent),
         Screen::Automation,
         cx,
     );
     click(handle, "automation-pause-open", cx);
     let text = label(handle, "automation-pause-state", cx).expect("state line");
+    assert!(text.starts_with("Accepted: Pause is accepted."), "{text}");
+    assert!(
+        text.contains("Path: no agent runs, so the window wrote the record directly"),
+        "{text}"
+    );
+    assert!(matches!(
+        state_of(&view, &Slot::Pause, cx),
+        Some(ActionState::Accepted { .. })
+    ));
+}
+
+#[gpui_kit::test]
+fn with_no_agent_a_queue_request_is_unavailable_and_names_the_cause(cx: &mut TestAppContext) {
+    let (handle, view) = open(
+        FixtureSource::new(FixtureScenario::Pressure).with_actions(ActionScript::Unavailable),
+        Screen::History,
+        cx,
+    );
+    click(handle, "history-cancel-op_fixture_0002", cx);
+    let text = label(handle, "history-action-op_fixture_0002", cx).expect("state line");
     assert!(
         text.starts_with("Unavailable: No agent holds the coordinator lock"),
         "{text}"
@@ -116,6 +140,10 @@ fn with_no_agent_the_action_is_unavailable_and_names_the_cause(cx: &mut TestAppC
         text.contains("does not act in place of the agent"),
         "{text}"
     );
+    assert!(matches!(
+        state_of(&view, &Slot::Operation("op_fixture_0002".to_owned()), cx),
+        Some(ActionState::Unavailable(_))
+    ));
 }
 
 #[gpui_kit::test]

@@ -1,7 +1,9 @@
 //! The fixture path of an action. It writes nothing and sends nothing: it
 //! gives the state that its script names, for tests and screenshots.
 
-use super::{Action, ActionPort, ActionState, StopProposal, StopTarget, Unavailable};
+use super::{
+    Action, ActionPort, ActionState, AuthorityPath, StopProposal, StopTarget, Unavailable,
+};
 use crate::data::{
     DataSource as _,
     fixture::{FixtureScenario, FixtureSource},
@@ -76,12 +78,32 @@ impl FixturePort {
     }
 }
 
-const FIXTURE_NOTE: &str = " (Fixture: nothing was written.)";
+const FIXTURE_NOTE: &str = "(Fixture: nothing was written.)";
+
+/// Whether `action` changes the authority record rather than writing a
+/// request to the queue.
+const fn is_authority(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Pause { .. } | Action::Resume | Action::Enable { .. } | Action::Disable { .. }
+    )
+}
+
+fn accepted(action: &Action) -> ActionState {
+    ActionState::Accepted {
+        detail: format!("{} is accepted.", action.verb()),
+    }
+}
 
 impl ActionPort for FixturePort {
     fn submit(&self, action: &Action) -> ActionState {
-        match self.script {
+        let state: ActionState = match self.script {
             ActionScript::Refuse => ActionState::refused("policy_revision_changed"),
+            // With no agent, a change of the authority record is written
+            // directly, as the CLI does; a request of the queue is refused.
+            ActionScript::Unavailable if is_authority(action) => {
+                AuthorityPath::NoAgent.annotate(accepted(action))
+            }
             ActionScript::Unavailable => ActionState::Unavailable(Unavailable::NoAgent),
             ActionScript::Pending => match action {
                 Action::Stop { proposal, .. } => ActionState::AwaitingAdmission {
@@ -96,10 +118,15 @@ impl ActionPort for FixturePort {
                     operation: "op-fixture-stop".to_owned(),
                     since: SystemTime::now(),
                 },
-                _ => ActionState::Accepted {
-                    detail: format!("{} is accepted.{FIXTURE_NOTE}", action.verb()),
-                },
+                _ if is_authority(action) => AuthorityPath::Agent.annotate(accepted(action)),
+                _ => accepted(action),
             },
+        };
+        match state {
+            ActionState::Accepted { detail } => ActionState::Accepted {
+                detail: format!("{detail} {FIXTURE_NOTE}"),
+            },
+            other => other,
         }
     }
 

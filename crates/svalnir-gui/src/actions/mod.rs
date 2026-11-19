@@ -5,16 +5,19 @@
 //! holds the coordinator lock (`svalnir_agent::client`):
 //!
 //! - The pause, the resume, and the enable and disable of a guard write a
-//!   new authority record with a compare-and-set on its revision. The agent
-//!   reads the record at its next tick.
+//!   new authority record with a compare-and-set on its revision, with the
+//!   shared function of the CLI (`client::write_authority`). The client
+//!   writes the record also when no agent holds the lock, as the CLI does,
+//!   and the state line names the path ([`AuthorityPath`]). The agent reads
+//!   the record at its next tick, or when it starts.
 //! - The rearm of an incident, the cancel and the acknowledgment of an
 //!   operation, and the stop of an application group write a request to the
 //!   queue of the journal. The coordinator of the agent decides it, and the
-//!   client reads the completion.
+//!   client reads the completion. With no agent that holds the lock, each
+//!   of these is refused with the cause, and nothing is written.
 //!
-//! With no agent that holds the lock, each action is refused with the
-//! cause, and nothing is written. The client never takes the coordinator
-//! lock.
+//! The client never takes the coordinator lock and never makes the state
+//! directory or the journal.
 
 pub mod fixture;
 pub mod live;
@@ -208,10 +211,64 @@ impl Unavailable {
             Self::NoAgent => "No agent holds the coordinator lock, so no process can decide the request. This window does not act in place of the agent. Start the agent with `svalnir agent install`.".to_owned(),
             Self::OtherCoordinator => "A command-line client holds the coordinator lock, not the agent. Wait for the command to end, then try again.".to_owned(),
             Self::AgentUnknown => "The coordinator lock cannot be read, so it is not known whether the agent runs.".to_owned(),
-            Self::NoJournal => "The state directory has no operation journal, so no agent runs on it.".to_owned(),
+            Self::NoJournal => "The state directory has no operation journal, so no agent runs on it. The window does not make one.".to_owned(),
             Self::NoStateDirectory => "The state directory is not known.".to_owned(),
             Self::Home(reason) => format!("{reason}. The window changes nothing in this state."),
             Self::Clock => "A clock of this host gave no value.".to_owned(),
+        }
+    }
+}
+
+/// The path on which a pause, a resume, or an enable or disable of a guard
+/// reached the authority record. The client writes the record with the
+/// same compare-and-set as the CLI on each path; the path tells the user
+/// which process reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityPath {
+    /// The agent holds the coordinator lock. It reads the record at its
+    /// next tick.
+    Agent,
+    /// No process holds the coordinator lock. The window wrote the record
+    /// directly, as the CLI does.
+    NoAgent,
+    /// A command-line client holds the lock as a transient coordinator,
+    /// which evaluates no guard.
+    OtherCoordinator,
+    /// The lock file cannot be read, so it is not known whether the agent
+    /// runs.
+    Unknown,
+}
+
+impl AuthorityPath {
+    /// One sentence that names the path and which process reads the
+    /// record.
+    #[must_use]
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Self::Agent => {
+                "Path: the agent holds the coordinator lock and reads the record at its next tick."
+            }
+            Self::NoAgent => {
+                "Path: no agent runs, so the window wrote the record directly, as the command-line client does. An agent reads it when it starts."
+            }
+            Self::OtherCoordinator => {
+                "Path: a command-line client holds the coordinator lock and evaluates no guard, so the window wrote the record directly. An agent reads it when it starts."
+            }
+            Self::Unknown => {
+                "Path: the coordinator lock cannot be read, so the window wrote the record directly. An agent that runs reads it at its next tick."
+            }
+        }
+    }
+
+    /// The accepted state `state` with the sentence of the path. A state
+    /// that is not accepted does not change: nothing was written.
+    #[must_use]
+    pub fn annotate(self, state: ActionState) -> ActionState {
+        match state {
+            ActionState::Accepted { detail } => ActionState::Accepted {
+                detail: format!("{detail} {}", self.sentence()),
+            },
+            other => other,
         }
     }
 }

@@ -1,13 +1,15 @@
 //! The live path of an action: the operation journal of the state
 //! directory, through `svalnir_agent::client`.
 //!
-//! Each action first checks that the agent holds the coordinator lock and
-//! that `HOME` is the home directory of the account record. Then it opens
-//! the existing journal for writes; it never makes the state directory or
-//! the journal, and it never takes the coordinator lock.
+//! Each action first checks that `HOME` is the home directory of the
+//! account record. A request of the queue also needs the agent that holds
+//! the coordinator lock; a change of the authority record is written with
+//! no agent too, as the CLI does. Then the action opens the existing
+//! journal for writes; it never makes the state directory or the journal,
+//! and it never takes the coordinator lock.
 
 use super::{
-    ADMISSION_GRACE, Action, ActionPort, ActionState, StopProposal, StopTarget,
+    ADMISSION_GRACE, Action, ActionPort, ActionState, AuthorityPath, StopProposal, StopTarget,
     UNEXPECTED_COMPLETION, Unavailable,
 };
 use crate::data::{live_records::collect_processes, model::OperationPhase};
@@ -100,9 +102,42 @@ impl LivePort {
         Ok(path)
     }
 
-    fn authority_action(&self, action: &Action) -> Result<ActionState, ActionState> {
-        let path: PathBuf = self.gate()?;
-        let mut journal: OperationJournal = open_for_writes(&path)?;
+    /// The journal path and the path of an authority change, when `HOME` is
+    /// the home directory of the account record. The CLI writes the
+    /// authority record with no agent too, so the presence of the agent
+    /// does not gate the write; it only names the path.
+    fn authority_gate(&self) -> Result<(PathBuf, AuthorityPath), ActionState> {
+        let directory: &Path = self
+            .state_directory
+            .as_deref()
+            .ok_or(ActionState::Unavailable(Unavailable::NoStateDirectory))?;
+        let path: PathBuf = journal_path(directory);
+        verify_process_home().map_err(|error| {
+            ActionState::Unavailable(Unavailable::Home(capitalized(&error.to_string())))
+        })?;
+        let route: AuthorityPath = match client::agent_presence(&path) {
+            AgentPresence::Agent => AuthorityPath::Agent,
+            AgentPresence::Absent => AuthorityPath::NoAgent,
+            AgentPresence::OtherCoordinator => AuthorityPath::OtherCoordinator,
+            AgentPresence::Unknown => AuthorityPath::Unknown,
+        };
+        Ok((path, route))
+    }
+
+    /// Writes a pause, a resume, or an enable or disable of a guard to the
+    /// authority record, as `svalnir agent pause`, `agent resume`,
+    /// `policy enable`, and `policy disable` do: the change of the pure
+    /// grant logic, then the compare-and-set write of
+    /// `client::write_authority`. Neither client takes a lock for it; the
+    /// compare-and-set refuses a record that a different process changed
+    /// after the read.
+    // TODO(npochaev): the CLI makes the state directory and the journal for
+    // a pause, a resume, and a disable when they do not exist. The window
+    // refuses these with `NoJournal`: the private state directory function
+    // is in `svalnir-cli` (`Environment::create_state_directory`). Move it
+    // to `svalnir_agent::client` and call it here.
+    fn authority_action(path: &Path, action: &Action) -> Result<ActionState, ActionState> {
+        let mut journal: OperationJournal = open_for_writes(path)?;
         let stored: StoredAuthority = read_authority(&journal)?;
         let (clock, wall) = clocks()?;
         let control = ControlClock {
@@ -317,7 +352,9 @@ impl ActionPort for LivePort {
             Action::Pause { .. }
             | Action::Resume
             | Action::Enable { .. }
-            | Action::Disable { .. } => self.authority_action(action),
+            | Action::Disable { .. } => self.authority_gate().and_then(|(path, route)| {
+                Self::authority_action(&path, action).map(|state| route.annotate(state))
+            }),
             _ => self.queued_action(action),
         };
         result.unwrap_or_else(|state| state)
@@ -653,27 +690,116 @@ mod tests {
         (directory, path)
     }
 
+    /// The authority record of the journal at `path`.
+    fn stored_authority(path: &Path) -> StoredAuthority {
+        let journal = observe::open_existing_journal_read_only(path)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("no journal"));
+        observe::read_authority(&journal, observe::current_uid())
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn accepted_detail(state: &ActionState) -> &str {
+        match state {
+            ActionState::Accepted { detail } => detail,
+            other => panic!("not accepted: {other:?}"),
+        }
+    }
+
     #[test]
-    fn no_agent_writes_nothing() {
+    fn no_agent_refuses_a_queued_request_and_writes_nothing() {
         let (directory, path) = state_directory();
         let port = LivePort::new(Some(directory.path().to_owned()));
         let before = std::fs::metadata(&path).map(|metadata| metadata.len()).ok();
-        let state = port.submit(&Action::Pause { duration: None });
-        assert_eq!(state, ActionState::Unavailable(Unavailable::NoAgent));
         let cancel = port.submit(&Action::Cancel {
             operation: "op-1".to_owned(),
         });
         assert_eq!(cancel, ActionState::Unavailable(Unavailable::NoAgent));
-        let journal = observe::open_existing_journal_read_only(&path)
-            .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("no journal"));
-        let stored = observe::read_authority(&journal, observe::current_uid())
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(stored.revision, 0, "no authority record was written");
+        let rearm = port.submit(&Action::Rearm {
+            policy: PolicyId::MemoryGuard,
+            incident: "incident-1".to_owned(),
+            generation: 1,
+        });
+        assert_eq!(rearm, ActionState::Unavailable(Unavailable::NoAgent));
+        assert_eq!(stored_authority(&path).revision, 0, "no record was written");
         assert_eq!(
             std::fs::metadata(&path).map(|metadata| metadata.len()).ok(),
             before
         );
+    }
+
+    #[test]
+    fn no_agent_writes_the_pause_and_the_resume_directly_as_the_cli_does() {
+        let (directory, path) = state_directory();
+        let port = LivePort::new(Some(directory.path().to_owned()));
+        let paused = port.submit(&Action::Pause {
+            duration: Some(Duration::from_secs(3600)),
+        });
+        assert!(
+            accepted_detail(&paused).ends_with(AuthorityPath::NoAgent.sentence()),
+            "{paused:?}"
+        );
+        let stored = stored_authority(&path);
+        assert!(stored.state.pause.is_some());
+        assert_eq!(stored.revision, 1);
+        let resumed = port.submit(&Action::Resume);
+        assert!(
+            accepted_detail(&resumed).ends_with(AuthorityPath::NoAgent.sentence()),
+            "{resumed:?}"
+        );
+        assert!(stored_authority(&path).state.pause.is_none());
+        // A second resume needs no change and writes nothing.
+        let again = port.submit(&Action::Resume);
+        assert!(matches!(again, ActionState::Accepted { .. }), "{again:?}");
+        assert_eq!(stored_authority(&path).revision, 2);
+    }
+
+    #[test]
+    fn no_agent_refuses_an_enable_with_no_revision_and_writes_nothing() {
+        let (directory, path) = state_directory();
+        let port = LivePort::new(Some(directory.path().to_owned()));
+        let state = port.submit(&Action::Enable {
+            policy: PolicyId::DiskGuard,
+            revision: "rev-1".to_owned(),
+            classes: Vec::new(),
+        });
+        assert_eq!(state, ActionState::refused("no_active_policy_revision"));
+        let disabled = port.submit(&Action::Disable {
+            policy: PolicyId::DiskGuard,
+        });
+        assert!(
+            matches!(disabled, ActionState::Accepted { .. }),
+            "{disabled:?}"
+        );
+        assert_eq!(stored_authority(&path).revision, 0, "no record was written");
+    }
+
+    #[test]
+    fn a_changed_record_is_refused_and_not_replaced() {
+        let (directory, path) = state_directory();
+        let port = LivePort::new(Some(directory.path().to_owned()));
+        let mut journal = OperationJournal::open(&path, &JournalOptions::default())
+            .unwrap_or_else(|error| panic!("{error}"));
+        let stored = observe::read_authority(&journal, observe::current_uid())
+            .unwrap_or_else(|error| panic!("{error}"));
+        let (clock, wall) = clocks().unwrap_or_else(|state| panic!("{state:?}"));
+        let change = pause(
+            &stored.state,
+            &PauseRequest {
+                principal: observe::current_uid(),
+                duration: None,
+            },
+            &ControlClock {
+                clock: &clock,
+                wall,
+            },
+        )
+        .unwrap_or_else(|refusal| panic!("{refusal:?}"));
+        // A different process writes a record after the read of `stored`.
+        drop(port.submit(&Action::Pause { duration: None }));
+        let state = write(&mut journal, &stored, change, wall).map(|_| ());
+        assert_eq!(state, Err(ActionState::refused("authority_record_changed")));
+        assert_eq!(stored_authority(&path).revision, 1);
     }
 
     #[test]
@@ -683,8 +809,15 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let port = LivePort::new(Some(directory.path().to_owned()));
         assert_eq!(
-            port.submit(&Action::Resume),
+            port.submit(&Action::Cancel {
+                operation: "op-1".to_owned()
+            }),
             ActionState::Unavailable(Unavailable::OtherCoordinator)
+        );
+        let paused = port.submit(&Action::Pause { duration: None });
+        assert!(
+            accepted_detail(&paused).ends_with(AuthorityPath::OtherCoordinator.sentence()),
+            "{paused:?}"
         );
     }
 
@@ -704,7 +837,11 @@ mod tests {
         let port = LivePort::new(Some(directory.path().to_owned()));
         assert_eq!(
             port.submit(&Action::Resume),
-            ActionState::Unavailable(Unavailable::NoAgent)
+            ActionState::Unavailable(Unavailable::NoJournal)
+        );
+        assert_eq!(
+            port.submit(&Action::Pause { duration: None }),
+            ActionState::Unavailable(Unavailable::NoJournal)
         );
         assert!(!journal_path(directory.path()).exists());
     }
@@ -718,7 +855,10 @@ mod tests {
         let state = port.submit(&Action::Pause {
             duration: Some(Duration::from_secs(3600)),
         });
-        assert!(matches!(state, ActionState::Accepted { .. }), "{state:?}");
+        assert!(
+            accepted_detail(&state).ends_with(AuthorityPath::Agent.sentence()),
+            "{state:?}"
+        );
         let journal = observe::open_existing_journal_read_only(&path)
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("no journal"));

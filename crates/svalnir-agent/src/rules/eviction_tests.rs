@@ -471,6 +471,9 @@ fn a_state_directory_in_the_root_refuses_the_root() {
         discovery.roots[0].result,
         RootResult::Refused("root_overlaps_protected")
     );
+    // A root that exists and that was not examined: the result is not
+    // complete, so it supports no automatic plan.
+    assert!(!discovery.complete);
 }
 
 #[test]

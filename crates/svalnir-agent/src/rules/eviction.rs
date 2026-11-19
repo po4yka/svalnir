@@ -344,6 +344,13 @@ pub fn automatic_roots(
 ///
 /// The observation time is the time before the first query, so the
 /// evidence is never newer than its time says.
+///
+/// A denied identity query gives no owner. The inventory reads it as a
+/// process of a different user, as the process inventory of the memory
+/// guard does: the system denies the query for a process of a different
+/// user. A process of this user whose identity query is denied is thus
+/// not seen. This is a residual risk of the evidence; the lock check of
+/// the build database is the second check of the rule.
 pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvidence {
     let unknown = |observed_at: MonotonicNanos| XcodeEvidence {
         producer_processes: ProducerProcesses::Unknown,
@@ -587,8 +594,9 @@ impl EvictionCandidate {
 /// The result of one discovery for an eviction.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EvictionDiscovery {
-    /// True when each discovery that ran examined each unit of its root or
-    /// each known candidate, and the overlap resolution ran. A result that
+    /// True when each root that exists was examined, each discovery
+    /// examined each unit of its root or each known candidate, and the
+    /// overlap resolution ran. A root that is absent has no unit. A result that
     /// is not complete supports no automatic plan.
     pub complete: bool,
     /// The candidates that no overlap conflict rejected.
@@ -721,6 +729,18 @@ impl ReviewedRules {
                         result.complete = false;
                     }
                     result.bound_roots.extend(bound.ok());
+                }
+                // A root that exists and that was not examined can have
+                // units that the result does not show.
+                let not_examined: bool = match &root_result {
+                    RootResult::Refused(_) => true,
+                    RootResult::NotBound(problem) => *problem != RootProblem::Absent,
+                    RootResult::Examined { .. }
+                    | RootResult::OtherVolume
+                    | RootResult::NothingKnown => false,
+                };
+                if not_examined {
+                    result.complete = false;
                 }
                 found.extend(candidates);
                 result.roots.push(RootReport {

@@ -25,6 +25,17 @@
 //!    the executor, and [`DiscoveredCandidate::file_binding`] for the
 //!    plan builder.
 //!
+//! # Discovery for an eviction
+//!
+//! [`ReviewedRules::discover_for_eviction`] does steps 2 to 4 for the
+//! agent and for a client: it resolves and binds the approved roots of
+//! each rule that the request selects and that permits the purpose of the
+//! request ([`resolve_roots`]), makes the process evidence
+//! ([`xcode_evidence`]), runs each discovery, resolves the overlaps,
+//! applies the catalog of protected file locations, and sets predicates 3,
+//! 9, and 10. [`automatic_roots`] gives the approved roots of an automatic
+//! operation.
+//!
 //! # What a discovery establishes
 //!
 //! A discovery gives evidence for a plan. It is not a guard of a removal:
@@ -32,7 +43,8 @@
 //! examines each object again before its step. A rule establishes
 //! predicates 1, 2, 4, 5, 6, 7, and 8 of the specification. Predicates 3
 //! (authorized scope), 9 (resources), and 10 (fresh check) stay `unknown`
-//! until admission, so no candidate of a discovery is eligible.
+//! in the result of the `discover` function of a rule, so no candidate of
+//! that result is eligible. The discovery for an eviction sets them.
 
 #[cfg(unix)]
 mod eviction;

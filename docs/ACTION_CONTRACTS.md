@@ -2,7 +2,7 @@
 
 **Status:** Design specification. This document defines required behavior for the first implementation; the examples are conceptual, and the types are not a shipped API or evidence of runtime validation. The `action` module of `svalnir-core` has the types of this contract and the serialized spellings that this document fixes. No executor, journal, or coordinator is implemented.
 
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-19
 
 These contracts connect [policy decisions](POLICY_SPEC.md) and [cleanup rules](CLEANUP_RULES.md) to observable effects. They refine the component boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and address the threats in [THREAT_MODEL.md](THREAT_MODEL.md). [RESOURCE_MODEL.md](RESOURCE_MODEL.md) defines the identities and resource observations used here, [INTERFACES.md](INTERFACES.md) defines how clients see these states, and [VALIDATION.md](VALIDATION.md) owns the release evidence. A contract applies equally to CLI, GPUI, and background requests.
 
@@ -115,6 +115,10 @@ Hard OS and control-plane protections are never overridden. Generic personal-dat
 
 An automatic plan is admitted only with the incident allowance that the controller of the agent holds for the incident of the plan. The allowance is not in the journal and not in a request. Thus an automatic plan that arrives through the request queue of the journal, or that a client applies from a stored plan, has no allowance and is refused with `incident_allowance_missing` (family `limits`). A stored automatic plan gives a client no way to use the standing authorization of a guard.
 
+The coordinator applies the catalog of protected file locations ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 5) to each file target of a plan at admission, for a manual and for an automatic plan. It uses the home directory and the state directory of its own process, each with its symbolic links resolved, so a plan that a different process built does not reach the executor with a protected target. The entry is the root path that the plan binds and then its relative entry. The coordinator examines the text of that path, and, when the mount table reports the root on a local filesystem, the directory of the entry with its symbolic links resolved and the entry with each symbolic link resolved. A form that does not exist gives no fact: an entry that is absent at admission gets no call, and the other targets of the plan are not held back. A protected target refuses the plan with `target_protected` (family `eligibility`). A target whose protection is not known, because a location of the coordinator is not known or a form cannot be read, refuses the plan with `target_protection_unknown` (family `evidence`). One such target refuses the whole plan, and nothing is reserved or recorded.
+
+The approved roots of an automatic operation are the roots of the rule declarations: for each rule that the configuration in effect approves for the disk guard and that the registry permits for automatic eviction, each root of its declaration that exists on the host, bound to its object, its volume, and its mount generation. The agent resolves them immediately before it applies an automatic plan. No root of an automatic operation comes from the plan, and these roots give a manual plan no root. A target of an automatic plan whose root is not in the set, or whose root record has a different path or object, gets no call.
+
 Failed admission returns reasons and issues no external mutation. Transient failure may justify preparing or admitting a later operation; it never converts an expired plan into current authority.
 
 ## 5. Budgets and resource leases
@@ -222,6 +226,8 @@ The rule defines the smallest supported candidate and executable unit. A folder 
 Enumerate bounded units under the approved protocol; revalidate before each unit or specifically justified batch. Skip newly appearing or changed entries. If a rule requires an indivisible native lifecycle operation, the entire operation must fit its bounds before submission.
 
 Record each removal, skipped item, or uncertain effect. Successful unlink removes a directory entry; storage reclamation can wait for open references. [Apple documents this behavior][unlink]. A removal has the attribution `possible` (Shared preconditions). Capacity measurements remain separate.
+
+Immediately before the call of each step whose target a rule found, the coordinator reads the activity of the producer of that rule again, from evidence that this reading makes (for `xcode.inactive-derived-data`, the process inventory of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 11). Only evidence that the producer is inactive permits the call. An active producer skips the target with `producer_active` (family `eligibility`), and evidence that is not known skips it with `producer_activity_unknown` (family `evidence`); the result is `Skipped` with the stop reason `TARGET_SKIPPED`, the charge of the step is released, and no call is issued. Each later step has its own reading. The coordinator never stops a producer to make an eviction possible. The reading is of the process evidence; the lock of a build database is examined by the discovery and not again at this point.
 
 Stop before the next unit if the deadline, policy, activity evidence, namespace condition, lease, or budget is invalid. Earlier removals remain performed; the contract provides no transactional rollback. A unit that is a directory is removed entry by entry, with the stop rule of a directory target of `DeleteSelectedFiles`.
 

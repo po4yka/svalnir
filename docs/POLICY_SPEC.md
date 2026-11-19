@@ -2,7 +2,7 @@
 
 **Status:** Design specification. `svalnir-core` has the configuration parser and the pure evaluation and simulation functions of this specification. No agent runs them, and no policy can become active.  
 **Specification revision:** 1  
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-19
 
 This document defines when Svalnir may propose and continue a resource intervention. [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) defines execution and recovery. [CLEANUP_RULES.md](CLEANUP_RULES.md) defines filesystem eligibility and rule review. [RESOURCE_MODEL.md](RESOURCE_MODEL.md) defines the observations that policy consumes, [INTERFACES.md](INTERFACES.md) defines the configuration and control commands, and [VALIDATION.md](VALIDATION.md) owns the release evidence. The [architecture](ARCHITECTURE.md), [threat model](THREAT_MODEL.md), and [README](../README.md) establish the product baseline.
 
@@ -277,6 +277,21 @@ A pass contains bounded batches. It stops at byte, item, time, rule, or incident
 Rank only eligible candidates, preferring configured rule priority, lower rebuild cost, and known inactivity before deterministic identity tie-breaking. A large estimate cannot override an exclusion or unknown activity. Revalidate before each batch and remeasure afterward.
 
 No-effect or immediate-regrowth results activate backoff; they do not justify broader roots or more personal-data access. Full rescans, duplicate hashing, and maintenance compaction stay outside emergency handling.
+
+### Candidate preparation
+
+The candidates of the disk guard come from the discovery of each rule that `approved_rules` names and that the registry permits for automatic eviction ([CLEANUP_RULES.md](CLEANUP_RULES.md) sections 4 and 6). A rule in a different lifecycle state is not examined. The exclusions of the discovery are the paths of `[protections].excluded_paths` and of `[disk_guard.exclusions].paths`.
+
+| Capacity of a selected volume | Preparation |
+| --- | --- |
+| In the warning band (`< warn_below`, not `< reclaim_below`), with no open disk incident | One bounded discovery when the agent has no candidate set or its set is older than 15 minutes. The discovery lists the approved roots and measures each unit. It is optional work: it does not start with memory pressure, in a pause, in the restart backoff, or when the agent is over its own budget, and it stops at its next name when one of these conditions starts |
+| Below `reclaim_below`, or in an open disk incident | The known candidates only: the agent examines the identity, the records, and the activity of each candidate of its latest discovery again. It lists no directory and measures no tree |
+
+A discovery runs on a worker thread of the agent, so the evaluation of the memory guard does not wait for it. A plan is made only from a set that an examination of the known candidates made not more than `decision_sample_max_age` before the decision.
+
+The agent does not keep the candidates across a restart. Thus an agent that starts while a volume is below `reclaim_below`, and an agent whose volume goes from above `warn_below` to below `reclaim_below` between two samples, has no known candidate: the disk guard reports that it has no eligible target, and it evicts nothing until a sample is in the warning band with no open disk incident. Whether the guard starts one bounded discovery in that state is not decided.
+
+The approved roots of an automatic operation are the roots of the same rules, as the agent resolves them from the rule declarations immediately before it applies a plan ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 4).
 
 ## 10. Memory guard
 

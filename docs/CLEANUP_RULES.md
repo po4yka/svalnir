@@ -1,8 +1,8 @@
 # Svalnir Cleanup Rules
 
-**Status:** Design specification. The registry below contains proposed integrations, not implemented adapters or verified claims that a directory is safe to delete. The `rule` module of `svalnir-core` has the declaration types, the registry interface, and the eligibility evidence of sections 2 to 9. No rule is implemented.
+**Status:** Design specification. The registry below contains proposed integrations, not implemented adapters or verified claims that a directory is safe to delete. The `rule` module of `svalnir-core` has the declaration types, the registry interface, and the eligibility evidence of sections 2 to 9. The `rules` module of `svalnir-agent` has the registry, the discovery of `svalnir.expired-temporary` and of `xcode.inactive-derived-data`, and the discovery for an eviction (root resolution, process evidence, overlap resolution, and the facts of admission). Each layout of each rule is `proposed`: no rule has a validation record, so no build evicts data under a rule.
 
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-19
 
 This document defines which filesystem data Svalnir may classify as disposable, the evidence required to select it, and the contract each cleanup adapter must satisfy. [POLICY_SPEC.md](POLICY_SPEC.md) controls when authorized cleanup is admitted. [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) controls dispatch, cancellation, journaling, and outcomes. The component and security boundaries remain those in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md). [RESOURCE_MODEL.md](RESOURCE_MODEL.md) defines the size and capacity measurements, and [VALIDATION.md](VALIDATION.md) owns the release evidence for rule promotion (`VAL-05`).
 
@@ -43,6 +43,10 @@ IDs use a stable producer/category namespace, such as `svalnir.expired-temporary
 Promotion requires recorded evidence, not merely changing a registry flag. An implementation can support different lifecycle states for different owner versions or layouts. The sealed plan binds the layout that the rule found for each of its targets ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 3), and the lifecycle state that permits a step is the state of that layout. A target of a `proposed` layout is thus not removed under a validated layout of the same rule revision.
 
 The serialized lifecycle states are `proposed`, `inspection_validated`, `manual_action_validated`, `automatic_eviction_validated`, `disabled`, and `retired`. A declaration gives one state for each supported layout. Each validated state has a reference to its validation record under [VALIDATION.md](VALIDATION.md); a validated state with no reference is not a valid declaration. A `disabled` state says whether inspection stays permitted. A state that the reader does not recognize permits no mode.
+
+The lifecycle state of a layout is a constant of the rule declaration in the source code (`crates/svalnir-agent/src/rules/`). A promotion is a reviewed change of that constant, together with its validation record ([VALIDATION.md](VALIDATION.md) section 13), in a new build. No command, configuration key, environment variable, or record of the state directory changes a lifecycle state, and a released build has no function that does. Only a test build (a unit test, or a debug build with the Cargo feature `test-support`) can make a registry with a different state for a fixture test; its reference text starts with `test-fixture/` and names no validation record.
+
+The stages of a promotion are in sequence, and each one needs its record: `inspection_validated`, then `manual_action_validated`, then `automatic_eviction_validated`. One record can cover more than one stage when it has the cases of each stage.
 
 Changes that broaden roots, ownership, action modes, or consequences require corresponding grant review. An existing plan executes only its exact original revision while that revision remains registered, supported, and authorized; even a narrower replacement requires a new plan. A safety fix may revoke the old revision and inhibit its pending work. Unknown IDs, revisions, or layouts cannot fall back to a generic cleaner.
 
@@ -85,6 +89,8 @@ Discover a producer's configured storage location when supported; a commonly use
 Bind a discovered root to filesystem identity, mount generation, ownership, and the adapter's expected layout. Retain a display path separately. Reject a root whose ancestor or final component violates the reviewed traversal protocol.
 
 A root must be on a filesystem that the mount flags report as local (`MNT_LOCAL`). A local external disk is local; a network filesystem and an automounter map (`autofs`, for example below `/net`) are not. The check reads the mount table with `getfsstat` and `MNT_NOWAIT`, which does not wait for a filesystem that does not answer. It compares the text of the root path with the mount points before the first call that uses the path, each mount point also at its second path through a firmlink of the data volume (a mount point below `/System/Volumes/Data` also below `/`, and a mount point below `/` also below `/System/Volumes/Data`), then examines each component from `/` with `lstat` and compares the device of each object with the table; a directory above the root must not be a symbolic link. A call is thus made only for a name in a directory on a local filesystem, so the check cannot start an automount or wait on a remote filesystem. A discovery refuses a root on a filesystem that is not local (`root_not_local`), and a root for which the table has no mount or cannot be read; the filesystem executor refuses such a root with the codes of [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7. A path that a rule takes from a producer record, such as the project path of `xcode.inactive-derived-data` (section 11), has the same check before the rule examines it. A protected path and a user exclusion are compared also in their resolved form only when the text check shows them on a local filesystem; each other one is compared as given, with no call on it.
+
+This build resolves an approved root of a declaration in this way. A root of the base `user_home` is below the home directory of the account record of the user, and a root of the base `svalnir_state` is below the state directory; each of the two has its symbolic links resolved first. For a root of the base `producer_configuration`, this build reads no configuration of the producer: the root is the default location of the declaration below the home directory. A producer that is configured for a different location, for example Xcode with a custom DerivedData location, thus has no root, and the rule finds nothing for it. A root that does not exist gives no candidate and is not an error. A root that is a symbolic link, that is not a directory, or whose volume has no identity is not bound. The identity of a bound root is a digest of its path, its device and inode, its volume, and its mount generation, so a root that was replaced or mounted again has a different identity.
 
 Custom roots require positive classification. A user-selected project directory does not become disposable merely because it was entered as a cache path. Detect overlapping protected locations, mixed-use roots, unexpected mount crossings, and shared ownership.
 
@@ -145,6 +151,16 @@ A candidate is eligible only when every required predicate is satisfied:
 Use three-valued evidence: satisfied, not satisfied, and unknown. Unknown activity, ownership, cost, or classification cannot be treated as an affirmative result. The serialized values are `satisfied`, `not_satisfied`, and `unknown`. A candidate has one value for each of the ten predicates, and it is eligible only when each value is `satisfied`. A value that the reader does not recognize is not `satisfied`.
 
 The candidate that the disk policy evaluates carries facts that derive from this evidence. Such a fact is affirmative only when its predicate is `satisfied`: a rule that is ready needs predicate 1, an owner that is the requesting user needs predicate 2, a target with no protected data class needs predicates 4 and 7, a known rebuild cost needs predicate 4, an inactive target needs predicate 5, a target with no product protection needs predicate 7, and a known work charge needs predicate 8. A fact also claims no more than the declaration of the exact rule revision: a rule is ready only for a layout that is validated for automatic eviction, a known rebuild cost is the cost of the declaration, an inactive time is not shorter than the quiescence time, and a known charge fits the candidate ceiling.
+
+A rule establishes predicates 1, 2, 4, 5, 6, 7, and 8. The discovery for an eviction, which the agent and a client share, sets the three others for each candidate that the overlap resolution keeps:
+
+| Predicate | Evidence of this build |
+| --- | --- |
+| 3 | `satisfied` when the catalog of protected file locations (section 5) gives `not_protected` for the unit. The discovery examines only a rule that the request selects (the approved rules of the disk guard, or the rule that the user names), under a root of its declaration. A protected unit gives `not_satisfied`; an unknown protection gives `unknown` |
+| 9 | `satisfied`: the discovery read the root and the mount table. The coordinator reserves the budget, takes the leases, and records the admission before a step, and refuses the plan when one of them is not available |
+| 10 | `satisfied`: the discovery examined the identity, the records, and the activity of the unit in this call. The coordinator reads the activity of the producer again before each step ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7), and the executor compares the object with the plan before its call |
+
+With no state directory, the hard exclusion of the control-plane state has no path: the discovery examines no rule, and its result is not complete.
 
 ### Age and use
 
@@ -234,7 +250,7 @@ Stopping a tool after a deadline does not undo its deletions or prove that child
 
 ## 10. Proposed registry
 
-Every entry is currently **proposed and unimplemented**. The “Initial development target” column is implementation priority, not present eligibility or a shipped default.
+Every entry is currently **proposed**. The first two entries have a discovery in `svalnir-agent`; the others have no implementation. The “Initial development target” column is implementation priority, not present eligibility or a shipped default.
 
 | Rule ID | Intended unit | Initial development target |
 | --- | --- | --- |
@@ -259,6 +275,8 @@ The registry deliberately omits a universal “all application caches” rule. M
 
 **Admission:** No live operation holds a use lease. The producer has sealed the unit against further writes under Svalnir's internal protocol, required retention has elapsed, and the complete target set is bounded. An orphan requires reconciliation with operation state before eligibility; a filename alone cannot establish that it is abandoned.
 
+This build has no producer of temporary items and no record of their use leases. The discovery for an eviction thus gives the rule a lease state that is not known, which blocks each item, and the fresh check before a step gives an unknown activity. The rule has no candidate that can be evicted until a build has the producer and the lease record.
+
 Sealing coordinates Svalnir's writers; it does not prevent another same-user process from modifying user-writable storage. The adapter still needs a tested confinement protocol and fresh identity checks within the specifically disposable namespace. A lifecycle marker or cooperative lease is not proof against an adversarial writer.
 
 **Action:** User-scope permanent eviction under the corresponding grant, or supported manual Trash. Deleting old temporary data must not require destroying the journal needed to record that deletion.
@@ -280,6 +298,10 @@ Apple documents the default DerivedData location as `~/Library/Developer/Xcode/D
 **Admission:** The supported activity protocol must cover Xcode, command-line builds, indexing, tests, and relevant shared consumers. An old directory or absent IDE window is insufficient. Shared module or compilation caches are not implicitly owned by one project. Producer versions and concrete generated subsets remain unvalidated until recorded in the adapter's support matrix.
 
 The evidence that no producer process runs is a process inventory of the caller, with the monotonic time of the inventory. The rule compares that time with the time of the assessment of each unit. An inventory that is older than the evidence expiry of the activity protocol, that has a time after the assessment, or that cannot be compared with a monotonic time does not show inactivity: the activity of the unit is unknown, and the unit is not a candidate. Evidence that a producer process runs blocks a unit at each age.
+
+The caller makes the inventory from the process table immediately before the discovery of the root: the executable name of each process whose effective or real user is the user of the discovery. A process that exited during the reading is not in the inventory, and a denied identity query is a process of a different user. The inventory is complete only when each other process gave its user and its executable path; a query that failed for a different cause, a process list that cannot be read, a list with no process, or a clock that gives no time makes the evidence unknown. The observation time is the time before the first query.
+
+The rule examines the lock of the build database of a project (`Build/Intermediates.noindex/XCBuildData/build.db`) for each unit of that project. A project with no build database has no lock evidence, so each of its units has an unknown activity. Thus, after the unit `Build/Intermediates.noindex` of a project is evicted, the units `Build/Products` and `Index.noindex` of that project are not candidates until a build makes the database again. The three units of a project are evicted together only when one batch has them. Whether the revision keeps this property is an open point of its promotion (section 15).
 
 The project that owns a unit comes from the `WorkspacePath` value of the `info.plist` file of its DerivedData directory. The user can write that file, so the value is attribution evidence of the same user and not a protected record: a same-user process that changes it can change which project the rule examines. It cannot move a unit out of the verified root, and it gives no access to the data of a different user. The value can also name a network volume or an automounter path. The rule examines it only with the local check of section 4: a project path on a filesystem that is not local, or for which the mount table has no mount, makes predicate 4 `unknown` with the reason `source_not_local`, and the rule makes no call on that path. A project path with a symbolic link also makes predicate 4 `unknown`, because the rule does not follow it, and makes predicate 7 `unknown`, because the text of the path then does not show whether the project overlaps the root. The rule does not compare the name hash of the project directory with `WorkspacePath`.
 
@@ -393,6 +415,8 @@ Each promoted revision needs a review record containing its sources, supported p
 A rule with a content allow-list, such as the children of a unit of `xcode.inactive-derived-data` (section 11), records in its promotion evidence the children that each supported producer version makes on real installations, and the list of the promoted revision agrees with that record. A list that was written without that record keeps the layout `proposed`.
 
 Use disposable fixtures and controlled writers on the supported macOS matrix. Do not validate rules by deleting real developer caches. Fixtures must exercise what can go wrong, not merely demonstrate that a directory disappears.
+
+[VALIDATION.md](VALIDATION.md) section 13 has the content of a promotion record and the host procedure for `xcode.inactive-derived-data`. The fixture tests of the repository run the path from the discovery to the removal with a fixture lifecycle state; they are not a promotion record, because no test of the repository runs a real producer.
 
 Automatic promotion requires all applicable gates plus compatible policy and action contracts. A regression disables the affected rule revision or supported combination while preserving history. Never respond to a failed gate by loosening exclusions or quietly switching to a broader deletion command.
 

@@ -376,6 +376,30 @@ fn the_developer_preset_filters_and_an_unknown_preset_is_refused() {
 }
 
 #[test]
+fn an_interrupted_discovery_makes_no_plan() {
+    let mut world = World::manual();
+    let (interrupt, flag) = crate::interrupt::Interrupt::manual();
+    world.environment.interrupt = interrupt;
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = world.plan(&[]);
+    assert_eq!(
+        outcome.status,
+        ExitStatus::Interrupted,
+        "{}",
+        outcome.stdout
+    );
+    let result = outcome.result();
+    assert!(result["explanation"]["plan"].is_null(), "{result}");
+    assert_eq!(result["plan_document"], "absent");
+    assert!(
+        result["note"].as_str().unwrap().contains("interrupted"),
+        "{result}"
+    );
+    assert!(!world.state_has_plans());
+    assert_eq!(world.remaining().len(), 3);
+}
+
+#[test]
 fn a_running_producer_gives_no_plan() {
     let world = World::manual();
     world.evidence.set_producer(ProducerProcesses::Running);

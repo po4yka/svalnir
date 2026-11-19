@@ -54,6 +54,9 @@ const DEVELOPER_RULES: [&str; 1] = [svalnir_agent::rules::XCODE_DERIVED_DATA_RUL
 /// root.
 const SKIPPED_LIMIT: usize = 64;
 
+const INTERRUPTED_NOTE: &str =
+    "The rule discovery was interrupted, so no plan was made. This command changed no file.";
+
 /// The time between two checks of the interrupt flag during a discovery.
 const INTERRUPT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -441,19 +444,17 @@ pub(crate) fn plan(
     let discovery_host: DiscoveryHost =
         DiscoveryHost::manual(session::current_uid(), locations.clone(), &config);
     let discovery: EvictionDiscovery = discover(&registry, rule, &discovery_host, environment);
-    if environment.interrupt.is_requested() {
-        return Err(ErrorBody::new(
-            "interrupted",
-            ErrorFamily::Outcome,
-            ErrorStage::Collection,
-            "the rule discovery was interrupted, so no plan was made; the command made no change",
-        )
-        .into());
-    }
+    // An interrupted discovery has a part of the candidates. No plan is
+    // made from a part: the result has the discovery and no target.
+    let interrupted: bool = environment.interrupt.is_requested();
 
     let plan_text: String = session::new_id("plan");
     let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
-    let entries: Vec<CleanupEntry> = entries(&discovery.candidates, &plan_text)?;
+    let entries: Vec<CleanupEntry> = if interrupted {
+        Vec::new()
+    } else {
+        entries(&discovery.candidates, &plan_text)?
+    };
     let home: Option<LosslessPath> = locations
         .home_directory()
         .and_then(|home| LosslessPath::from_path(home).ok());
@@ -514,12 +515,18 @@ pub(crate) fn plan(
         has_plan_document: has_plan,
         plan_document: if has_plan { "used" } else { "absent" },
         discovery: Some(DiscoveryView::new(rule.reference.clone(), &discovery)),
-        note: if has_plan {
+        note: if interrupted {
+            INTERRUPTED_NOTE
+        } else if has_plan {
             clean::PLAN_NOTE
         } else {
             clean::EMPTY_PLAN_NOTE
         },
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
-    Ok(ExitStatus::Success)
+    Ok(if interrupted {
+        ExitStatus::Interrupted
+    } else {
+        ExitStatus::Success
+    })
 }

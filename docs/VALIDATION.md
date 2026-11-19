@@ -1,7 +1,7 @@
 # Svalnir Validation Plan
 
 **Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Every release gate below is initially **unverified**.  
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-19
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
 
@@ -139,6 +139,8 @@ A lost reply must lead to a status query or reconciliation, not another effect. 
 For each exact rule revision and supported layout, construct genuine disposable content beside excluded and misleading content. Exercise custom/shared roots, protected descendants, unknown types, unexpected symlinks, hard links, ancestor/final-entry replacement, mount changes, ownership changes, and concurrent growth.
 
 Test producer activity and quiescence assumptions, including a writer that ignores cooperative locks. Svalnir's own sealing marker must not be treated as proof against another same-user process. Unsupported confinement conditions must inhibit unattended action.
+
+The promotion of a rule layout needs the record of section 13. The fixture tests of the repository run the discovery and the removal with a fixture lifecycle state; no record exists, and each layout of each rule is `proposed`.
 
 Verify fixed candidate sets and exact revision binding. New entries cannot enter an admitted recursive operation. Failed Trash must not become permanent deletion. Permission denial must not trigger a root retry. Disabling an unsafe revision must inhibit its pending work while preserving history.
 
@@ -342,6 +344,101 @@ Evidence references must resolve to retained logs, traces, artifacts, or reports
 On failure, preserve the smallest reproducible fixture and distinguish a product defect, harness defect, unsupported environment, and pre-existing failure. Verify the fix against the failing contract, then run affected neighboring gates. Record flakiness as a problem to explain; a later pass does not erase an earlier unexplained security failure.
 
 Release approval names the artifact and supported scope, summarizes passed/failed/blocked/excluded evidence, and identifies accepted optional gaps. Keep security and performance claims proportional to what the recorded evidence actually demonstrates.
+
+## 13. Rule promotion record and host procedure
+
+[CLEANUP_RULES.md](CLEANUP_RULES.md) sections 2 and 15 own the lifecycle states and the gates of a rule. This section owns the content of a promotion record and the procedure that makes it. No promotion record exists: each layout of each rule is `proposed`.
+
+### What the repository tests show, and what they do not show
+
+The fixture tests of the repository run the path from the discovery of a rule to the removal, with a lifecycle state that only a test build can give: `crates/svalnir-agent/src/rules/eviction_tests.rs` (the discovery, the roots, and the process evidence), `crates/svalnir-agent/src/runtime/tests/eviction.rs` (the disk guard, the coordinator, and the filesystem executor), `crates/svalnir-agent/src/coordinator/tests/protection.rs` (the catalog at admission), and `crates/svalnir-cli/src/evict_tests.rs` (the `evict` mode and its apply). Each test writes its own files in a temporary directory, and its process evidence is a fixture.
+
+These tests are evidence for `VAL-04` and `VAL-05` cases of the code. They are not a promotion record: no test runs a real producer, so no test shows the layout that a producer version makes, the lock behavior of its build system, or that the producer makes the data again.
+
+### Promotion record
+
+A promotion record is a case record of section 12 with `validation_id: VAL-05` and these fields in addition:
+
+```yaml
+rule_id: xcode.inactive-derived-data
+rule_revision: r1
+layout: derived-data-project-v1
+lifecycle_target: manual_action_validated
+record_id: VAL-05/xcode.inactive-derived-data/r1/derived-data-project-v1/manual
+producer_versions: []
+host_versions: []
+filesystems: []
+allow_list_observations: []
+gate_results: []
+fixture_test_revision: null
+residual_risks: []
+open_points_closed: []
+owner_approval: null
+```
+
+| Field | Content |
+| --- | --- |
+| `record_id` | The text that the `PromotionEvidence` reference of the declaration has. A declaration with a reference that names no record of this document is not a promotion |
+| `lifecycle_target` | `inspection_validated`, `manual_action_validated`, or `automatic_eviction_validated`. A record for a later stage has the cases of each earlier stage or names their record |
+| `producer_versions`, `host_versions`, `filesystems` | Each producer version, macOS version and build, and filesystem that a case ran on. The promoted layout supports no other combination |
+| `allow_list_observations` | For each producer version, the children of each unit that the producer made on the host, and the difference from the allow-list of the revision |
+| `gate_results` | One result for each gate of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 15 that applies, with its status of section 2 and its evidence paths |
+| `fixture_test_revision` | The source revision at which `scripts/check.sh test` passed, with its exit status |
+| `residual_risks` | Each risk that the owner accepts, in the words of the rule documentation |
+| `open_points_closed` | Each open point of the rule documentation that the record decides |
+| `owner_approval` | The name of the owner and the date. A record with no approval promotes nothing |
+
+The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names.
+
+### Host procedure for `xcode.inactive-derived-data`
+
+Only the project owner starts this procedure, on a host that the owner selects. It removes files on that host, so no contributor, automated agent, or test runner runs it without that decision. The procedure uses a dedicated user account, so that the `DerivedData` root has only disposable projects: the rule does not tell a disposable project from a real one.
+
+**Preparation**
+
+1. Make a standard user account for the validation, with no personal data. Log in as that user. Each later step runs as that user.
+2. Install each Xcode version of the intended support matrix. Record the output of `sw_vers`, `xcodebuild -version`, `diskutil info /System/Volumes/Data`, and `git rev-parse HEAD`.
+3. On a branch, set the lifecycle state of the layout in `crates/svalnir-agent/src/rules/xcode.rs` to the target state, with the `record_id` as its reference. Run `scripts/check.sh`; record its exit status. Build with `cargo build --release --locked --workspace --bins` and record `shasum -a 256` of the `svalnir` and `svalnir-agent` binaries. The branch is merged only with the approved record.
+4. Select a state directory for the validation, and use it in each command: `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`.
+5. Make two or more disposable Xcode projects outside the `DerivedData` root: an application for macOS and an application for an iOS simulator, each with a unit test target and a Swift package dependency. Do not set a custom DerivedData location.
+
+**Layout record (the allow-list)**
+
+6. For each Xcode version and each project, run a build, a test, and an index: `xcodebuild -scheme SCHEME -configuration Debug build`, the same for `Release`, `xcodebuild -scheme SCHEME test`, and open the project in Xcode until the indexing ends. Close Xcode.
+7. Record the children of each unit: `find "$HOME/Library/Developer/Xcode/DerivedData" -mindepth 2 -maxdepth 4 -print`. Compare each child of `Build/Products`, `Build/Intermediates.noindex`, and `Index.noindex` with the allow-list of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 11. A child that the list does not accept is a finding: the list changes in a new revision, or the layout stays `proposed`.
+8. Record the content of `info.plist` of each project directory, and whether it is an XML property list with `WorkspacePath` and `LastAccessedDate`.
+
+**Activity (the lock and the process evidence)**
+
+9. With a build in progress (`xcodebuild ... build` of a project that takes more than one minute), run `svalnir clean plan --mode evict --rule xcode.inactive-derived-data --format json`. Expected: no plan, and each unit has `active_producer`. Record whether `build.db` has a `-wal`, `-shm`, or `-journal` file during the build, and whether the lock query finds a lock when no producer process is in the inventory (for this, examine the result with the process evidence of a build that an SSH session of a different user cannot give; record the limit when it cannot be examined).
+10. With Xcode open and idle on a project, run the same command. Expected: no plan, `active_producer`.
+11. With no producer process, run the same command at once after a build. Expected: no plan, `retention_not_elapsed` for each unit.
+
+**Age**
+
+12. The rule needs 14 days with no change. Use one of these, and record which: wait 14 days with no build; or set the times of the disposable projects back with `find PROJECT_DIRECTORY -exec touch -h -t YYYYMMDDhhmm {} +` and `plutil -replace LastAccessedDate -date DATE PROJECT_DIRECTORY/info.plist`, with a date that is more than 14 days before now. The second way is a fixture change of disposable data; it does not show how Xcode updates `LastAccessedDate`, which step 8 and a wait of one day record.
+
+**Manual eviction (`manual_action_validated`)**
+
+13. `svalnir config apply --config ./config.toml --expected-revision none` with a configuration of `schema_version = 1`.
+14. `svalnir clean plan --mode evict --rule xcode.inactive-derived-data --format json`. Expected: one target for each unit of each project, the cleanup root `~/Library/Developer/Xcode/DerivedData`, `discovery.complete` true, and no target for `Logs`, `SourcePackages`, `info.plist`, `ModuleCache.noindex`, or a project directory. Keep the output.
+15. Exclusions: put a `.dSYM` directory, an `.xcarchive` directory, a file with a name that the deny-list has, a symbolic link, and a hard-linked file in a unit of one project; make a second plan. Expected: that unit is not a target and has its reason; nothing in it is removed later.
+16. Replacement: make a plan, then move one unit away and make a directory with one file at its name; `svalnir clean apply --plan PLAN_ID`. Expected: the question names permanent removal and each target; the replaced unit and its file stay; each other unit is removed.
+17. Producer after the plan: make a plan, start a build, then apply. Expected: each target is skipped with `producer_active`, and the build is not stopped.
+18. Apply of a plan with no change: `svalnir clean apply --plan PLAN_ID`, then `svalnir history --format json`. Expected: each unit is removed, `permanently_removed` has the count, `moved_to_trash` is 0, and `Logs`, `info.plist`, and the sources stay.
+19. Regeneration: build and test each project again with each Xcode version. Expected: each succeeds with no manual step. Record the time of the first build and of the indexing: this is the rebuild cost of the declaration.
+
+**Automatic eviction (`automatic_eviction_validated`)**
+
+20. Read the available capacity of the data volume with `svalnir status --format json`. Write a configuration with the disk guard enabled, `volumes = ["startup-data"]`, `approved_rules = ["xcode.inactive-derived-data"]`, `warn_below` 10 GiB above the available capacity, `reclaim_below` 5 GiB below it, and the other thresholds in the relation that [POLICY_SPEC.md](POLICY_SPEC.md) section 3 gives. Apply it, and run `svalnir policy enable disk-guard --accept-permanent-eviction`.
+21. Start the agent in a terminal, with no service: `svalnir-agent --foreground --state-dir "$SVALNIR_STATE_DIR"`. Do not run `agent install`. Expected, from `svalnir agent status --format json`: the disk guard is in the advisory band, and nothing is removed. Wait for two sample intervals, so that the discovery ran.
+22. Without a stop of the agent, apply a second configuration whose `reclaim_below` is 5 GiB above the available capacity and whose `recover_above` is above it, and enable the disk guard again. Expected, after `sustain_for`: one automatic operation in `svalnir history --format json` with the disk trigger; the units are removed in the bounds of the batch; the capacity observation of the operation; a second batch only after a measurement.
+23. Repeat step 22 with a build in progress. Expected: nothing is removed, and the status has the reason.
+24. Stop the agent with Control-C. Expected: exit status 0, and `svalnir agent status` shows a clean stop. Remove the validation user account and its home directory after the record is complete.
+
+**Not in this procedure**
+
+The procedure does not fill a disk, does not change the clock of the host, registers no service, and needs no administrator right. The budget stop, the backoff after a removal with no gain, a restart during an operation, a full journal volume, and a permission failure are cases of the fixture tests; the record names the tests and the revision. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and is outside the promoted support.
 
 ## References
 

@@ -46,7 +46,11 @@ objc2-foundation.workspace = true
 # check can come from `SVALNIR_TEST_ACCOUNT_HOME`, so that a test starts
 # the binary with a temporary home directory. A build without the feature,
 # and a build with no debug assertions, has no code that reads that
-# variable. No default feature enables it.
+# variable. The feature also gives the rule fixtures (`rules::fixture`) and
+# `ReviewedRules::with_fixture_lifecycle`, with which a fixture test runs
+# the path of an eviction in a temporary directory; a build without the
+# feature, and a build with no debug assertions, has no function that
+# changes the lifecycle state of a rule. No default feature enables it.
 [features]
 test-support = []
 

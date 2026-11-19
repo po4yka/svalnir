@@ -30,7 +30,8 @@
 //! | [`journal`] | The operation journal in `operations.sqlite`: plans, operations, the resource observations of an operation, revisions and grants, the request queue, the coordinator lock with the role of its holder and a reading that takes no lock, recovery reads, and the named agent records |
 //! | [`executor::fs`] | The filesystem executor: the Trash move and the descriptor-relative permanent removal of one admitted step, with a stop between the entries of a directory target |
 //! | [`executor::process`] | The process executor: the graceful request, the force signal, and the exit observation of one admitted step |
-//! | [`rules`] | The rule registry and the two reviewed rules, each in the `proposed` lifecycle state |
+//! | [`rules`] | The rule registry, the two reviewed rules, each in the `proposed` lifecycle state, and the discovery for an eviction: the roots of a rule declaration, the process evidence, the overlap resolution, and the facts of admission |
+//! | [`protection`] | The catalog of protected file locations for the paths of the host, for a client, a discovery, and the coordinator at admission |
 //! | [`coordinator`] | The operation coordinator: admission, serialization, dispatch records, the approved roots of a manual operation from its sealed plan, cancellation, the queue service, the stop of new claims at a shutdown, and reconciliation |
 //! | [`controller`] | The guard controller: the decisions of the disk guard and the memory guard from the authority record, and the open incidents that bound the retention of the journal |
 //! | [`runtime`] | The agent process: the driver loop, the agent clock with the sleep continuity of the host, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |

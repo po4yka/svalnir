@@ -124,7 +124,7 @@ impl ActionPort for FixturePort {
             // With no agent, a change of the authority record is written
             // directly, as the CLI does; a request of the queue is refused.
             ActionScript::Unavailable if is_authority(action) => {
-                AuthorityPath::NoAgent.annotate(accepted(action))
+                AuthorityPath::NoAgent.annotate(accepted(action), true)
             }
             ActionScript::Unavailable => ActionState::Unavailable(Unavailable::NoAgent),
             ActionScript::Pending => match action {
@@ -140,7 +140,7 @@ impl ActionPort for FixturePort {
                     operation: "op-fixture-stop".to_owned(),
                     since: SystemTime::now(),
                 },
-                _ if is_authority(action) => AuthorityPath::Agent.annotate(accepted(action)),
+                _ if is_authority(action) => AuthorityPath::Agent.annotate(accepted(action), true),
                 _ => accepted(action),
             },
         };
@@ -176,7 +176,13 @@ impl ActionPort for FixturePort {
         }
         // A group of a browser or an editor has many helper processes. The
         // fixture plan binds helpers too, so that the list scrolls.
-        let base: i32 = targets.last().map_or(1000, |target| target.pid);
+        // Above the highest PID of the members, so that no two rows share an
+        // identity.
+        let base: i32 = targets
+            .iter()
+            .map(|target| target.pid)
+            .max()
+            .unwrap_or(1000);
         for index in 1..=FIXTURE_HELPERS {
             targets.push(fixture_target(
                 base + 100 + index,

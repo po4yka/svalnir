@@ -295,6 +295,37 @@ impl HistoryView {
         rows
     }
 
+    /// Clears each filter value that `values` does not have: a value that
+    /// left the bounded read cannot be shown as a toggle, so it does not
+    /// filter in secret. Returns `true` when a value was cleared.
+    pub fn keep_values_of(&mut self, values: &FilterValues) -> bool {
+        let mut cleared: bool = false;
+        if self
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| !values.triggers.contains(trigger))
+        {
+            self.trigger = None;
+            cleared = true;
+        }
+        if self
+            .class
+            .as_ref()
+            .is_some_and(|class| !values.classes.contains(class))
+        {
+            self.class = None;
+            cleared = true;
+        }
+        if self
+            .outcome
+            .is_some_and(|outcome| !values.outcomes.contains(&outcome))
+        {
+            self.outcome = None;
+            cleared = true;
+        }
+        cleared
+    }
+
     /// Sorts by `column`: a second press on the same column reverses the
     /// direction.
     pub fn sort_by(&mut self, column: SortColumn) {
@@ -1221,6 +1252,11 @@ impl Render for HistoryScreen {
         let model: &AppModel = self.model.read(cx);
         let now: SystemTime = SystemTime::now();
         let history = shown(&model.history_records, now, |history| history.captured_at);
+        // A filter value that left the bounded read is cleared, so that the
+        // toggles always show the filter in effect.
+        if let Shown::Data { value, .. } = &history {
+            self.view.keep_values_of(&filter_values(&value.operations));
+        }
         let screen_entity: Entity<HistoryScreen> = cx.entity();
         let cards: Vec<(CardWidth, AnyElement)> = vec![(
             CardWidth::Full,
@@ -1420,6 +1456,22 @@ mod tests {
         assert_eq!(triggers, sorted);
         view.sort_by(SortColumn::Admitted);
         assert!(!view.ascending, "the admission time starts newest first");
+    }
+
+    #[test]
+    fn a_filter_value_that_left_the_read_is_cleared() {
+        let operations = fixture_operations();
+        let mut view = HistoryView {
+            trigger: Some("gone_trigger".to_owned()),
+            class: Some("MoveToTrash".to_owned()),
+            outcome: Some(OperationPhase::Pending),
+            ..HistoryView::default()
+        };
+        assert!(view.keep_values_of(&filter_values(&operations)));
+        assert_eq!(view.trigger, None);
+        assert_eq!(view.class.as_deref(), Some("MoveToTrash"));
+        assert_eq!(view.outcome, None);
+        assert!(!view.keep_values_of(&filter_values(&operations)));
     }
 
     #[test]

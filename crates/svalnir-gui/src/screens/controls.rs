@@ -282,7 +282,7 @@ fn target_list(
         .role(Role::List)
         .test_support()
         .aria_label(format!(
-            "{count} bound processes. The arrow keys, Page Up, Page Down, Home, and End scroll the list."
+            "{count} bound processes. The arrow keys, Page Up, Page Down, Space, Home, and End scroll the list."
         ))
         .track_focus(focus)
         .track_scroll(scroll)

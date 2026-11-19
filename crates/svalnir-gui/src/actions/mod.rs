@@ -263,7 +263,10 @@ impl Unavailable {
 }
 
 /// The path on which a pause, a resume, or an enable or disable of a guard
-/// reached the authority record. The client writes the record with the
+/// reached the authority record. The window reads the coordinator lock just
+/// before the write, so an agent that starts or stops in between can make
+/// the sentence name the wrong reader; the write itself does not depend on
+/// it. The client writes the record with the
 /// same compare-and-set as the CLI on each path; the path tells the user
 /// which process reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +298,7 @@ impl AuthorityPath {
                 "Path: no agent runs, so the window wrote the record directly, as the command-line client does. An agent reads it when it starts."
             }
             Self::OtherCoordinator => {
-                "Path: a command-line client holds the coordinator lock and evaluates no guard, so the window wrote the record directly. An agent reads it when it starts."
+                "Path: a command-line client holds the coordinator lock and evaluates no guard; the window wrote the record directly. An agent reads it when it starts."
             }
             Self::Unknown => {
                 "Path: the coordinator lock cannot be read, so the window wrote the record directly. An agent that runs reads it at its next tick."
@@ -303,18 +306,27 @@ impl AuthorityPath {
         }
     }
 
-    /// The accepted state `state` with the sentence of the path. A state
-    /// that is not accepted does not change: nothing was written.
+    /// The accepted state `state` with the sentence of the path when the
+    /// journal has a new record (`written`), or with the sentence that
+    /// nothing was written when the record already had the requested state.
+    /// A state that is not accepted does not change: nothing was written.
     #[must_use]
-    pub fn annotate(self, state: ActionState) -> ActionState {
+    pub fn annotate(self, state: ActionState, written: bool) -> ActionState {
         match state {
-            ActionState::Accepted { detail } => ActionState::Accepted {
+            ActionState::Accepted { detail } if written => ActionState::Accepted {
                 detail: format!("{detail} {}", self.sentence()),
+            },
+            ActionState::Accepted { detail } => ActionState::Accepted {
+                detail: format!("{detail} {NOTHING_WRITTEN}"),
             },
             other => other,
         }
     }
 }
+
+/// The sentence of an authority change that needed no write.
+pub const NOTHING_WRITTEN: &str =
+    "Nothing was written: the authority record already had this state.";
 
 /// The state of a control after an action.
 #[derive(Debug, Clone, PartialEq, Eq)]

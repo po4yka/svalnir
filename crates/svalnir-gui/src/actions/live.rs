@@ -136,7 +136,7 @@ impl LivePort {
     // refuses these with `NoJournal`: the private state directory function
     // is in `svalnir-cli` (`Environment::create_state_directory`). Move it
     // to `svalnir_agent::client` and call it here.
-    fn authority_action(path: &Path, action: &Action) -> Result<ActionState, ActionState> {
+    fn authority_action(path: &Path, action: &Action) -> Result<(ActionState, bool), ActionState> {
         let mut journal: OperationJournal = open_for_writes(path)?;
         let stored: StoredAuthority = read_authority(&journal)?;
         let (clock, wall) = clocks()?;
@@ -163,11 +163,9 @@ impl LivePort {
                     PauseRefusal::WrongPrincipal => ActionState::refused("wrong_principal"),
                     _ => ActionState::refused("invalid_duration"),
                 })?;
-                let detail: String = match duration {
-                    Some(_) => "The pause is in the authority record. The agent starts no new automatic intervention until the pause ends.".to_owned(),
-                    None => "The pause is in the authority record. The agent starts no new automatic intervention until a resume.".to_owned(),
-                };
-                write(&mut journal, &stored, change, wall).map(|_| accepted(detail))
+                let detail: String = pause_detail(duration.is_some());
+                write(&mut journal, &stored, change, wall)
+                    .map(|(_, written)| (accepted(detail), written))
             }
             Action::Resume => {
                 let change = resume(
@@ -177,8 +175,8 @@ impl LivePort {
                     &control,
                 )
                 .map_err(|_| ActionState::refused("wrong_principal"))?;
-                write(&mut journal, &stored, change, wall).map(|_| {
-                    accepted("The pause ended. The agent makes new measurements before an automatic intervention.".to_owned())
+                write(&mut journal, &stored, change, wall).map(|(_, written)| {
+                    (accepted("The pause ended. The agent makes new measurements before an automatic intervention.".to_owned()), written)
                 })
             }
             Action::Enable {
@@ -215,7 +213,7 @@ impl LivePort {
                 {
                     detail.push_str(" The history record of the grant was not written.");
                 }
-                Ok(accepted(detail))
+                Ok((accepted(detail), written))
             }
             Action::Disable { policy } => {
                 let change = disable(
@@ -229,11 +227,14 @@ impl LivePort {
                     ControlRefusal::WrongPrincipal => ActionState::refused("wrong_principal"),
                     ControlRefusal::UnknownGrant { .. } => ActionState::refused("disable_refused"),
                 })?;
-                write(&mut journal, &stored, change, wall).map(|_| {
-                    accepted(format!(
-                        "The {} is disabled. It starts no new automatic intervention.",
-                        policy_label(*policy)
-                    ))
+                write(&mut journal, &stored, change, wall).map(|(_, written)| {
+                    (
+                        accepted(format!(
+                            "The {} is disabled. It starts no new automatic intervention.",
+                            policy_label(*policy)
+                        )),
+                        written,
+                    )
                 })
             }
             _ => Err(ActionState::refused(UNEXPECTED_COMPLETION)),
@@ -353,7 +354,8 @@ impl ActionPort for LivePort {
             | Action::Resume
             | Action::Enable { .. }
             | Action::Disable { .. } => self.authority_gate().and_then(|(path, route)| {
-                Self::authority_action(&path, action).map(|state| route.annotate(state))
+                Self::authority_action(&path, action)
+                    .map(|(state, written)| route.annotate(state, written))
             }),
             _ => self.queued_action(action),
         };
@@ -496,6 +498,15 @@ fn gate_presence(presence: AgentPresence) -> Result<(), ActionState> {
             Err(ActionState::Unavailable(Unavailable::OtherCoordinator))
         }
         AgentPresence::Unknown => Err(ActionState::Unavailable(Unavailable::AgentUnknown)),
+    }
+}
+
+/// The state line of a pause that the authority record has.
+fn pause_detail(timed: bool) -> String {
+    if timed {
+        "The pause is in the authority record. The agent starts no new automatic intervention until the pause ends.".to_owned()
+    } else {
+        "The pause is in the authority record. The agent starts no new automatic intervention until a resume.".to_owned()
     }
 }
 
@@ -777,7 +788,10 @@ mod tests {
         assert!(stored_authority(&path).state.pause.is_none());
         // A second resume needs no change and writes nothing.
         let again = port.submit(&Action::Resume);
-        assert!(matches!(again, ActionState::Accepted { .. }), "{again:?}");
+        assert!(
+            accepted_detail(&again).ends_with(super::super::NOTHING_WRITTEN),
+            "{again:?}"
+        );
         assert_eq!(stored_authority(&path).revision, 2);
     }
 
@@ -795,7 +809,7 @@ mod tests {
             policy: PolicyId::DiskGuard,
         });
         assert!(
-            matches!(disabled, ActionState::Accepted { .. }),
+            accepted_detail(&disabled).ends_with(super::super::NOTHING_WRITTEN),
             "{disabled:?}"
         );
         assert_eq!(stored_authority(&path).revision, 0, "no record was written");

@@ -549,7 +549,7 @@ fn summarize(
 /// Three status intervals of the agent (the agent rewrites its status
 /// record at least every 30 s: `status_interval` in `svalnir-agent`
 /// `main.rs`).
-const STATUS_FRESH: Duration = Duration::from_secs(90);
+pub const STATUS_FRESH: Duration = Duration::from_secs(90);
 
 /// Reads the status record of the agent through the read-only journal. The
 /// coordinator lock is not read: a lock probe can make a starting agent exit.

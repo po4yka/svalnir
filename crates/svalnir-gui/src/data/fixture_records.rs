@@ -851,12 +851,30 @@ pub(super) fn diagnostics(scenario: FixtureScenario) -> DiagnosticsSnapshot {
         Measured::Value(AgentStatusRow {
             process_id: 512,
             started_at: back(captured_at, 86_400),
-            written_at: back(captured_at, 12),
+            // The stale status record is 12 min old.
+            written_at: back(
+                captured_at,
+                if scenario == FixtureScenario::Stale {
+                    720
+                } else {
+                    12
+                },
+            ),
             run_state: "running",
             revision: Some("rev-fixture-1".to_owned()),
             policy_problem: None,
-            capability_verdict: Some("ready".to_owned()),
-            required_not_available: Vec::new(),
+            // The capability summary of the agent: blocked under pressure,
+            // no check in the drift record, and ready in the others.
+            capability_verdict: match scenario {
+                FixtureScenario::Pressure => Some("blocked".to_owned()),
+                FixtureScenario::Drift => None,
+                _ => Some("ready".to_owned()),
+            },
+            required_not_available: if scenario == FixtureScenario::Pressure {
+                vec!["privacy.full_disk_access".to_owned()]
+            } else {
+                Vec::new()
+            },
             footprint: Measured::Value(38 * MB),
             budget: 120 * MB,
             degraded: if scenario == FixtureScenario::Pressure {

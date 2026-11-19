@@ -1,13 +1,16 @@
-//! The Diagnostics screen: the capabilities of this process, the status
-//! record of the agent, a start-failure record, and the journal file. The
-//! screen shows state only.
+//! The Diagnostics screen: two labeled capability lists (the summary of
+//! the agent from its status record, and the probes of this window), the
+//! status record of the agent, a start-failure record, and the journal
+//! file. The screen shows state only.
 
+use super::agent_state::span;
 use super::common::{
     CardWidth, Shown, ago, body_line, bytes_text, caption, card, fact, failed_body, inset,
     problem_lines, screen, shown, skeleton_rows,
 };
 use crate::{
     data::{
+        live::STATUS_FRESH,
         model::Measured,
         records::{
             AgentStatusRow, CapabilityLevel, CapabilityRow, DiagnosticsSnapshot, Need,
@@ -23,14 +26,91 @@ use crate::{
     },
 };
 use gpui_kit::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString,
-    Styled, TestSupportExt as _, Window,
+    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Render, Role,
+    SharedString, Styled, TestSupportExt as _, Window,
     component::{ActiveTheme as _, IconName, h_flex, v_flex},
     div,
     prelude::*,
     px,
 };
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// The capability summary of the agent from its status record, or the
+/// reason that it is not shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCapabilities {
+    /// The status record is current and has the capability check of the
+    /// start of the agent.
+    Current {
+        /// The verdict, as the agent wrote it: `ready`, `unverified`, or
+        /// `blocked`.
+        verdict: String,
+        /// The required capabilities that the agent does not have.
+        missing: Vec<String>,
+        /// The age of the status record.
+        age: Duration,
+    },
+    /// No current summary: one sentence with the reason.
+    Unavailable(String),
+}
+
+/// The capability summary of the agent in `snapshot`. The summary is the
+/// state of a running agent only when its status record is at most 90 s
+/// old (three status intervals) and the agent did not record a stop.
+#[must_use]
+pub fn agent_capabilities(snapshot: &DiagnosticsSnapshot) -> AgentCapabilities {
+    let status: &AgentStatusRow = match &snapshot.agent {
+        Measured::Value(status) => status,
+        Measured::Unavailable(reason) => {
+            return AgentCapabilities::Unavailable(format!(
+                "No agent capability summary: {reason}"
+            ));
+        }
+    };
+    let age: Duration = match snapshot.captured_at.duration_since(status.written_at) {
+        Ok(age) => age,
+        Err(ahead) if ahead.duration() <= STATUS_FRESH => Duration::ZERO,
+        Err(_) => {
+            return AgentCapabilities::Unavailable(
+                "No agent capability summary: the status record has a time later than the clock of this window, so its age is not known.".to_owned(),
+            );
+        }
+    };
+    if age > STATUS_FRESH {
+        return AgentCapabilities::Unavailable(format!(
+            "No agent capability summary: the status record is {} old, so the agent does not run or does not write. The summary of that time is not the state of an agent now.",
+            span(age)
+        ));
+    }
+    if status.run_state == "stopped" {
+        return AgentCapabilities::Unavailable(
+            "No agent capability summary: the agent recorded that it stopped.".to_owned(),
+        );
+    }
+    match &status.capability_verdict {
+        Some(verdict) => AgentCapabilities::Current {
+            verdict: verdict.clone(),
+            missing: status.required_not_available.clone(),
+            age,
+        },
+        None => AgentCapabilities::Unavailable(
+            "No agent capability summary: the status record has no capability check of the agent."
+                .to_owned(),
+        ),
+    }
+}
+
+/// The pill text and the tone of a verdict that the agent wrote as text.
+/// A text that this build does not know is "Not known".
+#[must_use]
+pub fn agent_verdict_pill(verdict: &str) -> (&'static str, Tone) {
+    match verdict {
+        "ready" => verdict_pill(Verdict::Ready),
+        "unverified" => verdict_pill(Verdict::Unverified),
+        "blocked" => verdict_pill(Verdict::Blocked),
+        _ => ("Not known", Tone::Warning),
+    }
+}
 
 /// The pill text, the tone, and the icon of a capability state. Each state
 /// has a different text, so the tone is not the only signal.
@@ -167,46 +247,157 @@ fn capability_row(row: &CapabilityRow, tokens: &Tokens) -> AnyElement {
     inset(block, tokens)
 }
 
-fn capabilities_card(diagnostics: &Shown<DiagnosticsSnapshot>, tokens: &Tokens) -> AnyElement {
-    let mut header: ShellHeader =
-        ShellHeader::new(IconName::Inspector, "Capabilities").subtitle("Probes of this process");
+/// The label of one of the two capability lists.
+fn list_title(id: &'static str, text: &'static str, tokens: &Tokens) -> AnyElement {
+    div()
+        .id(id)
+        .role(Role::Heading)
+        .test_support()
+        .aria_label(text)
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(to_hsla(tokens.foreground))
+        .child(text)
+        .into_any_element()
+}
+
+/// The list "Agent": the capability summary of the status record of the
+/// agent, with its age, or the reason that it is not shown.
+fn agent_list(value: &DiagnosticsSnapshot, mono: &SharedString, tokens: &Tokens) -> AnyElement {
+    let mut list = v_flex()
+        .gap(tokens::SPACE_1)
+        .child(list_title("diagnostics-list-agent", "Agent", tokens))
+        .child(caption(
+            "diagnostics-agent-scope",
+            "The capability check that the agent made at its start, from its status record.",
+            tokens,
+        ));
+    match agent_capabilities(value) {
+        AgentCapabilities::Unavailable(reason) => {
+            list = list.child(body_line(
+                "diagnostics-agent-summary-none",
+                reason,
+                true,
+                tokens,
+            ));
+        }
+        AgentCapabilities::Current {
+            verdict,
+            missing,
+            age,
+        } => {
+            let (text, tone) = agent_verdict_pill(&verdict);
+            list = list
+                .child(
+                    h_flex()
+                        .gap(tokens::SPACE_2)
+                        .items_center()
+                        .child(StatusPill::new(text, tone).id("diagnostics-agent-verdict"))
+                        .child(fact(
+                            "diagnostics-agent-summary-age",
+                            "Status record written",
+                            format!("{} ago", span(age)),
+                            mono,
+                            false,
+                            tokens,
+                        )),
+                )
+                .child(body_line(
+                    "diagnostics-agent-summary",
+                    if missing.is_empty() {
+                        "The agent has each required capability.".to_owned()
+                    } else {
+                        format!(
+                            "The agent does not have {} required {}:",
+                            missing.len(),
+                            if missing.len() == 1 {
+                                "capability"
+                            } else {
+                                "capabilities"
+                            }
+                        )
+                    },
+                    false,
+                    tokens,
+                ));
+            for id in &missing {
+                list = list.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "diagnostics-agent-missing-{id}"
+                        )))
+                        .test_support()
+                        .aria_label(format!("{id}: not available to the agent"))
+                        .gap(tokens::SPACE_2)
+                        .child(MonoTag::new(
+                            SharedString::from(format!("diagnostics-agent-missing-tag-{id}")),
+                            id.clone(),
+                        ))
+                        .child(StatusPill::new("Not available", Tone::Negative)),
+                );
+            }
+            list = list.child(caption(
+                "diagnostics-agent-summary-limit",
+                "The record has the verdict and the required capabilities that are not available, not the state of each capability.",
+                tokens,
+            ));
+        }
+    }
+    inset(list, tokens)
+}
+
+fn capabilities_card(
+    diagnostics: &Shown<DiagnosticsSnapshot>,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let header: ShellHeader =
+        ShellHeader::new(IconName::Inspector, "Capabilities").subtitle("The agent and this window");
     let body: AnyElement = match diagnostics {
         Shown::Loading => skeleton_rows(6),
         Shown::Failed(reason) => failed_body("diagnostics-value", reason, tokens),
         Shown::Data { value, .. } => {
             let (text, tone) = verdict_pill(value.verdict);
-            header = header.aside(StatusPill::new(text, tone).id("diagnostics-verdict"));
             let missing: usize = not_available_count(&value.capabilities);
-            let mut body = v_flex().gap(tokens::SPACE_2).child(body_line(
-                "diagnostics-verdict-sentence",
-                format!(
-                    "{} {missing} of {} capabilities that the product uses are not available.",
-                    verdict_sentence(value.verdict),
-                    value
-                        .capabilities
-                        .iter()
-                        .filter(|row| row.need != Need::Informational)
-                        .count()
-                ),
-                false,
-                tokens,
-            ));
+            let mut window_list = v_flex()
+                .gap(tokens::SPACE_2)
+                .child(
+                    h_flex()
+                        .gap(tokens::SPACE_2)
+                        .items_center()
+                        .child(list_title("diagnostics-list-window", "This window", tokens))
+                        .child(StatusPill::new(text, tone).id("diagnostics-verdict")),
+                )
+                .child(body_line(
+                    "diagnostics-verdict-sentence",
+                    format!(
+                        "{} {missing} of {} capabilities that the product uses are not available.",
+                        verdict_sentence(value.verdict),
+                        value
+                            .capabilities
+                            .iter()
+                            .filter(|row| row.need != Need::Informational)
+                            .count()
+                    ),
+                    false,
+                    tokens,
+                ));
             for row in &value.capabilities {
-                body = body.child(capability_row(row, tokens));
+                window_list = window_list.child(capability_row(row, tokens));
             }
             if value.capabilities.is_empty() {
-                body = body.child(body_line(
+                window_list = window_list.child(body_line(
                     "diagnostics-empty",
                     "The report has no capability.",
                     true,
                     tokens,
                 ));
             }
-            body = body
+            window_list = window_list
                 .child(caption(
                     "diagnostics-scope",
                     format!(
-                        "{}. A capability of the agent can be different; see the status record of the agent.",
+                        "{}. The probes of this window are not the capabilities of the agent, which runs as a different process.",
                         value.subject
                     ),
                     tokens,
@@ -215,7 +406,11 @@ fn capabilities_card(diagnostics: &Shown<DiagnosticsSnapshot>, tokens: &Tokens) 
                     ProvenanceLine::new("capability probes", value.captured_at, "this process")
                         .id("diagnostics-provenance"),
                 );
-            body.into_any_element()
+            v_flex()
+                .gap(tokens::SPACE_3)
+                .child(agent_list(value, mono, tokens))
+                .child(window_list)
+                .into_any_element()
         }
     };
     card(header, body)
@@ -332,17 +527,6 @@ fn agent_facts(
             tokens,
         ),
         fact(
-            "diagnostics-agent-capabilities",
-            "Capability check of the agent",
-            status
-                .capability_verdict
-                .clone()
-                .unwrap_or_else(|| "\u{2014}".to_owned()),
-            mono,
-            false,
-            tokens,
-        ),
-        fact(
             "diagnostics-agent-footprint",
             "Footprint of budget",
             footprint,
@@ -370,16 +554,6 @@ fn agent_notes(status: &AgentStatusRow, tokens: &Tokens) -> Vec<AnyElement> {
         rows.push(caption(
             "diagnostics-agent-policy-problem",
             format!("Problem: the agent cannot use the authority record: {problem}."),
-            tokens,
-        ));
-    }
-    if !status.required_not_available.is_empty() {
-        rows.push(caption(
-            "diagnostics-agent-missing",
-            format!(
-                "The agent does not have these required capabilities: {}.",
-                status.required_not_available.join(", ")
-            ),
             tokens,
         ));
     }
@@ -511,7 +685,10 @@ impl Render for DiagnosticsScreen {
             diagnostics.captured_at
         });
         let cards: Vec<(CardWidth, AnyElement)> = vec![
-            (CardWidth::Full, capabilities_card(&diagnostics, tokens)),
+            (
+                CardWidth::Full,
+                capabilities_card(&diagnostics, &mono, tokens),
+            ),
             (
                 CardWidth::Share,
                 agent_card(&diagnostics, now, &mono, tokens),
@@ -535,6 +712,95 @@ mod tests {
             detail: "A protected location refused the read.".to_owned(),
             enables: "A scan.".to_owned(),
             remediation: remediation.map(str::to_owned),
+        }
+    }
+
+    /// The healthy fixture with the status record `edit` makes from its
+    /// record, or with no record.
+    fn snapshot_with(
+        edit: impl FnOnce(AgentStatusRow, SystemTime) -> Measured<AgentStatusRow>,
+    ) -> DiagnosticsSnapshot {
+        use crate::data::{
+            DataSource as _,
+            fixture::{FixtureScenario, FixtureSource},
+        };
+        let mut snapshot = FixtureSource::new(FixtureScenario::Healthy).diagnostics();
+        let Measured::Value(status) = snapshot.agent.clone() else {
+            panic!("the healthy fixture has a status record");
+        };
+        snapshot.agent = edit(status, snapshot.captured_at);
+        snapshot
+    }
+
+    #[test]
+    fn a_current_status_record_gives_the_summary_of_the_agent() {
+        let snapshot = snapshot_with(|mut status, now| {
+            status.capability_verdict = Some("blocked".to_owned());
+            status.required_not_available = vec!["privacy.full_disk_access".to_owned()];
+            status.written_at = now - Duration::from_secs(30);
+            Measured::Value(status)
+        });
+        assert_eq!(
+            agent_capabilities(&snapshot),
+            AgentCapabilities::Current {
+                verdict: "blocked".to_owned(),
+                missing: vec!["privacy.full_disk_access".to_owned()],
+                age: Duration::from_secs(30),
+            }
+        );
+        assert_eq!(agent_verdict_pill("blocked"), ("Blocked", Tone::Negative));
+        assert_eq!(agent_verdict_pill("other"), ("Not known", Tone::Warning));
+    }
+
+    #[test]
+    fn an_old_stopped_future_or_empty_record_gives_no_summary() {
+        type Edit = fn(AgentStatusRow, SystemTime) -> Measured<AgentStatusRow>;
+        let cases: Vec<(Edit, &str)> = vec![
+            (
+                |_, _| Measured::Unavailable("No journal exists.".to_owned()),
+                "No journal exists.",
+            ),
+            (
+                |mut status, now| {
+                    status.written_at = now - Duration::from_secs(91);
+                    Measured::Value(status)
+                },
+                "1 min old",
+            ),
+            (
+                |mut status, now| {
+                    status.written_at = now;
+                    status.run_state = "stopped";
+                    Measured::Value(status)
+                },
+                "recorded that it stopped",
+            ),
+            (
+                |mut status, now| {
+                    status.written_at = now + Duration::from_secs(600);
+                    Measured::Value(status)
+                },
+                "later than the clock",
+            ),
+            (
+                |mut status, now| {
+                    status.written_at = now;
+                    status.capability_verdict = None;
+                    Measured::Value(status)
+                },
+                "no capability check",
+            ),
+        ];
+        for (edit, expected) in cases {
+            let summary = agent_capabilities(&snapshot_with(edit));
+            let AgentCapabilities::Unavailable(reason) = summary else {
+                panic!("a summary: {summary:?}");
+            };
+            assert!(
+                reason.starts_with("No agent capability summary: "),
+                "{reason}"
+            );
+            assert!(reason.contains(expected), "{reason}");
         }
     }
 

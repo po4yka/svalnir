@@ -481,3 +481,72 @@ fn diagnostics_shows_a_probe_with_no_result_and_a_start_failure(cx: &mut TestApp
         Some("Exists: No")
     );
 }
+
+#[gpui_kit::test]
+fn diagnostics_has_a_labeled_list_for_the_agent_and_for_this_window(cx: &mut TestAppContext) {
+    let (handle, _view) = open(FixtureScenario::Healthy, Screen::Diagnostics, cx);
+    assert_eq!(
+        label(handle, "diagnostics-list-agent", cx).as_deref(),
+        Some("Agent")
+    );
+    assert_eq!(
+        label(handle, "diagnostics-list-window", cx).as_deref(),
+        Some("This window")
+    );
+    assert_eq!(
+        label(handle, "diagnostics-agent-verdict", cx).as_deref(),
+        Some("Ready")
+    );
+    assert_eq!(
+        label(handle, "diagnostics-agent-summary-age", cx).as_deref(),
+        Some("Status record written: 12 s ago")
+    );
+    assert_eq!(label(handle, "diagnostics-agent-summary-none", cx), None);
+    let scope = label(handle, "diagnostics-scope", cx).expect("scope");
+    assert!(
+        scope.contains("not the capabilities of the agent"),
+        "{scope}"
+    );
+
+    let (handle, _view) = open(FixtureScenario::Pressure, Screen::Diagnostics, cx);
+    assert_eq!(
+        label(handle, "diagnostics-agent-verdict", cx).as_deref(),
+        Some("Blocked")
+    );
+    assert_eq!(
+        label(
+            handle,
+            "diagnostics-agent-missing-privacy.full_disk_access",
+            cx
+        )
+        .as_deref(),
+        Some("privacy.full_disk_access: not available to the agent")
+    );
+}
+
+#[gpui_kit::test]
+fn the_agent_list_is_unavailable_with_a_reason_when_no_current_summary_exists(
+    cx: &mut TestAppContext,
+) {
+    for (scenario, expected) in [
+        (FixtureScenario::Stale, "the status record is 12 min old"),
+        (FixtureScenario::Drift, "has no capability check"),
+        (
+            FixtureScenario::Unavailable,
+            "cannot be read in this fixture",
+        ),
+        (FixtureScenario::AgentAbsent, "No journal exists"),
+    ] {
+        let (handle, _view) = open(scenario, Screen::Diagnostics, cx);
+        let reason = label(handle, "diagnostics-agent-summary-none", cx)
+            .unwrap_or_else(|| panic!("no reason for {scenario:?}"));
+        assert!(
+            reason.starts_with("No agent capability summary: "),
+            "{scenario:?}: {reason}"
+        );
+        assert!(reason.contains(expected), "{scenario:?}: {reason}");
+        assert_eq!(label(handle, "diagnostics-agent-verdict", cx), None);
+        // The list of this window stays.
+        assert!(label(handle, "diagnostics-list-window", cx).is_some());
+    }
+}

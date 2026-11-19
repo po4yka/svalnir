@@ -1,6 +1,6 @@
 # Svalnir Validation Plan
 
-**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of two host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
+**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of three host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
 **Last reviewed:** 2026-11-19
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
@@ -444,7 +444,7 @@ The procedure does not fill a disk, does not change the clock of the host, regis
 
 ## 14. Host validation records
 
-This section has the case records of two runs on one host of the project owner, made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. The authorization excluded each grant, each enabled guard, and each other application, so no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.
+This section has the case records of three runs on one host of the project owner, made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. The authorization excluded each grant, each enabled guard, and each other application, so no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.
 
 The evidence files are command records: the command, the UTC time, the standard output, the exit status, and the standard error. They are on the host of the owner, in the directory `.omc/handoffs/` of the main checkout, which Git ignores. The repository does not keep them, so a contributor cannot read them; each record names this limit. No record has a reviewer.
 
@@ -526,14 +526,66 @@ limitations: [one host, one run, ad-hoc signature, not installed through an inst
 
 The run found no new defect.
 
+### Host run 3: GUI actions on the release artifacts of `186498a`
+
+The run drove the window of `Svalnir.app` with fixtures only, under the owner answer "Yes, after the code changes" of 2026-11-19 for the host case of the GUI actions. The window, the CLI, and the agent came from the artifacts of one `scripts/package.sh` run. The fixture application `SvalnirHostFixture.app` (identifier `invalid.svalnir-m3gui.fixture`) was made, started, and waited for by the run, so each stopped process was a child of the run. The run applied the built-in template to a fixture state directory only, because the window builds a stop plan only with a revision in effect; the template enables no guard and gives no grant.
+
+```yaml
+source_revision: 186498a7a02a8b6ccad2447f09b0a2a8e23597da
+artifact_digest:
+  svalnir-0.0.0-aarch64-apple-darwin.tar.gz: sha256:b94218ca444bdda3c9f8c2c3afbddca604cb40267c437fac89adf31e65ab8f60
+  svalnir-0.0.0-aarch64-apple-darwin-app.zip: sha256:b5232c4ed4cbf8669d5a57775b7d516ffdada54f97f4689095e98c3c72d9d8a0
+adapter_revision: null
+environment_record: macOS 27.2.1 (26B131), Mac16,7, Apple M4 Pro, 48 GiB, Aqua session, System Integrity Protection enabled; rustc 1.100.0; release artifacts of scripts/package.sh, ad-hoc signature with the hardened runtime, no Developer ID, not notarized; the window executable of Svalnir.app started directly with SVALNIR_STATE_DIR; memory pressure normal and warning, 57.7 GB of used swap
+fixture_manifest: SvalnirHostFixture.app (invalid.svalnir-m3gui.fixture, LSUIElement, ad-hoc signature, 64 MiB of its own memory, option refuse-quit); a state directory with no agent and a new state directory for the installed agent, both in the scratchpad of the run
+effective_policy_and_grants: built-in template (schema_version 1) applied to the fixture state directory of the agent; both guards not enabled; no grant; agent in observation mode
+seed_or_trace: null
+reviewer: null
+run_started_at: 2026-11-19T12:35:18Z
+evidence_paths: [.omc/handoffs/m3-host-gui-done.md, .omc/handoffs/m3-host-gui-evidence/]
+limitations: [one host, one run, ad-hoc signature, not installed through an installer, input through a computer-use tool, keyboard operation and accessible labels not examined, evidence not tracked]
+```
+
+| `validation_id` | `case_id` | Case of the run | Status | Observed results |
+| --- | --- | --- | --- | --- |
+| VAL-10 | `gui_pause_refused_with_no_journal` | N2 | `passed` | With no state directory, the pause of Automation is refused as unavailable with the reason; no file is made |
+| VAL-10 | `gui_direct_authority_write_with_no_agent` | N1 | `passed` | With a journal and no agent, pause and resume write the authority record directly; the state line names the path; the CLI reads the same record |
+| VAL-10 | `gui_direct_authority_write_after_uninstall` | N3 | `passed` | The same on the journal of the agent after `agent uninstall` |
+| VAL-10 | `gui_screens_show_live_data_with_agent` | a | `passed` | Each screen shows live data and no error state while the agent runs |
+| VAL-10 | `gui_pause_resume_through_agent` | b | `passed` | Pause and resume from Automation with the path "agent holds the coordinator lock"; the window and the CLI agree on the authority record |
+| VAL-06 | `gui_manual_stop_own_fixture_application` | c | `passed` | The dialog lists exactly the verified member of the instance of the fixture application and agrees with the sealed plan; the exit is verified (`ExitVerified`); History shows the detail |
+| VAL-06 | `gui_cancel_during_graceful_wait` | d | `passed` | Third try. The fixture refuses the quit request; a cancel from History gives `Incomplete` with `StillRunning` and a durable stop fence |
+| VAL-10 | `gui_rearm_control_with_no_incident` | e | `passed` | With no open incident, the rearm control is not offered |
+| VAL-10 | `gui_diagnostics_two_lists` | f | `passed` | The "Agent" list comes from the status record and the "This window" list from the probes of the role `window`; defect D-8 |
+| VAL-10 | `gui_history_filter_and_sort` | g | `passed` | Filter and sort order on the records of the run; defect D-10 |
+| VAL-13 | `no_system_notification_posted` | h | `passed` | No system notification; the `doctor` row `agent_notifications` is `unsupported`. Observation O-5: the window links the User Notifications framework through the GPUI platform crate and opens a client at launch, which the system refuses; the window posts nothing |
+| VAL-11 | `agent_log_location` | i | `passed` | The agent writes `~/Library/Logs/Svalnir/agent.log` in plain text with no terminal escape sequence |
+| VAL-11 | `explicit_uninstall` | U | `passed` | `agent uninstall` exits 0; proof of removal as in runs 1 and 2 |
+| VAL-10 | `gui_dark_theme_reduce_motion` | T | No status | Captured with `--appearance dark --reduce-motion`; only the History capture was examined, so the case has no result and is not in the count |
+| VAL-10 | `gui_enable_disable_guard` | — | `not_run` | The revision gives each guard no action class, so the window offers no enable control |
+| VAL-10 | `gui_stop_waiting_for_admission` | — | `not_run` | Needs an agent that does not serve the queue; outside the scope of the run |
+
+The count is 13 `passed`, 0 `failed`, and 2 `not_run`; case T is captured only and has no status. No automatic action occurred: the journal of the agent has only the three stop operations and the four requests (three `Apply`, one `Cancel`) of the run. The record makes no family and no gate pass: each family above has required parts that the run did not exercise, for example keyboard operation, focus, and accessible labels for VAL-10, and process identity replacement and force escalation for VAL-06.
+
+The run found four defects:
+
+| ID | Defect |
+| --- | --- |
+| D-8 | Diagnostics showed the journal size limit as 17.6 TB, the SQLite default page limit of the read-only connection of the window, in place of the 64 MiB limit of the agent. The label "Size of limit" was not clear |
+| D-9 | The button row of the stop confirmation was wider than the dialog with a long application name |
+| D-10 | In History, the state line of a cancel overflowed the State column and covered the next column |
+| D-11 | The sidebar and the status line said "Agent reporting" for up to 90 s after a clean stop of the agent, because the state came from the age of the status record only |
+
+Commit `2e3e6f9` corrects the four defects, each with a regression test: the read-only open of the journal applies the page limit of the writer through one shared function, and the row has the label "Size and size limit" (D-8); a button that fits its container (`ActionButton::fit()`) and a dialog footer that wraps keep the button row inside the dialog ([DESIGN.md](../DESIGN.md) §7) (D-9); the state cell of History wraps inside its cell (D-10); a status record with the run state stopped gives `AgentState::Stopped` at each age, and a running record keeps the freshness rule (D-11). No host run examined the corrections.
+
 ### What the records support
 
 Each gate of section 9 stays unverified. A record with `passed` is evidence for its case only, on one host, one macOS version, and one build. The cases are partial evidence for:
 
 - G-02 through VAL-04 and VAL-05: the manual Trash path of the two executors, with no permanent removal and no eviction.
-- G-03 through VAL-03, VAL-04, and VAL-06: the stop of a fixture child, and one refused rearm.
-- G-05 and G-09 through VAL-11: install, agent-only operation, pause and resume, a permanent start error, and uninstall.
-- G-06 through VAL-10 and VAL-13: the read-only commands, the result views, and the log of the agent.
+- G-03 through VAL-03, VAL-04, and VAL-06: the stop of a fixture child, the stop and the cancel of a fixture application from the window, and one refused rearm.
+- G-05 and G-09 through VAL-11: install, agent-only operation, pause and resume, a permanent start error, the log location, and uninstall.
+- G-06 through VAL-10 and VAL-13: the read-only commands, the result views, the log of the agent, and the agreement of the window and the CLI on the authority record and the operations of run 3.
 - G-07 through VAL-14: the reading of the lock only. No fuzzing ran.
 
 They are not evidence for:
@@ -544,7 +596,8 @@ They are not evidence for:
 - VAL-07: no crash at a journal or action boundary.
 - VAL-16: no signed installed artifact.
 - Automatic eviction or automatic application control: no grant existed and each rule is `proposed`.
-- The GPUI client, sleep and wake, a crash and restart, a disabled login item, and a non-local root.
+- The keyboard operation, the focus, the accessible labels, the two themes, and Reduce Motion of the GPUI client; its enable and disable of a guard; a stop that waits for admission; the menu bar item; and the corrections of D-8 to D-11.
+- Sleep and wake, a crash and restart, a disabled login item, and a non-local root.
 
 The evidence files are not tracked. Whether a record with untracked evidence meets section 12 ("Evidence references must resolve to retained logs") is a decision of the project owner.
 

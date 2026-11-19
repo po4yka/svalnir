@@ -1544,6 +1544,283 @@ fn the_fixed_units_of_a_recognized_project_are_candidates() {
     );
 }
 
+/// The result of a discovery of the Xcode rule with `limits`.
+fn discover_xcode_limited(fixture: &Fixture, limits: DiscoveryLimits) -> Discovery {
+    let registry = ReviewedRules::new().unwrap();
+    let cancel = CancellationToken::new();
+    let clock = month_later_clock();
+    let control = DiscoveryControl {
+        limits,
+        cancel: &cancel,
+        clock: &clock,
+    };
+    registry
+        .xcode_derived_data()
+        .discover(&fixture.scope(), NOT_RUNNING, DiscoveryMode::Full, &control)
+        .unwrap()
+}
+
+/// Asserts that each candidate of `partial` is a candidate of `full` with
+/// the same measurement: a stopped discovery has no candidate with a
+/// partial measurement.
+fn assert_candidates_are_complete(partial: &Discovery, full: &Discovery) {
+    for candidate in &partial.candidates {
+        let name: &str = candidate.evidence.relative_entry.as_utf8().unwrap();
+        let reference = &candidate_of(full, name).measurement;
+        assert_eq!(candidate.measurement.charge.items, reference.charge.items);
+        assert_eq!(candidate.measurement.logical_bytes, reference.logical_bytes);
+    }
+}
+
+#[test]
+fn an_info_plist_above_the_read_limit_is_a_record_that_is_not_valid() {
+    let (fixture, project) = xcode_fixture();
+    // The same fixture with a small `info.plist` has three candidates.
+    assert_eq!(discover_xcode(&fixture).candidates.len(), 3);
+
+    // A valid property list followed by a comment above 64 KiB.
+    let mut text: String = fs::read_to_string(project.join("info.plist")).unwrap();
+    text.push_str("<!-- ");
+    text.push_str(&"x".repeat(70_000));
+    text.push_str(" -->\n");
+    fs::write(project.join("info.plist"), text).unwrap();
+
+    let discovery = discover_xcode(&fixture);
+    assert_eq!(discovery.completion, DiscoveryCompletion::Finished);
+    assert_eq!(discovery.candidates.len(), 0, "{:?}", discovery.candidates);
+    let skipped = skip_of(&discovery, PROJECT);
+    assert_eq!(skipped.reasons, [SkipReason::RecordInvalid]);
+    assert_eq!(skipped.eligibility.rule_supports_layout, Fact::NotSatisfied);
+    // No unit of the project was measured.
+    assert_eq!(discovery.entries_examined, EntryCount::ZERO);
+    assert!(project.join("Build/Products/Debug/App.app/App").exists());
+}
+
+#[test]
+fn a_discovery_that_reaches_the_unit_limit_does_not_examine_the_next_project() {
+    let (fixture, _) = xcode_fixture();
+    let workspace = fixture.base().join("src/App/App.xcodeproj");
+    add_project(&fixture, "Second-abcdefghijklmnopqrstuvwxyzab", &workspace);
+    let full = discover_xcode(&fixture);
+    assert_eq!(full.completion, DiscoveryCompletion::Finished);
+    assert_eq!(full.candidates.len(), 6);
+
+    let one = discover_xcode_limited(
+        &fixture,
+        DiscoveryLimits {
+            max_units: 1,
+            ..limits()
+        },
+    );
+    assert_eq!(one.completion, DiscoveryCompletion::UnitLimitReached);
+    assert_eq!(one.units_examined, 1);
+    // One project directory is one name: its three units are candidates,
+    // and the second project directory has none.
+    assert_eq!(one.candidates.len(), 3, "{:?}", one.skipped);
+    assert_candidates_are_complete(&one, &full);
+    let projects: std::collections::BTreeSet<&str> = one
+        .candidates
+        .iter()
+        .filter_map(|candidate| candidate.evidence.relative_entry.as_utf8())
+        .filter_map(|name| name.split('/').next())
+        .collect();
+    assert_eq!(projects.len(), 1);
+}
+
+#[test]
+fn a_discovery_that_reaches_the_entry_limit_has_no_candidate_with_a_partial_measurement() {
+    let (fixture, _) = xcode_fixture();
+    let full = discover_xcode(&fixture);
+    assert_eq!(full.candidates.len(), 3);
+
+    let mut stopped: u32 = 0;
+    for max in 0_u64..=20 {
+        let partial = discover_xcode_limited(
+            &fixture,
+            DiscoveryLimits {
+                max_entries: EntryCount::new(max),
+                ..limits()
+            },
+        );
+        assert!(partial.entries_examined <= EntryCount::new(max), "{max}");
+        assert_candidates_are_complete(&partial, &full);
+        if partial.completion == DiscoveryCompletion::EntryLimitReached {
+            stopped += 1;
+            assert!(partial.candidates.len() < full.candidates.len(), "{max}");
+        } else {
+            assert_eq!(partial.completion, DiscoveryCompletion::Finished, "{max}");
+            assert_eq!(partial.candidates.len(), 3, "{max}");
+        }
+    }
+    // A limit of 2 stops the discovery, and a limit of 20 does not.
+    assert!(stopped > 0);
+    let none = discover_xcode_limited(
+        &fixture,
+        DiscoveryLimits {
+            max_entries: EntryCount::new(2),
+            ..limits()
+        },
+    );
+    assert_eq!(none.completion, DiscoveryCompletion::EntryLimitReached);
+    assert_eq!(none.candidates.len(), 0);
+}
+
+#[test]
+fn a_unit_deeper_than_the_depth_limit_is_not_a_candidate() {
+    let (fixture, _) = xcode_fixture();
+    let full = discover_xcode(&fixture);
+    let shallow = discover_xcode_limited(
+        &fixture,
+        DiscoveryLimits {
+            max_depth: 1,
+            ..limits()
+        },
+    );
+    assert_eq!(shallow.completion, DiscoveryCompletion::Finished);
+    // The child directories of `Intermediates.noindex` hold only files, so
+    // the measurement ends at the first level. The trees of the other two
+    // units have more directory levels.
+    assert_eq!(shallow.candidates.len(), 1, "{:?}", shallow.skipped);
+    assert_eq!(
+        shallow.candidates[0].evidence.relative_entry.as_utf8(),
+        Some(unit("Build/Intermediates.noindex").as_str())
+    );
+    for name in ["Build/Products", "Index.noindex"] {
+        assert_eq!(
+            skip_of(&shallow, &unit(name)).reasons,
+            [SkipReason::MeasurementIncomplete],
+            "{name}"
+        );
+    }
+    // Each depth gives either the complete measurement or no candidate.
+    for depth in 0_u32..=6 {
+        let partial = discover_xcode_limited(
+            &fixture,
+            DiscoveryLimits {
+                max_depth: depth,
+                ..limits()
+            },
+        );
+        assert_candidates_are_complete(&partial, &full);
+        assert_eq!(
+            partial.candidates.len() + partial.skipped.len(),
+            3,
+            "{depth}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_xcode_discovery_reports_the_stop_and_no_later_candidate() {
+    let (fixture, _) = xcode_fixture();
+    let full = discover_xcode(&fixture);
+    let registry = ReviewedRules::new().unwrap();
+    let clock = month_later_clock();
+
+    // Cancelled before the start.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let control = DiscoveryControl {
+        limits: limits(),
+        cancel: &cancel,
+        clock: &clock,
+    };
+    let discovery = registry
+        .xcode_derived_data()
+        .discover(&fixture.scope(), NOT_RUNNING, DiscoveryMode::Full, &control)
+        .unwrap();
+    assert_eq!(discovery.completion, DiscoveryCompletion::Cancelled);
+    assert_eq!(discovery.candidates.len(), 0);
+
+    // Cancelled after the measurement of the first unit.
+    let cancel = CancellationToken::new();
+    let control = DiscoveryControl {
+        limits: limits(),
+        cancel: &cancel,
+        clock: &clock,
+    };
+    let mut cancel_after_first = |_: &Path| cancel.cancel();
+    let discovery = registry
+        .xcode_derived_data()
+        .discover_with(
+            &fixture.scope(),
+            NOT_RUNNING,
+            DiscoveryMode::Full,
+            &control,
+            &mut cancel_after_first,
+        )
+        .unwrap();
+    assert_eq!(discovery.completion, DiscoveryCompletion::Cancelled);
+    assert!(discovery.candidates.len() < full.candidates.len());
+    assert_candidates_are_complete(&discovery, &full);
+}
+
+#[test]
+fn a_unit_that_is_a_symbolic_link_is_not_a_candidate_and_is_not_followed() {
+    // A link to a directory in the root, a link to a directory outside the
+    // root, and a link in place of `Build`.
+    for case in ["inside", "outside", "build"] {
+        let (fixture, project) = xcode_fixture();
+        assert_eq!(discover_xcode(&fixture).candidates.len(), 3);
+        let target: PathBuf = match case {
+            "inside" => fixture.root().join("shared-products"),
+            _ => fixture.base().join("outside-products"),
+        };
+        let link: PathBuf = if case == "build" {
+            project.join("Build")
+        } else {
+            project.join("Build/Products")
+        };
+        fs::rename(&link, &target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let discovery = discover_xcode(&fixture);
+        assert_eq!(
+            discovery.completion,
+            DiscoveryCompletion::Finished,
+            "{case}"
+        );
+        let linked: Vec<&str> = if case == "build" {
+            vec!["Build/Intermediates.noindex", "Build/Products"]
+        } else {
+            vec!["Build/Products"]
+        };
+        for name in &linked {
+            let skipped = skip_of(&discovery, &unit(name));
+            assert_eq!(skipped.reasons, [SkipReason::SymbolicLink], "{case}");
+            assert_eq!(skipped.eligibility.identity_matches, Fact::NotSatisfied);
+        }
+        // With `Build` linked, the build database is not examined, so the
+        // third unit is not a candidate either.
+        let expected: usize = if case == "build" { 0 } else { 2 };
+        assert_eq!(discovery.candidates.len(), expected, "{case}");
+        // The target of the link is not changed.
+        let kept: &str = if case == "build" {
+            "Products/Debug/App.app/App"
+        } else {
+            "Debug/App.app/App"
+        };
+        assert_eq!(fs::read(target.join(kept)).unwrap().len(), 5_000, "{case}");
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+}
+
+#[test]
+fn an_xcode_unit_with_a_fifo_is_skipped_and_the_fifo_is_not_opened() {
+    let (fixture, project) = xcode_fixture();
+    assert_eq!(discover_xcode(&fixture).candidates.len(), 3);
+    make_fifo(&project.join("Build/Products/Debug/pipe"));
+
+    // An open of the FIFO for reading would block this test.
+    let discovery = discover_xcode(&fixture);
+
+    assert_eq!(discovery.candidates.len(), 2, "{:?}", discovery.skipped);
+    assert_eq!(
+        skip_of(&discovery, &unit("Build/Products")).reasons,
+        [SkipReason::UnsupportedObject]
+    );
+}
+
 #[test]
 fn a_symbolic_link_in_a_unit_is_one_entry_and_is_not_followed() {
     let (fixture, project) = xcode_fixture();

@@ -239,9 +239,11 @@ pub enum CleanCommand {
 
 #[derive(Debug, Args)]
 pub struct CleanPlanArgs {
-    /// Identifier of the scan that supplies the candidates.
+    /// Identifier of the scan that supplies the candidates. The `trash` and
+    /// `permanent` modes require it. The `evict` mode reads no scan: its
+    /// candidates come from the rule.
     #[arg(long, value_name = "SCAN_ID")]
-    pub scan: String,
+    pub scan: Option<String>,
     /// Selection preset that filters candidates. It grants no authority.
     #[arg(long, value_name = "PRESET")]
     pub profile: Option<String>,

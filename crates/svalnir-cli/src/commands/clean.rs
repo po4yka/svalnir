@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::platform::volume;
+use svalnir_agent::protection::ProtectedLocations;
+use svalnir_agent::rules::root_id_of;
 use svalnir_agent::scan::ScanResult;
 use svalnir_core::action::{FileObjectType, Plan, TargetBinding, WorkCharge};
 use svalnir_core::authority::AuthorityBinding;
@@ -28,13 +30,12 @@ use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, Lossless
 use svalnir_core::id::{OperationId, PlanId, RootId, ScanId, StepId, TargetId};
 use svalnir_core::plan::{
     CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, PlanBuildError, PlanContext,
-    PlanExplanation, PlanMode, PlanOutcome, PlanPreview, SizeEstimate, TargetPreview,
-    build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
+    PlanExplanation, PlanMode, PlanOutcome, PlanPreview, SelectionPreset, SizeEstimate,
+    TargetPreview, build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
 };
-use svalnir_core::policy::{FileProtectionContext, ProtectionFact, file_hard_protection};
+use svalnir_core::policy::ProtectionFact;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
-use svalnir_core::rule::{RuleMode, RuleRegistry as _};
 use svalnir_core::volume::VolumeIdentity;
 
 use super::apply::{self, ApplyFlow};
@@ -57,14 +58,14 @@ const PLAN_WORK_ITEMS: u64 = 4_000_000;
 const BATCH_WORK_ITEMS: u64 = 100_000;
 
 /// The time that the execution of a manual cleanup plan can use.
-const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000_000);
+pub(crate) const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000_000);
 
 /// The time in which the executor verifies the effect of one step.
-const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
+pub(crate) const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
 
-const PLAN_NOTE: &str = "This command changed no file. The plan gives no authority: apply it with `svalnir clean apply --plan PLAN_ID`, which asks for the approval of this plan and checks each target again.";
+pub(crate) const PLAN_NOTE: &str = "This command changed no file. The plan gives no authority: apply it with `svalnir clean apply --plan PLAN_ID`, which asks for the approval of this plan and checks each target again.";
 
-const EMPTY_PLAN_NOTE: &str =
+pub(crate) const EMPTY_PLAN_NOTE: &str =
     "No entry is in the plan, so there is no plan to apply. This command changed no file.";
 
 /// An entry of the scan record that is not a candidate now.
@@ -98,6 +99,10 @@ pub(crate) struct PlanView {
     pub(crate) has_plan_document: bool,
     /// `used`, `absent`, `not_readable`, or `disagrees_with_plan`.
     pub(crate) plan_document: &'static str,
+    /// The rule discovery behind the plan, for a plan of the `evict` mode
+    /// that this invocation made. A plan of a scan has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) discovery: Option<super::evict::DiscoveryView>,
     pub(crate) note: &'static str,
 }
 
@@ -117,6 +122,9 @@ impl PlanView {
             if self.stale_entries.len() > plan_view::TEXT_LIST_LIMIT {
                 out.push_str("  ...\n");
             }
+        }
+        if let Some(discovery) = &self.discovery {
+            discovery.render(&mut out);
         }
         if let Some(operation_id) = &self.operation_id {
             put_line!(out, "\nApplied: operation {operation_id}");
@@ -139,7 +147,7 @@ impl PlanView {
     }
 }
 
-fn plan_error(error: &PlanBuildError) -> ErrorBody {
+pub(crate) fn plan_error(error: &PlanBuildError) -> ErrorBody {
     let code: &'static str = match error {
         PlanBuildError::TooManyEntries { .. } => "selection_too_large",
         PlanBuildError::Rule(_) => "rule_mode_not_validated",
@@ -229,33 +237,6 @@ fn root_record(scan: &ScanResult) -> Result<RootRecord, ErrorBody> {
     })
 }
 
-/// The identity of a cleanup root: a digest of its path, its device and
-/// inode, its volume, and its mount generation.
-///
-/// The sealed plan binds this identity, the root path, and the root object
-/// of each target. A plan document whose root has a different path or a
-/// different object does not agree with the sealed plan, and the client
-/// does not use it.
-fn root_id_of(
-    path: &LosslessPath,
-    object: FileObjectEvidence,
-    volume: &VolumeIdentity,
-) -> Option<RootId> {
-    let digest = svalnir_core::digest::ContentDigest::of_json(&(
-        path,
-        object,
-        &volume.volume_id,
-        &volume.mount_id,
-    ))
-    .ok()?;
-    let text: &str = digest.as_str();
-    RootId::new(format!(
-        "root-{}",
-        text.strip_prefix("sha256:").unwrap_or(text)
-    ))
-    .ok()
-}
-
 /// Whether a plan document agrees with the sealed plan of the journal:
 /// the same digest, the same plan, and cleanup roots that are exactly
 /// those that the file targets of the plan bind, each with the path and
@@ -331,99 +312,39 @@ fn bound_path(binding: &svalnir_core::action::FileBinding) -> Option<LosslessPat
 }
 
 /// The hard protection of a file entry, from the catalog of protected
-/// file locations of `svalnir-core`: storage of the operating system, swap
-/// storage, the state directory of Svalnir, and the home directory with
-/// each directory that contains it. The filesystem executor refuses the
-/// home directory and its ancestors again, and the plan builder applies
-/// the `[protections]` table.
+/// file locations: storage of the operating system, swap storage, the
+/// state directory of Svalnir, and the home directory with each directory
+/// that contains it ([`ProtectedLocations`]). The coordinator applies the
+/// same catalog again at admission, the filesystem executor refuses the
+/// home directory and its ancestors, and the plan builder applies the
+/// `[protections]` table.
 ///
-/// The catalog compares path text, so each path has no symbolic link, as
-/// `canonicalize` gives it.
+/// `home` and `state_directory` have no symbolic link, as `canonicalize`
+/// gives them. The catalog compares path text.
+#[cfg(test)]
 fn file_protection(
     path: &Path,
     home: Option<&Path>,
     state_directory: Option<&Path>,
 ) -> ProtectionFact {
-    let lossless = |path: &Path| LosslessPath::from_path(path).ok();
-    let Some(path) = lossless(path) else {
-        return ProtectionFact::Unknown;
-    };
-    let home: Option<LosslessPath> = home.and_then(lossless);
-    let state_directory: Option<LosslessPath> = state_directory.and_then(lossless);
-    file_hard_protection(
-        &path,
-        &FileProtectionContext {
-            home_directory: home.as_ref(),
-            state_directory: state_directory.as_ref(),
-        },
+    locations_of(home, state_directory).of_text(path)
+}
+
+fn locations_of(home: Option<&Path>, state_directory: Option<&Path>) -> ProtectedLocations {
+    ProtectedLocations::from_resolved(
+        home.map(Path::to_path_buf),
+        state_directory.map(Path::to_path_buf),
     )
 }
 
-/// The hard protection of the entry at `path`, for two forms of its
-/// path:
-///
-/// - Its own location: the directory of the entry with its symbolic links
-///   resolved, and the name of the entry. A link in a protected location
-///   is thus protected, also when it points out of it.
-/// - Its resolved form, with the entry itself resolved. A link whose
-///   target is a protected location is thus protected also: the home
-///   directory and the state directory are compared in their resolved
-///   forms, so a link at the configured path of one of them has the
-///   protection of that directory.
-///
-/// The entry is protected when one form is protected. It is not protected
-/// only when the two forms are not protected. An entry whose directory
-/// does not resolve, or that does not resolve itself (a link with no
-/// target), has an unknown protection.
+/// The hard protection of the entry at `path`, for its own location and
+/// for its resolved form ([`ProtectedLocations::of_entry`]).
 fn entry_protection(
     path: &Path,
     home: Option<&Path>,
     state_directory: Option<&Path>,
 ) -> ProtectionFact {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return ProtectionFact::Unknown;
-    };
-    let fact_of = |resolved: std::io::Result<PathBuf>| {
-        resolved.map_or(ProtectionFact::Unknown, |form| {
-            file_protection(&form, home, state_directory)
-        })
-    };
-    let own_location: ProtectionFact =
-        fact_of(std::fs::canonicalize(parent).map(|directory| directory.join(name)));
-    let resolved: ProtectionFact = fact_of(std::fs::canonicalize(path));
-    match (own_location, resolved) {
-        (ProtectionFact::Protected, _) | (_, ProtectionFact::Protected) => {
-            ProtectionFact::Protected
-        }
-        (ProtectionFact::NotProtected, ProtectionFact::NotProtected) => {
-            ProtectionFact::NotProtected
-        }
-        _ => ProtectionFact::Unknown,
-    }
-}
-
-/// The two forms of [`entry_protection`] that resolve: the own location
-/// and the resolved form. The plan builder applies the `[protections]`
-/// list to them as well as to the path of the entry.
-fn resolved_forms(path: &Path) -> Vec<LosslessPath> {
-    let own_location: Option<PathBuf> = match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
-            .ok()
-            .map(|directory| directory.join(name)),
-        _ => None,
-    };
-    let mut forms: Vec<LosslessPath> = Vec::new();
-    for form in [own_location, std::fs::canonicalize(path).ok()]
-        .into_iter()
-        .flatten()
-    {
-        if let Ok(form) = LosslessPath::from_path(&form)
-            && !forms.contains(&form)
-        {
-            forms.push(form);
-        }
-    }
-    forms
+    locations_of(home, state_directory).of_entry(path)
 }
 
 /// The type of a file object that a plan can bind.
@@ -586,60 +507,11 @@ fn select(
                 estimated_reclaimable_bytes: (mode != CleanMode::Trash).then_some(entry.allocated),
             },
             hard_protection: entry_protection(&path, home.as_deref(), state_directory.as_deref()),
-            resolved_paths: resolved_forms(&path),
+            resolved_paths: svalnir_agent::protection::resolved_forms(&path),
             rule: None,
         });
     }
     Ok(selection)
-}
-
-/// The `evict` mode needs the candidates of one reviewed rule with a
-/// recorded validation for manual eviction. No rule of this build has one,
-/// and the rule discovery is not connected to this command.
-#[cfg(unix)]
-fn evict_refusal(rule: Option<&str>) -> ErrorBody {
-    let Ok(registry) = svalnir_agent::rules::ReviewedRules::new() else {
-        return ErrorBody::new(
-            "rule_registry_unavailable",
-            ErrorFamily::Native,
-            ErrorStage::Dispatch,
-            "the rule registry of this build is not usable; the command made no change",
-        );
-    };
-    let name: &str = rule.unwrap_or_default();
-    let Some(found) = registry
-        .rules()
-        .into_iter()
-        .find(|candidate| candidate.reference.id.as_str() == name)
-    else {
-        return ErrorBody::new(
-            "unknown_rule",
-            ErrorFamily::Request,
-            ErrorStage::Arguments,
-            "the rule registry of this build has no rule with this ID; the command made no change",
-        )
-        .with_fields(&["rule"]);
-    };
-    let validated: bool = found
-        .layouts
-        .iter()
-        .any(|layout| layout.lifecycle.permits(&RuleMode::ManualEviction));
-    if validated {
-        ErrorBody::new(
-            "evict_discovery_not_available",
-            ErrorFamily::Native,
-            ErrorStage::Dispatch,
-            "the candidate discovery of a reviewed rule is not connected to `svalnir clean plan` in this build; the command made no change",
-        )
-    } else {
-        ErrorBody::new(
-            "rule_mode_not_validated",
-            ErrorFamily::Eligibility,
-            ErrorStage::Admission,
-            "the rule has no recorded validation for manual eviction, so the `evict` mode is not permitted for it; the command made no change",
-        )
-        .with_fields(&["rule", "mode"])
-    }
 }
 
 fn plan_not_found(plan_id: &str) -> ErrorBody {
@@ -659,16 +531,29 @@ fn parse_plan_id(text: &str) -> Result<PlanId, ErrorBody> {
         .map_err(|_| session::invalid_identifier("invalid_plan_id", "plan ID", &["plan"]))
 }
 
+/// The selection of one plan of a scan.
+struct ScanSelection<'a> {
+    plan_id: &'a PlanId,
+    policy_revision: &'a svalnir_core::id::PolicyRevisionId,
+    mode: CleanMode,
+    entries: &'a [CleanupEntry],
+    preset: Option<&'a SelectionPreset>,
+}
+
 /// Builds the plan of a selection with the plan builder.
 fn build(
     environment: &Environment,
     now: &Now,
     config: &svalnir_core::config::ValidatedConfig,
-    plan_id: &PlanId,
-    policy_revision: &svalnir_core::id::PolicyRevisionId,
-    mode: CleanMode,
-    entries: &[CleanupEntry],
+    selection: &ScanSelection<'_>,
 ) -> Result<PlanOutcome, ErrorBody> {
+    let ScanSelection {
+        plan_id,
+        policy_revision,
+        mode,
+        entries,
+        preset,
+    } = *selection;
     let home: Option<LosslessPath> = environment
         .home
         .as_ref()
@@ -696,7 +581,7 @@ fn build(
             CleanMode::Trash | CleanMode::Evict => ModeSelection::Trash,
         },
         entries,
-        preset: None,
+        preset,
         limits: CleanupLimits {
             plan: WorkCharge::new(
                 Bytes::new(PLAN_WORK_BYTES),
@@ -713,46 +598,61 @@ fn build(
     build_cleanup_plan(&context, &request).map_err(|error| plan_error(&error))
 }
 
+/// The candidates of a scan for review, with no selection: no plan, no
+/// plan document, and no journal change.
+fn list_candidates(
+    scan: &ScanResult,
+    mode: CleanMode,
+    invocation: &mut Invocation<'_>,
+) -> Result<ExitStatus, CommandFailure> {
+    let root: RootRecord = root_record(scan)?;
+    let listed: Selection = select(scan, &root, mode, "candidate", invocation.environment, None)?;
+    let view = selection::CandidatesView::new(
+        scan.scan_id.clone(),
+        if mode == CleanMode::Permanent {
+            "permanent"
+        } else {
+            "trash"
+        },
+        &listed.entries,
+        listed.stale,
+    );
+    invocation.emit(Kind::Report, &view, selection::CandidatesView::render)?;
+    Ok(selection::NO_ENTRY_STATUS)
+}
+
 pub(crate) fn plan(
     arguments: &CleanPlanArgs,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    if arguments.profile.is_some() {
-        return Err(ErrorBody::new(
-            "selection_preset_not_available",
-            ErrorFamily::Native,
-            ErrorStage::Dispatch,
-            "this build defines no selection preset, so `--profile` cannot filter the candidates; send the request with no `--profile`; the command made no change",
-        )
-        .with_fields(&["profile"])
-        .into());
-    }
     if arguments.mode == CleanMode::Evict {
         if !arguments.entries.is_empty() {
             return Err(selection::entry_not_accepted().into());
         }
-        return Err(evict_refusal(arguments.rule.as_deref()).into());
+        return super::evict::plan(arguments, invocation);
     }
+    // A preset only filters: the plan builder leaves out each entry that
+    // the preset does not include. An entry of a scan has no rule, so the
+    // preset of this build includes none of them.
+    let preset: Option<SelectionPreset> = arguments
+        .profile
+        .as_deref()
+        .map(super::evict::preset)
+        .transpose()?;
+    let Some(scan_text) = arguments.scan.as_deref() else {
+        return Err(ErrorBody::new(
+            "scan_required",
+            ErrorFamily::Request,
+            ErrorStage::Arguments,
+            "the `trash` and `permanent` modes need `--scan SCAN_ID`: their candidates are the entries of a saved scan; the command made no change",
+        )
+        .with_fields(&["scan"])
+        .into());
+    };
     let environment: &Environment = invocation.environment;
-    let scan: ScanResult = super::scan::load_scan(&arguments.scan, environment)?;
+    let scan: ScanResult = super::scan::load_scan(scan_text, environment)?;
     if arguments.entries.is_empty() {
-        // No selection: the candidates for review, and no plan, no plan
-        // document, and no journal change.
-        let root: RootRecord = root_record(&scan)?;
-        let listed: Selection =
-            select(&scan, &root, arguments.mode, "candidate", environment, None)?;
-        let view = selection::CandidatesView::new(
-            scan.scan_id.clone(),
-            if arguments.mode == CleanMode::Permanent {
-                "permanent"
-            } else {
-                "trash"
-            },
-            &listed.entries,
-            listed.stale,
-        );
-        invocation.emit(Kind::Report, &view, selection::CandidatesView::render)?;
-        return Ok(selection::NO_ENTRY_STATUS);
+        return list_candidates(&scan, arguments.mode, invocation);
     }
     let named: BTreeSet<LosslessPath> = selection::named_entries(
         // The scan root is the cleanup root and never a target.
@@ -783,10 +683,13 @@ pub(crate) fn plan(
         environment,
         &now,
         &config,
-        &plan_id,
-        &active.revision.revision_id,
-        arguments.mode,
-        &chosen.entries,
+        &ScanSelection {
+            plan_id: &plan_id,
+            policy_revision: &active.revision.revision_id,
+            mode: arguments.mode,
+            entries: &chosen.entries,
+            preset: preset.as_ref(),
+        },
     )?;
     selection::refuse_protected(&outcome)?;
     let has_plan: bool = outcome.plan.is_some();
@@ -814,6 +717,7 @@ pub(crate) fn plan(
         },
         has_plan_document: has_plan,
         plan_document: if has_plan { "used" } else { "absent" },
+        discovery: None,
         note: if has_plan { PLAN_NOTE } else { EMPTY_PLAN_NOTE },
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
@@ -995,6 +899,7 @@ pub(crate) fn show(
         cleanup_roots: stored.cleanup_roots(),
         has_plan_document: stored.document.is_some(),
         plan_document: stored.document_state.as_str(),
+        discovery: None,
         note: "This command changed nothing.",
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;

@@ -41,6 +41,7 @@ pub(crate) mod authority;
 pub(crate) mod clean;
 pub(crate) mod config;
 pub(crate) mod doctor;
+pub(crate) mod evict;
 #[cfg(target_os = "macos")]
 pub(crate) mod execution;
 pub(crate) mod history;

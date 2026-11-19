@@ -349,15 +349,21 @@ fn discover(
     let evidence = environment.seams.discovery_environment();
     let rules: [RuleId; 1] = [rule.reference.id.clone()];
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !finished.load(Ordering::SeqCst) {
-                if interrupt.is_requested() {
-                    cancel.cancel();
-                    return;
-                }
-                std::thread::sleep(INTERRUPT_POLL);
-            }
-        });
+        // With no thread for the interrupt, the discovery still runs to
+        // its bounds; it then does not stop at an interrupt.
+        drop(
+            std::thread::Builder::new()
+                .name("svalnir-interrupt".to_owned())
+                .spawn_scoped(scope, || {
+                    while !finished.load(Ordering::SeqCst) {
+                        if interrupt.is_requested() {
+                            cancel.cancel();
+                            return;
+                        }
+                        std::thread::sleep(INTERRUPT_POLL);
+                    }
+                }),
+        );
         let _finish = Finish(&finished);
         registry.discover_for_eviction(
             &EvictionRequest {

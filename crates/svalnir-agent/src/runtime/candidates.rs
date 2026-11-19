@@ -52,7 +52,14 @@ struct Worker {
     /// The time of the request that started the discovery. The candidates
     /// of the discovery are not newer than this time.
     started_at: MonotonicNanos,
+    /// The rules and the exclusions of the request that started the
+    /// discovery.
+    scope: Scope,
 }
+
+/// The part of the configuration that a discovery depends on: the approved
+/// rules and the exclusions. A result of a different scope is not used.
+type Scope = (Vec<RuleId>, Vec<std::path::PathBuf>);
 
 /// The candidate source of the agent.
 pub struct RuleCandidateSource {
@@ -66,6 +73,8 @@ pub struct RuleCandidateSource {
     known: Vec<DiscoveredCandidate>,
     /// The latest set.
     latest: Option<CandidateSet>,
+    /// The rules and the exclusions of the latest request.
+    scope: Option<Scope>,
     worker: Option<Worker>,
 }
 
@@ -124,18 +133,26 @@ impl RuleCandidateSource {
             limits,
             known: Vec::new(),
             latest: None,
+            scope: None,
             worker: None,
         }
     }
 
     /// Records the result of a discovery or of an examination that
     /// started at `at`.
+    ///
+    /// A result that is not complete (a discovery that was cancelled, that
+    /// stopped at a bound, or that ended with no result) does not replace
+    /// the known candidates: the candidates of the earlier complete result
+    /// stay for the next examination, which examines each of them again.
     fn record(&mut self, discovery: EvictionDiscovery, at: MonotonicNanos) {
-        self.known = discovery
-            .candidates
-            .iter()
-            .map(|candidate| candidate.discovered.clone())
-            .collect();
+        if discovery.complete {
+            self.known = discovery
+                .candidates
+                .iter()
+                .map(|candidate| candidate.discovered.clone())
+                .collect();
+        }
         // A set that the controller cannot use in full supports no plan.
         let complete: bool =
             discovery.complete && discovery.candidates.len() <= MAX_PREPARED_CANDIDATES;
@@ -165,7 +182,10 @@ impl RuleCandidateSource {
 
     /// Takes the result of the worker when it finished. A worker that
     /// ended with no result (a defect) gives a set that is not complete.
-    fn take_finished(&mut self) {
+    /// The result of a discovery that started with different approved
+    /// rules or exclusions than `scope` is discarded: the configuration
+    /// changed, and the controller asks again when its set is old.
+    fn take_finished(&mut self, scope: &Scope) {
         if !self
             .worker
             .as_ref()
@@ -177,7 +197,9 @@ impl RuleCandidateSource {
             return;
         };
         let discovery: EvictionDiscovery = worker.handle.join().unwrap_or_default();
-        self.record(discovery, worker.started_at);
+        if &worker.scope == scope {
+            self.record(discovery, worker.started_at);
+        }
     }
 
     fn start(&mut self, host: DiscoveryHost, rules: Vec<RuleId>, request: &Preparation<'_>) {
@@ -187,6 +209,7 @@ impl RuleCandidateSource {
         let limits: DiscoveryLimits = self.limits;
         let volumes: Vec<VolumeId> = request.volumes.to_vec();
         let token: CancellationToken = cancel.clone();
+        let scope: Scope = (rules.clone(), host.user_exclusions.clone());
         let spawned = std::thread::Builder::new()
             .name("svalnir-rule-discovery".to_owned())
             .spawn(move || {
@@ -210,6 +233,7 @@ impl RuleCandidateSource {
                 cancel,
                 handle,
                 started_at: request.time.clock.now,
+                scope,
             });
         }
     }
@@ -217,10 +241,16 @@ impl RuleCandidateSource {
 
 impl CandidateSource for RuleCandidateSource {
     fn prepare(&mut self, request: &Preparation<'_>) -> Option<CandidateSet> {
-        self.take_finished();
         let rules: Vec<RuleId> = request.config.disk_guard().approved_rules.clone();
         let host: DiscoveryHost =
             DiscoveryHost::automatic(self.principal, self.locations.clone(), request.config);
+        let scope: Scope = (rules.clone(), host.user_exclusions.clone());
+        // A set of a different configuration supports no plan.
+        if self.scope.as_ref().is_some_and(|known| known != &scope) {
+            self.latest = None;
+        }
+        self.scope = Some(scope.clone());
+        self.take_finished(&scope);
         match request.mode {
             PreparationMode::Refresh => {
                 if self.worker.is_none() {
@@ -265,5 +295,144 @@ impl Drop for RuleCandidateSource {
             worker.cancel.cancel();
             drop(worker.handle.join());
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use svalnir_core::config::ValidatedConfig;
+    use svalnir_core::id::VolumeId;
+
+    use super::RuleCandidateSource;
+    use crate::controller::PreparationMode;
+    use crate::controller::tests::support::{config, time, user};
+    use crate::platform::volume::volume_at;
+    use crate::protection::ProtectedLocations;
+    use crate::rules::fixture::{
+        FixtureEnvironment, automatic_eviction_validated, derived_data_root, write_project,
+        write_workspace,
+    };
+    use crate::rules::{DiscoveryLimits, ReviewedRules};
+    use crate::runtime::{CandidateSource as _, Preparation};
+
+    const RULE_LINE: &str = "approved_rules = [\"test.cache\"]";
+    const XCODE_RULE_LINE: &str = "approved_rules = [\"xcode.inactive-derived-data\"]";
+
+    /// A source for a home directory with one project, in a temporary
+    /// directory, and the volume of that directory.
+    fn source() -> (tempfile::TempDir, RuleCandidateSource, VolumeId) {
+        let directory = tempfile::tempdir().unwrap();
+        let base: PathBuf = std::fs::canonicalize(directory.path()).unwrap();
+        let home: PathBuf = base.join("home");
+        let state: PathBuf = home.join("state");
+        let root: PathBuf = derived_data_root(&home);
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = write_workspace(&base.join("src"), "App").unwrap();
+        write_project(&root, "App-abcdefghijklmnopqrstuvwxyzab", &workspace).unwrap();
+        let volume: VolumeId = volume_at(&root).unwrap().identity.volume_id;
+        let source = RuleCandidateSource::new(
+            ReviewedRules::with_fixture_lifecycle(&automatic_eviction_validated()).unwrap(),
+            user(),
+            ProtectedLocations::resolve(Some(&home), Some(&state)),
+            Arc::new(FixtureEnvironment::days_later(30)),
+            DiscoveryLimits::default(),
+        );
+        (directory, source, volume)
+    }
+
+    fn approved() -> ValidatedConfig {
+        config(&[(RULE_LINE, XCODE_RULE_LINE)])
+    }
+
+    fn count(
+        source: &mut RuleCandidateSource,
+        mode: PreparationMode,
+        volume: &VolumeId,
+        config: &ValidatedConfig,
+        now: u64,
+    ) -> Option<(bool, usize)> {
+        let time = time(now);
+        source
+            .prepare(&Preparation {
+                volumes: std::slice::from_ref(volume),
+                mode,
+                time: &time,
+                config,
+            })
+            .map(|set| (set.complete, set.candidates.len()))
+    }
+
+    #[test]
+    fn a_discovery_gives_the_known_candidates_of_a_later_examination() {
+        let (_directory, mut source, volume) = source();
+        let config = approved();
+        // With no discovery, nothing is known.
+        assert_eq!(
+            count(&mut source, PreparationMode::KnownOnly, &volume, &config, 1),
+            Some((true, 0))
+        );
+        count(&mut source, PreparationMode::Refresh, &volume, &config, 2);
+        let found = source.wait_for_discovery().unwrap();
+        assert!(found.complete);
+        assert_eq!(found.candidates.len(), 3);
+        assert_eq!(
+            count(&mut source, PreparationMode::KnownOnly, &volume, &config, 3),
+            Some((true, 3))
+        );
+    }
+
+    #[test]
+    fn a_cancelled_discovery_keeps_the_known_candidates() {
+        let (_directory, mut source, volume) = source();
+        let config = approved();
+        count(&mut source, PreparationMode::Refresh, &volume, &config, 1);
+        assert_eq!(source.wait_for_discovery().unwrap().candidates.len(), 3);
+        // A second discovery is cancelled before it ends, as it is when
+        // optional work is reduced. A discovery that was cancelled before
+        // its first name has no candidate.
+        let cancelled = super::EvictionDiscovery::default();
+        assert!(!cancelled.complete);
+        source.record(cancelled, time(2).clock.now);
+        assert!(!source.latest.as_ref().unwrap().complete);
+        // The emergency still examines the candidates of the complete
+        // discovery.
+        assert_eq!(
+            count(&mut source, PreparationMode::KnownOnly, &volume, &config, 3),
+            Some((true, 3))
+        );
+    }
+
+    #[test]
+    fn a_changed_configuration_discards_the_set_and_the_running_discovery() {
+        let (_directory, mut source, volume) = source();
+        let config = approved();
+        count(&mut source, PreparationMode::Refresh, &volume, &config, 1);
+        assert_eq!(source.wait_for_discovery().unwrap().candidates.len(), 3);
+        // A discovery starts with the approved rule. Before its result is
+        // taken, the configuration approves a different rule.
+        count(&mut source, PreparationMode::Refresh, &volume, &config, 2);
+        while !source.worker.as_ref().unwrap().handle.is_finished() {
+            std::thread::yield_now();
+        }
+        let other = config_with_other_rule();
+        // The set of the earlier configuration is not given, the result of
+        // the discovery is discarded, and the rule that is not approved is
+        // not examined.
+        assert_eq!(
+            count(&mut source, PreparationMode::KnownOnly, &volume, &other, 3),
+            Some((true, 0))
+        );
+    }
+
+    fn config_with_other_rule() -> ValidatedConfig {
+        config(&[(
+            RULE_LINE,
+            "approved_rules = [\"svalnir.expired-temporary\"]",
+        )])
     }
 }

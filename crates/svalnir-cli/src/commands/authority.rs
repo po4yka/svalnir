@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use svalnir_agent::journal::{AgentRecord, OperationJournal, OperationJournalError};
+use svalnir_agent::journal::{OperationJournal, OperationJournalError};
 use svalnir_core::action::ActionClass;
 use svalnir_core::authority::{ActionGrantRef, Generation};
 use svalnir_core::config::ValidatedConfig;
@@ -20,8 +20,8 @@ use svalnir_core::grant::{
     Acceptance, Acknowledged, AcknowledgementLevel, ActivationRefusal, ActivationReport,
     ActivationRequest, AuthorityState, Change, ControlRefusal, DisableRequest, EnableRefusal,
     EnableReport, EnableRequest, GuardStanding, InstanceInhibition, PauseBasis, PauseReport,
-    PauseRequest, PauseStatus, Persistence, RearmRequest, RestrictionReport, ResumeReport,
-    ResumeRequest, activate, disable, enable, guard_standing, pause, pause_status, resume,
+    PauseRequest, PauseStatus, RearmRequest, RestrictionReport, ResumeReport, ResumeRequest,
+    activate, disable, enable, guard_standing, pause, pause_status, resume,
 };
 use svalnir_core::id::{ActionGrantId, IncidentId, PolicyRevisionId};
 use svalnir_core::policy::PolicyId;
@@ -145,20 +145,9 @@ fn persist<R>(
     change: Change<R>,
     now: WallTime,
 ) -> Result<(Acknowledged<R>, bool), ErrorBody> {
-    let inhibition = InstanceInhibition::default();
-    if !change.needs_persistence() {
-        return Ok((change.acknowledge(&inhibition, Persistence::Durable), false));
-    }
     let restriction: bool = change.is_restriction();
-    journal
-        .put_agent_record(
-            AgentRecord::Authority,
-            &change.next,
-            Some(stored.revision),
-            now,
-        )
-        .map_err(|error| not_persisted(&error, restriction))?;
-    Ok((change.acknowledge(&inhibition, Persistence::Durable), true))
+    svalnir_agent::client::write_authority(journal, stored, change, now)
+        .map_err(|error| not_persisted(&error, restriction))
 }
 
 fn emit_control<R: Serialize>(

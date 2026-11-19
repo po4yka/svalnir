@@ -49,17 +49,10 @@ use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, NextAction, 
 /// The wait for the lock file of a stop request when `--timeout` is absent.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
-/// The grace period when `--grace` is not given.
-const DEFAULT_GRACE: Duration = Duration::from_secs(10);
-
-/// The time in which the executor observes the exit after a force signal.
-const FORCE_VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
-
-/// The longest grace period of a manual stop.
-const MAX_GRACE: Nanoseconds = Nanoseconds::new(5 * 60 * 1_000_000_000);
-
-/// The time that the deadline has in addition to the steps.
-const DEADLINE_MARGIN: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
+/// The grace period when `--grace` is not given, and the longest one.
+use svalnir_agent::client::{
+    DEFAULT_STOP_GRACE as DEFAULT_GRACE, MAX_STOP_GRACE as MAX_GRACE, StopMode,
+};
 
 fn stop_error(code: &'static str, family: ErrorFamily, message: &str) -> ErrorBody {
     ErrorBody::new(
@@ -90,36 +83,17 @@ fn shape(arguments: &ProcessesStopArgs) -> Result<Shape, ErrorBody> {
             )
             .with_fields(&["grace"])
         })?;
-    let (strategy, window): (StopStrategy, Nanoseconds) = if arguments.force {
-        (StopStrategy::ImmediateForce, FORCE_VERIFICATION_WINDOW)
+    let mode: StopMode = if arguments.force {
+        StopMode::ImmediateForce
     } else if arguments.force_after_timeout {
-        (
-            StopStrategy::ForceAfterGrace { grace },
-            FORCE_VERIFICATION_WINDOW,
-        )
+        StopMode::ForceAfterGrace
     } else {
         // With no force step, the grace period is the time in which the
         // executor observes the exit after the graceful request.
-        (StopStrategy::Graceful, grace)
+        StopMode::Graceful
     };
-    let steps: u64 = window.get().saturating_mul(2);
-    let deadline: Nanoseconds = Nanoseconds::new(
-        strategy
-            .grace()
-            .map_or(0, Nanoseconds::get)
-            .saturating_add(steps)
-            .saturating_add(DEADLINE_MARGIN.get()),
-    );
-    Ok(Shape {
-        strategy,
-        limits: StopLimits {
-            execution_deadline: deadline,
-            verification_window: window,
-            max_grace: MAX_GRACE,
-            max_verification_window: MAX_GRACE,
-            max_execution_deadline: deadline,
-        },
-    })
+    let (strategy, limits) = svalnir_agent::client::manual_stop(mode, grace);
+    Ok(Shape { strategy, limits })
 }
 
 /// The candidate of a stop plan with one process: the process of the

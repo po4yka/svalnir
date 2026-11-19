@@ -25,6 +25,7 @@
 //! | [`platform::sleep`] | The sleep time of the host and the sleep-boundary check of a rate interval |
 //! | [`scan`] | Bounded, volume-aware, read-only filesystem scanner with partial results |
 //! | [`observe`] | The readings that a client process makes in its own process: the collection context, the disk and memory reading of the host, the query of the coordinator lock, and the read-only reads of the operation journal: the existing journal, the authority record, and the standing of each guard |
+//! | [`client`] | The client side of the request queue and of the authority record, which the CLI and the GPUI client share: the holder of the coordinator lock, the principal and the identities of a request, the wait for a completion, and the compare-and-set write of the authority record |
 //! | [`store`] | Local `SQLite` state for metric samples and scan records, with migrations and retention |
 //! | [`capability`] | Diagnostic capability probes and the capability report |
 //! | [`journal`] | The operation journal in `operations.sqlite`: plans, operations, the resource observations of an operation, revisions and grants, the request queue, the coordinator lock with the role of its holder and a reading that takes no lock, recovery reads, and the named agent records |
@@ -37,6 +38,7 @@
 //! | [`runtime`] | The agent process: the driver loop, the agent clock with the sleep continuity of the host, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |
 
 pub mod capability;
+pub mod client;
 pub mod controller;
 pub mod coordinator;
 pub mod executor;

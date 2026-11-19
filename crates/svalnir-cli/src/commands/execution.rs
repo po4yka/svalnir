@@ -16,6 +16,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use svalnir_agent::client::{self, AgentPresence, WaitError};
 use svalnir_agent::controller::{AuthorityRecords, SharedAuthority};
 use svalnir_agent::coordinator::{
     ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies, Idle, Phase,
@@ -26,8 +27,8 @@ use svalnir_agent::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
 use svalnir_agent::journal::{
-    AgentRecord, CoordinatorLock, CoordinatorRole, Enqueued, LockState, OperationJournal,
-    QueuedRequest, RequestBody, RequestCompletion, RequestStatus,
+    AgentRecord, CoordinatorRole, Enqueued, OperationJournal, QueuedRequest, RequestBody,
+    RequestCompletion, RequestStatus,
 };
 use svalnir_agent::platform::memory::CollectionContext;
 use svalnir_agent::platform::process::DarwinProcessSource;
@@ -64,12 +65,10 @@ const LOCK_RETRIES: u32 = 3;
 /// The time between two tries.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(60);
 
-/// The number of queue reads between two reads of the coordinator lock.
-const PRESENCE_CHECK_INTERVAL: u32 = 10;
-
-/// The time between two reads of the journal while a different process
+/// The number of queue reads between two reads of the coordinator lock,
+/// and the time between two reads of the journal while a different process
 /// executes the request.
-const QUEUE_POLL: Duration = Duration::from_millis(100);
+use svalnir_agent::client::{PRESENCE_CHECK_INTERVAL, QUEUE_POLL};
 
 /// How long a `--no-wait` request waits for its admission by a different
 /// process before it reports the request as queued.
@@ -126,38 +125,8 @@ pub(crate) enum Applied {
     Stopped(StopSignal),
 }
 
-/// The number of reads in sequence that a wait tries again when the
-/// journal is busy.
-pub(crate) const BUSY_READS: u32 = 40;
-
-/// The count of the failed reads in sequence of a wait on the journal.
-///
-/// A busy journal is read again, because a different process writes to it
-/// and a read changes nothing. The wait does not go on without a bound:
-/// after [`BUSY_READS`] busy reads in sequence the error of the read is
-/// the result. A read that succeeds starts the count again, and an error
-/// that is not "busy" is never tried again.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct BusyReads(u32);
-
-impl BusyReads {
-    /// Records a read that succeeded.
-    pub(crate) const fn succeeded(&mut self) {
-        self.0 = 0;
-    }
-
-    /// Records a read that failed. Returns `true` when the wait reads the
-    /// journal again: the failure is a busy journal, and fewer than
-    /// [`BUSY_READS`] busy reads came before it in sequence.
-    pub(crate) const fn reads_again(&mut self, is_busy: bool) -> bool {
-        if is_busy && self.0 < BUSY_READS {
-            self.0 = self.0.saturating_add(1);
-            true
-        } else {
-            false
-        }
-    }
-}
+/// The bound of the busy reads of a wait, which each client shares.
+pub(crate) use svalnir_agent::client::BusyReads;
 
 /// How a wait ended.
 pub(crate) enum WaitEnd {
@@ -655,51 +624,26 @@ fn wait_for_completion(
     timeout: Duration,
     pending: &Pending,
 ) -> Result<RequestCompletion, ErrorBody> {
-    let started: Instant = Instant::now();
-    let mut reads: u32 = 0;
-    let mut busy: BusyReads = BusyReads::default();
-    loop {
-        reads = reads.wrapping_add(1);
-        match journal.request_status(request_id) {
-            Ok(Some(RequestStatus::Completed { completion })) => return Ok(completion),
-            Ok(_) => busy.succeeded(),
-            // A busy journal is read again: a different process writes to
-            // it.
-            Err(error) => {
-                let is_busy: bool = matches!(
-                    error,
-                    svalnir_agent::journal::OperationJournalError::Busy(_)
-                );
-                if !busy.reads_again(is_busy) {
-                    return Err(journal_error(&error));
-                }
-            }
-        }
-        if reads.is_multiple_of(PRESENCE_CHECK_INTERVAL)
-            && session::coordinator_presence(database) == session::CoordinatorPresence::NotRunning
-        {
-            return Err(ErrorBody::new(
-                "coordinator_stopped",
-                ErrorFamily::Evidence,
-                ErrorStage::Dispatch,
-                format!(
-                    "the process that held the coordinator lock stopped before it served {}; the request is in the queue and the next coordinator serves it",
-                    pending.served
-                ),
-            )
-            .with_next_action(NextAction::RefreshObservation));
-        }
-        if started.elapsed() >= timeout {
-            return Err(ErrorBody::new(
-                pending.code,
-                ErrorFamily::Limits,
-                ErrorStage::Dispatch,
-                pending.message,
-            )
-            .with_next_action(NextAction::RefreshObservation));
-        }
-        std::thread::sleep(QUEUE_POLL);
-    }
+    client::wait_for_completion(journal, database, request_id, timeout).map_err(|error| match error {
+        WaitError::Journal(error) => journal_error(&error),
+        WaitError::CoordinatorStopped => ErrorBody::new(
+            "coordinator_stopped",
+            ErrorFamily::Evidence,
+            ErrorStage::Dispatch,
+            format!(
+                "the process that held the coordinator lock stopped before it served {}; the request is in the queue and the next coordinator serves it",
+                pending.served
+            ),
+        )
+        .with_next_action(NextAction::RefreshObservation),
+        WaitError::Pending => ErrorBody::new(
+            pending.code,
+            ErrorFamily::Limits,
+            ErrorStage::Dispatch,
+            pending.message,
+        )
+        .with_next_action(NextAction::RefreshObservation),
+    })
 }
 
 /// The longest wait for the agent that serves a queued rearm, when the
@@ -740,10 +684,7 @@ pub(crate) fn rearm(
     timeout: Option<Duration>,
 ) -> Result<RearmResult, ErrorBody> {
     let database = environment.journal_path()?;
-    if !matches!(
-        CoordinatorLock::probe(&database),
-        Ok(LockState::Held(CoordinatorRole::Agent))
-    ) {
+    if client::agent_presence(&database) != AgentPresence::Agent {
         return Err(ErrorBody::new(
             code::AGENT_NOT_RUNNING,
             ErrorFamily::Evidence,
@@ -1220,28 +1161,6 @@ mod decision_tests {
         AUTHORITY_READ_GRACE, AuthorityRead, ErrorBody, ErrorFamily, ErrorStage, NextAction,
         authority_after_read, read_failure,
     };
-
-    #[test]
-    fn a_busy_journal_is_read_again_for_a_bounded_number_of_reads_in_sequence() {
-        use super::{BUSY_READS, BusyReads};
-        let mut busy = BusyReads::default();
-        // An error that is not a busy journal is never tried again, and it
-        // does not use a place of the bound.
-        assert!(!busy.reads_again(false));
-        for _ in 0..BUSY_READS {
-            assert!(busy.reads_again(true));
-        }
-        // The bound is reached: the error of the read is the result.
-        assert!(!busy.reads_again(true));
-        assert!(!busy.reads_again(true));
-        // A read that succeeds starts the count again.
-        busy.succeeded();
-        for _ in 0..BUSY_READS {
-            assert!(busy.reads_again(true));
-            assert!(!busy.reads_again(false));
-        }
-        assert!(!busy.reads_again(true));
-    }
 
     #[test]
     fn a_record_that_cannot_be_read_is_not_authority_after_the_grace_period() {

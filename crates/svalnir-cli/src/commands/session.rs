@@ -6,15 +6,12 @@
 //! the journal in the state directory (`docs/INTERFACES.md` section 4).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use svalnir_agent::journal::{JournalOptions, OperationJournal, OperationJournalError};
 use svalnir_core::action::{ActionError, ClientRole, Principal};
-use svalnir_core::config::{ValidatedConfig, parse_and_validate};
-use svalnir_core::digest::ContentDigest;
-use svalnir_core::grant::{ActiveRevision, AuthorityState, ControlClock};
-use svalnir_core::policy::{ContinuityGeneration, EvaluationClock};
+use svalnir_core::grant::{AuthorityState, ControlClock};
+use svalnir_core::policy::EvaluationClock;
 use svalnir_core::process::Uid;
 use svalnir_core::time::WallTime;
 
@@ -36,25 +33,13 @@ pub(crate) fn current_uid() -> Uid {
 /// The principal of a request of this client. The journal is same-user
 /// state: the principal is a record, not an authentication.
 pub(crate) fn principal() -> Principal {
-    Principal {
-        uid: current_uid(),
-        session: None,
-        role: ClientRole::Cli,
-    }
+    svalnir_agent::client::principal(ClientRole::Cli)
 }
 
 /// A new identity text: the prefix, the wall-clock time, the process ID,
 /// and a counter of this process.
 pub(crate) fn new_id(prefix: &str) -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanoseconds: u128 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    format!(
-        "{prefix}_{nanoseconds:x}_{:x}_{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    )
+    svalnir_agent::client::new_id(prefix)
 }
 
 /// The error for an identity that could not be made.
@@ -79,26 +64,15 @@ pub(crate) struct Now {
 impl Now {
     /// Reads the clocks of the collection context.
     pub(crate) fn read(host: &Host) -> Result<Self, ErrorBody> {
-        let context = host.context();
-        let identity = context.identity();
-        let unavailable = |_| {
+        let (clock, wall) = svalnir_agent::client::control_time(host.context()).map_err(|_| {
             ErrorBody::new(
                 "clock_unavailable",
                 ErrorFamily::Native,
                 ErrorStage::Collection,
                 "a clock of this host gave no value; the command made no change",
             )
-        };
-        Ok(Self {
-            clock: EvaluationClock {
-                now: context.clock().monotonic_now().map_err(unavailable)?,
-                clock_domain: identity.clock_domain.clone(),
-                boot_id: identity.boot_id.clone(),
-                continuity: ContinuityGeneration::new(0),
-                last_discontinuity: None,
-            },
-            wall: context.clock().wall_now().map_err(unavailable)?,
-        })
+        })?;
+        Ok(Self { clock, wall })
     }
 
     /// The clock of a control request.
@@ -273,13 +247,7 @@ pub(crate) fn no_active_revision() -> ErrorBody {
 }
 
 /// The configuration of the revision in effect.
-#[derive(Debug, Clone)]
-pub(crate) struct ActiveConfig {
-    /// The revision and its scope.
-    pub(crate) active: ActiveRevision,
-    /// The validated configuration of the revision.
-    pub(crate) config: ValidatedConfig,
-}
+pub(crate) use svalnir_agent::client::ActiveConfig;
 
 /// Reads the configuration text of the revision in effect and validates it
 /// against the content digest of the revision, as the agent does.
@@ -293,29 +261,16 @@ pub(crate) fn active_config(
     journal: &OperationJournal,
     state: &AuthorityState,
 ) -> Result<ActiveConfig, ErrorBody> {
-    let active: &ActiveRevision = state.active.as_ref().ok_or_else(no_active_revision)?;
-    let not_usable = || {
-        ErrorBody::new(
+    use svalnir_agent::client::ActiveConfigError;
+    svalnir_agent::client::active_config(journal, state).map_err(|error| match error {
+        ActiveConfigError::NoActiveRevision => no_active_revision(),
+        ActiveConfigError::Journal(error) => journal_error(&error),
+        ActiveConfigError::SourceNotUsable => ErrorBody::new(
             "policy_revision_source_not_usable",
             ErrorFamily::Recording,
             ErrorStage::Storage,
             "the journal does not have a usable configuration text for the revision in effect; activate the configuration again",
-        )
-    };
-    let source: String = journal
-        .policy_revision_source(&active.revision.revision_id)
-        .map_err(|error| journal_error(&error))?
-        .ok_or_else(not_usable)?;
-    if ContentDigest::of_bytes(source.as_bytes()) != active.revision.content {
-        return Err(not_usable());
-    }
-    let config: ValidatedConfig = parse_and_validate(&source)
-        .config()
-        .cloned()
-        .ok_or_else(not_usable)?;
-    Ok(ActiveConfig {
-        active: active.clone(),
-        config,
+        ),
     })
 }
 

@@ -6,7 +6,9 @@
 //! the existing journal for writes; it never makes the state directory or
 //! the journal, and it never takes the coordinator lock.
 
-use super::{Action, ActionPort, ActionState, StopProposal, StopTarget, Unavailable};
+use super::{
+    Action, ActionPort, ActionState, StopProposal, StopTarget, UNEXPECTED_COMPLETION, Unavailable,
+};
 use crate::data::{live_records::collect_processes, model::OperationPhase};
 use std::{
     path::{Path, PathBuf},
@@ -185,7 +187,7 @@ impl LivePort {
                     ))
                 })
             }
-            _ => Err(ActionState::refused("journal_conflict")),
+            _ => Err(ActionState::refused(UNEXPECTED_COMPLETION)),
         }
     }
 
@@ -208,7 +210,7 @@ impl LivePort {
                     RequestCompletion::Rearmed { new_generation, .. } => accepted(format!(
                         "The agent recorded budget generation {new_generation} for incident {incident}. The usage of the earlier generation stays in the history."
                     )),
-                    _ => ActionState::refused("journal_conflict"),
+                    _ => ActionState::refused(UNEXPECTED_COMPLETION),
                 })
             }
             Action::Cancel { operation } => {
@@ -221,7 +223,7 @@ impl LivePort {
                         "The stop fence is recorded. The agent dispatches no further step. A call that was issued is not recalled, so the operation can end as Partial, Incomplete, or UnknownOutcome."
                             .to_owned(),
                     ),
-                    _ => ActionState::refused("journal_conflict"),
+                    _ => ActionState::refused(UNEXPECTED_COMPLETION),
                 })
             }
             Action::Acknowledge { operation } => {
@@ -237,11 +239,11 @@ impl LivePort {
                         "The acknowledgment is recorded, and the leases of the operation are released. The outcome stays unknown."
                             .to_owned()
                     }),
-                    _ => ActionState::refused("journal_conflict"),
+                    _ => ActionState::refused(UNEXPECTED_COMPLETION),
                 })
             }
             Action::Stop { proposal, force } => self.stop(proposal, *force),
-            _ => Err(ActionState::refused("journal_conflict")),
+            _ => Err(ActionState::refused(UNEXPECTED_COMPLETION)),
         }
     }
 
@@ -267,6 +269,11 @@ impl LivePort {
             plan_id: plan.plan_id.clone(),
             digest: plan.digest().clone(),
         };
+        // TODO(npochaev): a stop that the agent does not admit in
+        // ADMISSION_WAIT shows "Not answered", and the window does not
+        // follow the request: the agent can admit the plan later, until it
+        // expires. Keep the request identity and read its completion at
+        // each poll, as `read_waiting_stops` does for an operation.
         let completion: RequestCompletion = send_on(
             &mut journal,
             &path,
@@ -278,7 +285,7 @@ impl LivePort {
                 operation: operation_id.to_string(),
                 since: SystemTime::now(),
             },
-            _ => ActionState::refused("journal_conflict"),
+            _ => ActionState::refused(UNEXPECTED_COMPLETION),
         })
     }
 
@@ -323,8 +330,8 @@ impl ActionPort for LivePort {
         drop(journal);
         let host: Host = Host::open().map_err(|_| ActionState::Unavailable(Unavailable::Clock))?;
         let (clock, wall) = clocks_of(&host)?;
-        let snapshot: ProcessSnapshot =
-            collect_processes(&host).map_err(|_| ActionState::refused("group_not_found"))?;
+        let snapshot: ProcessSnapshot = collect_processes(&host)
+            .map_err(|_| ActionState::refused("process_reading_unavailable"))?;
         let control_plane = control_plane_of_this_process(&snapshot);
         let protection = ProtectionContext {
             principal: observe::current_uid(),
@@ -381,8 +388,8 @@ impl ActionPort for LivePort {
                 limits,
             };
             build_stop_plan(&context, &request)
-                .ok()
-                .and_then(|outcome| outcome.plan)
+                .map_err(|_| ActionState::refused("plan_not_buildable"))?
+                .plan
                 .map(Arc::new)
                 .ok_or_else(|| ActionState::refused("target_not_eligible"))
         };
@@ -572,7 +579,12 @@ fn expiry_wall(plan: &Plan) -> SystemTime {
         .expires_at
         .get()
         .saturating_sub(validity.created_at.get());
-    crate::data::live_records::system_time(validity.created_wall) + Duration::from_nanos(lifetime)
+    let created: SystemTime = crate::data::live_records::system_time(validity.created_wall);
+    // A lifetime out of range shows the plans as expired; the expiry check
+    // before the record of the plan decides.
+    created
+        .checked_add(Duration::from_nanos(lifetime))
+        .unwrap_or(created)
 }
 
 #[cfg(test)]

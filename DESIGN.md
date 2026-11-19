@@ -435,8 +435,9 @@ A control that changes state shows the state of its last request in a line below
 | Accepted | "Accepted" | `positive` | Check | What is now true, for example "The pause is in the authority record" |
 | Waiting for exit | "Waiting for exit" | `brand` | Loader | The operation of the stop and the elapsed seconds. The control shows `loading` |
 | Exited, Partial, No action, Failed, Unknown outcome | The state | The tone of the operation state | The icon of the operation state | The final record of the stop operation. Only `Completed` is "Exited" |
+| Exit not confirmed | "Exit not confirmed" | `warning` | Info | The window did not read the final record of the stop operation in 5 min. The control takes a new request; History shows the operation |
 | Not answered | "Not answered" | `warning` | Info | The wait ended; the request stays in the queue, and the agent can decide it later |
-| Refused | "Refused" | `negative` | Cross | The reason, the error code in parentheses, and "Nothing changed." |
+| Refused | "Refused" | `negative` | Cross | The reason, the error code in parentheses, and "Nothing changed." A completion of a different kind than the request (`unexpected_completion`) reached the agent, so its sentence does not say that nothing changed |
 | Unavailable | "Unavailable" | Neutral | Info | The cause, for example that no agent holds the coordinator lock, and what the user can do. Nothing was written |
 
 Refused and Unavailable are different states: a refusal is a decision of the agent or of the authority rules, and Unavailable means that the request did not reach the agent.

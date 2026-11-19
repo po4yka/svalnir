@@ -240,6 +240,12 @@ pub enum ActionState {
         /// The phase of its final record.
         phase: OperationPhase,
     },
+    /// The window did not read the final record of the stop operation in
+    /// time. The operation can still end; History shows it.
+    ExitNotConfirmed {
+        /// The operation of the stop.
+        operation: String,
+    },
     /// The wait ended with no answer. The request stays in the queue, and
     /// the agent can decide it later.
     Queued,
@@ -286,6 +292,7 @@ impl ActionState {
                 OperationPhase::Failed => ("Failed", Tone::Negative, IconName::CircleX),
                 _ => ("Unknown outcome", Tone::Warning, IconName::Info),
             },
+            Self::ExitNotConfirmed { .. } => ("Exit not confirmed", Tone::Warning, IconName::Info),
             Self::Queued => ("Not answered", Tone::Warning, IconName::Info),
             Self::Refused { .. } => ("Refused", Tone::Negative, IconName::CircleX),
             Self::Unavailable(_) => ("Unavailable", Tone::Neutral, IconName::Info),
@@ -311,7 +318,11 @@ impl ActionState {
                     phase_name(*phase)
                 ),
             },
+            Self::ExitNotConfirmed { operation } => format!("The window did not read the final record of operation {operation} in 5 min. The operation can still end; History shows its state."),
             Self::Queued => "The agent did not answer before the end of the wait. The request stays in the queue, and the agent can decide it later. See History.".to_owned(),
+            Self::Refused { code, reason } if code == UNEXPECTED_COMPLETION => {
+                format!("{reason} ({code}).")
+            }
             Self::Refused { code, reason } => format!("{reason} ({code}). Nothing changed."),
             Self::Unavailable(cause) => cause.sentence(),
         }
@@ -329,6 +340,11 @@ const fn phase_name(phase: OperationPhase) -> &'static str {
         OperationPhase::Unknown => "UnknownOutcome",
     }
 }
+
+/// The code of a completion of a different kind than the request. The
+/// request reached the agent, so this refusal does not say that nothing
+/// changed.
+pub const UNEXPECTED_COMPLETION: &str = "unexpected_completion";
 
 /// The sentence of an error code of the coordinator, of the authority
 /// logic, or of this client.
@@ -377,6 +393,10 @@ pub fn reason_of(code: &str) -> &'static str {
         "journal_conflict" => "The journal has a different request with this identity",
         "identity_unavailable" => "An identity of the request cannot be made",
         "plan_not_buildable" => "The stop plan cannot be made",
+        "process_reading_unavailable" => "The processes of this user cannot be read",
+        UNEXPECTED_COMPLETION => {
+            "The agent answered with a result of a different kind, so its effect is not known here. See History"
+        }
         "authority_record_not_readable" => "The authority record cannot be read",
         _ => "The agent refused the request",
     }
@@ -406,6 +426,9 @@ pub struct ActionBook {
     states: HashMap<Slot, ActionState>,
     /// The stop dialog: the instance and its plans.
     pub stop: Option<(String, Proposal)>,
+    /// The number of the latest preparation of stop plans. A result of an
+    /// earlier preparation is not kept.
+    stop_request: u64,
 }
 
 impl ActionBook {
@@ -418,6 +441,53 @@ impl ActionBook {
     /// Records the state of `slot`.
     pub fn set(&mut self, slot: Slot, state: ActionState) {
         self.states.insert(slot, state);
+    }
+
+    /// Opens the stop dialog of `instance` with plans that are being made,
+    /// and gives the number of this preparation.
+    pub fn open_stop(&mut self, instance: &str) -> u64 {
+        self.stop_request = self.stop_request.wrapping_add(1);
+        self.stop = Some((instance.to_owned(), Proposal::Preparing));
+        self.stop_request
+    }
+
+    /// Records the plans of the preparation `request`. Returns `false` and
+    /// keeps nothing when the dialog closed or a later preparation started.
+    pub fn finish_stop(&mut self, request: u64, proposal: Proposal) -> bool {
+        if request != self.stop_request {
+            return false;
+        }
+        match &mut self.stop {
+            Some((_, open)) => {
+                *open = proposal;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Closes the stop dialog. A preparation that runs keeps no result.
+    pub fn close_stop(&mut self) {
+        self.stop_request = self.stop_request.wrapping_add(1);
+        self.stop = None;
+    }
+
+    /// Ends each wait for an exit that started more than `limit` before
+    /// `now` as [`ActionState::ExitNotConfirmed`]. Returns `true` when a
+    /// state changed.
+    pub fn end_long_waits(&mut self, now: SystemTime, limit: Duration) -> bool {
+        let mut changed: bool = false;
+        for state in self.states.values_mut() {
+            if let ActionState::WaitingForExit { operation, since } = state
+                && now.duration_since(*since).is_ok_and(|age| age > limit)
+            {
+                *state = ActionState::ExitNotConfirmed {
+                    operation: operation.clone(),
+                };
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Each control with the state of its last action.
@@ -565,6 +635,62 @@ mod tests {
             Some("Exited")
         );
         assert_eq!(book.waiting(), Vec::new());
+    }
+
+    #[test]
+    fn only_the_latest_preparation_of_an_open_dialog_is_kept() {
+        let mut book = ActionBook::default();
+        let first = book.open_stop("app-1");
+        // The user asks for new plans while the first preparation runs.
+        let second = book.open_stop("app-1");
+        let late = Proposal::Ready(proposal(SystemTime::UNIX_EPOCH));
+        assert!(!book.finish_stop(first, late));
+        assert!(matches!(book.stop, Some((_, Proposal::Preparing))));
+        assert!(book.finish_stop(
+            second,
+            Proposal::Failed(ActionState::refused("group_not_found"))
+        ));
+        // A dialog that closed and opened again keeps no earlier result.
+        let third = book.open_stop("app-1");
+        book.close_stop();
+        let fourth = book.open_stop("app-1");
+        assert!(!book.finish_stop(third, Proposal::Preparing));
+        assert!(book.finish_stop(fourth, Proposal::Preparing));
+        book.close_stop();
+        assert!(!book.finish_stop(fourth, Proposal::Preparing));
+        assert!(book.stop.is_none());
+    }
+
+    #[test]
+    fn a_long_wait_for_the_exit_ends_and_frees_the_control() {
+        let since = SystemTime::UNIX_EPOCH;
+        let mut book = ActionBook::default();
+        let slot = Slot::Stop("app-1".to_owned());
+        book.set(
+            slot.clone(),
+            ActionState::WaitingForExit {
+                operation: "op-1".to_owned(),
+                since,
+            },
+        );
+        let limit = Duration::from_secs(300);
+        assert!(!book.end_long_waits(since + limit, limit));
+        assert!(book.is_busy(&slot));
+        assert!(book.end_long_waits(since + limit + Duration::from_secs(1), limit));
+        assert!(!book.is_busy(&slot));
+        let state = book.state(&slot).cloned();
+        assert_eq!(
+            state.as_ref().map(|state| state.pill().0),
+            Some("Exit not confirmed")
+        );
+        assert_eq!(book.waiting(), Vec::new());
+    }
+
+    #[test]
+    fn an_unexpected_completion_does_not_say_that_nothing_changed() {
+        let sentence = ActionState::refused(UNEXPECTED_COMPLETION).sentence(SystemTime::UNIX_EPOCH);
+        assert!(!sentence.contains("Nothing changed"), "{sentence}");
+        assert!(sentence.ends_with("(unexpected_completion)."), "{sentence}");
     }
 
     #[test]

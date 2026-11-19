@@ -58,6 +58,10 @@ pub fn scan_allowed(host: &Loadable<HostSnapshot>) -> ScanGate {
     }
 }
 
+/// The longest wait for the final record of a stop operation. A manual stop
+/// has a deadline below one minute; the limit leaves time for a busy agent.
+pub const STOP_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
 /// The poll interval while the window is active.
 pub const ACTIVE_INTERVAL: Duration = Duration::from_secs(2);
 /// The poll interval while the window is not active.
@@ -549,31 +553,24 @@ impl AppModel {
     /// Opens the stop dialog of the group `instance` and makes its plans on
     /// a background thread. Nothing is recorded until a confirmation.
     pub fn prepare_stop(&mut self, instance: &str, name: &str, cx: &mut Context<Self>) {
-        self.actions.stop = Some((instance.to_owned(), Proposal::Preparing));
+        let request: u64 = self.actions.open_stop(instance);
         cx.notify();
         let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
         let (instance, name): (String, String) = (instance.to_owned(), name.to_owned());
         cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let key: String = instance.clone();
             let result = cx
                 .background_spawn(async move { port.prepare_stop(&instance, &name) })
                 .await;
             if this
                 .update(cx, |model, cx| {
-                    // A dialog that closed or changed keeps no late result.
-                    if model
-                        .actions
-                        .stop
-                        .as_ref()
-                        .is_some_and(|(open, _)| *open == key)
-                    {
-                        model.actions.stop = Some((
-                            key,
-                            match result {
-                                Ok(proposal) => Proposal::Ready(Arc::new(proposal)),
-                                Err(state) => Proposal::Failed(state),
-                            },
-                        ));
+                    // Only the result of the latest preparation of the open
+                    // dialog is kept: a dialog that closed, opened again,
+                    // or asked for new plans keeps no earlier result.
+                    let proposal: Proposal = match result {
+                        Ok(proposal) => Proposal::Ready(Arc::new(proposal)),
+                        Err(state) => Proposal::Failed(state),
+                    };
+                    if model.actions.finish_stop(request, proposal) {
                         cx.notify();
                     }
                 })
@@ -587,13 +584,20 @@ impl AppModel {
 
     /// Closes the stop dialog. Its plans are not recorded.
     pub fn close_stop(&mut self, cx: &mut Context<Self>) {
-        self.actions.stop = None;
+        self.actions.close_stop();
         cx.notify();
     }
 
     /// Reads the operation of each stop that waits for the exit, and records
-    /// a final phase.
+    /// a final phase. A wait longer than [`STOP_WAIT_LIMIT`] ends as "exit
+    /// not confirmed", so that the control takes a new request.
     fn read_waiting_stops(&mut self, cx: &mut Context<Self>) {
+        if self
+            .actions
+            .end_long_waits(SystemTime::now(), STOP_WAIT_LIMIT)
+        {
+            cx.notify();
+        }
         for (slot, operation) in self.actions.waiting() {
             let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
             cx.spawn(async move |this, cx: &mut AsyncApp| {

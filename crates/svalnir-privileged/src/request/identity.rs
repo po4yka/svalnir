@@ -133,13 +133,6 @@ impl CallerIdentity {
     /// not a value that the peer sent. `login_session` is `None` when the
     /// connection has no login session; the helper refuses each request of
     /// such a caller.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the transport of Milestone 3 is the only caller; Milestone 2 has no transport"
-        )
-    )]
     pub(crate) fn from_transport(
         code: CodeIdentity,
         audited_uid: Uid,

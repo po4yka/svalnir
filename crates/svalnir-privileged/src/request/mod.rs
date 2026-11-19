@@ -52,6 +52,7 @@ mod decode;
 mod identity;
 mod operation;
 
+pub(crate) use decode::check_nesting;
 pub use decode::{DecodeError, MAX_ENCODED_REQUEST_BYTES, MAX_NESTING_DEPTH, decode_request};
 pub use identity::{
     CallerIdentity, CodeIdentity, CodeIdentityError, LoginSessionId, MAX_CODE_IDENTITY_BYTES,

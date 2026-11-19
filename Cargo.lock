@@ -6933,6 +6933,7 @@ dependencies = [
 name = "svalnir-privileged"
 version = "0.0.0"
 dependencies = [
+ "block2 0.6.2",
  "libc",
  "serde",
  "serde_json",

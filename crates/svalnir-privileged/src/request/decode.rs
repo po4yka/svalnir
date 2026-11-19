@@ -134,7 +134,7 @@ pub fn decode_request(
 
 /// Checks the nesting of objects and arrays before a parser reads the
 /// bytes. The scan uses no memory that depends on the input.
-fn check_nesting(bytes: &[u8]) -> Result<(), DecodeError> {
+pub(crate) fn check_nesting(bytes: &[u8]) -> Result<(), DecodeError> {
     let mut depth: usize = 0;
     let mut in_string: bool = false;
     let mut escaped: bool = false;

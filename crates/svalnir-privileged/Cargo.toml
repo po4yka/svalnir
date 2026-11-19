@@ -16,9 +16,8 @@ path = "src/lib.rs"
 name = "svalnir-privileged"
 path = "src/main.rs"
 
-# The dependencies of the declared request and validation modules. No
-# rendering crate and no agent crate is permitted in this graph: the helper
-# does not link the code of its caller.
+# No rendering crate and no agent crate is permitted in this graph: the
+# helper does not link the code of its caller.
 [dependencies]
 libc.workspace = true
 serde.workspace = true
@@ -26,7 +25,12 @@ serde_json.workspace = true
 svalnir-core.workspace = true
 thiserror.workspace = true
 
-# Tests only: disposable directories for the validation of file targets.
+# The blocks of the XPC event handlers. The XPC, libdispatch, and Security
+# calls are declared in `src/transport/xpc/sys.rs`.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+
+# Tests only: disposable directories for the executor and the service.
 [dev-dependencies]
 tempfile.workspace = true
 

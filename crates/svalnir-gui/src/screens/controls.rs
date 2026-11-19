@@ -390,7 +390,7 @@ fn stop_body(
             "confirm-expiry",
             until(proposal.expires_at, now).map_or_else(
                 || "The plans expire now.".to_owned(),
-                |left| format!("The plans expire in {left}."),
+                |left| format!("The plans expire {left}."),
             ),
             tokens,
         ))

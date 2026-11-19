@@ -792,11 +792,29 @@ fn with_detail(mut operation: OperationDetail) -> OperationDetail {
             },
         })
         .collect();
-    let mut number: usize = 0;
-    operation.targets = operation
+    // Each step takes the effect that agrees with its state: a failed step
+    // a refusal, a step with no action a skip or an absent target, and the
+    // others an effect with no error. Effects that no step takes follow.
+    let mut pool: Vec<String> = operation
         .effects
         .iter()
         .flat_map(|(effect, count)| std::iter::repeat_n(effect.clone(), *count))
+        .collect();
+    let mut ordered: Vec<String> = Vec::with_capacity(pool.len());
+    for state in &operation.steps {
+        let fits = |effect: &String| match state.as_str() {
+            "Failed" => fixture_error(effect).is_some() && effect != "Skipped",
+            "NoAction" => effect == "Skipped" || effect == "AlreadyAbsent",
+            _ => fixture_error(effect).is_none() || effect == "UnknownOutcome",
+        };
+        if let Some(index) = pool.iter().position(fits) {
+            ordered.push(pool.remove(index));
+        }
+    }
+    ordered.append(&mut pool);
+    let mut number: usize = 0;
+    operation.targets = ordered
+        .into_iter()
         .map(|effect| {
             number += 1;
             TargetDetail {

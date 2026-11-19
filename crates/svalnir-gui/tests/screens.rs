@@ -591,7 +591,7 @@ fn history_filters_sorts_and_opens_the_detail_of_one_operation(cx: &mut TestAppC
             .expect("step")
             .starts_with("Step Failed: ")
     );
-    let target = label(handle, "history-detail-target-2", cx).expect("target");
+    let target = label(handle, "history-detail-target-1", cx).expect("target");
     assert!(
         target.contains("error target_protected at admission"),
         "{target}"

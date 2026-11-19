@@ -231,6 +231,8 @@ Immediately before the call of each step whose target a rule found, the coordina
 
 Stop before the next unit if the deadline, policy, activity evidence, namespace condition, lease, or budget is invalid. Earlier removals remain performed; the contract provides no transactional rollback. A unit that is a directory is removed entry by entry, with the stop rule of a directory target of `DeleteSelectedFiles`.
 
+A step of the privileged helper has stricter units. An entry is one file, one symbolic link, or one empty directory, and it gets one call. The helper does not remove a directory entry by entry: a directory that is not empty is refused (`helper_directory_not_empty`). The helper removes an object only when the helper user or user 0 owns the object and each directory from the approved root to the object, and no other user can write to one of those directories. Each directory above the root also has such an owner, and another user can write to it only when it has the sticky bit. The helper skips an object with more than one link (`helper_target_hard_linked`). It opens the root and then reads the mount flags of the root with `fstatfs` on the open root, where the filesystem executor of the agent compares the mount table before the open (Shared preconditions). The ownership rule and the order of the locality check are the rules of the helper code of this build, and each one is an open decision of the project owner ([INTERFACES.md](INTERFACES.md) section 4). No agent calls the helper, and its executor runs only in tests.
+
 ## 8. Application intervention
 
 An application plan freezes the verified application instance and members to which its selected backend applies. Descendants, similarly named executables, shared services, and process groups are not automatically included.
@@ -245,7 +247,7 @@ The catalog of hard protections gives one fact for each application or job insta
 | `launchd` | Its process ID is 1 |
 | Control plane | It is the evaluating Svalnir process or one of its ancestors. An ancestor is identified by its process ID together with its start time |
 | Session application | Its bundle identifier is one of `com.apple.finder`, `com.apple.dock`, `com.apple.loginwindow`, `com.apple.systemuiserver`, `com.apple.controlcenter`, `com.apple.notificationcenterui`, `com.apple.WindowManager`, `com.apple.Spotlight`, `com.apple.SecurityAgent`, and `com.apple.coreservices.uiagent`. The comparison ignores ASCII case |
-| Svalnir component | Its bundle identifier is `dev.svalnir` or starts with `dev.svalnir.`, or its executable has the file name `svalnir`, `svalnir-agent`, `svalnir-privileged`, or `svalnir-gui`. The comparison ignores ASCII case |
+| Svalnir component | Its bundle identifier is `dev.po4yka.svalnir` or starts with `dev.po4yka.svalnir.`, or its executable has the file name `svalnir`, `svalnir-agent`, `svalnir-privileged`, or `svalnir-gui`. The comparison ignores ASCII case |
 | System executable | Its executable is below `/System/`, `/usr/`, `/bin/`, `/sbin/`, or `/Library/Apple/`, and not below `/usr/local/`. The comparison ignores ASCII case |
 
 A rule can only add a protection. A name, a path, or a bundle identifier never selects a target. A bundle identifier protects also when the membership of the process is not verified.
@@ -386,7 +388,7 @@ A durable-success acknowledgement requires persistent state first. If persistenc
 
 Journal records cover principal, authority generations, target evidence, budget reservation/consumption, lease context, dispatch state, native response, and observed outcome. Do not store unnecessary file contents, process arguments, environments, or credentials.
 
-The user executor and privileged helper each persist their own authoritative action records. The agent cannot treat its journal as proof that the helper recorded an intent. If either required recording boundary fails, do not issue the associated external operation.
+The user executor and privileged helper each persist their own authoritative action records. The agent cannot treat its journal as proof that the helper recorded an intent. If either required recording boundary fails, do not issue the associated external operation. The helper then records the step as `NoAction` with the error `helper_record_not_durable`; the step stays consumed. A result that the helper cannot make durable after the effect is reported with the durability `persistence_failed` and the error `helper_result_not_durable`, and a restart of the helper restores that step as `UnknownOutcome`. The helper of this build has no durable record store ([INTERFACES.md](INTERFACES.md) section 4), so its record is never durable and it issues no call.
 
 SQLite WAL with `synchronous=FULL` is the architectural baseline; the actual build, VFS, sync options, and storage-error behavior require validation. WAL with `NORMAL` can lose committed transactions after power failure. [SQLite's WAL documentation][sqlite-wal] describes that distinction.
 

@@ -101,7 +101,7 @@ Threat IDs are stable references for design reviews, tests, and incident reports
 
 **Controls:** Authenticate each live connection with OS-supported peer identity checks and principal/session binding. Use explicit signer and executable requirements, typed method allowlists, per-method authorization, bounded results, and independent helper checks. Reject incompatible protocols before dispatch. Keep privacy-bearing queries scoped as carefully as mutation requests.
 
-**Residual risk:** A genuine CLI launched by same-user malware can satisfy executable authentication. Client authentication narrows callers; it does not establish human intent or rescue compromised user-session grants.
+**Residual risk:** A genuine CLI launched by same-user malware can satisfy executable authentication. Client authentication narrows callers; it does not establish human intent or rescue compromised user-session grants. A process of a user can make the helper stop the handling of the messages of that same user for 10 s with repeated malformed messages ([INTERFACES.md](INTERFACES.md) section 10). It cannot do that for another user. Until the XPC transport exists, the clients and the agent share the request queue of the journal, which authenticates no peer (owner decision of 2026-11-19, [INTERFACES.md](INTERFACES.md) section 4).
 
 ### T-02 — Configuration becomes administrative authority
 
@@ -123,7 +123,7 @@ Threat IDs are stable references for design reviews, tests, and incident reports
 
 **Scenario:** A directory, final filename, symlink, mount, or ownership relationship changes between inspection and removal, redirecting an otherwise authorized operation.
 
-**Controls:** Anchor traversal to verified directory handles; reject symlink traversal; validate ownership, object and volume identity; constrain mount crossings; use descriptor-relative operations and bounded batches. Do not rely on string prefixes or one-time canonicalization. Detect unsupported hard-link and namespace conditions and skip them.
+**Controls:** Anchor traversal to verified directory handles; reject symlink traversal; validate ownership, object and volume identity; constrain mount crossings; use descriptor-relative operations and bounded batches. Do not rely on string prefixes or one-time canonicalization. Detect unsupported hard-link and namespace conditions and skip them. The privileged helper requires that only the helper user and user 0 can write to the approved root and to each directory between the root and the object ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7).
 
 These defenses reduce race exposure but do not make a final name check followed by `unlinkat` atomic. An active or adversarial owner-controlled namespace is ineligible for unattended deletion unless an explicitly risk-accepted disposable root and a reviewed protocol demonstrate confinement. Advisory locks and an idle process observation do not constrain a malicious writer. Apple's secure-coding guidance describes these TOCTOU limitations and the limits of cooperative locking. [Source][file-races]
 

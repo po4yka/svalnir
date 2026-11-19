@@ -17,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use svalnir_agent::client::{self, AgentPresence};
+use svalnir_agent::client::{self, AgentPresence, WaitError};
 use svalnir_agent::journal::{
     OperationJournal, OperationJournalError, QueuedRequest, RequestBody, RequestCompletion,
 };
@@ -280,6 +280,8 @@ const SETTLED_BEFORE_NOTE: &str =
 
 const NOT_SERVED_NOTE: &str = "The agent did not serve the cancel request before the end of the wait, so this client wrote the stop fence in the journal itself. The request stays in the queue; the agent finds the fence when it serves it.";
 
+const UNREADABLE_NOTE: &str = "The request queue could not be read after the cancel request was written, so this client wrote the stop fence in the journal itself. The request stays in the queue; the agent finds the fence when it serves it.";
+
 const CURRENT_INSTANCE_NOTE: &str = "The agent stopped the operation in its executor, but the journal did not take the stop fence. A restart of the agent before the operation settles does not keep the stop.";
 
 impl CancelView {
@@ -314,9 +316,12 @@ impl CancelView {
 }
 
 /// Writes the stop fence of `operation_id` in the journal.
+/// `queued` is true when the cancel request of this invocation is in the
+/// queue of the journal, so the agent can still serve it.
 fn write_fence(
     journal: &mut OperationJournal,
     operation_id: &OperationId,
+    queued: bool,
 ) -> Result<(), ErrorBody> {
     journal
         .try_set_stop_fence(operation_id)
@@ -324,11 +329,23 @@ fn write_fence(
             OperationJournalError::NotFound => not_found(operation_id),
             other => {
                 let mut body: ErrorBody = journal_error(&other);
-                body.message = format!(
-                    "{}; the stop fence was not written, so the cancel is NOT in effect: this client has no executor that it can stop",
-                    body.message
-                );
-                body.with_operation(operation_id.as_str())
+                body.message = if queued {
+                    format!(
+                        "{}; the stop fence was not written; the cancel request stays in the queue with the `request_id` of this response, and the agent can still serve it; query the operation with `svalnir operations show` before a different action",
+                        body.message
+                    )
+                } else {
+                    format!(
+                        "{}; the stop fence was not written, so the cancel is NOT in effect: this client has no executor that it can stop",
+                        body.message
+                    )
+                };
+                let body: ErrorBody = body.with_operation(operation_id.as_str());
+                if queued {
+                    body.with_next_action(NextAction::QueryOperation)
+                } else {
+                    body
+                }
             }
         })
 }
@@ -338,8 +355,11 @@ enum Queued {
     /// The agent recorded the stop with this fence.
     Served(StopFence),
     /// The agent did not serve the request in the wait: the wait ended,
-    /// the agent stopped, or the queue could not be read.
+    /// or the agent stopped.
     NotServed,
+    /// The queue could not be read after the request was written, so the
+    /// completion of the request is not known.
+    Unreadable,
 }
 
 /// Writes the cancel request to the queue and waits for the agent.
@@ -363,9 +383,14 @@ fn cancel_through_queue(
         },
         enqueued_at: session::wall_now(),
     };
-    journal
-        .enqueue_request(&request)
-        .map_err(|error| journal_error(&error).with_operation(operation_id.as_str()))?;
+    journal.enqueue_request(&request).map_err(|error| {
+        let mut body: ErrorBody = journal_error(&error);
+        body.message = format!(
+            "{}; the cancel request was not written to the queue and no stop fence was written, so the cancel is NOT in effect",
+            body.message
+        );
+        body.with_operation(operation_id.as_str())
+    })?;
     match client::wait_for_completion(journal, journal_path, request_id, timeout) {
         Ok(RequestCompletion::Stopped { fence }) => Ok(Queued::Served(fence)),
         Ok(RequestCompletion::Rejected { error }) => {
@@ -374,7 +399,8 @@ fn cancel_through_queue(
         Ok(_) => Err(execution::unexpected_completion()),
         // The request stays in the queue. The caller writes the fence, so
         // the cancel does not depend on the agent.
-        Err(_) => Ok(Queued::NotServed),
+        Err(WaitError::Pending | WaitError::CoordinatorStopped) => Ok(Queued::NotServed),
+        Err(WaitError::Journal(_)) => Ok(Queued::Unreadable),
     }
 }
 
@@ -412,13 +438,18 @@ pub(crate) fn cancel(
                 (false, CancelPath::RequestQueue)
             }
             Queued::NotServed => {
-                write_fence(&mut journal, &operation_id)?;
+                write_fence(&mut journal, &operation_id, true)?;
                 notes.push(NOT_SERVED_NOTE);
+                (true, CancelPath::StopFence)
+            }
+            Queued::Unreadable => {
+                write_fence(&mut journal, &operation_id, true)?;
+                notes.push(UNREADABLE_NOTE);
                 (true, CancelPath::StopFence)
             }
         }
     } else {
-        write_fence(&mut journal, &operation_id)?;
+        write_fence(&mut journal, &operation_id, false)?;
         notes.push(CANCEL_NOTE);
         (true, CancelPath::StopFence)
     };

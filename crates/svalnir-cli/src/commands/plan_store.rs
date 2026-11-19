@@ -335,7 +335,7 @@ pub(crate) fn load_stop(
     // earlier request possibly sent a signal, so it permits no new plan.
     let different = || {
         store_error(
-            "of an earlier stop request is of a different format; this build makes no second plan for the process",
+            "of an earlier stop request is of a different format; this build makes no second plan for the process or group",
         )
     };
     let record: Option<StopRecord> = read_document(&stop_path(environment, target)?, different)?;

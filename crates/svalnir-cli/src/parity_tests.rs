@@ -152,11 +152,50 @@ fn a_group_stop_binds_each_verified_member_and_no_process_of_the_same_name() {
     assert_eq!(binding.members.len(), 2);
     drop(journal);
 
-    // A repeated request finds the plan and the operation of the first.
+    // The operation is settled, so a repeated request reads the group
+    // again. Its members are gone: no second plan and no second signal.
     let again = stop_group(&world.environment, &instance, &["--grace", "10s", "--yes"]);
-    assert_eq!(again.status, ExitStatus::Success, "{}", again.stdout);
-    assert_eq!(again.result()["existing_operation"], true);
-    assert_eq!(again.result()["plan_id"], result["plan_id"]);
+    assert_eq!(again.error_code(), "group_not_found", "{}", again.stdout);
+    let history = json(&world.environment, &["history"]);
+    assert_eq!(history.result()["records"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_member_that_joins_after_a_settled_group_stop_is_in_the_next_plan() {
+    let mut world: World = world_for_stop();
+    // The first member ignores the request to exit, so the graceful stop
+    // settles with the member still running.
+    let mut first: ChildGuard = spawn_child(true);
+    let mut later: ChildGuard = spawn_child(false);
+    let instance: String = instance_of(&first);
+    let later_target: String = later.target();
+    give_membership(&mut world.environment, &instance, vec![first.pid()], None);
+    let stop = stop_group(&world.environment, &instance, &["--grace", "1s", "--yes"]);
+    assert_eq!(stop.status, ExitStatus::Partial, "{}", stop.stdout);
+    assert_eq!(stop.result()["operation"]["state"], "Incomplete");
+    let first_plan = stop.result()["plan_id"].clone();
+
+    // A second process joins the instance. The same request makes a new
+    // plan from a new reading, with both members.
+    give_membership(
+        &mut world.environment,
+        &instance,
+        vec![first.pid(), later.pid()],
+        None,
+    );
+    let again = stop_group(&world.environment, &instance, &["--grace", "1s", "--yes"]);
+    let result = again.result();
+    assert_ne!(result["plan_id"], first_plan, "{}", again.stdout);
+    assert_eq!(result["existing_operation"], false);
+    assert!(
+        effects(&again)
+            .iter()
+            .any(|(member, effect)| member == &later_target && effect == "ExitVerified"),
+        "{}",
+        again.stdout
+    );
+    assert!(later.has_exited());
+    assert!(!first.has_exited());
 }
 
 #[test]

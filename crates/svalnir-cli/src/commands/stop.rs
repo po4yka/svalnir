@@ -21,6 +21,9 @@
 //! The command keeps its plan identity in a stop record of the process
 //! generation or of the group. A repeated request, for example after a lost
 //! response, finds that plan and its operation and makes no second plan.
+//! After the operation of a group is settled, a repeated group request
+//! makes a new plan from a new reading, because the members of an instance
+//! can change; a member of the earlier plan that exited is not in it.
 
 use std::time::Duration;
 
@@ -265,6 +268,18 @@ fn earlier_plan(
         // effect, and a new plan takes its place.
         return Ok(None);
     }
+    // The members of a group can change after its plan, for example when
+    // the application starts a helper again. After a settled operation, a
+    // repeated group request is a new decision with a new reading, so a
+    // member that came later is in the new plan. A process generation
+    // cannot change, so a settled operation of `--target` is kept.
+    if matches!(target, StopKey::Group(_))
+        && operation
+            .as_ref()
+            .is_some_and(|operation| operation.state().is_settled())
+    {
+        return Ok(None);
+    }
     let same_request: bool = record.kind == requested.strategy.kind()
         && record.grace == requested.strategy.grace()
         && record.verification_window == requested.limits.verification_window;
@@ -294,13 +309,19 @@ fn check_protection(key: &StopKey, protection: ProtectionFact) -> Result<(), Err
             key,
             "target_protected",
             ErrorFamily::Eligibility,
-            "a hard protection applies to the process: it is a system process, a process of Svalnir, this client or one of its ancestors, or a process of a different user; `--force` does not change a protection",
+            match key {
+                StopKey::Process(_) => "a hard protection applies to the process: it is a system process, a process of Svalnir, this client or one of its ancestors, or a process of a different user; `--force` does not change a protection",
+                StopKey::Group(_) => "a hard protection applies to a member of the group: a system process, a process of Svalnir, this client or one of its ancestors, or a process of a different user; one protected member protects the group; `svalnir processes show` gives each member; `--force` does not change a protection",
+            },
         )),
         ProtectionFact::Unknown => Err(stop_error(
             key,
             "target_protection_unknown",
             ErrorFamily::Evidence,
-            "the protection of the process is not known: it has no executable evidence, or the ancestors of this client are not known",
+            match key {
+                StopKey::Process(_) => "the protection of the process is not known: it has no executable evidence, or the ancestors of this client are not known",
+                StopKey::Group(_) => "the protection of a member of the group is not known: a member has no executable evidence, or the ancestors of this client are not known",
+            },
         )
         .with_next_action(NextAction::RefreshObservation)),
     }

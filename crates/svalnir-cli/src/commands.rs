@@ -364,14 +364,6 @@ fn waits_for_an_operation(command: &Command) -> bool {
     )
 }
 
-/// Writes one JSON value and a newline.
-///
-/// The value is serialized to memory first, so a serialization failure
-/// leaves no partial line in `stdout`.
-pub(crate) fn write_json<T: Serialize>(stdout: &mut dyn Write, value: &T) -> io::Result<()> {
-    stdout.write_all(&json_line(value)?)
-}
-
 /// Writes all of `bytes`. The user can interrupt a write that blocks.
 ///
 /// `write_all` retries a write that `EINTR` ended, so a blocked write to a

@@ -342,9 +342,9 @@ fn json_line_serializes_before_writing() {
             Err(serde::ser::Error::custom("fails"))
         }
     }
-    let mut out: Vec<u8> = Vec::new();
-    assert!(crate::commands::write_json(&mut out, &Bad).is_err());
-    assert_eq!(out, Vec::<u8>::new());
+    // The value is serialized to memory before a write, so a failure
+    // leaves no partial line in the output.
+    assert!(crate::commands::json_line(&Bad).is_err());
 }
 
 #[test]
@@ -1118,6 +1118,9 @@ mod host {
                 "--format",
                 "json",
             ]);
+            if host_snapshot_is_too_large(&outcome) {
+                continue;
+            }
             assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
             let envelope = outcome.envelope();
             assert_eq!(envelope["kind"], "report");
@@ -1135,6 +1138,15 @@ mod host {
             }
         }
         let text = svalnir(&["policy", "simulate", "disk-guard"]);
+        if text.status == ExitStatus::Unavailable {
+            // The same condition of the host, in the text form.
+            assert!(
+                text.stderr.contains("the snapshot is not usable"),
+                "{}",
+                text.stderr
+            );
+            return;
+        }
         assert_eq!(text.status, ExitStatus::Success);
         assert!(
             text.stdout
@@ -1142,6 +1154,22 @@ mod host {
             "{}",
             text.stdout
         );
+    }
+
+    /// True when the live host has more processes of one application than
+    /// a simulation takes, which the command refuses with its own code.
+    /// The test reads the host of the developer, and an application with
+    /// more than the limit of member processes is a possible condition of
+    /// it. Each other refusal fails the test.
+    fn host_snapshot_is_too_large(outcome: &super::Outcome) -> bool {
+        if outcome.status != ExitStatus::Unavailable {
+            return false;
+        }
+        let error = &outcome.envelope()["error"];
+        assert_eq!(error["code"], "simulation_input_too_large", "{error}");
+        assert_eq!(error["next_action"], "refresh_observation");
+        eprintln!("the host has an application above the simulation limit: {error}");
+        true
     }
 }
 
@@ -1220,4 +1248,36 @@ fn an_interrupted_result_write_has_status_130() {
         &mut stderr,
     );
     assert_eq!(status, ExitStatus::Interrupted);
+}
+
+#[test]
+fn an_interrupted_write_of_an_error_ends_and_keeps_the_status_of_the_error() {
+    // A command refuses its request after the user interrupted it. The
+    // write of the error is cut short: it is not tried again, and the
+    // command does not report a success.
+    let (mut environment, _directory) = environment();
+    let (interrupt, flag) = crate::interrupt::Interrupt::manual();
+    environment.interrupt = interrupt;
+    let mut stdout = ShortWriter {
+        first: 3,
+        calls: 0,
+        flag,
+    };
+    let mut stderr: Vec<u8> = Vec::new();
+    let status = run_in(
+        [
+            "svalnir",
+            "--format",
+            "json",
+            "operations",
+            "show",
+            "operation_that_no_journal_has",
+        ],
+        request_id(),
+        &environment,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(stdout.calls, 1);
+    assert_ne!(status, ExitStatus::Success);
 }

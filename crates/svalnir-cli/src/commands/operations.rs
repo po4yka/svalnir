@@ -158,22 +158,20 @@ pub(crate) fn wait(
     environment.interrupt.arm();
     let started: Instant = Instant::now();
     let mut reads: u32 = 0;
-    let mut busy_reads: u32 = 0;
+    let mut busy: execution::BusyReads = execution::BusyReads::default();
     let (wait, operation, note): (&'static str, Operation, Option<&'static str>) = loop {
         let operation: Operation = match read(&journal, &operation_id) {
             Ok(operation) => {
-                busy_reads = 0;
+                busy.succeeded();
                 operation
             }
             // A busy journal is read again: a different process writes
             // to it. The wait changes nothing, so a repeat is safe.
             Err(error)
-                if &*error.code == "journal_busy"
-                    && busy_reads < execution::BUSY_READS
-                    && !environment.interrupt.is_requested()
-                    && timeout.is_none_or(|timeout| started.elapsed() < timeout) =>
+                if !environment.interrupt.is_requested()
+                    && timeout.is_none_or(|timeout| started.elapsed() < timeout)
+                    && busy.reads_again(&*error.code == "journal_busy") =>
             {
-                busy_reads = busy_reads.saturating_add(1);
                 std::thread::sleep(POLL);
                 continue;
             }

@@ -129,6 +129,35 @@ pub(crate) enum Applied {
 /// journal is busy.
 pub(crate) const BUSY_READS: u32 = 40;
 
+/// The count of the failed reads in sequence of a wait on the journal.
+///
+/// A busy journal is read again, because a different process writes to it
+/// and a read changes nothing. The wait does not go on without a bound:
+/// after [`BUSY_READS`] busy reads in sequence the error of the read is
+/// the result. A read that succeeds starts the count again, and an error
+/// that is not "busy" is never tried again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BusyReads(u32);
+
+impl BusyReads {
+    /// Records a read that succeeded.
+    pub(crate) const fn succeeded(&mut self) {
+        self.0 = 0;
+    }
+
+    /// Records a read that failed. Returns `true` when the wait reads the
+    /// journal again: the failure is a busy journal, and fewer than
+    /// [`BUSY_READS`] busy reads came before it in sequence.
+    pub(crate) const fn reads_again(&mut self, is_busy: bool) -> bool {
+        if is_busy && self.0 < BUSY_READS {
+            self.0 = self.0.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// How a wait ended.
 pub(crate) enum WaitEnd {
     /// The operation has its final record, or an unknown outcome.
@@ -619,20 +648,23 @@ fn wait_for_completion(
 ) -> Result<RequestCompletion, ErrorBody> {
     let started: Instant = Instant::now();
     let mut reads: u32 = 0;
-    let mut failed_reads: u32 = 0;
+    let mut busy: BusyReads = BusyReads::default();
     loop {
         reads = reads.wrapping_add(1);
         match journal.request_status(request_id) {
             Ok(Some(RequestStatus::Completed { completion })) => return Ok(completion),
-            Ok(_) => failed_reads = 0,
+            Ok(_) => busy.succeeded(),
             // A busy journal is read again: a different process writes to
             // it.
-            Err(svalnir_agent::journal::OperationJournalError::Busy(_))
-                if failed_reads < BUSY_READS =>
-            {
-                failed_reads = failed_reads.saturating_add(1);
+            Err(error) => {
+                let is_busy: bool = matches!(
+                    error,
+                    svalnir_agent::journal::OperationJournalError::Busy(_)
+                );
+                if !busy.reads_again(is_busy) {
+                    return Err(journal_error(&error));
+                }
             }
-            Err(error) => return Err(journal_error(&error)),
         }
         if reads.is_multiple_of(PRESENCE_CHECK_INTERVAL)
             && session::coordinator_presence(database) == session::CoordinatorPresence::NotRunning
@@ -1064,7 +1096,7 @@ impl Queued {
         let started: Instant = Instant::now();
         let mut last: Option<OperationReport> = None;
         let mut reads: u32 = 0;
-        let mut failed_reads: u32 = 0;
+        let mut busy: BusyReads = BusyReads::default();
         loop {
             reads = reads.wrapping_add(1);
             let state = self.state();
@@ -1088,15 +1120,12 @@ impl Queued {
                 );
             }
             if state.is_ok() {
-                failed_reads = 0;
+                busy.succeeded();
             }
             match state {
                 // A busy journal is read again: a different process
                 // writes to it.
-                Err(error) if &*error.code == "journal_busy" && failed_reads < BUSY_READS => {
-                    failed_reads = failed_reads.saturating_add(1);
-                    drop(error);
-                }
+                Err(error) if busy.reads_again(&*error.code == "journal_busy") => drop(error),
                 Err(error) => return WaitEnd::Failed(self.read_failure(error, last.as_ref())),
                 Ok(QueueState::Rejected(error)) => return WaitEnd::Rejected(error),
                 Ok(QueueState::Operation(operation)) => {
@@ -1182,6 +1211,28 @@ mod decision_tests {
         AUTHORITY_READ_GRACE, AuthorityRead, ErrorBody, ErrorFamily, ErrorStage, NextAction,
         authority_after_read, read_failure,
     };
+
+    #[test]
+    fn a_busy_journal_is_read_again_for_a_bounded_number_of_reads_in_sequence() {
+        use super::{BUSY_READS, BusyReads};
+        let mut busy = BusyReads::default();
+        // An error that is not a busy journal is never tried again, and it
+        // does not use a place of the bound.
+        assert!(!busy.reads_again(false));
+        for _ in 0..BUSY_READS {
+            assert!(busy.reads_again(true));
+        }
+        // The bound is reached: the error of the read is the result.
+        assert!(!busy.reads_again(true));
+        assert!(!busy.reads_again(true));
+        // A read that succeeds starts the count again.
+        busy.succeeded();
+        for _ in 0..BUSY_READS {
+            assert!(busy.reads_again(true));
+            assert!(!busy.reads_again(false));
+        }
+        assert!(!busy.reads_again(true));
+    }
 
     #[test]
     fn a_record_that_cannot_be_read_is_not_authority_after_the_grace_period() {

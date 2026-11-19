@@ -94,7 +94,10 @@ where
             let mut written: io::Result<()> = write!(stderr, "{rendered}");
             if written.is_ok() && requests_machine_format(&arguments) {
                 let body: ErrorBody = commands::invalid_arguments(error.kind().as_str());
-                written = commands::write_json(stdout, &Envelope::error(request_id, body))
+                written = commands::json_line(&Envelope::error(request_id, body))
+                    .and_then(|line| {
+                        commands::write_interruptible(stdout, &line, &environment.interrupt)
+                    })
                     .and_then(|()| stdout.flush());
             }
             return finish(written, ExitStatus::Usage, stderr);
@@ -131,6 +134,7 @@ where
                 request_id,
                 error,
                 Vec::new(),
+                &environment.interrupt,
                 stdout,
                 stderr,
             );
@@ -144,6 +148,7 @@ where
                 request_id,
                 error,
                 warnings,
+                &environment.interrupt,
                 stdout,
                 stderr,
             );
@@ -159,11 +164,16 @@ where
         .map_or(status, interrupt::StopSignal::exit_status)
 }
 
+/// Writes the error of a rejected command. The write of a machine format
+/// is the interruptible write of a result: a command that armed the
+/// interrupt handler before its refusal does not block on a full pipe
+/// after Ctrl+C. The exit status is that of the error in each case.
 fn report_error(
     format: Format,
     request_id: RequestId,
     error: ErrorBody,
     warnings: Vec<Warning>,
+    interrupt: &interrupt::Interrupt,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
@@ -175,10 +185,9 @@ fn report_error(
             writeln!(stderr, "error: {}", error.message)
         }
         Format::Json | Format::Ndjson => {
-            commands::write_json(
-                stdout,
-                &Envelope::error(request_id, error).with_warnings(warnings),
-            )?;
+            let line: Vec<u8> =
+                commands::json_line(&Envelope::error(request_id, error).with_warnings(warnings))?;
+            commands::write_interruptible(stdout, &line, interrupt)?;
             stdout.flush()
         }
     }

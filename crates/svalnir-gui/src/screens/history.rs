@@ -1,12 +1,15 @@
 //! The History screen: the latest operations of the journal with their
 //! trigger, their steps, their target results, and the observed change of a
-//! resource. The screen shows state only.
+//! resource. A row that is not settled has a cancel, and an
+//! `UnknownOutcome` row has an acknowledgment (`crate::actions`).
 
 use super::common::{
     CardWidth, Shown, ago, body_line, bytes_text, caption, card, cell, failed_body, head,
     mono_text, problem_lines, screen, shown, skeleton_rows, stale_line,
 };
+use super::controls::{action_button, slot_status};
 use crate::{
+    actions::{Action, Slot},
     data::{
         model::{Measured, OperationPhase},
         records::{EffectRow, HISTORY_ROWS_MAX, HistorySnapshot, OperationDetail},
@@ -14,6 +17,7 @@ use crate::{
     },
     screens::overview::phase_pill,
     theme::tokens::{self, Tokens, to_hsla},
+    ui::action_button::ButtonVariant,
     ui::{
         data_state::format_bytes,
         pill::{StatusPill, Tone},
@@ -251,8 +255,82 @@ fn two_lines(first: AnyElement, second: impl Into<SharedString>, tokens: &Tokens
         .into_any_element()
 }
 
+/// The control of an operation row: a cancel for an operation that is not
+/// settled, and an acknowledgment for an `UnknownOutcome` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowControl {
+    /// Stop the dispatch of the further steps.
+    Cancel,
+    /// Acknowledge the unknown outcome and release the leases.
+    Acknowledge,
+}
+
+/// The control of `operation`, if it has one.
+#[must_use]
+pub fn row_control(operation: &OperationDetail) -> Option<RowControl> {
+    match operation.phase {
+        OperationPhase::Pending | OperationPhase::Running => Some(RowControl::Cancel),
+        OperationPhase::Unknown if operation.state_text == "UnknownOutcome" => {
+            Some(RowControl::Acknowledge)
+        }
+        _ => None,
+    }
+}
+
+/// The state cell of a row: the state pill, the control, and the state of
+/// its last action.
+fn state_cell(
+    operation: &OperationDetail,
+    pill: StatusPill,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+    now: SystemTime,
+    tokens: &Tokens,
+) -> AnyElement {
+    let id: &str = &operation.operation_id;
+    let slot = Slot::Operation(id.to_owned());
+    let busy: bool = model.actions.is_busy(&slot);
+    let control = row_control(operation).map(|control| match control {
+        RowControl::Cancel => action_button(
+            SharedString::from(format!("history-cancel-{id}")),
+            "Cancel",
+            ButtonVariant::Quiet,
+            entity,
+            Action::Cancel {
+                operation: id.to_owned(),
+            },
+            busy,
+        ),
+        RowControl::Acknowledge => action_button(
+            SharedString::from(format!("history-acknowledge-{id}")),
+            "Acknowledge",
+            ButtonVariant::Quiet,
+            entity,
+            Action::Acknowledge {
+                operation: id.to_owned(),
+            },
+            busy,
+        ),
+    });
+    v_flex()
+        .gap(tokens::SPACE_1)
+        .items_start()
+        .child(pill)
+        .children(control)
+        .children(slot_status(
+            SharedString::from(format!("history-action-{id}")),
+            model,
+            &slot,
+            now,
+            tokens,
+        ))
+        .into_any_element()
+}
+
 fn operation_table(
     snapshot: &HistorySnapshot,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
     now: SystemTime,
     stale: bool,
     mono: &SharedString,
@@ -266,6 +344,7 @@ fn operation_table(
         if let Some(icon) = phase_icon(operation.phase) {
             pill = pill.icon(icon);
         }
+        let state_column: AnyElement = state_cell(operation, pill, entity, model, now, tokens);
         let origin: &str = if operation.automatic {
             "Started by a guard"
         } else {
@@ -318,7 +397,7 @@ fn operation_table(
             ))
             .child(cell(classes, 4, false))
             .child(cell(tick_track(operation, tokens), 3, false))
-            .child(cell(pill, 3, false))
+            .child(cell(state_column, 3, false))
             .child(cell(observed, 4, false))
     });
     Table::new()
@@ -341,6 +420,8 @@ fn operation_table(
 
 fn operations_card(
     history: &Shown<HistorySnapshot>,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
     now: SystemTime,
     mono: &SharedString,
     tokens: &Tokens,
@@ -356,6 +437,8 @@ fn operations_card(
             if !value.operations.is_empty() {
                 body = body.child(operation_table(
                     value,
+                    entity,
+                    model,
                     now,
                     stale_age.is_some(),
                     mono,
@@ -382,7 +465,7 @@ fn operations_card(
             }
             body = body.child(caption(
                 "history-note",
-                "A capacity value is an observation before and after the operation. A move to the Trash has no capacity observation. The journal is a record and not an undo list.",
+                "A capacity value is an observation before and after the operation. A move to the Trash has no capacity observation. The journal is a record and not an undo list. Cancel stops the dispatch of the further steps; it does not recall a call that was issued.",
                 tokens,
             ));
             body.into_any_element()
@@ -395,12 +478,13 @@ impl Render for HistoryScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let mono: SharedString = cx.theme().mono_font_family.clone();
+        let entity: Entity<AppModel> = self.model.clone();
         let model: &AppModel = self.model.read(cx);
         let now: SystemTime = SystemTime::now();
         let history = shown(&model.history_records, now, |history| history.captured_at);
         let cards: Vec<(CardWidth, AnyElement)> = vec![(
             CardWidth::Full,
-            operations_card(&history, now, &mono, tokens),
+            operations_card(&history, &entity, model, now, &mono, tokens),
         )];
         screen("History", cards, self.activation, cx.reduce_motion())
     }

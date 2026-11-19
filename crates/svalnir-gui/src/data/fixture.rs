@@ -14,6 +14,10 @@ use super::{
         AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
     },
 };
+use crate::actions::{
+    ActionPort,
+    fixture::{ActionScript, FixturePort},
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -107,6 +111,8 @@ pub struct FixtureSource {
     base: Arc<OnceLock<SystemTime>>,
     /// The number of scans that started, for the changed sizes of a later scan.
     scans: Arc<AtomicUsize>,
+    /// The answer of each state-changing action.
+    actions: ActionScript,
 }
 
 /// The time between two readings of the `drift` sequence.
@@ -175,7 +181,16 @@ impl FixtureSource {
             step: Arc::new(AtomicUsize::new(0)),
             base: Arc::new(OnceLock::new()),
             scans: Arc::new(AtomicUsize::new(0)),
+            actions: ActionScript::of(scenario),
         }
+    }
+
+    /// Sets the answer of each state-changing action. Without it, the
+    /// scenario gives the answer ([`ActionScript::of`]).
+    #[must_use]
+    pub const fn with_actions(mut self, script: ActionScript) -> Self {
+        self.actions = script;
+        self
     }
 
     /// The origin of the `drift` times: the span of the seeded readings
@@ -510,6 +525,10 @@ impl DataSource for FixtureSource {
 
     fn fixture_name(&self) -> Option<&'static str> {
         Some(self.scenario.name())
+    }
+
+    fn actions(&self) -> Arc<dyn ActionPort> {
+        Arc::new(FixturePort::new(self.scenario, self.actions))
     }
 }
 

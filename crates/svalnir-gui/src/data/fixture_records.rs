@@ -8,16 +8,16 @@ use super::{
     records::{
         AgentStatusRow, ApplicationRow, AutomationSnapshot, CapabilityLevel, CapabilityRow,
         DiagnosticsSnapshot, EffectRow, Foreground, GrantRow, GroupKind, GuardDetail,
-        HistorySnapshot, JournalRow, MemorySnapshot, Need, OperationDetail, PauseRow, ProcessRow,
-        ProcessesSnapshot, Protection, RevisionRow, StartFailureRow, Verdict, rank_applications,
-        rank_processes,
+        HistorySnapshot, IncidentRow, JournalRow, MemorySnapshot, Need, OperationDetail, PauseRow,
+        ProcessRow, ProcessesSnapshot, Protection, RevisionRow, StartFailureRow, Verdict,
+        rank_applications, rank_processes,
     },
 };
 use std::{
     path::PathBuf,
     time::{Duration, SystemTime},
 };
-use svalnir_core::{grant::GuardStanding, policy::PolicyId};
+use svalnir_core::{action::ActionClass, grant::GuardStanding, policy::PolicyId};
 
 const MB: u64 = 1_000_000;
 const GB: u64 = 1_000_000_000;
@@ -222,7 +222,7 @@ fn standing(scenario: FixtureScenario, policy: PolicyId) -> GuardStanding {
             if policy == PolicyId::DiskGuard {
                 GuardStanding::Active
             } else {
-                GuardStanding::NoGrant
+                GuardStanding::Disabled
             }
         }
         FixtureScenario::Pressure => GuardStanding::Active,
@@ -271,7 +271,30 @@ pub(super) fn automation(scenario: FixtureScenario) -> AutomationSnapshot {
                 let row: GuardRow = GuardRow::new(policy.as_str(), standing);
                 let granted: bool = standing == GuardStanding::Active;
                 GuardDetail {
+                    policy: *policy,
                     name: row.name,
+                    scope_classes: if !present {
+                        Vec::new()
+                    } else if *policy == PolicyId::DiskGuard {
+                        vec![ActionClass::EvictRegenerableData]
+                    } else {
+                        vec![
+                            ActionClass::RequestApplicationExit,
+                            ActionClass::ForceApplicationExit,
+                        ]
+                    },
+                    // Under memory pressure the memory guard has an open
+                    // incident.
+                    incidents: if scenario == FixtureScenario::Pressure
+                        && *policy == PolicyId::MemoryGuard
+                    {
+                        vec![IncidentRow {
+                            id: "inc-fixture-memory-1".to_owned(),
+                            generation: 2,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
                     standing: row.standing,
                     detail: row.detail,
                     enabled: granted || standing == GuardStanding::NoGrant,

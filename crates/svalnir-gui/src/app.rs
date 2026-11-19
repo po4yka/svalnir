@@ -1,6 +1,7 @@
 //! Application bootstrap: gpui-kit, fonts, theme, key bindings, main window.
 
 use crate::{
+    actions::fixture::ActionScript,
     data::{
         DataSource,
         fixture::{FixtureScenario, FixtureSource},
@@ -50,6 +51,10 @@ Options:
   --focus CHART        Give a chart keyboard focus at launch and pick its
                        first mark, so its card shows without a pointer
                        (dial, session, volume, folders)
+  --actions NAME       With --fixture only: the answer of each action
+                       (accept, refuse, unavailable, pending). The fixture
+                       writes nothing
+  --no-notifications   Post no system notification
   --help               Print this text
 ";
 
@@ -75,6 +80,10 @@ impl ForcedAppearance {
 
 /// The options of one launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent flag for each launch option"
+)]
 pub struct LaunchOptions {
     /// The fixture scenario; `None` selects the live source.
     pub fixture: Option<FixtureScenario>,
@@ -98,6 +107,11 @@ pub struct LaunchOptions {
     pub sidebar_narrow: Option<bool>,
     /// The chart that has keyboard focus at launch.
     pub focus: Option<FocusTarget>,
+    /// The answer of each action of a fixture; `None` is the answer of
+    /// the scenario.
+    pub actions: Option<ActionScript>,
+    /// Whether system notifications are off.
+    pub no_notifications: bool,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -220,6 +234,15 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                     format!("unknown chart `{name}`; use dial, session, volume, or folders")
                 })?);
             }
+            "--actions" => {
+                let name: String = args
+                    .next()
+                    .ok_or_else(|| "`--actions` needs a name".to_owned())?;
+                options.actions = Some(ActionScript::from_name(&name).ok_or_else(|| {
+                    format!("unknown actions `{name}`; use accept, refuse, unavailable, or pending")
+                })?);
+            }
+            "--no-notifications" => options.no_notifications = true,
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -229,6 +252,9 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
     }
     if options.rescan && options.scan.is_none() {
         return Err("`--rescan` is valid only with `--scan`".to_owned());
+    }
+    if options.actions.is_some() && options.fixture.is_none() {
+        return Err("`--actions` is valid only with `--fixture`".to_owned());
     }
     Ok(options)
 }
@@ -303,7 +329,12 @@ pub fn run() -> ExitCode {
             FixtureSource::new(scenario)
                 .with_pacing(std::time::Duration::from_millis(120))
                 .with_seeded_readings(options.readings.unwrap_or(0))
-                .with_local_time(),
+                .with_local_time()
+                .with_actions(
+                    options
+                        .actions
+                        .unwrap_or_else(|| ActionScript::of(scenario)),
+                ),
         ),
         None => Arc::new(LiveSource::from_environment()),
     };
@@ -407,6 +438,9 @@ mod tests {
             "ring",
             "--focus",
             "dial",
+            "--actions",
+            "refuse",
+            "--no-notifications",
             "--help",
         ]);
         assert_eq!(
@@ -423,6 +457,8 @@ mod tests {
                 readings: Some(40),
                 sidebar_narrow: Some(true),
                 focus: Some(FocusTarget::Dial),
+                actions: Some(ActionScript::Refuse),
+                no_notifications: true,
                 help: true,
             })
         );
@@ -446,6 +482,8 @@ mod tests {
             Ok(Some(false))
         );
         assert!(parse(&["--rescan"]).is_err(), "needs a scan");
+        assert!(parse(&["--actions", "accept"]).is_err(), "needs a fixture");
+        assert!(parse(&["--fixture", "healthy", "--actions", "maybe"]).is_err());
         assert!(parse(&["--rescan", "--scan", "/tmp/a"]).is_ok());
         assert!(parse(&["--size", "100x100"]).is_err());
         assert!(parse(&["--size", "wide"]).is_err());

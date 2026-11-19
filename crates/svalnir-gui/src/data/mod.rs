@@ -3,11 +3,15 @@
 pub mod fixture;
 mod fixture_records;
 pub mod live;
-mod live_records;
+pub(crate) mod live_records;
 pub mod model;
 pub mod records;
 pub mod store;
 
+use crate::actions::{
+    ActionPort,
+    fixture::{ActionScript, FixturePort},
+};
 use model::{AgentSnapshot, HostSnapshot, ScanProgress, ScanSummary, ServiceSnapshot};
 use records::{
     AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
@@ -15,6 +19,7 @@ use records::{
 use std::{
     fmt::Debug,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use svalnir_agent::scan::CancellationToken;
 
@@ -83,5 +88,14 @@ pub trait DataSource: Send + Sync + Debug {
     /// The name of the fixture scenario, when the source is a fixture.
     fn fixture_name(&self) -> Option<&'static str> {
         None
+    }
+
+    /// The path of the state-changing actions for this source. The default
+    /// path changes nothing and gives "no agent" for each action.
+    fn actions(&self) -> Arc<dyn ActionPort> {
+        Arc::new(FixturePort::new(
+            fixture::FixtureScenario::Healthy,
+            ActionScript::Unavailable,
+        ))
     }
 }

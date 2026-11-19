@@ -7,9 +7,9 @@ use super::{
     records::{
         AgentStatusRow, ApplicationRow, AutomationSnapshot, CapabilityLevel, CapabilityRow,
         DiagnosticsSnapshot, EffectRow, Foreground, GrantRow, GroupKind, GuardDetail,
-        HISTORY_ROWS_MAX, HistorySnapshot, JournalRow, MemorySnapshot, Need, OperationDetail,
-        PauseRow, ProcessRow, ProcessesSnapshot, Protection, RevisionRow, StartFailureRow, Verdict,
-        rank_applications, rank_processes, refine_phase,
+        HISTORY_ROWS_MAX, HistorySnapshot, IncidentRow, JournalRow, MemorySnapshot, Need,
+        OperationDetail, PauseRow, ProcessRow, ProcessesSnapshot, Protection, RevisionRow,
+        StartFailureRow, Verdict, rank_applications, rank_processes, refine_phase,
     },
 };
 use std::{
@@ -44,7 +44,7 @@ use svalnir_core::{
 /// The label of the live source.
 const SOURCE: &str = "in-process collection";
 
-pub(super) fn system_time(time: WallTime) -> SystemTime {
+pub(crate) fn system_time(time: WallTime) -> SystemTime {
     let seconds: i64 = time.unix_seconds();
     let nanos: Duration = Duration::from_nanos(u64::from(time.subsecond_nanoseconds()));
     if seconds >= 0 {
@@ -248,6 +248,12 @@ fn process_rows(snapshot: &ProcessSnapshot) -> ProcessesSnapshot {
 
 /// Reads the processes of the current user.
 pub(super) fn processes(host: &Host) -> Result<ProcessesSnapshot, String> {
+    collect_processes(host).map(|snapshot| process_rows(&snapshot))
+}
+
+/// Reads the process snapshot of the current user, for the rows of a
+/// screen and for the plan of a stop.
+pub(crate) fn collect_processes(host: &Host) -> Result<ProcessSnapshot, String> {
     let identity = host.context().identity();
     let collector = ProcessCollector::new(
         DarwinProcessSource::new(),
@@ -258,8 +264,7 @@ pub(super) fn processes(host: &Host) -> Result<ProcessesSnapshot, String> {
         },
     )
     .map_err(|error| error.to_string())?;
-    let snapshot: ProcessSnapshot = collector.collect().map_err(|error| error.to_string())?;
-    Ok(process_rows(&snapshot))
+    collector.collect().map_err(|error| error.to_string())
 }
 
 /// Opens the journal of `state_directory` for reading. `Ok(None)`: no
@@ -273,7 +278,37 @@ fn open_journal(state_directory: Option<&Path>) -> Result<Option<OperationJourna
     }
 }
 
-fn guard_details(state: &AuthorityState, now: WallTime) -> Vec<GuardDetail> {
+/// The open incidents of each guard in the status record of the agent. A
+/// record that cannot be read gives none: a rearm then has no incident to
+/// name.
+fn open_incidents(journal: &OperationJournal) -> Vec<(PolicyId, IncidentRow)> {
+    let Ok(Some(stored)) = journal.agent_record::<AgentStatus>(AgentRecord::Status) else {
+        return Vec::new();
+    };
+    stored
+        .record
+        .controller
+        .iter()
+        .flat_map(|controller| controller.guards.iter())
+        .flat_map(|guard| {
+            guard.incidents.iter().map(|incident| {
+                (
+                    guard.guard.policy(),
+                    IncidentRow {
+                        id: incident.incident_id.to_string(),
+                        generation: incident.generation,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn guard_details(
+    state: &AuthorityState,
+    now: WallTime,
+    incidents: &[(PolicyId, IncidentRow)],
+) -> Vec<GuardDetail> {
     observe::guard_standings(state, now)
         .into_iter()
         .map(|(policy, standing)| {
@@ -291,7 +326,14 @@ fn guard_details(state: &AuthorityState, now: WallTime) -> Vec<GuardDetail> {
                 _ => (None, [].as_slice()),
             };
             GuardDetail {
+                policy,
                 name: row.name,
+                scope_classes: scope.map_or_else(Vec::new, |scope| scope.action_classes(policy)),
+                incidents: incidents
+                    .iter()
+                    .filter(|(owner, _)| *owner == policy)
+                    .map(|(_, incident)| incident.clone())
+                    .collect(),
                 standing: row.standing,
                 detail: row.detail,
                 enabled: authority.is_some_and(|guard| guard.enabled),
@@ -345,7 +387,7 @@ pub(super) fn automation(state_directory: Option<&Path>) -> AutomationSnapshot {
     let journal = match open_journal(state_directory) {
         Ok(Some(journal)) => journal,
         Ok(None) => {
-            snapshot.guards = guard_details(&AuthorityState::new(uid), now);
+            snapshot.guards = guard_details(&AuthorityState::new(uid), now, &[]);
             snapshot.pause = Some(PauseRow::NotPaused);
             return snapshot;
         }
@@ -364,7 +406,7 @@ pub(super) fn automation(state_directory: Option<&Path>) -> AutomationSnapshot {
                 activated_at: system_time(active.revision.activated_at),
                 profile: active.scope.profile.clone(),
             });
-            snapshot.guards = guard_details(state, now);
+            snapshot.guards = guard_details(state, now, &open_incidents(&journal));
             snapshot.pause = Some(state.pause.as_ref().map_or(PauseRow::NotPaused, |pause| {
                 PauseRow::Paused {
                     since: system_time(pause.started_wall),

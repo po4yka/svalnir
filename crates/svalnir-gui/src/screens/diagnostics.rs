@@ -492,7 +492,7 @@ fn journal_card(
             body = body.children(problem_lines("diagnostics", &value.problems, tokens));
             body = body.child(caption(
                 "diagnostics-read-only-note",
-                "This window opens the journal for reading only. It makes no file and does not read the coordinator lock.",
+                "The reads of the window open the journal for reading only and make no file. Only an action that you start on the Automation, History, or Applications screen writes to the journal, and it first reads the coordinator lock to find the agent.",
                 tokens,
             ));
             body.into_any_element()

@@ -1,18 +1,22 @@
 //! The Applications screen: the application and job groups with their
-//! verified members, their footprint, and their hard protection. The screen
-//! shows state only; it has no control that stops an application.
+//! verified members, their footprint, and their hard protection. A group
+//! that the catalog does not protect has a stop control with a
+//! confirmation that shows the processes of the plan (`crate::actions`).
 
 use super::common::{
     CardWidth, Shown, body_line, bytes_text, caption, card, cell, fact, failed_body, head,
     mono_text, screen, shown, skeleton_rows, stale_line,
 };
+use super::controls::{open_stop, slot_status};
 use crate::{
+    actions::Slot,
     data::{
         model::Measured,
         records::{ApplicationRow, Foreground, ProcessesSnapshot, Protection},
         store::AppModel,
     },
     theme::tokens::{self, Tokens},
+    ui::action_button::{ActionButton, ButtonVariant},
     ui::{
         pill::{MonoTag, StatusPill, Tone},
         provenance::ProvenanceLine,
@@ -120,8 +124,61 @@ impl ApplicationsScreen {
     }
 }
 
+/// Whether the stop control is offered for a group. A protected group and
+/// a group whose protection is not known have no stop control; the plan
+/// builder and the coordinator refuse them as well.
+#[must_use]
+pub const fn stop_offered(protection: Protection) -> bool {
+    matches!(protection, Protection::NotProtected)
+}
+
+/// The stop cell of a row: the stop control and the state of its last
+/// stop.
+fn stop_cell(
+    row: &ApplicationRow,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+    tokens: &Tokens,
+) -> AnyElement {
+    let slot = Slot::Stop(row.instance.clone());
+    let busy: bool = model.actions.is_busy(&slot);
+    let mut column = v_flex().gap(tokens::SPACE_1).items_start();
+    if stop_offered(row.protection) {
+        let opener: Entity<AppModel> = entity.clone();
+        let (instance, name) = (row.instance.clone(), row.name.clone());
+        column = column.child(
+            ActionButton::new(
+                SharedString::from(format!("applications-stop-{}", row.instance)),
+                "Stop…",
+            )
+            .variant(ButtonVariant::Quiet)
+            .loading(busy)
+            .on_click(move |_, window, cx| {
+                open_stop(&opener, &instance, &name, window, cx);
+            }),
+        );
+    } else {
+        column = column.child(caption(
+            SharedString::from(format!("applications-stop-none-{}", row.instance)),
+            "No stop",
+            tokens,
+        ));
+    }
+    column
+        .children(slot_status(
+            SharedString::from(format!("applications-stop-state-{}", row.instance)),
+            model,
+            &slot,
+            SystemTime::now(),
+            tokens,
+        ))
+        .into_any_element()
+}
+
 fn group_table(
     snapshot: &ProcessesSnapshot,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
     stale: bool,
     mono: &SharedString,
     tokens: &Tokens,
@@ -173,6 +230,7 @@ fn group_table(
                 2,
                 false,
             ))
+            .child(cell(stop_cell(row, entity, model, tokens), 2, false))
     });
     Table::new()
         .small()
@@ -185,7 +243,8 @@ fn group_table(
                     .child(head("Processes", 1, true, tokens))
                     .child(head("Footprint", 2, true, tokens))
                     .child(head("Foreground", 2, false, tokens))
-                    .child(head("Hard protection", 2, false, tokens)),
+                    .child(head("Hard protection", 2, false, tokens))
+                    .child(head("Stop", 2, false, tokens)),
             ),
         )
         .child(TableBody::new().children(rows))
@@ -194,6 +253,8 @@ fn group_table(
 
 fn groups_card(
     processes: &Shown<ProcessesSnapshot>,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
     mono: &SharedString,
     tokens: &Tokens,
 ) -> AnyElement {
@@ -212,7 +273,14 @@ fn groups_card(
                     tokens,
                 ));
             } else {
-                body = body.child(group_table(value, stale_age.is_some(), mono, tokens));
+                body = body.child(group_table(
+                    value,
+                    entity,
+                    model,
+                    stale_age.is_some(),
+                    mono,
+                    tokens,
+                ));
             }
             body = body.child(caption(
                 "applications-summary",
@@ -296,8 +364,8 @@ fn control_card(tokens: &Tokens) -> AnyElement {
             "\"Unknown\" means that the lookup gave no result. Automation skips such a group.",
         ),
         (
-            "applications-read-only-note",
-            "This window sends no request, so it has no control that stops an application. Use the command `svalnir processes stop`.",
+            "applications-stop-note",
+            "Stop makes a quit plan and a force-quit plan for the verified members of the group and shows the processes that they bind. The agent admits the plan that you confirm; with no agent, nothing is sent. A stop is done only when the agent confirms the exit.",
         ),
         (
             "applications-restart-note",
@@ -315,12 +383,16 @@ impl Render for ApplicationsScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let mono: SharedString = cx.theme().mono_font_family.clone();
+        let entity: Entity<AppModel> = self.model.clone();
         let model: &AppModel = self.model.read(cx);
         let processes = shown(&model.processes, SystemTime::now(), |processes| {
             processes.captured_at
         });
         let cards: Vec<(CardWidth, AnyElement)> = vec![
-            (CardWidth::Full, groups_card(&processes, &mono, tokens)),
+            (
+                CardWidth::Full,
+                groups_card(&processes, &entity, model, &mono, tokens),
+            ),
             (
                 CardWidth::Share,
                 attribution_card(&processes, &mono, tokens),

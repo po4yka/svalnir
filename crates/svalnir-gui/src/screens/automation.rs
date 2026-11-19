@@ -1,19 +1,23 @@
 //! The Automation screen: the revision in effect, the recorded pause, and
-//! each guard with its standing, its grant, and its thresholds. The screen
-//! shows state only; it has no control that changes a policy.
+//! each guard with its standing, its grant, and its thresholds. The pause
+//! control, the enable and disable of a guard, and the rearm of an open
+//! incident send their change to the agent (`crate::actions`).
 
 use super::common::{
     CardWidth, Shown, ago, body_line, caption, card, fact, failed_body, inset, problem_lines,
     screen, shown, skeleton_rows, stale_line, until,
 };
+use super::controls::{action_button, open_enable, open_rearm, slot_status};
 use crate::{
+    actions::{Action, Slot},
     data::{
         model::GuardState,
-        records::{AutomationSnapshot, GrantRow, GuardDetail, PauseRow},
+        records::{AutomationSnapshot, GrantRow, GuardDetail, IncidentRow, PauseRow, RevisionRow},
         store::AppModel,
     },
     theme::tokens::{self, Tokens},
     ui::{
+        action_button::{ActionButton, ButtonVariant},
         pill::{MonoTag, StatusPill, Tone},
         surface::ShellHeader,
     },
@@ -141,8 +145,58 @@ impl AutomationScreen {
     }
 }
 
+/// The pause control: a resume while a pause is recorded, else a timed and
+/// an open pause. With no authority record read, the control is absent.
+fn pause_controls(
+    pause: Option<&PauseRow>,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+) -> Option<AnyElement> {
+    let busy: bool = model.actions.is_busy(&Slot::Pause);
+    let row = h_flex().gap(tokens::SPACE_2);
+    match pause? {
+        PauseRow::Paused { .. } => Some(
+            row.child(action_button(
+                "automation-resume",
+                "Resume automation",
+                ButtonVariant::Secondary,
+                entity,
+                Action::Resume,
+                busy,
+            ))
+            .into_any_element(),
+        ),
+        PauseRow::NotPaused => Some(
+            row.child(action_button(
+                "automation-pause-hour",
+                "Pause automation for 1 hour",
+                ButtonVariant::Secondary,
+                entity,
+                Action::Pause {
+                    duration: Some(PAUSE_HOUR),
+                },
+                busy,
+            ))
+            .child(action_button(
+                "automation-pause-open",
+                "Pause until resumed",
+                ButtonVariant::Quiet,
+                entity,
+                Action::Pause { duration: None },
+                busy,
+            ))
+            .into_any_element(),
+        ),
+    }
+}
+
+/// The length of the timed pause.
+const PAUSE_HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
 fn state_card(
     automation: &Shown<AutomationSnapshot>,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
     now: SystemTime,
     mono: &SharedString,
     tokens: &Tokens,
@@ -158,6 +212,15 @@ fn state_card(
             header = header.aside(StatusPill::new(text, tone).id("automation-pause-pill"));
             let mut body = v_flex().gap(tokens::SPACE_2);
             body = body.child(body_line("automation-pause", sentence, stale, tokens));
+            body = body
+                .children(pause_controls(value.pause.as_ref(), entity, model))
+                .children(slot_status(
+                    "automation-pause-state",
+                    model,
+                    &Slot::Pause,
+                    now,
+                    tokens,
+                ));
             if let Some(revision) = &value.revision {
                 body = body
                     .child(fact(
@@ -200,8 +263,8 @@ fn state_card(
                 body = body.child(stale_line("automation-stale", age, tokens));
             }
             body = body.child(caption(
-                "automation-read-only-note",
-                "This window sends no request, so it has no control that changes a policy or the pause. Use the commands `svalnir policy` and `svalnir agent`.",
+                "automation-control-note",
+                "A change goes to the agent through the operation journal. With no agent, the window refuses the change and writes nothing. A pause stops new automatic interventions; it does not stop an admitted operation.",
                 tokens,
             ));
             body.into_any_element()
@@ -282,8 +345,122 @@ fn grant_block(
     inset(block, tokens)
 }
 
+/// The enable or disable control of a guard. An enable needs a revision in
+/// effect that gives the guard action classes.
+fn guard_controls(
+    guard: &GuardDetail,
+    revision: Option<&RevisionRow>,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+    tokens: &Tokens,
+) -> AnyElement {
+    let name: &str = guard.name;
+    let policy = guard.policy;
+    let busy: bool = model.actions.is_busy(&Slot::Guard(policy));
+    let mut column = v_flex().gap(tokens::SPACE_2);
+    if guard.enabled {
+        column = column.child(h_flex().child(action_button(
+            SharedString::from(format!("automation-disable-{name}")),
+            "Disable",
+            ButtonVariant::Secondary,
+            entity,
+            Action::Disable { policy },
+            busy,
+        )));
+    } else if let Some(revision) = revision.filter(|_| !guard.scope_classes.is_empty()) {
+        let entity: Entity<AppModel> = entity.clone();
+        let revision: String = revision.id.clone();
+        let classes = guard.scope_classes.clone();
+        column = column.child(
+            h_flex().child(
+                ActionButton::new(
+                    SharedString::from(format!("automation-enable-{name}")),
+                    "Enable…",
+                )
+                .variant(ButtonVariant::Secondary)
+                .loading(busy)
+                .on_click(move |_, window, cx| {
+                    open_enable(
+                        &entity,
+                        policy,
+                        revision.clone(),
+                        classes.clone(),
+                        window,
+                        cx,
+                    );
+                }),
+            ),
+        );
+    } else {
+        column = column.child(caption(
+            SharedString::from(format!("automation-enable-note-{name}")),
+            "The revision in effect gives this guard no action class, so it cannot be enabled. Activate a configuration that requests it.",
+            tokens,
+        ));
+    }
+    column
+        .children(slot_status(
+            SharedString::from(format!("automation-guard-state-{name}")),
+            model,
+            &Slot::Guard(policy),
+            SystemTime::now(),
+            tokens,
+        ))
+        .into_any_element()
+}
+
+/// One open incident with its rearm control.
+fn incident_row(
+    guard: &GuardDetail,
+    incident: &IncidentRow,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let slot = Slot::Incident(incident.id.clone());
+    let busy: bool = model.actions.is_busy(&slot);
+    let (policy, id, generation) = (guard.policy, incident.id.clone(), incident.generation);
+    let opener: Entity<AppModel> = entity.clone();
+    let rearm = ActionButton::new(
+        SharedString::from(format!("automation-rearm-{id}")),
+        "Rearm…",
+    )
+    .variant(ButtonVariant::Quiet)
+    .loading(busy)
+    .on_click(move |_, window, cx| {
+        open_rearm(&opener, policy, id.clone(), generation, window, cx);
+    });
+    let block = v_flex()
+        .gap(tokens::SPACE_1)
+        .child(fact(
+            SharedString::from(format!("automation-incident-{}", incident.id)),
+            "Open incident",
+            format!("{} · generation {}", incident.id, incident.generation),
+            mono,
+            false,
+            tokens,
+        ))
+        .child(h_flex().child(rearm))
+        .children(slot_status(
+            SharedString::from(format!("automation-incident-state-{}", incident.id)),
+            model,
+            &slot,
+            SystemTime::now(),
+            tokens,
+        ));
+    inset(block, tokens)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a card builder takes the guard, its context, and the theme values"
+)]
 fn guard_card(
     guard: &GuardDetail,
+    revision: Option<&RevisionRow>,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
     now: SystemTime,
     stale: bool,
     mono: &SharedString,
@@ -316,7 +493,11 @@ fn guard_card(
             mono,
             stale,
             tokens,
-        ));
+        ))
+        .child(guard_controls(guard, revision, entity, model, tokens));
+    for incident in &guard.incidents {
+        body = body.child(incident_row(guard, incident, entity, model, mono, tokens));
+    }
     body = match &guard.grant {
         Some(grant) => body.child(grant_block(guard, grant, now, stale, mono, tokens)),
         None => body.child(caption(
@@ -350,16 +531,28 @@ impl Render for AutomationScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let mono: SharedString = cx.theme().mono_font_family.clone();
+        let entity: Entity<AppModel> = self.model.clone();
         let model: &AppModel = self.model.read(cx);
         let now: SystemTime = SystemTime::now();
         let automation = shown(&model.automation, now, |automation| automation.captured_at);
-        let mut cards: Vec<(CardWidth, AnyElement)> =
-            vec![(CardWidth::Full, state_card(&automation, now, &mono, tokens))];
+        let mut cards: Vec<(CardWidth, AnyElement)> = vec![(
+            CardWidth::Full,
+            state_card(&automation, &entity, model, now, &mono, tokens),
+        )];
         if let Shown::Data { value, stale_age } = &automation {
             for guard in &value.guards {
                 cards.push((
                     CardWidth::Share,
-                    guard_card(guard, now, stale_age.is_some(), &mono, tokens),
+                    guard_card(
+                        guard,
+                        value.revision.as_ref(),
+                        &entity,
+                        model,
+                        now,
+                        stale_age.is_some(),
+                        &mono,
+                        tokens,
+                    ),
                 ));
             }
         }

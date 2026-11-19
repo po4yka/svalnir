@@ -310,6 +310,12 @@ impl DataSource for LiveSource {
     fn label(&self) -> &'static str {
         "in-process collection"
     }
+
+    fn actions(&self) -> std::sync::Arc<dyn crate::actions::ActionPort> {
+        std::sync::Arc::new(crate::actions::live::LivePort::new(
+            self.state_directory.clone(),
+        ))
+    }
 }
 
 /// The shortest interval between two progress calls.

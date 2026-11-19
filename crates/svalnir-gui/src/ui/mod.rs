@@ -1,6 +1,7 @@
 //! Shared presentation building blocks.
 
 pub mod action_button;
+pub mod action_status;
 pub mod chart_tip;
 pub mod data_state;
 pub mod entry;

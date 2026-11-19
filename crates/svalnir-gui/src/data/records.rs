@@ -7,6 +7,7 @@
 
 use super::model::{GuardState, Measured, OperationPhase};
 use std::{path::PathBuf, time::SystemTime};
+use svalnir_core::{action::ActionClass, policy::PolicyId};
 
 /// The most process rows that a snapshot keeps.
 pub const PROCESS_ROWS_MAX: usize = 40;
@@ -185,11 +186,28 @@ pub struct GrantRow {
     pub in_effect: bool,
 }
 
+/// One open incident of a guard, from the status record of the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncidentRow {
+    /// The incident identity.
+    pub id: String,
+    /// The budget generation of the incident.
+    pub generation: u64,
+}
+
 /// One guard with its standing, its grant, and its thresholds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardDetail {
+    /// The guard.
+    pub policy: PolicyId,
     /// The policy name.
     pub name: &'static str,
+    /// The action classes that the revision in effect gives the guard. An
+    /// enable accepts exactly these classes.
+    pub scope_classes: Vec<ActionClass>,
+    /// The open incidents that the last status record of the agent has.
+    /// Empty when the record has none or was not read.
+    pub incidents: Vec<IncidentRow>,
     /// Whether the guard can act.
     pub standing: GuardState,
     /// One sentence that says why.

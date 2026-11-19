@@ -11,6 +11,7 @@ use super::{
         ProcessesSnapshot,
     },
 };
+use crate::actions::{Action, ActionBook, ActionPort, ActionState, Proposal, Slot};
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
     path::{Path, PathBuf},
@@ -218,6 +219,11 @@ pub struct AppModel {
     pub diagnostics: Loadable<DiagnosticsSnapshot>,
     /// The topics that the screen in front shows.
     topics: Vec<Topic>,
+    /// The path of the state-changing actions.
+    port: Arc<dyn ActionPort>,
+    /// The state of each control after its last action, and the stop plans
+    /// of the open dialog.
+    pub actions: ActionBook,
     /// The state of the scan of the Storage screen.
     pub scan: ScanState,
     /// A refusal that does not replace a finished result.
@@ -263,6 +269,7 @@ impl AppModel {
                     .update(cx, |model, cx| {
                         model.mark_stale();
                         model.refresh_kinds(true, false, cx);
+                        model.read_waiting_stops(cx);
                         cx.notify();
                     })
                     .is_ok();
@@ -274,6 +281,8 @@ impl AppModel {
         let mut model = Self {
             source_label: source.label(),
             fixture_name: source.fixture_name(),
+            port: source.actions(),
+            actions: ActionBook::default(),
             source,
             host: Loadable::Loading,
             history: std::collections::VecDeque::new(),
@@ -502,6 +511,109 @@ impl AppModel {
     /// kind that is in flight is dropped.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.refresh_kinds(true, true, cx);
+        self.read_waiting_stops(cx);
+    }
+
+    /// Sends `action` on a background thread and records its state. A
+    /// control that waits for an answer takes no second request. After the
+    /// answer, the model reads the topics again.
+    pub fn run_action(&mut self, action: Action, cx: &mut Context<Self>) {
+        let slot: Slot = action.slot();
+        if self.actions.is_busy(&slot) {
+            return;
+        }
+        if matches!(action, Action::Stop { .. }) {
+            self.actions.stop = None;
+        }
+        self.actions.set(slot.clone(), ActionState::Pending);
+        cx.notify();
+        let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let state: ActionState = cx
+                .background_spawn(async move { port.submit(&action) })
+                .await;
+            if this
+                .update(cx, |model, cx| {
+                    model.actions.set(slot, state);
+                    model.refresh_kinds(false, false, cx);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                tracing::debug!("the model closed before the action finished");
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the stop dialog of the group `instance` and makes its plans on
+    /// a background thread. Nothing is recorded until a confirmation.
+    pub fn prepare_stop(&mut self, instance: &str, name: &str, cx: &mut Context<Self>) {
+        self.actions.stop = Some((instance.to_owned(), Proposal::Preparing));
+        cx.notify();
+        let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
+        let (instance, name): (String, String) = (instance.to_owned(), name.to_owned());
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let key: String = instance.clone();
+            let result = cx
+                .background_spawn(async move { port.prepare_stop(&instance, &name) })
+                .await;
+            if this
+                .update(cx, |model, cx| {
+                    // A dialog that closed or changed keeps no late result.
+                    if model
+                        .actions
+                        .stop
+                        .as_ref()
+                        .is_some_and(|(open, _)| *open == key)
+                    {
+                        model.actions.stop = Some((
+                            key,
+                            match result {
+                                Ok(proposal) => Proposal::Ready(Arc::new(proposal)),
+                                Err(state) => Proposal::Failed(state),
+                            },
+                        ));
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                tracing::debug!("the model closed before the plans were made");
+            }
+        })
+        .detach();
+    }
+
+    /// Closes the stop dialog. Its plans are not recorded.
+    pub fn close_stop(&mut self, cx: &mut Context<Self>) {
+        self.actions.stop = None;
+        cx.notify();
+    }
+
+    /// Reads the operation of each stop that waits for the exit, and records
+    /// a final phase.
+    fn read_waiting_stops(&mut self, cx: &mut Context<Self>) {
+        for (slot, operation) in self.actions.waiting() {
+            let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let id: String = operation.clone();
+                let phase = cx
+                    .background_spawn(async move { port.operation_phase(&id) })
+                    .await;
+                if let Some(phase) = phase
+                    && this
+                        .update(cx, |model, cx| {
+                            model.actions.settle(&slot, &operation, phase);
+                            cx.notify();
+                        })
+                        .is_err()
+                {
+                    tracing::debug!("the model closed before the read finished");
+                }
+            })
+            .detach();
+        }
     }
 
     /// Sets the topics that the screen in front shows and reads them now.

@@ -3,10 +3,10 @@
 
 use crate::theme::tokens::{self, Tokens, hex_alpha, to_hsla};
 use gpui_kit::{
-    App, BoxShadow, ClickEvent, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, RenderOnce, Role, SharedString,
+    AnyElement, App, BoxShadow, ClickEvent, ElementId, FocusHandle, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
-    component::{ActiveTheme as _, Icon, IconName, h_flex},
+    component::{ActiveTheme as _, Icon, IconName, h_flex, spinner::Spinner},
     div, linear_color_stop, linear_gradient, point, px,
 };
 use std::rc::Rc;
@@ -20,6 +20,9 @@ pub enum ButtonVariant {
     Secondary,
     /// No fill; a 6% fill on hover.
     Quiet,
+    /// A `negative` fill with light text, for an action that ends
+    /// processes or removes data. It is never the default button.
+    Danger,
 }
 
 /// The height of a button.
@@ -53,6 +56,7 @@ pub struct ActionButton {
     size: ButtonSize,
     icon: Option<IconName>,
     disabled: bool,
+    loading: bool,
     on_click: Option<ClickHandler>,
 }
 
@@ -75,8 +79,18 @@ impl ActionButton {
             size: ButtonSize::Sm,
             icon: None,
             disabled: false,
+            loading: false,
             on_click: None,
         }
+    }
+
+    /// Shows a spinner in place of the icon and disables the button, while
+    /// the request of the button waits for an answer. With Reduce Motion
+    /// on, the spinner is a still loader glyph.
+    #[must_use]
+    pub const fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
     }
 
     /// Sets the variant.
@@ -123,6 +137,42 @@ fn darken(color: Hsla, amount: f32) -> Hsla {
     }
 }
 
+/// The colors of a variant: the top and the bottom of the fill, the text,
+/// and the edge.
+struct Colors {
+    top: Hsla,
+    bottom: Hsla,
+    text: Hsla,
+    edge: Hsla,
+}
+
+fn colors(variant: ButtonVariant, tokens: &Tokens, dark: bool) -> Colors {
+    let (top, bottom): (Hsla, Hsla) = match variant {
+        ButtonVariant::Primary => (to_hsla(tokens.primary_bottom), to_hsla(tokens.primary_top)),
+        ButtonVariant::Danger => (to_hsla(tokens.negative), to_hsla(tokens.negative)),
+        ButtonVariant::Secondary | ButtonVariant::Quiet => (
+            to_hsla(tokens.secondary_bottom),
+            to_hsla(tokens.secondary_top),
+        ),
+    };
+    let text: Hsla = match variant {
+        ButtonVariant::Primary => to_hsla(tokens.primary_text),
+        ButtonVariant::Danger => to_hsla(hex_alpha(0xff_ffff, 1.0)),
+        ButtonVariant::Secondary | ButtonVariant::Quiet => to_hsla(tokens.foreground),
+    };
+    let edge: Hsla = match variant {
+        ButtonVariant::Primary if dark => to_hsla(hex_alpha(0xff_ffff, 0.5)),
+        ButtonVariant::Primary => to_hsla(hex_alpha(0x00_0000, 0.1)),
+        _ => Hsla::transparent_black(),
+    };
+    Colors {
+        top,
+        bottom,
+        text,
+        edge,
+    }
+}
+
 impl RenderOnce for ActionButton {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let dark: bool = cx.theme().is_dark();
@@ -135,22 +185,12 @@ impl RenderOnce for ActionButton {
             )
             .read(cx)
             .clone();
-        let (top, bottom): (Hsla, Hsla) = match self.variant {
-            ButtonVariant::Primary => (to_hsla(tokens.primary_bottom), to_hsla(tokens.primary_top)),
-            _ => (
-                to_hsla(tokens.secondary_bottom),
-                to_hsla(tokens.secondary_top),
-            ),
-        };
-        let text: Hsla = match self.variant {
-            ButtonVariant::Primary => to_hsla(tokens.primary_text),
-            _ => to_hsla(tokens.foreground),
-        };
-        let edge: Hsla = match self.variant {
-            ButtonVariant::Primary if dark => to_hsla(hex_alpha(0xff_ffff, 0.5)),
-            ButtonVariant::Primary => to_hsla(hex_alpha(0x00_0000, 0.1)),
-            _ => Hsla::transparent_black(),
-        };
+        let Colors {
+            top,
+            bottom,
+            text,
+            edge,
+        } = colors(self.variant, tokens, dark);
         let gradient = |from: Hsla, to: Hsla| {
             linear_gradient(
                 0.0,
@@ -175,7 +215,18 @@ impl RenderOnce for ActionButton {
             },
         ];
         let handler: Option<ClickHandler> = self.on_click;
-        let disabled: bool = self.disabled;
+        let disabled: bool = self.disabled || self.loading;
+        let reduce_motion: bool = cx.reduce_motion();
+        let lead: Option<AnyElement> = if self.loading {
+            Some(if reduce_motion {
+                Icon::new(IconName::Loader).size_4().into_any_element()
+            } else {
+                Spinner::new().color(text).into_any_element()
+            })
+        } else {
+            self.icon
+                .map(|icon| Icon::new(icon).size_4().into_any_element())
+        };
         let mut base = h_flex()
             .id(ElementId::from(self.id))
             .role(Role::Button)
@@ -220,7 +271,6 @@ impl RenderOnce for ActionButton {
                     .on_click(move |event, window, cx| handler(event, window, cx));
             }
         }
-        base.children(self.icon.map(|icon| Icon::new(icon).size_4()))
-            .child(div().child(self.label))
+        base.children(lead).child(div().child(self.label))
     }
 }

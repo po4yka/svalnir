@@ -192,8 +192,8 @@ fn applications_show_groups_protection_and_a_partial_sum(cx: &mut TestAppContext
         label(handle, "attribution-unattributed", cx).as_deref(),
         Some("With no verified group: 3")
     );
-    let note = label(handle, "applications-read-only-note", cx).expect("note");
-    assert!(note.starts_with("This window sends no request"), "{note}");
+    let note = label(handle, "applications-stop-note", cx).expect("note");
+    assert!(note.starts_with("Stop makes a quit plan"), "{note}");
 }
 
 #[gpui_kit::test]

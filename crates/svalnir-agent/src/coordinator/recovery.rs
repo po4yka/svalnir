@@ -263,6 +263,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             unsettled_steps,
         } = record;
         let plan: Option<Plan> = self.journal.plan(operation.plan_id()).ok().flatten();
+        let before_reconciliation: OperationState = operation.state().clone();
         let mut written: bool = true;
         for recovery in &unsettled_steps {
             written &= self
@@ -286,6 +287,17 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             }
         }
         let finished: bool = operation.state().is_settled();
+        // An operation that this reconciliation settled, or whose
+        // `UnknownOutcome` it resolved, has a new final record. An
+        // operation with no readable plan has no notice: its trigger and
+        // its targets are not known.
+        if finished
+            && written
+            && operation.state() != &before_reconciliation
+            && let Some(plan) = plan.as_ref()
+        {
+            self.keep_settled(&operation, plan);
+        }
         // A step whose dispatch was consumed and that has no settled
         // record possibly issued a call, also when the state machine
         // refused each result for it and the operation stays in an

@@ -1484,20 +1484,22 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         self.settled.drain(..).collect()
     }
 
-    /// Keeps `active` for [`Coordinator::take_settled`].
-    pub(super) fn keep_settled(&mut self, active: &Active) {
+    /// Keeps `operation` of `plan` for [`Coordinator::take_settled`]. The
+    /// caller calls it only after the journal has the settled record of
+    /// the operation, so that a notice does not name a record that a
+    /// client cannot read yet.
+    pub(super) fn keep_settled(&mut self, operation: &Operation, plan: &Plan) {
         if self.settled.len() >= MAX_SETTLED_OPERATIONS {
             self.settled.pop_front();
         }
         self.settled.push_back(SettledOperation {
-            operation_id: active.operation.operation_id().clone(),
-            automatic: active.plan.trigger.class.is_automatic(),
-            stops_application: active
-                .plan
+            operation_id: operation.operation_id().clone(),
+            automatic: plan.trigger.class.is_automatic(),
+            stops_application: plan
                 .targets
                 .iter()
                 .any(|target| target.binding.processes().is_some()),
-            state: active.operation.state().clone(),
+            state: operation.state().clone(),
         });
     }
 

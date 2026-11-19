@@ -129,7 +129,13 @@ fn main() -> ExitCode {
         )
         // The service manager does not rotate the log file: the writer
         // cuts it at its size limit.
+        // Only the log file of the agent below the checked home directory
+        // is cut, never a file that a person gave as the stream.
         .with_writer(svalnir_agent::runtime::log_file::BoundedLog::standard_error(
+            svalnir_agent::platform::account::verify_process_home()
+                .ok()
+                .map(|home| svalnir_agent::runtime::launch_agent::agent_log_path(&home))
+                .as_deref(),
             svalnir_agent::runtime::log_file::AGENT_LOG_LIMIT_BYTES,
         ))
         .init();

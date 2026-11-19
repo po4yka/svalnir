@@ -858,7 +858,9 @@ fn a_denied_notification_center_is_reported_in_the_status_record() {
     bench.center = Some(center.clone());
     let mut driver = bench.start();
     let mut notifications = None;
-    for _ in 0..200 {
+    // The worker is a real thread: a deadline of 5 s, as in the tests of
+    // the notification service.
+    for _ in 0..1_000 {
         driver.tick(Some(bench.sample(
             5 * GIBIBYTE,
             PressureState::Normal,

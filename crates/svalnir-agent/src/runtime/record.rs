@@ -79,7 +79,8 @@ pub struct CapabilitySummary {
     /// The notification capability of the agent and the counts of its
     /// notices, at the time of the status record. Unlike the lines, the
     /// agent reads it again at each status write. `None` when the agent
-    /// has no notification service.
+    /// has no notification service. A status record with no capability
+    /// summary has no notification capability either.
     pub notifications: Option<NotificationStatus>,
 }
 

@@ -445,6 +445,11 @@ pub(crate) fn prepared_log_directory(path: &Path, uid: u32) -> Result<(), String
     if metadata.uid() != uid || metadata.mode() & 0o300 != 0o300 {
         return Err("this user does not own the log directory or cannot write to it".to_owned());
     }
+    // A different user who can write in the directory can replace the log
+    // file with a symbolic link that the service manager follows.
+    if metadata.mode() & 0o022 != 0 {
+        return Err("a different user can write to the log directory".to_owned());
+    }
     Ok(())
 }
 
@@ -920,6 +925,11 @@ mod log_directory_tests {
         let refused = prepared_log_directory(&path, uid).unwrap_err();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(refused.contains("cannot write"), "{refused}");
+        // A directory that the group or each user can write is refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let shared = prepared_log_directory(&path, uid).unwrap_err();
+        assert!(shared.contains("different user can write"), "{shared}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         // A directory of a different owner is refused.
         let other = prepared_log_directory(&path, uid.wrapping_add(1)).unwrap_err();
         assert!(other.contains("does not own"), "{other}");

@@ -1533,7 +1533,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
         self.board.publish(active.view(Phase::Finished));
         self.board.set_recorded(&operation_id, recorded);
-        self.keep_settled(&active);
+        // A volatile record is not in the journal; its settlement is
+        // still the final result of this lifetime.
+        if recorded {
+            self.keep_settled(&active.operation, &active.plan);
+        }
         if unknown || !recorded {
             // The leases and the reservation stay: a conflicting step
             // needs a reconciliation first.
@@ -1624,6 +1628,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 self.board.set_recorded(&operation_id, true);
             }
             if saved && active.operation.state().is_settled() {
+                self.keep_settled(&active.operation, &active.plan);
                 if let Some(stop) = &mut active.stop {
                     stop.acknowledgement = StopAcknowledgement::Settled;
                 }

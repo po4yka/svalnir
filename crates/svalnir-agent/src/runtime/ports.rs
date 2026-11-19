@@ -131,8 +131,10 @@ pub trait Notifier: Send {
     /// reading that is not a value.
     fn pressure(&mut self, _reading: Option<&PressureState>, _at: MonotonicNanos) {}
 
-    /// The notification capability, for the status record. `None` when
-    /// the receiver posts no system notification.
+    /// The notification capability, for the capability summary of the
+    /// status record. `None` when the receiver posts no system
+    /// notification. The driver writes it only into a status record that
+    /// has a capability summary.
     fn status(&self) -> Option<NotificationStatus> {
         None
     }

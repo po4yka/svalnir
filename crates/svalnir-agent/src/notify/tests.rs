@@ -120,10 +120,10 @@ fn the_center_of_this_build_is_unsupported_and_posts_nothing() {
 }
 
 /// A center that blocks does not block the caller: each offer returns at
-/// once, the queue keeps at most its capacity, and the oldest notices go
-/// first.
+/// once, and the rate gate bounds the notices that wait. The drop of a
+/// full queue is in `a_full_queue_drops_its_oldest_notice`.
 #[test]
-fn a_slow_center_fills_the_queue_and_never_blocks_an_offer() {
+fn a_slow_center_never_blocks_an_offer_and_the_gate_bounds_the_waiting_notices() {
     let center = FakeCenter::new(CenterAuthorization::Authorized);
     center.with(|state| state.hold = true);
     let mut service = NotificationService::start(Box::new(center.clone()));
@@ -230,6 +230,8 @@ fn a_closed_service_drops_its_notices() {
     service.close();
     service.offer(notice("a"), at(0));
     assert_eq!(service.status().counts.dropped, 1);
+    // The dropped notice took no place of the gate.
+    assert_eq!(service.gate.admit("a", at(1)), Admission::Admitted);
     std::thread::sleep(Duration::from_millis(20));
     assert!(center.with(|state| state.posted.is_empty()));
 }
@@ -355,6 +357,9 @@ fn the_controller_notices_are_the_meaningful_changes() {
     assert!(unknown.body.contains("not known"), "{}", unknown.body);
     // A state that this build does not recognize is not a completion.
     assert!(finished("Unexpected").is_some());
+    // An operation that is not settled, for example one whose record the
+    // journal refused, has no notice of a final state.
+    assert_eq!(finished("Admitted"), None);
 }
 
 #[test]

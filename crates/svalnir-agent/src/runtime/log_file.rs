@@ -4,9 +4,17 @@
 //! [`agent_log_path`](super::launch_agent::agent_log_path) and does not
 //! rotate the file. [`BoundedLog`] is the writer of the structured log: when
 //! the file is larger than its limit, the next write cuts the file to zero
-//! and starts it with one line that says so. The file thus stays below the
-//! limit plus one record. A stream that is not a regular file, for example
-//! a terminal, has no bound.
+//! and starts it with one line that says so. The writer counts the bytes
+//! that it writes; a write of a different source to the same stream, for
+//! example a panic message, counts when the count of the writer next
+//! passes the limit and the writer reads the size of the file again. The
+//! file thus stays below the limit plus one record plus those other
+//! writes.
+//!
+//! Only the log file of the agent has a bound: a standard error stream
+//! that is a different file, for example one that a person gave with
+//! `2>file` in a foreground run, is never cut. A stream that is not a
+//! regular file, for example a terminal, has no bound.
 //!
 //! The file is cut and not rotated: the service manager holds the open
 //! file, and the agent has no other name for it.
@@ -16,6 +24,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The largest size of the log file before a cut: 8 MiB.
@@ -41,9 +50,12 @@ pub struct BoundedLog {
 }
 
 impl BoundedLog {
-    /// The writer of the standard error stream of this process.
+    /// The writer of the standard error stream of this process. The
+    /// stream has a bound only when it is the file at `log`, the log file
+    /// of the agent ([`agent_log_path`](super::launch_agent::agent_log_path)
+    /// of the checked home directory). `None`: no bound.
     #[must_use]
-    pub fn standard_error(limit: u64) -> Self {
+    pub fn standard_error(log: Option<&Path>, limit: u64) -> Self {
         use std::os::fd::AsFd as _;
 
         let file: Option<File> = io::stderr()
@@ -51,9 +63,26 @@ impl BoundedLog {
             .try_clone_to_owned()
             .ok()
             .map(File::from);
-        match file {
-            Some(file) => Self::of_file(file, limit),
-            None => Self { state: None, limit },
+        match (file, log) {
+            (Some(file), Some(log)) => Self::of_file_at(file, log, limit),
+            _ => Self { state: None, limit },
+        }
+    }
+
+    /// The writer of `file`, with a bound only when `file` is the file at
+    /// `log`: the same device and inode.
+    #[must_use]
+    pub fn of_file_at(file: File, log: &Path, limit: u64) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let same: bool = match (file.metadata(), std::fs::metadata(log)) {
+            (Ok(stream), Ok(at)) => stream.dev() == at.dev() && stream.ino() == at.ino(),
+            _ => false,
+        };
+        if same {
+            Self::of_file(file, limit)
+        } else {
+            Self { state: None, limit }
         }
     }
 
@@ -94,15 +123,20 @@ impl BoundedLog {
                 .file
                 .metadata()
                 .map_or(state.size, |metadata| metadata.len());
-            if state.size.saturating_add(length) > self.limit {
-                state.file.set_len(0)?;
+            // A cut that fails does not stop the log: the record is
+            // written, and the next write that passes the limit tries the
+            // cut again.
+            if state.size.saturating_add(length) > self.limit && state.file.set_len(0).is_ok() {
                 // The offset of a stream with no `O_APPEND` flag stays at
                 // the old end after the cut; the next write would leave a
                 // hole. A stream with the flag writes at the end in each
                 // case.
-                state.file.seek(SeekFrom::Start(0))?;
-                state.file.write_all(CUT_NOTICE.as_bytes())?;
-                state.size = u64::try_from(CUT_NOTICE.len()).unwrap_or(u64::MAX);
+                state.size = 0;
+                if state.file.seek(SeekFrom::Start(0)).is_ok()
+                    && state.file.write_all(CUT_NOTICE.as_bytes()).is_ok()
+                {
+                    state.size = u64::try_from(CUT_NOTICE.len()).unwrap_or(u64::MAX);
+                }
             }
         }
         let written: usize = state.file.write(buffer)?;
@@ -207,6 +241,26 @@ mod tests {
         let bytes: Vec<u8> = std::fs::read(&path).unwrap();
         assert!(!bytes.contains(&0), "{bytes:?}");
         assert!(bytes.starts_with(CUT_NOTICE.as_bytes()));
+    }
+
+    #[test]
+    fn a_stream_that_is_not_the_log_file_of_the_agent_is_never_cut() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("agent.log");
+        std::fs::write(&log, b"").unwrap();
+        // A file that a person gave as the standard error stream.
+        let other = directory.path().join("output.txt");
+        std::fs::write(&other, vec![b'k'; 500]).unwrap();
+        let writer = BoundedLog::of_file_at(append(&other), &log, 100);
+        assert!(writer.state.is_none());
+        // The writer has no cut for that file.
+        assert_eq!(std::fs::metadata(&other).unwrap().len(), 500);
+        // The log file of the agent has the bound.
+        let bounded = BoundedLog::of_file_at(append(&log), &log, 100);
+        assert!(bounded.state.is_some());
+        // A log path that does not exist gives no bound.
+        let absent = BoundedLog::of_file_at(append(&other), &directory.path().join("absent"), 1);
+        assert!(absent.state.is_none());
     }
 
     #[test]

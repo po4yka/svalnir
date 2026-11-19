@@ -126,6 +126,8 @@ fn a_journal_that_fails_after_the_dispatch_keeps_the_result_and_runs_no_further_
     );
     assert_eq!(steps[1].results()[0].effect, TargetEffect::Skipped);
     assert!(view.degraded_recording);
+    // The journal has no settled record, so no notice names one.
+    assert_eq!(coordinator.take_settled(), Vec::new());
     bench.heal();
     coordinator.step();
     let stored = coordinator
@@ -136,6 +138,14 @@ fn a_journal_that_fails_after_the_dispatch_keeps_the_result_and_runs_no_further_
         .unwrap();
     assert_eq!(stored.state(), &OperationState::Partial);
     assert_eq!(stored.steps()[0].results()[0].effect, TargetEffect::Removed);
+    // The later write of the record gives the settled operation, once.
+    let settled = coordinator.take_settled();
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0].operation_id, operation_id);
+    assert_eq!(settled[0].state, OperationState::Partial);
+    assert!(!settled[0].automatic && !settled[0].stops_application);
+    coordinator.step();
+    assert_eq!(coordinator.take_settled(), Vec::new());
 }
 
 #[test]
@@ -248,6 +258,12 @@ fn a_crash_after_a_consumed_dispatch_is_unknown_and_is_never_replayed() {
         view.operation.dispatch(),
         DispatchState::SubmissionUncertain
     );
+    // The reconciliation settled the operation of the earlier lifetime:
+    // its new final record has a notice.
+    let settled = coordinator.take_settled();
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0].operation_id, operation_id);
+    assert_eq!(settled[0].state, OperationState::Failed);
     // The plan is consumed: a repeated apply returns this operation.
     let plan = open_journal(&bench.tree.database)
         .plan(view.operation.plan_id())

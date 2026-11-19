@@ -10,7 +10,7 @@
 //! | [`NoticeKind::GuardActing`] | A guard starts an automatic operation (its phase changes to `Acting`). |
 //! | [`NoticeKind::IncidentBudgetExhausted`] | A ceiling of an incident admits no further automatic work. |
 //! | [`NoticeKind::AutomaticOperationNotCompleted`] | An automatic operation settles in a state that is not `Completed` or `NoAction`. |
-//! | [`NoticeKind::StopSettled`] | A stop of an application that a person requested has its final record. |
+//! | [`NoticeKind::StopSettled`] | A stop of an application that a person requested has its final record in the journal: at its settlement, at a later write of a record that failed, or when a reconciliation settles it or resolves its `UnknownOutcome`. An acknowledgement, which a person requests, has no notice. |
 //! | [`NoticeKind::ManualOperationNotCompleted`] | A different operation that a person requested settles in a state that is not `Completed` or `NoAction`. |
 //!
 //! The two client conditions "the agent stopped reporting" and "the agent
@@ -123,10 +123,14 @@ const fn guard_name(guard: Guard) -> &'static str {
     }
 }
 
-/// True for a settled state that a person must know: the operation did not
-/// do all that its plan asked.
+/// True for a final state that a person must know: the operation did not
+/// do all that its plan asked. `Admitted` is not a final state: an
+/// operation whose record the journal refused can show it.
 fn not_completed(state: &OperationState) -> bool {
-    !matches!(state, OperationState::Completed | OperationState::NoAction)
+    !matches!(
+        state,
+        OperationState::Completed | OperationState::NoAction | OperationState::Admitted
+    )
 }
 
 fn exhausted(guard: Guard) -> Notice {
@@ -504,6 +508,15 @@ impl NotificationService {
 
     /// Offers `notice` at `now`. The call never waits for the center.
     pub fn offer(&mut self, notice: Notice, now: MonotonicNanos) {
+        // A closed queue posts nothing, so the notice takes no place of
+        // the gate.
+        {
+            let mut state = self.shared.lock();
+            if state.closed {
+                state.counts.dropped = state.counts.dropped.saturating_add(1);
+                return;
+            }
+        }
         let admission: Admission = self.gate.admit(&notice.tag, now);
         let mut state = self.shared.lock();
         match admission {

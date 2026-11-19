@@ -586,17 +586,17 @@ pub(crate) fn install(
             "Register the per-user service {LAUNCH_AGENT_LABEL}?\n{consequence}\nAn agent of this service that runs now is stopped and started again; an operation that it executes is left for reconciliation."
         ),
     )?;
-    environment.create_state_directory()?;
-    let uid: u32 = session::current_uid().get();
     // The service manager does not make the directory of the log file. A
     // directory that this user cannot write is refused before the
     // definition changes.
     host.prepare_log_directory(&log_directory).map_err(|error| {
         failure(
             &error,
-            "the command changed no registration; make sure that this user owns the log directory and can write to it",
+            "the command changed no registration; make sure that this user owns the log directory and can write to it, and that no other user can write to it",
         )
     })?;
+    environment.create_state_directory()?;
+    let uid: u32 = session::current_uid().get();
     // The new definition is in place before an earlier registration is
     // unloaded, so a failed write leaves the earlier service as it was.
     host.write_definition(&definition, &text)

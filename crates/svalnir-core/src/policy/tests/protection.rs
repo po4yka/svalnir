@@ -229,3 +229,145 @@ fn missing_evidence_is_unknown_and_not_unprotected() {
         ProtectionFact::Protected
     );
 }
+
+mod explanation {
+    use super::super::super::{
+        ControlPlaneProcess, HardProtectionEntry, HardProtectionExplanation, ProtectionContext,
+        ProtectionMember, ProtectionUnknownCause, explain_hard_protection, hard_protection,
+    };
+    use super::{USER, context, member, with_bundle, with_path};
+    use crate::process::{Pid, ProcessIdentity, Uid};
+
+    fn entry(
+        processes: &[ProcessIdentity],
+        context: &ProtectionContext<'_>,
+    ) -> HardProtectionEntry {
+        let explanation: HardProtectionExplanation = explain_hard_protection(processes, context);
+        assert_eq!(explanation.fact(), hard_protection(processes, context));
+        match explanation {
+            HardProtectionExplanation::Protected { entry, .. } => entry,
+            other => panic!("not protected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_entry_of_the_catalog_is_the_reason_of_its_match() {
+        let mut other: ProcessIdentity = member();
+        other.uid = Uid::new(USER.get() + 1);
+        assert_eq!(
+            entry(&[other], &context(&[])),
+            HardProtectionEntry::DifferentOwner
+        );
+
+        let mut root: ProcessIdentity = member();
+        root.uid = Uid::new(0);
+        let as_root = ProtectionContext {
+            principal: Uid::new(0),
+            control_plane: Some(&[]),
+        };
+        assert_eq!(entry(&[root], &as_root), HardProtectionEntry::RootOwner);
+
+        let mut launchd: ProcessIdentity = member();
+        launchd.pid = Pid::new(1).unwrap();
+        assert_eq!(
+            entry(&[launchd], &context(&[])),
+            HardProtectionEntry::Launchd
+        );
+
+        assert_eq!(
+            entry(&[with_bundle("com.apple.finder")], &context(&[])),
+            HardProtectionEntry::SessionApplication
+        );
+        assert_eq!(
+            entry(&[with_bundle("dev.svalnir.gui")], &context(&[])),
+            HardProtectionEntry::ControlPlaneBundle
+        );
+        assert_eq!(
+            entry(&[with_path("/usr/libexec/secd")], &context(&[])),
+            HardProtectionEntry::SystemLocation
+        );
+        assert_eq!(
+            entry(
+                &[with_path("/Applications/X.app/Contents/MacOS/svalnir-gui")],
+                &context(&[])
+            ),
+            HardProtectionEntry::ControlPlaneExecutable
+        );
+        let process: ProcessIdentity = member();
+        let control_plane = [ControlPlaneProcess {
+            pid: process.pid,
+            start_time: process.start_time,
+        }];
+        assert_eq!(
+            entry(&[process], &context(&control_plane)),
+            HardProtectionEntry::ControlPlaneProcess
+        );
+    }
+
+    #[test]
+    fn the_explanation_names_the_first_protected_member() {
+        let ordinary: ProcessIdentity = member();
+        let mut system: ProcessIdentity = with_path("/usr/libexec/secd");
+        system.pid = Pid::new(777).unwrap();
+        let explanation = explain_hard_protection(&[ordinary, system.clone()], &context(&[]));
+        assert_eq!(
+            explanation,
+            HardProtectionExplanation::Protected {
+                member: ProtectionMember {
+                    pid: system.pid,
+                    start_time: system.start_time,
+                },
+                entry: HardProtectionEntry::SystemLocation,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_result_names_its_cause() {
+        let unknown = |processes: &[ProcessIdentity], context: &ProtectionContext<'_>| {
+            let explanation = explain_hard_protection(processes, context);
+            assert_eq!(explanation.fact(), hard_protection(processes, context));
+            match explanation {
+                HardProtectionExplanation::Unknown { cause, .. } => cause,
+                other => panic!("not unknown: {other:?}"),
+            }
+        };
+        assert_eq!(
+            unknown(&[], &context(&[])),
+            ProtectionUnknownCause::NoMember
+        );
+        let mut no_executable: ProcessIdentity = member();
+        no_executable.executable = None;
+        assert_eq!(
+            unknown(&[no_executable], &context(&[])),
+            ProtectionUnknownCause::NoExecutableEvidence
+        );
+        assert_eq!(
+            unknown(&[with_path("/Applications/../usr/bin/x")], &context(&[])),
+            ProtectionUnknownCause::PathNotClassified
+        );
+        let no_control_plane = ProtectionContext {
+            principal: USER,
+            control_plane: None,
+        };
+        assert_eq!(
+            unknown(&[member()], &no_control_plane),
+            ProtectionUnknownCause::ControlPlaneNotKnown
+        );
+        // A protected member decides also when another member is unknown.
+        let mut no_executable: ProcessIdentity = member();
+        no_executable.executable = None;
+        assert_eq!(
+            explain_hard_protection(
+                &[no_executable, with_path("/usr/libexec/secd")],
+                &context(&[])
+            )
+            .fact(),
+            crate::policy::ProtectionFact::Protected
+        );
+        assert_eq!(
+            explain_hard_protection(&[member()], &context(&[])),
+            HardProtectionExplanation::NotProtected
+        );
+    }
+}

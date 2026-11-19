@@ -738,3 +738,144 @@ fn a_larger_recovery_threshold_is_widening_like_a_smaller_one() {
 fn two_scopes_of_no_configuration_have_no_difference() {
     assert_eq!(difference(&PolicyScope::none(), &PolicyScope::none()), []);
 }
+
+#[test]
+fn each_threshold_of_a_scope_has_a_unit() {
+    use super::super::{Threshold, ThresholdUnit};
+    let scope: PolicyScope = scope(&base_config());
+    let thresholds: Vec<&Threshold> = scope
+        .agent_thresholds
+        .iter()
+        .chain(&scope.disk.thresholds)
+        .chain(&scope.memory.thresholds)
+        .collect();
+    assert!(thresholds.len() > 20);
+    for threshold in &thresholds {
+        assert!(threshold.unit().is_some(), "{} has no unit", threshold.key);
+    }
+    let unit = |key: &str| {
+        thresholds
+            .iter()
+            .find(|threshold| threshold.key == key)
+            .and_then(|threshold| threshold.unit())
+    };
+    assert_eq!(unit("disk_guard.reclaim_below"), Some(ThresholdUnit::Bytes));
+    assert_eq!(unit("disk_guard.batch_limit"), Some(ThresholdUnit::Bytes));
+    assert_eq!(
+        unit("disk_guard.batch_item_limit"),
+        Some(ThresholdUnit::Count)
+    );
+    assert_eq!(unit("agent.plan_ttl"), Some(ThresholdUnit::Nanoseconds));
+    assert_eq!(
+        unit("memory_guard.app_budgets[build-worker].footprint_stop"),
+        Some(ThresholdUnit::Bytes)
+    );
+    assert_eq!(
+        unit("memory_guard.app_budgets[build-worker].cooldown"),
+        Some(ThresholdUnit::Nanoseconds)
+    );
+    assert_eq!(
+        unit("memory_guard.max_applications_per_incident"),
+        Some(ThresholdUnit::Count)
+    );
+}
+
+#[test]
+fn a_key_that_this_build_does_not_make_has_no_unit() {
+    use super::super::threshold_unit;
+    for key in [
+        "",
+        "cooldown",
+        "disk_guard",
+        "disk_guard.unknown_field",
+        "protections.cooldown",
+        // A budget identifier with a `.` does not change the field.
+        "memory_guard.app_budgets[a.cooldown].unknown",
+    ] {
+        assert_eq!(threshold_unit(key), None, "{key}");
+    }
+}
+
+#[test]
+fn a_threshold_value_has_the_text_of_the_configuration_grammar() {
+    use super::super::{Threshold, ThresholdValue};
+    use crate::byte_size::parse_byte_size;
+    use crate::duration::parse_duration;
+    use crate::quantity::{Bytes, Nanoseconds};
+
+    let value = |key: &str, value: u64| {
+        Threshold {
+            key: key.to_owned(),
+            value,
+        }
+        .typed_value()
+        .unwrap()
+    };
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const SECOND: u64 = 1_000_000_000;
+    assert_eq!(
+        value("disk_guard.reclaim_below", 25 * GIB),
+        ThresholdValue::Bytes(Bytes::new(25 * GIB))
+    );
+    assert_eq!(
+        value("disk_guard.reclaim_below", 25 * GIB).to_string(),
+        "25GiB"
+    );
+    assert_eq!(
+        value("disk_guard.batch_limit", 1536 * 1024 * 1024).to_string(),
+        "1536MiB"
+    );
+    assert_eq!(value("disk_guard.batch_limit", 1000).to_string(), "1000B");
+    assert_eq!(value("disk_guard.batch_limit", 0).to_string(), "0B");
+    assert_eq!(
+        value("disk_guard.sustain_for", 120 * SECOND).to_string(),
+        "2m"
+    );
+    assert_eq!(
+        value("disk_guard.sustain_for", 90 * SECOND).to_string(),
+        "90s"
+    );
+    assert_eq!(
+        value("disk_guard.sustain_for", 250_000_000).to_string(),
+        "250ms"
+    );
+    assert_eq!(value("disk_guard.sustain_for", 0).to_string(), "0s");
+    assert_eq!(value("disk_guard.sustain_for", 7).to_string(), "7ns");
+    assert_eq!(value("agent.plan_ttl", 86_400 * SECOND).to_string(), "1d");
+    assert_eq!(
+        value("disk_guard.pass_item_limit", 5000).to_string(),
+        "5000"
+    );
+    assert_eq!(
+        value("disk_guard.sustain_for", 7),
+        ThresholdValue::Nanoseconds(Nanoseconds::new(7))
+    );
+
+    // The text of each value of the base scope reads back to the value.
+    let scope: PolicyScope = scope(&base_config());
+    for threshold in scope
+        .agent_thresholds
+        .iter()
+        .chain(&scope.disk.thresholds)
+        .chain(&scope.memory.thresholds)
+    {
+        let text: String = threshold.typed_value().unwrap().to_string();
+        match threshold.typed_value().unwrap() {
+            ThresholdValue::Bytes(size) => assert_eq!(parse_byte_size(&text), Ok(size), "{text}"),
+            ThresholdValue::Nanoseconds(time) => assert_eq!(
+                u64::try_from(parse_duration(&text).unwrap().as_nanos()).unwrap(),
+                time.get(),
+                "{text}"
+            ),
+            ThresholdValue::Count(count) => assert_eq!(text, count.to_string()),
+        }
+    }
+    assert_eq!(
+        Threshold {
+            key: "disk_guard.unknown".to_owned(),
+            value: 1
+        }
+        .typed_value(),
+        None
+    );
+}

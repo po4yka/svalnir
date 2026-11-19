@@ -71,7 +71,7 @@ pub use rearm::{
 pub use scope::{
     AffectedGuards, DiskScope, MemoryScope, PolicyScope, ProtectionTable, RuleScope, ScopeChange,
     ScopeDifference, ScopeDifferenceKind, ScopeEffect, ScopeError, ScopeSubject, Setting,
-    Threshold, difference, effect_on,
+    Threshold, ThresholdUnit, ThresholdValue, difference, effect_on, threshold_unit,
 };
 pub use state::{
     Acknowledged, AcknowledgementLevel, ActiveRevision, AuthorityState, Change, GuardAuthority,

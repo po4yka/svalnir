@@ -80,8 +80,9 @@ pub use memory::{
 };
 pub use protection::{
     CONTROL_PLANE_BUNDLE_IDENTIFIER, CONTROL_PLANE_EXECUTABLES, ControlPlaneProcess,
-    LOCAL_DIRECTORY, ProtectionContext, SESSION_BUNDLE_IDENTIFIERS, SYSTEM_DIRECTORIES,
-    hard_protection,
+    HardProtectionEntry, HardProtectionExplanation, LOCAL_DIRECTORY, ProtectionContext,
+    ProtectionMember, ProtectionUnknownCause, SESSION_BUNDLE_IDENTIFIERS, SYSTEM_DIRECTORIES,
+    explain_hard_protection, hard_protection,
 };
 pub use reason::{DecisionReason, Explanation, ReasonDetail};
 pub use simulate::{

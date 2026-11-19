@@ -20,6 +20,7 @@ use crate::action::{ActionClass, Escalation};
 use crate::config::{AppBudget, Profile, ValidatedConfig};
 use crate::id::RuleId;
 use crate::policy::PolicyId;
+use crate::quantity::{Bytes, Nanoseconds};
 use crate::rule::{ApprovedRoot, Rule, RuleMode, RuleRef, RuleRegistry};
 
 /// The reason a configuration has no scope.
@@ -57,7 +58,8 @@ pub enum ScopeError {
 /// One numeric value of a configuration: a threshold, a ceiling, or a time.
 /// The key has the format of a finding path, for example
 /// `disk_guard.reclaim_below` or `memory_guard.app_budgets[ID].cooldown`.
-/// A size is in bytes, a time is in nanoseconds, and a count is a number.
+/// A size is in bytes, a time is in nanoseconds, and a count is a number;
+/// [`Threshold::unit`] gives the unit of a key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Threshold {
@@ -65,6 +67,174 @@ pub struct Threshold {
     pub key: String,
     /// The value.
     pub value: u64,
+}
+
+/// The unit of the value of a [`Threshold`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdUnit {
+    /// A size in bytes.
+    Bytes,
+    /// A time in nanoseconds.
+    Nanoseconds,
+    /// A count with no unit.
+    Count,
+}
+
+/// The fields of the configuration schema that are a size in bytes.
+const SIZE_FIELDS: [&str; 10] = [
+    "warn_below",
+    "reclaim_below",
+    "emergency_below",
+    "recover_above",
+    "batch_limit",
+    "pass_limit",
+    "incident_limit",
+    "footprint_soft",
+    "footprint_stop",
+    "footprint_recover",
+];
+
+/// The fields of the configuration schema that are a time.
+const TIME_FIELDS: [&str; 16] = [
+    "sustain_for",
+    "emergency_sustain_for",
+    "recovery_stable_for",
+    "pass_time_limit",
+    "pass_cooldown",
+    "observe_after_action",
+    "no_effect_backoff",
+    "grace_period",
+    "over_limit_for",
+    "cooldown",
+    "sample_interval",
+    "pressure_sample_interval",
+    "decision_sample_max_age",
+    "max_qualifying_sample_gap",
+    "plan_ttl",
+    "manual_plan_ttl",
+];
+
+/// The fields of the configuration schema that are a count.
+const COUNT_FIELDS: [&str; 5] = [
+    "batch_item_limit",
+    "pass_item_limit",
+    "incident_item_limit",
+    "max_passes_per_incident",
+    "max_applications_per_incident",
+];
+
+/// The tables of the configuration schema that have a threshold.
+const THRESHOLD_TABLES: [&str; 3] = ["agent", "disk_guard", "memory_guard"];
+
+/// The unit of the threshold with the key path `key`. `None` when the key
+/// is not a key that [`PolicyScope::of`] makes: this build does not know the
+/// unit of its value.
+///
+/// The unit comes from the field name, which is the text after the last
+/// `.` of the key path. The identifier of an application budget is in
+/// brackets before that point, so it has no effect.
+pub fn threshold_unit(key: &str) -> Option<ThresholdUnit> {
+    let (table, _) = key.split_once('.')?;
+    if !THRESHOLD_TABLES.contains(&table) {
+        return None;
+    }
+    let (_, field) = key.rsplit_once('.')?;
+    if SIZE_FIELDS.contains(&field) {
+        Some(ThresholdUnit::Bytes)
+    } else if TIME_FIELDS.contains(&field) {
+        Some(ThresholdUnit::Nanoseconds)
+    } else if COUNT_FIELDS.contains(&field) {
+        Some(ThresholdUnit::Count)
+    } else {
+        None
+    }
+}
+
+/// The value of a [`Threshold`] with its unit.
+///
+/// The text form is the form of the configuration grammar with the largest
+/// unit that gives the value with no fraction: `25GiB`, `2m`, or `3`. The
+/// text of a size or of a time is a text that
+/// [`parse_byte_size`](crate::byte_size::parse_byte_size) or
+/// [`parse_duration`](crate::duration::parse_duration) reads back to the same
+/// value. A time that is not a whole number of milliseconds has no text in
+/// that grammar; its text has the unit `ns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "unit", content = "value", rename_all = "snake_case")]
+pub enum ThresholdValue {
+    /// A size.
+    Bytes(Bytes),
+    /// A time.
+    Nanoseconds(Nanoseconds),
+    /// A count.
+    Count(u64),
+}
+
+/// The text of `value` with the largest unit of `units` that divides it
+/// with no remainder. `units` is in the sequence from the largest factor to
+/// the smallest, and its last factor is 1.
+fn exact_text(value: u64, units: &[(u64, &str)]) -> String {
+    for (factor, unit) in units {
+        if value != 0 && value % factor == 0 {
+            return format!("{}{unit}", value / factor);
+        }
+    }
+    let unit: &str = units.last().map_or("", |(_, unit)| unit);
+    format!("{value}{unit}")
+}
+
+impl std::fmt::Display for ThresholdValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const KIB: u64 = 1024;
+        const MILLISECOND: u64 = 1_000_000;
+        const SECOND: u64 = 1000 * MILLISECOND;
+        let text: String = match self {
+            Self::Bytes(size) => exact_text(
+                size.get(),
+                &[
+                    (KIB * KIB * KIB * KIB, "TiB"),
+                    (KIB * KIB * KIB, "GiB"),
+                    (KIB * KIB, "MiB"),
+                    (KIB, "KiB"),
+                    (1, "B"),
+                ],
+            ),
+            // The zero time is `0s`, as the configuration writes it.
+            Self::Nanoseconds(time) if time.get() == 0 => "0s".to_owned(),
+            Self::Nanoseconds(time) => exact_text(
+                time.get(),
+                &[
+                    (86_400 * SECOND, "d"),
+                    (3600 * SECOND, "h"),
+                    (60 * SECOND, "m"),
+                    (SECOND, "s"),
+                    (MILLISECOND, "ms"),
+                    (1, "ns"),
+                ],
+            ),
+            Self::Count(count) => count.to_string(),
+        };
+        formatter.write_str(&text)
+    }
+}
+
+impl Threshold {
+    /// The unit of the value. See [`threshold_unit`].
+    pub fn unit(&self) -> Option<ThresholdUnit> {
+        threshold_unit(&self.key)
+    }
+
+    /// The value with its unit. `None` when this build does not know the
+    /// unit of the key: the number then has no known meaning, and a view
+    /// shows it with no unit and says so.
+    pub fn typed_value(&self) -> Option<ThresholdValue> {
+        self.unit().map(|unit| match unit {
+            ThresholdUnit::Bytes => ThresholdValue::Bytes(Bytes::new(self.value)),
+            ThresholdUnit::Nanoseconds => ThresholdValue::Nanoseconds(Nanoseconds::new(self.value)),
+            ThresholdUnit::Count => ThresholdValue::Count(self.value),
+        })
+    }
 }
 
 /// One setting of a configuration with a text value. The key has the

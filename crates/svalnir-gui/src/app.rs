@@ -54,7 +54,6 @@ Options:
   --actions NAME       With --fixture only: the answer of each action
                        (accept, refuse, unavailable, pending). The fixture
                        writes nothing
-  --no-notifications   Post no system notification
   --help               Print this text
 ";
 
@@ -80,10 +79,6 @@ impl ForcedAppearance {
 
 /// The options of one launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "one independent flag for each launch option"
-)]
 pub struct LaunchOptions {
     /// The fixture scenario; `None` selects the live source.
     pub fixture: Option<FixtureScenario>,
@@ -110,8 +105,6 @@ pub struct LaunchOptions {
     /// The answer of each action of a fixture; `None` is the answer of
     /// the scenario.
     pub actions: Option<ActionScript>,
-    /// Whether system notifications are off.
-    pub no_notifications: bool,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -242,7 +235,6 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                     format!("unknown actions `{name}`; use accept, refuse, unavailable, or pending")
                 })?);
             }
-            "--no-notifications" => options.no_notifications = true,
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -306,7 +298,6 @@ pub fn open_main_window_seeded(
             None => apply::install(window, cx),
         }
         let model: Entity<AppModel> = cx.new(|cx| AppModel::new_seeded(source, readings, cx));
-        crate::notify::watch(&model, cx);
         cx.new(|cx| MainWindow::new(model, window, cx))
     })
 }
@@ -348,9 +339,6 @@ pub fn run() -> ExitCode {
             }
             fonts::register(cx);
             nav::bind_keys(cx);
-            if options.no_notifications {
-                cx.set_global(crate::notify::NotificationsOff);
-            }
 
             cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {
@@ -444,7 +432,6 @@ mod tests {
             "dial",
             "--actions",
             "refuse",
-            "--no-notifications",
             "--help",
         ]);
         assert_eq!(
@@ -462,7 +449,6 @@ mod tests {
                 sidebar_narrow: Some(true),
                 focus: Some(FocusTarget::Dial),
                 actions: Some(ActionScript::Refuse),
-                no_notifications: true,
                 help: true,
             })
         );

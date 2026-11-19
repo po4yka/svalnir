@@ -1459,3 +1459,50 @@ fn a_stale_application_list_blocks_a_ready_budget_and_proves_no_absence() {
     assert_eq!(budget(&evaluation).level, FootprintLevel::Unknown);
     assert!(budget(&evaluation).latched);
 }
+
+#[test]
+fn the_configured_protections_of_an_instance_agree_with_the_decision() {
+    use crate::file::LosslessPath;
+    use crate::policy::{ConfiguredProtectionTable, ConfiguredProtections, configured_protections};
+
+    let mut harness: Harness = Harness::new();
+    let home: LosslessPath = LosslessPath::from_bytes("/Users/tester").unwrap();
+    for (name, detail) in [
+        ("Protected", Some(ReasonDetail::ProtectedBundleId)),
+        ("Keep", Some(ReasonDetail::ProtectedExecutablePath)),
+        ("Editor", None),
+    ] {
+        let candidate: ApplicationCandidate = app(name, GIB, 0);
+        let reading: ConfiguredProtections =
+            configured_protections(&harness.config, Some(&home), &candidate.processes);
+        let decision: ApplicationDecision = decide(&mut harness, 0, candidate);
+        let decided: Vec<ReasonDetail> = decision
+            .reasons
+            .iter()
+            .map(|reason| reason.detail)
+            .filter(|detail| {
+                matches!(
+                    detail,
+                    ReasonDetail::ProtectedBundleId | ReasonDetail::ProtectedExecutablePath
+                )
+            })
+            .collect();
+        let read: Vec<ReasonDetail> = reading.matches.iter().map(|found| found.detail).collect();
+        assert_eq!(read, decided, "{name}");
+        assert_eq!(read, detail.into_iter().collect::<Vec<_>>(), "{name}");
+        assert!(!reading.home_unresolved);
+        assert!(!reading.executable_unknown);
+        if let Some(found) = reading.matches.first() {
+            assert_eq!(found.table, ConfiguredProtectionTable::MemoryGuard);
+        }
+    }
+    let matched =
+        configured_protections(&harness.config, Some(&home), &app("Keep", GIB, 0).processes);
+    assert_eq!(matched.matches[0].entry, "/Applications/Keep.app");
+
+    let mut no_executable: ApplicationCandidate = app("Editor", GIB, 0);
+    no_executable.processes[0].executable = None;
+    assert!(
+        configured_protections(&harness.config, None, &no_executable.processes).executable_unknown
+    );
+}

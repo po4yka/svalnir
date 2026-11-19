@@ -73,10 +73,11 @@ pub use file_protection::{
 };
 pub use memory::{
     AdmissionTrigger, ApplicationCandidate, ApplicationCooldown, ApplicationDecision,
-    ApplicationKind, BudgetState, BudgetTrigger, FirstIntervention, FootprintLevel,
-    ForceEscalation, ForegroundStatus, GlobalPressureTrigger, InterventionPlan, InventoryEvidence,
-    MemoryEvaluation, MemoryGuardState, MemoryIncident, MemorySnapshot, evaluate_memory_guard,
-    plan_intervention,
+    ApplicationKind, BudgetState, BudgetTrigger, ConfiguredProtectionMatch, ConfiguredProtections,
+    FirstIntervention, FootprintLevel, ForceEscalation, ForegroundStatus, GlobalPressureTrigger,
+    InterventionPlan, InventoryEvidence, MemoryEvaluation, MemoryGuardState, MemoryIncident,
+    MemorySnapshot, ProtectionTable as ConfiguredProtectionTable, configured_protections,
+    evaluate_memory_guard, plan_intervention,
 };
 pub use protection::{
     CONTROL_PLANE_BUNDLE_IDENTIFIER, CONTROL_PLANE_EXECUTABLES, ControlPlaneProcess,

@@ -34,7 +34,10 @@ use super::reason::{DecisionReason, Explanation, ReasonDetail, push_reason};
 use super::window::{
     QualificationWindow, QualifyingSample, WindowEvidence, WindowReport, WindowStep, advance,
 };
-use crate::config::{AppBudget, EligibleGroup, GlobalTrigger, MemoryGuard};
+use crate::config::{
+    AppBudget, BundleId, EligibleGroup, GlobalTrigger, MemoryGuard, ValidatedConfig,
+};
+use crate::file::LosslessPath;
 use crate::id::{ApplicationInstanceId, MembershipSnapshotId};
 use crate::observation::{Coverage, MetricId, Observation, Sample, Scope, ScopeKind, metric};
 use crate::process::{ProcessAssociation, ProcessIdentity, VerifiedMembership};
@@ -328,9 +331,8 @@ fn verified_identity(candidate: &ApplicationCandidate) -> Result<Identity<'_>, R
 
 /// The bundle identifiers that the processes of a candidate claim, verified
 /// or not. A protection applies to a claimed identifier.
-fn claimed_bundle_ids(candidate: &ApplicationCandidate) -> impl Iterator<Item = &str> {
-    candidate
-        .processes
+fn claimed_bundle_ids(processes: &[ProcessIdentity]) -> impl Iterator<Item = &str> {
+    processes
         .iter()
         .filter_map(|process| match &process.association {
             ProcessAssociation::Application {
@@ -338,6 +340,130 @@ fn claimed_bundle_ids(candidate: &ApplicationCandidate) -> impl Iterator<Item = 
             } => Some(bundle_identifier.as_str()),
             _ => None,
         })
+}
+
+/// True when a configured bundle identifier protects the claimed identifier
+/// `claimed`. The comparison ignores ASCII case.
+fn bundle_matches(protected: &BundleId, claimed: &str) -> bool {
+    protected.as_str().eq_ignore_ascii_case(claimed)
+}
+
+/// The executable paths of `[protections]` and of `[memory_guard]`,
+/// resolved against `home`.
+fn protected_path_set(config: &ValidatedConfig, home: Option<&LosslessPath>) -> PathSet {
+    PathSet::resolve(
+        config
+            .protections()
+            .protected_executable_paths
+            .iter()
+            .chain(&config.memory_guard().protected_executable_paths),
+        home,
+    )
+}
+
+/// The configuration table of a configured protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionTable {
+    /// The `[protections]` table, which applies to each action.
+    Protections,
+    /// The `[memory_guard]` table, which applies to automatic memory
+    /// intervention.
+    MemoryGuard,
+}
+
+/// One configured protection that matches a process of an instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ConfiguredProtectionMatch {
+    /// The table of the entry.
+    pub table: ProtectionTable,
+    /// [`ReasonDetail::ProtectedBundleId`] or
+    /// [`ReasonDetail::ProtectedExecutablePath`]: the detail that the
+    /// evaluation of the memory guard gives for this match.
+    pub detail: ReasonDetail,
+    /// The entry, as the configuration writes it.
+    pub entry: String,
+}
+
+/// The configured protections of the processes of one instance.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct ConfiguredProtections {
+    /// Each entry that matches, in the sequence of the configuration:
+    /// `[protections]` first, the bundle identifiers before the paths.
+    pub matches: Vec<ConfiguredProtectionMatch>,
+    /// True when an entry starts from the home directory and no usable home
+    /// directory was given. Such an entry is not applied, and the evaluation
+    /// gives [`ReasonDetail::HomeDirectoryUnknown`].
+    pub home_unresolved: bool,
+    /// True when a path entry exists and a process has no executable
+    /// evidence. The evaluation then gives
+    /// [`ReasonDetail::ExecutableUnknown`]: no path match is not evidence of
+    /// no protection.
+    pub executable_unknown: bool,
+}
+
+/// The configured protections that match `processes`: the bundle
+/// identifiers and the executable paths of `[protections]` and of
+/// `[memory_guard]`.
+///
+/// The matching is the matching of [`plan_intervention`]: a claimed bundle
+/// identifier, verified or not, with no ASCII case, and an executable path
+/// that is an entry or is inside an entry. The function changes no
+/// decision. A configured protection is not a hard protection, so
+/// [`hard_protection`](super::hard_protection) does not give it.
+pub fn configured_protections(
+    config: &ValidatedConfig,
+    home: Option<&LosslessPath>,
+    processes: &[ProcessIdentity],
+) -> ConfiguredProtections {
+    let protections = config.protections();
+    let guard: &MemoryGuard = config.memory_guard();
+    let mut result: ConfiguredProtections = ConfiguredProtections {
+        home_unresolved: protected_path_set(config, home).unresolved,
+        ..ConfiguredProtections::default()
+    };
+    let tables = [
+        (
+            ProtectionTable::Protections,
+            &protections.protected_bundle_ids,
+            &protections.protected_executable_paths,
+        ),
+        (
+            ProtectionTable::MemoryGuard,
+            &guard.protected_bundle_ids,
+            &guard.protected_executable_paths,
+        ),
+    ];
+    for (table, bundle_ids, paths) in tables {
+        for protected in bundle_ids {
+            if claimed_bundle_ids(processes).any(|claimed| bundle_matches(protected, claimed)) {
+                result.matches.push(ConfiguredProtectionMatch {
+                    table,
+                    detail: ReasonDetail::ProtectedBundleId,
+                    entry: protected.as_str().to_owned(),
+                });
+            }
+        }
+        for path in paths {
+            let entry: PathSet = PathSet::resolve(std::iter::once(path), home);
+            if processes
+                .iter()
+                .filter_map(|process| process.executable.as_ref())
+                .any(|executable| entry.covers(&executable.path))
+            {
+                result.matches.push(ConfiguredProtectionMatch {
+                    table,
+                    detail: ReasonDetail::ProtectedExecutablePath,
+                    entry: path.to_string(),
+                });
+            }
+        }
+    }
+    let has_paths: bool = !protections.protected_executable_paths.is_empty()
+        || !guard.protected_executable_paths.is_empty();
+    result.executable_unknown =
+        has_paths && processes.iter().any(|process| process.executable.is_none());
+    result
 }
 
 /// The window subject of a candidate: the instance, the membership
@@ -660,7 +786,7 @@ fn budget_subject<'a>(
             // An unverified process that claims the bundle identifier makes
             // the attribution ambiguous.
             Err(_) => {
-                if claimed_bundle_ids(candidate)
+                if claimed_bundle_ids(&candidate.processes)
                     .any(|claimed| claimed.eq_ignore_ascii_case(bundle_id))
                 {
                     return BudgetSubject::Unusable(EvidenceProblem::MembershipUnverified);
@@ -1004,12 +1130,12 @@ struct Checked<'a> {
 impl<'a> ApplicationChecks<'a> {
     fn bundle_protected(&self, candidate: &ApplicationCandidate) -> bool {
         let protections = self.context.config.protections();
-        claimed_bundle_ids(candidate).any(|claimed| {
+        claimed_bundle_ids(&candidate.processes).any(|claimed| {
             protections
                 .protected_bundle_ids
                 .iter()
                 .chain(&self.guard.protected_bundle_ids)
-                .any(|protected| protected.as_str().eq_ignore_ascii_case(claimed))
+                .any(|protected| bundle_matches(protected, claimed))
         })
     }
 
@@ -1251,13 +1377,7 @@ pub fn plan_intervention(
         context,
         guard,
         evaluation,
-        protected_paths: PathSet::resolve(
-            protections
-                .protected_executable_paths
-                .iter()
-                .chain(&guard.protected_executable_paths),
-            context.home_directory,
-        ),
+        protected_paths: protected_path_set(context.config, context.home_directory),
         has_protected_paths,
         max_age: nanoseconds(context.config.agent().decision_sample_max_age),
         list_may_be_stale: snapshot.application_list_may_be_stale,

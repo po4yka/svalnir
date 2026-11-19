@@ -237,7 +237,10 @@ fn process_rows(snapshot: &ProcessSnapshot) -> ProcessesSnapshot {
         applications: rank_applications(applications),
         unattributed,
         other_user: omissions.other_user,
-        not_readable: omissions.permission_denied + omissions.failed + omissions.identity_changed,
+        not_readable: omissions
+            .permission_denied
+            .saturating_add(omissions.failed)
+            .saturating_add(omissions.identity_changed),
         notes,
         source: SOURCE,
     }
@@ -260,10 +263,11 @@ pub(super) fn processes(host: &Host) -> Result<ProcessesSnapshot, String> {
 }
 
 /// Opens the journal of `state_directory` for reading. `Ok(None)`: no
-/// journal exists, or the directory is not known.
+/// journal exists. A directory that is not known is an error: it does not
+/// show that no journal exists.
 fn open_journal(state_directory: Option<&Path>) -> Result<Option<OperationJournal>, String> {
     match state_directory {
-        None => Ok(None),
+        None => Err("The state directory is not known, so the journal was not read.".to_owned()),
         Some(directory) => observe::open_existing_journal_read_only(&journal_path(directory))
             .map_err(|error| format!("The journal cannot be read: {error}.")),
     }
@@ -346,7 +350,7 @@ pub(super) fn automation(state_directory: Option<&Path>) -> AutomationSnapshot {
             return snapshot;
         }
         Err(problem) => {
-            snapshot.journal_present = true;
+            snapshot.journal_present = state_directory.is_some();
             snapshot.problems.push(problem);
             return snapshot;
         }
@@ -451,7 +455,7 @@ pub(super) fn history(state_directory: Option<&Path>) -> HistorySnapshot {
         Ok(Some(journal)) => journal,
         Ok(None) => return snapshot,
         Err(problem) => {
-            snapshot.journal_present = true;
+            snapshot.journal_present = state_directory.is_some();
             snapshot.problems.push(problem);
             return snapshot;
         }
@@ -588,9 +592,11 @@ pub(super) fn diagnostics(state_directory: Option<&Path>) -> DiagnosticsSnapshot
     match open_journal(state_directory) {
         Ok(None) => {}
         Err(problem) => {
-            snapshot.journal.present = true;
-            snapshot.agent = Measured::Unavailable("the journal cannot be read".to_owned());
-            snapshot.problems.push(problem);
+            snapshot.journal.present = state_directory.is_some();
+            snapshot.agent = Measured::Unavailable("The journal was not read.".to_owned());
+            if state_directory.is_some() {
+                snapshot.problems.push(problem);
+            }
         }
         Ok(Some(journal)) => {
             snapshot.journal.present = true;
@@ -616,4 +622,35 @@ pub(super) fn diagnostics(state_directory: Option<&Path>) -> DiagnosticsSnapshot
         }
     }
     snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_state_directory_is_not_an_absent_journal() {
+        let automation: AutomationSnapshot = automation(None);
+        // The pause was not read: it is not "not paused".
+        assert_eq!(automation.pause, None);
+        assert!(automation.guards.is_empty());
+        assert!(!automation.journal_present);
+        assert_eq!(automation.problems.len(), 1);
+        let history: HistorySnapshot = history(None);
+        assert!(history.operations.is_empty());
+        assert_eq!(history.problems.len(), 1);
+    }
+
+    #[test]
+    fn a_state_directory_with_no_journal_has_no_problem() {
+        let directory = std::env::temp_dir().join("svalnir-gui-test-no-such-state-directory");
+        let automation: AutomationSnapshot = automation(Some(&directory));
+        assert_eq!(automation.pause, Some(PauseRow::NotPaused));
+        assert!(!automation.journal_present);
+        assert!(automation.problems.is_empty());
+        assert_eq!(automation.guards.len(), PolicyId::ALL.len());
+        let history: HistorySnapshot = history(Some(&directory));
+        assert!(history.problems.is_empty());
+        assert!(!directory.exists(), "a read makes no directory");
+    }
 }

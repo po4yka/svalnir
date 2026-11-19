@@ -465,12 +465,15 @@ mod tests {
     fn the_label_of_a_process_with_no_footprint_has_the_reason() {
         let mut row = ProcessRow {
             pid: 7,
-            name: Some("syncd".to_owned()),
+            name: Some("sync-agent".to_owned()),
             group: None,
             footprint: Measured::Value(96_000_000),
             resident: Measured::Value(1),
         };
-        assert_eq!(process_label(&row), "syncd, process 7, footprint 96.0 MB");
+        assert_eq!(
+            process_label(&row),
+            "sync-agent, process 7, footprint 96.0 MB"
+        );
         row.footprint = Measured::Unavailable("exited".to_owned());
         row.name = None;
         assert_eq!(

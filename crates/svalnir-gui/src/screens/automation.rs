@@ -185,7 +185,10 @@ fn state_card(
                         tokens,
                     ));
             } else {
-                let text: &str = if value.journal_present {
+                let text: &str = if value.pause.is_none() {
+                    // The authority record was not read: the revision is not known.
+                    "The revision in effect was not read."
+                } else if value.journal_present {
                     "No policy revision is in effect. No guard can act."
                 } else {
                     "No journal exists in the state directory, so no policy revision is in effect. No guard can act."
@@ -330,7 +333,7 @@ fn guard_card(
         ));
         for (key, value) in &guard.thresholds {
             list = list.child(fact(
-                SharedString::from(format!("automation-threshold-{key}")),
+                SharedString::from(format!("automation-threshold-{name}-{key}")),
                 key,
                 grouped(*value),
                 mono,

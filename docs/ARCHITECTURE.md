@@ -1,8 +1,8 @@
 # Svalnir Architecture
 
-**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with a Milestone 2 build that is not validated, with release artifacts that have no Developer ID signature and no notarization. It has the collectors, the scanner, the local store, the capability probes, the configuration validation, and the policy simulation of Milestone 1, and the plan builder, the grant logic, the operation journal, the coordinator, the filesystem and process executors, the rule registry, the guard controller, and the agent runtime of Milestone 2. The CLI applies a manual plan through the coordinator: through the request queue of the journal when an agent holds the coordinator lock, and as a transient coordinator in its own process when none does. No socket exists and no XPC service is registered. The helper has its protocol, its XPC transport adapter, and its executor, and it is not installed, not called, and not validated. The GPUI client has seven screens. It sends its state-changing actions to a running agent through the journal, and it is never a coordinator. It has no menu bar item. The packaging scripts make artifacts with an ad-hoc signature only. Each reviewed rule is in the `proposed` lifecycle state, so no eviction is permitted. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
+**Status:** Design baseline. The repository contains project documentation and a Cargo workspace with a Milestone 2 build that is not validated, with release artifacts that have no Developer ID signature and no notarization. It has the collectors, the scanner, the local store, the capability probes, the configuration validation, and the policy simulation of Milestone 1, and the plan builder, the grant logic, the operation journal, the coordinator, the filesystem and process executors, the rule registry, the guard controller, and the agent runtime of Milestone 2. The CLI applies a manual plan through the coordinator: through the request queue of the journal when an agent holds the coordinator lock, and as a transient coordinator in its own process when none does. No socket exists and no XPC service is registered. The helper has its protocol, its XPC transport adapter, and its executor, and it is not installed, not called, and not validated; it has no operation in the first release (owner decision of 2026-11-19). The GPUI client has seven screens, of which Memory, Applications, and Automation show the readings of the agent records. It sends its state-changing actions to a running agent through the journal, and it is never a coordinator. It has no menu bar item. The packaging scripts make artifacts with an ad-hoc signature only. Each reviewed rule is in the `proposed` lifecycle state, so no eviction is permitted. The components, protocols, and guarantees described here are requirements for implementation, not claims about a shipped executable.
 
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-19
 
 This document defines how Svalnir observes macOS resource use, decides whether intervention is authorized, executes bounded actions, and reports their outcomes. Product scope and illustrative commands are in [README.md](../README.md). Repository working instructions are in [AGENTS.md](../AGENTS.md) and [CONTRIBUTING.md](../CONTRIBUTING.md).
 
@@ -31,10 +31,10 @@ The Cargo workspace contains five crates under `crates/`. `svalnir-cli` implemen
 | Component | Responsibilities | Must not own |
 | --- | --- | --- |
 | `svalnir-core` | Typed identities and units; accounting; pure policy evaluation; rule, plan, action, and journal contracts | GPUI, launchd lifecycle, direct deletion or signaling |
-| `svalnir-agent` | Collection; candidate catalog; controller; action coordination; user-scope adapters; local client API | Arbitrary root execution or rendering |
-| `svalnir-privileged` | Independently validated administrative operations; helper-owned grants and journal; host resource leases | User-controlled policy interpretation as root authority |
+| `svalnir-agent` | Collection; candidate catalog; controller; action coordination; user-scope adapters; local client API; system notifications | Arbitrary root execution or rendering |
+| `svalnir-privileged` | After the first release: independently validated administrative operations; helper-owned grants and journal; host resource leases | User-controlled policy interpretation as root authority |
 | `svalnir-cli` | `clap` parsing, completions, presentation, structured output, client requests | An independent destructive execution path |
-| `svalnir-gui` | GPUI views, interaction, notifications, client-side view state | Policy enforcement or blocking native work on the UI thread |
+| `svalnir-gui` | GPUI views, interaction, client-side view state | Policy enforcement or blocking native work on the UI thread |
 
 The agent, helper, and clients depend on relevant core contracts. The core does not depend on those executables. macOS bindings initially live in focused internal platform modules; extracting another crate requires a concrete ownership or reuse benefit.
 
@@ -57,7 +57,7 @@ The graph shows runtime responsibility, not permission inheritance: granting acc
 
 ## 3. Runtime and coordination
 
-A user-session LaunchAgent owns routine monitoring. Closing the CLI or GUI leaves it running while the session and machine state permit. The optional system helper provides supported administrative operations and arbitration between cooperating Svalnir sessions.
+A user-session LaunchAgent owns routine monitoring. Closing the CLI or GUI leaves it running while the session and machine state permit. The optional system helper provides supported administrative operations and arbitration between cooperating Svalnir sessions. The first release has no helper (owner decision of 2026-11-19); it comes after the release.
 
 The agent separates:
 
@@ -69,7 +69,7 @@ The agent separates:
 
 The initial implementation permits one intervention action at a time per user agent. Observation and control messages remain concurrent. Short scheduling locks must never be held while waiting for an application, native callback, or storage operation.
 
-Conflicts are keyed by resource identity, including process generation, cleanup root, and APFS capacity domain. The helper brokers host-wide leases for shared domains. Multiuser automatic shared-volume cleanup requires that broker; without it, deployment must explicitly restrict automation to a single-user mode or remain observational for affected domains.
+Conflicts are keyed by resource identity, including process generation, cleanup root, and APFS capacity domain. The helper brokers host-wide leases for shared domains. Multiuser automatic shared-volume cleanup requires that broker; without it, deployment must explicitly restrict automation to a single-user mode or remain observational for affected domains. The first release has no helper and so no broker: it restricts automatic shared-volume cleanup to a single-user mode, or it only observes the affected domains.
 
 Leases serialize cooperating Svalnir instances. They do not lock out other applications or make filesystem contents immutable. Expired leases require reconciliation of an outstanding action before another conflicting dispatch; expiry alone is not proof that work stopped.
 
@@ -258,6 +258,8 @@ By the owner decision of 2026-11-19, the state-changing actions of the CLI and o
 
 ## 11. Authorization and the privileged boundary
 
+The first release has no privileged helper. The `PrivilegeGrant` and the helper rules of this section apply to the release that adds the helper.
+
 Three records have different authority:
 
 | Record | Owner and purpose | Security limit |
@@ -316,7 +318,7 @@ Structured stdout contains only the versioned machine-readable result or stream.
 
 GPUI views consume immutable snapshots and asynchronous updates. Native collection, scans, and IPC waits run away from the rendering thread. Reconnection refreshes state after sequence gaps. Accessibility labels, keyboard operation, and unavailable/loading/error states are part of the client contract.
 
-Neither client invents successful completion from a dispatched request. History and notifications describe observed outcomes, including partial completion and force escalation.
+Neither client invents successful completion from a dispatched request. History and notifications describe observed outcomes, including partial completion and force escalation. The agent posts the system notifications, so they do not need an open window (owner decision of 2026-11-19); in the current build the GPUI client posts them while it runs.
 
 ## 14. Lifecycle, packaging, and upgrades
 
@@ -366,7 +368,7 @@ Before enabling unattended mutation, record:
 
 - The supported OS/SDK/API matrix and actual target-binding guarantees.
 - Each cleanup adapter's regenerability, activity, and namespace-safety evidence.
-- The code-signing requirements, helper grant schema, and administrative flow.
+- The code-signing requirements; for the release that adds the helper, the helper grant schema and the administrative flow.
 - Journal durability settings, bounded-storage behavior, and recovery results.
 - Policy defaults and measured budgets for idle CPU, memory, I/O, scan work, and intervention latency.
 - Upgrade, uninstall, service-disable, and permission-degradation behavior.

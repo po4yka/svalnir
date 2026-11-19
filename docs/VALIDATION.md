@@ -1,6 +1,6 @@
 # Svalnir Validation Plan
 
-**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Every release gate below is initially **unverified**.  
+**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of two host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
 **Last reviewed:** 2026-11-19
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
@@ -287,6 +287,8 @@ First-release acceptance additionally requires a complete installed workflow: en
 
 Record any signed fixture build that substitutes observations as a distinct artifact from the shipped build. Its passing workflow validates the controlled decision/execution path, not native pressure detection. The shipped artifacts also require their actual collector, identity, permission, and executor checks; production must not expose a pressure-injection bypass to satisfy the test.
 
+The first release has no privileged helper (owner decision of 2026-11-19). The cases of a family that need the helper, for example the helper ceilings of VAL-08 and the `PrivilegeGrant` cases of VAL-09, are `excluded` from the first-release scope and apply to the release that adds the helper. Each family and each gate keeps its identifier.
+
 At least a useful reviewed automatic cleanup subset and a validated force backend must pass their applicable gates. An observation-only build is an internal milestone. Optional unvalidated integrations remain visibly disabled and do not borrow evidence from another adapter.
 
 ## 10. Performance evidence
@@ -439,6 +441,112 @@ Only the project owner starts this procedure, on a host that the owner selects. 
 **Not in this procedure**
 
 The procedure does not fill a disk, does not change the clock of the host, registers no service, and needs no administrator right. The budget stop, the backoff after a removal with no gain, a restart during an operation, a full journal volume, and a permission failure are cases of the fixture tests; the record names the tests and the revision. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and is outside the promoted support.
+
+## 14. Host validation records
+
+This section has the case records of two runs on one host of the project owner, made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. The authorization excluded each grant, each enabled guard, and each other application, so no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.
+
+The evidence files are command records: the command, the UTC time, the standard output, the exit status, and the standard error. They are on the host of the owner, in the directory `.omc/handoffs/` of the main checkout, which Git ignores. The repository does not keep them, so a contributor cannot read them; each record names this limit. No record has a reviewer.
+
+### Host run 1: build of `3d8d3bb`
+
+```yaml
+source_revision: 3d8d3bb3d1871ea1c576adea980c00da9b78e8e4
+artifact_digest:
+  svalnir: sha256:128d6093f431ee0030a50e1b06a000f03d6b61887c812bdd4c4911476db91b1e
+  svalnir-agent: sha256:fe9883bcf261e8afbfc637e356bc6d3355f1bc24042b2be39e053033578443a6
+adapter_revision: svalnir.process.darwin 1; svalnir.filesystem; macos.process
+environment_record: macOS 27.2.1 (26B131), Mac16,7, Apple M4 Pro, 14 cores, 48 GiB, Aqua session, System Integrity Protection enabled; cargo build --locked, dev profile, not signed, not packaged; memory pressure warning and 43.9 GiB of used swap during the run
+effective_policy_and_grants: built-in template (schema_version 1), activated only where a manual plan needed a revision; no grant; no guard enabled; default state directory for the installed agent
+seed_or_trace: null
+reviewer: null
+run_started_at: 2026-11-19T04:32:11Z
+evidence_paths: [.omc/handoffs/m3-host-validation-done.md, .omc/handoffs/m3-host-validation-evidence/]
+limitations: [one host, one run, debug build, not signed, label dev.svalnir.agent of the build before the identifier decision, evidence not tracked]
+```
+
+| `validation_id` | `case_id` | Case of the run | Status | Observed results |
+| --- | --- | --- | --- | --- |
+| VAL-10 | `host_read_only_commands_no_state_directory` | 1 | `passed` | 7 read-only commands exit 0; growth `not_collected` and swap rates `not_initialized`, each with its reason; no state directory made |
+| VAL-14 | `flock_reported_by_fcntl_getlk` | 2 | `passed` | 4 lock tests passed on the host; between two processes `F_GETLK` gave `F_WRLCK` with `l_pid` -1 while a child held `flock`, and `F_UNLCK` with no holder |
+| VAL-11 | `launch_agent_install_observation_mode` | 3 | `passed` | Definition as rendered, bootstrap status 0, the agent holds the coordinator lock, `observation_only` true, no guard enabled |
+| VAL-11 | `doctor_reports_installed_agent` | 3 | `failed` | Defect D-2: `service.background_agent` `unknown` while the service ran, because the probe used the prefix `dev.po4yka.svalnir` and the label was `dev.svalnir.agent` |
+| VAL-11 | `agent_only_operation_pause_resume` | 4 | `passed` | 10 minutes with no client, `runs = 1`, never exited; pause and resume in the status record of the agent in 1 s |
+| VAL-11 | `install_while_loaded_restarts_agent` | 4 | `failed` | Defect D-1: `bootout` 0, then `bootstrap` 5, and the service stayed unloaded; a `bootstrap` 0.34 s later gave 0 |
+| VAL-11 | `permanent_start_error_record` | 5 | `passed` | Exit 0, one start-failure record `configuration_invalid` with mode `0600` after two starts; `agent status` and `doctor` show it |
+| VAL-11 | `explicit_uninstall` | 9 | `passed` | `launchctl print` 113, no definition file, no agent process, clean stop recorded, state directory kept |
+| VAL-11 | `sleep_wake` | S | `not_run` | Needs the owner |
+| VAL-05 | `manual_trash_fixture_transient_and_agent_queue` | 6 | `passed` | Fixture manifest: `svalnir-m3-fixture-transient-A.bin` (1048576 bytes) and `svalnir-m3-fixture-agent-queue-A.bin` (2097152 bytes), each with neighbors that did not change. Only the named entry moved, into the Trash of the user; the Trash transfer was not reported as reclaimed capacity; a second apply made no second operation; `evict` was refused for a `proposed` rule. Both executors: a transient coordinator and the agent through the queue |
+| VAL-05 | `root_not_local_refusal` | 8 | `blocked` | The autofs mounts were empty and not writable, so no fixture file could be made |
+| VAL-06 | `stop_own_child_graceful_and_force` | 7 | `passed` | Fixture child of the run, plain and ignoring `SIGTERM`: wait status 143 for a graceful stop and 137 for a force step after the grace period with the option; `Incomplete`, exit 4, with no force option. A refusal of `/bin/sleep` with exit 3 was seen, and its command record was overwritten, so that assertion has no evidence file |
+| VAL-15 | `agent_idle_cost_characterization` | 3 | `not_run` | Characterization only, with no approved limit (section 10): 16.5 s of CPU in 678 s, footprint 7.8 MiB to 20 MiB, RSS 16 MiB to 30 MiB, debug build |
+
+The run found seven defects, D-1 to D-7, in its record. Run 2 shows the correction of each for the case that showed it.
+
+### Host run 2: release artifacts of `fe7e702`
+
+```yaml
+source_revision: fe7e702f25ce080e17f9ce6a6e0baa89c4ca9246
+artifact_digest:
+  svalnir-0.0.0-aarch64-apple-darwin.tar.gz: sha256:6e99d005857d3d744113adfa40614ec0d336a6856d3ab6b23e29ddc1d83f083b
+  svalnir: sha256:2bce2f6ba623d52c22ec4f381494e7a1fdbe4a842938fbfaf3d43eef9d2bda94
+  svalnir-agent: sha256:9896cd9d6b65cf4468d05ab4ac08dd7233992800fccf36b744bc026ba0ff7983
+adapter_revision: svalnir.process.darwin 1; svalnir.filesystem; macos.process
+environment_record: macOS 27.2.1 (26B131), Mac16,7, Apple M4 Pro, 14 cores, 48 GiB, Aqua session, System Integrity Protection enabled; rustc 1.100.0; binaries archive of scripts/package.sh, release profile, aarch64-apple-darwin, ad-hoc signature with the hardened runtime, no Developer ID, not notarized; memory pressure normal, warning for some minutes in case 7
+effective_policy_and_grants: built-in template (schema_version 1), activated only where a manual plan needed a revision; no grant; no guard enabled; a new state directory with no authority record for the installed agent (SVALNIR_STATE_DIR)
+seed_or_trace: null
+reviewer: null
+run_started_at: 2026-11-19T09:52:09Z
+evidence_paths: [.omc/handoffs/m3-host-validation-2-done.md, .omc/handoffs/m3-host-validation-2-evidence/]
+limitations: [one host, one run, ad-hoc signature, not installed through an installer, Svalnir.app not used, evidence not tracked]
+```
+
+| `validation_id` | `case_id` | Case of the run | Status | Observed results |
+| --- | --- | --- | --- | --- |
+| VAL-10 | `host_read_only_commands_no_state_directory` | 1 | `passed` | 8 read-only commands exit 0; growth `not_collected` and swap rates `not_initialized`; no state directory made |
+| VAL-14 | `flock_reported_by_fcntl_getlk` | 2 | `passed` | 4 lock tests passed; between two processes `F_WRLCK` with `l_pid` -1, and `F_UNLCK` with no holder |
+| VAL-11 | `launch_agent_install_observation_mode` | 3, 10 | `passed` | Definition as rendered with the label `dev.po4yka.svalnir.agent`, service running, the agent holds the lock, `observation_only` true, no guard enabled; nothing with the label `dev.svalnir.agent` made |
+| VAL-11 | `doctor_reports_installed_agent` | 3 | `passed` | `service.background_agent` "A registration file is present"; its state stays `unknown`, and the row gives the reason |
+| VAL-11 | `install_while_loaded_restarts_agent` | 4 | `passed` | 3 installs while the service was loaded, each exit 0 with a new PID and a clean stop of the earlier agent; a direct `bootstrap` after `bootout` still gives 5 |
+| VAL-11 | `agent_only_operation_pause_resume` | 4 | `passed` | 10.6 minutes with no client, `runs = 1`; pause and resume in the status record of the agent in 1 s |
+| VAL-11 | `permanent_start_error_record` | 5 | `passed` | Exit 0, one record with mode `0600` after two starts; `agent status` and `doctor` show it; `doctor` examines the state directory of the invocation |
+| VAL-11 | `explicit_uninstall` | 9 | `passed` | `launchctl print` 113 for both labels, no definition file, no agent process, clean stop recorded, state directory kept |
+| VAL-11 | `sleep_wake` | S | `not_run` | Needs the owner |
+| VAL-11 | `crash_restart_logout_disabled_item_installed_identity_access` | 13 | `not_run` | Crash and `KeepAlive` restart, logout and login, a login item that the user disabled, and Full Disk Access of the installed agent identity |
+| VAL-13 | `agent_log_plain_text_under_launchd` | 3, 9 | `passed` | 48 lines, 0 with a terminal escape sequence, 0 `WARN` or `ERROR`; no secret and no process argument in the log |
+| VAL-05 | `manual_trash_fixture_transient_and_agent_queue` | 6 | `passed` | Fixture manifest: `svalnir-m3v2-fixture-transient-A.bin` (1048576 bytes) and `svalnir-m3v2-fixture-agent-queue-A.bin` (2097152 bytes), with neighbors that did not change. Only the named entry moved; the Trash transfer was not reported as reclaimed capacity; a second apply made no second operation; `evict` was refused for a `proposed` rule |
+| VAL-05 | `root_not_local_refusal` | 8 | `blocked` | No network filesystem, and the autofs maps had no fixture file |
+| VAL-04 | `queued_request_result_has_recorded_observation` | 7 | `passed` | 7 of 7 waited results of queued requests have `resource_effects`; `Incomplete`, exit 4, for a graceful request that the process ignored; a repeated apply returns the first operation |
+| VAL-06 | `stop_own_child_graceful_and_force` | 7 | `passed` | Fixture children of the run, plain and ignoring `SIGTERM`, through a transient coordinator and the agent queue: wait status 143 and 137; a force step only with the option and after the grace period; `Incomplete` with no force option; `/bin/sleep` refused with exit 3 and no signal |
+| VAL-03 | `rearm_refused_with_no_incident` | 11 | `passed` | The queued request completed as rejected with `incident_not_found` at admission; no `incident_usage` row |
+| VAL-10 | `history_and_result_views_agree_with_contract` | 6, 7 | `passed` | The note of `history` agrees with its output; no capacity note on a stop result; `work` null for a client that did not execute the operation |
+| VAL-10 | `gui_state_changing_actions` | 12 | `not_run` | The run did not drive the GUI |
+| VAL-15 | `agent_idle_cost_characterization` | 3, 4 | `not_run` | Characterization only, with no approved limit: 1.24 s of CPU in 611 s idle, footprint 6.1 MiB to 11 MiB, RSS 16.3 MiB to 25.7 MiB, release build |
+| VAL-16 | `release_artifacts_layout_and_adhoc_signature` | Build | `not_run` | `scripts/package.sh` exit 0, and `scripts/check-artifacts.sh` passed. The family needs signed installed artifacts, so this run does not satisfy it |
+
+The run found no new defect.
+
+### What the records support
+
+Each gate of section 9 stays unverified. A record with `passed` is evidence for its case only, on one host, one macOS version, and one build. The cases are partial evidence for:
+
+- G-02 through VAL-04 and VAL-05: the manual Trash path of the two executors, with no permanent removal and no eviction.
+- G-03 through VAL-03, VAL-04, and VAL-06: the stop of a fixture child, and one refused rearm.
+- G-05 and G-09 through VAL-11: install, agent-only operation, pause and resume, a permanent start error, and uninstall.
+- G-06 through VAL-10 and VAL-13: the read-only commands, the result views, and the log of the agent.
+- G-07 through VAL-14: the reading of the lock only. No fuzzing ran.
+
+They are not evidence for:
+
+- G-01: no policy decision ran against a host incident.
+- G-04 (VAL-08, VAL-09, VAL-12): no signed peer, no grant, and one user.
+- G-08 and VAL-15: no budget is approved, so the measurements are characterization.
+- VAL-07: no crash at a journal or action boundary.
+- VAL-16: no signed installed artifact.
+- Automatic eviction or automatic application control: no grant existed and each rule is `proposed`.
+- The GPUI client, sleep and wake, a crash and restart, a disabled login item, and a non-local root.
+
+The evidence files are not tracked. Whether a record with untracked evidence meets section 12 ("Evidence references must resolve to retained logs") is a decision of the project owner.
 
 ## References
 

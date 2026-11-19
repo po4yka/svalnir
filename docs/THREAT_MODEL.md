@@ -1,10 +1,10 @@
 # Svalnir Threat Model
 
-**Last reviewed:** 2026-11-16
+**Last reviewed:** 2026-11-19
 
 > **Status:** Design specification. Controls described as requirements are not claims that an implementation, security audit, or release validation already exists.
 >
-> **Scope:** Svalnir's initial macOS release: Rust core, `clap` CLI, GPUI application, persistent per-user agent, and optional narrow privileged helper. Automatic cache eviction and automatic application termination, including force quit, are included.
+> **Scope:** Svalnir's initial macOS release: Rust core, `clap` CLI, GPUI application, and persistent per-user agent. Automatic cache eviction and automatic application termination, including force quit, are included. The initial release has no privileged helper (owner decision of 2026-11-19): its code is not registered and not called. The threats and the controls of the narrow privileged helper stay in this model for the release that adds it, and each threat identifier keeps its number.
 >
 > **Related documents:** [README](../README.md) and [Architecture](ARCHITECTURE.md) define the product and component baseline. [Policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), [cleanup rules](CLEANUP_RULES.md), [resource model](RESOURCE_MODEL.md), and [interfaces](INTERFACES.md) specify the controls named here. [Validation plan](VALIDATION.md) owns the release gates. [CONTRIBUTING](../CONTRIBUTING.md) and [AGENTS](../AGENTS.md) give working instructions.
 
@@ -68,9 +68,9 @@ Code identity is not evidence of human intent. A malicious process can launch a 
 | CLI or GPUI client → per-user agent | Authenticate the live peer and principal; validate bounded typed requests; apply the same policy and target checks for both clients |
 | Agent → macOS observation APIs | Treat missing, denied, stale, or inconsistent observations as distinct states; never replace failure with zero |
 | Agent → user-owned files or applications | Use the requesting user's privileges; enforce action grants, target identity, exclusions, and budgets |
-| Agent → privileged helper | Authenticate the specific permitted client identity and session; independently enforce helper-owned privilege grants |
+| Agent → privileged helper (after the initial release) | Authenticate the specific permitted client identity and session; independently enforce helper-owned privilege grants |
 | Agent → catalog and journal | Treat stored plans as stale observations; protect state files and validate decoded records |
-| Helper → its own state and host coordination | Use root-owned storage and scoped leases; never trust user storage as administrative authority |
+| Helper → its own state and host coordination (after the initial release) | Use root-owned storage and scoped leases; never trust user storage as administrative authority |
 | Release artifacts → installed services | Verify signed artifacts and compatibility before enabling mutation; protect privileged executable locations |
 
 Apple supplies native XPC peer code-signing requirement APIs. The implementation must use supported APIs appropriate to the selected deployment target and verify their failure behavior; executable paths, process names, or a Team ID alone are insufficient identity policy. See [Apple's XPC API][xpc-requirement].
@@ -89,7 +89,7 @@ Configuration proposes behavior. It cannot create a privilege grant. A user-writ
 
 The helper accepts only compiled, reviewed operation types and supported adapter versions. It independently checks its current grant, target constraints, request freshness, and limits. It binds each delegated step to the user and the login session of the caller that it accepted, and it refuses a request with no login session and each request for that step from another login session ([INTERFACES.md](INTERFACES.md) section 10). It accepts a request only when the grant applies until the expiry of the request, so no accepted step is executed after the expiry of its grant; a step that was in work when the helper stopped has an unknown outcome and is not accepted a second time ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 11). It does not load executable rules from a user directory, open the user's catalog as authoritative policy, run caller-provided shell commands, or implement unrestricted recursive deletion.
 
-Ordinary cache eviction runs with the owning user's privileges, including separately granted privacy access. Initial privileged filesystem mutation is restricted to helper-owned data or specifically reviewed administrator-controlled disposable namespaces. User-writable cache trees do not gain a generic root override. Privileged process control defaults to the requesting user's verified eligible applications or managed jobs. Root, system, and other-user processes remain protected unless a separately designed administrative integration supports them.
+Ordinary cache eviction runs with the owning user's privileges, including separately granted privacy access. The initial release has no privileged filesystem mutation. When the helper is added, its first privileged filesystem mutation is restricted to helper-owned data or specifically reviewed administrator-controlled disposable namespaces. User-writable cache trees do not gain a generic root override. Privileged process control defaults to the requesting user's verified eligible applications or managed jobs. Root, system, and other-user processes remain protected unless a separately designed administrative integration supports them.
 
 ## 5. Threat catalogue
 

@@ -34,7 +34,7 @@ pub const MIN_CARD_WIDTH: f32 = 320.0;
 /// The least width of a table column. The component gives a column 100 px
 /// for each unit of its span, which is wider than a card of 320 px; the span
 /// stays the relative width.
-const CELL_MIN_WIDTH: gpui_kit::Pixels = px(48.0);
+pub const CELL_MIN_WIDTH: gpui_kit::Pixels = px(48.0);
 
 /// How a card reads a loadable value.
 #[derive(Debug, Clone)]

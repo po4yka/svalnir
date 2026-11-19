@@ -11,9 +11,9 @@ use super::{
         GenerationRow, GrantRow, GroupKind, Growth, GuardDetail, HISTORY_ROWS_MAX, HistorySnapshot,
         IncidentRow, IncidentUsage, JournalRow, JournalUsageRow, MemorySnapshot, Need,
         OperationDetail, PauseKind, PauseRow, ProcessRow, ProcessesSnapshot, Protection,
-        ProtectionReason, RevisionRow, StartFailureRow, StatusAge, ThresholdQuantity, ThresholdRow,
-        TriggerRow, UnknownCause, UsageRow, Verdict, rank_applications, rank_processes,
-        refine_phase,
+        ProtectionReason, RevisionRow, StartFailureRow, StatusAge, StepDetail, TargetDetail,
+        ThresholdQuantity, ThresholdRow, TriggerRow, UnknownCause, UsageRow, Verdict,
+        rank_applications, rank_processes, refine_phase,
     },
 };
 use std::{
@@ -850,7 +850,37 @@ fn operation_detail(operation: &Operation, resources: Vec<EffectRow>) -> Operati
             None => effects.push((name.to_owned(), 1)),
         }
     }
+    let step_details: Vec<StepDetail> = operation
+        .steps()
+        .iter()
+        .map(|step| StepDetail {
+            step_id: step.step_id().to_string(),
+            action_class: step.action_class().as_str().to_owned(),
+            target_id: step.target_id().to_string(),
+            state: step.progress().state().as_str().to_owned(),
+            dispatch: step.progress().dispatch().as_str().to_owned(),
+        })
+        .collect();
+    let targets: Vec<TargetDetail> = operation
+        .target_results()
+        .iter()
+        .map(|result| TargetDetail {
+            target_id: result.target_id.to_string(),
+            member: result.member.as_ref().map(ToString::to_string),
+            effect: result.effect.as_str().to_owned(),
+            dispatch: result.dispatch.as_str().to_owned(),
+            stop_reason: result.stop_reason.as_str().to_owned(),
+            attribution: result.attribution.as_str().to_owned(),
+            error: result
+                .failure
+                .as_ref()
+                .map(|failure| format!("{} at {}", failure.code.as_str(), failure.stage.as_str())),
+        })
+        .collect();
     OperationDetail {
+        plan_id: operation.plan_id().to_string(),
+        step_details,
+        targets,
         operation_id: operation.operation_id().to_string(),
         phase: refine_phase(phase, &steps),
         state_text,
@@ -1593,6 +1623,20 @@ eligible_groups = ["background-user-applications", "managed-jobs"]
         );
         assert_eq!(operation.resources, vec![EffectRow::Unrecognized]);
         assert_eq!(operation.effects, Vec::new());
+        // The detail view has each step of the plan with its state and its
+        // dispatch, and the plan of the operation.
+        assert_ne!(operation.plan_id, String::new());
+        assert_eq!(operation.step_details.len(), operation.steps.len());
+        assert!(
+            operation
+                .step_details
+                .iter()
+                .all(|step| step.state == "Admitted" && step.dispatch == "not_submitted"),
+            "{:?}",
+            operation.step_details
+        );
+        assert_eq!(operation.targets, Vec::new());
+        assert_eq!(operation.errors(), Vec::<&str>::new());
 
         // Diagnostics: the status record of the agent.
         let service: DiagnosticsSnapshot = diagnostics(Some(directory));

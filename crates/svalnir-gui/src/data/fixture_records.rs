@@ -12,8 +12,8 @@ use super::{
         GenerationRow, GrantRow, GroupKind, Growth, GuardDetail, HistorySnapshot, IncidentRow,
         IncidentUsage, JournalRow, JournalUsageRow, MemorySnapshot, Need, OperationDetail,
         PauseKind, PauseRow, ProcessRow, ProcessesSnapshot, Protection, ProtectionReason,
-        RevisionRow, StartFailureRow, StatusAge, ThresholdRow, TriggerRow, UnknownCause, UsageRow,
-        Verdict, rank_applications, rank_processes,
+        RevisionRow, StartFailureRow, StatusAge, StepDetail, TargetDetail, ThresholdRow,
+        TriggerRow, UnknownCause, UsageRow, Verdict, rank_applications, rank_processes,
     },
 };
 use std::{
@@ -631,6 +631,10 @@ fn names(items: &[&str]) -> Vec<String> {
 }
 
 /// The operations of the fixture journal, newest first.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one literal list of the fixture operations"
+)]
 fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail> {
     let capacity = |before: u64, after: u64| EffectRow::Capacity {
         before: Measured::Value(before),
@@ -648,6 +652,9 @@ fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail
             steps: names(&["Completed", "Completed", "Completed"]),
             effects: vec![("Removed".to_owned(), 3)],
             resources: vec![capacity(22 * GB, 31 * GB + 400 * MB)],
+            plan_id: String::new(),
+            step_details: Vec::new(),
+            targets: Vec::new(),
         },
         OperationDetail {
             operation_id: "op_fixture_0000".to_owned(),
@@ -665,6 +672,9 @@ fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail
             ],
             // A move to the Trash has no capacity observation.
             resources: Vec::new(),
+            plan_id: String::new(),
+            step_details: Vec::new(),
+            targets: Vec::new(),
         },
         OperationDetail {
             operation_id: "op_fixture_00zz".to_owned(),
@@ -680,6 +690,9 @@ fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail
                 before: Measured::Value("critical".to_owned()),
                 after: Measured::Unavailable("the reading failed".to_owned()),
             }],
+            plan_id: String::new(),
+            step_details: Vec::new(),
+            targets: Vec::new(),
         },
         OperationDetail {
             operation_id: "op_fixture_00yy".to_owned(),
@@ -692,6 +705,9 @@ fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail
             steps: names(&["Failed"]),
             effects: vec![("Refused".to_owned(), 1)],
             resources: Vec::new(),
+            plan_id: String::new(),
+            step_details: Vec::new(),
+            targets: Vec::new(),
         },
         OperationDetail {
             operation_id: "op_fixture_00xx".to_owned(),
@@ -704,6 +720,9 @@ fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail
             steps: names(&["NoAction"]),
             effects: vec![("AlreadyAbsent".to_owned(), 1)],
             resources: Vec::new(),
+            plan_id: String::new(),
+            step_details: Vec::new(),
+            targets: Vec::new(),
         },
     ];
     if scenario == FixtureScenario::Pressure {
@@ -720,10 +739,90 @@ fn operations(now: SystemTime, scenario: FixtureScenario) -> Vec<OperationDetail
                 steps: names(&["Completed", "Verifying", "Admitted"]),
                 effects: vec![("ExitVerified".to_owned(), 1)],
                 resources: Vec::new(),
+                plan_id: String::new(),
+                step_details: Vec::new(),
+                targets: Vec::new(),
             },
         );
     }
-    list
+    list.into_iter().map(with_detail).collect()
+}
+
+/// The error that a fixture target result of the effect `effect` has.
+fn fixture_error(effect: &str) -> Option<String> {
+    match effect {
+        "Refused" => Some("target_protected at admission".to_owned()),
+        "Skipped" => Some("target_changed at revalidation".to_owned()),
+        "UnknownOutcome" => Some("exit_not_observed at verification".to_owned()),
+        _ => None,
+    }
+}
+
+/// `operation` with the plan, the step details, and the target results
+/// that its step states and effect counts name: one target for each step,
+/// in the order of the plan.
+fn with_detail(mut operation: OperationDetail) -> OperationDetail {
+    let suffix: &str = operation
+        .operation_id
+        .strip_prefix("op_")
+        .unwrap_or(&operation.operation_id);
+    operation.plan_id = format!("plan_{suffix}");
+    let class: String = operation
+        .action_classes
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    operation.step_details = operation
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, state)| StepDetail {
+            step_id: format!("step_{suffix}_{}", index + 1),
+            action_class: operation
+                .action_classes
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| class.clone()),
+            target_id: format!("target_{suffix}_{}", index + 1),
+            state: state.clone(),
+            dispatch: if state == "Admitted" || state == "NoAction" {
+                "not_submitted".to_owned()
+            } else {
+                "submitted".to_owned()
+            },
+        })
+        .collect();
+    let mut number: usize = 0;
+    operation.targets = operation
+        .effects
+        .iter()
+        .flat_map(|(effect, count)| std::iter::repeat_n(effect.clone(), *count))
+        .map(|effect| {
+            number += 1;
+            TargetDetail {
+                target_id: format!("target_{suffix}_{number}"),
+                member: None,
+                dispatch: if effect == "Refused" || effect == "Skipped" {
+                    "not_submitted".to_owned()
+                } else {
+                    "submitted".to_owned()
+                },
+                stop_reason: if fixture_error(&effect).is_some() {
+                    "error".to_owned()
+                } else {
+                    "completed".to_owned()
+                },
+                attribution: if effect == "Removed" || effect == "ExitVerified" {
+                    "caused_by_action".to_owned()
+                } else {
+                    "not_attributed".to_owned()
+                },
+                error: fixture_error(&effect),
+                effect,
+            }
+        })
+        .collect();
+    operation
 }
 
 /// The history of `scenario`.

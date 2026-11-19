@@ -49,6 +49,15 @@ fn open(
     (handle, view)
 }
 
+fn click(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id.to_owned(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 fn label(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> Option<String> {
     let mut found: Option<String> = None;
     cx.update_window(handle, |_, window, cx| {
@@ -548,5 +557,62 @@ fn the_agent_list_is_unavailable_with_a_reason_when_no_current_summary_exists(
         assert_eq!(label(handle, "diagnostics-agent-verdict", cx), None);
         // The list of this window stays.
         assert!(label(handle, "diagnostics-list-window", cx).is_some());
+    }
+}
+
+#[gpui_kit::test]
+fn history_filters_sorts_and_opens_the_detail_of_one_operation(cx: &mut TestAppContext) {
+    let (handle, _view) = open(FixtureScenario::Pressure, Screen::History, cx);
+    let bound = label(handle, "history-bound", cx).expect("bound");
+    assert!(bound.contains("not to the whole journal"), "{bound}");
+    assert!(bound.ends_with("6 of 6 shown."), "{bound}");
+    // The trigger filter: the values come in the order of the read, newest
+    // first (global_critical_memory, disk_pressure, manual, ...), so
+    // "manual" has index 2.
+    click(handle, "history-filter-trigger-2", cx);
+    let bound = label(handle, "history-bound", cx).expect("bound");
+    assert!(bound.ends_with("2 of 6 shown."), "{bound}");
+    assert!(label(handle, "history-operation-op_fixture_0000", cx).is_some());
+    assert_eq!(label(handle, "history-operation-op_fixture_0001", cx), None);
+    click(handle, "history-filter-trigger-all", cx);
+    let bound = label(handle, "history-bound", cx).expect("bound");
+    assert!(bound.ends_with("6 of 6 shown."), "{bound}");
+
+    click(handle, "history-sort-outcome", cx);
+    assert!(label(handle, "history-sort-outcome", cx).is_some());
+
+    click(handle, "history-details-op_fixture_0000", cx);
+    assert_eq!(
+        label(handle, "history-detail-trigger", cx).as_deref(),
+        Some("Trigger: manual, started by the user")
+    );
+    assert!(
+        label(handle, "history-detail-step-step_fixture_0000_2", cx)
+            .expect("step")
+            .starts_with("Step Failed: ")
+    );
+    let target = label(handle, "history-detail-target-2", cx).expect("target");
+    assert!(
+        target.contains("error target_protected at admission"),
+        "{target}"
+    );
+    assert_eq!(
+        label(handle, "history-detail-error-0", cx).as_deref(),
+        Some("Error: target_protected at admission")
+    );
+    assert_eq!(
+        label(handle, "history-detail-observed-0", cx).as_deref(),
+        Some("No measurement in the journal")
+    );
+    click(handle, "history-detail-close", cx);
+    assert_eq!(label(handle, "history-detail-trigger", cx), None);
+}
+
+#[gpui_kit::test]
+fn history_has_no_filter_when_nothing_was_read(cx: &mut TestAppContext) {
+    for scenario in [FixtureScenario::Unavailable, FixtureScenario::AgentAbsent] {
+        let (handle, _view) = open(scenario, Screen::History, cx);
+        assert_eq!(label(handle, "history-bound", cx), None, "{scenario:?}");
+        assert_eq!(label(handle, "history-filter-trigger-all", cx), None);
     }
 }

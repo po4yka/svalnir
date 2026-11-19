@@ -722,6 +722,42 @@ pub enum EffectRow {
     Unrecognized,
 }
 
+/// One step of an operation, for the detail view of History.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepDetail {
+    /// The step identity.
+    pub step_id: String,
+    /// The action class of the step.
+    pub action_class: String,
+    /// The target of the step.
+    pub target_id: String,
+    /// The state name of the step.
+    pub state: String,
+    /// Whether the external call of the step was submitted, as its name.
+    pub dispatch: String,
+}
+
+/// One target result of an operation, for the detail view of History.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetDetail {
+    /// The target.
+    pub target_id: String,
+    /// The member of an application target that the result is for. `None`:
+    /// the result is for the target as a whole.
+    pub member: Option<String>,
+    /// The observed effect, as its name.
+    pub effect: String,
+    /// Whether the call for the target was submitted, as its name.
+    pub dispatch: String,
+    /// Why work on the target stopped, as its name.
+    pub stop_reason: String,
+    /// Whether the action caused the observed condition, as its name.
+    pub attribution: String,
+    /// The error of a target that was skipped, refused, or failed: the code
+    /// and the stage, for example `target_protected at admission`.
+    pub error: Option<String>,
+}
+
 /// One operation of the journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationDetail {
@@ -747,6 +783,31 @@ pub struct OperationDetail {
     /// The resource observations. Empty: the journal has no measurement,
     /// which is not a measurement of no change.
     pub resources: Vec<EffectRow>,
+    /// The plan that the operation applies.
+    pub plan_id: String,
+    /// Each step, in the order of the plan.
+    pub step_details: Vec<StepDetail>,
+    /// Each target result, in execution sequence.
+    pub targets: Vec<TargetDetail>,
+}
+
+impl OperationDetail {
+    /// The error of each target result that has one, each one time, in the
+    /// order of the first occurrence.
+    #[must_use]
+    pub fn errors(&self) -> Vec<&str> {
+        let mut errors: Vec<&str> = Vec::new();
+        for error in self
+            .targets
+            .iter()
+            .filter_map(|target| target.error.as_deref())
+        {
+            if !errors.contains(&error) {
+                errors.push(error);
+            }
+        }
+        errors
+    }
 }
 
 /// The latest operations of the journal.

@@ -192,6 +192,11 @@ const EMPTY_STATE_COMMANDS: &[(&[&str], u8, Option<&str>)] = &[
         2,
         Some("invalid_grace"),
     ),
+    (
+        &["processes", "stop", "--group", "app/1", "--yes"],
+        2,
+        Some("invalid_group"),
+    ),
     (&["agent", "status"], 0, None),
     (&["agent", "uninstall"], 3, Some("approval_required")),
     (
@@ -399,6 +404,15 @@ fn incompatible_arguments_fail_before_dispatch() {
             "--grace",
             "10",
         ],
+        &["processes", "stop"],
+        &[
+            "processes",
+            "stop",
+            "--target",
+            "pg-1-1",
+            "--group",
+            "app-1-1",
+        ],
         &["status", "--timeout", "soon"],
         &["status", "--timeout", "0s"],
         &["agent", "pause", "--for", "0m"],
@@ -517,6 +531,11 @@ fn completions_cover_the_command_surface() {
         assert_eq!(outcome.status, ExitStatus::Success);
         assert!(outcome.stdout.contains("svalnir"));
         assert!(outcome.stdout.contains("force-after-timeout"));
+        // Fish names a long option with `-l`.
+        assert!(
+            outcome.stdout.contains("--group") || outcome.stdout.contains("-l group"),
+            "{shell}"
+        );
         assert_eq!(outcome.stderr, "");
     }
 }

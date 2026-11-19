@@ -356,7 +356,9 @@ fn waits_for_an_operation(command: &Command) -> bool {
         Command::Clean {
             command: CleanCommand::Apply(_)
         } | Command::Operations {
-            command: OperationsCommand::Wait(_) | OperationsCommand::Acknowledge(_)
+            command: OperationsCommand::Wait(_)
+                | OperationsCommand::Cancel(_)
+                | OperationsCommand::Acknowledge(_)
         } | Command::Processes {
             command: ProcessesCommand::Stop(_)
         } | Command::Policy {

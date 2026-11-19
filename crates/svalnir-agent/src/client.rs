@@ -15,14 +15,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use svalnir_core::action::{ClientRole, Principal};
+use svalnir_core::authority::AuthorityBinding;
 use svalnir_core::config::{ValidatedConfig, parse_and_validate};
 use svalnir_core::digest::ContentDigest;
+use svalnir_core::file::LosslessPath;
 use svalnir_core::grant::{
     Acknowledged, ActiveRevision, AuthorityState, Change, InstanceInhibition, Persistence,
 };
-use svalnir_core::id::RequestId;
-use svalnir_core::plan::{StopLimits, StopStrategy};
-use svalnir_core::policy::{ContinuityGeneration, EvaluationClock};
+use svalnir_core::id::{ApplicationInstanceId, PlanId, RequestId, StepId, TargetId};
+use svalnir_core::plan::{
+    PlanBuildError, PlanContext, PlanOutcome, StopLimits, StopRequest, StopStepIds, StopStrategy,
+    build_stop_plan, manual_plan_lifetime,
+};
+use svalnir_core::policy::{
+    ApplicationCandidate, ContinuityGeneration, EvaluationClock, ProtectionContext,
+};
+use svalnir_core::process::VerifiedMembership;
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::WallTime;
 
@@ -32,6 +40,7 @@ use crate::journal::{
 };
 use crate::observe::{self, CoordinatorPresence, StoredAuthority};
 use crate::platform::memory::{ClockError, CollectionContext};
+use crate::platform::process::{ProcessSnapshot, application_candidates};
 
 /// Which process holds the coordinator lock of a journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +363,127 @@ pub fn active_config(
         active: active.clone(),
         config,
     })
+}
+
+/// The application or managed-job instance of `candidate`: the instance
+/// of the verified membership of its members. `None` for a candidate with
+/// no member that has a verified membership.
+#[must_use]
+pub fn candidate_instance(candidate: &ApplicationCandidate) -> Option<&ApplicationInstanceId> {
+    match candidate
+        .processes
+        .first()?
+        .association
+        .verified_membership()?
+    {
+        VerifiedMembership::Application { instance_id, .. }
+        | VerifiedMembership::ManagedJob { instance_id, .. } => Some(instance_id),
+    }
+}
+
+/// The candidate of the application or managed-job instance `instance` in
+/// `snapshot`, from [`application_candidates`]: only the processes with a
+/// verified membership in the instance are its members, never the
+/// processes that have the same name.
+///
+/// `None` when the snapshot has no verified member of the instance, or
+/// when the instance has no candidate because no membership identity or
+/// footprint observation can be made for it.
+#[must_use]
+pub fn group_candidate(
+    snapshot: &ProcessSnapshot,
+    protection: &ProtectionContext<'_>,
+    instance: &ApplicationInstanceId,
+) -> Option<ApplicationCandidate> {
+    application_candidates(snapshot, protection)
+        .into_iter()
+        .find(|candidate| candidate_instance(candidate) == Some(instance))
+}
+
+/// The inputs of the plan of a manual stop.
+#[derive(Debug, Clone, Copy)]
+pub struct ManualStopPlan<'a> {
+    /// The identity text of the plan, from [`new_id`]. The target and the
+    /// steps have identities that start with it.
+    pub plan_id: &'a str,
+    /// The principal of the plan.
+    pub principal: &'a Principal,
+    /// The revision in effect, which the plan binds.
+    pub active: &'a ActiveRevision,
+    /// The validated configuration of the revision.
+    pub config: &'a ValidatedConfig,
+    /// The clock of the plan.
+    pub clock: &'a EvaluationClock,
+    /// The wall-clock time of the plan.
+    pub created_wall: WallTime,
+    /// The canonical home directory, for the protections of the
+    /// configuration.
+    pub home_directory: Option<&'a LosslessPath>,
+    /// The processes to stop: one process, or the verified members of one
+    /// instance.
+    pub candidate: &'a ApplicationCandidate,
+    /// The protection context of the client.
+    pub protection: &'a ProtectionContext<'a>,
+    /// The strategy and the durations, from [`manual_stop`].
+    pub strategy: StopStrategy,
+    /// The durations of the stop, from [`manual_stop`].
+    pub limits: StopLimits,
+}
+
+/// Why the plan of a manual stop was not built.
+#[derive(Debug, thiserror::Error)]
+pub enum ManualStopError {
+    /// An identity of the plan, of its target, or of a step is not valid.
+    #[error("an identity of the plan is not valid")]
+    Identity,
+    /// The plan builder refused the request.
+    #[error("{0}")]
+    Build(PlanBuildError),
+}
+
+/// Builds the plan of a manual stop with [`build_stop_plan`], as each
+/// client does: the plan binds the revision in effect and no grant, and it
+/// has the lifetime of a manual plan of the configuration.
+///
+/// The result has no plan when the builder left the candidate out, for
+/// example for a protection; its preview has the reasons.
+///
+/// # Errors
+///
+/// Returns [`ManualStopError::Identity`] for an identity that is not valid,
+/// and [`ManualStopError::Build`] when the builder refuses the request or
+/// the configuration has no usable lifetime of a manual plan
+/// ([`PlanBuildError::Lifetime`]).
+pub fn build_manual_stop(input: &ManualStopPlan<'_>) -> Result<PlanOutcome, ManualStopError> {
+    let identity = |suffix: &str| format!("{}-{suffix}", input.plan_id);
+    let lifetime: Nanoseconds = manual_plan_lifetime(input.config)
+        .ok_or(ManualStopError::Build(PlanBuildError::Lifetime))?;
+    let context = PlanContext {
+        plan_id: PlanId::new(input.plan_id).map_err(|_| ManualStopError::Identity)?,
+        principal: input.principal.clone(),
+        authority: AuthorityBinding {
+            policy_revision: input.active.revision.revision_id.clone(),
+            action_grants: Vec::new(),
+            privilege_grant: None,
+        },
+        clock: input.clock,
+        created_wall: input.created_wall,
+        lifetime,
+        protections: input.config.protections(),
+        home_directory: input.home_directory,
+    };
+    let request = StopRequest {
+        target_id: TargetId::new(identity("app")).map_err(|_| ManualStopError::Identity)?,
+        candidate: input.candidate,
+        protection: input.protection,
+        strategy: input.strategy,
+        steps: StopStepIds {
+            graceful: StepId::new(identity("graceful")).map_err(|_| ManualStopError::Identity)?,
+            force: StepId::new(identity("force")).map_err(|_| ManualStopError::Identity)?,
+        },
+        limits: input.limits,
+    };
+    build_stop_plan(&context, &request).map_err(ManualStopError::Build)
 }
 
 #[cfg(test)]

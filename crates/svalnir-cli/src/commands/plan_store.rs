@@ -16,7 +16,9 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::file::{FileObjectEvidence, LosslessPath};
-use svalnir_core::id::{OperationId, PlanId, ProcessGenerationId, RootId, ScanId};
+use svalnir_core::id::{
+    ApplicationInstanceId, OperationId, PlanId, ProcessGenerationId, RootId, ScanId,
+};
 use svalnir_core::plan::{PlanOutcome, StopKind};
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::volume::VolumeIdentity;
@@ -28,7 +30,7 @@ use crate::output::{ErrorBody, ErrorFamily, ErrorStage, NextAction};
 /// The version of the document format. A development build has one
 /// format: a document of a different version is refused, with no
 /// migration.
-const DOCUMENT_VERSION: u32 = 2;
+const DOCUMENT_VERSION: u32 = 3;
 
 /// The code of a stored plan or plan document of a different schema
 /// version.
@@ -67,8 +69,8 @@ pub(crate) struct PlanDocument {
     pub(crate) roots: Vec<RootRecord>,
     /// The scan of a cleanup plan.
     pub(crate) scan_id: Option<ScanId>,
-    /// The process of a stop plan.
-    pub(crate) stop_target: Option<ProcessGenerationId>,
+    /// The process or the group of a stop plan.
+    pub(crate) stop_target: Option<StopKey>,
     /// The operation of the plan, after its admission.
     pub(crate) operation_id: Option<OperationId>,
     /// The measurements of the operation, when this client executed it.
@@ -91,12 +93,37 @@ impl PlanDocument {
     }
 }
 
+/// What a stop request names: one process generation (`--target`), or one
+/// application or managed-job instance (`--group`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub(crate) enum StopKey {
+    /// One process generation.
+    Process(ProcessGenerationId),
+    /// The verified members of one application or managed-job instance.
+    Group(ApplicationInstanceId),
+}
+
+impl StopKey {
+    /// The stem of the stop record and of the lock file. The two kinds
+    /// have different stems, so a process and a group never share a
+    /// record. Each identity has only letters, digits, `.`, `_`, `:`, and
+    /// `-`, so the stem is one file name.
+    fn stem(&self) -> String {
+        match self {
+            Self::Process(target) => format!("stop-{target}"),
+            Self::Group(instance) => format!("stop-group-{instance}"),
+        }
+    }
+}
+
 /// The record that binds a stop request to its plan, so that a repeated
-/// `processes stop` of the same process generation makes no second plan.
+/// `processes stop` of the same process generation or the same group makes
+/// no second plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StopRecord {
     pub(crate) schema_version: u32,
-    pub(crate) target: ProcessGenerationId,
+    pub(crate) target: StopKey,
     pub(crate) plan_id: PlanId,
     pub(crate) kind: StopKind,
     pub(crate) grace: Option<Nanoseconds>,
@@ -106,7 +133,7 @@ pub(crate) struct StopRecord {
 
 impl StopRecord {
     pub(crate) fn new(
-        target: ProcessGenerationId,
+        target: StopKey,
         plan_id: PlanId,
         kind: StopKind,
         grace: Option<Nanoseconds>,
@@ -158,13 +185,10 @@ fn plan_path(environment: &Environment, plan_id: &PlanId) -> Result<PathBuf, Err
         .join(format!("plan-{plan_id}.json")))
 }
 
-fn stop_path(
-    environment: &Environment,
-    target: &ProcessGenerationId,
-) -> Result<PathBuf, ErrorBody> {
+fn stop_path(environment: &Environment, target: &StopKey) -> Result<PathBuf, ErrorBody> {
     Ok(environment
         .plan_directory()?
-        .join(format!("stop-{target}.json")))
+        .join(format!("{}.json", target.stem())))
 }
 
 /// Writes a document beside its final name and renames it, so a reader
@@ -293,7 +317,7 @@ pub(crate) fn load_plan(
     Ok(document.filter(|document| &document.plan_id == plan_id))
 }
 
-/// Writes the stop record of a process generation.
+/// Writes the stop record of a process generation or a group.
 pub(crate) fn save_stop(environment: &Environment, record: &StopRecord) -> Result<(), ErrorBody> {
     write_document(
         environment,
@@ -302,10 +326,10 @@ pub(crate) fn save_stop(environment: &Environment, record: &StopRecord) -> Resul
     )
 }
 
-/// Reads the stop record of a process generation.
+/// Reads the stop record of a process generation or a group.
 pub(crate) fn load_stop(
     environment: &Environment,
-    target: &ProcessGenerationId,
+    target: &StopKey,
 ) -> Result<Option<StopRecord>, ErrorBody> {
     // A record that this build cannot interpret is not "no record": an
     // earlier request possibly sent a signal, so it permits no new plan.
@@ -321,7 +345,8 @@ pub(crate) fn load_stop(
     }
 }
 
-/// An exclusive lock for the stop requests of one process generation. It
+/// An exclusive lock for the stop requests of one process generation or
+/// one group. It
 /// is released when the value is dropped, and when the process ends.
 #[derive(Debug)]
 pub(crate) struct StopLock {
@@ -333,16 +358,16 @@ const LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Takes the lock of the stop requests of `target`, and waits at most
 /// `limit` for a different client that holds it. Two requests for one
-/// process generation then make one plan. A holder that does not release
-/// the lock gives an error and not an endless wait.
+/// process generation or one group then make one plan. A holder that does
+/// not release the lock gives an error and not an endless wait.
 pub(crate) fn lock_stop(
     environment: &Environment,
-    target: &ProcessGenerationId,
+    target: &StopKey,
     limit: Duration,
 ) -> Result<StopLock, ErrorBody> {
     environment.create_state_directory()?;
     let directory: PathBuf = plan_directory(environment)?;
-    let path: PathBuf = directory.join(format!("stop-{target}.lock"));
+    let path: PathBuf = directory.join(format!("{}.lock", target.stem()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -423,15 +448,15 @@ pub(crate) fn prune(environment: &Environment) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use svalnir_core::id::ProcessGenerationId;
+    use svalnir_core::id::{ApplicationInstanceId, ProcessGenerationId};
 
-    use super::lock_stop;
+    use super::{StopKey, lock_stop};
     use crate::test_support::environment;
 
     #[test]
     fn a_second_stop_request_does_not_wait_without_a_bound_for_the_lock() {
         let (environment, _directory) = environment();
-        let target = ProcessGenerationId::new("pg-4242-1").unwrap();
+        let target = StopKey::Process(ProcessGenerationId::new("pg-4242-1").unwrap());
         let first = lock_stop(&environment, &target, Duration::from_secs(10)).unwrap();
 
         let start = Instant::now();
@@ -443,5 +468,17 @@ mod tests {
 
         drop(first);
         lock_stop(&environment, &target, Duration::from_millis(200)).unwrap();
+    }
+
+    #[test]
+    fn a_process_and_a_group_have_different_records() {
+        let process = StopKey::Process(ProcessGenerationId::new("pg-4242-1").unwrap());
+        let group = StopKey::Group(ApplicationInstanceId::new("pg-4242-1").unwrap());
+        assert_ne!(process.stem(), group.stem());
+        assert_eq!(group.stem(), "stop-group-pg-4242-1");
+        // A lock of the process does not block a request for the group.
+        let (environment, _directory) = environment();
+        let _process = lock_stop(&environment, &process, Duration::from_secs(1)).unwrap();
+        lock_stop(&environment, &group, Duration::from_millis(100)).unwrap();
     }
 }

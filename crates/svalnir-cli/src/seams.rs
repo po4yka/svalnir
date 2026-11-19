@@ -325,6 +325,23 @@ impl Debug for WhileAsked {
     }
 }
 
+/// A change that a test makes to the process reading of `processes stop`:
+/// it gives disposable children of the test a verified membership, which a
+/// child of a test does not have on the host, or it records a different
+/// start time, as for a process that the host replaced after the reading.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ProcessReading(
+    pub(crate) Arc<dyn Fn(&mut svalnir_agent::platform::process::ProcessSnapshot) + Send + Sync>,
+);
+
+#[cfg(test)]
+impl Debug for ProcessReading {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProcessReading")
+    }
+}
+
 /// The values that a test sets in place of the host.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
@@ -353,6 +370,9 @@ pub(crate) struct TestSeams {
     /// environment with no evidence, so that no test reads the process
     /// table of the host.
     pub(crate) discovery_environment: Option<TestEnvironment>,
+    /// A change of the process reading of `processes stop`. `None`: the
+    /// reading of the host, unchanged.
+    pub(crate) process_reading: Option<ProcessReading>,
 }
 
 /// The discovery environment of a test.
@@ -482,6 +502,27 @@ impl Seams {
         {
             Box::new(SystemTrash)
         }
+    }
+
+    /// Applies the change of the process reading that a test set. A
+    /// build that is not a test changes nothing.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "a test build reads the values of the test"
+        )
+    )]
+    pub(crate) fn edit_process_reading(
+        &self,
+        snapshot: &mut svalnir_agent::platform::process::ProcessSnapshot,
+    ) {
+        #[cfg(test)]
+        if let Some(ProcessReading(edit)) = &self.test.process_reading {
+            edit(snapshot);
+        }
+        #[cfg(not(test))]
+        let _ = snapshot;
     }
 
     /// The service host.

@@ -350,10 +350,26 @@ pub struct TargetRef {
     pub target: String,
 }
 
+/// What `processes stop` stops: one process generation, or the verified
+/// members of one application or managed-job instance.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct StopSubject {
+    /// Identifier of one process generation, from `svalnir processes top`.
+    #[arg(long, value_name = "TARGET_ID")]
+    pub target: Option<String>,
+    /// Identifier of an application or managed-job instance, from the
+    /// `Instance` field of `svalnir processes show`. The plan binds each
+    /// process with a verified membership in the instance, and no process
+    /// only because it has the same name.
+    #[arg(long, value_name = "INSTANCE_ID")]
+    pub group: Option<String>,
+}
+
 #[derive(Debug, Args)]
 pub struct ProcessesStopArgs {
     #[command(flatten)]
-    pub target: TargetRef,
+    pub subject: StopSubject,
     /// Time that the target has to exit after the graceful request.
     #[arg(long, value_name = "DURATION", value_parser = positive_duration)]
     pub grace: Option<Duration>,

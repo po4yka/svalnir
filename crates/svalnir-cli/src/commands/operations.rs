@@ -2,18 +2,27 @@
 //! `operations acknowledge`.
 //!
 //! Each command reads the operation record of the journal. `show` and
-//! `wait` change nothing. `cancel` sets the stop fence of the operation in
-//! the journal: the executor dispatches no further step after it reads the
-//! fence. A call that the executor issued is not recalled. `acknowledge`
+//! `wait` change nothing. `cancel` stops the dispatch of the later steps.
+//! When the agent holds the coordinator lock, `cancel` writes a cancel
+//! request to the request queue of the journal, as the GPUI client does,
+//! and the agent decides it: it checks the principal, stops the operation
+//! in its executor, and records the stop fence. With no agent, or when the
+//! agent does not serve the request in the wait, the client sets the stop
+//! fence of the operation in the journal itself: the executor dispatches
+//! no further step after it reads the fence. A call that the executor
+//! issued is not recalled. `acknowledge`
 //! records that the user accepts the unknown outcome of an operation: the
 //! coordinator releases its leases, and the result stays `UnknownOutcome`.
 
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use svalnir_agent::journal::{OperationJournal, OperationJournalError};
-use svalnir_core::action::{Operation, OperationState};
-use svalnir_core::id::OperationId;
+use svalnir_agent::client::{self, AgentPresence};
+use svalnir_agent::journal::{
+    OperationJournal, OperationJournalError, QueuedRequest, RequestBody, RequestCompletion,
+};
+use svalnir_core::action::{Operation, OperationState, StopFence};
+use svalnir_core::id::{OperationId, RequestId};
 
 use super::apply::{ApplyView, target_paths};
 use super::execution::{self, Executor};
@@ -34,6 +43,11 @@ const LOCK_CHECK_INTERVAL: u32 = 10;
 /// How long `operations cancel` waits for the executor to settle the
 /// operation after the fence, before it reports the fence alone.
 const SETTLE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long `operations cancel` waits for the agent to serve its queued
+/// request when the command has no `--timeout`. After the wait, the client
+/// writes the stop fence itself.
+const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
 const NO_COORDINATOR_NOTE: &str = "No process holds the coordinator lock, so no process executes this operation now. The next coordinator reconciles it from fresh evidence before it admits other work; it does not dispatch it again.";
 
@@ -219,18 +233,41 @@ pub(crate) fn wait(
     invocation.emit_with_status(Kind::Operation, &view, ApplyView::render, status)
 }
 
+/// How `operations cancel` reached the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CancelPath {
+    /// The agent served the cancel request of the queue.
+    RequestQueue,
+    /// This client wrote the stop fence in the journal: no agent holds the
+    /// coordinator lock, or the agent did not serve the request in the
+    /// wait.
+    StopFence,
+    /// The operation was settled before the request, so nothing was
+    /// written.
+    None,
+}
+
 /// The result of `operations cancel`.
 #[derive(Debug, Clone, Serialize)]
 struct CancelView {
     operation_id: OperationId,
     /// The acknowledgement that the request reached
     /// (`docs/INTERFACES.md` section 12): `durable_stop_fence` when the
-    /// journal has the fence and the operation is not settled, and
-    /// `settled` when the operation has its final record.
+    /// journal has the fence and the operation is not settled,
+    /// `current_instance` when the agent stopped the operation in its
+    /// executor but the journal did not take the fence, and `settled` when
+    /// the operation has its final record.
     acknowledgement: &'static str,
-    /// True when this request wrote the fence. False when the operation
-    /// was settled before the request.
+    /// True when this request wrote the durable fence, or the agent wrote
+    /// it for this request. False when the operation was settled before
+    /// the request, and for `current_instance`.
     fence_written: bool,
+    /// How the request reached the operation.
+    path: CancelPath,
+    /// The identity of the queue request, when the request went to the
+    /// queue.
+    request_id: Option<RequestId>,
     coordinator: CoordinatorPresence,
     operation: OperationReport,
     notes: Vec<&'static str>,
@@ -241,6 +278,10 @@ const CANCEL_NOTE: &str = "A cancel stops the dispatch of further steps. It does
 const SETTLED_BEFORE_NOTE: &str =
     "The operation had its final record before the request, so the request changed nothing.";
 
+const NOT_SERVED_NOTE: &str = "The agent did not serve the cancel request before the end of the wait, so this client wrote the stop fence in the journal itself. The request stays in the queue; the agent finds the fence when it serves it.";
+
+const CURRENT_INSTANCE_NOTE: &str = "The agent stopped the operation in its executor, but the journal did not take the stop fence. A restart of the agent before the operation settles does not keep the stop.";
+
 impl CancelView {
     fn render(&self) -> String {
         let mut out = String::new();
@@ -250,7 +291,18 @@ impl CancelView {
             self.operation_id,
             match self.acknowledgement {
                 "settled" => "settled; no step is executing",
+                "current_instance" =>
+                    "stopped in the executor of the agent; the stop fence is not durable",
                 _ => "durable stop fence; the executor dispatches no further step",
+            }
+        );
+        put_line!(
+            out,
+            "  Path: {}",
+            match self.path {
+                CancelPath::RequestQueue => "the agent served the request of the queue",
+                CancelPath::StopFence => "this client wrote the stop fence in the journal",
+                CancelPath::None => "no write",
             }
         );
         self.operation.render(&mut out);
@@ -258,6 +310,71 @@ impl CancelView {
             put_line!(out, "  Note: {note}");
         }
         out
+    }
+}
+
+/// Writes the stop fence of `operation_id` in the journal.
+fn write_fence(
+    journal: &mut OperationJournal,
+    operation_id: &OperationId,
+) -> Result<(), ErrorBody> {
+    journal
+        .try_set_stop_fence(operation_id)
+        .map_err(|error| match error {
+            OperationJournalError::NotFound => not_found(operation_id),
+            other => {
+                let mut body: ErrorBody = journal_error(&other);
+                body.message = format!(
+                    "{}; the stop fence was not written, so the cancel is NOT in effect: this client has no executor that it can stop",
+                    body.message
+                );
+                body.with_operation(operation_id.as_str())
+            }
+        })
+}
+
+/// What a cancel request through the queue gave.
+enum Queued {
+    /// The agent recorded the stop with this fence.
+    Served(StopFence),
+    /// The agent did not serve the request in the wait: the wait ended,
+    /// the agent stopped, or the queue could not be read.
+    NotServed,
+}
+
+/// Writes the cancel request to the queue and waits for the agent.
+///
+/// # Errors
+///
+/// Returns the refusal of the agent, a journal error of the write of the
+/// request, and a completion of a different kind.
+fn cancel_through_queue(
+    journal: &mut OperationJournal,
+    journal_path: &std::path::Path,
+    operation_id: &OperationId,
+    request_id: &RequestId,
+    timeout: Duration,
+) -> Result<Queued, ErrorBody> {
+    let request = QueuedRequest {
+        request_id: request_id.clone(),
+        principal: session::principal(),
+        body: RequestBody::Cancel {
+            operation_id: operation_id.clone(),
+        },
+        enqueued_at: session::wall_now(),
+    };
+    journal
+        .enqueue_request(&request)
+        .map_err(|error| journal_error(&error).with_operation(operation_id.as_str()))?;
+    match client::wait_for_completion(journal, journal_path, request_id, timeout) {
+        Ok(RequestCompletion::Stopped { fence }) => Ok(Queued::Served(fence)),
+        Ok(RequestCompletion::Rejected { error }) => {
+            Err(session::action_error(&error, "the cancel").with_operation(operation_id.as_str()))
+        }
+        Ok(_) => Err(execution::unexpected_completion()),
+        // The request stays in the queue. The caller writes the fence, so
+        // the cancel does not depend on the agent.
+        Err(_) => Ok(Queued::NotServed),
     }
 }
 
@@ -271,29 +388,44 @@ pub(crate) fn cancel(
     let journal_path = environment.journal_path()?;
     let mut operation: Operation = read(&journal, &operation_id)?;
     let mut notes: Vec<&'static str> = Vec::new();
-    let fence_written: bool = if operation.state().is_settled() {
+    let mut request_id: Option<RequestId> = None;
+    let mut current_instance: bool = false;
+    let (fence_written, path): (bool, CancelPath) = if operation.state().is_settled() {
         notes.push(SETTLED_BEFORE_NOTE);
-        false
-    } else {
-        journal
-            .try_set_stop_fence(&operation_id)
-            .map_err(|error| match error {
-                OperationJournalError::NotFound => not_found(&operation_id),
-                other => {
-                    let mut body: ErrorBody = journal_error(&other);
-                    body.message = format!(
-                        "{}; the stop fence was not written, so the cancel is NOT in effect: this client has no executor that it can stop",
-                        body.message
-                    );
-                    body.with_operation(operation_id.as_str())
-                }
-            })?;
+        (false, CancelPath::None)
+    } else if client::agent_presence(&journal_path) == AgentPresence::Agent {
+        // The agent decides the request, as for the GPUI client.
+        request_id = Some(invocation.request_id.clone());
+        let queued: Queued = cancel_through_queue(
+            &mut journal,
+            &journal_path,
+            &operation_id,
+            invocation.request_id,
+            invocation.timeout.unwrap_or(CANCEL_WAIT),
+        )?;
         notes.push(CANCEL_NOTE);
-        true
+        match queued {
+            Queued::Served(StopFence::Durable) => (true, CancelPath::RequestQueue),
+            Queued::Served(StopFence::CurrentInstance) => {
+                current_instance = true;
+                notes.push(CURRENT_INSTANCE_NOTE);
+                (false, CancelPath::RequestQueue)
+            }
+            Queued::NotServed => {
+                write_fence(&mut journal, &operation_id)?;
+                notes.push(NOT_SERVED_NOTE);
+                (true, CancelPath::StopFence)
+            }
+        }
+    } else {
+        write_fence(&mut journal, &operation_id)?;
+        notes.push(CANCEL_NOTE);
+        (true, CancelPath::StopFence)
     };
+    let stop_requested: bool = fence_written || current_instance;
     let coordinator: CoordinatorPresence = coordinator_presence(&journal_path);
     // An executor that runs settles the operation at its next boundary.
-    if fence_written && coordinator == CoordinatorPresence::Running {
+    if stop_requested && coordinator == CoordinatorPresence::Running {
         let started: Instant = Instant::now();
         while started.elapsed() < SETTLE_WAIT {
             // The fence is written. A read that fails here does not
@@ -315,10 +447,14 @@ pub(crate) fn cancel(
         operation_id,
         acknowledgement: if operation.state().is_settled() {
             "settled"
+        } else if current_instance {
+            "current_instance"
         } else {
             "durable_stop_fence"
         },
         fence_written,
+        path,
+        request_id,
         coordinator,
         operation: report(&journal, environment, &operation),
         notes,

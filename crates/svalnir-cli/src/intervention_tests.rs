@@ -30,25 +30,25 @@ const CHILD_LIFE: Duration = Duration::from_secs(60);
 
 const BALANCED_CONFIG: &str = "schema_version = 1\n\n[agent]\nprofile = \"balanced\"\n\n[disk_guard]\nenabled = true\nvolumes = [\"startup-data\"]\n\n[memory_guard]\nenabled = true\neligible_groups = [\"background-user-applications\"]\n";
 
-struct Outcome {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
+pub(super) struct Outcome {
+    pub(super) status: ExitStatus,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
 }
 
 impl Outcome {
-    fn envelope(&self) -> Value {
+    pub(super) fn envelope(&self) -> Value {
         assert_eq!(self.stdout.lines().count(), 1, "{}", self.stdout);
         serde_json::from_str(&self.stdout).unwrap()
     }
 
-    fn result(&self) -> Value {
+    pub(super) fn result(&self) -> Value {
         let envelope = self.envelope();
         assert!(envelope["error"].is_null(), "{}", self.stdout);
         envelope["result"].clone()
     }
 
-    fn error_code(&self) -> String {
+    pub(super) fn error_code(&self) -> String {
         self.envelope()["error"]["code"]
             .as_str()
             .unwrap_or_default()
@@ -59,7 +59,7 @@ impl Outcome {
 /// The counter of the request identities of this test binary.
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn run(environment: &Environment, arguments: &[&str]) -> Outcome {
+pub(super) fn run(environment: &Environment, arguments: &[&str]) -> Outcome {
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
     // Each invocation has its own request identity, as each process has.
@@ -82,20 +82,20 @@ fn run(environment: &Environment, arguments: &[&str]) -> Outcome {
     }
 }
 
-fn json(environment: &Environment, arguments: &[&str]) -> Outcome {
+pub(super) fn json(environment: &Environment, arguments: &[&str]) -> Outcome {
     let mut machine: Vec<&str> = arguments.to_vec();
     machine.extend(["--format", "json"]);
     run(environment, &machine)
 }
 
 /// One temporary world.
-struct World {
-    environment: Environment,
+pub(super) struct World {
+    pub(super) environment: Environment,
     directory: TempDirectory,
 }
 
 impl World {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let (mut environment, directory) = environment();
         let trash: PathBuf = directory.path().join("trash");
         std::fs::create_dir_all(&trash).unwrap();
@@ -106,12 +106,12 @@ impl World {
         }
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    pub(super) fn path(&self, name: &str) -> PathBuf {
         self.directory.path().join(name)
     }
 
     /// Makes `tree/` with two directories and one file.
-    fn tree(&self) -> PathBuf {
+    pub(super) fn tree(&self) -> PathBuf {
         let tree: PathBuf = self.path("tree");
         std::fs::create_dir_all(tree.join("build/objects")).unwrap();
         std::fs::create_dir_all(tree.join("cache")).unwrap();
@@ -123,7 +123,7 @@ impl World {
     }
 
     /// Activates a configuration and returns its revision.
-    fn activate(&self, text: &str, expected: &str) -> String {
+    pub(super) fn activate(&self, text: &str, expected: &str) -> String {
         let config: PathBuf = self.path("config.toml");
         std::fs::write(&config, text).unwrap();
         let outcome = json(
@@ -191,7 +191,7 @@ impl World {
     }
 
     /// A world with an active template configuration, a tree, and a plan.
-    fn with_plan(mode: &str) -> (Self, PathBuf, String) {
+    pub(super) fn with_plan(mode: &str) -> (Self, PathBuf, String) {
         let world = Self::new();
         world.activate("schema_version = 1\n", "none");
         let tree: PathBuf = world.tree();
@@ -1788,22 +1788,22 @@ fn child_entry() {
 
 /// A child process that is killed and collected when the value is
 /// dropped.
-struct ChildGuard(Child);
+pub(super) struct ChildGuard(Child);
 
 impl ChildGuard {
-    fn pid(&self) -> Pid {
+    pub(super) fn pid(&self) -> Pid {
         Pid::new(i32::try_from(self.0.id()).unwrap()).unwrap()
     }
 
     /// The target ID of the child: its process generation.
-    fn target(&self) -> String {
+    pub(super) fn target(&self) -> String {
         let info = DarwinProcessSource::new().process_info(self.pid()).unwrap();
         generation_id(self.pid(), info.start_time)
             .unwrap()
             .to_string()
     }
 
-    fn has_exited(&mut self) -> bool {
+    pub(super) fn has_exited(&mut self) -> bool {
         self.0.try_wait().unwrap().is_some()
     }
 }
@@ -1818,7 +1818,7 @@ impl Drop for ChildGuard {
 
 /// Starts a child of this test. With `ignores_term`, the shell sets the
 /// disposition of `SIGTERM` and replaces itself with the test binary.
-fn spawn_child(ignores_term: bool) -> ChildGuard {
+pub(super) fn spawn_child(ignores_term: bool) -> ChildGuard {
     let program = std::env::current_exe().unwrap();
     let arguments = ["--ignored", "--exact", CHILD_TEST];
     let configure = |command: &mut Command| {
@@ -1859,7 +1859,7 @@ fn spawn_child(ignores_term: bool) -> ChildGuard {
     }
 }
 
-fn world_for_stop() -> World {
+pub(super) fn world_for_stop() -> World {
     let world = World::new();
     world.activate("schema_version = 1\n", "none");
     world
@@ -2487,7 +2487,7 @@ fn a_plan_document_of_a_different_version_is_refused() {
     // number refuses the document.
     let text: String = std::fs::read_to_string(&document).unwrap();
     let mut value: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], 3);
     value["schema_version"] = serde_json::json!(1);
     value.as_object_mut().unwrap().remove("roots");
     std::fs::write(&document, serde_json::to_string(&value).unwrap()).unwrap();
@@ -3096,7 +3096,7 @@ const REARM: [&str; 7] = [
 /// coordinator lock with the role of an agent, claims one request of the
 /// queue, and completes it with `completion`. It changes only the journal
 /// of the test.
-fn serve_one_rearm(
+pub(super) fn serve_one_rearm(
     journal: PathBuf,
     completion: svalnir_agent::journal::RequestCompletion,
 ) -> (

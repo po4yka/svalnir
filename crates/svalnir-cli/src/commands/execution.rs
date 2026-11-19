@@ -604,7 +604,7 @@ struct Pending {
 
 /// The error for a completion of a different kind than the request: the
 /// request identity names a different request.
-fn unexpected_completion() -> ErrorBody {
+pub(crate) fn unexpected_completion() -> ErrorBody {
     ErrorBody::new(
         "journal_conflict",
         ErrorFamily::Evidence,

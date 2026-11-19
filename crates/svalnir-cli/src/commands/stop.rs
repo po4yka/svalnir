@@ -1,32 +1,38 @@
 //! `processes stop`: prepare, authorize, and apply the stop of one process
-//! generation through the same plan builder and coordinator as each other
-//! intervention (`docs/INTERFACES.md` section 5).
+//! generation or of one group through the same plan builder and coordinator
+//! as each other intervention (`docs/INTERFACES.md` section 5).
 //!
-//! The target ID names one process generation, and the plan has that one
-//! process and no other: the command never selects the processes of an
-//! application by name. A process with a verified membership in an
+//! `--target` names one process generation, and the plan has that one
+//! process and no other. A process with a verified membership in an
 //! application or a managed job is the only member of an application
 //! target. A process with no application or job evidence, for example a
 //! process that a shell started, is a target of one process
 //! (`docs/ACTION_CONTRACTS.md` section 3), which the executor signals
 //! directly after it checks the identity evidence again.
 //!
+//! `--group` names one application or managed-job instance. The plan has
+//! each process with a verified membership in that instance, as the stop of
+//! the GPUI client has: both clients get the candidate from
+//! [`svalnir_agent::client::group_candidate`] and build the plan with
+//! [`svalnir_agent::client::build_manual_stop`]. The command never selects
+//! the processes of an application by name. The executor checks the
+//! identity of each member again before its signal.
+//!
 //! The command keeps its plan identity in a stop record of the process
-//! generation. A repeated request, for example after a lost response,
-//! finds that plan and its operation and makes no second plan.
+//! generation or of the group. A repeated request, for example after a lost
+//! response, finds that plan and its operation and makes no second plan.
 
 use std::time::Duration;
 
+use svalnir_agent::client::{self, ManualStopError, ManualStopPlan};
 use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::platform::process::{
     ForegroundState, ProcessRecord, ProcessSnapshot, control_plane_of_this_process,
 };
 use svalnir_core::action::Plan;
-use svalnir_core::authority::AuthorityBinding;
-use svalnir_core::id::{MembershipSnapshotId, PlanId, ProcessGenerationId, StepId, TargetId};
+use svalnir_core::id::{ApplicationInstanceId, MembershipSnapshotId, PlanId};
 use svalnir_core::plan::{
-    PlanBuildError, PlanContext, PlanOutcome, StopKind, StopLimits, StopRequest, StopStepIds,
-    StopStrategy, build_stop_plan, check_expiry, explain, manual_plan_lifetime,
+    PlanBuildError, PlanOutcome, StopKind, StopLimits, StopStrategy, check_expiry, explain,
 };
 use svalnir_core::policy::{
     ApplicationCandidate, ControlPlaneProcess, ForegroundStatus, ProtectionContext, ProtectionFact,
@@ -37,11 +43,11 @@ use svalnir_core::quantity::Nanoseconds;
 
 use super::apply::{self, ApplyFlow};
 use super::clean::{StoredPlan, load_plan, outcome_of};
-use super::plan_store::{self, PlanDocument, StopRecord};
+use super::plan_store::{self, PlanDocument, StopKey, StopRecord};
 use super::plan_view;
 use super::session::{self, ActiveConfig, Now, journal_error};
 use super::{CommandFailure, Invocation, processes};
-use crate::cli::ProcessesStopArgs;
+use crate::cli::{ProcessesStopArgs, StopSubject};
 use crate::environment::Environment;
 use crate::host::Host;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, NextAction, Warning};
@@ -55,14 +61,62 @@ use svalnir_agent::client::{
     DEFAULT_STOP_GRACE as DEFAULT_GRACE, MAX_STOP_GRACE as MAX_GRACE, StopMode,
 };
 
-fn stop_error(code: &'static str, family: ErrorFamily, message: &str) -> ErrorBody {
+/// The argument that names the subject of a request.
+const fn fields(key: &StopKey) -> &'static [&'static str] {
+    match key {
+        StopKey::Process(_) => &["target"],
+        StopKey::Group(_) => &["group"],
+    }
+}
+
+fn stop_error(key: &StopKey, code: &'static str, family: ErrorFamily, message: &str) -> ErrorBody {
     ErrorBody::new(
         code,
         family,
         ErrorStage::Admission,
         format!("{message}; the command sent no signal"),
     )
-    .with_fields(&["target"])
+    .with_fields(fields(key))
+}
+
+/// Parses `--target` or `--group`. The parser of the arguments permits
+/// exactly one of them.
+fn key_of(subject: &StopSubject) -> Result<StopKey, ErrorBody> {
+    match (&subject.target, &subject.group) {
+        (Some(target), None) => Ok(StopKey::Process(processes::parse_target(target)?)),
+        (None, Some(group)) => ApplicationInstanceId::new(group.as_str())
+            .map(StopKey::Group)
+            .map_err(|_| {
+                ErrorBody::new(
+                    "invalid_group",
+                    ErrorFamily::Request,
+                    ErrorStage::Arguments,
+                    "the group ID is not valid; use the `Instance` value of `svalnir processes show`; the command made no change",
+                )
+                .with_fields(&["group"])
+                .with_next_action(NextAction::CorrectRequest)
+            }),
+        _ => Err(ErrorBody::new(
+            "invalid_target",
+            ErrorFamily::Request,
+            ErrorStage::Arguments,
+            "give exactly one of `--target` and `--group`; the command made no change",
+        )
+        .with_fields(&["target", "group"])
+        .with_next_action(NextAction::CorrectRequest)),
+    }
+}
+
+/// The refusal of a group that the reading has no candidate for.
+fn group_not_found() -> ErrorBody {
+    ErrorBody::new(
+        "group_not_found",
+        ErrorFamily::Evidence,
+        ErrorStage::Collection,
+        "the snapshot of this invocation has no process with a verified membership in this instance, or the membership or the footprint of the instance cannot be read: the application exited, the ID is of an earlier launch, or the instance is of another user; the command made no change",
+    )
+    .with_fields(&["group"])
+    .with_next_action(NextAction::RefreshObservation)
 }
 
 /// The strategy and the durations of the request.
@@ -93,7 +147,7 @@ fn shape(arguments: &ProcessesStopArgs) -> Result<Shape, ErrorBody> {
         // executor observes the exit after the graceful request.
         StopMode::Graceful
     };
-    let (strategy, limits) = svalnir_agent::client::manual_stop(mode, grace);
+    let (strategy, limits) = client::manual_stop(mode, grace);
     Ok(Shape { strategy, limits })
 }
 
@@ -101,7 +155,7 @@ fn shape(arguments: &ProcessesStopArgs) -> Result<Shape, ErrorBody> {
 /// target ID, with the association that the inventory gave it. The plan
 /// builder binds it as the only member of its instance, or, with no
 /// application or job evidence, as a target of one process.
-fn candidate(
+fn process_candidate(
     record: &ProcessRecord,
     control_plane: Option<&[ControlPlaneProcess]>,
 ) -> Result<ApplicationCandidate, ErrorBody> {
@@ -128,6 +182,28 @@ fn candidate(
     })
 }
 
+/// The candidate of the request: the one process of `--target`, or the
+/// verified members of the instance of `--group`.
+fn candidate_of(
+    key: &StopKey,
+    snapshot: &ProcessSnapshot,
+    control_plane: Option<&[ControlPlaneProcess]>,
+) -> Result<ApplicationCandidate, ErrorBody> {
+    match key {
+        StopKey::Process(target) => {
+            let record: &ProcessRecord = processes::find_target(snapshot, target.as_str())?;
+            process_candidate(record, control_plane)
+        }
+        StopKey::Group(instance) => {
+            let protection = ProtectionContext {
+                principal: session::current_uid(),
+                control_plane,
+            };
+            client::group_candidate(snapshot, &protection, instance).ok_or_else(group_not_found)
+        }
+    }
+}
+
 fn plan_error(error: &PlanBuildError) -> ErrorBody {
     let code: &'static str = match error {
         PlanBuildError::Limits | PlanBuildError::Lifetime => "stop_durations_not_usable",
@@ -147,7 +223,7 @@ fn plan_error(error: &PlanBuildError) -> ErrorBody {
 fn earlier_plan(
     journal: &OperationJournal,
     environment: &Environment,
-    target: &ProcessGenerationId,
+    target: &StopKey,
     requested: &Shape,
     now: &Now,
 ) -> Result<Option<StoredPlan>, ErrorBody> {
@@ -160,7 +236,10 @@ fn earlier_plan(
             "stop_plan_exists",
             ErrorFamily::Evidence,
             ErrorStage::Admission,
-            format!("an earlier request for this process has a plan{reason}; the command made no second plan and sent no signal; query the earlier operation"),
+            format!("an earlier request for this {} has a plan{reason}; the command made no second plan and sent no signal; query the earlier operation", match target {
+                StopKey::Process(_) => "process",
+                StopKey::Group(_) => "group",
+            }),
         )
         .with_plan(record.plan_id.as_str())
         .with_fields(&["force", "force_after_timeout", "grace"])
@@ -207,15 +286,18 @@ fn earlier_plan(
 }
 
 /// Refuses a process that is protected, or whose protection is not known.
-fn check_protection(protection: ProtectionFact) -> Result<(), ErrorBody> {
+/// For a group, one protected member protects the group.
+fn check_protection(key: &StopKey, protection: ProtectionFact) -> Result<(), ErrorBody> {
     match protection {
         ProtectionFact::NotProtected => Ok(()),
         ProtectionFact::Protected => Err(stop_error(
+            key,
             "target_protected",
             ErrorFamily::Eligibility,
             "a hard protection applies to the process: it is a system process, a process of Svalnir, this client or one of its ancestors, or a process of a different user; `--force` does not change a protection",
         )),
         ProtectionFact::Unknown => Err(stop_error(
+            key,
             "target_protection_unknown",
             ErrorFamily::Evidence,
             "the protection of the process is not known: it has no executable evidence, or the ancestors of this client are not known",
@@ -228,15 +310,15 @@ fn check_protection(protection: ProtectionFact) -> Result<(), ErrorBody> {
 fn new_plan(
     journal: &mut OperationJournal,
     environment: &Environment,
-    record: &ProcessRecord,
+    key: &StopKey,
+    candidate: &ApplicationCandidate,
     control_plane: Option<&[ControlPlaneProcess]>,
     requested: &Shape,
     now: &Now,
 ) -> Result<StoredPlan, ErrorBody> {
     let authority = session::read_authority(journal)?;
     let ActiveConfig { active, config } = session::active_config(journal, &authority.state)?;
-    let candidate: ApplicationCandidate = candidate(record, control_plane)?;
-    check_protection(candidate.hard_protection)?;
+    check_protection(key, candidate.hard_protection)?;
     let plan_text: String = session::new_id("plan");
     let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
     let home = environment
@@ -244,38 +326,26 @@ fn new_plan(
         .as_ref()
         .and_then(|home| std::fs::canonicalize(home).ok())
         .and_then(|home| svalnir_core::file::LosslessPath::from_path(&home).ok());
-    let context = PlanContext {
-        plan_id: plan_id.clone(),
-        principal: session::principal(),
-        authority: AuthorityBinding {
-            policy_revision: active.revision.revision_id.clone(),
-            action_grants: Vec::new(),
-            privilege_grant: None,
-        },
+    let outcome: PlanOutcome = client::build_manual_stop(&ManualStopPlan {
+        plan_id: &plan_text,
+        principal: &session::principal(),
+        active: &active,
+        config: &config,
         clock: &now.clock,
         created_wall: now.wall,
-        lifetime: manual_plan_lifetime(&config)
-            .ok_or_else(|| plan_error(&PlanBuildError::Lifetime))?,
-        protections: config.protections(),
         home_directory: home.as_ref(),
-    };
-    let identity = |suffix: &str| format!("{plan_text}-{suffix}");
-    let request = StopRequest {
-        target_id: TargetId::new(identity("app")).map_err(|_| session::identity_error())?,
-        candidate: &candidate,
+        candidate,
         protection: &ProtectionContext {
             principal: session::current_uid(),
             control_plane,
         },
         strategy: requested.strategy,
-        steps: StopStepIds {
-            graceful: StepId::new(identity("graceful")).map_err(|_| session::identity_error())?,
-            force: StepId::new(identity("force")).map_err(|_| session::identity_error())?,
-        },
         limits: requested.limits,
-    };
-    let outcome: PlanOutcome =
-        build_stop_plan(&context, &request).map_err(|error| plan_error(&error))?;
+    })
+    .map_err(|error| match error {
+        ManualStopError::Identity => session::identity_error(),
+        ManualStopError::Build(error) => plan_error(&error),
+    })?;
     let Some(plan) = outcome.plan.clone() else {
         let reasons: Vec<String> = outcome
             .preview
@@ -286,10 +356,15 @@ fn new_plan(
             .map(plan_view::wire_reason)
             .collect();
         return Err(stop_error(
+            key,
             "target_not_eligible",
             ErrorFamily::Eligibility,
             &format!(
-                "the process is not a permitted target ({}); `--force` does not change a protection",
+                "the {} is not a permitted target ({}); `--force` does not change a protection",
+                match key {
+                    StopKey::Process(_) => "process",
+                    StopKey::Group(_) => "group",
+                },
                 if reasons.is_empty() {
                     "no reason recorded".to_owned()
                 } else {
@@ -302,14 +377,14 @@ fn new_plan(
         .try_record_plan(&plan)
         .map_err(|error| journal_error(&error))?;
     let mut document = PlanDocument::new(plan_id.clone(), plan.digest().clone(), outcome);
-    document.stop_target = Some(record.identity.generation_id.clone());
+    document.stop_target = Some(key.clone());
     plan_store::save_plan(environment, &document)?;
     // The stop record is the last write: a request that stops before it
     // leaves a plan that no later request applies.
     plan_store::save_stop(
         environment,
         &StopRecord::new(
-            record.identity.generation_id.clone(),
+            key.clone(),
             plan_id,
             requested.strategy.kind(),
             requested.strategy.grace(),
@@ -336,7 +411,7 @@ pub(crate) fn stop(
     arguments: &ProcessesStopArgs,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    let target: ProcessGenerationId = processes::parse_target(&arguments.target.target)?;
+    let key: StopKey = key_of(&arguments.subject)?;
     let requested: Shape = shape(arguments)?;
     if arguments.force && arguments.grace.is_some() {
         invocation.warnings.push(Warning {
@@ -350,27 +425,25 @@ pub(crate) fn stop(
     let mut journal: OperationJournal = session::open_journal(environment)?;
 
     // One client at a time reads the stop record of a process generation
-    // and makes its plan, so two requests make one plan.
-    let lock = plan_store::lock_stop(
-        environment,
-        &target,
-        invocation.timeout.unwrap_or(LOCK_WAIT),
-    )?;
-    // An earlier request for the same process generation has the plan.
-    // The process of an applied plan can be gone, so this lookup is before
-    // the inventory.
-    let earlier: Option<StoredPlan> =
-        earlier_plan(&journal, environment, &target, &requested, &now)?;
-    let snapshot: ProcessSnapshot = processes::collect_snapshot()?;
+    // or of a group and makes its plan, so two requests make one plan.
+    let lock = plan_store::lock_stop(environment, &key, invocation.timeout.unwrap_or(LOCK_WAIT))?;
+    // An earlier request for the same subject has the plan. The processes
+    // of an applied plan can be gone, so this lookup is before the
+    // inventory.
+    let earlier: Option<StoredPlan> = earlier_plan(&journal, environment, &key, &requested, &now)?;
+    let mut snapshot: ProcessSnapshot = processes::collect_snapshot()?;
+    environment.seams.edit_process_reading(&mut snapshot);
     let control_plane: Option<Vec<ControlPlaneProcess>> = control_plane_of_this_process(&snapshot);
     let stored: StoredPlan = if let Some(stored) = earlier {
         stored
     } else {
-        let record: &ProcessRecord = processes::find_target(&snapshot, &arguments.target.target)?;
+        let candidate: ApplicationCandidate =
+            candidate_of(&key, &snapshot, control_plane.as_deref())?;
         new_plan(
             &mut journal,
             environment,
-            record,
+            &key,
+            &candidate,
             control_plane.as_deref(),
             &requested,
             &now,
@@ -387,11 +460,18 @@ pub(crate) fn stop(
         &[],
         &mut summary,
     );
-    crate::text::put_line!(
-        summary,
-        "This request sends {} to process {target}. Unsaved data of the process can be lost.",
-        kind_text(requested.strategy.kind())
-    );
+    match &key {
+        StopKey::Process(target) => crate::text::put_line!(
+            summary,
+            "This request sends {} to process {target}. Unsaved data of the process can be lost.",
+            kind_text(requested.strategy.kind())
+        ),
+        StopKey::Group(instance) => crate::text::put_line!(
+            summary,
+            "This request sends {} to each process of the list above, the verified members of instance {instance}. Unsaved data of these processes can be lost.",
+            kind_text(requested.strategy.kind())
+        ),
+    }
     apply::run(
         ApplyFlow {
             plan,
@@ -401,7 +481,10 @@ pub(crate) fn stop(
             no_wait: arguments.apply.no_wait,
             yes: arguments.apply.yes,
             summary,
-            what: "the stop of the process",
+            what: match key {
+                StopKey::Process(_) => "the stop of the process",
+                StopKey::Group(_) => "the stop of the group",
+            },
         },
         invocation,
     )

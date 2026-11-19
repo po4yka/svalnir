@@ -83,12 +83,13 @@ fn a_healthy_host_shows_the_grid_the_pressure_and_the_pause_control(cx: &mut Tes
         grid.contains(&CellPaint::Filled(ItemTone::Brand)),
         "some space is used: {grid:?}"
     );
-    // The fixture disk guard warns below 40 GiB free of 512 GB: the last two
-    // cells are its tinted zone. Its emergency below 10 GiB free is 2% of the
-    // volume, less than half a cell, so it has no cell (`zone_start`).
+    // The fixture disk guard warns below 40 GiB free of 512 GB (cells 18
+    // and 19) and has its emergency below 10 GiB free, 2% of the volume:
+    // less than half a cell, so the zone keeps the last cell, and the
+    // warning zone stays before it.
     assert_eq!(grid[17], CellPaint::Empty, "{grid:?}");
     assert_eq!(grid[18], CellPaint::Tint(ItemTone::Warning), "{grid:?}");
-    assert_eq!(grid[19], CellPaint::Tint(ItemTone::Warning), "{grid:?}");
+    assert_eq!(grid[19], CellPaint::Tint(ItemTone::Negative), "{grid:?}");
     assert_eq!(view.pressure, Some(ItemTone::Positive));
     assert_eq!(view.title, "Normal");
     assert!(view.label.contains("Disk:"), "{}", view.label);

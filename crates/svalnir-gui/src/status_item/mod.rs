@@ -121,6 +121,9 @@ pub enum CellPaint {
     Tint(ItemTone),
     /// A free cell outside the zones.
     Empty,
+    /// A used cell of a stale reading: the color of the menu bar text, with
+    /// no tone (`DESIGN.md` §8: a stale value is muted).
+    Muted,
 }
 
 /// The appearance that the menu bar draws the item in.
@@ -138,6 +141,8 @@ const TINT_ALPHA: [f64; 2] = [0.25, 0.5];
 /// An empty cell is the color of the menu bar text at this alpha, so it is
 /// visible on the light and the dark menu bar.
 const EMPTY_ALPHA: [f64; 2] = [0.3, 0.55];
+/// The alpha of a used cell of a stale reading.
+const MUTED_ALPHA: [f64; 2] = [0.65, 0.85];
 
 /// The color of `tone` in the theme of `dark`, as red, green, blue.
 #[must_use]
@@ -168,6 +173,10 @@ pub fn paint_rgba(paint: CellPaint, look: MenuBarLook) -> [f64; 4] {
         CellPaint::Empty => {
             let text: f64 = if look.dark { 1.0 } else { 0.0 };
             [text, text, text, EMPTY_ALPHA[contrast]]
+        }
+        CellPaint::Muted => {
+            let text: f64 = if look.dark { 1.0 } else { 0.0 };
+            [text, text, text, MUTED_ALPHA[contrast]]
         }
     }
 }
@@ -201,8 +210,22 @@ pub fn grid_paints(
     paints
 }
 
+/// The paint of a stale reading: the used cells muted, with no zone.
+#[must_use]
+pub fn stale_paints(used: u64, total: u64) -> [CellPaint; INLINE_CELLS] {
+    let filled: usize = used_cells(used, total, INLINE_CELLS);
+    let mut paints: [CellPaint; INLINE_CELLS] = [CellPaint::Empty; INLINE_CELLS];
+    for paint in paints.iter_mut().take(filled) {
+        *paint = CellPaint::Muted;
+    }
+    paints
+}
+
 /// The first cell of the zone where less than `below` bytes of `total` are
-/// free; `None` when the zone is empty or the total is not known.
+/// free; `None` when the zone is empty or the total is not known. A zone
+/// that is not empty has at least the last cell, also when it is less than
+/// half a cell: the default `emergency_below` of 2 GiB is 0.2% of a 1 TB
+/// volume, and rounding would hide it.
 #[must_use]
 pub fn free_zone_start(below: u64, total: u64) -> Option<usize> {
     if total == 0 || below == 0 {
@@ -214,7 +237,22 @@ pub fn free_zone_start(below: u64, total: u64) -> Option<usize> {
         reason = "a share of the volume for a grid of 20 cells"
     )]
     let fraction: f32 = 1.0 - (below as f32 / total as f32);
-    Some(zone_start(fraction, INLINE_CELLS))
+    Some(zone_start(fraction, INLINE_CELLS).min(INLINE_CELLS - 1))
+}
+
+/// The starts of the warning and the critical zone, with the warning zone
+/// before the critical zone when both have cells, so that each shows.
+#[must_use]
+pub fn zone_starts(
+    warning: Option<usize>,
+    critical: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match (warning, critical) {
+        (Some(warning), Some(critical)) if critical > 0 => {
+            (Some(warning.min(critical - 1)), Some(critical))
+        }
+        pair => pair,
+    }
 }
 
 /// The bytes of the disk guard threshold `field` in the revision in effect,
@@ -380,14 +418,20 @@ fn grid_and_tone(
     used: &Measured<u64>,
     total: &Measured<u64>,
 ) -> (Option<[CellPaint; INLINE_CELLS]>, Option<ItemTone>) {
+    let stale: bool = matches!(model.host, Loadable::Stale(_));
     let grid: Option<[CellPaint; INLINE_CELLS]> = match (used, total) {
-        (Measured::Value(used), Measured::Value(total)) if *total > 0 => Some(grid_paints(
-            *used,
-            *total,
-            disk_threshold(model, "warn_below").and_then(|below| free_zone_start(below, *total)),
-            disk_threshold(model, "emergency_below")
-                .and_then(|below| free_zone_start(below, *total)),
-        )),
+        (Measured::Value(used), Measured::Value(total)) if *total > 0 && stale => {
+            Some(stale_paints(*used, *total))
+        }
+        (Measured::Value(used), Measured::Value(total)) if *total > 0 => {
+            let (warning, critical) = zone_starts(
+                disk_threshold(model, "warn_below")
+                    .and_then(|below| free_zone_start(below, *total)),
+                disk_threshold(model, "emergency_below")
+                    .and_then(|below| free_zone_start(below, *total)),
+            );
+            Some(grid_paints(*used, *total, warning, critical))
+        }
         _ => None,
     };
     let pressure_level: Option<ItemTone> = match &model.host {
@@ -766,6 +810,37 @@ mod tests {
         assert_eq!(paints[19], CellPaint::Tint(ItemTone::Negative));
         assert_eq!(free_zone_start(0, 100), None);
         assert_eq!(free_zone_start(10, 0), None);
+    }
+
+    #[test]
+    fn the_default_zones_show_on_a_large_volume() {
+        // The defaults: warning below 20 GiB, emergency below 2 GiB, on a
+        // volume of 1 TB. Each zone is less than half a cell.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let total: u64 = 1_000_000_000_000;
+        let warning = free_zone_start(20 * GIB, total);
+        let critical = free_zone_start(2 * GIB, total);
+        assert_eq!((warning, critical), (Some(19), Some(19)));
+        let (warning, critical) = zone_starts(warning, critical);
+        assert_eq!((warning, critical), (Some(18), Some(19)));
+        let paints = grid_paints(total / 2, total, warning, critical);
+        assert_eq!(paints[17], CellPaint::Empty);
+        assert_eq!(paints[18], CellPaint::Tint(ItemTone::Warning));
+        assert_eq!(paints[19], CellPaint::Tint(ItemTone::Negative));
+        assert_eq!(zone_starts(Some(5), Some(0)), (Some(5), Some(0)));
+        assert_eq!(zone_starts(Some(19), None), (Some(19), None));
+    }
+
+    #[test]
+    fn a_stale_grid_is_muted_with_no_zone() {
+        let paints = stale_paints(60, 100);
+        assert_eq!(paints[11], CellPaint::Muted);
+        assert_eq!(paints[12], CellPaint::Empty);
+        assert!(
+            !paints
+                .iter()
+                .any(|paint| matches!(paint, CellPaint::Filled(_) | CellPaint::Tint(_)))
+        );
     }
 
     #[test]

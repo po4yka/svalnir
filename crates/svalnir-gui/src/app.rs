@@ -432,6 +432,9 @@ fn show_main_window(
         let bounds = Bounds::centered(None, size(px(window_size.0), px(window_size.1)), cx);
         if let Err(error) = open_main_window_with_model(bounds, model.clone(), appearance, cx) {
             tracing::error!(%error, "cannot open the main window");
+            // No window came, so the client leaves the Dock again.
+            let windows: usize = cx.windows().len();
+            cx.set_activation_policy(dock_policy(true, windows));
             return;
         }
     }

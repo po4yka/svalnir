@@ -217,6 +217,21 @@ impl DataSource for SubfolderFails {
     fn label(&self) -> &'static str {
         "subfolder-fails"
     }
+    fn memory(&self) -> Result<svalnir_gui::data::records::MemorySnapshot, String> {
+        FixtureSource::new(FixtureScenario::Healthy).memory()
+    }
+    fn processes(&self) -> Result<svalnir_gui::data::records::ProcessesSnapshot, String> {
+        FixtureSource::new(FixtureScenario::Healthy).processes()
+    }
+    fn automation(&self) -> svalnir_gui::data::records::AutomationSnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).automation()
+    }
+    fn history(&self) -> svalnir_gui::data::records::HistorySnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).history()
+    }
+    fn diagnostics(&self) -> svalnir_gui::data::records::DiagnosticsSnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).diagnostics()
+    }
     fn scan(
         &self,
         root: &Path,
@@ -358,6 +373,21 @@ impl DataSource for WaitingSource {
     }
     fn label(&self) -> &'static str {
         "waiting"
+    }
+    fn memory(&self) -> Result<svalnir_gui::data::records::MemorySnapshot, String> {
+        FixtureSource::new(FixtureScenario::Healthy).memory()
+    }
+    fn processes(&self) -> Result<svalnir_gui::data::records::ProcessesSnapshot, String> {
+        FixtureSource::new(FixtureScenario::Healthy).processes()
+    }
+    fn automation(&self) -> svalnir_gui::data::records::AutomationSnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).automation()
+    }
+    fn history(&self) -> svalnir_gui::data::records::HistorySnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).history()
+    }
+    fn diagnostics(&self) -> svalnir_gui::data::records::DiagnosticsSnapshot {
+        FixtureSource::new(FixtureScenario::Healthy).diagnostics()
     }
     fn scan(
         &self,

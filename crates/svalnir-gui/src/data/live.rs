@@ -8,6 +8,12 @@ use super::{
         ServiceSnapshot,
     },
 };
+use super::{
+    live_records,
+    records::{
+        AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
+    },
+};
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
@@ -51,6 +57,18 @@ impl LiveSource {
         Self {
             host: Mutex::new(None),
             state_directory,
+        }
+    }
+
+    /// Runs `read` with the host of this source, which it opens one time.
+    fn with_host<T>(&self, read: impl FnOnce(&Host) -> Result<T, String>) -> Result<T, String> {
+        let mut guard = self.host.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(Host::open().map_err(|error| error.to_string())?);
+        }
+        match guard.as_ref() {
+            Some(host) => read(host),
+            None => Err("the host is not open".to_owned()),
         }
     }
 
@@ -228,6 +246,26 @@ impl DataSource for LiveSource {
                 .push(format!("The latest operation cannot be read: {error}.")),
         }
         snapshot
+    }
+
+    fn memory(&self) -> Result<MemorySnapshot, String> {
+        self.with_host(live_records::memory)
+    }
+
+    fn processes(&self) -> Result<ProcessesSnapshot, String> {
+        self.with_host(live_records::processes)
+    }
+
+    fn automation(&self) -> AutomationSnapshot {
+        live_records::automation(self.state_directory.as_deref())
+    }
+
+    fn history(&self) -> HistorySnapshot {
+        live_records::history(self.state_directory.as_deref())
+    }
+
+    fn diagnostics(&self) -> DiagnosticsSnapshot {
+        live_records::diagnostics(self.state_directory.as_deref())
     }
 
     fn scan(

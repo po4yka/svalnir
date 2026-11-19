@@ -6,6 +6,10 @@ use super::{
         AgentSnapshot, HostSnapshot, Loadable, Measured, PressureLevel, ScanEnd, ScanProgress,
         ScanState, ScanSummary, ServiceSnapshot,
     },
+    records::{
+        AutomationSnapshot, Captured, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot,
+        ProcessesSnapshot,
+    },
 };
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
@@ -80,10 +84,82 @@ pub fn is_stale(captured_at: SystemTime, now: SystemTime, interval: Duration) ->
 
 /// The reads that run now, one flag for each kind.
 #[derive(Debug, Default, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent flag for each kind of read"
+)]
 struct InFlight {
     host: bool,
     agent: bool,
     service: bool,
+    memory: bool,
+    processes: bool,
+    automation: bool,
+    history: bool,
+    diagnostics: bool,
+}
+
+/// A kind of read that only some screens need. The model reads a topic only
+/// while a screen that shows it is in front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Topic {
+    /// The memory quantities of the host.
+    Memory,
+    /// The processes and their application groups.
+    Processes,
+    /// The authority record.
+    Automation,
+    /// The latest operations.
+    History,
+    /// The capability probes and the service records. The model reads it
+    /// when the topic is set and at an explicit refresh, not at each poll.
+    Diagnostics,
+}
+
+/// The value of a read that can fail as a whole.
+fn loaded<T>(result: Result<T, String>) -> Loadable<T> {
+    match result {
+        Ok(snapshot) => Loadable::Ready(Arc::new(snapshot)),
+        Err(reason) => Loadable::Unavailable(reason),
+    }
+}
+
+/// Turns a `Ready` value that is older than three intervals into `Stale`.
+fn age<T: Captured>(value: &mut Loadable<T>, now: SystemTime, interval: Duration) {
+    if let Loadable::Ready(snapshot) = value
+        && is_stale(snapshot.captured_at(), now, interval)
+    {
+        *value = Loadable::Stale(Arc::clone(snapshot));
+    }
+}
+
+/// Starts one background read of a kind, unless one is in flight, and
+/// stores its result on the foreground.
+macro_rules! start_read {
+    ($model:ident, $cx:ident, $flag:ident, $read:expr, $store:expr) => {
+        if !$model.in_flight.$flag {
+            $model.in_flight.$flag = true;
+            let source: Arc<dyn DataSource> = Arc::clone(&$model.source);
+            $cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let result = cx
+                    .background_spawn(async move { ($read)(source.as_ref()) })
+                    .await;
+                if this
+                    .update(cx, |model, cx| {
+                        model.in_flight.$flag = false;
+                        ($store)(model, result);
+                        // A reading can be old when it arrives.
+                        model.mark_stale();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("the model closed before the read finished");
+                }
+            })
+            .detach();
+        }
+    };
 }
 
 /// The most scan roots that keep an earlier result.
@@ -128,6 +204,20 @@ pub struct AppModel {
     pub agent: Loadable<AgentSnapshot>,
     /// The guards and the latest operation.
     pub service: Loadable<ServiceSnapshot>,
+    /// The memory quantities of the host. `Loading` until a screen asks.
+    pub memory: Loadable<MemorySnapshot>,
+    /// The processes and their groups. `Loading` until a screen asks.
+    pub processes: Loadable<ProcessesSnapshot>,
+    /// The authority record. `Loading` until a screen asks.
+    pub automation: Loadable<AutomationSnapshot>,
+    /// The latest operations. `Loading` until a screen asks.
+    pub history_records: Loadable<HistorySnapshot>,
+    /// The capability probes and the service records. `Loading` until a
+    /// screen asks. The model does not mark it stale: the screen shows the
+    /// time of the probes.
+    pub diagnostics: Loadable<DiagnosticsSnapshot>,
+    /// The topics that the screen in front shows.
+    topics: Vec<Topic>,
     /// The state of the scan of the Storage screen.
     pub scan: ScanState,
     /// A refusal that does not replace a finished result.
@@ -172,7 +262,7 @@ impl AppModel {
                 let alive: bool = this
                     .update(cx, |model, cx| {
                         model.mark_stale();
-                        model.refresh(cx);
+                        model.refresh_kinds(true, false, cx);
                         cx.notify();
                     })
                     .is_ok();
@@ -189,6 +279,12 @@ impl AppModel {
             history: std::collections::VecDeque::new(),
             agent: Loadable::Loading,
             service: Loadable::Loading,
+            memory: Loadable::Loading,
+            processes: Loadable::Loading,
+            automation: Loadable::Loading,
+            history_records: Loadable::Loading,
+            diagnostics: Loadable::Loading,
+            topics: Vec::new(),
             scan: ScanState::Idle,
             scan_notice: None,
             default_root: None,
@@ -211,7 +307,7 @@ impl AppModel {
                 model.apply_host(result);
             }
             model.mark_stale();
-            model.refresh_kinds(false, cx);
+            model.refresh_kinds(false, false, cx);
         }
         let probe: Arc<dyn DataSource> = Arc::clone(&model.source);
         cx.spawn(async move |this, cx: &mut AsyncApp| {
@@ -396,15 +492,80 @@ impl AppModel {
         if self.active != active {
             self.active = active;
             if active {
-                self.refresh(cx);
+                self.refresh_kinds(true, false, cx);
             }
         }
     }
 
-    /// Starts one background read of each kind. A request for a kind that is
-    /// in flight is dropped.
+    /// Starts one background read of each kind that the screen in front
+    /// shows, with the capability probes when it shows them. A request for a
+    /// kind that is in flight is dropped.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.refresh_kinds(true, cx);
+        self.refresh_kinds(true, true, cx);
+    }
+
+    /// Sets the topics that the screen in front shows and reads them now.
+    pub fn set_topics(&mut self, topics: &[Topic], cx: &mut Context<Self>) {
+        self.topics = topics.to_vec();
+        self.refresh_topics(true, cx);
+    }
+
+    /// The topics that the screen in front shows.
+    #[must_use]
+    pub fn topics(&self) -> &[Topic] {
+        &self.topics
+    }
+
+    /// Starts the reads of the topics. The capability probes start a
+    /// process, so they run only when `probes` is true.
+    fn refresh_topics(&mut self, probes: bool, cx: &mut Context<Self>) {
+        for topic in self.topics.clone() {
+            match topic {
+                Topic::Memory => start_read!(
+                    self,
+                    cx,
+                    memory,
+                    |source: &dyn DataSource| source.memory(),
+                    |model: &mut Self, result| model.memory = loaded(result)
+                ),
+                Topic::Processes => start_read!(
+                    self,
+                    cx,
+                    processes,
+                    |source: &dyn DataSource| source.processes(),
+                    |model: &mut Self, result| model.processes = loaded(result)
+                ),
+                Topic::Automation => start_read!(
+                    self,
+                    cx,
+                    automation,
+                    |source: &dyn DataSource| source.automation(),
+                    |model: &mut Self, result| model.automation = Loadable::Ready(Arc::new(result))
+                ),
+                Topic::History => start_read!(
+                    self,
+                    cx,
+                    history,
+                    |source: &dyn DataSource| source.history(),
+                    |model: &mut Self, result| {
+                        model.history_records = Loadable::Ready(Arc::new(result));
+                    }
+                ),
+                Topic::Diagnostics => {
+                    if probes {
+                        start_read!(
+                            self,
+                            cx,
+                            diagnostics,
+                            |source: &dyn DataSource| source.diagnostics(),
+                            |model: &mut Self, result| {
+                                model.diagnostics = Loadable::Ready(Arc::new(result));
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Stores one host reading: the latest value and the history sample.
@@ -423,8 +584,10 @@ impl AppModel {
         self.last_refresh = Some(SystemTime::now());
     }
 
-    /// Starts the reads; the host read only when `host` is true.
-    fn refresh_kinds(&mut self, host: bool, cx: &mut Context<Self>) {
+    /// Starts the reads; the host read only when `host` is true, and the
+    /// capability probes only when `probes` is true.
+    fn refresh_kinds(&mut self, host: bool, probes: bool, cx: &mut Context<Self>) {
+        self.refresh_topics(probes, cx);
         if host && !self.in_flight.host {
             self.in_flight.host = true;
             let source: Arc<dyn DataSource> = Arc::clone(&self.source);
@@ -504,6 +667,10 @@ impl AppModel {
         {
             self.service = Loadable::Stale(Arc::clone(snapshot));
         }
+        age(&mut self.memory, now, interval);
+        age(&mut self.processes, now, interval);
+        age(&mut self.automation, now, interval);
+        age(&mut self.history_records, now, interval);
     }
 }
 

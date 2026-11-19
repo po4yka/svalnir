@@ -8,6 +8,12 @@ use super::{
         ServiceSnapshot,
     },
 };
+use super::{
+    fixture_records,
+    records::{
+        AutomationSnapshot, DiagnosticsSnapshot, HistorySnapshot, MemorySnapshot, ProcessesSnapshot,
+    },
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -376,6 +382,26 @@ impl DataSource for FixtureSource {
             FixtureScenario::AgentAbsent => {}
         }
         snapshot
+    }
+
+    fn memory(&self) -> Result<MemorySnapshot, String> {
+        fixture_records::memory(self.scenario)
+    }
+
+    fn processes(&self) -> Result<ProcessesSnapshot, String> {
+        fixture_records::processes(self.scenario)
+    }
+
+    fn automation(&self) -> AutomationSnapshot {
+        fixture_records::automation(self.scenario)
+    }
+
+    fn history(&self) -> HistorySnapshot {
+        fixture_records::history(self.scenario)
+    }
+
+    fn diagnostics(&self) -> DiagnosticsSnapshot {
+        fixture_records::diagnostics(self.scenario)
     }
 
     fn scan(

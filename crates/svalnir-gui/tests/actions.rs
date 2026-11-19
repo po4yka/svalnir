@@ -453,3 +453,43 @@ fn with_no_journal_the_rearm_is_off(cx: &mut TestAppContext) {
         assert!(reason.starts_with("Rearm is off: "), "{reason}");
     }
 }
+
+#[gpui_kit::test]
+fn the_stop_confirmation_lists_each_bound_target_with_its_evidence(cx: &mut TestAppContext) {
+    let (handle, view) = open(
+        FixtureSource::new(FixtureScenario::Healthy),
+        Screen::Applications,
+        cx,
+    );
+    let (instance, _name) = stoppable_group(&view, cx);
+    click(handle, &format!("applications-stop-{instance}"), cx);
+    let targets = cx.update(|cx| {
+        view.read(cx)
+            .model()
+            .read(cx)
+            .actions
+            .stop
+            .as_ref()
+            .and_then(|(_, proposal)| match proposal {
+                svalnir_gui::actions::Proposal::Ready(ready) => Some(ready.targets.clone()),
+                _ => None,
+            })
+            .expect("ready plans")
+    });
+    assert!(targets.len() > 12, "the fixture plan binds more than 12");
+    let list = label(handle, "confirm-targets", cx).expect("list");
+    assert!(
+        list.starts_with(&format!("{} bound processes.", targets.len())),
+        "{list}"
+    );
+    assert!(list.contains("arrow keys"), "{list}");
+    // Each target of the plan has a row, also past the twelfth; there is no
+    // count of the others.
+    for target in &targets {
+        let row = label(handle, &format!("confirm-target-{}", target.pid), cx)
+            .unwrap_or_else(|| panic!("no row for PID {}", target.pid));
+        assert!(row.contains(&target.evidence()), "{row}");
+        assert!(row.contains("start "), "{row}");
+    }
+    assert_eq!(label(handle, "confirm-more", cx), None);
+}

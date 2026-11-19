@@ -136,13 +136,55 @@ impl Action {
     }
 }
 
-/// One process that a stop plan binds.
+/// One process that a stop plan binds, with the identity evidence that the
+/// plan binds for it. The executor checks this evidence again before it
+/// signals the process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopTarget {
     /// The process ID.
     pub pid: i32,
-    /// The name of the process.
+    /// The name of the process, from the process reading of the plans.
     pub name: String,
+    /// The start time that the kernel reports, in microseconds since the
+    /// Unix epoch. It is identity evidence, not a time for display.
+    pub start_time: u64,
+    /// The user that owns the process.
+    pub uid: u32,
+    /// The executable path for display, when the plan binds one.
+    pub executable: Option<String>,
+    /// The file object of the executable ("device 1, inode 2"), when the
+    /// plan binds one.
+    pub file: Option<String>,
+    /// The signing identifier and the team of the executable, when the plan
+    /// binds a validated signature.
+    pub signature: Option<String>,
+}
+
+impl StopTarget {
+    /// The identity evidence as one line, for example
+    /// "start 1794830400.250000 · user 501 · /Applications/Editor.app/…".
+    #[must_use]
+    pub fn evidence(&self) -> String {
+        let mut parts: Vec<String> = vec![
+            format!(
+                "start {}.{:06}",
+                self.start_time / 1_000_000,
+                self.start_time % 1_000_000
+            ),
+            format!("user {}", self.uid),
+        ];
+        match &self.executable {
+            Some(path) => parts.push(path.clone()),
+            None => parts.push("no executable evidence".to_owned()),
+        }
+        if let Some(file) = &self.file {
+            parts.push(file.clone());
+        }
+        if let Some(signature) = &self.signature {
+            parts.push(format!("signed {signature}"));
+        }
+        parts.join(" · ")
+    }
 }
 
 /// The two stop plans of one application group, made from one process
@@ -154,7 +196,8 @@ pub struct StopProposal {
     pub instance: String,
     /// The name of the group.
     pub name: String,
-    /// The processes of the plans.
+    /// The processes of the plans: exactly the members that the sealed
+    /// plans bind, in the order of the plans.
     pub targets: Vec<StopTarget>,
     /// The wall-clock time at which the plans expire.
     pub expires_at: SystemTime,
@@ -675,6 +718,11 @@ mod tests {
             targets: vec![StopTarget {
                 pid: 10,
                 name: "Editor".to_owned(),
+                start_time: 1_794_830_400_250_000,
+                uid: 501,
+                executable: None,
+                file: None,
+                signature: None,
             }],
             expires_at,
             quit: None,
@@ -880,6 +928,27 @@ mod tests {
             unknown
                 .sentence(SystemTime::UNIX_EPOCH)
                 .contains("UnknownOutcome")
+        );
+    }
+
+    #[test]
+    fn the_evidence_names_what_the_plan_binds() {
+        let plans = proposal(SystemTime::UNIX_EPOCH);
+        let mut target = plans
+            .targets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("target"));
+        assert_eq!(
+            target.evidence(),
+            "start 1794830400.250000 · user 501 · no executable evidence"
+        );
+        target.executable = Some("/Applications/Editor.app/Contents/MacOS/Editor".to_owned());
+        target.file = Some("device 1, inode 2".to_owned());
+        target.signature = Some("com.example.editor (TEAM1)".to_owned());
+        assert_eq!(
+            target.evidence(),
+            "start 1794830400.250000 · user 501 · /Applications/Editor.app/Contents/MacOS/Editor · device 1, inode 2 · signed com.example.editor (TEAM1)"
         );
     }
 

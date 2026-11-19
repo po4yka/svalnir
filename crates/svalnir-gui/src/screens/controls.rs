@@ -12,7 +12,7 @@ use crate::{
     actions::{Action, ActionState, Proposal, Slot, StopProposal, live::policy_label},
     data::store::AppModel,
     screens::common::{body_line, caption, until},
-    theme::tokens::{self, Tokens},
+    theme::tokens::{self, Tokens, to_hsla},
     ui::{
         action_button::{ActionButton, ButtonVariant},
         action_status::action_status,
@@ -20,14 +20,39 @@ use crate::{
     },
 };
 use gpui_kit::{
-    AnyElement, App, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
+    AnyElement, App, BoxShadow, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, TestSupportExt as _, Window,
     component::{ActiveTheme as _, WindowExt as _, dialog::Dialog, h_flex, v_flex},
+    div, point, px,
 };
 use std::{sync::Arc, time::SystemTime};
 use svalnir_core::{action::ActionClass, policy::PolicyId};
 
-/// The most processes that a stop confirmation lists by name.
-pub const LISTED_TARGETS_MAX: usize = 12;
+/// The height of the list of bound processes in a stop confirmation. A
+/// longer list scrolls: with the pointer, and from the keyboard when the
+/// list has focus.
+pub const TARGET_LIST_HEIGHT: f32 = 240.0;
+
+/// The height of one row of the list, for a step of an arrow key.
+const TARGET_ROW_STEP: f32 = 40.0;
+
+/// The scroll offset after `key` on a list whose offset is `offset` (0 at
+/// the top, negative below it, as GPUI counts it) and whose largest scroll
+/// is `max`. `None` for a key that does not scroll.
+#[must_use]
+pub fn list_scroll(key: &str, offset: f32, max: f32, line: f32, page: f32) -> Option<f32> {
+    let next: f32 = match key {
+        "down" => offset - line,
+        "up" => offset + line,
+        "pagedown" | "space" => offset - page,
+        "pageup" => offset + page,
+        "home" => 0.0,
+        "end" => -max,
+        _ => return None,
+    };
+    Some(next.clamp(-max.max(0.0), 0.0))
+}
 
 /// The state line of `slot`, when it has a state.
 pub fn slot_status(
@@ -239,23 +264,108 @@ pub fn open_rearm(
     });
 }
 
+/// The list of the processes that the plans bind: each bound target with
+/// its PID, its name, and the identity evidence of the plan. The list has
+/// a bounded height and scrolls; it is a focus stop, and the arrow keys,
+/// Page Up, Page Down, Space, Home, and End scroll it.
+fn target_list(
+    proposal: &StopProposal,
+    scroll: &ScrollHandle,
+    focus: &FocusHandle,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
+    let count: usize = proposal.targets.len();
+    let key_scroll: ScrollHandle = scroll.clone();
+    let mut list = div()
+        .id("confirm-targets")
+        .role(Role::List)
+        .test_support()
+        .aria_label(format!(
+            "{count} bound processes. The arrow keys, Page Up, Page Down, Home, and End scroll the list."
+        ))
+        .track_focus(focus)
+        .track_scroll(scroll)
+        .overflow_y_scroll()
+        .max_h(px(TARGET_LIST_HEIGHT))
+        .w_full()
+        .rounded(tokens::INSET_RADIUS)
+        .bg(to_hsla(tokens.inset_tint))
+        .focus_visible(move |style| style.shadow(focus_ring(tokens)))
+        .on_key_down(move |event, window, cx| {
+            let offset = key_scroll.offset();
+            let max: f32 = f32::from(key_scroll.max_offset().y);
+            let page: f32 = (TARGET_LIST_HEIGHT - TARGET_ROW_STEP).max(TARGET_ROW_STEP);
+            if let Some(y) = list_scroll(
+                event.keystroke.key.as_str(),
+                f32::from(offset.y),
+                max,
+                TARGET_ROW_STEP,
+                page,
+            ) {
+                key_scroll.set_offset(point(offset.x, px(y)));
+                window.refresh();
+                cx.stop_propagation();
+            }
+        });
+    for target in &proposal.targets {
+        let evidence: String = target.evidence();
+        list = list.child(
+            v_flex()
+                .id(SharedString::from(format!("confirm-target-{}", target.pid)))
+                .role(Role::ListItem)
+                .test_support()
+                .aria_label(format!("PID {}, {}: {evidence}", target.pid, target.name))
+                .px(tokens::SPACE_2)
+                .py(tokens::SPACE_1)
+                .child(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(12.0))
+                        .child(format!("PID {}  {}", target.pid, target.name)),
+                )
+                .child(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(11.0))
+                        .text_color(to_hsla(tokens.muted_foreground))
+                        .child(evidence),
+                ),
+        );
+    }
+    list.into_any_element()
+}
+
+/// The focus ring of §9: a 2 px gap in the surface color, then 2 px of
+/// `brand`.
+fn focus_ring(tokens: &Tokens) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: to_hsla(tokens.surface),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(2.0),
+            inset: false,
+        },
+        BoxShadow {
+            color: to_hsla(tokens.brand),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(4.0),
+            inset: false,
+        },
+    ]
+}
+
 /// The body of a stop confirmation with ready plans.
-fn stop_body(proposal: &StopProposal, now: SystemTime, tokens: &Tokens) -> AnyElement {
-    let mut list = v_flex().gap(tokens::SPACE_1);
-    for target in proposal.targets.iter().take(LISTED_TARGETS_MAX) {
-        list = list.child(MonoTag::new(
-            SharedString::from(format!("confirm-target-{}", target.pid)),
-            format!("PID {}  {}", target.pid, target.name),
-        ));
-    }
-    let more: usize = proposal.targets.len().saturating_sub(LISTED_TARGETS_MAX);
-    if more > 0 {
-        list = list.child(caption(
-            "confirm-more",
-            format!("and {more} more processes of the same group"),
-            tokens,
-        ));
-    }
+fn stop_body(
+    proposal: &StopProposal,
+    now: SystemTime,
+    scroll: &ScrollHandle,
+    focus: &FocusHandle,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> AnyElement {
     let count: usize = proposal.targets.len();
     let processes: &str = if count == 1 { "process" } else { "processes" };
     v_flex()
@@ -263,13 +373,13 @@ fn stop_body(proposal: &StopProposal, now: SystemTime, tokens: &Tokens) -> AnyEl
         .child(body_line(
             "confirm-object",
             format!(
-                "The plans bind {count} {processes} of {}. A process that starts later is not in the plans.",
+                "The plans bind {count} {processes} of {}, each with the identity evidence below. A process that starts later is not in the plans, and a process whose evidence changed is not signaled.",
                 proposal.name
             ),
             false,
             tokens,
         ))
-        .child(list)
+        .child(target_list(proposal, scroll, focus, mono, tokens))
         .child(body_line(
             "confirm-consequence",
             "Quit asks each process to exit. Force quit ends each process at once. Unsaved data of the processes can be lost. A stop has no undo.",
@@ -300,8 +410,13 @@ pub fn open_stop(
     let (instance, name): (String, String) = (instance.to_owned(), name.to_owned());
     model.update(cx, |model, cx| model.prepare_stop(&instance, &name, cx));
     let model: Entity<AppModel> = model.clone();
+    // The list keeps its scroll position and its focus handle while the
+    // dialog is open.
+    let scroll: ScrollHandle = ScrollHandle::new();
+    let focus: FocusHandle = cx.focus_handle();
     window.open_dialog(cx, move |dialog: Dialog, _window, cx| {
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        let mono: SharedString = cx.theme().mono_font_family.clone();
         let now: SystemTime = SystemTime::now();
         let close_model: Entity<AppModel> = model.clone();
         let dialog = dialog
@@ -360,7 +475,7 @@ pub fn open_stop(
                     force: true,
                 };
                 dialog
-                    .child(stop_body(&proposal, now, tokens))
+                    .child(stop_body(&proposal, now, &scroll, &focus, &mono, tokens))
                     .footer(footer(vec![
                         cancel_button(Some(model.clone())),
                         confirm_button(
@@ -407,6 +522,23 @@ mod tests {
             text,
             "An eligible incident then proceeds with no further question. The guard can ask an application to quit, and force an application to quit."
         );
+    }
+
+    #[test]
+    fn the_keys_scroll_the_list_inside_its_bounds() {
+        let max: f32 = 400.0;
+        assert_eq!(list_scroll("down", 0.0, max, 40.0, 200.0), Some(-40.0));
+        assert_eq!(list_scroll("up", 0.0, max, 40.0, 200.0), Some(0.0));
+        assert_eq!(
+            list_scroll("pagedown", -300.0, max, 40.0, 200.0),
+            Some(-400.0)
+        );
+        assert_eq!(list_scroll("pageup", -100.0, max, 40.0, 200.0), Some(0.0));
+        assert_eq!(list_scroll("end", 0.0, max, 40.0, 200.0), Some(-400.0));
+        assert_eq!(list_scroll("home", -250.0, max, 40.0, 200.0), Some(0.0));
+        assert_eq!(list_scroll("a", -250.0, max, 40.0, 200.0), None);
+        // A list that fits has nothing to scroll.
+        assert_eq!(list_scroll("down", 0.0, 0.0, 40.0, 200.0), Some(0.0));
     }
 
     #[test]

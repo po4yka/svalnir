@@ -50,7 +50,7 @@ use svalnir_core::{
         PlanContext, StopRequest, StopStepIds, build_stop_plan, check_expiry, manual_plan_lifetime,
     },
     policy::{ApplicationCandidate, EvaluationClock, PolicyId, ProtectionContext, ProtectionFact},
-    process::VerifiedMembership,
+    process::{ProcessIdentity, VerifiedMembership},
     quantity::Nanoseconds,
     time::WallTime,
 };
@@ -446,10 +446,17 @@ impl ActionPort for LivePort {
         };
         let quit: Arc<Plan> = build(StopMode::Graceful)?;
         let force: Arc<Plan> = build(StopMode::ImmediateForce)?;
+        // The dialog lists exactly the processes that the sealed plans
+        // bind. The two plans come from one reading, so they bind the same
+        // processes; plans that do not are not offered.
+        let targets: Vec<StopTarget> = plan_targets(&quit, &snapshot);
+        if targets.is_empty() || targets != plan_targets(&force, &snapshot) {
+            return Err(ActionState::refused("plan_not_buildable"));
+        }
         Ok(StopProposal {
             instance: instance.to_owned(),
             name: name.to_owned(),
-            targets: targets(&snapshot, &candidate),
+            targets,
             expires_at: expiry_wall(&quit),
             quit: Some(quit),
             force: Some(force),
@@ -640,19 +647,39 @@ fn instance_of(candidate: &ApplicationCandidate) -> Option<&str> {
     }
 }
 
-/// The processes of `candidate`, with the names of the snapshot.
-fn targets(snapshot: &ProcessSnapshot, candidate: &ApplicationCandidate) -> Vec<StopTarget> {
-    candidate
-        .processes
+/// The processes that `plan` binds, with the identity evidence of the plan
+/// and the names of the snapshot.
+fn plan_targets(plan: &Plan, snapshot: &ProcessSnapshot) -> Vec<StopTarget> {
+    plan.targets
         .iter()
-        .map(|process| StopTarget {
-            pid: process.pid.get(),
-            name: snapshot
-                .find_pid(process.pid)
-                .and_then(ProcessRecord::display_label)
-                .unwrap_or_else(|| format!("PID {}", process.pid.get())),
-        })
+        .filter_map(|target| target.binding.processes())
+        .flatten()
+        .map(|process| stop_target(process, snapshot))
         .collect()
+}
+
+/// One bound process as the dialog shows it.
+fn stop_target(process: &ProcessIdentity, snapshot: &ProcessSnapshot) -> StopTarget {
+    let executable = process.executable.as_ref();
+    StopTarget {
+        pid: process.pid.get(),
+        name: snapshot
+            .find_pid(process.pid)
+            .and_then(ProcessRecord::display_label)
+            .unwrap_or_else(|| format!("PID {}", process.pid.get())),
+        start_time: process.start_time.get(),
+        uid: process.uid.get(),
+        executable: executable.map(|executable| executable.path.display_label()),
+        file: executable
+            .and_then(|executable| executable.file.as_ref())
+            .map(|file| format!("device {}, inode {}", file.device.get(), file.inode.get())),
+        signature: executable
+            .and_then(|executable| executable.code_signature.as_ref())
+            .map(|signature| match &signature.team_identifier {
+                Some(team) => format!("{} ({team})", signature.signing_identifier),
+                None => signature.signing_identifier.clone(),
+            }),
+    }
 }
 
 /// The wall-clock time at which `plan` expires: its creation time plus its
@@ -1004,6 +1031,49 @@ mod tests {
             force: false,
         });
         assert_eq!(state, ActionState::refused("plan_not_buildable"));
+    }
+
+    #[test]
+    fn the_listed_targets_are_exactly_the_members_of_the_sealed_plan() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let mut child = Child::sleeper(directory.path());
+        let plan = stop_plan(&mut child, "plan-test-targets", Duration::from_secs(0));
+        let members: Vec<(i32, u64, u32)> = plan
+            .targets
+            .iter()
+            .filter_map(|target| target.binding.processes())
+            .flatten()
+            .map(|process| {
+                (
+                    process.pid.get(),
+                    process.start_time.get(),
+                    process.uid.get(),
+                )
+            })
+            .collect();
+        let host: Host = Host::open().unwrap_or_else(|error| panic!("{error}"));
+        let snapshot = collect_processes(&host).unwrap_or_else(|error| panic!("{error}"));
+        let listed: Vec<StopTarget> = plan_targets(&plan, &snapshot);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|target| (target.pid, target.start_time, target.uid))
+                .collect::<Vec<_>>(),
+            members
+        );
+        let pid: i32 = i32::try_from(child.0.id()).unwrap_or_else(|error| panic!("{error}"));
+        let target = listed
+            .iter()
+            .find(|target| target.pid == pid)
+            .unwrap_or_else(|| panic!("the child is not listed: {listed:?}"));
+        assert!(
+            target
+                .executable
+                .as_deref()
+                .is_some_and(|path| path.ends_with("/sleeper")),
+            "{target:?}"
+        );
+        assert!(target.evidence().contains("user "), "{}", target.evidence());
     }
 
     #[test]

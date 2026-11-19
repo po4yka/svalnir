@@ -80,6 +80,28 @@ impl FixturePort {
 
 const FIXTURE_NOTE: &str = "(Fixture: nothing was written.)";
 
+/// The helper processes that a fixture stop plan binds after the members
+/// of the process list.
+pub const FIXTURE_HELPERS: i32 = 14;
+
+/// A bound process of a fixture plan, with synthetic identity evidence.
+fn fixture_target(pid: i32, name: String, group: &str) -> StopTarget {
+    let start: u64 = 1_794_830_400_000_000 + u64::from(pid.unsigned_abs()) * 1_250;
+    let bundle: String = group.to_lowercase().replace(' ', "-");
+    StopTarget {
+        pid,
+        name,
+        start_time: start,
+        uid: 501,
+        executable: Some(format!("/Applications/{group}.app/Contents/MacOS/{group}")),
+        file: Some(format!(
+            "device 16777230, inode {}",
+            4_000_000 + pid.unsigned_abs()
+        )),
+        signature: (pid % 5 != 0).then(|| format!("dev.fixture.{bundle} (FIXTURE01)")),
+    }
+}
+
 /// Whether `action` changes the authority record rather than writing a
 /// request to the queue.
 const fn is_authority(action: &Action) -> bool {
@@ -141,16 +163,26 @@ impl ActionPort for FixturePort {
             .processes
             .iter()
             .filter(|process| process.group.as_deref() == Some(name))
-            .map(|process| StopTarget {
-                pid: process.pid,
-                name: process.name.clone().unwrap_or_else(|| name.to_owned()),
+            .map(|process| {
+                fixture_target(
+                    process.pid,
+                    process.name.clone().unwrap_or_else(|| name.to_owned()),
+                    name,
+                )
             })
             .collect();
         if targets.is_empty() {
-            targets.push(StopTarget {
-                pid: 1000,
-                name: name.to_owned(),
-            });
+            targets.push(fixture_target(1000, name.to_owned(), name));
+        }
+        // A group of a browser or an editor has many helper processes. The
+        // fixture plan binds helpers too, so that the list scrolls.
+        let base: i32 = targets.last().map_or(1000, |target| target.pid);
+        for index in 1..=FIXTURE_HELPERS {
+            targets.push(fixture_target(
+                base + 100 + index,
+                format!("{name} Helper (Renderer) {index}"),
+                name,
+            ));
         }
         Ok(StopProposal {
             instance: instance.to_owned(),

@@ -30,7 +30,9 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+umask 022
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 readonly ROOT
 
 # shellcheck source=scripts/package-layout.sh
@@ -124,7 +126,7 @@ check_code() {
     [ "$mode" = "755" ] || fail "$file has mode $mode, not 755"
     archs="$(lipo -archs "$file")"
     [ "$archs" = "$MACHO_ARCH" ] || fail "$file has the architectures '$archs', not '$MACHO_ARCH'"
-    minos="$(otool -l "$file" | awk '$1 == "cmd" { build = ($2 == "LC_BUILD_VERSION") } build && $1 == "minos" { print $2; exit }')"
+    minos="$(otool -l "$file" | awk '$1 == "cmd" { build = ($2 == "LC_BUILD_VERSION") } build && !found && $1 == "minos" { print $2; found = 1 }')"
     [ "$minos" = "$MIN_MACOS" ] || fail "$file has the deployment target '$minos', not '$MIN_MACOS'"
 
     codesign --verify --strict "$file" || fail "$file has no valid signature"
@@ -146,7 +148,8 @@ check_code() {
         fail "SVALNIR_SIGNING is '$SIGNING'; use 'adhoc' or 'developer-id'"
         ;;
     esac
-    entitlements="$(codesign --display --entitlements - --xml "$file" 2>/dev/null || true)"
+    entitlements="$(codesign --display --entitlements - --xml "$file" 2>/dev/null)" ||
+        fail "cannot read the entitlements of $file"
     if grep -Fq '<key>' <<<"$entitlements"; then
         fail "$file has an entitlement; the contract permits none"
     fi
@@ -228,6 +231,9 @@ readonly APP="$WORK/app/Svalnir.app"
 readonly APP_BIN_DIR="$APP/Contents/MacOS"
 links="$(find "$WORK/archive" "$WORK/app" -type l)"
 [ -z "$links" ] || fail "an artifact has a symbolic link: $links"
+modes="$(find "$WORK/archive/$NAME" "$APP" \( \( -type d ! -perm 755 \) -o \
+    \( -type f ! -path '*/bin/*' ! -path '*/Contents/MacOS/*' ! -perm 644 \) \) -print)"
+[ -z "$modes" ] || fail "an entry does not have the mode 755 (directory) or 644 (file): $modes"
 
 step "code ($SIGNING)"
 for bin in "${BINS[@]}"; do

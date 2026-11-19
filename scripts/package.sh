@@ -39,6 +39,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# The physical path: rustc sees it, and the path replacement must match it.
+cd "$(pwd -P)"
 
 # shellcheck source=scripts/package-layout.sh
 source scripts/package-layout.sh
@@ -63,10 +65,18 @@ check_signing_configuration() {
     developer-id)
         [ -n "${SVALNIR_SIGN_IDENTITY:-}" ] ||
             fail "SVALNIR_SIGNING=developer-id needs SVALNIR_SIGN_IDENTITY; no signing identity is configured"
-        local identities
-        identities="$(security find-identity -v -p codesigning)"
-        grep -F -- "$SVALNIR_SIGN_IDENTITY" <<<"$identities" | grep -F 'Developer ID Application' >/dev/null ||
+        # Exactly one valid identity must match, so that codesign cannot use
+        # a different certificate. The signature then uses its SHA-1 hash.
+        local identities matches
+        identities="$(security find-identity -v -p codesigning)" ||
+            fail "cannot read the signing identities of the keychain search list"
+        matches="$(grep -F -- "$SVALNIR_SIGN_IDENTITY" <<<"$identities" | grep -F '"Developer ID Application: ' || true)"
+        [ -n "$matches" ] ||
             fail "no valid 'Developer ID Application' identity '$SVALNIR_SIGN_IDENTITY' is in the keychain search list"
+        [ "$(wc -l <<<"$matches" | tr -d ' ')" = "1" ] ||
+            fail "SVALNIR_SIGN_IDENTITY '$SVALNIR_SIGN_IDENTITY' matches more than one identity; give the SHA-1 hash"
+        SIGN_HASH="$(awk '{ print $2 }' <<<"$matches")"
+        [[ "$SIGN_HASH" =~ ^[0-9A-F]{40}$ ]] || fail "cannot read the SHA-1 hash of the signing identity"
         ;;
     *)
         fail "SVALNIR_SIGNING is '$SIGNING'; use 'adhoc' or 'developer-id'"
@@ -79,6 +89,10 @@ check_signing_configuration() {
             fail "SVALNIR_NOTARIZE=1 needs SVALNIR_SIGNING=developer-id; the notary service refuses an ad-hoc signature"
         [ -n "${SVALNIR_NOTARY_PROFILE:-}" ] ||
             fail "SVALNIR_NOTARIZE=1 needs SVALNIR_NOTARY_PROFILE; no notary credentials are configured"
+        # This call needs the network. It fails for a profile that does not
+        # exist and for credentials that the notary service refuses.
+        xcrun notarytool history --keychain-profile "$SVALNIR_NOTARY_PROFILE" >/dev/null 2>&1 ||
+            fail "the keychain profile '$SVALNIR_NOTARY_PROFILE' is not usable with the notary service"
         ;;
     *)
         fail "SVALNIR_NOTARIZE is '$NOTARIZE'; use '0' or '1'"
@@ -95,7 +109,7 @@ sign_code() {
     local path="$1" identifier="$2" entitlements="$ENTITLEMENTS_DIR/$3.entitlements"
     local identity=(--sign - --timestamp=none)
     if [ "$SIGNING" = "developer-id" ]; then
-        identity=(--sign "$SVALNIR_SIGN_IDENTITY" --timestamp)
+        identity=(--sign "$SIGN_HASH" --timestamp)
     fi
     [ -f "$entitlements" ] || fail "no entitlements file '$entitlements'"
     codesign --force "${identity[@]}" \
@@ -108,8 +122,18 @@ sign_code() {
 # Send one zip file to the notary service and wait for the result.
 # TODO(npochaev): run the developer-id and notarization steps with a real
 # identity; no run of them exists, because the project has no Developer ID.
+# The exit status of `notarytool` is not sufficient: the result must be
+# "Accepted".
 notarize() {
-    xcrun notarytool submit "$1" --keychain-profile "$SVALNIR_NOTARY_PROFILE" --wait
+    local result status id
+    result="$(xcrun notarytool submit "$1" --keychain-profile "$SVALNIR_NOTARY_PROFILE" --wait --output-format json)" ||
+        fail "the notary service did not accept the request for $(basename "$1")"
+    status="$(jq -r '.status // empty' <<<"$result")"
+    if [ "$status" != "Accepted" ]; then
+        id="$(jq -r '.id // empty' <<<"$result")"
+        [ -z "$id" ] || xcrun notarytool log "$id" --keychain-profile "$SVALNIR_NOTARY_PROFILE" >&2 || true
+        fail "the notary service gave the result '${status:-unknown}' for $(basename "$1")"
+    fi
 }
 
 # Give each staged entry the same mode and time on each host.
@@ -172,17 +196,25 @@ else
     # the Cargo home, the toolchain, the checkout, and the target directory.
     # rustc uses the last option that matches, so the widest prefix is first.
     # scripts/check-artifacts.sh fails when a path of the build host stays.
-    remap=""
+    # Cargo splits RUSTFLAGS at each space, so a path with a space needs the
+    # encoded form, which has the separator 0x1f.
+    readonly SEPARATOR=$'\x1f'
+    flags="${CARGO_ENCODED_RUSTFLAGS:-}"
+    if [ -z "$flags" ]; then
+        for flag in ${RUSTFLAGS:-}; do
+            flags="${flags:+$flags$SEPARATOR}$flag"
+        done
+    fi
     for pair in \
         "$HOME=/home" \
         "${CARGO_HOME:-$HOME/.cargo}=/cargo" \
         "$(rustc --print sysroot)=/toolchain" \
         "$PWD=/svalnir" \
         "$target_dir=/target"; do
-        remap="$remap --remap-path-prefix=$pair"
+        flags="${flags:+$flags$SEPARATOR}--remap-path-prefix=$pair"
     done
     MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" \
-        RUSTFLAGS="${RUSTFLAGS:-}$remap" \
+        CARGO_ENCODED_RUSTFLAGS="$flags" \
         cargo build --release --locked --workspace --bins --target "$TARGET"
     BIN_SRC="$target_dir/$TARGET/release"
 fi

@@ -78,9 +78,9 @@ Each signature has the hardened runtime (`--options runtime`) and the entitlemen
 | `SVALNIR_SIGNING` | Signature |
 | --- | --- |
 | `adhoc`, the default | Ad hoc, with no timestamp. Gatekeeper blocks the application after a download. |
-| `developer-id` | The identity that `SVALNIR_SIGN_IDENTITY` names, with a secure timestamp. The script stops before the build when the variable is empty or when no valid `Developer ID Application` identity with that name is in the keychain search list. |
+| `developer-id` | The identity that `SVALNIR_SIGN_IDENTITY` names, with a secure timestamp. The script stops before the build when the variable is empty, or when it does not match exactly one valid `Developer ID Application` identity of the keychain search list. |
 
-`SVALNIR_NOTARIZE=1` sends the application and the executables to the Apple notary service with the keychain profile that `SVALNIR_NOTARY_PROFILE` names, staples the ticket to `Svalnir.app`, and validates it. It needs `developer-id` signing. A ticket cannot be stapled to a single executable, so Gatekeeper gets the ticket of the binaries archive online.
+`SVALNIR_NOTARIZE=1` sends the application and the executables to the Apple notary service with the keychain profile that `SVALNIR_NOTARY_PROFILE` names, staples the ticket to `Svalnir.app`, and validates it. It needs `developer-id` signing. Before the build, the script asks the notary service for the history of the profile, which needs the network, and stops when the profile is not usable. A ticket cannot be stapled to a single executable, so Gatekeeper gets the ticket of the binaries archive online.
 
 The `developer-id` and notarization steps were not run: the project has no Developer ID.
 
@@ -90,7 +90,7 @@ For one commit, one toolchain, and one build host, two runs of `scripts/package.
 
 - Each archive entry has the time `SOURCE_DATE_EPOCH`. The default is the committer time of `HEAD`.
 - The entries are in the order of `LC_ALL=C sort`, with fixed modes. The tar entries have the owner 0 and the group 0. The gzip header has no name and no time. The zip entries have no extra field.
-- The build replaces the path of the checkout, of the Cargo home, and of the home directory in the executables (`--remap-path-prefix`).
+- The build replaces the path of the home directory, of the Cargo home, of the toolchain, of the checkout, and of the target directory in the executables (`--remap-path-prefix`).
 - An ad-hoc signature has no timestamp. A Developer ID signature has one, so a signed artifact is not the same for two runs.
 
 The sameness of the executables for two build hosts is not verified.

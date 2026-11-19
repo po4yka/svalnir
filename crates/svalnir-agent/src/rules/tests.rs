@@ -556,6 +556,23 @@ fn a_forged_root_marker_does_not_classify_the_root() {
             fs::hard_link(&real, marker).unwrap();
         }),
     ];
+    // The control: the unchanged valid marker classifies the root.
+    let fixture = Fixture::new("Temporary");
+    fs::create_dir(fixture.root().join("item-a")).unwrap();
+    let marker: PathBuf = fixture.root().join(ROOT_MARKER_NAME);
+    fs::write(
+        &marker,
+        serde_json::to_vec(&valid_marker(&fixture)).unwrap(),
+    )
+    .unwrap();
+    let control = discover_temporary_with(
+        &fixture,
+        NO_LEASES,
+        DiscoveryMode::Full,
+        limits(),
+        &later_clock(),
+    );
+    assert!(control.is_ok(), "a valid marker: {:?}", control.err());
     for (name, forge) in cases {
         let fixture = Fixture::new("Temporary");
         fs::create_dir(fixture.root().join("item-a")).unwrap();
@@ -763,6 +780,31 @@ fn an_item_with_content_that_the_rule_preserves_is_skipped() {
     }
 }
 
+/// The time that a discovery on a FIFO can take. A discovery that opens the
+/// FIFO for reading never ends.
+const FIFO_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs `discover` on a second thread and waits for its result. The test
+/// fails at the timeout, so that a discovery that blocks on a FIFO does not
+/// block the test run.
+fn discovery_within_timeout(
+    fixture: Fixture,
+    discover: impl FnOnce(&Fixture) -> Discovery + Send + 'static,
+) -> Discovery {
+    let (sender, receiver) = std::sync::mpsc::channel::<Discovery>();
+    std::thread::spawn(move || {
+        // The receiver is gone only after the timeout.
+        let discovery: Discovery = discover(&fixture);
+        if sender.send(discovery).is_err() {
+            // The test has failed at the timeout. Nobody reads the result.
+        }
+    });
+    match receiver.recv_timeout(FIFO_DISCOVERY_TIMEOUT) {
+        Ok(discovery) => discovery,
+        Err(error) => panic!("the discovery did not end, it can have opened a FIFO: {error}"),
+    }
+}
+
 /// Makes a FIFO at `path`.
 fn make_fifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
@@ -781,7 +823,7 @@ fn an_item_with_a_fifo_is_skipped_and_the_fifo_is_not_opened() {
     make_fifo(&item.join("nested/pipe"));
 
     // An open of the FIFO for reading would block this test.
-    let discovery = discover_temporary(&fixture);
+    let discovery = discovery_within_timeout(fixture, discover_temporary);
 
     assert_eq!(discovery.candidates.len(), 0);
     assert_eq!(
@@ -1812,7 +1854,7 @@ fn an_xcode_unit_with_a_fifo_is_skipped_and_the_fifo_is_not_opened() {
     make_fifo(&project.join("Build/Products/Debug/pipe"));
 
     // An open of the FIFO for reading would block this test.
-    let discovery = discover_xcode(&fixture);
+    let discovery = discovery_within_timeout(fixture, discover_xcode);
 
     assert_eq!(discovery.candidates.len(), 2, "{:?}", discovery.skipped);
     assert_eq!(

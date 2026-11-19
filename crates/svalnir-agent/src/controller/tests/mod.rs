@@ -8,7 +8,7 @@ use svalnir_core::action::{ActionClass, Escalation, Plan, TargetBinding, Trigger
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::grant::{AuthorityState, InstanceInhibition};
-use svalnir_core::id::{ExecutorEpochId, OperationId, PlanId};
+use svalnir_core::id::{ExecutorEpochId, IncidentId, OperationId, PlanId};
 use svalnir_core::policy::{ApplicationCandidate, ForegroundStatus};
 use svalnir_core::quantity::ByteDelta;
 use svalnir_core::state::PressureState;
@@ -1524,6 +1524,15 @@ fn a_pause_and_a_resume_on_the_disk_path_inhibit_the_plan_and_need_a_fresh_measu
     let mut bench = Bench::new();
     let all = specs();
     let active: AuthorityState = bench.authority.clone().unwrap();
+    // The incident is open before the pause, and its first plan is complete.
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let plan_id: PlanId = bench.state.outstanding.clone().unwrap().plan_id;
+    bench.advance(SAMPLE);
+    let report = completed_with_gain(plan_id, 3_000);
+    bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
+    assert_eq!(bench.state.disk_incidents.len(), 1);
+    assert!(bench.state.outstanding.is_none());
+    let incident_id: IncidentId = bench.state.disk_incidents[0].incident_id.clone();
     bench.authority = Some(paused(&active, bench.now));
     let output = bench.run(40 * SECOND, disk(5 * GIBIBYTE, &all));
     assert!(output.status.paused);
@@ -1535,6 +1544,7 @@ fn a_pause_and_a_resume_on_the_disk_path_inhibit_the_plan_and_need_a_fresh_measu
     );
     // The pause does not reset the incident.
     assert_eq!(bench.state.disk_incidents.len(), 1);
+    assert_eq!(bench.state.disk_incidents[0].incident_id, incident_id);
 
     // The resume. The sample is from before it, so it supports no action.
     let before = disk(5 * GIBIBYTE, &all)(bench.now);
@@ -1606,6 +1616,7 @@ fn a_clean_restart_keeps_the_cooldown_of_an_open_disk_incident() {
     let report = completed_with_gain(plan_id, 0);
     bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[report]);
     let stored_cooldown = bench.state.policy.disk.incidents[0].cooldown.clone();
+    let incident_id: IncidentId = bench.state.disk_incidents[0].incident_id.clone();
     assert_eq!(
         stored_cooldown.as_ref().unwrap().until.get(),
         reported_at + 900 * SECOND
@@ -1619,6 +1630,7 @@ fn a_clean_restart_keeps_the_cooldown_of_an_open_disk_incident() {
     )));
     bench.epoch = epoch("epoch_2");
     assert!(bench.state.disk_incidents[0].established);
+    assert_eq!(bench.state.disk_incidents[0].incident_id, incident_id);
     let incident = &bench.state.policy.disk.incidents[0];
     assert_eq!(incident.cooldown, stored_cooldown);
 
@@ -1630,7 +1642,8 @@ fn a_clean_restart_keeps_the_cooldown_of_an_open_disk_incident() {
     assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Cooldown);
     // After it, the same incident makes its next plan.
     bench.run(320 * SECOND, disk(5 * GIBIBYTE, &all));
-    assert!(bench.state.outstanding.is_some());
+    let outstanding = bench.state.outstanding.clone().unwrap();
+    assert_eq!(outstanding.incident_id, incident_id);
 }
 
 #[test]

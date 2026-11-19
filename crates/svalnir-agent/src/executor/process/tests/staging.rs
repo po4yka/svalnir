@@ -1184,7 +1184,26 @@ fn an_observation_ends_when_the_clock_gives_no_value() {
     // reported.
     assert_eq!(report.members[0].result.effect, TargetEffect::StillRunning);
     assert_eq!(report.members[0].result.stop_reason, StopReason::Completed);
-    assert_eq!(report.next, NextStep::ForceNotPermitted);
+
+    // With a force step permitted, the time of the submission is the reading
+    // after the call, and a clock failure in the observation does not
+    // change it.
+    let host: Host = Host::new().with_process(100, 10);
+    let envelope = graceful(Escalation::ForceAfterGrace, vec![member(100, 10, job())]);
+    let mut observation = observing(begin(&host, &envelope));
+    host.change(|world| world.clock_fails = true);
+    for _ in 1..MAX_CLOCK_FAILURES {
+        observation = observing(poll(&host, observation, None));
+    }
+    let report = finished(poll(&host, observation, None));
+    assert_eq!(report.members[0].result.effect, TargetEffect::StillRunning);
+    assert_eq!(report.submitted_at, Some(MonotonicNanos::new(START)));
+    assert_eq!(
+        report.next,
+        NextStep::Force {
+            not_before: MonotonicNanos::new(START + GRACE)
+        }
+    );
 
     // With no clock value at the start, no call is issued.
     let host: Host = Host::new().with_process(100, 10);

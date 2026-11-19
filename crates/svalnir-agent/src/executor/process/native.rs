@@ -53,6 +53,13 @@ const fn signal_number(signal: ProcessSignal) -> libc::c_int {
     }
 }
 
+/// The target of a signal, or `None` for a target that `kill` must not
+/// get. PID 1 is `launchd`. A value of 0 or less is a group form.
+fn checked_target(pid: Pid) -> Option<libc::pid_t> {
+    let target: libc::pid_t = pid.get();
+    (target > 1).then_some(target)
+}
+
 impl ProcessControl for DarwinProcessControl {
     fn own_process(&self) -> Option<Pid> {
         pid_of(std::process::id())
@@ -63,11 +70,9 @@ impl ProcessControl for DarwinProcessControl {
     }
 
     fn signal(&self, pid: Pid, signal: ProcessSignal) -> SignalResult {
-        let target: libc::pid_t = pid.get();
-        // PID 1 is `launchd`. A value of 0 or less is a group form.
-        if target <= 1 {
+        let Some(target) = checked_target(pid) else {
             return SignalResult::InvalidTarget;
-        }
+        };
         // SAFETY: `kill` takes two integers by value and keeps no pointer.
         // `target` is larger than 1, so the call addresses one process and
         // not a process group.
@@ -129,24 +134,15 @@ impl ProcessControl for DarwinProcessControl {
 mod tests {
     use svalnir_core::process::Pid;
 
-    use super::DarwinProcessControl;
-    use crate::executor::process::control::{
-        GracefulSignal, ProcessControl as _, ProcessSignal, SignalResult,
-    };
+    use super::checked_target;
 
-    /// The guard returns before the call to `kill`, so the test signals
+    /// The test calls only the pure function of the guard. It signals
     /// nothing.
     #[test]
     fn the_signal_of_process_one_is_refused_before_any_system_call() {
-        let pid: Pid = Pid::new(1).unwrap();
-        for signal in [
-            ProcessSignal::Graceful(GracefulSignal::Terminate),
-            ProcessSignal::Kill,
-        ] {
-            assert_eq!(
-                DarwinProcessControl.signal(pid, signal),
-                SignalResult::InvalidTarget
-            );
-        }
+        let one: Pid = Pid::new(1).unwrap();
+        assert_eq!(checked_target(one), None);
+        let ordinary: Pid = Pid::new(2).unwrap();
+        assert_eq!(checked_target(ordinary), Some(2));
     }
 }

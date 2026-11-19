@@ -1874,6 +1874,8 @@ fn a_queued_request_at_a_restart_is_served_only_after_the_reconciliation() {
     bench.clock.advance(SECOND);
     driver.tick(None);
     // The crash, and a client request that is queued after it.
+    let before = bench.journal().operation(&operation_id).unwrap().unwrap();
+    assert_eq!(before.state(), &OperationState::Admitted);
     drop(driver);
     let plan: Plan = trash_plan(&bench, "client-file");
     let mut client = bench.journal();
@@ -1885,7 +1887,7 @@ fn a_queued_request_at_a_restart_is_served_only_after_the_reconciliation() {
     // request is not served in the start.
     let mut driver = bench.start();
     let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
-    assert_ne!(operation.state(), &OperationState::Admitted);
+    assert_eq!(operation.state(), &OperationState::Failed);
     assert!(file.exists());
     assert_eq!(
         client.request_status(&request.request_id).unwrap(),
@@ -1902,6 +1904,6 @@ fn a_queued_request_at_a_restart_is_served_only_after_the_reconciliation() {
         Some(RequestStatus::Queued)
     );
     let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
-    assert_ne!(operation.state(), &OperationState::Admitted);
+    assert_eq!(operation.state(), &OperationState::Failed);
     assert!(child.is_running());
 }

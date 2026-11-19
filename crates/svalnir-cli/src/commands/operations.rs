@@ -465,7 +465,8 @@ pub(crate) fn cancel(
                 Ok(current) => operation = current,
                 Err(_) => break,
             }
-            if operation.state().is_settled() {
+            // An unknown outcome does not change until a reconciliation.
+            if is_ended(&operation) {
                 break;
             }
             std::thread::sleep(POLL);

@@ -20,7 +20,9 @@ use svalnir_agent::journal::{
     CoordinatorLock, CoordinatorRole, JournalOptions, OperationJournal, RequestBody,
     RequestCompletion, RequestStatus,
 };
-use svalnir_agent::platform::process::{ProcessSnapshot, generation_id};
+use svalnir_agent::platform::process::{
+    DarwinProcessSource, ProcessSnapshot, ProcessSource as _, generation_id,
+};
 use svalnir_core::action::{
     ActionError, ActionStage, ClientRole, DispatchState, ErrorCode, ErrorFamily, Journal as _,
     StopFence, TargetBinding,
@@ -39,18 +41,28 @@ use crate::seams::{ProcessReading, WhileAsked};
 /// instance `instance` in each process reading of `processes stop`. The
 /// reading of `replaced`, when it is given, has a different start time, as
 /// for a process that the host replaced at the same PID after the reading.
+///
+/// A member is the generation that runs now: its PID and its start time.
+/// A process that gets a member's PID after the member exits is not a
+/// member, so a later reading binds no process that the test did not
+/// start.
 fn give_membership(
     environment: &mut Environment,
     instance: &str,
     members: Vec<Pid>,
     replaced: Option<Pid>,
 ) {
+    let source = DarwinProcessSource::new();
+    let members: Vec<(Pid, ProcessStartTime)> = members
+        .into_iter()
+        .map(|pid| (pid, source.process_info(pid).unwrap().start_time))
+        .collect();
     let instance: ApplicationInstanceId = ApplicationInstanceId::new(instance).unwrap();
     environment.seams.test.process_reading = Some(ProcessReading(Arc::new(
         move |snapshot: &mut ProcessSnapshot| {
             for record in &mut snapshot.records {
                 let identity = &mut record.identity;
-                if !members.contains(&identity.pid) {
+                if !members.contains(&(identity.pid, identity.start_time)) {
                     continue;
                 }
                 identity.association = ProcessAssociation::ManagedJob {
@@ -215,7 +227,12 @@ fn a_group_stop_has_a_text_form_and_a_question_that_name_the_group() {
         &world.environment,
         &["processes", "stop", "--group", &instance, "--grace", "10s"],
     );
-    assert_ne!(declined.status, ExitStatus::Success, "{}", declined.stderr);
+    assert_eq!(
+        declined.status,
+        ExitStatus::Unavailable,
+        "{}",
+        declined.stderr
+    );
     assert!(
         declined.stderr.contains(&format!("instance {instance}")),
         "{}",
@@ -321,7 +338,7 @@ fn a_member_whose_identity_changed_after_the_plan_gets_no_signal() {
 fn a_plan_that_expires_while_the_question_waits_signals_no_member() {
     let mut world: World = World::new();
     world.activate(
-        "schema_version = 1\n\n[agent]\nmanual_plan_ttl = \"1s\"\n",
+        "schema_version = 1\n\n[agent]\nmanual_plan_ttl = \"5s\"\n",
         "none",
     );
     let mut first: ChildGuard = spawn_child(false);
@@ -332,7 +349,7 @@ fn a_plan_that_expires_while_the_question_waits_signals_no_member() {
             "yes".to_owned(),
         ]))));
     world.environment.seams.test.while_asked = Some(WhileAsked(Arc::new(|| {
-        std::thread::sleep(Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(5500));
     })));
     let stop = stop_group(&world.environment, &instance, &["--grace", "10s"]);
     assert_eq!(stop.error_code(), "plan_expired", "{}", stop.stdout);
@@ -374,7 +391,9 @@ fn a_group_with_no_verified_member_and_a_protected_group_are_refused() {
         vec![first.pid(), this_process()],
         None,
     );
-    let protected = stop_group(&world.environment, &instance, &["--force", "--yes"]);
+    // No `--force`: a protection is independent of the strategy, and a
+    // regression then sends no immediate force signal to this process.
+    let protected = stop_group(&world.environment, &instance, &["--yes"]);
     assert_eq!(
         protected.error_code(),
         "target_protected",
@@ -434,6 +453,16 @@ fn a_cancel_with_an_agent_goes_to_the_queue_and_the_agent_decides_it() {
     assert_eq!(result["acknowledgement"], "durable_stop_fence");
     assert_eq!(result["request_id"], request.request_id.as_str());
     assert_eq!(request.principal.role, ClientRole::Cli);
+    // The agent decided the request: the client wrote no fence of its own,
+    // and the agent of this test writes none.
+    let show = json(
+        &world.environment,
+        &["operations", "show", "--operation", &operation],
+    );
+    assert_eq!(
+        show.result()["operation"]["stop"]["durable_stop_fence"],
+        false
+    );
     assert_eq!(
         request.body,
         RequestBody::Cancel {
@@ -457,11 +486,22 @@ fn a_cancel_that_the_agent_stops_only_in_its_executor_is_not_durable() {
     let result = outcome.result();
     assert_eq!(result["acknowledgement"], "current_instance");
     assert_eq!(result["fence_written"], false);
-    let text = run(
+    assert!(
+        result["notes"].as_array().unwrap().iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("did not take the stop fence")),
+        "{result}"
+    );
+    // The client wrote no fence of its own.
+    let show = json(
         &world.environment,
         &["operations", "show", "--operation", &operation],
     );
-    assert_eq!(text.status, ExitStatus::Success);
+    assert_eq!(
+        show.result()["operation"]["stop"]["durable_stop_fence"],
+        false
+    );
 }
 
 #[test]
@@ -489,7 +529,7 @@ fn a_cancel_that_the_agent_refuses_reports_the_code_of_the_agent() {
         "{}",
         outcome.stdout
     );
-    assert_ne!(outcome.status, ExitStatus::Success);
+    assert_eq!(outcome.status, ExitStatus::Unavailable);
     assert_eq!(outcome.envelope()["error"]["operation_id"], operation);
     // The refused request wrote no fence.
     let show = json(

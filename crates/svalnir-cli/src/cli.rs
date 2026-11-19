@@ -39,6 +39,8 @@ pub struct CommonOptions {
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
     pub format: Format,
     /// Maximum time that the client waits. It does not cancel admitted work.
+    /// For `operations cancel`, it bounds the wait for the agent; after it,
+    /// the client writes the stop fence itself.
     #[arg(long, global = true, value_name = "DURATION", value_parser = positive_duration)]
     pub timeout: Option<Duration>,
     /// Color of the human-readable output. Machine output has no color.

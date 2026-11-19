@@ -62,9 +62,11 @@ pub(crate) fn stop_plan(child: &mut Child, plan_id: &str, age: Duration) -> Plan
     )
     .unwrap_or_else(|error| panic!("{error:?}"));
     // The inventory can read a new child only after its start; the test
-    // reads the processes again for at most 5 s.
+    // reads the processes again for at most 20 s. The bound is for a host
+    // under load (several suites at the same time): the loop ends at the
+    // first reading that has the child.
     let mut last: Option<String> = None;
-    let snapshot: ProcessSnapshot = (0..50)
+    let snapshot: ProcessSnapshot = (0..200)
         .find_map(|_| {
             let snapshot = collect_processes(&host).unwrap_or_else(|error| panic!("{error}"));
             if snapshot.find_pid(pid).is_some() {

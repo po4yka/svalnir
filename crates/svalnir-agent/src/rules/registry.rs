@@ -46,6 +46,19 @@ pub enum ClaimError {
     LifecycleMismatch,
 }
 
+/// The declaration of `rule` with `lifecycle` for each layout.
+#[cfg(any(test, all(feature = "test-support", debug_assertions)))]
+pub(super) fn with_lifecycle(
+    rule: &Rule,
+    lifecycle: &LifecycleState,
+) -> Result<Rule, RegistryError> {
+    let mut declaration: svalnir_core::rule::RuleDeclaration = (**rule).clone();
+    for layout in &mut declaration.layouts {
+        layout.lifecycle = lifecycle.clone();
+    }
+    svalnir_core::action::Checked::new(declaration).map_err(RegistryError::Incomplete)
+}
+
 /// The lifecycle state of one rule revision for one layout, with the
 /// modes that the state permits. Admission reads this record; it has no
 /// other source for the state of a rule.
@@ -81,6 +94,29 @@ impl ReviewedRules {
         Ok(Self {
             expired_temporary: ExpiredTemporaryRule::new()?,
             xcode_derived_data: XcodeDerivedDataRule::new()?,
+        })
+    }
+
+    /// The registry with `lifecycle` for each layout of each rule, for a
+    /// fixture test.
+    ///
+    /// Only a test build has this function: a unit test of this crate, or
+    /// a debug build with the feature `test-support`. A released build has
+    /// no function that changes a lifecycle state, so each rule of a
+    /// released build has the state of its declaration. The state of a
+    /// test names no validation record of `docs/VALIDATION.md`; the test
+    /// gives a reference that says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RegistryError`] when a declaration with the state is
+    /// not complete.
+    #[cfg(any(test, all(feature = "test-support", debug_assertions)))]
+    pub fn with_fixture_lifecycle(lifecycle: &LifecycleState) -> Result<Self, RegistryError> {
+        let registry: Self = Self::new()?;
+        Ok(Self {
+            expired_temporary: registry.expired_temporary.with_lifecycle(lifecycle)?,
+            xcode_derived_data: registry.xcode_derived_data.with_lifecycle(lifecycle)?,
         })
     }
 

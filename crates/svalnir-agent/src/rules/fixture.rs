@@ -1,0 +1,198 @@
+//! Fixtures of the rule tests of this crate and of its clients.
+//!
+//! Only a test build has this module: a unit test of this crate, or a
+//! debug build with the feature `test-support`. A function of this module
+//! writes only below a directory that the caller gives, which a test made
+//! as a temporary directory. No function reads the home directory, a real
+//! `DerivedData` root, or the process table.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Instant, SystemTime};
+
+use svalnir_core::process::Uid;
+use svalnir_core::rule::{LifecycleState, PromotionEvidence};
+use svalnir_core::time::{MonotonicNanos, WallTime};
+
+use super::eviction::DiscoveryEnvironment;
+use super::xcode::{ProducerProcesses, XcodeEvidence};
+use crate::scan::{ScanClock, ScanTimestamp};
+
+/// The reference of a lifecycle state of a test. It names no validation
+/// record of `docs/VALIDATION.md`.
+pub const FIXTURE_EVIDENCE: &str = "test-fixture/no-recorded-evidence";
+
+/// The lifecycle state of a fixture test that permits manual eviction and
+/// not automatic eviction.
+#[must_use]
+pub fn manual_action_validated() -> LifecycleState {
+    LifecycleState::ManualActionValidated {
+        evidence: PromotionEvidence {
+            record: FIXTURE_EVIDENCE.to_owned(),
+        },
+    }
+}
+
+/// The lifecycle state of a fixture test that permits automatic eviction.
+#[must_use]
+pub fn automatic_eviction_validated() -> LifecycleState {
+    LifecycleState::AutomaticEvictionValidated {
+        evidence: PromotionEvidence {
+            record: FIXTURE_EVIDENCE.to_owned(),
+        },
+    }
+}
+
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The environment of a fixture test: the wall-clock time of the host
+/// moved forward by a number of days, a process-local monotonic time, and
+/// a producer state that the test sets.
+///
+/// A fixture has the modification times of the moment of its creation, so
+/// a clock that is 30 days later makes each unit older than the minimum
+/// age of `xcode.inactive-derived-data`.
+#[derive(Debug, Clone)]
+pub struct FixtureEnvironment {
+    started: Instant,
+    days_later: i64,
+    producer: Arc<AtomicU8>,
+}
+
+const NOT_RUNNING: u8 = 0;
+const RUNNING: u8 = 1;
+const UNKNOWN: u8 = 2;
+
+impl FixtureEnvironment {
+    /// An environment whose wall-clock time is `days_later` days after
+    /// the time of the host, with no process of the producer.
+    #[must_use]
+    pub fn days_later(days_later: i64) -> Self {
+        Self {
+            started: Instant::now(),
+            days_later,
+            producer: Arc::new(AtomicU8::new(NOT_RUNNING)),
+        }
+    }
+
+    /// Sets the producer state that each later reading gives. Each copy of
+    /// the environment has the same state.
+    pub fn set_producer(&self, producer: ProducerProcesses) {
+        self.producer.store(
+            match producer {
+                ProducerProcesses::NotRunning => NOT_RUNNING,
+                ProducerProcesses::Running => RUNNING,
+                ProducerProcesses::Unknown => UNKNOWN,
+            },
+            Ordering::SeqCst,
+        );
+    }
+
+    fn monotonic(&self) -> MonotonicNanos {
+        let elapsed: u64 = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        MonotonicNanos::new(1_000_000_000_u64.saturating_add(elapsed))
+    }
+}
+
+impl ScanClock for FixtureEnvironment {
+    fn now(&self) -> ScanTimestamp {
+        let wall: Option<WallTime> = WallTime::try_from(SystemTime::now()).ok().and_then(|now| {
+            WallTime::from_unix(
+                now.unix_seconds()
+                    .saturating_add(self.days_later.saturating_mul(SECONDS_PER_DAY)),
+                0,
+            )
+            .ok()
+        });
+        ScanTimestamp {
+            wall,
+            monotonic_ns: Some(self.monotonic()),
+        }
+    }
+}
+
+impl DiscoveryEnvironment for FixtureEnvironment {
+    fn xcode_evidence(&self, _principal: Uid) -> XcodeEvidence {
+        XcodeEvidence {
+            producer_processes: match self.producer.load(Ordering::SeqCst) {
+                NOT_RUNNING => ProducerProcesses::NotRunning,
+                RUNNING => ProducerProcesses::Running,
+                _ => ProducerProcesses::Unknown,
+            },
+            observed_at: self.monotonic(),
+        }
+    }
+}
+
+/// The path of the `DerivedData` root below the home directory `home`,
+/// as the declaration of `xcode.inactive-derived-data` gives it.
+#[must_use]
+pub fn derived_data_root(home: &Path) -> PathBuf {
+    home.join("Library/Developer/Xcode/DerivedData")
+}
+
+/// Makes the Xcode project `NAME.xcodeproj` below `sources`, outside a
+/// `DerivedData` root, and returns its path.
+///
+/// # Errors
+///
+/// Returns the error of the file system when a file cannot be written.
+pub fn write_workspace(sources: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let workspace: PathBuf = sources.join(name).join(format!("{name}.xcodeproj"));
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("project.pbxproj"), b"// project")?;
+    Ok(workspace)
+}
+
+/// Makes the project directory `name` below the `DerivedData` root `root`
+/// with the three units of the rule, a log directory, and an `info.plist`
+/// that names `workspace` and that was accessed now. Returns its path.
+///
+/// `name` must have the form of a project directory name: a stem, `-`,
+/// and 28 lower-case letters.
+///
+/// # Errors
+///
+/// Returns the error of the file system when a file cannot be written, or
+/// an error when the clock of the host gives no time.
+pub fn write_project(root: &Path, name: &str, workspace: &Path) -> std::io::Result<PathBuf> {
+    let project: PathBuf = root.join(name);
+    let write = |relative: &str, bytes: &[u8]| -> std::io::Result<()> {
+        let path: PathBuf = project.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, bytes)
+    };
+    write(
+        "Build/Intermediates.noindex/XCBuildData/build.db",
+        &[0_u8; 2_048],
+    )?;
+    write(
+        "Build/Intermediates.noindex/App.build/App.o",
+        &[1_u8; 3_000],
+    )?;
+    write("Build/Products/Debug/App.app/App", &[2_u8; 5_000])?;
+    write("Index.noindex/DataStore/v5/records/AB", &[3_u8; 700])?;
+    write("Logs/Build/1.xcactivitylog", b"log")?;
+    let accessed: String = WallTime::try_from(SystemTime::now())
+        .map(|now| now.to_string())
+        .map_err(|_| std::io::Error::other("the clock of the host gave no time"))?;
+    write(
+        "info.plist",
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n\
+             \t<key>LastAccessedDate</key>\n\t<date>{accessed}</date>\n\
+             \t<key>WorkspacePath</key>\n\t<string>{}</string>\n\
+             </dict>\n</plist>\n",
+            workspace.display()
+        )
+        .as_bytes(),
+    )?;
+    Ok(project)
+}

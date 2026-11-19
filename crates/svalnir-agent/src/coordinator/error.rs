@@ -66,6 +66,17 @@ pub mod code {
     pub const TRIGGER_NOT_CURRENT: &str = "trigger_not_current";
     /// The hard protection of the target is not `NotProtected`.
     pub const TARGET_PROTECTED: &str = "target_protected";
+    /// The catalog of protected file locations gave no fact for a file
+    /// target: a location of the user or of the control plane is not
+    /// known, or the entry did not resolve.
+    pub const TARGET_PROTECTION_UNKNOWN: &str = "target_protection_unknown";
+    /// The producer of the data of an eviction target is active at the
+    /// fresh check before the step. The target is skipped with no call.
+    pub const PRODUCER_ACTIVE: &str = "producer_active";
+    /// The fresh check before an eviction step gave no evidence that the
+    /// producer of the data is inactive. The target is skipped with no
+    /// call.
+    pub const PRODUCER_ACTIVITY_UNKNOWN: &str = "producer_activity_unknown";
     /// The executor refused the step before a call.
     pub const EXECUTOR_REFUSED_STEP: &str = "executor_refused_step";
     /// The executor made no consistent result.

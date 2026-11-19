@@ -26,17 +26,17 @@ use svalnir_core::policy::{
 };
 use svalnir_core::process::{Pid, Uid};
 use svalnir_core::quantity::{Bytes, Nanoseconds};
-use svalnir_core::rule::{RuleMode, RuleRegistry};
 use svalnir_core::state::PressureState;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use svalnir_core::volume::VolumeIdentity;
 use thiserror::Error;
 
+use super::candidates::RuleCandidateSource;
 use super::driver::DriverParts;
-use super::ports::{AgentClock, CandidateSource, Collector, Notifier, Sample, SelfFootprint};
+use super::ports::{AgentClock, Collector, Notifier, Sample, SelfFootprint};
 use super::record::CapabilitySummary;
 use crate::capability::{CapabilityReport, WorkerRole, diagnose};
-use crate::controller::{CandidateSet, Notification, PreparationMode};
+use crate::controller::Notification;
 use crate::coordinator::{IdSource, Measurements, SystemProbe, TimeReading};
 use crate::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
 use crate::executor::process::{
@@ -50,7 +50,8 @@ use crate::platform::process::{
 };
 use crate::platform::sleep::sleep_between;
 use crate::platform::volume::{MountedVolume, collect_capacity, volume_at};
-use crate::rules::ReviewedRules;
+use crate::protection::ProtectedLocations;
+use crate::rules::{DiscoveryLimits, ReviewedRules, SharedEnvironment, SourceEnvironment};
 use crate::store::Store;
 
 /// The logical volume selector that this build resolves.
@@ -516,48 +517,6 @@ impl Collector for SystemCollector {
     }
 }
 
-/// The candidate source of this build.
-///
-/// Each reviewed rule is in the `proposed` lifecycle state, so no rule
-/// permits automatic eviction and the agent discovers nothing: the set is
-/// complete and empty. With a registry that has a rule for automatic
-/// eviction, this source has no set, which permits no automatic plan: the
-/// discovery of a validated rule is not connected to the agent in this
-/// build.
-#[derive(Debug, Clone, Copy)]
-pub struct ReviewedCandidateSource {
-    automatic_rule: bool,
-}
-
-impl ReviewedCandidateSource {
-    /// The source for the rules of `registry`.
-    #[must_use]
-    pub fn new(registry: &dyn RuleRegistry) -> Self {
-        Self {
-            automatic_rule: registry.rules().iter().any(|rule| {
-                rule.layouts
-                    .iter()
-                    .any(|layout| layout.lifecycle.permits(&RuleMode::AutomaticEviction))
-            }),
-        }
-    }
-}
-
-impl CandidateSource for ReviewedCandidateSource {
-    fn prepare(
-        &mut self,
-        _volumes: &[VolumeId],
-        _mode: PreparationMode,
-        time: &TimeReading,
-    ) -> Option<CandidateSet> {
-        (!self.automatic_rule).then(|| CandidateSet {
-            prepared_at: time.clock.now,
-            complete: true,
-            candidates: Vec::new(),
-        })
-    }
-}
-
 /// Writes each notification to the structured log. A notification has
 /// identities and reason names; it has no path and no process argument.
 #[derive(Debug, Clone, Copy, Default)]
@@ -618,9 +577,17 @@ pub struct SystemParts {
 /// Makes the parts of the agent for the running system.
 ///
 /// The executors are the ones that act on the host: the filesystem
-/// executor with the Trash of the user and no approved root, and the
-/// process executor of this user. They act only for a step that the
-/// coordinator admitted.
+/// executor with the Trash of the user, and the process executor of this
+/// user. They act only for a step that the coordinator admitted. The
+/// process has no fixed approved root: the driver resolves the approved
+/// roots of an automatic operation from the rule declarations and the
+/// configuration in effect before it applies an automatic plan
+/// ([`crate::rules::automatic_roots`]).
+///
+/// The candidate source is the discovery of the reviewed rules
+/// ([`RuleCandidateSource`]). Each reviewed rule of this build is in the
+/// `proposed` lifecycle state, so the source examines no rule and each
+/// set is empty.
 ///
 /// # Errors
 ///
@@ -631,6 +598,7 @@ pub fn system_parts(
     epoch: &ExecutorEpochId,
     principal: Uid,
     home_directory: &LosslessPath,
+    state_directory: &Path,
     store: Option<Store>,
 ) -> Result<SystemParts, HostError> {
     let context: Arc<CollectionContext> = Arc::new(
@@ -640,7 +608,14 @@ pub fn system_parts(
     let clock: Arc<SystemAgentClock> = Arc::new(SystemAgentClock::watching_sleep(&context));
     let registry: ReviewedRules =
         ReviewedRules::new().map_err(|error| HostError::Registry(error.to_string()))?;
-    let candidates: ReviewedCandidateSource = ReviewedCandidateSource::new(&registry);
+    let environment: SharedEnvironment = Arc::new(SourceEnvironment(DarwinProcessSource::new()));
+    let candidates: RuleCandidateSource = RuleCandidateSource::new(
+        registry.clone(),
+        principal,
+        ProtectedLocations::resolve(Some(&home_directory.to_path_buf()), Some(state_directory)),
+        Arc::clone(&environment),
+        DiscoveryLimits::default(),
+    );
     let roots: ApprovedRoots =
         ApprovedRoots::new(Vec::new()).map_err(|error| HostError::Executor(error.to_string()))?;
     let filesystem: FsExecutor = FsExecutor::with_system_trash(&FsExecutorConfig {
@@ -681,6 +656,7 @@ pub fn system_parts(
         application: Box::new(application),
         probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
         candidates: Box::new(candidates),
+        environment,
         notifier: Box::new(LogNotifier),
         footprint: Box::new(ProcessFootprint),
         store,

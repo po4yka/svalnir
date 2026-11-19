@@ -39,6 +39,8 @@ use crate::journal::{
     ClaimedRequest, CoordinationStart, CoordinatorLock, CoordinatorLockError, CoordinatorRole,
     OperationJournalError, RequestBody, RequestCompletion, VolatileRecord,
 };
+use crate::platform::volume::MountTable;
+use crate::protection::ProtectedLocations;
 
 /// The largest number of admitted operations that wait for the active
 /// one. A further apply is refused with `queue_full`.
@@ -365,7 +367,11 @@ fn total_charge(plan: &Plan) -> Result<Option<WorkCharge>, NotChargeable> {
 /// The approved roots of the filesystem steps of an operation of `plan`.
 ///
 /// An automatic plan acts only under the roots that the process has from
-/// its own configuration (`configured`).
+/// its own configuration: the fixed set `configured`, and the set
+/// `automatic` that the owner of the authority records resolved from the
+/// rule declarations and the configuration in effect
+/// ([`AuthoritySource::automatic_roots`]). A root that the two sets have
+/// has the record of `configured`. No root comes from the plan.
 ///
 /// A manual plan acts under the roots that its file targets bind. The
 /// sealed plan has the identity, the path, the object, the volume, and
@@ -386,9 +392,10 @@ fn total_charge(plan: &Plan) -> Result<Option<WorkCharge>, NotChargeable> {
 pub fn approved_roots_of(
     plan: &Plan,
     configured: &ApprovedRoots,
+    automatic: &ApprovedRoots,
 ) -> Result<ApprovedRoots, RootError> {
     if plan.trigger.class.is_automatic() {
-        return Ok(configured.clone());
+        return configured.merged_with(automatic);
     }
     let mut roots: BTreeMap<&RootId, ApprovedRoot> = BTreeMap::new();
     for target in &plan.targets {
@@ -730,7 +737,52 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 )));
             }
         }
+        self.check_file_protection(plan)?;
         Ok(None)
+    }
+
+    /// The catalog of protected file locations, for each file target of
+    /// the plan (`docs/CLEANUP_RULES.md` section 5).
+    ///
+    /// The builder of the plan applied the catalog before. This check is
+    /// of the coordinator: it uses the home directory and the state
+    /// directory of this process, so a plan that a different process
+    /// built, or a plan whose entry changed after it was built, does not
+    /// reach the executor with a protected target. A protected target
+    /// refuses the plan with `target_protected`. A target whose protection
+    /// is not known refuses it with `target_protection_unknown`: an
+    /// unknown protection is not "not protected".
+    fn check_file_protection(&self, plan: &Plan) -> Result<(), Box<ActionError>> {
+        let has_file: bool = plan
+            .targets
+            .iter()
+            .any(|target| matches!(target.binding, TargetBinding::File(_)));
+        if !has_file {
+            return Ok(());
+        }
+        let locations: ProtectedLocations = self.authority.protected_locations();
+        // One reading of the mount table for the plan. With no table, only
+        // the text of each path is examined.
+        let mounts: Option<MountTable> = MountTable::read().ok();
+        for target in &plan.targets {
+            let TargetBinding::File(file) = &target.binding else {
+                continue;
+            };
+            let refusal: Option<(&str, ErrorFamily)> =
+                match locations.of_binding(file, mounts.as_ref()) {
+                    ProtectionFact::NotProtected => None,
+                    ProtectionFact::Protected => {
+                        Some((code::TARGET_PROTECTED, ErrorFamily::Eligibility))
+                    }
+                    ProtectionFact::Unknown => {
+                        Some((code::TARGET_PROTECTION_UNKNOWN, ErrorFamily::Evidence))
+                    }
+                };
+            if let Some((code, family)) = refusal {
+                return Err(Box::new(admission_error(code, family, &plan.plan_id)));
+            }
+        }
+        Ok(())
     }
 
     fn check_revisions(
@@ -928,7 +980,12 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         if self.waiting.len() >= MAX_WAITING_OPERATIONS {
             return limits(code::QUEUE_FULL);
         }
-        let Ok(roots) = approved_roots_of(&plan, &self.roots) else {
+        let automatic: ApprovedRoots = if plan.trigger.class.is_automatic() {
+            self.authority.automatic_roots()
+        } else {
+            ApprovedRoots::default()
+        };
+        let Ok(roots) = approved_roots_of(&plan, &self.roots, &automatic) else {
             return refused(admission_error(
                 code::PLAN_NOT_EXECUTABLE,
                 ErrorFamily::Request,

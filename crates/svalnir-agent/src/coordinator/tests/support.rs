@@ -73,7 +73,8 @@ use crate::platform::process::{
     DarwinProcessSource, ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication,
     Timebase,
 };
-use crate::rules::ReviewedRules;
+use crate::protection::ProtectedLocations;
+use crate::rules::{ProducerActivity, ReviewedRules};
 
 pub(super) const SECOND: u64 = 1_000_000_000;
 /// The time of the test clock at the start of a test.
@@ -242,6 +243,15 @@ pub(super) struct Records {
     pub(super) trigger_holds: Option<bool>,
     pub(super) protection: ProtectionFact,
     pub(super) registry: NoRules,
+    /// The locations of the catalog of protected file locations. The
+    /// default names two directories that do not exist, so no entry of a
+    /// test tree is protected.
+    pub(super) locations: ProtectedLocations,
+    /// The approved roots of an automatic operation.
+    pub(super) automatic_roots: ApprovedRoots,
+    /// The activity of the producer at the fresh check of an eviction
+    /// step.
+    pub(super) activity: ProducerActivity,
 }
 
 /// The authority records of a test, behind the grant module.
@@ -298,6 +308,12 @@ impl TestAuthority {
             trigger_holds: Some(true),
             protection: ProtectionFact::NotProtected,
             registry,
+            locations: ProtectedLocations::from_resolved(
+                Some(PathBuf::from("/svalnir-test-no-home")),
+                Some(PathBuf::from("/svalnir-test-no-state")),
+            ),
+            automatic_roots: ApprovedRoots::default(),
+            activity: ProducerActivity::Inactive,
         })))
     }
 
@@ -423,6 +439,18 @@ impl AuthoritySource for TestAuthority {
 
     fn protection(&self, _processes: &[ProcessIdentity]) -> ProtectionFact {
         self.records().protection
+    }
+
+    fn protected_locations(&self) -> ProtectedLocations {
+        self.records().locations.clone()
+    }
+
+    fn automatic_roots(&self) -> ApprovedRoots {
+        self.records().automatic_roots.clone()
+    }
+
+    fn producer_activity(&self, _rule: &svalnir_core::rule::RuleRef) -> ProducerActivity {
+        self.records().activity
     }
 }
 

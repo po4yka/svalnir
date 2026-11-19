@@ -359,13 +359,34 @@ fn an_automatic_plan_gets_no_root_from_its_own_content() {
 
     let none = crate::executor::fs::ApprovedRoots::default();
     // The manual plan: the root that its target binds.
-    let roots = approved_roots_of(&manual, &none).unwrap();
+    let roots = approved_roots_of(&manual, &none, &none).unwrap();
     assert_eq!(roots.len(), 1);
     assert!(roots.root(&root_id_of(&manual)).is_some());
-    // The automatic plan: only the roots of the process, here none.
-    assert!(approved_roots_of(&automatic, &none).unwrap().is_empty());
+    // The roots of an automatic operation give a manual plan no root.
     let configured = bench.tree.roots();
-    assert_eq!(approved_roots_of(&automatic, &configured).unwrap().len(), 1);
+    let roots = approved_roots_of(&manual, &none, &configured).unwrap();
+    assert_eq!(roots.len(), 1);
+    // The automatic plan: only the roots of the process, here none. The
+    // root that the plan binds is not a root of the operation.
+    assert_eq!(
+        approved_roots_of(&automatic, &none, &none).unwrap().len(),
+        0
+    );
+    // The fixed set of the process, and the set that the owner of the
+    // authority records resolved from the rules. One root that the two
+    // sets have is one root.
+    for (fixed, resolved) in [
+        (&configured, &none),
+        (&none, &configured),
+        (&configured, &configured),
+    ] {
+        assert_eq!(
+            approved_roots_of(&automatic, fixed, resolved)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 #[test]

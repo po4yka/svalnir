@@ -23,10 +23,13 @@ use svalnir_core::policy::{
     ControlPlaneProcess, ProtectionContext, ProtectionFact, hard_protection,
 };
 use svalnir_core::process::{ProcessIdentity, Uid};
-use svalnir_core::rule::{RuleMode, RuleRegistry};
+use svalnir_core::rule::{RuleMode, RuleRef, RuleRegistry};
 
 use super::model::{TriggerKey, TriggerRecord};
 use crate::coordinator::{AuthoritySource, RevisionSnapshot, TimeReading, TriggerStanding};
+use crate::executor::fs::ApprovedRoots;
+use crate::protection::ProtectedLocations;
+use crate::rules::{ProducerActivity, SharedEnvironment};
 
 /// The largest number of automatic plans whose trigger the records keep.
 /// The oldest plan is removed first; a plan with no entry has a trigger
@@ -54,6 +57,20 @@ pub struct AuthorityRecords {
     /// The processes of the control plane, for the hard-protection
     /// catalog.
     pub control_plane: Option<Vec<ControlPlaneProcess>>,
+    /// The home directory of the user and the state directory of Svalnir,
+    /// for the catalog of protected file locations. The default has no
+    /// location, which gives each file target an unknown protection: the
+    /// owner of the records sets the locations before a plan with a file
+    /// target is applied.
+    pub locations: ProtectedLocations,
+    /// The approved roots of this process for an automatic operation. The
+    /// owner of the records resolves them from the rule declarations and
+    /// the configuration in effect before it applies an automatic plan.
+    pub automatic_roots: ApprovedRoots,
+    /// The environment of the fresh activity check before a step of an
+    /// eviction: the process table and the clock. `None` gives an unknown
+    /// activity, which permits no eviction step.
+    pub environment: Option<SharedEnvironment>,
 }
 
 impl fmt::Debug for AuthorityRecords {
@@ -80,6 +97,9 @@ impl AuthorityRecords {
             triggers: Vec::new(),
             plans: Vec::new(),
             control_plane: None,
+            locations: ProtectedLocations::default(),
+            automatic_roots: ApprovedRoots::default(),
+            environment: None,
         }
     }
 
@@ -212,6 +232,26 @@ impl AuthoritySource for SharedAuthority {
                 control_plane: records.control_plane.as_deref(),
             },
         )
+    }
+
+    fn protected_locations(&self) -> ProtectedLocations {
+        self.records().locations.clone()
+    }
+
+    fn automatic_roots(&self) -> ApprovedRoots {
+        self.records().automatic_roots.clone()
+    }
+
+    fn producer_activity(&self, rule: &RuleRef) -> ProducerActivity {
+        // The reading of the process table is outside the critical
+        // section.
+        let (environment, principal) = {
+            let records = self.records();
+            (records.environment.clone(), records.principal)
+        };
+        environment.map_or(ProducerActivity::Unknown, |environment| {
+            environment.producer_activity(&rule.id, principal)
+        })
     }
 }
 

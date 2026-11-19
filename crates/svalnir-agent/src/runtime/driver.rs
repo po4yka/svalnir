@@ -17,14 +17,16 @@ use svalnir_core::config::{ValidatedConfig, parse_and_validate};
 use svalnir_core::digest::ContentDigest;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::grant::{AuthorityState, ControlClock, InstanceInhibition, MeasurementFloor};
-use svalnir_core::id::{ExecutorEpochId, OperationId};
+use svalnir_core::id::{ExecutorEpochId, OperationId, RuleId};
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{ByteDelta, Bytes, Nanoseconds};
 use svalnir_core::rule::RuleRegistry;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use thiserror::Error;
 
-use super::ports::{AgentClock, CandidateSource, ClockHandle, Notifier, Sample, SelfFootprint};
+use super::ports::{
+    AgentClock, CandidateSource, ClockHandle, Notifier, Preparation, Sample, SelfFootprint,
+};
 use super::record::{
     AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, LIFECYCLE_VERSION, LifecycleRecord,
     MAX_DEGRADED_REASONS, PolicySource, RunState, SelfLimits, restart_backoff,
@@ -44,6 +46,8 @@ use crate::journal::{
     AgentRecord, CoordinatorRole, JournalOptions, OperationJournal, OperationJournalError,
     RequestCompletion,
 };
+use crate::protection::ProtectedLocations;
+use crate::rules::{SharedEnvironment, automatic_roots};
 use crate::store::{EncodedSample, RetentionPolicy, Store};
 
 /// The file name of the operation journal in the state directory.
@@ -111,6 +115,9 @@ pub struct DriverParts {
     pub probe: Box<dyn TargetProbe + Send>,
     /// The source of the cleanup candidates.
     pub candidates: Box<dyn CandidateSource>,
+    /// The process table and the clock of the fresh activity check before
+    /// a step of an eviction.
+    pub environment: SharedEnvironment,
     /// The receiver of the notifications.
     pub notifier: Box<dyn Notifier>,
     /// The measurement of the footprint of the agent.
@@ -421,6 +428,30 @@ pub fn journal_path(state_directory: &Path) -> PathBuf {
     state_directory.join(JOURNAL_FILE_NAME)
 }
 
+/// The authority records of a start, with no authority record of the
+/// journal: the locations of the catalog of protected file locations (the
+/// home directory of the user and the state directory of this agent, each
+/// with its symbolic links resolved), and the environment of the fresh
+/// activity check.
+fn authority_records(
+    settings: &DriverSettings,
+    state_directory: &Path,
+    registry: Box<dyn RuleRegistry + Send>,
+    environment: SharedEnvironment,
+) -> AuthorityRecords {
+    let mut records: AuthorityRecords = AuthorityRecords::new(settings.principal, registry);
+    records.locations = ProtectedLocations::resolve(
+        settings
+            .home_directory
+            .as_ref()
+            .map(LosslessPath::to_path_buf)
+            .as_deref(),
+        Some(state_directory),
+    );
+    records.environment = Some(environment);
+    records
+}
+
 impl Driver {
     /// Starts the agent on the journal of `state_directory`.
     ///
@@ -449,8 +480,12 @@ impl Driver {
             OperationJournal::open(&database, &settings.journal).map_err(DriverError::Journal)?;
         let time: TimeReading = parts.clock.now().ok_or(DriverError::Clock)?;
 
-        let authority: SharedAuthority =
-            SharedAuthority::new(AuthorityRecords::new(settings.principal, parts.registry));
+        let authority: SharedAuthority = SharedAuthority::new(authority_records(
+            &settings,
+            state_directory,
+            parts.registry,
+            parts.environment,
+        ));
         let dependencies: Dependencies = Dependencies {
             clock: Box::new(ClockHandle(Arc::clone(&parts.clock))),
             authority: Box::new(authority.clone()),
@@ -802,9 +837,24 @@ impl Driver {
             });
             return;
         };
-        self.authority
-            .records()
-            .bind_plan(plan_id.clone(), apply.trigger.clone());
+        {
+            let mut records = self.authority.records();
+            records.bind_plan(plan_id.clone(), apply.trigger.clone());
+            // The approved roots of an automatic operation come from the
+            // rule declarations and the configuration in effect, as the
+            // host is now. No root comes from the plan.
+            if apply.guard == Guard::Disk {
+                let approved: &[RuleId] = &self
+                    .effective
+                    .as_ref()
+                    .unwrap_or(&self.settings.proposal)
+                    .disk_guard()
+                    .approved_rules;
+                let roots: ApprovedRoots =
+                    automatic_roots(records.registry.as_ref(), approved, &records.locations);
+                records.automatic_roots = roots;
+            }
+        }
         let request: ApplyRequest = ApplyRequest {
             approval: PlanApproval {
                 plan_id: plan_id.clone(),
@@ -1148,13 +1198,22 @@ impl Driver {
                     // A discovery is optional work. The known candidates
                     // are examined in each case.
                     if mode == PreparationMode::KnownOnly || !self.optional_reduced {
-                        self.observations.candidates =
-                            self.candidates.prepare(&volumes, mode, time);
+                        let request: Preparation<'_> = Preparation {
+                            volumes: &volumes,
+                            mode,
+                            time,
+                            config: self.effective.as_ref().unwrap_or(&self.settings.proposal),
+                        };
+                        self.observations.candidates = self.candidates.prepare(&request);
                         acted = true;
                     }
                 }
                 Intent::Notify(notification) => self.notifier.notify(&notification),
-                Intent::ReduceOptionalWork(_) => self.optional_reduced = true,
+                Intent::ReduceOptionalWork(_) => {
+                    self.optional_reduced = true;
+                    // A discovery that runs now is optional work.
+                    self.candidates.cancel();
+                }
                 Intent::Idle => {}
             }
         }
@@ -1319,6 +1378,7 @@ impl Driver {
     /// next start reconciles.
     pub fn shutdown(mut self, idle: &mut dyn Idle) -> ShutdownReport {
         self.stopping = true;
+        self.candidates.cancel();
         let give_up_at: Option<MonotonicNanos> = self.clock.now().map(|time| {
             time.clock
                 .now

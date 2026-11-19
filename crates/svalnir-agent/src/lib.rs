@@ -42,6 +42,7 @@ pub mod executor;
 pub mod journal;
 pub mod observe;
 pub mod platform;
+pub mod protection;
 pub mod rules;
 pub mod runtime;
 pub mod scan;

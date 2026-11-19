@@ -123,6 +123,7 @@
 //! - **Power.** The agent takes no power assertion and has no timer that
 //!   wakes the host.
 
+mod candidates;
 mod driver;
 #[cfg(target_os = "macos")]
 pub mod host;
@@ -134,12 +135,14 @@ pub mod start_failure;
 #[cfg(test)]
 mod tests;
 
+pub use self::candidates::RuleCandidateSource;
 pub use self::driver::{
     CODE_STATE_NOT_RECORDED, Driver, DriverError, DriverParts, DriverSettings, DriverStart,
     JOURNAL_FILE_NAME, ShutdownReport, TickReport, journal_path,
 };
 pub use self::ports::{
-    AgentClock, CandidateSource, ClockHandle, Collector, Notifier, Sample, SelfFootprint,
+    AgentClock, CandidateSource, ClockHandle, Collector, Notifier, Preparation, Sample,
+    SelfFootprint,
 };
 pub use self::record::{
     AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, LIFECYCLE_VERSION, LifecycleRecord,

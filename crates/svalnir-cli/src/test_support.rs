@@ -631,3 +631,24 @@ impl svalnir_agent::executor::fs::TrashBackend for SilentTrash {
         svalnir_agent::executor::fs::TrashReply::Unknown
     }
 }
+
+/// The discovery environment of a test that set none: the wall-clock time
+/// of the host, no monotonic time, and no process evidence. Each rule
+/// then finds no unit that is known to be inactive.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NoEvidence;
+
+impl svalnir_agent::scan::ScanClock for NoEvidence {
+    fn now(&self) -> ScanTimestamp {
+        svalnir_agent::scan::ScanClock::now(&svalnir_agent::scan::WallScanClock)
+    }
+}
+
+impl svalnir_agent::rules::DiscoveryEnvironment for NoEvidence {
+    fn xcode_evidence(&self, _principal: Uid) -> svalnir_agent::rules::XcodeEvidence {
+        svalnir_agent::rules::XcodeEvidence {
+            producer_processes: svalnir_agent::rules::ProducerProcesses::Unknown,
+            observed_at: MonotonicNanos::new(0),
+        }
+    }
+}

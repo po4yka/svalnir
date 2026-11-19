@@ -357,6 +357,16 @@ impl ExpiredTemporaryRule {
         Self { mounts, ..self }
     }
 
+    /// The rule with `lifecycle` for each layout. Only a test build has
+    /// this function ([`super::ReviewedRules::with_fixture_lifecycle`]).
+    #[cfg(any(test, all(feature = "test-support", debug_assertions)))]
+    pub(super) fn with_lifecycle(self, lifecycle: &LifecycleState) -> Result<Self, RegistryError> {
+        Ok(Self {
+            rule: super::registry::with_lifecycle(&self.rule, lifecycle)?,
+            ..self
+        })
+    }
+
     /// The checked declaration of the rule revision.
     pub fn rule(&self) -> &Rule {
         &self.rule

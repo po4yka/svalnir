@@ -8,6 +8,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use svalnir_core::config::ValidatedConfig;
 use svalnir_core::id::VolumeId;
 use svalnir_core::policy::ControlPlaneProcess;
 use svalnir_core::quantity::Bytes;
@@ -74,20 +75,37 @@ pub trait Collector: Send {
     fn collect(&mut self) -> Sample;
 }
 
+/// One request for the cleanup candidates.
+#[derive(Debug, Clone, Copy)]
+pub struct Preparation<'a> {
+    /// The volumes whose candidates the disk guard needs.
+    pub volumes: &'a [VolumeId],
+    /// How much work the source does.
+    pub mode: PreparationMode,
+    /// The time of the request.
+    pub time: &'a TimeReading,
+    /// The configuration in effect: the approved rules of the disk guard
+    /// and the exclusions of the user.
+    pub config: &'a ValidatedConfig,
+}
+
 /// The source of the cleanup candidates.
 pub trait CandidateSource: Send {
-    /// Prepares the candidates of `volumes`.
+    /// Prepares the candidates of the volumes of `request`.
     ///
     /// [`PreparationMode::KnownOnly`] examines the candidates of an
-    /// earlier call again and lists no directory.
-    /// [`PreparationMode::Refresh`] is a bounded discovery. `None` means
+    /// earlier discovery again and lists no directory. The call returns
+    /// in a short, bounded time.
+    /// [`PreparationMode::Refresh`] asks for a bounded discovery. The
+    /// call does not wait for it: a source can run the discovery on a
+    /// different thread and give the set that it has now. `None` means
     /// that the source has no set: the disk guard then makes no plan.
-    fn prepare(
-        &mut self,
-        volumes: &[VolumeId],
-        mode: PreparationMode,
-        time: &TimeReading,
-    ) -> Option<CandidateSet>;
+    fn prepare(&mut self, request: &Preparation<'_>) -> Option<CandidateSet>;
+
+    /// Stops a discovery that runs now. The driver calls it when optional
+    /// work is reduced (memory pressure, a pause, the budget of the agent)
+    /// and at a stop. The default is a source with no background work.
+    fn cancel(&mut self) {}
 }
 
 /// The receiver of the notifications of the controller.

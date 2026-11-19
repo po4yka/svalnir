@@ -12,6 +12,7 @@ mod application;
 mod budget;
 mod children;
 mod cleanup;
+mod protection;
 mod queue;
 mod rearm;
 mod recording;

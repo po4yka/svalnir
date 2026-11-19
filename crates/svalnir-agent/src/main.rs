@@ -363,7 +363,7 @@ mod agent {
         .ok();
         let parts: SystemParts =
             // The text of the error can have a path of the user.
-            system_parts(&epoch, principal, &home, store)
+            system_parts(&epoch, principal, &home, &options.state_directory, store)
                 .map_err(|error| StartFailed::Transient(error.cause()))?;
         let service: ServiceSettings = ServiceSettings {
             sample_interval: config.agent().sample_interval,

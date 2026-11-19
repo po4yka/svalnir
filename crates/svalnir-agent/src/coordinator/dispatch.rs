@@ -34,6 +34,7 @@ use crate::executor::fs::{
 use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
+use crate::rules::ProducerActivity;
 
 /// The result of one unit of work on the active operation.
 #[derive(Debug)]
@@ -801,6 +802,32 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             )?;
             return Ok(StepEnd::Next);
         };
+        // The fresh check of an eviction: the producer of the data must be
+        // inactive now. A producer that became active after the plan was
+        // made inhibits the step, and nothing stops the producer. Each
+        // later step has its own check.
+        if let Some(rule) = &file.rule {
+            let refusal: Option<(&str, ErrorFamily)> = match self.authority.producer_activity(rule)
+            {
+                ProducerActivity::Inactive => None,
+                ProducerActivity::Active => Some((code::PRODUCER_ACTIVE, ErrorFamily::Eligibility)),
+                ProducerActivity::Unknown => {
+                    Some((code::PRODUCER_ACTIVITY_UNKNOWN, ErrorFamily::Evidence))
+                }
+            };
+            if let Some((code, family)) = refusal {
+                let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
+                self.end_without_call(
+                    active,
+                    step,
+                    charge,
+                    charged,
+                    StopReason::TargetSkipped,
+                    Some(error),
+                )?;
+                return Ok(StepEnd::Next);
+            }
+        }
         // The executor call. The status board is not locked here. The
         // executor reads the signal between the entries of a directory
         // target. The signal is the final check, read again: the stop

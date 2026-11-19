@@ -35,7 +35,11 @@
 //! until admission, so no candidate of a discovery is eligible.
 
 #[cfg(unix)]
+mod eviction;
+#[cfg(unix)]
 mod expired_temporary;
+#[cfg(all(unix, any(test, all(feature = "test-support", debug_assertions))))]
+pub mod fixture;
 #[cfg(unix)]
 mod model;
 #[cfg(unix)]
@@ -53,8 +57,17 @@ mod xcode;
 
 #[cfg(test)]
 #[cfg(unix)]
+mod eviction_tests;
+#[cfg(test)]
+#[cfg(unix)]
 mod tests;
 
+#[cfg(unix)]
+pub use eviction::{
+    BoundRoot, DiscoveryEnvironment, DiscoveryHost, EvictionCandidate, EvictionDiscovery,
+    EvictionRequest, ProducerActivity, RootProblem, RootReport, RootResult, SharedEnvironment,
+    SourceEnvironment, automatic_roots, bind_root, resolve_roots, root_id_of, xcode_evidence,
+};
 #[cfg(unix)]
 pub use expired_temporary::{
     CONTENT_REGENERABLE_INTERMEDIATE, EXPIRED_TEMPORARY_LAYOUT, EXPIRED_TEMPORARY_REVISION,

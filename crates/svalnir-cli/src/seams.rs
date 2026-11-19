@@ -15,6 +15,7 @@ use std::sync::Arc;
 use svalnir_agent::executor::fs::SystemTrash;
 use svalnir_agent::executor::fs::TrashBackend;
 use svalnir_agent::platform::account::AccountSource;
+use svalnir_agent::rules::{RegistryError, ReviewedRules, SharedEnvironment};
 
 /// The answer of the user to a confirmation question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +306,26 @@ pub(crate) struct TestSeams {
     /// The home directory of the account record of the effective user.
     /// `None`: no account record.
     pub(crate) account_home: Option<PathBuf>,
+    /// The lifecycle state of each layout of each reviewed rule, in place
+    /// of the state of its declaration. `None`: the registry of the build,
+    /// in which each layout is `proposed`.
+    pub(crate) rule_lifecycle: Option<svalnir_core::rule::LifecycleState>,
+    /// The clock and the process evidence of a rule discovery. `None`: an
+    /// environment with no evidence, so that no test reads the process
+    /// table of the host.
+    pub(crate) discovery_environment: Option<TestEnvironment>,
+}
+
+/// The discovery environment of a test.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestEnvironment(pub(crate) SharedEnvironment);
+
+#[cfg(test)]
+impl Debug for TestEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestEnvironment")
+    }
 }
 
 /// The account record of a test: a fixed home directory, or none. A test
@@ -438,6 +459,58 @@ impl Seams {
         #[cfg(not(test))]
         {
             Arc::new(SystemServiceHost)
+        }
+    }
+
+    /// The rule registry.
+    ///
+    /// A released build has the registry of the build, in which each
+    /// layout of each rule has the lifecycle state of its declaration. A
+    /// test can give a different state for a fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RegistryError`] when a declaration is not complete.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "a test build reads the values of the test"
+        )
+    )]
+    pub(crate) fn rule_registry(&self) -> Result<ReviewedRules, RegistryError> {
+        #[cfg(all(test, debug_assertions))]
+        {
+            if let Some(lifecycle) = &self.test.rule_lifecycle {
+                return ReviewedRules::with_fixture_lifecycle(lifecycle);
+            }
+        }
+        ReviewedRules::new()
+    }
+
+    /// The clock and the process evidence of a rule discovery, and of the
+    /// fresh activity check before a step of an eviction.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "a test build reads the values of the test"
+        )
+    )]
+    pub(crate) fn discovery_environment(&self) -> SharedEnvironment {
+        // A test build never reads the process table of the host.
+        #[cfg(test)]
+        {
+            match &self.test.discovery_environment {
+                Some(environment) => Arc::clone(&environment.0),
+                None => Arc::new(crate::test_support::NoEvidence),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Arc::new(svalnir_agent::rules::SourceEnvironment(
+                svalnir_agent::platform::process::DarwinProcessSource::new(),
+            ))
         }
     }
 

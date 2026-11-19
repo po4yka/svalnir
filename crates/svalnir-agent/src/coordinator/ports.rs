@@ -31,6 +31,9 @@ use crate::journal::{
     VolatilePersistReport, VolatileRecord,
 };
 use crate::platform::process::ProcessSource;
+use crate::protection::ProtectedLocations;
+use crate::rules::ProducerActivity;
+use svalnir_core::rule::RuleRef;
 
 /// One reading of the clocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +64,7 @@ pub struct RevisionSnapshot {
     /// The current generation of each action grant that is in effect.
     pub action_grants: Vec<svalnir_core::authority::ActionGrantRef>,
     /// The rule revisions that the registry has now for the mode.
-    pub rules: Vec<svalnir_core::rule::RuleRef>,
+    pub rules: Vec<RuleRef>,
 }
 
 /// Whether the trigger of an automatic plan holds at a dispatch boundary.
@@ -108,6 +111,25 @@ pub trait AuthoritySource: Debug {
     /// application target, or the one process of a process target
     /// ([`TargetBinding::processes`]).
     fn protection(&self, processes: &[ProcessIdentity]) -> ProtectionFact;
+
+    /// The home directory of the user and the state directory of Svalnir,
+    /// for the catalog of protected file locations
+    /// ([`ProtectedLocations`]). The coordinator applies the catalog to
+    /// each file target of a plan at admission. A location that is not
+    /// known gives an unknown protection, which refuses the plan.
+    fn protected_locations(&self) -> ProtectedLocations;
+
+    /// The approved roots of this process for an automatic operation, as
+    /// the owner of the records resolved them from the rule declarations
+    /// and the configuration in effect. A process with no automatic
+    /// operation gives an empty set.
+    fn automatic_roots(&self) -> ApprovedRoots;
+
+    /// Whether the producer of the data of `rule` is active now, from
+    /// evidence that this call reads. The coordinator asks immediately
+    /// before each step of an eviction. Only
+    /// [`ProducerActivity::Inactive`] permits the step.
+    fn producer_activity(&self, rule: &RuleRef) -> ProducerActivity;
 }
 
 /// The measurements of outcome verification.

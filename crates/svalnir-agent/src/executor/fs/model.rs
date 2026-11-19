@@ -145,6 +145,26 @@ impl ApprovedRoots {
         self.roots.get(root_id).map(|anchored| &anchored.root)
     }
 
+    /// The set with each root of `other` whose identity this set does not
+    /// have. A root that the two sets have keeps the record of this set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RootError::TooMany`] when the result is larger than a set
+    /// can be.
+    pub fn merged_with(&self, other: &Self) -> Result<Self, RootError> {
+        let mut roots: BTreeMap<RootId, AnchoredRoot> = self.roots.clone();
+        for (root_id, anchored) in &other.roots {
+            roots
+                .entry(root_id.clone())
+                .or_insert_with(|| anchored.clone());
+        }
+        if roots.len() > MAX_APPROVED_ROOTS {
+            return Err(RootError::TooMany);
+        }
+        Ok(Self { roots })
+    }
+
     /// The number of roots.
     pub fn len(&self) -> usize {
         self.roots.len()

@@ -32,6 +32,7 @@ use svalnir_agent::journal::{
 use svalnir_agent::platform::memory::CollectionContext;
 use svalnir_agent::platform::process::DarwinProcessSource;
 use svalnir_agent::platform::volume;
+use svalnir_agent::protection::ProtectedLocations;
 use svalnir_agent::rules::ReviewedRules;
 use svalnir_agent::runtime::host::{EpochIds, SystemAgentClock, SystemMeasurements};
 use svalnir_agent::runtime::{AgentClock, ClockHandle, ThreadIdle};
@@ -273,7 +274,7 @@ fn coordinator_dependencies(
             .map_err(|error| crate::host::collector_unavailable(&error.to_string()))?,
     );
     let clock: Arc<dyn AgentClock> = Arc::new(SystemAgentClock::new(&context));
-    let registry: ReviewedRules = ReviewedRules::new().map_err(|_| {
+    let registry: ReviewedRules = environment.seams.rule_registry().map_err(|_| {
         execution_error(
             "rule_registry_unavailable",
             "the rule registry of this build is not usable",
@@ -313,6 +314,14 @@ fn coordinator_dependencies(
         AuthorityRecords::new(session::current_uid(), Box::new(registry));
     records.state = Some(authority.clone());
     records.control_plane = control_plane.map(<[ControlPlaneProcess]>::to_vec);
+    // The locations of the catalog of protected file locations, which the
+    // coordinator applies to each file target at admission, and the
+    // evidence of the fresh activity check before a step of an eviction.
+    records.locations = ProtectedLocations::resolve(
+        environment.home.as_deref(),
+        environment.state_directory().ok().as_deref(),
+    );
+    records.environment = Some(environment.seams.discovery_environment());
     let authority: SharedAuthority = SharedAuthority::new(records);
     Ok((
         Dependencies {

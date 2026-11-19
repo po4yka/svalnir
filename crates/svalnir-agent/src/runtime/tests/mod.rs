@@ -11,6 +11,7 @@
 #![cfg(target_os = "macos")]
 
 mod busy;
+mod eviction;
 mod rearm;
 
 use std::fs;
@@ -47,8 +48,8 @@ use tempfile::TempDir;
 
 use super::{
     AgentClock, AgentStatus, CandidateSource, Collector, Driver, DriverParts, DriverSettings,
-    DriverStart, LifecycleRecord, Notifier, RunState, Sample, SelfFootprint, ServiceSettings,
-    ShutdownReport, StopHandle, journal_path, run,
+    DriverStart, LifecycleRecord, Notifier, Preparation, RunState, Sample, SelfFootprint,
+    ServiceSettings, ShutdownReport, StopHandle, journal_path, run,
 };
 use crate::controller::tests::support::{
     CandidateSpec, GIBIBYTE, MOUNT, ROOT_ID, Registry, SECOND, VOLUME, application, boot, capacity,
@@ -74,6 +75,7 @@ use crate::journal::{
     RequestBody, RequestCompletion, RequestStatus,
 };
 use crate::platform::process::{DarwinProcessSource, ProcessSource, QueryFailure, generation_id};
+use crate::rules::fixture::FixtureEnvironment;
 
 /// The time of a fixed clock at the start of a test.
 const START: u64 = 1_000 * SECOND;
@@ -360,6 +362,32 @@ impl TrashBackend for TempTrash {
     }
 }
 
+/// The environment of the tests with the synthetic rule of the controller
+/// tests: the producer of that rule is not active. A build knows no
+/// producer evidence for a rule that is not in its registry.
+#[derive(Debug, Clone)]
+struct TestRuleEnvironment(FixtureEnvironment);
+
+impl crate::scan::ScanClock for TestRuleEnvironment {
+    fn now(&self) -> crate::scan::ScanTimestamp {
+        self.0.now()
+    }
+}
+
+impl crate::rules::DiscoveryEnvironment for TestRuleEnvironment {
+    fn xcode_evidence(&self, principal: svalnir_core::process::Uid) -> crate::rules::XcodeEvidence {
+        self.0.xcode_evidence(principal)
+    }
+
+    fn producer_activity(
+        &self,
+        _rule: &svalnir_core::id::RuleId,
+        _principal: svalnir_core::process::Uid,
+    ) -> crate::rules::ProducerActivity {
+        crate::rules::ProducerActivity::Inactive
+    }
+}
+
 /// The candidates of a test: each regular file below the root of the
 /// fixture, as a candidate of the test rule.
 #[derive(Debug)]
@@ -370,12 +398,8 @@ struct TempCandidates {
 }
 
 impl CandidateSource for TempCandidates {
-    fn prepare(
-        &mut self,
-        _volumes: &[VolumeId],
-        mode: PreparationMode,
-        time: &TimeReading,
-    ) -> Option<CandidateSet> {
+    fn prepare(&mut self, request: &Preparation<'_>) -> Option<CandidateSet> {
+        let Preparation { mode, time, .. } = *request;
         self.modes.lock().unwrap().push(mode);
         let rule = self.registry.rules().first().copied()?.clone();
         let mut names: Vec<String> = fs::read_dir(&self.root)
@@ -610,6 +634,7 @@ impl Bench {
                 root: self.root.clone(),
                 modes: Arc::clone(&self.modes),
             }),
+            environment: Arc::new(TestRuleEnvironment(FixtureEnvironment::days_later(0))),
             notifier: Box::new(self.notes.clone()),
             footprint: Box::new(Footprint(
                 Arc::clone(&self.footprint),

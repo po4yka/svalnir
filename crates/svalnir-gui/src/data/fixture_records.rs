@@ -389,9 +389,12 @@ pub(super) fn automation(scenario: FixtureScenario) -> AutomationSnapshot {
                         ]
                     },
                     // Under memory pressure the memory guard has an open
-                    // incident.
-                    incidents: if scenario == FixtureScenario::Pressure
-                        && *policy == PolicyId::MemoryGuard
+                    // incident. The stale status record also names one,
+                    // which the stale controller reading cannot confirm.
+                    incidents: if matches!(
+                        scenario,
+                        FixtureScenario::Pressure | FixtureScenario::Stale
+                    ) && *policy == PolicyId::MemoryGuard
                     {
                         vec![IncidentRow {
                             id: "inc-fixture-memory-1".to_owned(),

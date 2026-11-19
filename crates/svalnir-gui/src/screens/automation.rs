@@ -3,9 +3,7 @@
 //! control, the enable and disable of a guard, and the rearm of an open
 //! incident send their change to the agent (`crate::actions`).
 
-use super::agent_state::{
-    cooldown_facts, incident_block, span_left, status_age_text, threshold_text,
-};
+use super::agent_state::{cooldown_facts, incident_block, span, span_left, threshold_text};
 use super::common::{
     CardWidth, Shown, ago, body_line, caption, card, fact, failed_body, inset, problem_lines,
     screen, shown, skeleton_rows, stale_line, until,
@@ -17,7 +15,7 @@ use crate::{
         model::{GuardState, Measured},
         records::{
             AutomationSnapshot, ControllerSnapshot, CooldownSubject, FreshMeasurement, GrantRow,
-            GuardDetail, IncidentRow, PauseKind, PauseRow, RevisionRow,
+            GuardDetail, IncidentRow, IncidentUsage, PauseKind, PauseRow, RevisionRow, StatusAge,
         },
         store::AppModel,
     },
@@ -441,24 +439,188 @@ fn guard_controls(
         .into_any_element()
 }
 
-/// One open incident with its rearm control.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a row builder takes the incident, its context, and the theme values"
-)]
-fn incident_row(
+/// The open incidents that the rearm control offers, from the controller
+/// reading of the agent (`observe::read_agent_records_at`), or the reason
+/// that the control is off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RearmOffer {
+    /// The first controller reading is not done.
+    Loading,
+    /// The controller reading is current: each open incident of the guard
+    /// with its budget generation and its usage.
+    Ready(Vec<IncidentUsage>),
+    /// The reading is stale, stopped, not known, or absent, so the control
+    /// is off. `incidents` are the incidents that the window knows from an
+    /// older reading or from the status record, with their generations;
+    /// each shows a control that is off.
+    Off {
+        /// One sentence: why the control is off.
+        reason: String,
+        /// The known incidents: identity and generation.
+        incidents: Vec<(String, u64)>,
+    },
+}
+
+/// The rearm offer of `policy` from the controller reading. A reading is
+/// current only when the window read it recently and the status record of
+/// the agent is at most 90 s old: the agent then runs, and its open
+/// incidents are those of the reading. `status` are the open incidents of
+/// the last status record, which can be 30 s old.
+#[must_use]
+pub fn rearm_offer(
+    policy: PolicyId,
+    controller: &Shown<ControllerSnapshot>,
+    status: &[IncidentRow],
+) -> RearmOffer {
+    let off = |reason: String, rows: &[IncidentUsage]| {
+        let mut incidents: Vec<(String, u64)> = rows
+            .iter()
+            .filter(|incident| incident.policy == policy)
+            .map(|incident| (incident.id.clone(), incident.generation))
+            .collect();
+        for row in status {
+            if !incidents.iter().any(|(id, _)| *id == row.id) {
+                incidents.push((row.id.clone(), row.generation));
+            }
+        }
+        RearmOffer::Off { reason, incidents }
+    };
+    let (value, stale_age) = match controller {
+        Shown::Loading => return RearmOffer::Loading,
+        Shown::Failed(reason) => {
+            return off(
+                format!("Rearm is off: the controller reading failed: {reason}"),
+                &[],
+            );
+        }
+        Shown::Data { value, stale_age } => (value, stale_age),
+    };
+    let rows = match &value.rows {
+        Measured::Unavailable(reason) => {
+            return off(
+                format!("Rearm is off: the controller reading has no rows: {reason}"),
+                &[],
+            );
+        }
+        Measured::Value(rows) => rows,
+    };
+    if let Some(age) = stale_age {
+        return off(
+            format!(
+                "Rearm is off: this window read the controller record {age}, so the open incidents are not known now."
+            ),
+            &rows.incidents,
+        );
+    }
+    let reason: Option<String> = match value.status_age {
+        StatusAge::Current => None,
+        StatusAge::Stale { age } => Some(format!(
+            "Rearm is off: the status of the agent is {} old, so the agent does not run or does not write, and the open incidents are not known now.",
+            span(age)
+        )),
+        StatusAge::Stopped => Some(
+            "Rearm is off: the agent recorded that it stopped, so no process decides a rearm."
+                .to_owned(),
+        ),
+        StatusAge::Unknown => Some(
+            "Rearm is off: the journal has no usable status record of the agent, so it is not known whether the agent runs."
+                .to_owned(),
+        ),
+    };
+    match reason {
+        Some(reason) => off(reason, &rows.incidents),
+        None => RearmOffer::Ready(
+            rows.incidents
+                .iter()
+                .filter(|incident| incident.policy == policy)
+                .cloned()
+                .collect(),
+        ),
+    }
+}
+
+/// The open incidents of `guard` with their rearm controls, from the
+/// controller reading.
+fn rearm_rows(
     guard: &GuardDetail,
-    incident: &IncidentRow,
     controller: &Shown<ControllerSnapshot>,
     entity: &Entity<AppModel>,
     model: &AppModel,
     now: SystemTime,
     mono: &SharedString,
     tokens: &Tokens,
+) -> Vec<AnyElement> {
+    match rearm_offer(guard.policy, controller, &guard.incidents) {
+        RearmOffer::Loading => vec![skeleton_rows(1)],
+        RearmOffer::Ready(incidents) => incidents
+            .iter()
+            .map(|incident| {
+                let usage: AnyElement =
+                    incident_block("automation", incident, now, false, mono, tokens);
+                incident_row(
+                    guard,
+                    (&incident.id, incident.generation),
+                    true,
+                    usage,
+                    entity,
+                    model,
+                    mono,
+                    tokens,
+                )
+            })
+            .collect(),
+        RearmOffer::Off { reason, incidents } => {
+            let name: &str = guard.name;
+            let mut rows: Vec<AnyElement> = incidents
+                .iter()
+                .map(|(id, generation)| {
+                    let usage: AnyElement = caption(
+                        SharedString::from(format!("automation-incident-usage-{id}")),
+                        "The usage is not shown: the controller reading is not current.",
+                        tokens,
+                    );
+                    incident_row(
+                        guard,
+                        (id, *generation),
+                        false,
+                        usage,
+                        entity,
+                        model,
+                        mono,
+                        tokens,
+                    )
+                })
+                .collect();
+            rows.push(caption(
+                SharedString::from(format!("automation-rearm-off-{name}")),
+                reason,
+                tokens,
+            ));
+            rows
+        }
+    }
+}
+
+/// One open incident with its rearm control. `enabled` is false when the
+/// controller reading is not current: the control is off.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a row builder takes the incident, its context, and the theme values"
+)]
+fn incident_row(
+    guard: &GuardDetail,
+    (id, generation): (&str, u64),
+    enabled: bool,
+    usage: AnyElement,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+    mono: &SharedString,
+    tokens: &Tokens,
 ) -> AnyElement {
-    let slot = Slot::Incident(incident.id.clone());
+    let slot = Slot::Incident(id.to_owned());
     let busy: bool = model.actions.is_busy(&slot);
-    let (policy, id, generation) = (guard.policy, incident.id.clone(), incident.generation);
+    let policy: PolicyId = guard.policy;
+    let incident: String = id.to_owned();
     let opener: Entity<AppModel> = entity.clone();
     let rearm = ActionButton::new(
         SharedString::from(format!("automation-rearm-{id}")),
@@ -466,79 +628,30 @@ fn incident_row(
     )
     .variant(ButtonVariant::Quiet)
     .loading(busy)
+    .disabled(!enabled)
     .on_click(move |_, window, cx| {
-        open_rearm(&opener, policy, id.clone(), generation, window, cx);
+        open_rearm(&opener, policy, incident.clone(), generation, window, cx);
     });
     let block = v_flex()
         .gap(tokens::SPACE_1)
         .child(fact(
-            SharedString::from(format!("automation-incident-{}", incident.id)),
+            SharedString::from(format!("automation-incident-{id}")),
             "Open incident",
-            format!("{} · generation {}", incident.id, incident.generation),
+            format!("{id} · generation {generation}"),
             mono,
-            false,
+            !enabled,
             tokens,
         ))
         .child(h_flex().child(rearm))
         .children(slot_status(
-            SharedString::from(format!("automation-incident-state-{}", incident.id)),
+            SharedString::from(format!("automation-incident-state-{id}")),
             model,
             &slot,
             SystemTime::now(),
             tokens,
         ))
-        .child(incident_usage(incident, controller, now, mono, tokens));
+        .child(usage);
     inset(block, tokens)
-}
-
-/// The usage of an open incident from the controller record, or the
-/// reason that it is not shown.
-fn incident_usage(
-    incident: &IncidentRow,
-    controller: &Shown<ControllerSnapshot>,
-    now: SystemTime,
-    mono: &SharedString,
-    tokens: &Tokens,
-) -> AnyElement {
-    let id: &str = incident.id.as_str();
-    let missing = |text: String| {
-        caption(
-            SharedString::from(format!("automation-incident-usage-{id}")),
-            text,
-            tokens,
-        )
-    };
-    match controller {
-        Shown::Loading => skeleton_rows(1),
-        Shown::Failed(reason) => missing(format!("The usage is not shown: {reason}")),
-        Shown::Data { value, stale_age } => match (&value.rows, value.incident(id)) {
-            (Measured::Unavailable(reason), _) => {
-                missing(format!("The usage is not shown: {reason}"))
-            }
-            (Measured::Value(_), None) => missing(
-                "The controller record has no entry for this incident, so its usage is not shown."
-                    .to_owned(),
-            ),
-            (Measured::Value(_), Some(usage)) => v_flex()
-                .gap(tokens::SPACE_1)
-                .child(incident_block(
-                    "automation",
-                    usage,
-                    now,
-                    stale_age.is_some(),
-                    mono,
-                    tokens,
-                ))
-                .children(status_age_text(value.status_age).map(|text| {
-                    caption(
-                        SharedString::from(format!("automation-incident-age-{id}")),
-                        text,
-                        tokens,
-                    )
-                }))
-                .into_any_element(),
-        },
-    }
 }
 
 /// The pass cooldowns of the disk guard from the controller record.
@@ -620,11 +733,9 @@ fn guard_card(
             tokens,
         ))
         .child(guard_controls(guard, revision, entity, model, tokens));
-    for incident in &guard.incidents {
-        body = body.child(incident_row(
-            guard, incident, controller, entity, model, now, mono, tokens,
-        ));
-    }
+    body = body.children(rearm_rows(
+        guard, controller, entity, model, now, mono, tokens,
+    ));
     if guard.policy == PolicyId::DiskGuard {
         body = body.children(disk_cooldowns(controller, stale, mono, tokens));
     }
@@ -796,6 +907,112 @@ mod tests {
                 now()
             ),
             "Expired 3 h ago"
+        );
+    }
+
+    fn data(snapshot: ControllerSnapshot, stale_age: Option<&str>) -> Shown<ControllerSnapshot> {
+        Shown::Data {
+            value: std::sync::Arc::new(snapshot),
+            stale_age: stale_age.map(str::to_owned),
+        }
+    }
+
+    fn controller_of(scenario: crate::data::fixture::FixtureScenario) -> ControllerSnapshot {
+        use crate::data::DataSource as _;
+        crate::data::fixture::FixtureSource::new(scenario).controller()
+    }
+
+    fn status_incident() -> Vec<IncidentRow> {
+        vec![IncidentRow {
+            id: "inc-status".to_owned(),
+            generation: 4,
+        }]
+    }
+
+    #[test]
+    fn a_current_reading_offers_the_incidents_of_the_controller_not_of_the_status() {
+        use crate::data::fixture::FixtureScenario;
+        let shown = data(controller_of(FixtureScenario::Pressure), None);
+        let offer = rearm_offer(PolicyId::MemoryGuard, &shown, &status_incident());
+        let RearmOffer::Ready(incidents) = offer else {
+            panic!("not ready: {offer:?}");
+        };
+        let ids: Vec<(&str, u64)> = incidents
+            .iter()
+            .map(|incident| (incident.id.as_str(), incident.generation))
+            .collect();
+        assert_eq!(ids, vec![("inc-fixture-memory-1", 2)]);
+        // An incident of the other guard is not offered.
+        assert_eq!(
+            rearm_offer(PolicyId::DiskGuard, &shown, &[]),
+            RearmOffer::Ready(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_stale_status_turns_the_control_off_and_keeps_the_known_incidents() {
+        use crate::data::fixture::FixtureScenario;
+        let mut snapshot = controller_of(FixtureScenario::Pressure);
+        snapshot.status_age = StatusAge::Stale {
+            age: Duration::from_mins(12),
+        };
+        let offer = rearm_offer(
+            PolicyId::MemoryGuard,
+            &data(snapshot, None),
+            &status_incident(),
+        );
+        let RearmOffer::Off { reason, incidents } = offer else {
+            panic!("not off: {offer:?}");
+        };
+        assert!(reason.contains("12 min old"), "{reason}");
+        assert_eq!(
+            incidents,
+            vec![
+                ("inc-fixture-memory-1".to_owned(), 2),
+                ("inc-status".to_owned(), 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn each_unusable_reading_turns_the_control_off_with_its_reason() {
+        use crate::data::fixture::FixtureScenario;
+        let stopped = ControllerSnapshot {
+            status_age: StatusAge::Stopped,
+            ..controller_of(FixtureScenario::Pressure)
+        };
+        let unknown = ControllerSnapshot {
+            status_age: StatusAge::Unknown,
+            ..controller_of(FixtureScenario::Pressure)
+        };
+        let cases: Vec<(Shown<ControllerSnapshot>, &str)> = vec![
+            (Shown::Failed("disk error".to_owned()), "failed: disk error"),
+            (
+                data(controller_of(FixtureScenario::AgentAbsent), None),
+                "No journal exists",
+            ),
+            (
+                data(controller_of(FixtureScenario::Pressure), Some("12 min ago")),
+                "read the controller record 12 min ago",
+            ),
+            (data(stopped, None), "recorded that it stopped"),
+            (data(unknown, None), "no usable status record"),
+        ];
+        for (shown, expected) in cases {
+            let offer = rearm_offer(PolicyId::MemoryGuard, &shown, &status_incident());
+            let RearmOffer::Off { reason, incidents } = offer else {
+                panic!("not off: {offer:?}");
+            };
+            assert!(reason.starts_with("Rearm is off: "), "{reason}");
+            assert!(reason.contains(expected), "{reason}");
+            assert!(
+                incidents.contains(&("inc-status".to_owned(), 4)),
+                "{incidents:?}"
+            );
+        }
+        assert_eq!(
+            rearm_offer(PolicyId::MemoryGuard, &Shown::Loading, &[]),
+            RearmOffer::Loading
         );
     }
 }

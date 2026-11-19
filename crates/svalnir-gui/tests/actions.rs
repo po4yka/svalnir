@@ -390,3 +390,66 @@ fn a_protected_group_has_no_stop(cx: &mut TestAppContext) {
         Some("No stop")
     );
 }
+
+#[gpui_kit::test]
+fn a_stale_controller_reading_turns_the_rearm_off_with_the_reason(cx: &mut TestAppContext) {
+    let (handle, view) = open(
+        FixtureSource::new(FixtureScenario::Stale),
+        Screen::Automation,
+        cx,
+    );
+    // The stale status record names the incident; the control is off.
+    assert_eq!(
+        label(handle, "automation-incident-inc-fixture-memory-1", cx).as_deref(),
+        Some("Open incident: inc-fixture-memory-1 · generation 2")
+    );
+    let reason = label(handle, "automation-rearm-off-memory-guard", cx).expect("reason");
+    assert!(
+        reason.starts_with("Rearm is off: ") && reason.contains("12 min"),
+        "{reason}"
+    );
+    click(handle, "automation-rearm-inc-fixture-memory-1", cx);
+    assert_eq!(label(handle, "confirm-object", cx), None, "no dialog opens");
+    assert_eq!(
+        state_of(
+            &view,
+            &Slot::Incident("inc-fixture-memory-1".to_owned()),
+            cx
+        ),
+        None
+    );
+}
+
+#[gpui_kit::test]
+fn the_rearm_offers_an_incident_that_only_the_controller_reading_has(cx: &mut TestAppContext) {
+    let (handle, _view) = open(
+        FixtureSource::new(FixtureScenario::Drift).with_actions(ActionScript::Accept),
+        Screen::Automation,
+        cx,
+    );
+    assert_eq!(
+        label(handle, "automation-incident-inc-fixture-disk-1", cx).as_deref(),
+        Some("Open incident: inc-fixture-disk-1 · generation 1")
+    );
+    assert_eq!(label(handle, "automation-rearm-off-disk-guard", cx), None);
+    click(handle, "automation-rearm-inc-fixture-disk-1", cx);
+    let object = label(handle, "confirm-object", cx).expect("object");
+    assert!(object.contains("inc-fixture-disk-1"), "{object}");
+}
+
+#[gpui_kit::test]
+fn with_no_journal_the_rearm_is_off(cx: &mut TestAppContext) {
+    let (handle, _view) = open(
+        FixtureSource::new(FixtureScenario::AgentAbsent),
+        Screen::Automation,
+        cx,
+    );
+    let reasons: Vec<String> = ["memory-guard", "disk-guard"]
+        .into_iter()
+        .filter_map(|name| label(handle, &format!("automation-rearm-off-{name}"), cx))
+        .collect();
+    assert!(!reasons.is_empty(), "no guard says that the rearm is off");
+    for reason in reasons {
+        assert!(reason.starts_with("Rearm is off: "), "{reason}");
+    }
+}

@@ -17,7 +17,7 @@
 //! | --- | --- |
 //! | Before each entry: the gate of the service (the grant, the root, the rule, and the deadline of the step, on a new clock reading) | This entry and each later entry are `Skipped`, with no call |
 //! | The root opens from `/` name by name, with no symbolic link | Each entry is `Skipped` |
-//! | The root is a directory of the helper user or of user 0, and no other user can write to it | Each entry is `Skipped` |
+//! | The root and each directory above it are directories of the helper user or of user 0. No other user can write to the root. Another user can write to a directory above it only when that directory has the sticky bit | Each entry is `Skipped` |
 //! | The root is on a local filesystem | Each entry is `Skipped` |
 //! | Each directory between the root and the object opens with no symbolic link, is on the filesystem of the root, is a directory of the helper user or of user 0, and no other user can write to it | The entry is `Skipped` |
 //! | The object has the type and the native identifiers of the request | The entry is `Skipped` (`helper_target_changed`) |

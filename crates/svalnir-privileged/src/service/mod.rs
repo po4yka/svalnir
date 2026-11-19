@@ -357,7 +357,14 @@ impl<S: RecordStore, E: EvictionExecutor, C: ClockSource> HelperService<S, E, C>
                 reason.code(),
                 reason.family(),
                 ActionStage::Dispatch,
-                DispatchState::NotSubmitted,
+                // The stop is before a call of its own entry. When an
+                // earlier entry of the step got a call, the error of the
+                // step does not state that nothing was submitted.
+                if submitted {
+                    DispatchState::Submitted
+                } else {
+                    DispatchState::NotSubmitted
+                },
                 Some(correlation),
             )
         });

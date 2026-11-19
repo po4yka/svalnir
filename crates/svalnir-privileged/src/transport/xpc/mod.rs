@@ -31,8 +31,11 @@
 //! # Limits
 //!
 //! The transport has one serial queue: the helper handles one message at a
-//! time. It keeps at most [`MAX_PEER_CONNECTIONS`] live peer connections
-//! and cancels a new one over that number. After
+//! time. It keeps at most
+//! [`MAX_PEER_CONNECTIONS_PER_USER`](super::MAX_PEER_CONNECTIONS_PER_USER)
+//! live peer connections of one user and
+//! [`MAX_PEER_CONNECTIONS`](super::MAX_PEER_CONNECTIONS) in all, and cancels
+//! a new one over a limit. After
 //! [`MAX_PENALIZED_MESSAGES`](super::MAX_PENALIZED_MESSAGES) penalized
 //! messages of one user in one window, it cancels each connection of that
 //! user at its next message, with no reply and no code identity check,
@@ -55,13 +58,12 @@ mod sys;
 mod tests;
 
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use super::{
-    CodeVerification, MAX_PEER_CONNECTIONS, PeerFacts, PeerPolicy, PenaltyLimiter, Reply,
+    CodeVerification, ConnectionCounter, PeerFacts, PeerPolicy, PenaltyLimiter, Reply,
     RequestHandler, Transport, TransportError, UnverifiedReason, requirement_text,
 };
 use crate::request::{CodeIdentity, MAX_ENCODED_REQUEST_BYTES};
@@ -209,7 +211,7 @@ impl XpcTransport {
         };
 
         let (invalid, stopped) = sync_channel::<()>(1);
-        let live: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let live: Arc<Mutex<ConnectionCounter>> = Arc::default();
         let limiter: Arc<Mutex<PenaltyLimiter>> = Arc::default();
         let peer_queue: Arc<sys::Queue> = Arc::clone(&queue);
         listener.set_event_handler(&sys::handler_block(
@@ -248,21 +250,22 @@ fn accept(
     handler: &Arc<dyn RequestHandler>,
     verifier: &Arc<Verifier>,
     queue: &sys::Queue,
-    live: &Arc<AtomicUsize>,
+    live: &Arc<Mutex<ConnectionCounter>>,
     limiter: &Arc<Mutex<PenaltyLimiter>>,
 ) {
-    let over_limit: bool = live.fetch_add(1, Ordering::SeqCst) >= MAX_PEER_CONNECTIONS;
     // The platform recorded the two values for the connection. They are
     // not values of a message.
     let effective_uid: u32 = peer.effective_uid();
     let audit_session: i64 = i64::from(peer.audit_session());
+    // A counter that cannot count admits no connection.
+    let counted: bool = live.lock().is_ok_and(|mut live| live.open(effective_uid));
     // The handler has a reference to its own connection, to reply and to
     // cancel. The invalid event removes it, so the two do not keep each
     // other.
     let connection: Mutex<Option<sys::Connection>> = Mutex::new(Some(peer.clone()));
     let handler: Arc<dyn RequestHandler> = Arc::clone(handler);
     let verifier: Arc<Verifier> = Arc::clone(verifier);
-    let live: Arc<AtomicUsize> = Arc::clone(live);
+    let live: Arc<Mutex<ConnectionCounter>> = Arc::clone(live);
     let limiter: Arc<Mutex<PenaltyLimiter>> = Arc::clone(limiter);
 
     peer.set_target_queue(queue);
@@ -306,16 +309,18 @@ fn accept(
                 }
             }
             sys::Event::Invalid => {
-                live.fetch_sub(1, Ordering::SeqCst);
-                if let Ok(mut connection) = connection.lock() {
-                    *connection = None;
+                if counted && let Ok(mut live) = live.lock() {
+                    live.close(effective_uid);
                 }
+                // Also after a panic of this handler: the connection and
+                // its handler must not keep each other.
+                *connection.lock().unwrap_or_else(PoisonError::into_inner) = None;
             }
             sys::Event::Peer(_) | sys::Event::Other => {}
         },
     ));
     peer.resume();
-    if over_limit {
+    if !counted {
         peer.cancel();
     }
 }

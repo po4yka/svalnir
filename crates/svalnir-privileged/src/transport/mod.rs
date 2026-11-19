@@ -59,7 +59,49 @@ pub const MACH_SERVICE_NAME: &str = "dev.svalnir.privileged";
 pub const AGENT_SIGNING_IDENTIFIER: &str = "dev.svalnir.agent";
 
 /// The largest number of live peer connections of a transport.
-pub const MAX_PEER_CONNECTIONS: usize = 8;
+pub const MAX_PEER_CONNECTIONS: usize = 32;
+
+/// The largest number of live peer connections of one user. The helper
+/// has one caller for each user: the agent of that user.
+pub const MAX_PEER_CONNECTIONS_PER_USER: usize = 2;
+
+/// The count of the live peer connections, for each user of the platform.
+///
+/// The limit for one user stops a process that opens connections and
+/// sends no message from using each connection of the transport: it can
+/// use only the connections of its own user.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionCounter {
+    by_user: BTreeMap<u32, usize>,
+    total: usize,
+}
+
+impl ConnectionCounter {
+    /// Counts a new connection of `user`. Returns `false`, and counts
+    /// nothing, when the user or the transport has its largest number of
+    /// connections.
+    pub(crate) fn open(&mut self, user: u32) -> bool {
+        let of_user: usize = self.by_user.get(&user).copied().unwrap_or(0);
+        if self.total >= MAX_PEER_CONNECTIONS || of_user >= MAX_PEER_CONNECTIONS_PER_USER {
+            return false;
+        }
+        self.by_user.insert(user, of_user.saturating_add(1));
+        self.total = self.total.saturating_add(1);
+        true
+    }
+
+    /// Removes one counted connection of `user`.
+    pub(crate) fn close(&mut self, user: u32) {
+        let Some(of_user) = self.by_user.get_mut(&user) else {
+            return;
+        };
+        *of_user = of_user.saturating_sub(1);
+        if *of_user == 0 {
+            self.by_user.remove(&user);
+        }
+        self.total = self.total.saturating_sub(1);
+    }
+}
 
 /// The largest number of penalized messages of one user in one
 /// [`PENALTY_WINDOW`]. After that number, a transport handles no message
@@ -104,16 +146,16 @@ impl PenaltyLimiter {
     /// Whether the transport handles a message of `user` at `now`.
     ///
     /// The answer is `false` when the user has the largest number of
-    /// penalized messages in the window. It is also `false` for a user
-    /// that the limiter does not count while it counts the largest number
-    /// of users: the transport cannot keep the bounded state that a
-    /// penalty of that user needs.
+    /// penalized messages in the window. A user that the limiter does not
+    /// count is permitted, also while the limiter counts the largest
+    /// number of users: the penalties of other users do not stop a user
+    /// that has none. The limiter then does not count the penalties of
+    /// that user until a window is complete.
     pub(crate) fn permits(&mut self, user: u32, now: Instant) -> bool {
         self.forget_complete_windows(now);
-        match self.users.get(&user) {
-            Some(penalties) => penalties.count < MAX_PENALIZED_MESSAGES,
-            None => self.users.len() < MAX_PENALIZED_USERS,
-        }
+        self.users
+            .get(&user)
+            .is_none_or(|penalties: &Penalties| penalties.count < MAX_PENALIZED_MESSAGES)
     }
 
     /// Counts one penalized message of `user` at `now`.

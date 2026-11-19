@@ -635,6 +635,10 @@ fn a_deadline_in_the_step_stops_the_later_entries() {
     let error: &ActionError = step.error.as_ref().unwrap();
     assert_eq!(code_of(error), "helper_request_expired");
     assert_eq!(error.family, ErrorFamily::Limits);
+    // An earlier entry got a call, so the error of the step does not
+    // permit a retry before reconciliation.
+    assert_eq!(error.dispatch, DispatchState::Submitted);
+    assert_eq!(error.permitted_next_step(), PermittedNextStep::Reconcile);
     assert!(!first.exists());
     assert!(second.exists());
     assert!(third.exists());

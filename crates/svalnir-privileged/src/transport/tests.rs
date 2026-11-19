@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use super::fake::FakePeer;
 use super::{
-    AGENT_SIGNING_IDENTIFIER, CodeVerification, MACH_SERVICE_NAME, MAX_PENALIZED_MESSAGES,
+    AGENT_SIGNING_IDENTIFIER, CodeVerification, ConnectionCounter, MACH_SERVICE_NAME,
+    MAX_PEER_CONNECTIONS, MAX_PEER_CONNECTIONS_PER_USER, MAX_PENALIZED_MESSAGES,
     MAX_PENALIZED_USERS, PENALTY_WINDOW, PeerFacts, PeerPolicy, PenaltyLimiter, PolicyError,
     UnverifiedReason, requirement_text,
 };
@@ -128,12 +129,42 @@ fn the_penalty_limiter_counts_a_bounded_number_of_users() {
         limiter.penalize(user, start);
     }
 
-    // The limiter cannot count one more user, so it does not permit one.
-    // A user that it counts and that is below the limit is permitted.
-    assert!(!limiter.permits(users, start));
-    limiter.penalize(users, start);
-    assert!(!limiter.permits(users, start));
-    assert!(limiter.permits(0, start));
-    // When the windows are complete, the limiter has room again.
-    assert!(limiter.permits(users, start + PENALTY_WINDOW));
+    // The limiter cannot count one more user. The penalties of the other
+    // users do not stop that user, and its own penalties are not kept.
+    for _ in 0..=MAX_PENALIZED_MESSAGES {
+        assert!(limiter.permits(users, start));
+        limiter.penalize(users, start);
+    }
+    assert_eq!(limiter.users.len(), MAX_PENALIZED_USERS);
+    // A user that the limiter counts still has its limit.
+    for _ in 0..MAX_PENALIZED_MESSAGES {
+        limiter.penalize(0, start);
+    }
+    assert!(!limiter.permits(0, start));
+}
+
+#[test]
+fn the_connection_limit_is_for_one_user_and_for_the_transport() {
+    let mut counter: ConnectionCounter = ConnectionCounter::default();
+
+    // A user that opens connections and sends nothing gets its own
+    // number of them, and each other user still gets a connection.
+    for _ in 0..MAX_PEER_CONNECTIONS_PER_USER {
+        assert!(counter.open(USER));
+    }
+    assert!(!counter.open(USER));
+    assert!(counter.open(USER + 1));
+    counter.close(USER);
+    assert!(counter.open(USER));
+
+    // The limit of the transport.
+    let mut user: u32 = 10_000;
+    while counter.open(user) {
+        user += 1;
+    }
+    assert_eq!(counter.total, MAX_PEER_CONNECTIONS);
+    assert!(!counter.open(user + 1));
+    // A close of a user with no counted connection changes nothing.
+    counter.close(user + 1);
+    assert_eq!(counter.total, MAX_PEER_CONNECTIONS);
 }

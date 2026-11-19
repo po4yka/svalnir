@@ -184,10 +184,11 @@ impl Object {
 
 impl Clone for Object {
     fn clone(&self) -> Self {
-        // SAFETY: `self` owns a reference, so the object is live.
-        // `xpc_retain` returns its argument, which is not null.
-        let retained: XpcObject = unsafe { xpc_retain(self.as_ptr()) };
-        Self(NonNull::new(retained).unwrap_or(self.0))
+        // SAFETY: `self` owns a reference, so the object is live. The
+        // call adds one reference, which the new value owns.
+        // `xpc_retain` returns its argument.
+        let _same_object: XpcObject = unsafe { xpc_retain(self.as_ptr()) };
+        Self(self.0)
     }
 }
 
@@ -574,7 +575,7 @@ pub(super) mod client {
     use std::ffi::CStr;
 
     use super::{
-        Connection, Dictionary, Event, Message, Object, XpcObject, handler_block,
+        Connection, Dictionary, Event, Object, XpcObject, handler_block,
         xpc_connection_create_from_endpoint, xpc_connection_send_message_with_reply_sync,
         xpc_dictionary_create_empty, xpc_dictionary_set_int64, xpc_endpoint_create,
     };
@@ -616,15 +617,21 @@ pub(super) mod client {
             let Some(reply) = Object::from_owned(reply) else {
                 return Answer::Error;
             };
-            // SAFETY: `reply` is a live XPC object for this function.
-            match unsafe { super::read_event(reply.as_ptr()) } {
+            match read_owned(&reply) {
                 Event::Message(message) => {
-                    let message: Message<'_> = message;
                     Answer::Dictionary(message.data(response_key).map(<[u8]>::to_vec))
                 }
                 _ => Answer::Error,
             }
         }
+    }
+
+    /// Reads an object that this process owns. The event has the lifetime
+    /// of the borrow, so its bytes cannot be used after the object.
+    fn read_owned(object: &Object) -> Event<'_> {
+        // SAFETY: `object` owns a reference to a live XPC object, and the
+        // result has the lifetime of the borrow of `object`.
+        unsafe { super::read_event(object.as_ptr()) }
     }
 
     impl Dictionary {

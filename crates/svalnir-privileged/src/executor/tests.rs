@@ -403,3 +403,29 @@ fn a_gate_that_refuses_the_first_entry_leaves_the_root_closed() {
     assert_eq!(execution.entries[0].dispatch, DispatchState::NotSubmitted);
     assert!(file.exists());
 }
+
+#[test]
+fn a_root_below_a_directory_that_another_user_can_write_to_is_refused() {
+    let fixture: Fixture = Fixture::new();
+    let file: PathBuf = fixture.file("a.tmp");
+    let above: &Path = fixture.root.parent().unwrap();
+    // A user that can write to the directory above the root can put
+    // another directory at the name of the root.
+    fs::set_permissions(above, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let reports: Vec<EntryReport> = run(&eviction(&fixture, vec![fixture.entry("a.tmp")]));
+
+    assert_skipped(
+        &reports[0],
+        "helper_root_not_controlled",
+        &ErrorFamily::Eligibility,
+    );
+    assert!(file.exists());
+
+    // With the sticky bit, a user can replace only its own entries there,
+    // and the root has a controlling owner.
+    fs::set_permissions(above, fs::Permissions::from_mode(0o1777)).unwrap();
+    let reports: Vec<EntryReport> = run(&eviction(&fixture, vec![fixture.entry("a.tmp")]));
+    assert_eq!(reports[0].effect, TargetEffect::Removed);
+    fs::set_permissions(above, fs::Permissions::from_mode(0o700)).unwrap();
+}

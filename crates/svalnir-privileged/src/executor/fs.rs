@@ -28,6 +28,9 @@ const BLOCK_BYTES: u64 = 512;
 /// The permission bits that let a user other than the owner write.
 const WRITE_BY_OTHERS: u32 = 0o022;
 
+/// The sticky bit of a directory.
+const STICKY: u32 = 0o1000;
+
 /// The eviction executor of the host filesystem.
 ///
 /// The executor acts as the effective user of its process. It removes an
@@ -59,12 +62,33 @@ impl FsEvictor {
             && metadata.permissions & WRITE_BY_OTHERS == 0
     }
 
+    /// Whether a directory above the root is one in which only the helper
+    /// user and user 0 can replace a name. A directory with the sticky bit
+    /// qualifies when one of the two owns it: there, a user can rename or
+    /// remove only its own entries, and the next directory of the path
+    /// must again have a controlling owner.
+    fn is_controlled_ancestor(self, metadata: &Metadata) -> bool {
+        metadata.kind == Kind::Directory
+            && self.is_controlling_owner(metadata.owner)
+            && (metadata.permissions & WRITE_BY_OTHERS == 0 || metadata.permissions & STICKY != 0)
+    }
+
     /// Opens the approved root from `/`, one name at a time, and checks
-    /// it.
+    /// each directory of the path and the root.
     fn open_root(self, root: &ApprovedRoot) -> Result<Root, Condition> {
         let mut directory: OwnedFd =
             native::open_filesystem_root().map_err(|_| Condition::RootUnavailable)?;
         for name in root.path().names() {
+            // A user that can change a directory of the path can put
+            // another directory at the name of the root. The record has
+            // no native identifiers of the root, so each directory of the
+            // path must be one that only the helper user and user 0 can
+            // change.
+            let ancestor: Metadata = native::stat_descriptor(directory.as_fd())
+                .map_err(|_| Condition::RootUnavailable)?;
+            if !self.is_controlled_ancestor(&ancestor) {
+                return Err(Condition::RootNotControlled);
+            }
             let name: CString = CString::new(name).map_err(|_| Condition::RootUnavailable)?;
             directory = native::open_directory_at(directory.as_fd(), &name)
                 .map_err(|_| Condition::RootUnavailable)?;

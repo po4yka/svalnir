@@ -24,9 +24,6 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 /// The directory of the plan documents in the state directory.
 const PLAN_DIRECTORY_NAME: &str = "plans";
 
-/// The file name of the log of the agent in the state directory.
-const AGENT_LOG_FILE_NAME: &str = "agent.log";
-
 /// The file name of the catalog store in the state directory. It holds scan
 /// records and metric samples, which are rebuildable. The operation journal
 /// of `docs/ARCHITECTURE.md` section 12 is a different file.
@@ -121,9 +118,20 @@ impl Environment {
         Ok(self.state_directory()?.join(PLAN_DIRECTORY_NAME))
     }
 
-    /// The path of the log of the agent.
-    pub(crate) fn agent_log_path(&self) -> Result<PathBuf, ErrorBody> {
-        Ok(self.state_directory()?.join(AGENT_LOG_FILE_NAME))
+    /// The path of the log of the agent: `~/Library/Logs/Svalnir/agent.log`
+    /// below [`Environment::home`]. `None` when the home directory is not
+    /// known.
+    ///
+    /// The log does not follow the state-directory override. A command that
+    /// writes a path of this value into a service definition changes state,
+    /// so the `HOME` check has compared [`Environment::home`] with the
+    /// account record before it runs; a read-only command shows the path
+    /// only.
+    pub(crate) fn agent_log_path(&self) -> Option<PathBuf> {
+        self.home
+            .as_ref()
+            .filter(|home| home.is_absolute())
+            .map(|home| svalnir_agent::runtime::launch_agent::agent_log_path(home))
     }
 
     /// Creates the state directory, for a command that must write.

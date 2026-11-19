@@ -212,6 +212,9 @@ struct ServiceView {
     /// Whether the definition file exists. A file is not evidence that
     /// the service manager loaded it.
     definition_present: Option<bool>,
+    /// The log file of the agent that `agent install` names in the
+    /// definition. `None` when the home directory is not known.
+    log: Option<LosslessPath>,
 }
 
 impl StatusView {
@@ -276,6 +279,9 @@ impl StatusView {
                 (None, _) => "the home directory is not known".to_owned(),
             }
         );
+        if let Some(log) = &self.service.log {
+            put_line!(out, "Agent log: {}", log.display_label());
+        }
         put_line!(out, "\n{}", self.note);
         out
     }
@@ -306,6 +312,7 @@ pub(crate) fn status(invocation: &mut Invocation<'_>) -> Result<ExitStatus, Comm
             definition_path: path
                 .as_ref()
                 .and_then(|path| LosslessPath::from_path(path).ok()),
+            log: environment.agent_log_path().as_deref().and_then(lossless),
         },
         note: STATUS_RECORD_NOTE,
     };
@@ -452,7 +459,7 @@ fn standing_guards(environment: &Environment) -> Option<Vec<&'static str>> {
     }
 }
 
-const UNINSTALL_NOTE: &str = "The service is not registered. The state directory, the journal, and the authority record stay; a guard that is enabled stays enabled in the record, and no agent acts on it.";
+const UNINSTALL_NOTE: &str = "The service is not registered. The state directory, the journal, and the authority record stay; a guard that is enabled stays enabled in the record, and no agent acts on it. The log of the agent stays in its log directory; remove it yourself when you do not need it.";
 
 impl ServiceChangeView {
     fn render(&self) -> String {
@@ -466,6 +473,9 @@ impl ServiceChangeView {
         );
         if let Some(program) = &self.program {
             put_line!(out, "  Program: {}", program.display_label());
+        }
+        if let Some(log) = &self.log {
+            put_line!(out, "  Log: {}", log.display_label());
         }
         if let Some(mode) = self.mode {
             put_line!(out, "  Mode: {mode}; guards enabled by this command: none");
@@ -488,6 +498,25 @@ impl ServiceChangeView {
 
 fn lossless(path: &std::path::Path) -> Option<LosslessPath> {
     LosslessPath::from_path(path).ok()
+}
+
+/// The log file of the agent and its directory, for `agent install`.
+///
+/// The home directory has passed the `HOME` check of a command that changes
+/// state, so the log path is that of this user.
+fn agent_log(environment: &Environment) -> Result<(PathBuf, PathBuf), ErrorBody> {
+    let unavailable = || {
+        service_error(
+            "home_directory_unavailable",
+            "the home directory of the user is not known, so the log of the agent has no path; the command made no change",
+        )
+    };
+    let log: PathBuf = environment.agent_log_path().ok_or_else(unavailable)?;
+    let directory: PathBuf = log
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(unavailable)?;
+    Ok((log, directory))
 }
 
 pub(crate) fn install(
@@ -516,7 +545,7 @@ pub(crate) fn install(
         ),
     })?;
     let state_directory: PathBuf = environment.state_directory()?;
-    let log: PathBuf = environment.agent_log_path()?;
+    let (log, log_directory): (PathBuf, PathBuf) = agent_log(environment)?;
     let text: String = render(&LaunchAgentDefinition {
         program: program.clone(),
         state_directory: state_directory.clone(),
@@ -559,6 +588,15 @@ pub(crate) fn install(
     )?;
     environment.create_state_directory()?;
     let uid: u32 = session::current_uid().get();
+    // The service manager does not make the directory of the log file. A
+    // directory that this user cannot write is refused before the
+    // definition changes.
+    host.prepare_log_directory(&log_directory).map_err(|error| {
+        failure(
+            &error,
+            "the command changed no registration; make sure that this user owns the log directory and can write to it",
+        )
+    })?;
     // The new definition is in place before an earlier registration is
     // unloaded, so a failed write leaves the earlier service as it was.
     host.write_definition(&definition, &text)
@@ -632,7 +670,7 @@ pub(crate) fn uninstall(
         definition_path: lossless(&definition).ok_or_else(session::identity_error)?,
         program: None,
         state_directory: None,
-        log: None,
+        log: environment.agent_log_path().as_deref().and_then(lossless),
         mode: None,
         guards_enabled: Vec::new(),
         standing_guards: None,

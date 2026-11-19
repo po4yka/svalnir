@@ -127,7 +127,11 @@ fn main() -> ExitCode {
             std::io::IsTerminal::is_terminal(&std::io::stderr())
                 && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
         )
-        .with_writer(std::io::stderr)
+        // The service manager does not rotate the log file: the writer
+        // cuts it at its size limit.
+        .with_writer(svalnir_agent::runtime::log_file::BoundedLog::standard_error(
+            svalnir_agent::runtime::log_file::AGENT_LOG_LIMIT_BYTES,
+        ))
         .init();
     agent::run(&options)
 }

@@ -16,6 +16,26 @@ pub const LAUNCH_AGENT_LABEL: &str = "dev.po4yka.svalnir.agent";
 /// The file name of the definition in a `LaunchAgents` directory.
 pub const LAUNCH_AGENT_FILE_NAME: &str = "dev.po4yka.svalnir.agent.plist";
 
+/// The file name of the log of the agent in [`agent_log_directory`].
+pub const AGENT_LOG_FILE_NAME: &str = "agent.log";
+
+/// The log directory of the agent: `~/Library/Logs/Svalnir/` below
+/// `home`. It is the one log location of the agent.
+///
+/// `home` must be the home directory that a caller checked against the
+/// account record of the effective user: a `HOME` value that a different
+/// process set can name a directory of a different user.
+#[must_use]
+pub fn agent_log_directory(home: &Path) -> PathBuf {
+    home.join(crate::capability::host::LOG_DIRECTORY)
+}
+
+/// The log file of the agent in [`agent_log_directory`].
+#[must_use]
+pub fn agent_log_path(home: &Path) -> PathBuf {
+    agent_log_directory(home).join(AGENT_LOG_FILE_NAME)
+}
+
 /// The inputs of the definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchAgentDefinition {
@@ -27,7 +47,8 @@ pub struct LaunchAgentDefinition {
     /// one.
     pub config: Option<PathBuf>,
     /// The absolute path of the file that gets the standard error stream:
-    /// the structured log of the agent.
+    /// the structured log of the agent, [`agent_log_path`] of the checked
+    /// home directory. The service manager does not make its directory.
     pub log: PathBuf,
 }
 
@@ -151,16 +172,24 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        LAUNCH_AGENT_LABEL, LaunchAgentDefinition, LaunchAgentError, render,
+        LAUNCH_AGENT_LABEL, LaunchAgentDefinition, LaunchAgentError, agent_log_path, render,
         throttle_interval_seconds,
     };
+
+    #[test]
+    fn the_log_is_in_the_log_directory_of_the_home_directory() {
+        assert_eq!(
+            agent_log_path(std::path::Path::new("/Users/example")),
+            PathBuf::from("/Users/example/Library/Logs/Svalnir/agent.log")
+        );
+    }
 
     fn definition() -> LaunchAgentDefinition {
         LaunchAgentDefinition {
             program: PathBuf::from("/opt/svalnir/bin/svalnir-agent"),
             state_directory: PathBuf::from("/Users/example/Library/Application Support/Svalnir"),
             config: Some(PathBuf::from("/Users/example/.config/svalnir/config.toml")),
-            log: PathBuf::from("/Users/example/Library/Logs/Svalnir/agent.log"),
+            log: agent_log_path(std::path::Path::new("/Users/example")),
         }
     }
 

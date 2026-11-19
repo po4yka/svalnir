@@ -1311,6 +1311,9 @@ struct RecordingHost {
     problem: ProgramProblem,
     calls: Mutex<Vec<String>>,
     fail_load: bool,
+    /// The log directory is refused, as for a directory that this user
+    /// cannot write.
+    fail_log_directory: bool,
     /// The number of queries after an unload that still find the service,
     /// as the service manager of the host does for a short time. `None`:
     /// the service is never removed.
@@ -1326,6 +1329,7 @@ impl Default for RecordingHost {
             problem: ProgramProblem::NotFound,
             calls: Mutex::new(Vec::new()),
             fail_load: false,
+            fail_log_directory: false,
             late_removal: Some(0),
             queries: Mutex::new(0),
         }
@@ -1339,6 +1343,18 @@ impl ServiceHost for RecordingHost {
 
     fn definition_exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn prepare_log_directory(&self, path: &Path) -> Result<(), ServiceFailure> {
+        self.calls.lock().unwrap().push("log_directory".to_owned());
+        if self.fail_log_directory {
+            return Err(ServiceFailure {
+                step: "log_directory",
+                detail: "this user does not own the log directory or cannot write to it".to_owned(),
+            });
+        }
+        std::fs::create_dir_all(path).unwrap();
+        Ok(())
     }
 
     fn write_definition(&self, path: &Path, text: &str) -> Result<(), ServiceFailure> {
@@ -1418,7 +1434,12 @@ fn an_install_registers_an_observation_agent_through_the_service_host() {
     assert_eq!(result["service_manager"], "loaded");
     assert_eq!(
         *host.calls.lock().unwrap(),
-        ["write", "unload dev.po4yka.svalnir.agent", "load"]
+        [
+            "log_directory",
+            "write",
+            "unload dev.po4yka.svalnir.agent",
+            "load"
+        ]
     );
     let text: String = std::fs::read_to_string(&definition).unwrap();
     assert!(
@@ -1429,8 +1450,22 @@ fn an_install_registers_an_observation_agent_through_the_service_host() {
     assert!(text.contains("<string>--state-dir</string>"), "{text}");
     // The definition gives no configuration and enables no guard.
     assert!(!text.contains("--config"), "{text}");
+    // The log is in the log directory of the home directory, not in the
+    // state directory, and the directory exists before the service loads.
+    let log: PathBuf = world.path("home").join("Library/Logs/Svalnir/agent.log");
+    let log_text: String = format!(
+        "<key>StandardErrorPath</key>\n\t<string>{}</string>",
+        log.display()
+    );
+    assert!(text.contains(&log_text), "{text}");
+    assert!(log.parent().unwrap().is_dir());
+    assert_eq!(result["log"]["value"], log.display().to_string());
     let status = json(&world.environment, &["agent", "status"]);
     assert_eq!(status.result()["service"]["definition_present"], true);
+    assert_eq!(
+        status.result()["service"]["log"]["value"],
+        log.display().to_string()
+    );
     // The install made no authority record.
     assert!(status.result()["authority"].is_null());
 }
@@ -1669,12 +1704,51 @@ fn an_uninstall_unloads_the_service_and_removes_the_definition() {
         removed.stdout
     );
     assert_eq!(
-        host.calls.lock().unwrap()[3..],
+        host.calls.lock().unwrap()[4..],
         ["unload dev.po4yka.svalnir.agent", "remove"]
     );
     assert!(!definition.exists());
-    // The records of the state directory stay.
+    // The records of the state directory stay, and so does the log.
     assert!(world.path("state").exists());
+    assert!(
+        world.path("home").join("Library/Logs/Svalnir").is_dir(),
+        "the uninstall removed the log directory"
+    );
+    assert!(
+        removed.stdout.contains("The log of the agent stays"),
+        "{}",
+        removed.stdout
+    );
+    assert!(removed.stdout.contains("Library/Logs/Svalnir/agent.log"));
+}
+
+#[test]
+fn an_install_with_a_log_directory_that_is_not_writable_changes_no_registration() {
+    let (world, host) = world_with_host(RecordingHost {
+        program: Some(PathBuf::from("/opt/svalnir/bin/svalnir-agent")),
+        fail_log_directory: true,
+        ..RecordingHost::default()
+    });
+    let definition: PathBuf = world
+        .path("home")
+        .join("Library/LaunchAgents/dev.po4yka.svalnir.agent.plist");
+    let refused = json(&world.environment, &["agent", "install", "--yes"]);
+    assert_eq!(
+        refused.status,
+        ExitStatus::Unavailable,
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(refused.error_code(), "service_change_failed");
+    let message: String = refused.envelope()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("changed no registration"), "{message}");
+    assert!(message.contains("log directory"), "{message}");
+    // No definition and no service-manager call.
+    assert_eq!(*host.calls.lock().unwrap(), ["log_directory"]);
+    assert!(!definition.exists());
 }
 
 #[test]
@@ -1715,7 +1789,12 @@ fn an_install_reports_a_missing_program_and_a_refused_load() {
     );
     assert_eq!(
         *host.calls.lock().unwrap(),
-        ["write", "unload dev.po4yka.svalnir.agent", "load"]
+        [
+            "log_directory",
+            "write",
+            "unload dev.po4yka.svalnir.agent",
+            "load"
+        ]
     );
 }
 
@@ -1739,6 +1818,7 @@ fn a_reinstall_waits_until_the_service_manager_removed_the_service() {
     assert_eq!(
         *host.calls.lock().unwrap(),
         [
+            "log_directory",
             "write",
             "unload dev.po4yka.svalnir.agent",
             "pause",

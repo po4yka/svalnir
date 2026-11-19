@@ -126,6 +126,16 @@ pub(crate) trait ServiceHost: Debug + Send + Sync {
     fn agent_program(&self) -> Result<PathBuf, ProgramProblem>;
     /// Whether a definition file exists at `path`.
     fn definition_exists(&self, path: &Path) -> bool;
+    /// Makes the log directory of the agent when it does not exist, for
+    /// this user only, and checks that it is a directory that this user
+    /// owns and can write. The service manager opens the log file in it
+    /// and does not make the directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceFailure`] when the directory cannot be made, or
+    /// when the object at the path is not such a directory.
+    fn prepare_log_directory(&self, path: &Path) -> Result<(), ServiceFailure>;
     /// Writes the definition file. Its directory is made when it does not
     /// exist.
     fn write_definition(&self, path: &Path, text: &str) -> Result<(), ServiceFailure>;
@@ -190,6 +200,15 @@ impl ServiceHost for SystemServiceHost {
 
     fn definition_exists(&self, path: &Path) -> bool {
         path.symlink_metadata().is_ok()
+    }
+
+    fn prepare_log_directory(&self, path: &Path) -> Result<(), ServiceFailure> {
+        prepared_log_directory(path, crate::commands::session::current_uid().get()).map_err(
+            |detail| ServiceFailure {
+                step: "log_directory",
+                detail,
+            },
+        )
     }
 
     fn write_definition(&self, path: &Path, text: &str) -> Result<(), ServiceFailure> {
@@ -400,6 +419,35 @@ impl AccountSource for TestAccount {
     }
 }
 
+/// Makes the log directory `path` when it does not exist, with access for
+/// its owner only, and checks that it is a directory, not a symbolic link,
+/// that `uid` owns and can write and search.
+///
+/// # Errors
+///
+/// Returns the reason when the directory cannot be made or is not such a
+/// directory. The reason has no path.
+pub(crate) fn prepared_log_directory(path: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(path)
+        .map_err(|error| format!("the log directory was not made: {}", error.kind()))?;
+    // The metadata of the object itself: a symbolic link is refused.
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("the log directory cannot be examined: {}", error.kind()))?;
+    if !metadata.is_dir() {
+        return Err("the object at the path of the log directory is not a directory".to_owned());
+    }
+    if metadata.uid() != uid || metadata.mode() & 0o300 != 0o300 {
+        return Err("this user does not own the log directory or cannot write to it".to_owned());
+    }
+    Ok(())
+}
+
 /// The service host of a test that set none: it has no agent executable
 /// and refuses each change, so a test cannot reach the service manager or
 /// the service definitions of the developer.
@@ -425,6 +473,10 @@ impl ServiceHost for RefusingServiceHost {
 
     fn definition_exists(&self, _path: &Path) -> bool {
         false
+    }
+
+    fn prepare_log_directory(&self, _path: &Path) -> Result<(), ServiceFailure> {
+        Err(Self::refusal("log_directory"))
     }
 
     fn write_definition(&self, _path: &Path, _text: &str) -> Result<(), ServiceFailure> {
@@ -831,5 +883,73 @@ mod tests {
         for answer in [Some(""), Some("n"), Some("yep"), Some("\n"), None] {
             assert_eq!(interpret(answer), Confirmation::Declined, "{answer:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod log_directory_tests {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use super::prepared_log_directory;
+
+    fn uid_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    #[test]
+    fn an_absent_log_directory_is_made_for_its_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Library/Logs/Svalnir");
+        let uid: u32 = uid_of(root.path());
+        prepared_log_directory(&path, uid).unwrap();
+        let mode: u32 = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A second call keeps the directory and its content.
+        std::fs::write(path.join("agent.log"), b"kept").unwrap();
+        prepared_log_directory(&path, uid).unwrap();
+        assert_eq!(std::fs::read(path.join("agent.log")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn a_log_directory_that_is_not_writable_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let uid: u32 = uid_of(root.path());
+        let path = root.path().join("Svalnir");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = prepared_log_directory(&path, uid).unwrap_err();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.contains("cannot write"), "{refused}");
+        // A directory of a different owner is refused.
+        let other = prepared_log_directory(&path, uid.wrapping_add(1)).unwrap_err();
+        assert!(other.contains("does not own"), "{other}");
+    }
+
+    #[test]
+    fn a_file_or_a_symbolic_link_at_the_log_path_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let uid: u32 = uid_of(root.path());
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(prepared_log_directory(&file, uid).is_err());
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = prepared_log_directory(&link, uid).unwrap_err();
+        assert!(refused.contains("not a directory"), "{refused}");
+    }
+
+    #[test]
+    fn a_log_directory_below_a_parent_that_is_not_writable_is_not_made() {
+        let root = tempfile::tempdir().unwrap();
+        let uid: u32 = uid_of(root.path());
+        let parent = root.path().join("Logs");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = prepared_log_directory(&parent.join("Svalnir"), uid);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("was not made"), "{refused}");
     }
 }

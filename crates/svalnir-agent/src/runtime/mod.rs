@@ -128,6 +128,7 @@ mod driver;
 #[cfg(target_os = "macos")]
 pub mod host;
 pub mod launch_agent;
+pub mod log_file;
 mod ports;
 mod record;
 mod service;

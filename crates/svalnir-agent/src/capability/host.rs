@@ -819,7 +819,7 @@ mod tests {
             program: PathBuf::from("/opt/svalnir/bin/svalnir-agent"),
             state_directory: PathBuf::from("/Users/example/state"),
             config: None,
-            log: PathBuf::from("/Users/example/state/agent.log"),
+            log: crate::runtime::launch_agent::agent_log_path(Path::new("/Users/example")),
         })
         .unwrap();
         let label: &str = text

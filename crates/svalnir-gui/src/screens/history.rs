@@ -373,6 +373,12 @@ impl HistoryScreen {
         }
     }
 
+    /// Opens the detail of the operation `operation` below its row.
+    pub fn show_detail(&mut self, operation: &str, cx: &mut Context<Self>) {
+        self.view.selected = Some(operation.to_owned());
+        cx.notify();
+    }
+
     /// The filter, the sort order, and the selected operation.
     #[must_use]
     pub const fn view(&self) -> &HistoryView {

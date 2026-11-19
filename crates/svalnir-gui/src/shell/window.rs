@@ -322,6 +322,12 @@ impl MainWindow {
             .update(cx, |storage, cx| storage.set_layout(layout, cx));
     }
 
+    /// Opens the detail of the operation `operation` on History.
+    pub fn show_history_detail(&mut self, operation: &str, cx: &mut Context<Self>) {
+        self.history
+            .update(cx, |history, cx| history.show_detail(operation, cx));
+    }
+
     /// Shows `screen`.
     pub fn select(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if self.active != screen {

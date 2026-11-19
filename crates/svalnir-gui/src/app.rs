@@ -54,6 +54,10 @@ Options:
   --actions NAME       With --fixture only: the answer of each action
                        (accept, refuse, unavailable, pending). The fixture
                        writes nothing
+  --detail OPERATION   With --fixture only: open the detail of the
+                       operation OPERATION on History
+  --open-stop          With --fixture only: open the stop confirmation of
+                       the first group that the catalog does not protect
   --help               Print this text
 ";
 
@@ -79,6 +83,10 @@ impl ForcedAppearance {
 
 /// The options of one launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent flag for each launch option"
+)]
 pub struct LaunchOptions {
     /// The fixture scenario; `None` selects the live source.
     pub fixture: Option<FixtureScenario>,
@@ -105,6 +113,11 @@ pub struct LaunchOptions {
     /// The answer of each action of a fixture; `None` is the answer of
     /// the scenario.
     pub actions: Option<ActionScript>,
+    /// The operation whose History detail opens at launch.
+    pub detail: Option<String>,
+    /// Whether the stop confirmation of the first group that the catalog
+    /// does not protect opens at launch.
+    pub open_stop: bool,
     /// Whether `--help` was given.
     pub help: bool,
 }
@@ -235,6 +248,13 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                     format!("unknown actions `{name}`; use accept, refuse, unavailable, or pending")
                 })?);
             }
+            "--detail" => {
+                options.detail = Some(
+                    args.next()
+                        .ok_or_else(|| "`--detail` needs an operation".to_owned())?,
+                );
+            }
+            "--open-stop" => options.open_stop = true,
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -248,7 +268,44 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
     if options.actions.is_some() && options.fixture.is_none() {
         return Err("`--actions` is valid only with `--fixture`".to_owned());
     }
+    if options.detail.is_some() && options.fixture.is_none() {
+        return Err("`--detail` is valid only with `--fixture`".to_owned());
+    }
+    if options.open_stop && options.fixture.is_none() {
+        return Err("`--open-stop` is valid only with `--fixture`".to_owned());
+    }
     Ok(options)
+}
+
+/// Opens the stop confirmation of the first group of the fixture
+/// `scenario` that the catalog does not protect, for a screenshot of the
+/// dialog. The fixture path records nothing.
+fn open_fixture_stop(
+    handle: AnyWindowHandle,
+    view: &Entity<MainWindow>,
+    scenario: FixtureScenario,
+    cx: &mut App,
+) {
+    let group = FixtureSource::new(scenario)
+        .processes()
+        .ok()
+        .and_then(|processes| {
+            processes
+                .applications
+                .into_iter()
+                .find(|row| row.protection == crate::data::records::Protection::NotProtected)
+        });
+    let Some(group) = group else {
+        tracing::error!("the fixture has no group that the catalog does not protect");
+        return;
+    };
+    let model: Entity<AppModel> = view.read(cx).model().clone();
+    let opened = handle.update(cx, |_, window, cx| {
+        crate::screens::controls::open_stop(&model, &group.instance, &group.name, window, cx);
+    });
+    if let Err(error) = opened {
+        tracing::error!(%error, "cannot open the stop confirmation");
+    }
 }
 
 /// The most readings that `--readings` takes.
@@ -351,14 +408,14 @@ pub fn run() -> ExitCode {
                 .size
                 .map_or(DEFAULT_SIZE, |(w, h)| (f32::from(w), f32::from(h)));
             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-            let view = match open_main_window_seeded(
+            let (handle, view) = match open_main_window_seeded(
                 bounds,
                 source,
                 options.appearance,
                 options.readings.unwrap_or(0),
                 cx,
             ) {
-                Ok((_, view)) => view,
+                Ok((handle, view)) => (handle, view),
                 Err(error) => {
                     tracing::error!(%error, "cannot open the main window");
                     cx.quit();
@@ -378,6 +435,12 @@ pub fn run() -> ExitCode {
             }
             if let Some(target) = options.focus {
                 request_launch_focus(target, cx);
+            }
+            if let Some(operation) = &options.detail {
+                view.update(cx, |view, cx| view.show_history_detail(operation, cx));
+            }
+            if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
+                open_fixture_stop(handle, &view, scenario, cx);
             }
             if let Some(root) = &options.scan {
                 let model: Entity<AppModel> = view.read(cx).model().clone();
@@ -400,6 +463,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<LaunchOptions, String> {
         parse_args(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    #[test]
+    fn the_launch_dialogs_need_a_fixture() {
+        assert!(parse(&["--detail", "op-1"]).is_err());
+        assert!(parse(&["--open-stop"]).is_err());
+        assert!(parse(&["--fixture", "healthy", "--detail"]).is_err());
+        assert_eq!(
+            parse(&["--fixture", "healthy", "--open-stop"]).map(|o| o.open_stop),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -432,6 +506,9 @@ mod tests {
             "dial",
             "--actions",
             "refuse",
+            "--detail",
+            "op-1",
+            "--open-stop",
             "--help",
         ]);
         assert_eq!(
@@ -449,6 +526,8 @@ mod tests {
                 sidebar_narrow: Some(true),
                 focus: Some(FocusTarget::Dial),
                 actions: Some(ActionScript::Refuse),
+                detail: Some("op-1".to_owned()),
+                open_stop: true,
                 help: true,
             })
         );

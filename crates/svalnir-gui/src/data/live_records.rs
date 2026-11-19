@@ -976,12 +976,14 @@ fn agent_row(status: &AgentStatus) -> AgentStatusRow {
 
 /// Runs the capability probes and reads the records of the service.
 pub(super) fn diagnostics(state_directory: Option<&Path>) -> DiagnosticsSnapshot {
-    // The report has no role for a window. A window is a client process, as
-    // the CLI is, so the probes run with the role of the CLI.
-    // TODO(npochaev): use `WorkerRole::Window` when `svalnir-agent` adds it,
-    // so that the scope note and the Full Disk Access remediation name the
-    // application and not the terminal.
-    let report = capability::diagnose(WorkerRole::Cli);
+    // The probes run with the role of a window, so that the scope note and
+    // the Full Disk Access remediation name the application and not the
+    // terminal. With a known state directory, the probes examine that
+    // directory and not the default one.
+    let report = match state_directory {
+        Some(directory) => capability::diagnose_in(WorkerRole::Window, directory),
+        None => capability::diagnose(WorkerRole::Window),
+    };
     let capabilities: Vec<CapabilityRow> = report
         .capabilities
         .iter()

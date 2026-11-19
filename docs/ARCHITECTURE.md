@@ -318,7 +318,7 @@ Structured stdout contains only the versioned machine-readable result or stream.
 
 GPUI views consume immutable snapshots and asynchronous updates. Native collection, scans, and IPC waits run away from the rendering thread. Reconnection refreshes state after sequence gaps. Accessibility labels, keyboard operation, and unavailable/loading/error states are part of the client contract.
 
-Neither client invents successful completion from a dispatched request. History and notifications describe observed outcomes, including partial completion and force escalation. The agent posts the system notifications, so they do not need an open window (owner decision of 2026-11-19); in the current build the GPUI client posts them while it runs.
+Neither client invents successful completion from a dispatched request. History and notifications describe observed outcomes, including partial completion and force escalation. The agent posts the system notifications, so they do not need an open window (owner decision of 2026-11-19); in the current build the GPUI client posts none, and the agent has a notification port with a rate gate and a bounded queue but no native notification center, so no system notification is posted ([INTERFACES.md](INTERFACES.md) section 4).
 
 ## 14. Lifecycle, packaging, and upgrades
 

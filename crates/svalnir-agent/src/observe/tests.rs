@@ -289,7 +289,7 @@ fn a_journal_with_no_record_gives_absent_records_and_no_pause() {
     let pause = reading.pause.recorded().unwrap();
     assert_eq!(pause.status, PauseStatus::NotPaused);
     assert_eq!(pause.agent_step, None);
-    assert!(pause.unknown.is_empty());
+    assert_eq!(pause.unknown, Vec::new());
 }
 
 #[test]
@@ -484,7 +484,7 @@ fn the_pause_is_decided_on_the_monotonic_clock_of_its_boot() {
             basis: PauseBasis::Monotonic,
         }
     );
-    assert!(pause.unknown.is_empty());
+    assert_eq!(pause.unknown, Vec::new());
 
     // At the end, the pause is expired, and the reading cannot know whether
     // the agent has a newer measurement.

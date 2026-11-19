@@ -294,7 +294,7 @@ fn state_card(
             }
             body = body.child(caption(
                 "automation-control-note",
-                "A change goes to the agent through the operation journal. With no agent, the window refuses the change and writes nothing. A pause stops new automatic interventions; it does not stop an admitted operation.",
+                "A change goes to the agent through the operation journal. With no agent, the window writes a pause, a resume, or an enable or disable to the authority record directly, as the command-line client does, and refuses a rearm. A pause stops new automatic interventions; it does not stop an admitted operation.",
                 tokens,
             ));
             body.into_any_element()

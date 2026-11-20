@@ -1184,6 +1184,21 @@ mod host {
         let result = &shown.envelope()["result"];
         assert_eq!(result["identity"]["pid"], own_pid);
         assert_eq!(result["policy_eligibility"]["evaluated"], false);
+        // The context of the test process: its working directory, with the
+        // tagged path encoding. `processes top` does not read the context.
+        let directory = &result["context"]["working_directory"];
+        assert_eq!(directory["availability"], "available", "{directory}");
+        assert_eq!(directory["value"]["encoding"], "utf8");
+        let reported = std::path::PathBuf::from(directory["value"]["value"].as_str().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(reported).unwrap(),
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
+        );
+        assert_eq!(
+            result["context"]["listening_tcp_ports"]["availability"],
+            "available"
+        );
+        assert!(!own.to_string().contains("working_directory"));
 
         // A generation that does not exist: PID 1 is not of this user.
         let gone = svalnir(&[

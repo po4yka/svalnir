@@ -13,12 +13,22 @@
 //! so each invocation resolves the ID against a new snapshot: the ID resolves
 //! while that generation runs and gives `target_not_found` after it exits.
 //! A target ID is never permission to act on the process.
+//!
+//! # Context
+//!
+//! `processes show` also reads the working directory and the listening TCP
+//! ports of the target generation, as evidence for a person before a stop
+//! (`docs/RESOURCE_MODEL.md` section 11). They are not policy inputs and do
+//! not establish membership in an application group. `processes top` does
+//! not read them.
 
 use serde::Serialize;
 use svalnir_agent::platform::process::{
-    DerivedMetrics, ForegroundState, Omissions, ProcessRecord, ProcessSnapshot, RankMetric,
-    RankValue, Ranking, rank_processes,
+    AddressFamily, DEFAULT_MAX_DESCRIPTORS, DEFAULT_MAX_PORTS, DerivedMetrics, ForegroundState,
+    ListeningPort, ListeningPorts, Omissions, ProcessContext, ProcessRecord, ProcessSnapshot,
+    RankMetric, RankValue, Ranking, rank_processes,
 };
+use svalnir_core::file::LosslessPath;
 use svalnir_core::id::{ApplicationInstanceId, ProcessGenerationId};
 use svalnir_core::observation::{Observation, Reading};
 use svalnir_core::process::{Pid, ProcessAssociation, ProcessIdentity, Uid, VerifiedMembership};
@@ -44,6 +54,9 @@ const DERIVED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The statement about target IDs in each result.
 const TARGET_NOTE: &str = "A target ID names one process generation (PID and start time). No server holds identity evidence, so each invocation resolves the ID against a new snapshot. A target ID is not permission to act on the process.";
+
+/// The statement about the context in `processes show`.
+const CONTEXT_NOTE: &str = "The working directory and the listening ports are evidence for a person before a stop. They are not policy inputs, and they do not establish membership in an application group.";
 
 /// The statement about policy eligibility in `processes show`.
 const ELIGIBILITY_NOTE: &str =
@@ -416,12 +429,52 @@ pub(crate) struct ShowView {
     executable_unavailable: Option<String>,
     foreground: &'static str,
     metrics: MetricsView,
+    context: ContextView,
     application: Option<ApplicationView>,
     policy_eligibility: EligibilityView,
 }
 
+/// The context of the target generation.
+#[derive(Debug, Clone, Serialize)]
+struct ContextView {
+    /// The reason the collector made no context sample, for example a clock
+    /// with no value. Then the two observations are `null`.
+    not_collected: Option<String>,
+    /// `process.working_directory`, with the tagged path encoding.
+    working_directory: Option<Observation<LosslessPath>>,
+    /// `process.listening_tcp_ports`.
+    listening_tcp_ports: Option<Observation<ListeningPorts>>,
+    /// The ceiling on the file descriptors examined.
+    max_descriptors: usize,
+    /// The ceiling on the ports reported.
+    max_ports: usize,
+    note: &'static str,
+}
+
+/// The text of one listening port: the address, the port, and the family of
+/// a wildcard bind.
+fn port_text(port: &ListeningPort) -> String {
+    let family: &str = match port.family {
+        AddressFamily::Ipv4 => "IPv4",
+        AddressFamily::Ipv6 => "IPv6",
+    };
+    let endpoint: String = match port.address {
+        std::net::IpAddr::V4(address) => format!("{address}:{}", port.port),
+        std::net::IpAddr::V6(address) => format!("[{address}]:{}", port.port),
+    };
+    if port.wildcard {
+        format!("{endpoint} (each {family} address)")
+    } else {
+        format!("{endpoint} ({family})")
+    }
+}
+
 impl ShowView {
-    pub(crate) fn new(snapshot: &ProcessSnapshot, record: &ProcessRecord) -> Self {
+    pub(crate) fn new(
+        snapshot: &ProcessSnapshot,
+        record: &ProcessRecord,
+        context: Result<ProcessContext, String>,
+    ) -> Self {
         let application: Option<ApplicationView> =
             match record.identity.association.verified_membership() {
                 Some(
@@ -450,6 +503,17 @@ impl ShowView {
                 disk_read: record.metrics.disk_read.clone(),
                 disk_written: record.metrics.disk_written.clone(),
             },
+            context: ContextView {
+                not_collected: context.as_ref().err().cloned(),
+                working_directory: context
+                    .as_ref()
+                    .ok()
+                    .map(|context| context.working_directory.clone()),
+                listening_tcp_ports: context.ok().map(|context| context.listening_ports),
+                max_descriptors: DEFAULT_MAX_DESCRIPTORS,
+                max_ports: DEFAULT_MAX_PORTS,
+                note: CONTEXT_NOTE,
+            },
             application,
             policy_eligibility: EligibilityView {
                 evaluated: false,
@@ -463,6 +527,7 @@ impl ShowView {
         put_line!(out, "Target {}, at {}", self.target_id, self.captured_at);
         self.render_identity(&mut out);
         self.render_measurements(&mut out);
+        self.render_context(&mut out);
         if let Some(application) = &self.application {
             out.push_str("Application instance\n");
             field(&mut out, "Instance", 14, application.instance_id.as_str());
@@ -572,6 +637,46 @@ impl ShowView {
             "  Footprint and resident size are different quantities. A large footprint alone is not a reason to stop a process.\n",
         );
     }
+
+    fn render_context(&self, out: &mut String) {
+        out.push_str("Context\n");
+        let context: &ContextView = &self.context;
+        let (Some(working_directory), Some(listening_tcp_ports)) =
+            (&context.working_directory, &context.listening_tcp_ports)
+        else {
+            let reason: &str = context.not_collected.as_deref().unwrap_or("unknown");
+            field(out, "Not collected", 14, &escape(reason));
+            put_line!(out, "  {CONTEXT_NOTE}");
+            return;
+        };
+        field(
+            out,
+            "Directory",
+            14,
+            &observed(working_directory, LosslessPath::display_label),
+        );
+        let ports: Vec<String> = match listening_tcp_ports.value() {
+            None => vec![unavailable(&listening_tcp_ports.reading)],
+            Some(set) => {
+                let mut lines: Vec<String> = set.ports.iter().map(port_text).collect();
+                if lines.is_empty() {
+                    lines.push("none".to_owned());
+                }
+                if set.truncated {
+                    lines.push(format!(
+                        "truncated: the ceiling of {} descriptors or {} ports was reached",
+                        context.max_descriptors, context.max_ports
+                    ));
+                }
+                lines
+            }
+        };
+        for (index, line) in ports.iter().enumerate() {
+            let label: &str = if index == 0 { "Listening TCP" } else { "" };
+            field(out, label, 14, line);
+        }
+        put_line!(out, "  {CONTEXT_NOTE}");
+    }
 }
 
 /// Parses the `--target` value.
@@ -657,6 +762,41 @@ fn collect(
     Err(crate::host::unsupported_platform("processes"))
 }
 
+/// Reads the process inventory one time and the context of the target
+/// generation in it.
+#[cfg(target_os = "macos")]
+fn collect_with_context(
+    target: &str,
+) -> Result<(ProcessSnapshot, Result<ProcessContext, String>), ErrorBody> {
+    use svalnir_agent::platform::process::ContextLimits;
+
+    use crate::host::{Host, collector_unavailable};
+
+    let host: Host = Host::open()?;
+    let collector = host.process_collector()?;
+    let snapshot: ProcessSnapshot = collector
+        .collect()
+        .map_err(|error| collector_unavailable(&error.to_string()))?;
+    let record: &ProcessRecord = find_target(&snapshot, target)?;
+    let limits = ContextLimits {
+        max_descriptors: DEFAULT_MAX_DESCRIPTORS,
+        max_ports: DEFAULT_MAX_PORTS,
+    };
+    // The context is optional: a failure to make its sample leaves the
+    // identity and the measurements of the result.
+    let context: Result<ProcessContext, String> = collector
+        .collect_context(&record.identity, limits)
+        .map_err(|error| error.to_string());
+    Ok((snapshot, context))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect_with_context(
+    _target: &str,
+) -> Result<(ProcessSnapshot, Result<ProcessContext, String>), ErrorBody> {
+    Err(crate::host::unsupported_platform("processes"))
+}
+
 /// Reads the process inventory one time, for a stop request.
 pub(crate) fn collect_snapshot() -> Result<ProcessSnapshot, ErrorBody> {
     collect(false).map(|(snapshot, _, _)| snapshot)
@@ -682,9 +822,9 @@ pub(crate) fn show(
 ) -> Result<ExitStatus, CommandFailure> {
     // The target text is checked before the inventory is read.
     parse_target(&arguments.target)?;
-    let (snapshot, _, _) = collect(false)?;
+    let (snapshot, context) = collect_with_context(&arguments.target)?;
     let record: &ProcessRecord = find_target(&snapshot, &arguments.target)?;
-    let view = ShowView::new(&snapshot, record);
+    let view = ShowView::new(&snapshot, record, context);
     invocation.emit(Kind::Snapshot, &view, ShowView::render)?;
     Ok(ExitStatus::Success)
 }
@@ -719,7 +859,7 @@ mod tests {
     use super::{ShowView, TopView, find_target};
     use crate::cli::ProcessSort;
     use crate::output::{ErrorFamily, ExitStatus};
-    use crate::test_support::process_snapshot;
+    use crate::test_support::{process_context, process_snapshot};
 
     #[test]
     fn top_orders_by_footprint_and_keeps_an_unavailable_value_last() {
@@ -823,7 +963,7 @@ mod tests {
     fn show_explains_the_target_and_does_not_evaluate_eligibility() {
         let snapshot = process_snapshot();
         let record = find_target(&snapshot, "pg-200-1700000000000000").unwrap();
-        let view = ShowView::new(&snapshot, record);
+        let view = ShowView::new(&snapshot, record, Ok(process_context()));
         let text = view.render();
         assert!(
             text.starts_with("Target pg-200-1700000000000000, at "),
@@ -856,7 +996,7 @@ mod tests {
         snapshot.records[0].metrics.footprint.reading =
             Reading::Unavailable(UnavailableReason::ResourceGone);
         let record = find_target(&snapshot, "pg-200-1700000000000000").unwrap();
-        let text = ShowView::new(&snapshot, record).render();
+        let text = ShowView::new(&snapshot, record, Ok(process_context())).render();
         assert!(
             text.contains("Footprint       unavailable (resource_gone)"),
             "{text}"
@@ -864,6 +1004,123 @@ mod tests {
         assert!(
             text.contains("a lower bound: 1 members have no value"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn show_prints_the_working_directory_and_the_listening_ports() {
+        let snapshot = process_snapshot();
+        let record = find_target(&snapshot, "pg-200-1700000000000000").unwrap();
+        let text = ShowView::new(&snapshot, record, Ok(process_context())).render();
+        assert!(text.contains("Context\n"), "{text}");
+        // A path that is not valid UTF-8 has an escaped display label.
+        assert!(text.contains("Directory       /Users/u/caf\\xe9"), "{text}");
+        assert!(
+            text.contains("Listening TCP   127.0.0.1:5173 (IPv4)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("                [::]:8080 (each IPv6 address)"),
+            "{text}"
+        );
+        assert!(text.contains("They are not policy inputs"), "{text}");
+    }
+
+    #[test]
+    fn show_json_has_the_context_observations_with_the_tagged_path() {
+        let snapshot = process_snapshot();
+        let record = find_target(&snapshot, "pg-200-1700000000000000").unwrap();
+        let json =
+            serde_json::to_value(ShowView::new(&snapshot, record, Ok(process_context()))).unwrap();
+        let context = &json["context"];
+        let directory = &context["working_directory"];
+        assert_eq!(directory["metric_id"], "process.working_directory");
+        assert_eq!(directory["unit"], "path");
+        assert_eq!(directory["availability"], "available");
+        assert_eq!(
+            directory["value"],
+            serde_json::json!({"encoding": "hex", "value": "2f55736572732f752f636166e9"})
+        );
+        assert_eq!(directory["scope"]["kind"], "process");
+        let ports = &context["listening_tcp_ports"];
+        assert_eq!(ports["metric_id"], "process.listening_tcp_ports");
+        assert_eq!(ports["unit"], "endpoint");
+        assert_eq!(ports["coverage"], "complete");
+        assert_eq!(
+            ports["value"],
+            serde_json::json!({
+                "ports": [
+                    {"family": "ipv4", "address": "127.0.0.1", "port": 5173, "wildcard": false},
+                    {"family": "ipv6", "address": "::", "port": 8080, "wildcard": true}
+                ],
+                "truncated": false
+            })
+        );
+        assert_eq!(context["max_descriptors"], 4096);
+        assert_eq!(context["max_ports"], 64);
+        // No remote address is in the output.
+        let text = context.to_string();
+        assert!(
+            !text.contains("remote") && !text.contains("foreign"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn show_says_why_the_context_is_unavailable_or_truncated() {
+        let snapshot = process_snapshot();
+        let record = find_target(&snapshot, "pg-200-1700000000000000").unwrap();
+        let mut context = process_context();
+        context.working_directory.reading =
+            Reading::Unavailable(UnavailableReason::IdentityChanged);
+        if let Reading::Available(ports) = &mut context.listening_ports.reading {
+            ports.truncated = true;
+        }
+        let view = ShowView::new(&snapshot, record, Ok(context.clone()));
+        let text = view.render();
+        assert!(
+            text.contains("Directory       unavailable (identity_changed)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("truncated: the ceiling of 4096 descriptors or 64 ports was reached"),
+            "{text}"
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json["context"]["working_directory"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            json["context"]["working_directory"]["reason"],
+            "identity_changed"
+        );
+
+        context.listening_ports.reading = Reading::Unavailable(UnavailableReason::PermissionDenied);
+        let text = ShowView::new(&snapshot, record, Ok(context)).render();
+        assert!(
+            text.contains("Listening TCP   unavailable (permission_denied)"),
+            "{text}"
+        );
+        assert!(!text.contains("none"), "{text}");
+    }
+
+    #[test]
+    fn a_context_with_no_sample_keeps_the_rest_of_show() {
+        let snapshot = process_snapshot();
+        let record = find_target(&snapshot, "pg-200-1700000000000000").unwrap();
+        let view = ShowView::new(&snapshot, record, Err("a clock gave no value".to_owned()));
+        let text = view.render();
+        assert!(text.contains("Footprint       3.0 GiB"), "{text}");
+        assert!(
+            text.contains("Not collected   a clock gave no value"),
+            "{text}"
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["context"]["not_collected"], "a clock gave no value");
+        assert_eq!(
+            json["context"]["working_directory"],
+            serde_json::Value::Null
         );
     }
 

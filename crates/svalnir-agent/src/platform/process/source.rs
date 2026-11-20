@@ -5,6 +5,8 @@
 //! implementation is in `native.rs`. A test gives a synthetic implementation,
 //! so the identity and attribution logic runs with no live process.
 
+use std::net::IpAddr;
+
 use svalnir_core::file::{FileObjectEvidence, LosslessPath};
 use svalnir_core::observation::UnavailableReason;
 use svalnir_core::process::{Pid, ProcessStartTime, Uid};
@@ -135,6 +137,42 @@ pub struct RunningApplication {
     pub terminated: bool,
 }
 
+/// The address family of a socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SocketFamily {
+    /// `AF_INET`.
+    Ipv4,
+    /// `AF_INET6`. A socket of this family can also accept IPv4
+    /// connections unless it has `IPV6_V6ONLY`.
+    Ipv6,
+}
+
+/// One TCP socket in the listening state, as the kernel reports it for one
+/// file descriptor of a process.
+///
+/// The record has the local endpoint only. The adapter reads no remote
+/// address and reports no connected socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RawListeningSocket {
+    /// The address family of the socket.
+    pub family: SocketFamily,
+    /// The local (bind) address. An unspecified address is a wildcard bind.
+    pub address: IpAddr,
+    /// The local port, in host byte order.
+    pub port: u16,
+}
+
+/// The listening TCP sockets of one process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawListeningSockets {
+    /// The listening sockets of the examined descriptors, in descriptor
+    /// order. Two descriptors can refer to one socket.
+    pub sockets: Vec<RawListeningSocket>,
+    /// The process has more file descriptors than the ceiling, so the
+    /// descriptors after the ceiling were not examined.
+    pub descriptors_truncated: bool,
+}
+
 /// The native queries that the inventory uses.
 ///
 /// Each method addresses a process by its PID, because the native API does.
@@ -237,6 +275,38 @@ pub trait ProcessSource {
     ///
     /// Returns a [`QueryFailure`] when the clock gives no valid value.
     fn wall_now(&self) -> Result<WallTime, QueryFailure>;
+
+    /// The current working directory of the process that has this PID now.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the process does not exist, the query
+    /// is denied, or the source does not supply the query.
+    fn working_directory(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
+        let _ = pid;
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The TCP sockets in the listening state that the process that has this
+    /// PID holds now, from at most `max_descriptors` of its file
+    /// descriptors.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the process does not exist, the query
+    /// is denied, or the source does not supply the query.
+    fn listening_tcp_sockets(
+        &self,
+        pid: Pid,
+        max_descriptors: usize,
+    ) -> Result<RawListeningSockets, QueryFailure> {
+        let _ = (pid, max_descriptors);
+        Err(QueryFailure::Unsupported)
+    }
 }
 
 #[cfg(test)]

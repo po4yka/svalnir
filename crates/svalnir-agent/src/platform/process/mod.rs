@@ -15,6 +15,7 @@
 //! | [`footprint_growth`], [`cpu_usage`], [`derive_between`] | Pure functions over injected samples |
 //! | [`rank_processes`] | The order for `processes top` |
 //! | [`application_candidates`], [`control_plane`] | The instances of a snapshot as candidates of a memory-guard evaluation, with their hard protection |
+//! | [`ProcessCollector::collect_context`] | The working directory and the listening TCP ports of one process generation, on request, for a person; not a policy input |
 //!
 //! # Identity
 //!
@@ -47,6 +48,7 @@
 //! through `ProcessAssociation::verified_membership`.
 
 mod candidates;
+mod context;
 mod derived;
 mod inventory;
 #[cfg(target_os = "macos")]
@@ -54,6 +56,11 @@ mod native;
 mod rank;
 mod source;
 
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod context_smoke_tests;
+#[cfg(test)]
+mod context_tests;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
@@ -65,6 +72,11 @@ mod tests;
 pub use candidates::{
     MAX_CONTROL_PLANE_ANCESTORS, application_candidates, control_plane,
     control_plane_of_this_process, instance_count,
+};
+pub use context::{
+    AddressFamily, ContextLimits, DEFAULT_MAX_DESCRIPTORS, DEFAULT_MAX_PORTS,
+    LISTENING_TCP_PORTS_METRIC, ListeningPort, ListeningPorts, ProcessContext,
+    WORKING_DIRECTORY_METRIC,
 };
 pub use derived::{
     CpuSample, CpuUsage, DerivedMetrics, DerivedUnavailable, FootprintGrowth, FootprintSample,
@@ -79,7 +91,8 @@ pub use inventory::{
 pub use native::DarwinProcessSource;
 pub use rank::{RankMetric, RankValue, RankedProcess, Ranking, rank_processes};
 pub use source::{
-    ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication, Timebase,
+    ProcessSource, QueryFailure, RawListeningSocket, RawListeningSockets, RawProcessInfo, RawUsage,
+    RunningApplication, SocketFamily, Timebase,
 };
 
 #[cfg(target_os = "macos")]

@@ -16,7 +16,8 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::inventory::{CollectionContext, ProcessCollector};
 use super::source::{
-    ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication, Timebase,
+    ProcessSource, QueryFailure, RawListeningSockets, RawProcessInfo, RawUsage, RunningApplication,
+    Timebase,
 };
 
 pub(super) const USER: u32 = 501;
@@ -93,6 +94,12 @@ pub(super) struct FakeSource {
     pub(super) list_current: bool,
     /// The failure of the file evidence query of a path.
     pub(super) file_failures: BTreeMap<Vec<u8>, QueryFailure>,
+    /// The working directory of each PID.
+    pub(super) directories: BTreeMap<Pid, Result<LosslessPath, QueryFailure>>,
+    /// The listening sockets of each PID.
+    pub(super) sockets: BTreeMap<Pid, Result<RawListeningSockets, QueryFailure>>,
+    /// The `max_descriptors` argument of each socket query, in call order.
+    pub(super) socket_ceilings: RefCell<Vec<usize>>,
 }
 
 impl FakeSource {
@@ -114,6 +121,9 @@ impl FakeSource {
             sleep_queries: Cell::new(0),
             list_current: true,
             file_failures: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            sockets: BTreeMap::new(),
+            socket_ceilings: RefCell::new(Vec::new()),
         }
     }
 
@@ -267,5 +277,24 @@ impl ProcessSource for FakeSource {
 
     fn wall_now(&self) -> Result<WallTime, QueryFailure> {
         WallTime::from_unix(1_794_830_400, 0).map_err(|_| QueryFailure::Inconsistent)
+    }
+
+    fn working_directory(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
+        self.directories
+            .get(&pid)
+            .cloned()
+            .unwrap_or(Err(QueryFailure::Gone))
+    }
+
+    fn listening_tcp_sockets(
+        &self,
+        pid: Pid,
+        max_descriptors: usize,
+    ) -> Result<RawListeningSockets, QueryFailure> {
+        self.socket_ceilings.borrow_mut().push(max_descriptors);
+        self.sockets
+            .get(&pid)
+            .cloned()
+            .unwrap_or(Err(QueryFailure::Gone))
     }
 }

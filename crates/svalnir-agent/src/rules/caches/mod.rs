@@ -48,6 +48,7 @@ use svalnir_core::rule::{
 };
 
 pub use config::{ConfigFormat, ConfigProblem, ConfigSource, MAX_CONFIG_BYTES};
+pub(in crate::rules) use inspect::measure_unit;
 pub use inspect::{
     CacheInspection, CacheMeasurement, CacheRootReport, CacheUnitReport, InspectionHost,
     InspectionLimits, ReclaimFigure, RootOutcome, RootResolution, UnitOutcome, resolve,
@@ -169,6 +170,9 @@ pub enum ReclaimBasis {
     /// cache file whose content a project still has reclaims nothing for
     /// it (`docs/CLEANUP_RULES.md` section 12).
     LinkedIntoProjects,
+    /// No figure: the producer makes copies with APFS clones, which share
+    /// their blocks with the source, as `simctl clone` does for a device.
+    ClonedStorage,
 }
 
 /// The reviewed facts of one cache rule.

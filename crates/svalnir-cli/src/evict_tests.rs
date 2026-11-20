@@ -220,7 +220,7 @@ fn a_rule_of_the_build_is_proposed_and_the_evict_mode_is_refused() {
 }
 
 #[test]
-fn the_evict_mode_refuses_each_cache_rule_also_with_a_fixture_lifecycle() {
+fn the_evict_mode_refuses_each_inspection_rule_also_with_a_fixture_lifecycle() {
     // The registry of this world gives the other rules a state that is
     // validated for manual eviction. A cache rule has the inspection mode
     // only, so it keeps its `proposed` state.
@@ -245,6 +245,16 @@ fn the_evict_mode_refuses_each_cache_rule_also_with_a_fixture_lifecycle() {
         "uv.cache",
         "homebrew.download-cache",
         "cocoapods.cache",
+        // The rule of the project dependency directories has the
+        // inspection mode only too.
+        "project.dependency-directory",
+        // The rules of the owner tools.
+        "simulator.devices",
+        "container.build-cache",
+        "homebrew.cleanup",
+        // The rule of the linked Git worktrees is manual only by its
+        // specification and has the inspection mode only.
+        "git.linked-worktree",
     ] {
         let outcome = json(
             &world.environment,

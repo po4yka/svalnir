@@ -1,4 +1,6 @@
-//! A reader for the `info.plist` of a `DerivedData` project directory.
+//! A reader for an XML property list whose root is a dictionary of scalar
+//! values: the `info.plist` of a `DerivedData` project directory and the
+//! `device.plist` of a simulator device.
 //!
 //! The reader accepts one form only: an XML property list whose root is a
 //! dictionary with scalar values. A binary property list, a nested
@@ -73,10 +75,12 @@ fn scalar(text: &str) -> Option<(&'static str, &str, &str)> {
         .find_map(|name| element(text, name).map(|(content, rest)| (name, content, rest)))
 }
 
-/// Reads `WorkspacePath` and `LastAccessedDate` from the bytes of an
-/// `info.plist`. `None` when the file does not have the accepted form or
-/// does not have the two values one time each.
-pub(super) fn parse_project_info(bytes: &[u8]) -> Option<ProjectInfo> {
+/// The entries of the root dictionary of the XML property list `bytes`:
+/// each key with the element name of its value (`string`, `date`,
+/// `integer`, `real`, `data`, or `boolean`) and its decoded content.
+/// `None` when the file does not have the accepted form, has more than 64
+/// keys, or has a key two times.
+pub(super) fn parse_scalar_dictionary(bytes: &[u8]) -> Option<Vec<(String, &'static str, String)>> {
     let text: &str = std::str::from_utf8(bytes).ok()?;
     // Before the root: an XML declaration and a document type, each
     // optional, and white space.
@@ -93,9 +97,7 @@ pub(super) fn parse_project_info(bytes: &[u8]) -> Option<ProjectInfo> {
     }
     let after_tag: &str = attributes.get(attributes.find('>')?.checked_add(1)?..)?;
     let mut rest: &str = after_tag.trim_start().strip_prefix("<dict>")?;
-    let mut workspace_path: Option<PathBuf> = None;
-    let mut last_accessed: Option<WallTime> = None;
-    let mut keys: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, &'static str, String)> = Vec::new();
     loop {
         rest = rest.trim_start();
         if let Some(after_dict) = rest.strip_prefix("</dict>") {
@@ -107,21 +109,30 @@ pub(super) fn parse_project_info(bytes: &[u8]) -> Option<ProjectInfo> {
         }
         let (key, after_key) = element(rest, "key")?;
         let key: String = decode_entities(key)?;
-        if keys.len() >= MAX_KEYS || keys.contains(&key) {
+        if entries.len() >= MAX_KEYS || entries.iter().any(|(known, _, _)| *known == key) {
             return None;
         }
         let (kind, content, after_value) = scalar(after_key.trim_start())?;
+        entries.push((key, kind, decode_entities(content)?));
+        rest = after_value;
+    }
+    Some(entries)
+}
+
+/// Reads `WorkspacePath` and `LastAccessedDate` from the bytes of an
+/// `info.plist`. `None` when the file does not have the accepted form or
+/// does not have the two values one time each.
+pub(super) fn parse_project_info(bytes: &[u8]) -> Option<ProjectInfo> {
+    let mut workspace_path: Option<PathBuf> = None;
+    let mut last_accessed: Option<WallTime> = None;
+    for (key, kind, content) in parse_scalar_dictionary(bytes)? {
         match (key.as_str(), kind) {
-            ("WorkspacePath", "string") => {
-                workspace_path = Some(PathBuf::from(decode_entities(content)?));
-            }
+            ("WorkspacePath", "string") => workspace_path = Some(PathBuf::from(content)),
             ("LastAccessedDate", "date") => last_accessed = Some(content.trim().parse().ok()?),
             // The two values have one type each.
             ("WorkspacePath" | "LastAccessedDate", _) => return None,
             _ => {}
         }
-        keys.push(key);
-        rest = after_value;
     }
     Some(ProjectInfo {
         workspace_path: workspace_path?,

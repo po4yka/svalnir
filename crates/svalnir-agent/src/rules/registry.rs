@@ -1,9 +1,12 @@
 //! The registry of the reviewed rules of this build.
 //!
 //! `docs/CLEANUP_RULES.md` sections 2 and 10 own the contract. The
-//! registry has the two rules of Milestone 2 and the six package and build
-//! cache rules of section 10, which have the inspection mode only
-//! ([`super::caches`]). Each layout of each rule is
+//! registry has the two rules of Milestone 2, the six package and build
+//! cache rules of section 10 ([`super::caches`]), and the rule of the
+//! project dependency directories ([`super::projects`]), and the three
+//! rules of the data that only its owner tool removes
+//! ([`super::owner_tools`]), and the rule of the linked Git worktrees
+//! ([`super::worktrees`]). The last eleven have the inspection mode only. Each layout of each rule is
 //! `proposed`, because no validation record under `docs/VALIDATION.md`
 //! exists for a rule. The registry has no function that changes a
 //! lifecycle state: a promotion is a new declaration with a reference to
@@ -19,6 +22,9 @@ use super::caches::{CacheRule, cache_rules};
 use super::expired_temporary::ExpiredTemporaryRule;
 use super::model::DiscoveredCandidate;
 use super::overlap::{OverlapResolution, resolve_overlaps};
+use super::owner_tools::OwnerToolRules;
+use super::projects::ProjectRule;
+use super::worktrees::WorktreeRule;
 use super::xcode::XcodeDerivedDataRule;
 
 /// The reason the registry cannot be made. Each case is a defect of a
@@ -84,6 +90,9 @@ pub struct ReviewedRules {
     expired_temporary: ExpiredTemporaryRule,
     xcode_derived_data: XcodeDerivedDataRule,
     caches: Vec<CacheRule>,
+    projects: ProjectRule,
+    owner_tools: OwnerToolRules,
+    worktrees: WorktreeRule,
 }
 
 impl ReviewedRules {
@@ -99,6 +108,9 @@ impl ReviewedRules {
             expired_temporary: ExpiredTemporaryRule::new()?,
             xcode_derived_data: XcodeDerivedDataRule::new()?,
             caches: cache_rules()?,
+            projects: ProjectRule::new()?,
+            owner_tools: OwnerToolRules::new()?,
+            worktrees: WorktreeRule::new()?,
         })
     }
 
@@ -112,9 +124,11 @@ impl ReviewedRules {
     /// test names no validation record of `docs/VALIDATION.md`; the test
     /// gives a reference that says so.
     ///
-    /// The cache rules keep the state of their declarations: their
-    /// implementation has the inspection mode only, so no state permits a
-    /// removal under one of them, also in a test build.
+    /// The cache rules, `project.dependency-directory`, the rules of
+    /// [`super::owner_tools`], and `git.linked-worktree` keep the state of
+    /// their declarations: their implementation has the inspection mode
+    /// only, so no state permits a removal under one of them, also in a
+    /// test build.
     ///
     /// # Errors
     ///
@@ -127,6 +141,9 @@ impl ReviewedRules {
             expired_temporary: registry.expired_temporary.with_lifecycle(lifecycle)?,
             xcode_derived_data: registry.xcode_derived_data.with_lifecycle(lifecycle)?,
             caches: registry.caches,
+            projects: registry.projects,
+            owner_tools: registry.owner_tools,
+            worktrees: registry.worktrees,
         })
     }
 
@@ -151,6 +168,24 @@ impl ReviewedRules {
         self.caches
             .iter()
             .find(|cache| cache.rule().reference.id.as_str() == id)
+    }
+
+    /// The rule `project.dependency-directory`. It has the inspection mode
+    /// only.
+    pub fn projects(&self) -> &ProjectRule {
+        &self.projects
+    }
+
+    /// The rules of the data that only its owner tool removes:
+    /// `simulator.devices`, `container.build-cache`, and
+    /// `homebrew.cleanup`. They have the inspection mode only.
+    pub fn owner_tools(&self) -> &OwnerToolRules {
+        &self.owner_tools
+    }
+
+    /// The rule `git.linked-worktree`. It has the inspection mode only.
+    pub fn worktrees(&self) -> &WorktreeRule {
+        &self.worktrees
     }
 
     /// The exact revision `reference`.
@@ -253,6 +288,9 @@ impl RuleRegistry for ReviewedRules {
             self.xcode_derived_data.rule(),
         ];
         rules.extend(self.caches.iter().map(CacheRule::rule));
+        rules.push(self.projects.rule());
+        rules.extend(self.owner_tools.rules());
+        rules.push(self.worktrees.rule());
         rules
     }
 }

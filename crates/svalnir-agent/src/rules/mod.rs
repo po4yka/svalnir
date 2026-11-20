@@ -63,17 +63,25 @@ mod expired_temporary;
 #[cfg(all(unix, any(test, all(feature = "test-support", debug_assertions))))]
 pub mod fixture;
 #[cfg(unix)]
+pub mod git;
+#[cfg(unix)]
 mod model;
 #[cfg(unix)]
 mod native;
 #[cfg(unix)]
 mod overlap;
 #[cfg(unix)]
+pub mod owner_tools;
+#[cfg(unix)]
 mod plist;
+#[cfg(unix)]
+pub mod projects;
 #[cfg(unix)]
 mod registry;
 #[cfg(unix)]
 mod unit;
+#[cfg(unix)]
+pub mod worktrees;
 #[cfg(unix)]
 mod xcode;
 

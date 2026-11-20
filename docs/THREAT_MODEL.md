@@ -243,7 +243,7 @@ Every area below starts **unverified**. A release record must identify the imple
 | Input and privacy review | T-09, T-12 | Fuzz bounded parsers; review unsafe/native boundaries; verify sanitized output, redacted exports, retention, and absence of default telemetry | VAL-10, VAL-13, VAL-14 (G-06, G-07) |
 | Release integrity | T-15 | Verify actual installed executable identities, writable-path resistance, service registration, compatibility, and migration behavior | VAL-16 (G-09) |
 
-Use temporary directories, disposable processes, injected observations, and controlled clocks. Privileged integration tests require an isolated macOS test environment. Tests must not clean a developer's real caches or terminate unrelated applications merely to demonstrate functionality.
+Use temporary directories, disposable processes, injected observations, and controlled clocks. Privileged integration tests require an isolated macOS test environment. Tests must not clean a developer's real caches or terminate unrelated applications merely to demonstrate functionality. The owner host procedure of [VALIDATION.md](VALIDATION.md) section 13 is not a test of this kind: it removes the output of a real producer for disposable projects only, in a dedicated user account, and only the project owner starts it.
 
 An adapter or native backend that has not passed its applicable gates may provide inspection and planning but must not enable automatic mutation. The first usable release still requires verified automatic cache eviction and force termination; leaving all intervention disabled does not satisfy the product scope.
 

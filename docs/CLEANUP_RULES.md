@@ -414,7 +414,7 @@ Each promoted revision needs a review record containing its sources, supported p
 
 A rule with a content allow-list, such as the children of a unit of `xcode.inactive-derived-data` (section 11), records in its promotion evidence the children that each supported producer version makes on real installations, and the list of the promoted revision agrees with that record. A list that was written without that record keeps the layout `proposed`.
 
-Use disposable fixtures and controlled writers on the supported macOS matrix. Do not validate rules by deleting real developer caches. Fixtures must exercise what can go wrong, not merely demonstrate that a directory disappears.
+Use disposable fixtures and controlled writers on the supported macOS matrix. Do not validate rules by deleting real developer caches. The one exception is the owner host procedure of [VALIDATION.md](VALIDATION.md) section 13: it removes the output that a real producer made for disposable projects, in a dedicated user account with no personal data, and only the project owner starts it. Fixtures must exercise what can go wrong, not merely demonstrate that a directory disappears.
 
 [VALIDATION.md](VALIDATION.md) section 13 has the content of a promotion record and the host procedure for `xcode.inactive-derived-data`. The fixture tests of the repository run the path from the discovery to the removal with a fixture lifecycle state; they are not a promotion record, because no test of the repository runs a real producer.
 

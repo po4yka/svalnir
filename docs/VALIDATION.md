@@ -1,6 +1,6 @@
 # Svalnir Validation Plan
 
-**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of four host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
+**Status:** Design specification. The repository contains a Milestone 2 build that is not validated, with Milestone 3 in code in part, and the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of four host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
 **Last reviewed:** 2026-11-19
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
@@ -198,7 +198,7 @@ Record which OS/hardware combinations support each capability. Missing a particu
 
 ### VAL-12 — Multiuser coordination and leases
 
-Run isolated user sessions against shared capacity with separate histories and policies. Verify principal isolation, no other-user inventory leakage, no cross-user process selection, and the required host lease broker for shared-resource automation.
+Run isolated user sessions against shared capacity with separate histories and policies. Verify principal isolation, no other-user inventory leakage, no cross-user process selection, and, in a release with the helper, the host lease broker for shared-resource automation. A release with no helper has no broker: verify that it restricts automatic shared-volume cleanup to a single-user mode or only observes the affected domains ([ARCHITECTURE.md](ARCHITECTURE.md) section 3).
 
 Exercise simultaneous plans, broker loss, executor crash, lease expiry, and successor acquisition. Outstanding work must be reconciled before conflicting dispatch. Expiry or a fencing generation cannot be treated as canceling a native call already issued.
 
@@ -287,7 +287,7 @@ First-release acceptance additionally requires a complete installed workflow: en
 
 Record any signed fixture build that substitutes observations as a distinct artifact from the shipped build. Its passing workflow validates the controlled decision/execution path, not native pressure detection. The shipped artifacts also require their actual collector, identity, permission, and executor checks; production must not expose a pressure-injection bypass to satisfy the test.
 
-The first release has no privileged helper (owner decision of 2026-11-19). The cases of a family that need the helper, for example the helper ceilings of VAL-08 and the `PrivilegeGrant` cases of VAL-09, are `excluded` from the first-release scope and apply to the release that adds the helper. Each family and each gate keeps its identifier.
+The first release has no privileged helper (owner decision of 2026-11-19). The cases of a family that need the helper, for example the helper ceilings of VAL-08, the `PrivilegeGrant` cases of VAL-09, and the host lease broker cases of VAL-12, are `excluded` from the first-release scope and apply to the release that adds the helper. Each family and each gate keeps its identifier.
 
 At least a useful reviewed automatic cleanup subset and a validated force backend must pass their applicable gates. An observation-only build is an internal milestone. Optional unvalidated integrations remain visibly disabled and do not borrow evidence from another adapter.
 
@@ -355,7 +355,7 @@ Release approval names the artifact and supported scope, summarizes passed/faile
 
 The fixture tests of the repository run the path from the discovery of a rule to the removal, with a lifecycle state that only a test build can give: `crates/svalnir-agent/src/rules/eviction_tests.rs` (the discovery, the roots, and the process evidence), `crates/svalnir-agent/src/runtime/tests/eviction.rs` (the disk guard, the coordinator, and the filesystem executor), `crates/svalnir-agent/src/coordinator/tests/protection.rs` (the catalog at admission), and `crates/svalnir-cli/src/evict_tests.rs` (the `evict` mode and its apply). Each test writes its own files in a temporary directory, and its process evidence is a fixture.
 
-These tests are evidence for `VAL-04` and `VAL-05` cases of the code. They are not a promotion record: no test runs a real producer, so no test shows the layout that a producer version makes, the lock behavior of its build system, or that the producer makes the data again.
+A case record of section 12 can name these tests for cases of `VAL-04` and `VAL-05`. No such record exists, so the tests are not recorded evidence for a family. They are also not a promotion record: no test runs a real producer, so no test shows the layout that a producer version makes, the lock behavior of its build system, or that the producer makes the data again.
 
 ### Promotion record
 

@@ -806,7 +806,7 @@ Implement manual cleanup plans, the operation coordinator, reviewed cache adapte
 
 ### Milestone 3 — First usable release
 
-Package the agent, CLI, and core GPUI experience. The privileged helper has no operation in this release (owner decision of 2026-11-19); its code stays, not registered and not called. Its registration, its grant enrollment, and its validation with a signed build come after the release, in a milestone that is not decided. Complete setup, permission diagnostics, background registration, notifications, policy controls, history, upgrade behavior, and uninstall.
+Package the agent, CLI, and core GPUI experience. The privileged helper has no operation in this release (owner decision of 2026-11-19); its code stays, not registered and not called. Its registration, its grant enrollment, and its validation with a signed build come after the release, in a milestone that is not decided. Complete setup, permission diagnostics, background registration, notifications (in this release, a system dialog of the agent for the three urgent kinds only, with no banner; owner decision of 2026-11-20, [INTERFACES.md](docs/INTERFACES.md) section 4), policy controls, history, upgrade behavior, and uninstall.
 
 This release includes **automatic disk eviction and automatic application force termination under enabled policies**. An observation-only prototype does not satisfy the first-release goal.
 

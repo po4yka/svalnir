@@ -273,7 +273,7 @@ The project owner made this decision on 2026-11-20, after the research step on t
 
 | Subject | Decision | This build |
 | --- | --- | --- |
-| Native notification path of the agent | In the first release, the agent shows a system dialog (`CFUserNotification`) only for the urgent kinds `MemoryPressureCritical`, `IncidentBudgetExhausted`, and `AutomaticOperationNotCompleted`, with a timeout of 60 s. Banners through a nested application of the bundle come after the first release | As this decision, not validated: `notify::DialogCenter` with `CFUserNotificationDisplayNotice` (row "System notifications"). No dialog was shown on a host |
+| Native notification path of the agent | In the first release, the agent shows a system dialog (`CFUserNotification`) only for the urgent kinds `MemoryPressureCritical`, `IncidentBudgetExhausted`, and `AutomaticOperationNotCompleted`, with a timeout of 60 s. Banners through a nested application of the bundle come after the first release | As this decision, not validated: `notify::DialogCenter` with `CFUserNotificationDisplayNotice` (row "System notifications"). Host run 4 showed the dialog of each urgent kind from a debug build only ([VALIDATION.md](VALIDATION.md) section 14); no run examined an installed agent |
 
 The GPUI client of this build changes state through the journal, on the path of the CLI. The client side is the `svalnir_agent::client` module, which the CLI and the GUI share:
 

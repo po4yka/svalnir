@@ -29,6 +29,7 @@ use svalnir_core::rule::{
     RuleExclusions, RuleMode, RuleOwner, RuleRef,
 };
 
+pub(in crate::rules) use inspect::MAX_DIRECTORY_ENTRIES;
 pub use inspect::{
     Evidence, RepositoryReport, UntrackedFiles, WorktreeHead, WorktreeHost, WorktreeInspection,
     WorktreeLimits, WorktreePresence, WorktreeReport, WorktreeVerdict,

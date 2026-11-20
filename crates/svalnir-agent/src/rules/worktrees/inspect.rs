@@ -36,6 +36,9 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024;
 /// The largest index file, in bytes.
 const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The largest number of entries of one directory that the walk reads.
+pub(in crate::rules) const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+
 /// The largest configuration file of a repository, in bytes.
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
@@ -131,6 +134,9 @@ pub enum WorktreePresence {
     /// The directory exists, and its `.git` file is absent or names
     /// another record, or the directory fails a check.
     NotMatching,
+    /// A user exclusion contains the directory or is in it, so the
+    /// inspection reads nothing in it.
+    Excluded,
 }
 
 /// The summary of the evidence of a worktree.
@@ -143,7 +149,10 @@ pub enum WorktreeVerdict {
     HasWork,
     /// A fact is not known, so the absence of work is not shown.
     NotKnown,
-    /// Each fact is known, and none shows work that a removal would lose.
+    /// Each fact is known, and none shows a change that no commit has, a
+    /// file that Git does not track, or a commit that no branch has. The
+    /// entries that Git ignores are reported apart and are not in this
+    /// verdict.
     NoWorkSeen,
 }
 
@@ -170,6 +179,11 @@ pub struct WorktreeReport {
     pub changed_files: Evidence<u64>,
     /// The files that Git does not track and does not ignore.
     pub untracked_files: Evidence<UntrackedFiles>,
+    /// The entries that Git ignores, with an ignored directory as one
+    /// entry. `git worktree remove` deletes them with no `--force`, for
+    /// example a local `.env` file. They are not in the verdict, because
+    /// a build output is also ignored; a person decides on them.
+    pub ignored_entries: Evidence<UntrackedFiles>,
     /// The commits of `HEAD` that no local branch has.
     pub unique_commits: Evidence<u64>,
     /// The summary.
@@ -212,7 +226,7 @@ pub struct WorktreeInspection {
 
 const WORKFLOW_WITH_WORK: &str = "Keep the work first: commit or stash the changes in the worktree, add the files that Git does not track or move them out, and give each commit that no branch has a branch (`git branch NAME COMMIT`). Then run `git worktree remove PATH`, after `git worktree unlock PATH` for a locked worktree. Svalnir does not run them.";
 const WORKFLOW_NOT_KNOWN: &str = "Run `git -C PATH status` and `git -C PATH log --branches --not` to see the work of the worktree, keep it, then run `git worktree remove PATH`. Svalnir does not run them.";
-const WORKFLOW_CLEAN: &str = "Run `git worktree remove PATH`, after `git worktree unlock PATH` for a locked worktree. Git refuses a worktree with changes or with files that it does not track unless `--force` is given. Svalnir does not run it.";
+const WORKFLOW_CLEAN: &str = "Look at the entries that Git ignores first (`git -C PATH status --ignored`): `git worktree remove` deletes them, for example a local `.env` file. Then run `git worktree remove PATH`, after `git worktree unlock PATH` for a locked worktree. Git refuses a worktree with changes or with files that it does not track unless `--force` is given. Svalnir does not run them.";
 const WORKFLOW_MISSING: &str = "The directory of the worktree is absent. Give a branch to each commit that no branch has, then run `git worktree prune --dry-run` and `git worktree prune` to remove the record. Svalnir does not run them.";
 
 /// The text of a record file, with the line end removed.
@@ -396,6 +410,7 @@ impl Walker<'_> {
                 continue;
             };
             let names: BTreeSet<OsString> = entries
+                .take(MAX_DIRECTORY_ENTRIES)
                 .filter_map(Result::ok)
                 .map(|entry| entry.file_name())
                 .collect();
@@ -466,6 +481,7 @@ impl Walker<'_> {
             return Some(report);
         };
         let mut names: Vec<String> = entries
+            .take(MAX_DIRECTORY_ENTRIES)
             .filter_map(Result::ok)
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect();
@@ -517,6 +533,7 @@ impl Walker<'_> {
             staged_changes: Evidence::Unknown("work_tree_not_examined"),
             changed_files: Evidence::Unknown("work_tree_not_examined"),
             untracked_files: Evidence::Unknown("work_tree_not_examined"),
+            ignored_entries: Evidence::Unknown("work_tree_not_examined"),
             unique_commits: Evidence::Unknown("git_not_available"),
             verdict: WorktreeVerdict::NotKnown,
             owner_workflow: WORKFLOW_NOT_KNOWN,
@@ -527,12 +544,32 @@ impl Walker<'_> {
             report.unique_commits = unique_commits(git, record);
             if let (WorktreePresence::Present, Some(path)) = (presence, &path) {
                 report.staged_changes = staged_changes(git, record, path);
-                report.untracked_files =
-                    untracked_files(git, record, path, self.limits.max_untracked_output);
+                report.untracked_files = other_files(
+                    git,
+                    record,
+                    path,
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    self.limits.max_untracked_output,
+                );
+                report.ignored_entries = other_files(
+                    git,
+                    record,
+                    path,
+                    &[
+                        "ls-files",
+                        "-z",
+                        "--others",
+                        "--ignored",
+                        "--exclude-standard",
+                        "--directory",
+                    ],
+                    self.limits.max_untracked_output,
+                );
             }
         } else {
             report.staged_changes = Evidence::Unknown("git_not_available");
             report.untracked_files = Evidence::Unknown("git_not_available");
+            report.ignored_entries = Evidence::Unknown("git_not_available");
         }
         if let (WorktreePresence::Present, Some(path)) = (presence, &path) {
             report.changed_files = if object_format_known {
@@ -575,6 +612,14 @@ impl Walker<'_> {
     fn presence(&self, path: &Path, record: &Path) -> WorktreePresence {
         if self.host.locations.of_text(path) != ProtectionFact::NotProtected {
             return WorktreePresence::NotMatching;
+        }
+        if self
+            .host
+            .user_exclusions
+            .iter()
+            .any(|excluded| path.starts_with(excluded) || excluded.starts_with(path))
+        {
+            return WorktreePresence::Excluded;
         }
         match walk_local(path, &self.mounts) {
             Err(crate::rules::unit::WalkStop::Absent) => return WorktreePresence::Missing,
@@ -652,21 +697,17 @@ fn staged_changes(git: &GitTool, record: &Path, work_tree: &Path) -> Evidence<bo
     }
 }
 
-/// The files of the work tree that Git does not track and does not
-/// ignore, with the ignore rules of each level of the repository.
-fn untracked_files(
+/// The entries of the work tree that the `ls-files --others` query
+/// `arguments` lists, with the ignore rules of each level of the
+/// repository.
+fn other_files(
     git: &GitTool,
     record: &Path,
     work_tree: &Path,
+    arguments: &[&str],
     max_output: usize,
 ) -> Evidence<UntrackedFiles> {
-    match query(
-        git,
-        record,
-        Some(work_tree),
-        &["ls-files", "-z", "--others", "--exclude-standard"],
-        max_output,
-    ) {
+    match query(git, record, Some(work_tree), arguments, max_output) {
         Ok(output) if output.code == 0 => {
             // Each name ends with a NUL byte; a cut list ends with a part
             // of a name, which counts as one more.

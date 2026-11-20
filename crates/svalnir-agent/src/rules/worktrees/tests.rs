@@ -167,41 +167,26 @@ fn the_rule_is_proposed_with_the_inspection_mode_only() {
 fn each_linked_worktree_reports_the_work_that_a_removal_would_lose() {
     let home = Home::new();
     home.repository();
-    for name in ["clean", "staged", "dirty", "untracked", "ignored"] {
+    for name in ["clean", "staged", "dirty", "untracked"] {
         home.worktree(name);
     }
     home.git(
         "Code/repo",
         &["worktree", "add", "-q", "--detach", "../detached"],
     );
-    home.settle(&[
-        "clean",
-        "staged",
-        "dirty",
-        "untracked",
-        "ignored",
-        "detached",
-    ]);
+    home.settle(&["clean", "staged", "dirty", "untracked", "detached"]);
     home.write("Code/staged/README", b"staged change\n");
     home.git("Code/staged", &["add", "README"]);
     home.write("Code/dirty/README", b"a change that no commit has\n");
     home.write("Code/untracked/notes.txt", b"notes\n");
-    home.write("Code/ignored/debug.log", b"log\n");
     home.write("Code/detached/new.txt", b"new\n");
     home.git("Code/detached", &["add", "new.txt"]);
     home.git("Code/detached", &["commit", "-q", "-m", "only here"]);
     home.git("Code/repo", &["worktree", "lock", "../clean"]);
     let records: PathBuf = home.path.join("Code/repo/.git/worktrees");
     let indexes = || {
-        [
-            "clean",
-            "staged",
-            "dirty",
-            "untracked",
-            "ignored",
-            "detached",
-        ]
-        .map(|name| fs::read(records.join(name).join("index")).unwrap())
+        ["clean", "staged", "dirty", "untracked", "detached"]
+            .map(|name| fs::read(records.join(name).join("index")).unwrap())
     };
     let before = indexes();
 
@@ -213,7 +198,7 @@ fn each_linked_worktree_reports_the_work_that_a_removal_would_lose() {
         inspection.repositories[0].work_tree,
         home.path.join("Code/repo")
     );
-    assert_eq!(inspection.repositories[0].worktrees.len(), 6);
+    assert_eq!(inspection.repositories[0].worktrees.len(), 5);
 
     let clean = worktree(&inspection, "clean");
     assert_eq!(clean.path, Some(home.path.join("Code/clean")));
@@ -256,10 +241,6 @@ fn each_linked_worktree_reports_the_work_that_a_removal_would_lose() {
         })
     );
     assert_eq!(untracked.verdict, WorktreeVerdict::HasWork);
-
-    // A file that Git ignores is not work of the worktree.
-    let ignored = worktree(&inspection, "ignored");
-    assert_eq!(ignored.verdict, WorktreeVerdict::NoWorkSeen);
 
     let detached = worktree(&inspection, "detached");
     assert!(matches!(detached.head, WorktreeHead::Detached { .. }));
@@ -376,4 +357,92 @@ fn the_index_reader_reads_each_version_and_refuses_another_form() {
         ),
         Err("index_path_not_plain")
     );
+}
+
+#[test]
+fn a_local_edit_that_skip_worktree_hides_is_a_change() {
+    let home = Home::new();
+    home.repository();
+    home.worktree("hidden");
+    home.git(
+        "Code/hidden",
+        &["update-index", "--skip-worktree", "README"],
+    );
+    home.settle(&["hidden"]);
+    home.write(
+        "Code/hidden/README",
+        b"a local edit that Git does not show\n",
+    );
+    let inspection: WorktreeInspection = home.inspect();
+    let hidden = worktree(&inspection, "hidden");
+    assert_eq!(hidden.staged_changes, Evidence::Known(false));
+    assert_eq!(hidden.changed_files, Evidence::Known(1));
+    assert_eq!(hidden.verdict, WorktreeVerdict::HasWork);
+}
+
+#[test]
+fn a_worktree_in_a_user_exclusion_is_not_read() {
+    let home = Home::new();
+    home.repository();
+    home.git(
+        "Code/repo",
+        &["worktree", "add", "-q", "-b", "private", "../../Private/wt"],
+    );
+    let exclusions: Vec<PathBuf> = vec![home.path.join("Private")];
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let inspection: WorktreeInspection = registry.worktrees().inspect(
+        WorktreeHost {
+            principal: home.principal,
+            locations: &home.locations,
+            user_exclusions: &exclusions,
+            git: Ok(&home.git),
+        },
+        &SearchRoots::new(vec![PathBuf::from("Code")]).unwrap(),
+        WorktreeLimits::default(),
+        &CancellationToken::new(),
+    );
+    let private = worktree(&inspection, "wt");
+    assert_eq!(private.presence, WorktreePresence::Excluded);
+    assert!(matches!(private.changed_files, Evidence::Unknown(_)));
+    assert!(matches!(private.untracked_files, Evidence::Unknown(_)));
+    assert_eq!(private.verdict, WorktreeVerdict::NotKnown);
+}
+
+#[test]
+fn an_index_with_paths_longer_than_the_bound_is_refused() {
+    // A version 2 index with one entry whose path is 5000 bytes.
+    let path: Vec<u8> = vec![b'a'; 5000];
+    let mut bytes: Vec<u8> = b"DIRC".to_vec();
+    bytes.extend_from_slice(&2_u32.to_be_bytes());
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 40]);
+    bytes.extend_from_slice(&[0; 20]);
+    bytes.extend_from_slice(&0x0fff_u16.to_be_bytes());
+    bytes.extend_from_slice(&path);
+    let size: usize = 62 + path.len();
+    bytes.extend(std::iter::repeat_n(0, ((size + 8) & !7) - size));
+    bytes.extend_from_slice(&[0; 20]);
+    assert_eq!(parse(&bytes), Err("index_paths_too_large"));
+}
+
+#[test]
+fn the_entries_that_git_ignores_are_reported_apart_from_the_verdict() {
+    let home = Home::new();
+    home.repository();
+    home.worktree("ignored");
+    home.settle(&["ignored"]);
+    home.write("Code/ignored/debug.log", b"log\n");
+    let inspection: WorktreeInspection = home.inspect();
+    // A file that Git ignores is reported apart and is not in the
+    // verdict; the workflow says that a removal deletes it.
+    let ignored = worktree(&inspection, "ignored");
+    assert_eq!(ignored.verdict, WorktreeVerdict::NoWorkSeen);
+    assert_eq!(
+        ignored.ignored_entries,
+        Evidence::Known(UntrackedFiles {
+            count: 1,
+            more: false
+        })
+    );
+    assert!(ignored.owner_workflow.contains("status --ignored"));
 }

@@ -491,6 +491,7 @@ impl Inspector<'_> {
                 continue;
             };
             let names: BTreeSet<OsString> = entries
+                .take(crate::rules::worktrees::MAX_DIRECTORY_ENTRIES)
                 .filter_map(Result::ok)
                 .map(|entry| entry.file_name())
                 .collect();

@@ -27,8 +27,11 @@
 //! no replacement object. The command line sets the keys of the
 //! configuration of the repository that can run a program for these
 //! commands, and the command-line value has precedence over the file:
-//! `core.fsmonitor` is off, `core.hooksPath` is `/dev/null`, and no
-//! transport is permitted (`protocol.allow=never`). `--no-optional-locks`
+//! `core.fsmonitor` is off, `core.hooksPath` is `/dev/null`, and
+//! `protocol.allow=never`. A `protocol.NAME.allow` key of the repository
+//! has precedence over `protocol.allow`, so the environment variable
+//! `GIT_ALLOW_PROTOCOL` with a list that names no protocol is the control
+//! that permits no transport: Git then ignores each `protocol.*` key. `--no-optional-locks`
 //! keeps Git from a write of the index. A caller gives a pathspec with the
 //! `:(literal)` prefix, so a path is not a pattern. The Git directory and the
 //! work tree are explicit arguments, so Git does not search for a
@@ -64,7 +67,11 @@ pub const GIT_CANDIDATES: [&str; 2] = [
 ];
 
 /// The only environment variables of a query.
-pub const FIXED_ENVIRONMENT: [(&str, &str); 10] = [
+pub const FIXED_ENVIRONMENT: [(&str, &str); 11] = [
+    // A list of permitted protocols that names no protocol. With this
+    // variable, Git ignores each `protocol.*` key of the configuration, so
+    // a lazy fetch of a partial clone cannot run a transport.
+    ("GIT_ALLOW_PROTOCOL", "none"),
     ("PATH", "/usr/bin:/bin"),
     ("LC_ALL", "C"),
     ("GIT_CONFIG_NOSYSTEM", "1"),

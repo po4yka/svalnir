@@ -26,6 +26,14 @@ const SHA1_LENGTH: usize = 20;
 /// The largest number of entries that the reader accepts.
 pub(super) const MAX_ENTRIES: u32 = 2_000_000;
 
+/// The longest path of one entry, in bytes.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// The largest sum of the path lengths, as a multiple of the size of the
+/// file. A version 4 index can repeat a long prefix in each entry at a
+/// small cost, so this bound keeps the memory linear in the file size.
+const MAX_PATH_FACTOR: usize = 4;
+
 /// The part of an index entry that the comparison uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct IndexEntry {
@@ -90,6 +98,8 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Vec<IndexEntry>, &'static str> {
     let mut offset: usize = 12;
     let mut entries: Vec<IndexEntry> = Vec::new();
     let mut previous: Vec<u8> = Vec::new();
+    let mut path_bytes: usize = 0;
+    let max_path_bytes: usize = bytes.len().saturating_mul(MAX_PATH_FACTOR);
     for _ in 0..count {
         let field = |index: usize| word(bytes, offset + 4 * index).ok_or(INVALID);
         let fixed: usize = offset.checked_add(40 + SHA1_LENGTH).ok_or(INVALID)?;
@@ -124,6 +134,10 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Vec<IndexEntry>, &'static str> {
         };
         if cursor > end {
             return Err(INVALID);
+        }
+        path_bytes = path_bytes.saturating_add(path.len());
+        if path.len() > MAX_PATH_BYTES || path_bytes > max_path_bytes {
+            return Err("index_paths_too_large");
         }
         entries.push(IndexEntry {
             ctime: (field(0)?, field(1)?),
@@ -186,7 +200,7 @@ pub(super) struct Comparison {
 /// `index_mtime` is the modification time of the index file, in seconds.
 ///
 /// An entry of a submodule, of a sparse directory, or with the flag
-/// skip-worktree is not compared. A directory on the path of an entry
+/// skip-worktree and no file is not compared. A directory on the path of an entry
 /// must not be a symbolic link, so that no metadata read leaves the work
 /// tree.
 ///
@@ -208,14 +222,20 @@ pub(super) fn compare(
             return Err("deadline_reached");
         }
         let kind: u32 = entry.mode & TYPE_MASK;
-        if entry.stage != 0 || entry.skip_worktree || kind == TYPE_GITLINK || kind == TYPE_DIRECTORY
-        {
+        if entry.stage != 0 || kind == TYPE_GITLINK || kind == TYPE_DIRECTORY {
             continue;
         }
         if !is_plain(&entry.path) {
             return Err("index_path_not_plain");
         }
         let path: PathBuf = work_tree.join(OsStr::from_bytes(&entry.path));
+        // A file with the flag skip-worktree is outside a sparse checkout
+        // when it is absent. When it exists, it can have local edits that
+        // `git update-index --skip-worktree` hides from Git, so it is
+        // compared.
+        if entry.skip_worktree && std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
         // Each directory above the file is a directory, not a symbolic
         // link; a directory that is absent makes the file absent.
         let mut parent_absent: bool = false;

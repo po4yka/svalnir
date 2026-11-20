@@ -81,7 +81,7 @@ Svalnir does not promise that every cache is disposable or that every large appl
 
 | Area | First release target | Later extensions |
 | --- | --- | --- |
-| Disk analysis | Volume overview, directory sizes, application and developer categories, large-file discovery, partial-scan reporting | Incremental catalog from filesystem events, duplicate review, a report of capacity outside the scanned categories, richer storage attribution and historical comparisons |
+| Disk analysis | Volume overview, directory sizes, application and developer categories, large-file discovery, partial-scan reporting, invalidation of the candidate catalog from filesystem events | Duplicate review, a report of capacity outside the scanned categories, richer storage attribution and historical comparisons |
 | Manual cleanup | Previewable, expiring plans; exclusions; Trash or explicitly selected permanent removal | Additional application adapters and uninstall assistance |
 | Disk protection | Persistent monitoring and automatic eviction of approved regenerable files under low-space policies | More workload-aware preparation and forecasting |
 | Memory monitoring | System pressure, RAM composition, compression, swap usage and activity, process footprint and growth | Deeper diagnostic views and optional hardware metrics |
@@ -95,7 +95,7 @@ Automatic force termination belongs to the first release scope. It is an enabled
 
 ## How protection works
 
-The agent combines event notifications with bounded periodic sampling. Filesystem events invalidate affected catalog entries (after the first release; see [Automatic disk protection](#automatic-disk-protection)); memory-pressure notifications prompt a fresh assessment. Startup, wake, volume changes, and policy changes also trigger reconciliation.
+The agent combines event notifications with bounded periodic sampling. Filesystem events invalidate affected catalog entries (in code and not validated; see [Automatic disk protection](#automatic-disk-protection)); memory-pressure notifications prompt a fresh assessment. Startup, wake, volume changes, and policy changes also trigger reconciliation.
 
 The controller evaluates disk and memory together. During simultaneous critical disk and memory pressure, it first reduces its own work, uses already known cleanup candidates, and considers eligible memory-heavy applications. It avoids launching an expensive full-disk scan or hashing job in the middle of an emergency.
 
@@ -162,7 +162,7 @@ The [resource model](docs/RESOURCE_MODEL.md) defines each measurement, its sourc
 
 The disk guard runs while the graphical application is closed. It prepares a compact catalog during normal operation and refreshes affected areas when necessary. FSEvents is an invalidation mechanism; coalesced or dropped events require reconciliation and must not be treated as a complete per-file audit log. See [Apple's FSEvents guidance][fsevents].
 
-The first release has no FSEvents consumer (owner decision of 2026-11-20). The agent refreshes its candidates with a bounded discovery in the warning band of the disk guard. The FSEvents invalidation is the first item of Milestone 4.
+The first release has the FSEvents invalidation of the candidate catalog (owner decision of 2026-11-20, which replaces the decision of the same day that the release has no FSEvents consumer). The agent refreshes its candidates with a bounded discovery in the warning band of the disk guard, and an event marks a region of an approved root for that discovery. The build has this consumer; it is not validated on a host.
 
 ### Trigger and recovery policy
 

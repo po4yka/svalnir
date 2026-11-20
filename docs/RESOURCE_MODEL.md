@@ -215,7 +215,7 @@ A cleanup estimate references the exact candidate identities, rule revision, acq
 
 `work_bytes` is a separate conservative admission charge defined by the rule and [POLICY_SPEC.md](POLICY_SPEC.md). For ordinary entries, the documented convention can use checked `max(logical_bytes, allocated_bytes)` aggregation. Hard-link and directory handling must follow the rule's explicit charge convention; optimizing display deduplication must not silently reduce an approved work bound. Unknown or unbounded charges block unattended dispatch.
 
-Moving entries to Trash records transferred entries and the chosen byte convention. It does not report reclaimed capacity. Cloud placeholders must not be hydrated merely to measure or classify them. FSEvents invalidate affected inventory regions; lost or coalesced events require the documented reconciliation strategy, not invented complete coverage. [Source][fsevents] The first release has no FSEvents consumer; [ARCHITECTURE.md](ARCHITECTURE.md) gives the discovery that it uses.
+Moving entries to Trash records transferred entries and the chosen byte convention. It does not report reclaimed capacity. Cloud placeholders must not be hydrated merely to measure or classify them. FSEvents invalidate affected inventory regions; lost or coalesced events require the documented reconciliation strategy, not invented complete coverage. [Source][fsevents] This build has an FSEvents consumer in the agent, which is not validated on a host; [ARCHITECTURE.md](ARCHITECTURE.md) gives its rules.
 
 ## 9. Host memory accounting
 

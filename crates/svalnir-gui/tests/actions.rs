@@ -833,3 +833,35 @@ fn the_tooltip_of_a_cut_line_wraps_in_its_maximum_width(cx: &mut TestAppContext)
         "the text of the tooltip does not wrap: {tooltip:?}"
     );
 }
+
+/// Review finding on the correction of D-15: Quit in the stop confirmation
+/// of a group whose last stop still waits sent no request and closed the
+/// dialog, but the model kept the dialog as open, so each stop control
+/// stayed off.
+#[gpui_kit::test]
+fn a_confirmation_that_sends_nothing_still_closes_the_stop(cx: &mut TestAppContext) {
+    let (handle, view) = open(
+        FixtureSource::new(FixtureScenario::Healthy).with_actions(ActionScript::Pending),
+        Screen::Applications,
+        cx,
+    );
+    let (instance, name) = stoppable_group(&view, cx);
+    let model = cx.update(|cx| view.read(cx).model().clone());
+    click(handle, &format!("applications-stop-{instance}"), cx);
+    click(handle, "confirm-ok", cx);
+    let slot = Slot::Stop(instance.clone());
+    assert!(cx.update(|cx| view.read(cx).model().read(cx).actions.is_busy(&slot)));
+    // The control is off while the stop waits; a launch option can still
+    // open the confirmation of the same group.
+    cx.update_window(handle, |_, window, cx| {
+        svalnir_gui::screens::controls::open_stop(&model, &instance, &name, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    click(handle, "confirm-ok", cx);
+    assert!(cx.update(|cx| view.read(cx).model().read(cx).actions.stop.is_none()));
+    assert_eq!(
+        label(handle, &format!("applications-stop-open-{instance}"), cx),
+        None
+    );
+}

@@ -533,11 +533,14 @@ impl AppModel {
     /// answer, the model reads the topics again.
     pub fn run_action(&mut self, action: Action, cx: &mut Context<Self>) {
         let slot: Slot = action.slot();
+        // A stop comes from the stop dialog, which closes with it, also when
+        // the slot is busy and no request is sent: a dialog that stays
+        // recorded as open would turn off each stop control.
+        if matches!(action, Action::Stop { .. }) {
+            self.actions.close_stop();
+        }
         if self.actions.is_busy(&slot) {
             return;
-        }
-        if matches!(action, Action::Stop { .. }) {
-            self.actions.stop = None;
         }
         self.actions.start(&action, ActionState::Pending);
         cx.notify();

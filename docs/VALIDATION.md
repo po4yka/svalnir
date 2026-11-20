@@ -365,8 +365,8 @@ A promotion record is a case record of section 12 with `validation_id: VAL-05` a
 rule_id: xcode.inactive-derived-data
 rule_revision: r1
 layout: derived-data-project-v1
-lifecycle_target: manual_action_validated
-record_id: VAL-05/xcode.inactive-derived-data/r1/derived-data-project-v1/manual
+lifecycle_target: automatic_eviction_validated
+record_id: VAL-05/xcode.inactive-derived-data/r1/derived-data-project-v1/automatic
 producer_versions: []
 host_versions: []
 filesystems: []
@@ -380,8 +380,8 @@ owner_approval: null
 
 | Field | Content |
 | --- | --- |
-| `record_id` | The text that the `PromotionEvidence` reference of the declaration has. A declaration with a reference that names no record of this document is not a promotion |
-| `lifecycle_target` | `inspection_validated`, `manual_action_validated`, or `automatic_eviction_validated`. A record for a later stage has the cases of each earlier stage or names their record |
+| `record_id` | The text that the `PromotionEvidence` reference of the declaration has. A declaration with a reference that names no record of this document is not a promotion. The last part names the stage of `lifecycle_target`: `inspection`, `manual`, or `automatic` |
+| `lifecycle_target` | `inspection_validated`, `manual_action_validated`, or `automatic_eviction_validated`. A record for a later stage has the cases of each earlier stage or names their record. The subsection "Stages and the build of the run" gives the stage of each step of the host procedure |
 | `producer_versions`, `host_versions`, `filesystems` | Each producer version, macOS version and build, and filesystem that a case ran on. The promoted layout supports no other combination |
 | `allow_list_observations` | For each producer version, the children of each unit that the producer made on the host, and the difference from the allow-list of the revision |
 | `gate_results` | One result for each gate of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 15 that applies, with its status of section 2 and its evidence paths |
@@ -392,6 +392,23 @@ owner_approval: null
 
 The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names.
 
+### Stages and the build of the run
+
+The host procedure below makes the cases of the three stages of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 2 in one run, with one build:
+
+| Stage | Steps of the procedure |
+| --- | --- |
+| `inspection_validated` | 6 to 12: the layout record, the activity, and the age. No step of this stage removes a file |
+| `manual_action_validated` | 13 to 19: the manual eviction, the exclusions, the replacement, the producer after the plan, and the regeneration |
+| `automatic_eviction_validated` | 20 to 23: the disk guard of the agent |
+
+The build of the run (step 3) gives the layout the state `automatic_eviction_validated`, because each stage needs a state that permits its mode ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 2):
+
+- The `evict` mode of `clean plan` needs a state that permits manual eviction. This build has no command that runs the discovery of a rule in the inspection mode only, so the steps of the inspection stage also use the `evict` mode, and they apply no plan.
+- The disk guard needs `automatic_eviction_validated`. With an earlier state, the activation of step 20 lists the rule as not validated for automatic eviction, and the authorization refuses its automatic use.
+
+The `lifecycle_target` of the record is the last stage whose cases passed, when the cases of each earlier stage also passed. A failed case of a stage removes that stage and each later stage from the record. When the `lifecycle_target` is earlier than the state of the build of the run, the change that merges the record sets the state of the record, not the state of the build of the run, and the `limitations` of the record say that the build of the run had a later state. No branch is merged with a state that is later than the `lifecycle_target` of its approved record.
+
 ### Host procedure for `xcode.inactive-derived-data`
 
 Only the project owner starts this procedure, on a host that the owner selects. It removes files on that host, so no contributor, automated agent, or test runner runs it without that decision. The procedure uses a dedicated user account, so that the `DerivedData` root has only disposable projects: the rule does not tell a disposable project from a real one.
@@ -400,7 +417,7 @@ Only the project owner starts this procedure, on a host that the owner selects. 
 
 1. Make a standard user account for the validation, with no personal data. Log in as that user. Each later step runs as that user.
 2. Install each Xcode version of the intended support matrix. Record the output of `sw_vers`, `xcodebuild -version`, `diskutil info /System/Volumes/Data`, and `git rev-parse HEAD`.
-3. On a branch, set the lifecycle state of the layout in `crates/svalnir-agent/src/rules/xcode.rs` to the target state, with the `record_id` as its reference. Run `scripts/check.sh`; record its exit status. Build with `cargo build --release --locked --workspace --bins` and record `shasum -a 256` of the `svalnir` and `svalnir-agent` binaries. The branch is merged only with the approved record.
+3. On a branch, set the lifecycle state of the layout in `crates/svalnir-agent/src/rules/xcode.rs` to `automatic_eviction_validated`, with the `record_id` as its reference (subsection "Stages and the build of the run"). Run `scripts/check.sh`; record its exit status. Build with `cargo build --release --locked --workspace --bins` and record `shasum -a 256` of the `svalnir` and `svalnir-agent` binaries. The branch is merged only with the approved record.
 4. Select a state directory for the validation, and use it in each command: `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`.
 5. Make two or more disposable Xcode projects outside the `DerivedData` root: an application for macOS and an application for an iOS simulator, each with a unit test target and a Swift package dependency. Do not set a custom DerivedData location.
 

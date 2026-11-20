@@ -76,7 +76,7 @@ The following is the logical declaration contract.
 | `verification` | Observable effects and remaining uncertainty |
 | `provenance` | Primary documentation, relevant source revisions, and review evidence |
 
-The declaration type of `svalnir-core` has these parts of the contract: `id` and `revision`, `owner`, the supported layouts with their lifecycle states, the approved roots, `retention`, the checks and the windows of `activity_protocol`, `exclusions`, `modes`, the deletion method, `executor`, the rebuild cost, and the candidate and pass ceilings and the measurement expiry of `work_charge`. An approved root is relative to the home directory of the user, to the state directory of Svalnir, to the location that the configuration of the producer names, or, for the base `user_selected`, to a project directory that a discovery finds below a directory that the user names for the rule (section 12, `project.dependency-directory`); it is never an absolute path from user input. A root of the base `user_selected` has no default location, and the discovery for an eviction gives it no path. `candidate_unit`, `regenerability`, `namespace_protocol`, `failure_policy`, `verification`, and `provenance` have no field in that type yet. A rule that needs one of them for a validated mode adds the field with its implementation.
+The declaration type of `svalnir-core` has these parts of the contract: `id` and `revision`, `owner`, the supported layouts with their lifecycle states, the approved roots, `retention`, the checks and the windows of `activity_protocol`, `exclusions`, `modes`, the deletion method, `executor`, the rebuild cost, and the candidate and pass ceilings and the measurement expiry of `work_charge`. An approved root is relative to the home directory of the user, to the state directory of Svalnir, to the location that the configuration of the producer names, or, for the base `user_selected`, to a project directory that a discovery finds below a directory that the user names for the rule (section 12, `project.dependency-directory`); it is never an absolute path from user input. A root of the base `user_selected` has no default location, and the discovery for an eviction gives it no path. A root of the base `producer_installation` is below the documented absolute prefix of an installation of the producer, such as `/opt/homebrew` (section 12, `homebrew.cleanup`), or below a system location of the producer; the discovery for an eviction gives it no path either. `candidate_unit`, `regenerability`, `namespace_protocol`, `failure_policy`, `verification`, and `provenance` have no field in that type yet. A rule that needs one of them for a validated mode adds the field with its implementation.
 
 A missing support range, age policy, concurrency argument, or work bound is an incomplete rule. A declaration with no layout, no root, no activity check, a zero minimum age, a work ceiling with a zero part, a zero measurement expiry, or an unknown rebuild cost is rejected. So is a root path that is absolute or that has an empty, `.`, or `..` component, and a layout that is validated for a manual action or for automatic eviction when the implementation has no such mode. Each implementation has the inspection mode. No universal minimum age or cache-retention default is established here; each released revision must supply concrete validated values.
 
@@ -254,7 +254,7 @@ Stopping a tool after a deadline does not undo its deletions or prove that child
 
 ## 10. Proposed registry
 
-Every entry is currently **proposed**. The first two entries have a discovery in `svalnir-agent`. `project.dependency-directory` has a declaration with the inspection mode only and an inspection in `svalnir-agent` (`rules::projects`, section 12); it gives no candidate, and the `evict` mode refuses it also in a test build with a fixture lifecycle state. The six entries from `pnpm.content-store` to `cocoapods.cache` have a declaration with the inspection mode only and an inspection in `svalnir-agent` (`rules::caches`): it reports the resolved root (section 4), the measured size of each unit, and the owner workflow of section 12, and it gives no candidate. For `pnpm.content-store` and `uv.cache` the inspection gives no reclaim figure; for the other four the figure is the allocated size, which is not exclusive storage. A layout of these six rules stays `proposed` also in a test build with a fixture lifecycle state, so the `evict` mode refuses each of them. The other entries have no implementation. The “Initial development target” column is implementation priority, not present eligibility or a shipped default.
+Every entry is currently **proposed**. The first two entries have a discovery in `svalnir-agent`. `project.dependency-directory` has a declaration with the inspection mode only and an inspection in `svalnir-agent` (`rules::projects`, section 12); it gives no candidate, and the `evict` mode refuses it also in a test build with a fixture lifecycle state. `simulator.devices`, `container.build-cache`, and `homebrew.cleanup` have the same status (`rules::owner_tools`): their inspection attributes the data from the documented on-disk layout and gives the command of the owner tool, as section 9 requires for a command whose effect Svalnir cannot bound, and this build runs no command of their owner tools. The six entries from `pnpm.content-store` to `cocoapods.cache` have a declaration with the inspection mode only and an inspection in `svalnir-agent` (`rules::caches`): it reports the resolved root (section 4), the measured size of each unit, and the owner workflow of section 12, and it gives no candidate. For `pnpm.content-store` and `uv.cache` the inspection gives no reclaim figure; for the other four the figure is the allocated size, which is not exclusive storage. A layout of these six rules stays `proposed` also in a test build with a fixture lifecycle state, so the `evict` mode refuses each of them. The other entries have no implementation. The “Initial development target” column is implementation priority, not present eligibility or a shipped default.
 
 | Rule ID | Intended unit | Initial development target |
 | --- | --- | --- |
@@ -271,6 +271,9 @@ Every entry is currently **proposed**. The first two entries have a discovery in
 | `homebrew.download-cache` | The downloads of the resolved Homebrew cache | Inspection and manual workflow first |
 | `cocoapods.cache` | The resolved download cache of one CocoaPods installation | Inspection and manual workflow first |
 | `project.dependency-directory` | One generated directory (`node_modules`, `.venv`, or `Pods`) of one identified project below a directory that the user names | Inspection, then manual selection; never automatic in Milestone 4 |
+| `simulator.devices` | One simulator device or runtime, through the owner tool | Inspection and manual owner workflow |
+| `container.build-cache` | The build cache that the container engine reports, through the owner tool | Inspection and manual owner workflow |
+| `homebrew.cleanup` | The old kegs of the formulae of one Homebrew prefix, through the owner tool | Inspection and manual owner workflow |
 
 The six entries from `pnpm.content-store` to `cocoapods.cache` are package and build caches of the same class as `npm.content-cache` (owner decision of 2026-11-20). They widen the developer coverage of the first release. Each one stays `proposed` until it has its own promotion evidence (section 15).
 
@@ -278,13 +281,10 @@ The registry deliberately omits a universal “all application caches” rule. M
 
 ### Rule families after the first release
 
-These families are planned for Milestone 4 (owner decision of 2026-11-20). They have no rule ID, no declaration, and no implementation. Each one needs its own rule identity, support matrix, and action gates before it enters the registry. The family of project dependency and build directories entered the registry as `project.dependency-directory`.
+These families are planned for Milestone 4 (owner decision of 2026-11-20). They have no rule ID, no declaration, and no implementation. Each one needs its own rule identity, support matrix, and action gates before it enters the registry. The family of project dependency and build directories entered the registry as `project.dependency-directory`, and the families of simulator devices and runtimes, of the container build cache, and of Homebrew cleanup entered it as `simulator.devices`, `container.build-cache`, and `homebrew.cleanup`.
 
 | Family | Planned unit | Planned limit |
 | --- | --- | --- |
-| Simulator devices and runtimes | One device or runtime that the owner tool lists | Removal only through the owner tool as a producer-supported operation (section 9). Simulator contents stay outside generic eviction |
-| Container build cache | The build cache that the container tool reports | Removal only through the owner tool as a producer-supported operation. Persistent volumes, images in use, and databases stay protected |
-| Homebrew cleanup | The old versions and downloads that the owner tool reports | Removal only through the owner tool as a producer-supported operation |
 | Git worktrees | One linked worktree of one identified repository | Manual only, never automatic. A worktree can hold work that exists nowhere else: the plan must show uncommitted changes, files that are not tracked, and commits that no branch has, and must preserve them before the removal or refuse the worktree |
 
 ## 11. Initial automatic targets
@@ -376,6 +376,52 @@ The inspection asks Git, because Git owns the semantics of the ignore files of e
 
 **Required evidence:** Projects with each layout and each package manager of the support matrix, monorepos with nested projects, a committed dependency directory, ignore rules at each level and with negation, a sparse and a split index, linked worktrees, a build or a test that runs during the inspection, hard links and clones from a store, and the work charge of large directories.
 
+### `simulator.devices`
+
+**Purpose:** Show the simulator devices and runtimes of the user, which can use many gigabytes, with the commands of the owner tool that remove them.
+
+Apple documents `xcrun simctl delete` and `xcrun simctl erase` for devices and `xcrun simctl runtime delete` for runtimes. A device has apps, data, and settings that a person made, so its removal is a decision of the user and not a regeneration: simulator contents stay outside each candidate (section 5).
+
+**Roots:** The devices of the user in `~/Library/Developer/CoreSimulator/Devices` (layout `coresimulator-device`), and the runtime bundles in `/Library/Developer/CoreSimulator/Profiles/Runtimes` and in the mounted runtime volumes below `/Library/Developer/CoreSimulator/Volumes` (layout `coresimulator-runtime`, the base `producer_installation`). Each directory has the check of the local filesystem of section 4.
+
+**Candidate:** None in this build. The inspection lists each directory whose name has the form of a device identity, reads its `device.plist` (an XML property list with a root dictionary of scalar values, or the binary form, of at most 64 KiB, with the user as owner and one name), and reports the values `name`, `runtime`, `deviceType`, and `state` (1 is shut down, 3 is booted). A file that does not name the identity of its directory, or that has another form, gives `unsupported_layout`. A device directory that is a symbolic link is not followed. The inspection measures each device for information and gives no reclaim figure, because a device that `simctl clone` made shares its blocks with its source through APFS clones. It lists the runtime bundles by name and does not measure them.
+
+**Owner workflow:** For each device, `xcrun simctl delete UDID`, or `xcrun simctl erase UDID` to keep the device and remove its contents, after `xcrun simctl shutdown UDID` for a booted device; `xcrun simctl delete unavailable` for the devices whose runtime is not installed. For the runtimes, `xcrun simctl runtime list`, then `xcrun simctl runtime delete IDENTIFIER`. Svalnir runs none of them. It also runs no read-only query: `simctl list` starts the simulator service of the user, which is more than a read of the disk.
+
+**Impact:** A deleted device loses its apps, data, and settings. A deleted runtime makes each device of that runtime unavailable and needs a new download to use again.
+
+**Required evidence:** The `device.plist` of each supported Xcode version, devices that boot, clones and their shared blocks, runtimes in volumes and in bundles, and the result of the owner tool on each one.
+
+### `container.build-cache`
+
+**Purpose:** Attribute the storage of a container engine and show the owner command that removes its build cache.
+
+On macOS a container engine runs its images, containers, volumes, and build cache in a virtual machine, and keeps them in one disk image. The build cache is not a set of files that Svalnir can see or measure: only the engine reports it (`docker buildx du`) and removes it (`docker builder prune`).
+
+**Roots:** The documented disk image of each known engine below the home directory: `Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw` of Docker Desktop (layout `docker-desktop-disk`) and `.colima/_lima/colima/diffdisk` of Colima (layout `colima-disk`). A disk image at another location is not seen. These two paths are a first list from public knowledge of the engines and are not verified.
+
+**Candidate:** None, now and in a later revision of this rule: the disk image is a VM disk with persistent volumes and the images in use (section 5), and it is never a unit. The inspection reads the metadata of the image only: its logical size, which is the size that the virtual machine sees, and its allocated size. A sparse image is much larger than its storage, so the inspection gives no reclaim figure. An image that is a symbolic link is not followed.
+
+**Owner workflow:** `docker buildx du` to see the build cache, then `docker builder prune` to remove the build cache that no build uses now; it keeps images, containers, and volumes. `docker system prune --volumes` is not the workflow of this rule, because it removes volumes. The disk image becomes smaller only when the engine reclaims the free space. Svalnir runs no `docker` command: the executable and its plug-ins are in directories that the user can change, and the command talks to the engine.
+
+**Impact:** The next build makes each removed layer again and can need a network and the base images.
+
+**Required evidence:** The disk image paths of each supported engine and version, the effect of the owner command on the allocated size of the image, and engines that keep the image at another location.
+
+### `homebrew.cleanup`
+
+**Purpose:** Show the old versions of the formulae of a Homebrew installation, which `brew cleanup` removes.
+
+**Roots:** The Cellar of each documented Homebrew prefix, `/opt/homebrew` and `/usr/local` (the base `producer_installation`). The Cellar must be a directory on a local filesystem with the user as owner, as Homebrew installs it; a Cellar of another owner or that is a symbolic link is refused.
+
+**Candidate:** None in this build. The inspection reads the names of the kegs `PREFIX/Cellar/FORMULA/VERSION` (at most 10 000 formulae and 64 kegs of each) and the link `PREFIX/opt/FORMULA`, which it reads and does not follow. For a formula with more than one keg it reports each keg: the keg that `opt` links is `current`; with no link to a keg of the formula, each keg is `current_version_unknown`; each keg of a formula with an entry in `PREFIX/var/homebrew/pinned` is `pinned`; a keg with an executable that a process of the user runs is `in_use`; with a process inventory that is not complete, an old keg has an unknown activity. Each other keg is an old version and is measured, with the allocated size as an upper estimate. The current keg, the Caskroom, taps, and the Homebrew repository are never a unit; the downloads are `homebrew.download-cache`.
+
+**Owner workflow:** `brew cleanup --dry-run` to see what `brew cleanup` removes, then `brew cleanup FORMULA` or `brew cleanup`; it keeps the current version and the pinned formulae. Svalnir runs no `brew` command: the executable and the Ruby code that it loads are in the prefix, which the user can change.
+
+**Impact:** A removed old version cannot be used again without a reinstall of that version, which needs a source that is still available.
+
+**Required evidence:** The layout of the Cellar and of `opt` for each supported Homebrew version, keg-only formulae, pinned formulae, versions that a service runs, and the result of `brew cleanup` on each one.
+
 ### `npm.content-cache`
 
 npm documents a configurable cache containing an opaque content-addressed area, and describes cleanup and verification operations. Its cache is not promised as permanent package storage. [npm cache contract][npm-cache]
@@ -448,7 +494,7 @@ uv can link files from the cache into virtual environments with clones or hard l
 
 Homebrew documents `brew --cache` for the location of its downloads and `brew cleanup` to remove old downloads and old versions. [Homebrew manual][homebrew-manual]
 
-The candidate is a download in the resolved cache directory only. Installed kegs, the Cellar, the Caskroom, taps, and the Homebrew repository are outside this rule. The removal of old installed versions is the separate "Homebrew cleanup" family of section 10.
+The candidate is a download in the resolved cache directory only. Installed kegs, the Cellar, the Caskroom, taps, and the Homebrew repository are outside this rule. The removal of old installed versions is the separate rule `homebrew.cleanup`.
 
 Initial support explains and previews the owner workflow. A running `brew` process blocks admission. The impact is a new download for a reinstall, which needs a network and a source that is still available.
 

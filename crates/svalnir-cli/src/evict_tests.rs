@@ -248,6 +248,10 @@ fn the_evict_mode_refuses_each_inspection_rule_also_with_a_fixture_lifecycle() {
         // The rule of the project dependency directories has the
         // inspection mode only too.
         "project.dependency-directory",
+        // The rules of the owner tools.
+        "simulator.devices",
+        "container.build-cache",
+        "homebrew.cleanup",
     ] {
         let outcome = json(
             &world.environment,

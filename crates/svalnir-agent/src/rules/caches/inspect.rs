@@ -143,6 +143,9 @@ pub enum ReclaimFigure {
     /// project still has reclaims nothing for it. Neither the logical size
     /// nor the allocated size is the reclaim figure.
     NotKnownLinkedIntoProjects,
+    /// No figure. The data can share blocks with other data through APFS
+    /// clones, so neither size is the storage that a removal frees.
+    NotKnownClonedStorage,
 }
 
 /// The measurement of one unit.
@@ -670,6 +673,7 @@ pub(in crate::rules) fn measure_unit(
                 bytes: totals.allocated_bytes,
             },
             ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
+            ReclaimBasis::ClonedStorage => ReclaimFigure::NotKnownClonedStorage,
         },
     })
 }

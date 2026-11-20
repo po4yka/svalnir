@@ -184,6 +184,11 @@ wire_enum! {
         /// `node_modules`. The rule has no default location: with no
         /// directory that the user names, it examines nothing.
         UserSelected => "user_selected",
+        /// The prefix of an installation of the producer at a documented
+        /// absolute location, for example `/opt/homebrew`. The relative
+        /// path is below that prefix. It is not below the home directory,
+        /// and the discovery for an eviction gives it no path.
+        ProducerInstallation => "producer_installation",
     }
 }
 

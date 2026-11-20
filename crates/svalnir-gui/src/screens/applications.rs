@@ -10,9 +10,9 @@ use super::common::{
     CardWidth, Shown, body_line, bytes_text, caption, card, cell, fact, failed_body, head,
     mono_text, screen, shown, skeleton_rows, stale_line,
 };
-use super::controls::{open_stop, slot_status};
+use super::controls::{open_state_detail, open_stop};
 use crate::{
-    actions::Slot,
+    actions::{ActionState, Slot},
     data::{
         model::Measured,
         records::{
@@ -23,6 +23,7 @@ use crate::{
     },
     theme::tokens::{self, Tokens},
     ui::action_button::{ActionButton, ButtonVariant},
+    ui::action_status::action_status_short,
     ui::{
         pill::{MonoTag, StatusPill, Tone},
         provenance::ProvenanceLine,
@@ -33,7 +34,7 @@ use gpui_kit::{
     AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
     TestSupportExt as _, Window,
     component::{
-        ActiveTheme as _, IconName, Sizable as _,
+        ActiveTheme as _, IconName, Sizable as _, h_flex,
         table::{Table, TableBody, TableHeader, TableRow},
         v_flex,
     },
@@ -170,8 +171,93 @@ pub const fn stop_offered(protection: Protection) -> bool {
     matches!(protection, Protection::NotProtected)
 }
 
-/// The stop cell of a row: the stop control and the state of its last
-/// stop.
+/// The reason of a stop control that is off while the stop confirmation of
+/// its group is open.
+pub const STOP_OPEN: &str =
+    "The stop confirmation of this group is open, so each stop control is off until it closes.";
+
+/// The number of columns of the group table: the sum of the spans of its
+/// cells.
+const TABLE_SPAN: usize = 20;
+
+/// The state row of the last stop of a group, below the row of the group:
+/// the Stop column is too narrow for the pill and the sentence, so the line
+/// spans the table. It is the short state line: at most two lines of the
+/// sentence, with the full line as its accessible label and, when the
+/// sentence is cut, as its tooltip. The Details button is the keyboard path
+/// to the full line. While the stop confirmation of the group is open, the
+/// row also says that the stop control is off for that reason. `None` when
+/// the group has no stop state and no open confirmation.
+fn stop_state_row(
+    row: &ApplicationRow,
+    entity: &Entity<AppModel>,
+    model: &AppModel,
+    tokens: &Tokens,
+) -> Option<TableRow> {
+    let slot = Slot::Stop(row.instance.clone());
+    let open: bool = model.actions.stop_open() == Some(row.instance.as_str());
+    let state = model.actions.state(&slot);
+    if state.is_none() && !open {
+        return None;
+    }
+    let mut content = v_flex().w_full().min_w_0().gap(tokens::SPACE_1);
+    if open {
+        content = content.child(caption(
+            SharedString::from(format!("applications-stop-open-{}", row.instance)),
+            STOP_OPEN,
+            tokens,
+        ));
+    }
+    if let Some(state) = state {
+        content = content.child(state_with_details(row, entity, &slot, state, tokens));
+    }
+    Some(
+        TableRow::new()
+            .id(SharedString::from(format!(
+                "applications-stop-row-{}",
+                row.instance
+            )))
+            .child(cell(content, TABLE_SPAN, false)),
+    )
+}
+
+/// The short state line of the last stop of `row` and its Details button.
+fn state_with_details(
+    row: &ApplicationRow,
+    entity: &Entity<AppModel>,
+    slot: &Slot,
+    state: &ActionState,
+    tokens: &Tokens,
+) -> AnyElement {
+    let opener: Entity<AppModel> = entity.clone();
+    let slot: Slot = slot.clone();
+    let title: String = format!("Last stop of {}", row.name);
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap(tokens::SPACE_2)
+        .child(div().flex_1().min_w_0().child(action_status_short(
+            SharedString::from(format!("applications-stop-state-{}", row.instance)),
+            state,
+            SystemTime::now(),
+            tokens,
+        )))
+        .child(
+            ActionButton::new(
+                SharedString::from(format!("applications-stop-details-{}", row.instance)),
+                "Details",
+            )
+            .variant(ButtonVariant::Quiet)
+            .on_click(move |_, window, cx| {
+                open_state_detail(&opener, slot.clone(), title.clone(), window, cx);
+            }),
+        )
+        .into_any_element()
+}
+
+/// The stop cell of a row: the stop control. The state of its last stop is
+/// in the row below ([`stop_state_row`]).
 fn stop_cell(
     row: &ApplicationRow,
     entity: &Entity<AppModel>,
@@ -180,7 +266,14 @@ fn stop_cell(
 ) -> AnyElement {
     let slot = Slot::Stop(row.instance.clone());
     let busy: bool = model.actions.is_busy(&slot);
-    let mut column = v_flex().gap(tokens::SPACE_1).items_start();
+    // The window has at most one stop confirmation: while one is open, each
+    // stop control is off, and the row below its group says why.
+    let open: Option<&str> = model.actions.stop_open();
+    let mut column = v_flex()
+        .gap(tokens::SPACE_1)
+        .items_start()
+        .w_full()
+        .min_w_0();
     if stop_offered(row.protection) {
         let opener: Entity<AppModel> = entity.clone();
         let (instance, name) = (row.instance.clone(), row.name.clone());
@@ -191,6 +284,7 @@ fn stop_cell(
             )
             .variant(ButtonVariant::Quiet)
             .loading(busy)
+            .disabled(open.is_some())
             .on_click(move |_, window, cx| {
                 open_stop(&opener, &instance, &name, window, cx);
             }),
@@ -202,15 +296,7 @@ fn stop_cell(
             tokens,
         ));
     }
-    column
-        .children(slot_status(
-            SharedString::from(format!("applications-stop-state-{}", row.instance)),
-            model,
-            &slot,
-            SystemTime::now(),
-            tokens,
-        ))
-        .into_any_element()
+    column.into_any_element()
 }
 
 fn group_table(
@@ -221,7 +307,7 @@ fn group_table(
     mono: &SharedString,
     tokens: &Tokens,
 ) -> AnyElement {
-    let rows = snapshot.applications.iter().map(|row| {
+    let rows = snapshot.applications.iter().flat_map(|row| {
         let (footprint, partial) = group_footprint(row);
         let (protection, tone) = protection_pill(row.protection);
         let mut protection_cell = v_flex().gap(tokens::SPACE_1).items_start().child(
@@ -258,7 +344,7 @@ fn group_table(
                 "partial",
             ));
         }
-        TableRow::new()
+        let group: TableRow = TableRow::new()
             .id(SharedString::from(format!(
                 "applications-row-{}",
                 row.instance
@@ -286,7 +372,8 @@ fn group_table(
             .child(cell(change, 3, true))
             .child(cell(foreground_text(row.foreground), 2, false))
             .child(cell(protection_cell, 3, false))
-            .child(cell(stop_cell(row, entity, model, tokens), 2, false))
+            .child(cell(stop_cell(row, entity, model, tokens), 2, false));
+        std::iter::once(group).chain(stop_state_row(row, entity, model, tokens))
     });
     Table::new()
         .small()

@@ -395,3 +395,33 @@ fn a_removed_item_runs_no_command(cx: &mut TestAppContext) {
     });
     assert_eq!(shown.get(), 0);
 }
+
+/// Regression for D-13 of host run 4: after a resume from the menu, the
+/// menu said "Pause request: Accepted". The line is named after the last
+/// command.
+#[gpui_kit::test]
+fn the_request_line_names_the_last_command(cx: &mut TestAppContext) {
+    let (model, _recorder, _shown) = installed(cx, ActionScript::Unavailable);
+    cx.update(|cx| run_command(MenuCommand::PauseHour, cx));
+    cx.run_until_parked();
+    let paused = view(&model, cx);
+    assert!(
+        infos(&paused).contains(&"Pause request: Accepted".to_owned()),
+        "{:?}",
+        paused.rows
+    );
+    cx.update(|cx| run_command(MenuCommand::Resume, cx));
+    cx.run_until_parked();
+    let resumed = view(&model, cx);
+    let titles = infos(&resumed);
+    assert!(
+        titles.contains(&"Resume request: Accepted".to_owned()),
+        "{titles:?}"
+    );
+    assert!(
+        !titles
+            .iter()
+            .any(|title| title.starts_with("Pause request: ")),
+        "{titles:?}"
+    );
+}

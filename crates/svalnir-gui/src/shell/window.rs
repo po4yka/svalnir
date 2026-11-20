@@ -214,7 +214,7 @@ impl MainWindow {
     fn status_text(&self, cx: &Context<Self>) -> String {
         let model: &AppModel = self.model.read(cx);
         let agent: &str = match &model.agent {
-            Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => snapshot.state.label(),
+            Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => snapshot.state.predicate(),
             Loadable::Loading => "loading",
             Loadable::Unavailable(_) => "unavailable",
         };
@@ -464,7 +464,7 @@ impl MainWindow {
         let (text, color): (String, Rgba) = match &model.agent {
             Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => (
                 agent_line(
-                    snapshot.state.label(),
+                    snapshot.state.predicate(),
                     matches!(model.agent, Loadable::Stale(_)),
                 ),
                 match snapshot.state {
@@ -682,6 +682,24 @@ mod tests {
     fn a_stale_agent_line_says_so() {
         assert_eq!(agent_line("reporting", false), "Agent reporting");
         assert_eq!(agent_line("reporting", true), "Agent reporting (stale)");
+    }
+
+    /// D-12 of host run 4: the footer joined "Agent" and a noun label, so it
+    /// showed "Agent no journal" and "Agent no status".
+    #[test]
+    fn each_agent_line_reads_as_a_sentence() {
+        let at = SystemTime::UNIX_EPOCH;
+        let cases: [(AgentState, &str); 6] = [
+            (AgentState::NoJournal, "Agent has no journal"),
+            (AgentState::NoRecord, "Agent has no status record"),
+            (AgentState::Reporting { since: at }, "Agent reporting"),
+            (AgentState::Silent { last: at }, "Agent silent"),
+            (AgentState::Stopped { at }, "Agent stopped"),
+            (AgentState::Unknown("x".to_owned()), "Agent state unknown"),
+        ];
+        for (state, line) in cases {
+            assert_eq!(agent_line(state.predicate(), false), line);
+        }
     }
 
     #[test]

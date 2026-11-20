@@ -205,9 +205,9 @@ impl ActionPort for FixturePort {
         })
     }
 
-    fn operation_phase(&self, _operation: &str) -> Option<OperationPhase> {
+    fn operation_state(&self, _operation: &str) -> Option<(OperationPhase, String)> {
         match self.script {
-            ActionScript::Accept => Some(OperationPhase::Completed),
+            ActionScript::Accept => Some((OperationPhase::Completed, "Completed".to_owned())),
             _ => None,
         }
     }

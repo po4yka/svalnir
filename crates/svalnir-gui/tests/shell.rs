@@ -231,7 +231,7 @@ fn the_agent_footer_shows_the_state(cx: &mut TestAppContext) {
     let (handle, _view) = open_with(cx, 1120.0, FixtureScenario::AgentAbsent);
     assert_eq!(
         label_of(handle, "nav-agent", cx).as_deref(),
-        Some("Agent no journal")
+        Some("Agent has no journal")
     );
 }
 

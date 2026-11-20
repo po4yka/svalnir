@@ -675,3 +675,161 @@ fn a_short_line_has_a_tooltip_only_when_its_sentence_is_cut(cx: &mut TestAppCont
     assert_eq!(tooltip_of(handle, "fits", cx), None);
     assert_eq!(tooltip_of(handle, "cut", cx).as_deref(), Some(cut.as_str()));
 }
+
+/// Opens the window with `source` at `width` and shows `screen`.
+fn open_at(
+    source: FixtureSource,
+    screen: Screen,
+    width: f32,
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<MainWindow>) {
+    cx.update(gpui_kit::init);
+    cx.update(nav::bind_keys);
+    let (handle, view) = cx.update(|cx| {
+        open_main_window(
+            Bounds::new(Point::default(), size(px(width), px(900.0))),
+            Arc::new(source),
+            None,
+            cx,
+        )
+        .expect("open test window")
+    });
+    cx.run_until_parked();
+    let key: String = format!("cmd-{}", screen.index() + 1);
+    cx.update_window(handle, |_, window, cx| window.press(&key, cx))
+        .unwrap();
+    cx.run_until_parked();
+    (handle, view)
+}
+
+/// Regression for D-14 of host run 4: the pill "Waiting for admission" and
+/// its sentence were wider than the Stop column and were cut at the right
+/// edge of the table. The short state line is now in a row below the row
+/// of the group and spans the table, with the full line as its label, its
+/// tooltip, and in the dialog of the Details button.
+#[gpui_kit::test]
+fn the_state_of_a_stop_stays_inside_its_row(cx: &mut TestAppContext) {
+    for width in [1120.0, 720.0] {
+        let (handle, view) = open_at(
+            FixtureSource::new(FixtureScenario::Healthy).with_actions(ActionScript::Pending),
+            Screen::Applications,
+            width,
+            cx,
+        );
+        let (instance, _name) = stoppable_group(&view, cx);
+        click(handle, &format!("applications-stop-{instance}"), cx);
+        click(handle, "confirm-ok", cx);
+        let id: String = format!("applications-stop-state-{instance}");
+        let Some(state @ ActionState::AwaitingAdmission { .. }) =
+            state_of(&view, &Slot::Stop(instance.clone()), cx)
+        else {
+            panic!("the stop waits for admission");
+        };
+        let row = bounds_of(handle, &format!("applications-row-{instance}"), cx).expect("row");
+        let line = bounds_of(handle, &id, cx).expect("state line");
+        let pill = bounds_of(handle, &format!("{id}-pill"), cx).expect("pill");
+        let window_right: Pixels = px(width);
+        for (what, bounds) in [("line", line), ("pill", pill)] {
+            assert!(
+                bounds.right() <= row.right() + px(1.0) && bounds.right() <= window_right,
+                "{width}: {what} {bounds:?}, row {row:?}"
+            );
+        }
+        let sentence = bounds_of(handle, &format!("{id}-sentence"), cx).expect("sentence");
+        assert!(
+            sentence.size.height <= px(42.0),
+            "{width}: the sentence of the cell is not short: {sentence:?}"
+        );
+        let full: String = label(handle, &id, cx).expect("label");
+        assert!(
+            full.starts_with("Waiting for admission: The plan is recorded"),
+            "{full}"
+        );
+        assert!(full.contains("30 s after the plan expires."), "{full}");
+        assert!(matches!(state, ActionState::AwaitingAdmission { .. }));
+        // The keyboard path to the full line: the Details button opens a
+        // dialog with the full line.
+        assert_eq!(label(handle, "state-detail-line", cx), None);
+        click(handle, &format!("applications-stop-details-{instance}"), cx);
+        let detail = label(handle, "state-detail-line", cx).expect("detail line");
+        assert!(detail.starts_with("Waiting for admission: "), "{detail}");
+        assert!(detail.contains("30 s after the plan expires."), "{detail}");
+        click(handle, "state-detail-close", cx);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(label(handle, "state-detail-line", cx), None);
+    }
+}
+
+/// Regression for D-15 of host run 4: "Stop…" stayed active while its
+/// confirmation was open, and a second press opened a second confirmation
+/// of the same group above the first. The window has at most one stop
+/// confirmation, and each stop control is off while it is open, with the
+/// reason at the control of its group.
+#[gpui_kit::test]
+fn a_second_press_opens_no_second_stop_confirmation(cx: &mut TestAppContext) {
+    let (handle, view) = open(
+        FixtureSource::new(FixtureScenario::Healthy),
+        Screen::Applications,
+        cx,
+    );
+    let (instance, name) = stoppable_group(&view, cx);
+    let model = cx.update(|cx| view.read(cx).model().clone());
+    click(handle, &format!("applications-stop-{instance}"), cx);
+    assert!(label(handle, "confirm-object", cx).is_some());
+    assert_eq!(
+        label(handle, &format!("applications-stop-open-{instance}"), cx).as_deref(),
+        Some(svalnir_gui::screens::applications::STOP_OPEN)
+    );
+    // A second press, by the pointer or by the keyboard, comes to the same
+    // function as the first. It must open no second dialog. With a second
+    // dialog, the next lookup of "confirm-cancel" is ambiguous and fails.
+    cx.update_window(handle, |_, window, cx| {
+        svalnir_gui::screens::controls::open_stop(&model, &instance, &name, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    click(handle, "confirm-cancel", cx);
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    let open: bool = cx
+        .update_window(handle, |_, window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            window.has_active_dialog(cx)
+        })
+        .unwrap();
+    assert!(!open, "one close leaves no stop confirmation open");
+    assert!(cx.update(|cx| view.read(cx).model().read(cx).actions.stop.is_none()));
+    assert_eq!(
+        label(handle, &format!("applications-stop-open-{instance}"), cx),
+        None
+    );
+    // After the close, the control opens the confirmation again.
+    click(handle, &format!("applications-stop-{instance}"), cx);
+    assert!(label(handle, "confirm-object", cx).is_some());
+}
+
+/// Regression for D-17 of host run 4: the tooltip of a cut state line was
+/// one line and was cut at the right edge of the window. The tooltip has a
+/// maximum width, and its text wraps.
+#[gpui_kit::test]
+fn the_tooltip_of_a_cut_line_wraps_in_its_maximum_width(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let window = cx.update(|cx| {
+        cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| ShortLines))
+            .expect("open test window")
+    });
+    let handle: AnyWindowHandle = window.into();
+    cx.run_until_parked();
+    let cut: String = format!("Accepted: {CUT}");
+    assert_eq!(tooltip_of(handle, "cut", cx).as_deref(), Some(cut.as_str()));
+    let tooltip = bounds_of(handle, "cut-tooltip", cx).expect("tooltip");
+    assert!(
+        tooltip.size.width <= px(svalnir_gui::ui::action_status::TOOLTIP_MAX_WIDTH),
+        "the tooltip is wider than its maximum: {tooltip:?}"
+    );
+    assert!(
+        tooltip.size.height > px(24.0),
+        "the text of the tooltip does not wrap: {tooltip:?}"
+    );
+}

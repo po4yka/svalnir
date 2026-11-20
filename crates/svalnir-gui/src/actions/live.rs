@@ -483,13 +483,13 @@ impl ActionPort for LivePort {
         }
     }
 
-    fn operation_phase(&self, operation: &str) -> Option<OperationPhase> {
+    fn operation_state(&self, operation: &str) -> Option<(OperationPhase, String)> {
         let directory: &Path = self.state_directory.as_deref()?;
         let journal = observe::open_existing_journal_read_only(&journal_path(directory)).ok()??;
         let operation = journal
             .try_operation(&OperationId::new(operation).ok()?)
             .ok()??;
-        Some(OperationPhase::of(operation.state()).0)
+        Some(OperationPhase::of(operation.state()))
     }
 }
 
@@ -917,7 +917,7 @@ mod tests {
             port.submit(&Action::Resume),
             ActionState::Unavailable(Unavailable::NoStateDirectory)
         );
-        assert!(port.operation_phase("op-1").is_none());
+        assert!(port.operation_state("op-1").is_none());
     }
 
     #[test]

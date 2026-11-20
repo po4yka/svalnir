@@ -67,7 +67,7 @@ fn fixture_shows_status_and_banner(cx: &mut TestAppContext) {
 fn absent_agent_is_reported(cx: &mut TestAppContext) {
     let (handle, _view) = open(FixtureScenario::AgentAbsent, cx);
     let status = label(handle, "status-line", cx).expect("status line");
-    assert!(status.contains("agent no journal"), "{status}");
+    assert!(status.contains("agent has no journal"), "{status}");
     assert!(label(handle, "data-banner", cx).is_some());
 }
 

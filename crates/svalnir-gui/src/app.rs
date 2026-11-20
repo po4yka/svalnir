@@ -61,6 +61,9 @@ Options:
                        History shows the state line of the cancel
   --open-stop         With --fixture only: open the stop confirmation of
                        the first group that the catalog does not protect
+  --send-stop          With --fixture only: send the quit of the first group
+                       that the catalog does not protect at launch, so that
+                       its row on Applications shows the state of the stop
   --no-status-item     Add no item to the menu bar. The client then quits
                        when its last window closes
   --help               Print this text
@@ -125,6 +128,9 @@ pub struct LaunchOptions {
     /// Whether the stop confirmation of the first group that the catalog
     /// does not protect opens at launch.
     pub open_stop: bool,
+    /// Whether the quit of the first group that the catalog does not
+    /// protect is sent at launch. Fixture only.
+    pub send_stop: bool,
     /// Whether the menu bar item is off.
     pub no_status_item: bool,
     /// Whether `--help` was given.
@@ -270,6 +276,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                 );
             }
             "--open-stop" => options.open_stop = true,
+            "--send-stop" => options.send_stop = true,
             "--no-status-item" => options.no_status_item = true,
             "--help" | "-h" => options.help = true,
             other => return Err(format!("unknown argument `{other}`")),
@@ -294,6 +301,11 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
     }
     if options.open_stop && options.fixture.is_none() {
         return Err("`--open-stop` is valid only with `--fixture`".to_owned());
+    }
+    // A stop of the live source signals processes, so the launch option
+    // takes only a fixture, which records nothing and signals nothing.
+    if options.send_stop && options.fixture.is_none() {
+        return Err("`--send-stop` is valid only with `--fixture`".to_owned());
     }
     Ok(options)
 }
@@ -326,6 +338,68 @@ fn open_fixture_stop(
     });
     if let Err(error) = opened {
         tracing::error!(%error, "cannot open the stop confirmation");
+    }
+}
+
+/// Sends the quit of the first group of the fixture `scenario` that the
+/// catalog does not protect through the model, as the Quit button of the
+/// stop confirmation does, for a screenshot of the state of the stop. Only a
+/// fixture source calls it: the fixture path records nothing and signals no
+/// process.
+fn send_fixture_stop(
+    view: &Entity<MainWindow>,
+    scenario: FixtureScenario,
+    script: ActionScript,
+    cx: &mut App,
+) {
+    let source: FixtureSource = FixtureSource::new(scenario).with_actions(script);
+    let group = source.processes().ok().and_then(|processes| {
+        processes
+            .applications
+            .into_iter()
+            .find(|row| row.protection == crate::data::records::Protection::NotProtected)
+    });
+    let Some(group) = group else {
+        tracing::error!("the fixture has no group that the catalog does not protect");
+        return;
+    };
+    let proposal = match source.actions().prepare_stop(&group.instance, &group.name) {
+        Ok(proposal) => proposal,
+        Err(state) => {
+            tracing::error!(?state, "the fixture made no stop plan");
+            return;
+        }
+    };
+    let model: Entity<AppModel> = view.read(cx).model().clone();
+    let action = Action::Stop {
+        proposal: Arc::new(proposal),
+        force: false,
+    };
+    model.update(cx, |model, cx| model.run_action(action, cx));
+}
+
+/// Applies the launch options that open a detail or a dialog, or send a
+/// fixture action: `--detail`, `--cancel`, `--send-stop`, and `--open-stop`.
+fn apply_launch_actions(
+    handle: AnyWindowHandle,
+    view: &Entity<MainWindow>,
+    options: &LaunchOptions,
+    cx: &mut App,
+) {
+    if let Some(operation) = &options.detail {
+        view.update(cx, |view, cx| view.show_history_detail(operation, cx));
+    }
+    if let (Some(operation), Some(_)) = (&options.cancel, options.fixture) {
+        send_fixture_cancel(view, operation, cx);
+    }
+    if let (true, Some(scenario)) = (options.send_stop, options.fixture) {
+        let script: ActionScript = options
+            .actions
+            .unwrap_or_else(|| ActionScript::of(scenario));
+        send_fixture_stop(view, scenario, script, cx);
+    }
+    if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
+        open_fixture_stop(handle, view, scenario, cx);
     }
 }
 
@@ -555,15 +629,7 @@ pub fn run() -> ExitCode {
         if let Some(target) = options.focus {
             request_launch_focus(target, cx);
         }
-        if let Some(operation) = &options.detail {
-            view.update(cx, |view, cx| view.show_history_detail(operation, cx));
-        }
-        if let (Some(operation), Some(_)) = (&options.cancel, options.fixture) {
-            send_fixture_cancel(&view, operation, cx);
-        }
-        if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
-            open_fixture_stop(handle, &view, scenario, cx);
-        }
+        apply_launch_actions(handle, &view, &options, cx);
         if let Some(root) = &options.scan {
             let model: Entity<AppModel> = view.read(cx).model().clone();
             let rescan: bool = options.rescan;
@@ -599,6 +665,7 @@ mod tests {
         assert!(parse(&["--detail", "op-1"]).is_err());
         assert!(parse(&["--open-stop"]).is_err());
         assert!(parse(&["--cancel", "op-1"]).is_err());
+        assert!(parse(&["--send-stop"]).is_err());
         assert!(parse(&["--fixture", "healthy", "--detail"]).is_err());
         assert!(parse(&["--fixture", "healthy", "--cancel"]).is_err());
         assert_eq!(
@@ -642,6 +709,7 @@ mod tests {
             "--cancel",
             "op-2",
             "--open-stop",
+            "--send-stop",
             "--no-status-item",
             "--help",
         ]);
@@ -663,6 +731,7 @@ mod tests {
                 detail: Some("op-1".to_owned()),
                 cancel: Some("op-2".to_owned()),
                 open_stop: true,
+                send_stop: true,
                 no_status_item: true,
                 help: true,
             })

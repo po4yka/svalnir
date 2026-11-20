@@ -188,7 +188,7 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    /// The label for the status line.
+    /// The value of the line "Agent: VALUE" of the menu bar item.
     #[must_use]
     pub const fn label(&self) -> &'static str {
         match self {
@@ -198,6 +198,21 @@ impl AgentState {
             Self::Stopped { .. } => "stopped",
             Self::NoRecord => "no status",
             Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The predicate that follows the word "Agent" in a sentence, as in the
+    /// footer of the sidebar and the status line: "Agent has no journal",
+    /// not "Agent no journal".
+    #[must_use]
+    pub const fn predicate(&self) -> &'static str {
+        match self {
+            Self::NoJournal => "has no journal",
+            Self::Reporting { .. } => "reporting",
+            Self::Silent { .. } => "silent",
+            Self::Stopped { .. } => "stopped",
+            Self::NoRecord => "has no status record",
+            Self::Unknown(_) => "state unknown",
         }
     }
 

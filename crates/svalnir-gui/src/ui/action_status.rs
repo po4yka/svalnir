@@ -18,6 +18,11 @@ use std::{cell::Cell, rc::Rc, time::SystemTime};
 /// The largest number of lines of the sentence in a short state line.
 pub const SHORT_LINES: usize = 2;
 
+/// The largest width of the tooltip of a cut line, in pixels. A longer
+/// text wraps onto more lines, so that the tooltip stays inside a window of
+/// the minimum width and its end can be read.
+pub const TOOLTIP_MAX_WIDTH: f32 = 320.0;
+
 /// How much of the sentence a state line shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fit {
@@ -133,6 +138,8 @@ fn cut_tooltip(
             .id(id.clone())
             .test_support()
             .aria_label(label.clone())
+            .max_w(px(TOOLTIP_MAX_WIDTH))
+            .whitespace_normal()
             .child(label.clone())
     })
     .build(window, cx)

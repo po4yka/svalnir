@@ -408,7 +408,8 @@ fn stop_body(
 
 /// Opens the stop confirmation of the group `instance`, and makes its
 /// plans in the background. The dialog shows the processes that the plans
-/// bind; it removes the stop buttons when the plans expire.
+/// bind; it removes the stop buttons when the plans expire. While a stop
+/// confirmation is open, it opens no second one.
 pub fn open_stop(
     model: &Entity<AppModel>,
     instance: &str,
@@ -417,7 +418,9 @@ pub fn open_stop(
     cx: &mut App,
 ) {
     let (instance, name): (String, String) = (instance.to_owned(), name.to_owned());
-    model.update(cx, |model, cx| model.prepare_stop(&instance, &name, cx));
+    if !model.update(cx, |model, cx| model.prepare_stop(&instance, &name, cx)) {
+        return;
+    }
     let model: Entity<AppModel> = model.clone();
     // The list keeps its scroll position and its focus handle while the
     // dialog is open.
@@ -470,7 +473,7 @@ pub fn open_stop(
                             .variant(ButtonVariant::Secondary)
                             .fit()
                             .on_click(move |_, _, cx| {
-                                again.update(cx, |model, cx| model.prepare_stop(&instance, &name, cx));
+                                again.update(cx, |model, cx| model.renew_stop(&instance, &name, cx));
                             })
                             .into_any_element(),
                     ]))
@@ -505,6 +508,35 @@ pub fn open_stop(
                     ]))
             }
         }
+    });
+}
+
+/// Opens a dialog with the full state line of `slot`, for a screen that
+/// shows the short line in a dense row. The keyboard reaches the full text
+/// through the button that opens it. The dialog reads the state at each
+/// frame, so a state that changes while it is open shows the new state.
+pub fn open_state_detail(
+    model: &Entity<AppModel>,
+    slot: Slot,
+    title: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let model: Entity<AppModel> = model.clone();
+    window.open_dialog(cx, move |dialog: Dialog, _window, cx| {
+        let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
+        let state: Option<ActionState> = model.read(cx).actions.state(&slot).cloned();
+        let body: AnyElement = match state {
+            Some(state) => action_status("state-detail-line", &state, SystemTime::now(), tokens),
+            None => body_line("state-detail-none", "No request was sent.", true, tokens),
+        };
+        dialog.title(title.clone()).child(body).footer(footer(vec![
+            ActionButton::new("state-detail-close", "Close")
+                .variant(ButtonVariant::Secondary)
+                .fit()
+                .on_click(|_, window, cx| window.close_dialog(cx))
+                .into_any_element(),
+        ]))
     });
 }
 

@@ -363,6 +363,9 @@ pub enum ActionState {
         operation: String,
         /// The phase of its final record.
         phase: OperationPhase,
+        /// The operation-state name of its final record in the journal, for
+        /// example "Incomplete". Two states can have one phase.
+        state: String,
     },
     /// The window did not read the final record of the stop operation in
     /// time. The operation can still end; History shows it.
@@ -418,8 +421,11 @@ impl ActionState {
                 ("Waiting for admission", Tone::Brand, IconName::Loader)
             }
             Self::WaitingForExit { .. } => ("Waiting for exit", Tone::Brand, IconName::Loader),
-            Self::Settled { phase, .. } => match phase {
+            Self::Settled { phase, state, .. } => match phase {
                 OperationPhase::Completed => ("Exited", Tone::Positive, IconName::CircleCheck),
+                OperationPhase::Partial if state == "Incomplete" => {
+                    ("Incomplete", Tone::Warning, IconName::TriangleAlert)
+                }
                 OperationPhase::Partial => ("Partial", Tone::Warning, IconName::TriangleAlert),
                 OperationPhase::NoAction => ("No action", Tone::Neutral, IconName::Minus),
                 OperationPhase::Failed => ("Failed", Tone::Negative, IconName::CircleX),
@@ -448,14 +454,15 @@ impl ActionState {
                 let seconds: u64 = now.duration_since(*since).map_or(0, |age| age.as_secs());
                 format!("The agent admitted operation {operation}. Waiting for exit: {seconds} s.")
             }
-            Self::Settled { operation, phase } => match phase {
+            Self::Settled {
+                operation,
+                phase,
+                state,
+            } => match phase {
                 OperationPhase::Completed => {
                     format!("Operation {operation} completed: the agent confirmed the exit.")
                 }
-                _ => format!(
-                    "Operation {operation} ended in the state {}. See History.",
-                    phase_name(*phase)
-                ),
+                _ => format!("Operation {operation} ended in the state {state}. See History."),
             },
             Self::ExitNotConfirmed { operation } => format!("The window did not read the final record of operation {operation} in 5 min. The operation can still end; History shows its state."),
             Self::Queued => "The agent did not answer before the end of the wait. The request stays in the queue, and the agent can decide it later. See History.".to_owned(),
@@ -466,18 +473,6 @@ impl ActionState {
             Self::Refused { code, reason } => format!("{reason} ({code}). Nothing changed."),
             Self::Unavailable(cause) => cause.sentence(),
         }
-    }
-}
-
-const fn phase_name(phase: OperationPhase) -> &'static str {
-    match phase {
-        OperationPhase::Pending => "Pending",
-        OperationPhase::Running => "Running",
-        OperationPhase::Completed => "Completed",
-        OperationPhase::Partial => "Partial",
-        OperationPhase::NoAction => "NoAction",
-        OperationPhase::Failed => "Failed",
-        OperationPhase::Unknown => "UnknownOutcome",
     }
 }
 
@@ -568,8 +563,9 @@ pub trait ActionPort: Send + Sync + Debug {
     /// Returns the state of a refusal or of an unavailable agent.
     fn prepare_stop(&self, instance: &str, name: &str) -> Result<StopProposal, ActionState>;
 
-    /// The phase of the operation `operation`, when the journal has it.
-    fn operation_phase(&self, operation: &str) -> Option<OperationPhase>;
+    /// The phase and the operation-state name of the operation
+    /// `operation`, when the journal has it.
+    fn operation_state(&self, operation: &str) -> Option<(OperationPhase, String)>;
 
     /// The state of a stop whose request `request` waits for admission:
     /// `WaitingForExit` when the agent admitted the plan, or the refusal.
@@ -581,6 +577,9 @@ pub trait ActionPort: Send + Sync + Debug {
 #[derive(Debug, Default)]
 pub struct ActionBook {
     states: HashMap<Slot, ActionState>,
+    /// The name of the last action of each slot ([`Action::verb`]). Two
+    /// actions can share one slot, for example a pause and a resume.
+    verbs: HashMap<Slot, &'static str>,
     /// The stop dialog: the instance and its plans.
     pub stop: Option<(String, Proposal)>,
     /// The number of the latest preparation of stop plans. A result of an
@@ -600,12 +599,52 @@ impl ActionBook {
         self.states.insert(slot, state);
     }
 
+    /// Records that `action` is the last action of its slot, with the state
+    /// `state`.
+    pub fn start(&mut self, action: &Action, state: ActionState) {
+        let slot: Slot = action.slot();
+        self.verbs.insert(slot.clone(), action.verb());
+        self.states.insert(slot, state);
+    }
+
+    /// The name of the last action of `slot`, for example "Resume".
+    #[must_use]
+    pub fn verb(&self, slot: &Slot) -> Option<&'static str> {
+        self.verbs.get(slot).copied()
+    }
+
     /// Opens the stop dialog of `instance` with plans that are being made,
-    /// and gives the number of this preparation.
-    pub fn open_stop(&mut self, instance: &str) -> u64 {
+    /// and gives the number of this preparation. Gives `None` and changes
+    /// nothing while a stop dialog is open: the window has at most one stop
+    /// confirmation, so a second press of a stop control opens no second
+    /// dialog.
+    pub fn open_stop(&mut self, instance: &str) -> Option<u64> {
+        if self.stop.is_some() {
+            return None;
+        }
         self.stop_request = self.stop_request.wrapping_add(1);
         self.stop = Some((instance.to_owned(), Proposal::Preparing));
-        self.stop_request
+        Some(self.stop_request)
+    }
+
+    /// Makes new plans in the open stop dialog of `instance`, and gives the
+    /// number of this preparation. Gives `None` when no stop dialog of
+    /// `instance` is open.
+    pub fn renew_stop(&mut self, instance: &str) -> Option<u64> {
+        match &mut self.stop {
+            Some((open, proposal)) if open == instance => {
+                *proposal = Proposal::Preparing;
+                self.stop_request = self.stop_request.wrapping_add(1);
+                Some(self.stop_request)
+            }
+            _ => None,
+        }
+    }
+
+    /// The group whose stop dialog is open.
+    #[must_use]
+    pub fn stop_open(&self) -> Option<&str> {
+        self.stop.as_ref().map(|(instance, _)| instance.as_str())
     }
 
     /// Records the plans of the preparation `request`. Returns `false` and
@@ -709,18 +748,20 @@ impl ActionBook {
             .collect()
     }
 
-    /// Records the phase of a stop operation that waits for the exit. A
-    /// phase that is not final changes nothing.
-    pub fn settle(&mut self, slot: &Slot, operation: &str, phase: OperationPhase) {
+    /// Records the phase and the operation-state name `state` of a stop
+    /// operation that waits for the exit. A phase that is not final changes
+    /// nothing.
+    pub fn settle(&mut self, slot: &Slot, operation: &str, phase: OperationPhase, state: &str) {
         if matches!(phase, OperationPhase::Pending | OperationPhase::Running) {
             return;
         }
-        if let Some(state) = self.states.get_mut(slot)
-            && matches!(state, ActionState::WaitingForExit { operation: waiting, .. } if waiting == operation)
+        if let Some(current) = self.states.get_mut(slot)
+            && matches!(current, ActionState::WaitingForExit { operation: waiting, .. } if waiting == operation)
         {
-            *state = ActionState::Settled {
+            *current = ActionState::Settled {
                 operation: operation.to_owned(),
                 phase,
+                state: state.to_owned(),
             };
         }
     }
@@ -823,12 +864,12 @@ mod tests {
         );
         assert_eq!(book.waiting(), vec![(slot.clone(), "op-1".to_owned())]);
         // A phase that is not final changes nothing.
-        book.settle(&slot, "op-1", OperationPhase::Running);
+        book.settle(&slot, "op-1", OperationPhase::Running, "Running");
         assert!(book.is_busy(&slot));
         // A different operation changes nothing.
-        book.settle(&slot, "op-2", OperationPhase::Completed);
+        book.settle(&slot, "op-2", OperationPhase::Completed, "Completed");
         assert!(book.is_busy(&slot));
-        book.settle(&slot, "op-1", OperationPhase::Completed);
+        book.settle(&slot, "op-1", OperationPhase::Completed, "Completed");
         assert_eq!(
             book.state(&slot).map(|state| state.pill().0),
             Some("Exited")
@@ -839,9 +880,9 @@ mod tests {
     #[test]
     fn only_the_latest_preparation_of_an_open_dialog_is_kept() {
         let mut book = ActionBook::default();
-        let first = book.open_stop("app-1");
+        let first = book.open_stop("app-1").unwrap_or_else(|| panic!("open"));
         // The user asks for new plans while the first preparation runs.
-        let second = book.open_stop("app-1");
+        let second = book.renew_stop("app-1").unwrap_or_else(|| panic!("renew"));
         let late = Proposal::Ready(proposal(SystemTime::UNIX_EPOCH));
         assert!(!book.finish_stop(first, late));
         assert!(matches!(book.stop, Some((_, Proposal::Preparing))));
@@ -850,9 +891,9 @@ mod tests {
             Proposal::Failed(ActionState::refused("group_not_found"))
         ));
         // A dialog that closed and opened again keeps no earlier result.
-        let third = book.open_stop("app-1");
+        let third = book.renew_stop("app-1").unwrap_or_else(|| panic!("renew"));
         book.close_stop();
-        let fourth = book.open_stop("app-1");
+        let fourth = book.open_stop("app-1").unwrap_or_else(|| panic!("open"));
         assert!(!book.finish_stop(third, Proposal::Preparing));
         assert!(book.finish_stop(fourth, Proposal::Preparing));
         book.close_stop();
@@ -932,15 +973,69 @@ mod tests {
         assert!(sentence.ends_with("(unexpected_completion)."), "{sentence}");
     }
 
+    /// D-15 of host run 4: a second press of "Stop…" while the confirmation
+    /// was open opened a second confirmation of the same group.
+    #[test]
+    fn the_window_has_at_most_one_stop_confirmation() {
+        let mut book = ActionBook::default();
+        let first = book.open_stop("app-1").unwrap_or_else(|| panic!("open"));
+        assert_eq!(book.open_stop("app-1"), None);
+        assert_eq!(book.open_stop("app-2"), None);
+        assert_eq!(book.stop_open(), Some("app-1"));
+        // New plans in the open dialog replace the earlier preparation.
+        assert_eq!(book.renew_stop("app-2"), None);
+        let second = book.renew_stop("app-1").unwrap_or_else(|| panic!("renew"));
+        assert!(!book.finish_stop(first, Proposal::Preparing));
+        assert!(book.finish_stop(second, Proposal::Preparing));
+        book.close_stop();
+        assert_eq!(book.stop_open(), None);
+        assert!(book.open_stop("app-2").is_some());
+    }
+
+    /// D-16 of host run 4: the Applications row said "ended in the state
+    /// Partial" for an operation whose journal state is `Incomplete`.
+    #[test]
+    fn a_settled_stop_names_the_state_of_the_journal() {
+        let mut book = ActionBook::default();
+        let slot = Slot::Stop("app-1".to_owned());
+        book.set(
+            slot.clone(),
+            ActionState::WaitingForExit {
+                operation: "op-1".to_owned(),
+                since: SystemTime::UNIX_EPOCH,
+            },
+        );
+        book.settle(&slot, "op-1", OperationPhase::Partial, "Incomplete");
+        let state = book.state(&slot).unwrap_or_else(|| panic!("state"));
+        assert_eq!(
+            state.sentence(SystemTime::UNIX_EPOCH),
+            "Operation op-1 ended in the state Incomplete. See History."
+        );
+        assert_eq!(state.pill().0, "Incomplete");
+        let partial = ActionState::Settled {
+            operation: "op-2".to_owned(),
+            phase: OperationPhase::Partial,
+            state: "Partial".to_owned(),
+        };
+        assert_eq!(partial.pill().0, "Partial");
+        assert!(
+            partial
+                .sentence(SystemTime::UNIX_EPOCH)
+                .contains("state Partial.")
+        );
+    }
+
     #[test]
     fn an_unknown_outcome_is_not_a_failure() {
         let unknown = ActionState::Settled {
             operation: "op".to_owned(),
             phase: OperationPhase::Unknown,
+            state: "UnknownOutcome".to_owned(),
         };
         let failed = ActionState::Settled {
             operation: "op".to_owned(),
             phase: OperationPhase::Failed,
+            state: "Failed".to_owned(),
         };
         assert_ne!(unknown.pill().1, failed.pill().1);
         assert!(

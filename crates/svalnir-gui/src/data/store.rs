@@ -539,7 +539,7 @@ impl AppModel {
         if matches!(action, Action::Stop { .. }) {
             self.actions.stop = None;
         }
-        self.actions.set(slot.clone(), ActionState::Pending);
+        self.actions.start(&action, ActionState::Pending);
         cx.notify();
         let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
         cx.spawn(async move |this, cx: &mut AsyncApp| {
@@ -562,8 +562,26 @@ impl AppModel {
 
     /// Opens the stop dialog of the group `instance` and makes its plans on
     /// a background thread. Nothing is recorded until a confirmation.
-    pub fn prepare_stop(&mut self, instance: &str, name: &str, cx: &mut Context<Self>) {
-        let request: u64 = self.actions.open_stop(instance);
+    /// Returns `false` and does nothing while a stop dialog is open, so the
+    /// window has at most one stop confirmation.
+    pub fn prepare_stop(&mut self, instance: &str, name: &str, cx: &mut Context<Self>) -> bool {
+        let Some(request) = self.actions.open_stop(instance) else {
+            return false;
+        };
+        self.make_stop_plans(request, instance, name, cx);
+        true
+    }
+
+    /// Makes new plans in the open stop dialog of the group `instance`.
+    /// Does nothing when no stop dialog of `instance` is open.
+    pub fn renew_stop(&mut self, instance: &str, name: &str, cx: &mut Context<Self>) {
+        if let Some(request) = self.actions.renew_stop(instance) {
+            self.make_stop_plans(request, instance, name, cx);
+        }
+    }
+
+    /// Makes the plans of the preparation `request` on a background thread.
+    fn make_stop_plans(&self, request: u64, instance: &str, name: &str, cx: &mut Context<Self>) {
         cx.notify();
         let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
         let (instance, name): (String, String) = (instance.to_owned(), name.to_owned());
@@ -635,13 +653,13 @@ impl AppModel {
             let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
             cx.spawn(async move |this, cx: &mut AsyncApp| {
                 let id: String = operation.clone();
-                let phase = cx
-                    .background_spawn(async move { port.operation_phase(&id) })
+                let read = cx
+                    .background_spawn(async move { port.operation_state(&id) })
                     .await;
-                if let Some(phase) = phase
+                if let Some((phase, state)) = read
                     && this
                         .update(cx, |model, cx| {
-                            model.actions.settle(&slot, &operation, phase);
+                            model.actions.settle(&slot, &operation, phase, &state);
                             cx.notify();
                         })
                         .is_err()

@@ -405,11 +405,22 @@ fn push_pause_rows(model: &AppModel, now: SystemTime, rows: &mut Vec<MenuRow>) -
     if let Some(state) = model.actions.state(&Slot::Pause) {
         let (text, _tone, _icon) = state.pill();
         rows.push(MenuRow::Info {
-            title: format!("Pause request: {text}"),
+            title: request_line(model.actions.verb(&Slot::Pause), text),
             detail: Some(state.sentence(now)),
         });
     }
     pause_text
+}
+
+/// The title of the state line of the last request of the pause slot: it is
+/// named after the last command, because a pause and a resume share the
+/// slot. "Last request" when the command is not known.
+#[must_use]
+pub fn request_line(verb: Option<&str>, pill: &str) -> String {
+    match verb {
+        Some(verb) => format!("{verb} request: {pill}"),
+        None => format!("Last request: {pill}"),
+    }
 }
 
 /// The paint of the grid and the tone of the pressure dot of `model`.

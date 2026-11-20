@@ -563,6 +563,13 @@ pub struct CandidateSet {
     pub complete: bool,
     /// The candidates.
     pub candidates: Vec<PreparedCandidate>,
+    /// True when the runtime learned, after the examination, that an
+    /// approved root changed (an `FSEvents` invalidation). In the warning
+    /// band the disk guard asks for a bounded discovery again, as for a set
+    /// that is old. The set still supports the examination of the known
+    /// candidates in an incident: each target is checked again at
+    /// admission, and the flag authorizes nothing.
+    pub invalidated: bool,
 }
 
 /// How the runtime prepares candidates.

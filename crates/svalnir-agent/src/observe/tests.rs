@@ -383,6 +383,7 @@ fn the_capability_summary_of_the_agent_has_the_freshness_of_its_status() {
             remediation: None,
         }],
         notifications: None,
+        catalog_watch: None,
     };
     let mut status: AgentStatus = agent_status(100, RunState::Running, None);
     status.capabilities = Some(summary.clone());
@@ -390,7 +391,7 @@ fn the_capability_summary_of_the_agent_has_the_freshness_of_its_status() {
     assert_eq!(
         capabilities(400),
         AgentCapabilityReading::Recorded {
-            summary: summary.clone(),
+            summary: Box::new(summary.clone()),
             freshness: Freshness::Stale {
                 age: Nanoseconds::new(300 * SECOND)
             }

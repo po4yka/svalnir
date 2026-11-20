@@ -1,6 +1,6 @@
 //! `doctor`: the capability report of this process, the notification
-//! capability of the agent from its status record, and the latest
-//! permanent start error of the agent.
+//! capability and the catalog invalidation capability of the agent from
+//! its status record, and the latest permanent start error of the agent.
 //!
 //! A denied or unknown capability is a successful diagnostic, so the exit
 //! status is 0 for each verdict (`docs/INTERFACES.md` section 8).
@@ -9,6 +9,7 @@ use serde::Serialize;
 use svalnir_agent::capability::{self, CapabilityReport, WorkerRole};
 use svalnir_agent::notify::NotificationStatus;
 use svalnir_agent::observe::{self, AgentCapabilityReading, Freshness};
+use svalnir_agent::runtime::invalidation::CatalogWatchStatus;
 use svalnir_core::time::WallTime;
 
 use super::start_failure::StartFailureView;
@@ -132,30 +133,42 @@ enum AgentNotificationsView {
     },
 }
 
+/// The capability summary of the agent from its status record. The read
+/// makes no state directory and no journal.
+fn read_agent_capabilities(invocation: &Invocation<'_>) -> AgentCapabilityReading {
+    let journal = match super::session::open_existing_journal(invocation.environment) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return AgentCapabilityReading::NoStatus,
+        Err(error) => {
+            return AgentCapabilityReading::Unreadable {
+                reason: error.message,
+            };
+        }
+    };
+    let now: WallTime =
+        WallTime::try_from(std::time::SystemTime::now()).unwrap_or(WallTime::UNIX_EPOCH);
+    observe::agent_capabilities(&observe::read_status(&journal, now))
+}
+
 impl AgentNotificationsView {
-    fn read(invocation: &Invocation<'_>) -> Self {
-        let journal = match super::session::open_existing_journal(invocation.environment) {
-            Ok(Some(journal)) => journal,
-            Ok(None) => return Self::NoStatus,
-            Err(error) => {
-                return Self::Unreadable {
-                    reason: error.message,
-                };
-            }
-        };
-        let now: WallTime =
-            WallTime::try_from(std::time::SystemTime::now()).unwrap_or(WallTime::UNIX_EPOCH);
-        match observe::agent_capabilities(&observe::read_status(&journal, now)) {
+    fn of(reading: &AgentCapabilityReading) -> Self {
+        match reading {
             AgentCapabilityReading::NoStatus => Self::NoStatus,
-            AgentCapabilityReading::Unreadable { reason } => Self::Unreadable { reason },
-            AgentCapabilityReading::NotRecorded { freshness } => Self::NotRecorded { freshness },
+            AgentCapabilityReading::Unreadable { reason } => Self::Unreadable {
+                reason: reason.clone(),
+            },
+            AgentCapabilityReading::NotRecorded { freshness } => Self::NotRecorded {
+                freshness: *freshness,
+            },
             AgentCapabilityReading::Recorded { summary, freshness } => {
-                match summary.notifications {
+                match &summary.notifications {
                     Some(notifications) => Self::Recorded {
-                        freshness,
-                        notifications,
+                        freshness: *freshness,
+                        notifications: notifications.clone(),
                     },
-                    None => Self::NotRecorded { freshness },
+                    None => Self::NotRecorded {
+                        freshness: *freshness,
+                    },
                 }
             }
         }
@@ -207,6 +220,98 @@ impl AgentNotificationsView {
     }
 }
 
+/// The `FSEvents` invalidation of the candidate catalog of the agent, as its
+/// status record has it. Only the agent has a candidate source.
+#[derive(Debug, Serialize)]
+#[serde(tag = "reading", rename_all = "snake_case")]
+enum AgentCatalogWatchView {
+    /// The state directory has no journal, or no status record.
+    NoStatus,
+    /// The journal or the status record cannot be read.
+    Unreadable { reason: String },
+    /// The status record has no catalog invalidation capability.
+    NotRecorded { freshness: Freshness },
+    /// The capability.
+    Recorded {
+        freshness: Freshness,
+        #[serde(flatten)]
+        watch: CatalogWatchStatus,
+    },
+}
+
+impl AgentCatalogWatchView {
+    fn of(reading: &AgentCapabilityReading) -> Self {
+        match reading {
+            AgentCapabilityReading::NoStatus => Self::NoStatus,
+            AgentCapabilityReading::Unreadable { reason } => Self::Unreadable {
+                reason: reason.clone(),
+            },
+            AgentCapabilityReading::NotRecorded { freshness } => Self::NotRecorded {
+                freshness: *freshness,
+            },
+            AgentCapabilityReading::Recorded { summary, freshness } => {
+                match &summary.catalog_watch {
+                    Some(watch) => Self::Recorded {
+                        freshness: *freshness,
+                        watch: watch.clone(),
+                    },
+                    None => Self::NotRecorded {
+                        freshness: *freshness,
+                    },
+                }
+            }
+        }
+    }
+
+    fn render(&self, out: &mut String) {
+        out.push_str(
+            "Agent catalog invalidation (agent.catalog_watch, from the status record of the agent)\n",
+        );
+        match self {
+            Self::NoStatus => out.push_str(
+                "  No status record of the agent: no agent ran on this state directory.\n",
+            ),
+            Self::Unreadable { reason } => {
+                put_line!(
+                    out,
+                    "  The status record cannot be read: {}",
+                    escape(reason)
+                );
+            }
+            Self::NotRecorded { .. } => {
+                out.push_str(
+                    "  The status record has no catalog invalidation capability of the agent.\n",
+                );
+            }
+            Self::Recorded { freshness, watch } => {
+                put_line!(
+                    out,
+                    "  State: {} ({})",
+                    escape(watch.state.as_str()),
+                    freshness_text(freshness)
+                );
+                put_line!(out, "  {}", escape(&watch.detail));
+                let counts = &watch.counts;
+                put_line!(
+                    out,
+                    "  Stream of {} approved roots: {} events, {} dirty regions, {} full reconciliations{}, {} invalidations",
+                    watch.roots,
+                    counts.events,
+                    counts.regions,
+                    counts.reconciliations,
+                    counts
+                        .last_reconcile_reason
+                        .map_or_else(String::new, |reason| format!(
+                            " (latest: {})",
+                            reason.as_str()
+                        )),
+                    counts.invalidations
+                );
+            }
+        }
+    }
+}
+
 fn freshness_text(freshness: &Freshness) -> &'static str {
     match freshness {
         Freshness::Current { .. } => "current status record",
@@ -217,13 +322,14 @@ fn freshness_text(freshness: &Freshness) -> &'static str {
 }
 
 /// The result of `doctor`: the capability report of this process, the
-/// notification capability of the agent, and the latest permanent start
-/// error of the agent.
+/// notification capability and the catalog invalidation capability of the
+/// agent, and the latest permanent start error of the agent.
 #[derive(Debug, Serialize)]
 struct DoctorView {
     #[serde(flatten)]
     report: CapabilityReport,
     agent_notifications: AgentNotificationsView,
+    agent_catalog_watch: AgentCatalogWatchView,
     agent_start_failure: StartFailureView,
 }
 
@@ -231,6 +337,8 @@ fn render_view(view: &DoctorView) -> String {
     let mut out: String = render(&view.report);
     out.push('\n');
     view.agent_notifications.render(&mut out);
+    out.push('\n');
+    view.agent_catalog_watch.render(&mut out);
     out.push('\n');
     view.agent_start_failure.render(&mut out);
     out
@@ -253,9 +361,11 @@ pub(crate) fn run(invocation: &mut Invocation<'_>) -> Result<ExitStatus, Command
             capability::diagnose(WorkerRole::Cli)
         }
     };
+    let agent: AgentCapabilityReading = read_agent_capabilities(invocation);
     let view = DoctorView {
         report,
-        agent_notifications: AgentNotificationsView::read(invocation),
+        agent_notifications: AgentNotificationsView::of(&agent),
+        agent_catalog_watch: AgentCatalogWatchView::of(&agent),
         agent_start_failure: StartFailureView::read(invocation.environment),
     };
     invocation.emit(Kind::Report, &view, render_view)?;

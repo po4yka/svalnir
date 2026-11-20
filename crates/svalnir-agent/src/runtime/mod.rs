@@ -21,6 +21,7 @@
 //! | [`run`] | The threads of the agent: the driver on the calling thread and one collector thread. |
 //! | [`AgentStatus`], [`LifecycleRecord`] | The records that the agent writes to the journal. A client reads [`AgentStatus`] with [`OperationJournal::agent_record`](crate::journal::OperationJournal::agent_record) and [`AgentRecord::Status`](crate::journal::AgentRecord). |
 //! | [`launch_agent::render`] | The property list of a conventional per-user `LaunchAgent`, as text. Nothing here installs it. |
+//! | [`invalidation`] | The `FSEvents` invalidation of the candidate catalog: the consumer of the events on the approved roots, and the capability that the status record keeps. |
 //! | [`start_failure`] | The classes of start errors, and the record of the latest permanent start error in the state directory. |
 //! | [`Collector`], [`CandidateSource`], [`AgentClock`], [`Notifier`], [`SelfFootprint`] | The interfaces that a test replaces. `host` has the implementations for the running system. |
 //!
@@ -127,6 +128,7 @@ mod candidates;
 mod driver;
 #[cfg(target_os = "macos")]
 pub mod host;
+pub mod invalidation;
 pub mod launch_agent;
 pub mod log_file;
 mod ports;

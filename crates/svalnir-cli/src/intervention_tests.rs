@@ -3367,24 +3367,34 @@ fn a_resume_writes_the_floor_and_an_old_authority_record_is_refused() {
     }
 }
 
-/// The notification capability of the agent is a row of `doctor`: a
-/// denied center is a reported state, not a failure of the command.
-#[test]
-fn doctor_shows_the_notification_capability_of_the_agent() {
-    use svalnir_agent::journal::{AgentRecord, JournalOptions, OperationJournal};
-    use svalnir_agent::notify::{CenterAuthorization, NotificationCounts, NotificationStatus};
+/// The row `agent_catalog_watch` of `doctor` for the status record of
+/// [`doctor_shows_the_notification_capability_of_the_agent`].
+fn assert_catalog_watch_row(row: &Value, text: &str) {
+    assert_eq!(row["reading"], "recorded", "{row}");
+    assert_eq!(row["state"], "available", "{row}");
+    assert_eq!(row["roots"], 2, "{row}");
+    assert_eq!(
+        row["counts"]["last_reconcile_reason"], "events_dropped",
+        "{row}"
+    );
+    assert!(text.contains("agent.catalog_watch"), "{}", text);
+    assert!(
+        text.contains("7 events, 0 dirty regions, 1 full reconciliations (latest: events_dropped)"),
+        "{}",
+        text
+    );
+}
+
+/// A running status record of the agent for the rows of `doctor`.
+fn doctor_status(
+    now: svalnir_core::time::WallTime,
+    notifications: Option<svalnir_agent::notify::NotificationStatus>,
+    catalog_watch: Option<svalnir_agent::runtime::invalidation::CatalogWatchStatus>,
+) -> svalnir_agent::runtime::AgentStatus {
     use svalnir_agent::runtime::{
         AGENT_STATUS_VERSION, AgentStatus, CapabilitySummary, PolicySource, RunState, SelfLimits,
     };
-    use svalnir_core::state::CapabilityState;
-    use svalnir_core::time::WallTime;
-
-    let world = World::new();
-    std::fs::create_dir_all(world.path("state")).unwrap();
-    let path: PathBuf = world.path("state").join("operations.sqlite");
-    let mut journal = OperationJournal::open(&path, &JournalOptions::default()).unwrap();
-    let now: WallTime = WallTime::try_from(std::time::SystemTime::now()).unwrap();
-    let status = |notifications: Option<NotificationStatus>| AgentStatus {
+    AgentStatus {
         schema_version: AGENT_STATUS_VERSION,
         executor_epoch: svalnir_core::id::ExecutorEpochId::new("epoch_1").unwrap(),
         process_id: 4242,
@@ -3402,6 +3412,7 @@ fn doctor_shows_the_notification_capability_of_the_agent() {
             probed_at: Some(now),
             lines: Vec::new(),
             notifications,
+            catalog_watch,
         }),
         limits: SelfLimits {
             footprint_bytes: None,
@@ -3412,15 +3423,46 @@ fn doctor_shows_the_notification_capability_of_the_agent() {
         degraded: Vec::new(),
         unclean_stops: 0,
         restart_backoff: false,
+    }
+}
+
+/// The notification capability and the catalog invalidation capability of
+/// the agent are rows of `doctor`: a denied center or a refused event
+/// stream is a reported state, not a failure of the command.
+#[test]
+fn doctor_shows_the_notification_capability_of_the_agent() {
+    use svalnir_agent::journal::{AgentRecord, JournalOptions, OperationJournal};
+    use svalnir_agent::notify::{CenterAuthorization, NotificationCounts, NotificationStatus};
+    use svalnir_agent::runtime::AgentStatus;
+    use svalnir_agent::runtime::invalidation::{
+        CatalogWatchState, CatalogWatchStatus, InvalidationCounts, ReconcileReason,
+    };
+    use svalnir_core::state::CapabilityState;
+    use svalnir_core::time::WallTime;
+
+    let world = World::new();
+    std::fs::create_dir_all(world.path("state")).unwrap();
+    let path: PathBuf = world.path("state").join("operations.sqlite");
+    let mut journal = OperationJournal::open(&path, &JournalOptions::default()).unwrap();
+    let now: WallTime = WallTime::try_from(std::time::SystemTime::now()).unwrap();
+    let status = |notifications: Option<NotificationStatus>,
+                  catalog_watch: Option<CatalogWatchStatus>| {
+        doctor_status(now, notifications, catalog_watch)
     };
     // A status record with a summary and no notification capability.
     journal
-        .put_agent_record(AgentRecord::Status, &status(None), None, now)
+        .put_agent_record(AgentRecord::Status, &status(None, None), None, now)
         .unwrap();
     let outcome = json(&world.environment, &["doctor"]);
     assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
     assert_eq!(
         outcome.result()["agent_notifications"]["reading"],
+        "not_recorded",
+        "{}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.result()["agent_catalog_watch"]["reading"],
         "not_recorded",
         "{}",
         outcome.stdout
@@ -3440,10 +3482,21 @@ fn doctor_shows_the_notification_capability_of_the_agent() {
             ..NotificationCounts::default()
         },
     };
+    let watch = CatalogWatchStatus {
+        state: CatalogWatchState::Available,
+        detail: "FSEvents marks the approved roots dirty.".to_owned(),
+        roots: 2,
+        counts: InvalidationCounts {
+            events: 7,
+            reconciliations: 1,
+            last_reconcile_reason: Some(ReconcileReason::EventsDropped),
+            ..InvalidationCounts::default()
+        },
+    };
     journal
         .put_agent_record(
             AgentRecord::Status,
-            &status(Some(denied)),
+            &status(Some(denied), Some(watch)),
             Some(revision),
             now,
         )
@@ -3466,4 +3519,5 @@ fn doctor_shows_the_notification_capability_of_the_agent() {
     );
     assert!(text.stdout.contains("State: denied"), "{}", text.stdout);
     assert!(text.stdout.contains("3 not authorized"), "{}", text.stdout);
+    assert_catalog_watch_row(&outcome.result()["agent_catalog_watch"], &text.stdout);
 }

@@ -1122,6 +1122,7 @@ impl Driver {
         let rearmed: bool = self.serve_rearm(&time);
         worked |= rearmed;
         self.collect_finished(&time);
+        let invalidated: bool = self.read_invalidation(&time);
 
         // The controller evaluates a new sample, a report, a plan in
         // progress, a change of the authority, and a sample that got old.
@@ -1137,6 +1138,7 @@ impl Driver {
         let evaluate: bool = has_new_sample
             || authority_changed
             || rearmed
+            || invalidated
             || stale
             || self.stopping
             || self.last_status.is_none()
@@ -1164,6 +1166,22 @@ impl Driver {
             worked,
             wake_at,
             fast_sampling: self.fast_sampling,
+        }
+    }
+
+    /// Reads the `FSEvents` invalidation of the candidate source. Returns
+    /// true when the candidate set of the observations became invalidated
+    /// in this call, so that the controller evaluates it: in the warning
+    /// band it then asks for a bounded discovery. The read is short and
+    /// lists no directory, so it runs also in an incident.
+    fn read_invalidation(&mut self, time: &TimeReading) -> bool {
+        let invalidated: bool = self.candidates.invalidated(time.clock.now);
+        match &mut self.observations.candidates {
+            Some(set) if invalidated && !set.invalidated => {
+                set.invalidated = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1310,6 +1328,7 @@ impl Driver {
             policy: self.policy.clone(),
             capabilities: self.capabilities.clone().map(|mut summary| {
                 summary.notifications = self.notifier.status();
+                summary.catalog_watch = self.candidates.watch_status();
                 summary
             }),
             limits: SelfLimits {

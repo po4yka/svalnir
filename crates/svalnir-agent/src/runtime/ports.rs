@@ -20,6 +20,7 @@ use crate::controller::{CandidateSet, Notification, Observations, PreparationMod
 use crate::coordinator::SettledOperation;
 use crate::coordinator::{Clock, TimeReading};
 use crate::notify::NotificationStatus;
+use crate::runtime::invalidation::CatalogWatchStatus;
 
 /// The clocks of the agent, with the record of a clock discontinuity.
 pub trait AgentClock: Debug + Send + Sync {
@@ -111,6 +112,23 @@ pub trait CandidateSource: Send {
     /// work is reduced (memory pressure, a pause, the budget of the agent)
     /// and at a stop. The default is a source with no background work.
     fn cancel(&mut self) {}
+
+    /// Reads the changes of the approved roots since the last call at
+    /// `at`. Returns true when the set of the latest preparation does not
+    /// show the roots as they are now: the disk guard then asks for a
+    /// bounded discovery again in the warning band
+    /// ([`CandidateSet::invalidated`]). A change makes no candidate and
+    /// authorizes no action. The call is short and lists no directory. The
+    /// default is a source with no event stream.
+    fn invalidated(&mut self, _at: MonotonicNanos) -> bool {
+        false
+    }
+
+    /// The catalog invalidation capability, for the capability summary of
+    /// the status record. `None` when the source has no event stream.
+    fn watch_status(&self) -> Option<CatalogWatchStatus> {
+        None
+    }
 }
 
 /// The receiver of the changes of state that a person can want to know:

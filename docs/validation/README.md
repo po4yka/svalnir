@@ -2,7 +2,7 @@
 
 This directory has the promotion records of [VALIDATION.md](../VALIDATION.md#13-rule-promotion-record-and-host-procedure) section 13 and their evidence files.
 
-**Status:** No promotion record exists. [xcode.inactive-derived-data-r1.md](xcode.inactive-derived-data-r1.md) is an empty template, and each layout of each rule is `proposed`.
+**Status:** No promotion record exists. [xcode.inactive-derived-data-r1.md](xcode.inactive-derived-data-r1.md) is an empty template, and each layout of each rule is `proposed`. [val-15-budget-proposal.md](val-15-budget-proposal.md) is a draft of the VAL-15 limits that the owner has not approved.
 
 ## Owner checklist: promotion run of `xcode.inactive-derived-data`
 

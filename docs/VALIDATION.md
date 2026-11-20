@@ -293,7 +293,7 @@ At least a useful reviewed automatic cleanup subset and a validated force backen
 
 ## 10. Performance evidence
 
-Freeze numerical acceptance limits before the release measurement campaign. Every metric records its scope, unit, workload, statistic, duration, and hardware/build conditions.
+Freeze numerical acceptance limits before the release measurement campaign. No limit is approved. [validation/val-15-budget-proposal.md](validation/val-15-budget-proposal.md) is a draft proposal of limits that the owner has not approved; it sets no limit. Every metric records its scope, unit, workload, statistic, duration, and hardware/build conditions.
 
 | Measure | Required evaluation |
 | --- | --- |

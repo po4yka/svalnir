@@ -50,6 +50,7 @@ pub use activity::{
     BUILD_PROCESS_NAMES, BuildProcesses, NativeProcessEvidence, ProcessEvidence, ProjectProcess,
     is_build_process,
 };
+pub(in crate::rules) use inspect::open_search_root;
 pub use inspect::{
     GitAvailability, MAX_SEARCH_ROOTS, ProjectActivity, ProjectHost, ProjectInspection,
     ProjectLimits, ProjectUnitOutcome, ProjectUnitReport, SearchCompletion, SearchRootOutcome,

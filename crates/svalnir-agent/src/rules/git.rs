@@ -122,6 +122,9 @@ pub struct GitOutput {
     pub code: i32,
     /// The standard output, at most the bound of the query.
     pub stdout: Vec<u8>,
+    /// Whether the output was longer than the bound. The rest was read and
+    /// discarded.
+    pub truncated: bool,
 }
 
 /// Why a query gave no result.
@@ -132,8 +135,6 @@ pub enum GitFailure {
     NotStarted,
     /// The query passed its deadline and was stopped.
     Timeout,
-    /// The output was longer than the bound of the query.
-    OutputTooLarge,
     /// The process ended with a signal.
     Signaled,
 }
@@ -145,7 +146,6 @@ impl GitFailure {
         match self {
             Self::NotStarted => "git_not_started",
             Self::Timeout => "git_timeout",
-            Self::OutputTooLarge => "git_output_too_large",
             Self::Signaled => "git_signaled",
         }
     }
@@ -264,8 +264,8 @@ impl GitTool {
     /// # Errors
     ///
     /// Returns a [`GitFailure`] when the process does not start, passes
-    /// the deadline, writes more than `max_output` bytes, or ends with a
-    /// signal.
+    /// the deadline, or ends with a signal. An output of more than
+    /// `max_output` bytes is cut, and [`GitOutput::truncated`] says so.
     pub fn run(
         &self,
         git_dir: &Path,
@@ -302,10 +302,11 @@ impl GitTool {
         let Some(code) = status.code() else {
             return Err(GitFailure::Signaled);
         };
-        if overflow {
-            return Err(GitFailure::OutputTooLarge);
-        }
-        Ok(GitOutput { code, stdout })
+        Ok(GitOutput {
+            code,
+            stdout,
+            truncated: overflow,
+        })
     }
 }
 
@@ -344,7 +345,7 @@ pub enum RepositoryLookup {
 /// The Git directory that the content of a `.git` file names, relative to
 /// `directory` when the value is relative. A `..` component removes the
 /// component before it, as Git does.
-fn git_file_target(content: &[u8], directory: &Path) -> Option<PathBuf> {
+pub(super) fn git_file_target(content: &[u8], directory: &Path) -> Option<PathBuf> {
     let text: &str = std::str::from_utf8(content).ok()?;
     let value: &str = text
         .strip_prefix("gitdir: ")?

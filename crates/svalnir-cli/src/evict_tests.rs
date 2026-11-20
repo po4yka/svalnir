@@ -252,6 +252,9 @@ fn the_evict_mode_refuses_each_inspection_rule_also_with_a_fixture_lifecycle() {
         "simulator.devices",
         "container.build-cache",
         "homebrew.cleanup",
+        // The rule of the linked Git worktrees is manual only by its
+        // specification and has the inspection mode only.
+        "git.linked-worktree",
     ] {
         let outcome = json(
             &world.environment,

@@ -307,6 +307,49 @@ fn overlaps(first: &Path, second: &Path) -> bool {
     first.starts_with(second) || second.starts_with(first)
 }
 
+/// The checks of the search root at `path`, and its snapshot.
+///
+/// # Errors
+///
+/// Returns [`SearchRootOutcome::Absent`] for a root that does not exist,
+/// and a refusal for a root that fails a check.
+pub(in crate::rules) fn open_search_root(
+    path: &Path,
+    locations: &ProtectedLocations,
+    user_exclusions: &[PathBuf],
+    principal: Uid,
+    mounts: &MountTable,
+) -> Result<ObjectSnapshot, SearchRootOutcome> {
+    let refused = SearchRootOutcome::Refused;
+    // The text checks make no call on the path.
+    match locations.of_text(path) {
+        ProtectionFact::NotProtected => {}
+        ProtectionFact::Protected => return Err(refused("root_protected")),
+        ProtectionFact::Unknown => return Err(refused("root_protection_unknown")),
+    }
+    if user_exclusions
+        .iter()
+        .any(|excluded| path.starts_with(excluded))
+    {
+        return Err(refused("root_excluded"));
+    }
+    let snapshot: ObjectSnapshot = match walk_local(path, mounts) {
+        Ok(snapshot) => snapshot,
+        Err(WalkStop::Absent) => return Err(SearchRootOutcome::Absent),
+        Err(WalkStop::LinkInAncestor) => return Err(refused("root_path_not_plain")),
+        Err(WalkStop::NotLocal) => return Err(refused("root_not_local")),
+        Err(WalkStop::LocalityUnknown) => return Err(refused("root_locality_unknown")),
+        Err(WalkStop::Failed(_)) => return Err(refused("root_not_readable")),
+    };
+    if snapshot.kind != ObjectKind::Directory {
+        return Err(refused("root_not_directory"));
+    }
+    if snapshot.owner != principal {
+        return Err(refused("root_owner"));
+    }
+    Ok(snapshot)
+}
+
 impl ProjectRule {
     /// Inspects the search roots `roots` below the home directory.
     ///
@@ -395,56 +438,19 @@ impl Inspector<'_> {
             outcome: SearchRootOutcome::Absent,
             unreadable_directories: 0,
         };
-        let refused = SearchRootOutcome::Refused;
-        // The text checks make no call on the path.
-        match self.host.locations.of_text(&path) {
-            ProtectionFact::NotProtected => {}
-            ProtectionFact::Protected => {
-                report.outcome = refused("root_protected");
-                return report;
-            }
-            ProtectionFact::Unknown => {
-                report.outcome = refused("root_protection_unknown");
-                return report;
-            }
-        }
-        if self
-            .host
-            .user_exclusions
-            .iter()
-            .any(|excluded| path.starts_with(excluded))
-        {
-            report.outcome = refused("root_excluded");
-            return report;
-        }
-        let snapshot: ObjectSnapshot = match walk_local(&path, &self.mounts) {
+        let snapshot: ObjectSnapshot = match open_search_root(
+            &path,
+            self.host.locations,
+            self.host.user_exclusions,
+            self.host.principal,
+            &self.mounts,
+        ) {
             Ok(snapshot) => snapshot,
-            Err(WalkStop::Absent) => return report,
-            Err(WalkStop::LinkInAncestor) => {
-                report.outcome = refused("root_path_not_plain");
-                return report;
-            }
-            Err(WalkStop::NotLocal) => {
-                report.outcome = refused("root_not_local");
-                return report;
-            }
-            Err(WalkStop::LocalityUnknown) => {
-                report.outcome = refused("root_locality_unknown");
-                return report;
-            }
-            Err(WalkStop::Failed(_)) => {
-                report.outcome = refused("root_not_readable");
+            Err(outcome) => {
+                report.outcome = outcome;
                 return report;
             }
         };
-        if snapshot.kind != ObjectKind::Directory {
-            report.outcome = refused("root_not_directory");
-            return report;
-        }
-        if snapshot.owner != self.host.principal {
-            report.outcome = refused("root_owner");
-            return report;
-        }
         let completion: SearchCompletion = self.walk(&path, snapshot, &mut report);
         report.outcome = SearchRootOutcome::Examined(completion);
         report
@@ -687,10 +693,8 @@ impl Inspector<'_> {
             &literal,
         ]);
         match tracked {
-            Ok(output) if output.code == 0 && output.stdout.is_empty() => {}
+            Ok(output) if output.code == 0 && output.stdout.is_empty() && !output.truncated => {}
             Ok(output) if output.code == 0 => return VersionControl::Tracked,
-            // More output than the bound is more than one tracked path.
-            Err(GitFailure::OutputTooLarge) => return VersionControl::Tracked,
             Ok(_) => return unknown("git_query_failed"),
             Err(failure) => return unknown(failure.as_str()),
         }

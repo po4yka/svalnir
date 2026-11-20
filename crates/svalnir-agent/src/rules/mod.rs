@@ -81,6 +81,8 @@ mod registry;
 #[cfg(unix)]
 mod unit;
 #[cfg(unix)]
+pub mod worktrees;
+#[cfg(unix)]
 mod xcode;
 
 #[cfg(test)]

@@ -390,7 +390,7 @@ owner_approval: null
 | `open_points_closed` | Each open point of the rule documentation that the record decides |
 | `owner_approval` | The name of the owner and the date. A record with no approval promotes nothing |
 
-The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names.
+The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names. [validation/README.md](validation/README.md) has the owner checklist of the host procedure below, and [validation/xcode.inactive-derived-data-r1.md](validation/xcode.inactive-derived-data-r1.md) is an empty record; neither is a record of a run.
 
 ### Stages and the build of the run
 

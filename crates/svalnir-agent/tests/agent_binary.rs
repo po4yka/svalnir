@@ -92,6 +92,8 @@ fn agent(directories: &Directories) -> Command {
         .arg(&directories.state)
         .env("HOME", &directories.home)
         .env(TEST_ACCOUNT_HOME_VARIABLE, &directories.home)
+        // A variable of the shell must not give a test a real dialog.
+        .env_remove(svalnir_agent::notify::TEST_DIALOG_VARIABLE)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -396,6 +398,7 @@ fn the_agent_refuses_to_start_without_its_required_arguments() {
             .args(arguments)
             .env("HOME", &directories.home)
             .env(TEST_ACCOUNT_HOME_VARIABLE, &directories.home)
+            .env_remove(svalnir_agent::notify::TEST_DIALOG_VARIABLE)
             .stdin(Stdio::null())
             .output()
             .unwrap()

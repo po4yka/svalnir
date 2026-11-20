@@ -49,6 +49,9 @@ pub enum AgentCapabilities {
         missing: Vec<String>,
         /// The age of the status record.
         age: Duration,
+        /// The notification capability of the agent as one sentence, or
+        /// `None` when the record has none.
+        notifications: Option<String>,
     },
     /// No current summary: one sentence with the reason.
     Unavailable(String),
@@ -92,6 +95,7 @@ pub fn agent_capabilities(snapshot: &DiagnosticsSnapshot) -> AgentCapabilities {
             verdict: verdict.clone(),
             missing: status.required_not_available.clone(),
             age,
+            notifications: status.notifications.clone(),
         },
         None => AgentCapabilities::Unavailable(
             "No agent capability summary: the status record has no capability check of the agent."
@@ -285,6 +289,7 @@ fn agent_list(value: &DiagnosticsSnapshot, mono: &SharedString, tokens: &Tokens)
             verdict,
             missing,
             age,
+            notifications,
         } => {
             let (text, tone) = agent_verdict_pill(&verdict);
             list = list
@@ -336,6 +341,15 @@ fn agent_list(value: &DiagnosticsSnapshot, mono: &SharedString, tokens: &Tokens)
                         .child(StatusPill::new("Not available", Tone::Negative)),
                 );
             }
+            list = list.child(body_line(
+                "diagnostics-agent-notifications",
+                notifications.map_or_else(
+                    || "Notifications: the status record has no notification capability of the agent.".to_owned(),
+                    |detail| format!("Notifications: {detail}"),
+                ),
+                false,
+                tokens,
+            ));
             list = list.child(caption(
                 "diagnostics-agent-summary-limit",
                 "The record has the verdict and the required capabilities that are not available, not the state of each capability.",
@@ -746,6 +760,7 @@ mod tests {
                 verdict: "blocked".to_owned(),
                 missing: vec!["privacy.full_disk_access".to_owned()],
                 age: Duration::from_secs(30),
+                notifications: Some(svalnir_agent::notify::DIALOG_DETAIL.to_owned()),
             }
         );
         assert_eq!(agent_verdict_pill("blocked"), ("Blocked", Tone::Negative));

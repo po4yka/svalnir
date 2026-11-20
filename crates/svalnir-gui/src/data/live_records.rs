@@ -963,6 +963,11 @@ fn agent_row(status: &AgentStatus) -> AgentStatusRow {
             .capabilities
             .as_ref()
             .map_or_else(Vec::new, |summary| summary.required_not_available.clone()),
+        notifications: status
+            .capabilities
+            .as_ref()
+            .and_then(|summary| summary.notifications.as_ref())
+            .map(|notifications| notifications.detail.clone()),
         footprint: status.limits.footprint_bytes.map_or_else(
             || Measured::Unavailable("the agent did not measure its footprint".to_owned()),
             Measured::Value,

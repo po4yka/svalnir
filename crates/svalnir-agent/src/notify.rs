@@ -41,18 +41,25 @@
 //! a row of `svalnir doctor`), not an error. Nothing in this module asks
 //! the user for a permission.
 //!
+//! A center can show only some kinds ([`NotificationCenter::presents`]).
+//! The service counts a notice of a different kind as `not_presented`
+//! before the gate, so it takes no place of the gate or of the queue.
+//!
 //! # The center of this build
 //!
-//! This build has no native center: [`UnavailableCenter`] reports the
-//! capability as `unsupported` and posts nothing. Apple Developer Technical
-//! Support states that the User Notifications framework does not deliver
-//! for a launchd agent that runs from an executable inside the application
-//! bundle (Apple Developer Forums thread 804854); the agent of `Svalnir.app`
-//! is such an agent.
-// TODO(npochaev): add a native center when the bundle has a component that
-// the User Notifications framework accepts (for example a nested
-// `LSUIElement` application that Launch Services starts in the login
-// session), and decide when the agent asks for the authorization.
+//! The agent has [`DialogCenter`] (owner decision of 2026-11-20): a system
+//! dialog of `CFUserNotification` for the urgent kinds
+//! ([`NoticeKind::is_urgent`]) only, which closes after 60 s. It shows no
+//! banner: the User Notifications framework does not deliver for a launchd
+//! agent that runs from an executable inside the application bundle (Apple
+//! Developer Forums thread 804854). The other kinds are not shown. The
+//! dialog is not validated on a host.
+//!
+//! A debug build with the feature `test-support` has [`UnavailableCenter`]
+//! instead, so that no test shows a dialog, unless
+//! [`TEST_DIALOG_VARIABLE`] names an urgent kind: then the agent has the
+//! dialog center and offers one fixture notice of that kind at its start
+//! ([`process_notifier`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -66,6 +73,22 @@ use svalnir_core::time::MonotonicNanos;
 use crate::controller::{BlockedReason, Guard, GuardPhase, Notification};
 use crate::coordinator::SettledOperation;
 use crate::runtime::Notifier;
+
+mod dialog;
+
+#[cfg(target_os = "macos")]
+pub use dialog::CoreFoundationDialog;
+pub use dialog::{
+    DIALOG_DETAIL, DIALOG_TIMEOUT_SECONDS, DialogCenter, DialogDisplay, DialogText, DisplayError,
+    dialog_text,
+};
+
+/// The environment variable that, in a debug build with the feature
+/// `test-support` only, gives the agent the dialog center and one fixture
+/// notice at its start. Its value is the name of an urgent kind, for
+/// example `memory_pressure_critical`. A build without the feature, and a
+/// build with no debug assertions, has no code that reads it.
+pub const TEST_DIALOG_VARIABLE: &str = "SVALNIR_TEST_DIALOG_KIND";
 
 /// The largest number of notices that wait for the center.
 pub const QUEUE_CAPACITY: usize = 8;
@@ -100,6 +123,45 @@ pub enum NoticeKind {
     StopSettled,
     /// A different requested operation did not complete.
     ManualOperationNotCompleted,
+}
+
+impl NoticeKind {
+    /// Each kind, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::MemoryPressureCritical,
+        Self::GuardActing,
+        Self::IncidentBudgetExhausted,
+        Self::AutomaticOperationNotCompleted,
+        Self::StopSettled,
+        Self::ManualOperationNotCompleted,
+    ];
+
+    /// True for the kinds that a person must know at once: critical memory
+    /// pressure, an exhausted incident budget, and an automatic operation
+    /// that did not complete. Only these kinds reach [`DialogCenter`].
+    #[must_use]
+    pub const fn is_urgent(self) -> bool {
+        matches!(
+            self,
+            Self::MemoryPressureCritical
+                | Self::IncidentBudgetExhausted
+                | Self::AutomaticOperationNotCompleted
+        )
+    }
+
+    /// The name of the kind, as the status record and
+    /// [`TEST_DIALOG_VARIABLE`] spell it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MemoryPressureCritical => "memory_pressure_critical",
+            Self::GuardActing => "guard_acting",
+            Self::IncidentBudgetExhausted => "incident_budget_exhausted",
+            Self::AutomaticOperationNotCompleted => "automatic_operation_not_completed",
+            Self::StopSettled => "stop_settled",
+            Self::ManualOperationNotCompleted => "manual_operation_not_completed",
+        }
+    }
 }
 
 /// One notification.
@@ -179,15 +241,19 @@ pub fn controller_notice(notification: &Notification) -> Option<Notice> {
             if !not_completed(&settled) {
                 return None;
             }
-            let name: &str = guard_name(*guard);
-            Some(Notice {
-                kind: NoticeKind::AutomaticOperationNotCompleted,
-                tag: format!("svalnir-plan-{plan_id}"),
-                title: format!("An automatic operation of the {name} guard did not complete"),
-                body: outcome_sentence(&settled),
-            })
+            Some(automatic_not_completed(*guard, plan_id.as_ref(), &settled))
         }
         Notification::Phase { .. } | Notification::Blocked { .. } => None,
+    }
+}
+
+fn automatic_not_completed(guard: Guard, plan_id: &str, settled: &OperationState) -> Notice {
+    let name: &str = guard_name(guard);
+    Notice {
+        kind: NoticeKind::AutomaticOperationNotCompleted,
+        tag: format!("svalnir-plan-{plan_id}"),
+        title: format!("An automatic operation of the {name} guard did not complete"),
+        body: outcome_sentence(settled),
     }
 }
 
@@ -370,8 +436,8 @@ pub enum PostError {
     Failed(String),
 }
 
-/// A system notification center. A test uses a fake; this build has
-/// [`UnavailableCenter`] only.
+/// A system notification center. A test uses a fake; the agent has
+/// [`DialogCenter`], or [`UnavailableCenter`] in a test build.
 ///
 /// The worker thread of [`NotificationService`] calls it; a call can block
 /// that thread.
@@ -379,6 +445,13 @@ pub trait NotificationCenter: Send {
     /// The authorization, with the reason as one sentence. This call never
     /// asks the user.
     fn authorization(&mut self) -> (CenterAuthorization, String);
+
+    /// True when the center shows notices of `kind`. The service reads it
+    /// one time, at its start, and does not queue the other kinds. The
+    /// default shows each kind.
+    fn presents(&self, _kind: NoticeKind) -> bool {
+        true
+    }
 
     /// Posts one notice.
     ///
@@ -393,7 +466,7 @@ pub trait NotificationCenter: Send {
 pub struct UnavailableCenter;
 
 /// The reason of [`UnavailableCenter`].
-pub const UNAVAILABLE_REASON: &str = "This build has no notification adapter for the agent: the User Notifications framework does not deliver notifications for a launchd agent that runs from an executable inside the application bundle.";
+pub const UNAVAILABLE_REASON: &str = "This test build of the agent shows no notification: it has no dialog, so that no test shows one.";
 
 impl NotificationCenter for UnavailableCenter {
     fn authorization(&mut self) -> (CenterAuthorization, String) {
@@ -424,6 +497,9 @@ pub struct NotificationCounts {
     pub not_authorized: u64,
     /// Notices that the center did not take for a different reason.
     pub failed: u64,
+    /// Notices of a kind that the center does not show. They do not go to
+    /// the gate or the queue.
+    pub not_presented: u64,
 }
 
 /// The notification capability of the agent, for its status record.
@@ -468,6 +544,8 @@ pub struct NotificationService {
     shared: Arc<Shared>,
     gate: NoticeGate,
     pressure: PressureWatch,
+    /// The kinds that the center shows, from [`NotificationCenter::presents`].
+    presented: Vec<NoticeKind>,
 }
 
 impl NotificationService {
@@ -476,6 +554,10 @@ impl NotificationService {
     /// unavailable.
     #[must_use]
     pub fn start(center: Box<dyn NotificationCenter>) -> Self {
+        let presented: Vec<NoticeKind> = NoticeKind::ALL
+            .into_iter()
+            .filter(|kind| center.presents(*kind))
+            .collect();
         let shared: Arc<Shared> = Arc::new(Shared {
             state: Mutex::new(QueueState {
                 pending: VecDeque::with_capacity(QUEUE_CAPACITY),
@@ -503,6 +585,7 @@ impl NotificationService {
             shared,
             gate: NoticeGate::default(),
             pressure: PressureWatch::default(),
+            presented,
         }
     }
 
@@ -514,6 +597,12 @@ impl NotificationService {
             let mut state = self.shared.lock();
             if state.closed {
                 state.counts.dropped = state.counts.dropped.saturating_add(1);
+                return;
+            }
+            // A kind that the center does not show takes no place of the
+            // gate or of the queue.
+            if !self.presented.contains(&notice.kind) {
+                state.counts.not_presented = state.counts.not_presented.saturating_add(1);
                 return;
             }
         }
@@ -658,6 +747,85 @@ impl AgentNotifier {
         Self {
             service: NotificationService::start(center),
         }
+    }
+
+    /// Offers `notice` at `now`, through the gate and the queue.
+    pub fn offer(&mut self, notice: Notice, now: MonotonicNanos) {
+        self.service.offer(notice, now);
+    }
+}
+
+/// The notifier of the agent process: [`DialogCenter`] with
+/// [`CoreFoundationDialog`].
+///
+/// In a debug build with the feature `test-support`, it is
+/// [`UnavailableCenter`], so that no test shows a dialog, unless
+/// [`TEST_DIALOG_VARIABLE`] names an urgent kind. Then it is the dialog
+/// center, and it offers one fixture notice of that kind
+/// (`fixture_notice`) at `now`, the monotonic time of the start, for a
+/// host check of the dialog with no real pressure and no real incident.
+/// With no time (`None`), it offers no fixture notice. A value that is not
+/// the name of an urgent kind gives [`UnavailableCenter`] and a warning in
+/// the log.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn process_notifier(now: Option<MonotonicNanos>) -> AgentNotifier {
+    #[cfg(all(feature = "test-support", debug_assertions))]
+    {
+        let Some(value) = std::env::var_os(TEST_DIALOG_VARIABLE) else {
+            return AgentNotifier::new(Box::new(UnavailableCenter));
+        };
+        let kind: Option<NoticeKind> = NoticeKind::ALL
+            .into_iter()
+            .find(|kind| kind.is_urgent() && value == kind.as_str());
+        let Some(kind) = kind else {
+            tracing::warn!(
+                variable = TEST_DIALOG_VARIABLE,
+                "the value is not the name of an urgent notice kind; no dialog"
+            );
+            return AgentNotifier::new(Box::new(UnavailableCenter));
+        };
+        let mut notifier = AgentNotifier::new(Box::new(DialogCenter::new(CoreFoundationDialog)));
+        if let (Some(notice), Some(now)) = (fixture_notice(kind), now) {
+            tracing::info!(kind = kind.as_str(), "fixture notice for a dialog check");
+            notifier.offer(notice, now);
+        } else {
+            tracing::warn!("no fixture notice: the clock gave no time");
+        }
+        notifier
+    }
+    #[cfg(not(all(feature = "test-support", debug_assertions)))]
+    {
+        // Only a test build offers a fixture notice.
+        _ = now;
+        AgentNotifier::new(Box::new(DialogCenter::new(CoreFoundationDialog)))
+    }
+}
+
+/// A fixture notice of an urgent `kind`, made by the functions that make
+/// the real notices: the pressure watch, the notice of an exhausted budget
+/// of the disk guard, and the notice of a failed automatic operation of
+/// the disk guard with the plan tag `fixture`. `None` for a kind that is
+/// not urgent.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn fixture_notice(kind: NoticeKind) -> Option<Notice> {
+    match kind {
+        NoticeKind::MemoryPressureCritical => {
+            let mut watch = PressureWatch::default();
+            // The first reading gives no notice; the change to critical does.
+            drop(watch.observe(Some(&PressureState::Normal)));
+            watch.observe(Some(&PressureState::Critical))
+        }
+        NoticeKind::IncidentBudgetExhausted => Some(exhausted(Guard::Disk)),
+        NoticeKind::AutomaticOperationNotCompleted => Some(automatic_not_completed(
+            Guard::Disk,
+            "fixture",
+            &OperationState::Failed,
+        )),
+        NoticeKind::GuardActing
+        | NoticeKind::StopSettled
+        | NoticeKind::ManualOperationNotCompleted => None,
     }
 }
 

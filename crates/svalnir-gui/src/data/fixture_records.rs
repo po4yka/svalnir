@@ -992,6 +992,7 @@ pub(super) fn diagnostics(scenario: FixtureScenario) -> DiagnosticsSnapshot {
             } else {
                 Vec::new()
             },
+            notifications: Some(svalnir_agent::notify::DIALOG_DETAIL.to_owned()),
             footprint: Measured::Value(38 * MB),
             budget: 120 * MB,
             degraded: if scenario == FixtureScenario::Pressure {

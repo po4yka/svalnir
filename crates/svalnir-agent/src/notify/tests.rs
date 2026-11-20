@@ -107,14 +107,14 @@ fn a_failed_post_is_counted_and_not_retried() {
 }
 
 #[test]
-fn the_center_of_this_build_is_unsupported_and_posts_nothing() {
+fn the_unavailable_center_is_unsupported_and_posts_nothing() {
     let mut service = NotificationService::start(Box::new(UnavailableCenter));
     eventually(&service, |status| {
         status.authorization == CenterAuthorization::Unavailable
     });
     let status = service.status();
     assert_eq!(status.state, CapabilityState::Unsupported);
-    assert!(status.detail.contains("no notification adapter"));
+    assert!(status.detail.contains("shows no notification"));
     service.offer(notice("a"), at(0));
     eventually(&service, |status| status.counts.not_authorized == 1);
 }

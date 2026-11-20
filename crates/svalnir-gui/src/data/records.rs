@@ -915,6 +915,10 @@ pub struct AgentStatusRow {
     pub capability_verdict: Option<String>,
     /// The required capabilities that the agent does not have.
     pub required_not_available: Vec<String>,
+    /// The notification capability of the agent, as the one sentence that
+    /// the agent wrote at the time of the record. `None`: the record has
+    /// no notification capability.
+    pub notifications: Option<String>,
     /// The footprint of the agent process, in bytes.
     pub footprint: Measured<u64>,
     /// The footprint budget of the agent, in bytes.

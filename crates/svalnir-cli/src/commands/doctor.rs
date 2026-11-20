@@ -193,13 +193,14 @@ impl AgentNotificationsView {
                 let counts = &notifications.counts;
                 put_line!(
                     out,
-                    "  Notices of this agent lifetime: {} posted, {} not authorized, {} failed, {} dropped, {} rate limited, {} coalesced",
+                    "  Notices of this agent lifetime: {} posted, {} not authorized, {} failed, {} dropped, {} rate limited, {} coalesced, {} not shown (a kind that the center does not show)",
                     counts.posted,
                     counts.not_authorized,
                     counts.failed,
                     counts.dropped,
                     counts.rate_limited,
-                    counts.coalesced
+                    counts.coalesced,
+                    counts.not_presented
                 );
             }
         }

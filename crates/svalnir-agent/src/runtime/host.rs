@@ -41,7 +41,7 @@ use crate::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorC
 use crate::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
-use crate::notify::{AgentNotifier, UnavailableCenter};
+use crate::notify::process_notifier;
 use crate::platform::memory::context::{Clock as HostClock, CollectionContext};
 use crate::platform::memory::{collect_memory_snapshot, collect_pressure};
 use crate::platform::process::{
@@ -634,9 +634,11 @@ pub fn system_parts(
         probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
         candidates: Box::new(candidates),
         environment,
-        // This build has no native notification center
-        // ([`crate::notify`]): the capability is reported as unsupported.
-        notifier: Box::new(AgentNotifier::new(Box::new(UnavailableCenter))),
+        // The dialog center for the urgent kinds ([`crate::notify`]); a
+        // test build has no dialog unless a fixture kind is named.
+        notifier: Box::new(process_notifier(
+            clock.now().map(|reading| reading.clock.now),
+        )),
         footprint: Box::new(ProcessFootprint),
         store,
         capabilities: Some(capability_summary(state_directory)),

@@ -11,7 +11,9 @@ use svalnir_agent::capability::{
 };
 use svalnir_agent::platform::memory::{MemorySnapshot, SwapUsage, VmStatistics};
 use svalnir_agent::platform::process::{
-    ForegroundState, Omissions, ProcessMetrics, ProcessRecord, ProcessSnapshot,
+    AddressFamily, ForegroundState, LISTENING_TCP_PORTS_METRIC, ListeningPort, ListeningPorts,
+    Omissions, ProcessContext, ProcessMetrics, ProcessRecord, ProcessSnapshot,
+    WORKING_DIRECTORY_METRIC,
 };
 use svalnir_agent::platform::volume::{FoundationCapacity, VolumeCapacity};
 use svalnir_agent::scan::{
@@ -430,6 +432,50 @@ pub(crate) fn process_snapshot() -> ProcessSnapshot {
         launch_services_unavailable: None,
         application_list_may_be_stale: false,
         responsible_process_unavailable: None,
+    }
+}
+
+/// The context of process 200 of [`process_snapshot`]: a working directory
+/// that is not valid UTF-8 and two listening ports, one of them a wildcard
+/// bind.
+pub(crate) fn process_context() -> ProcessContext {
+    let scope: Scope =
+        Scope::process(ProcessGenerationId::new(format!("pg-200-{START_MICROSECONDS}")).unwrap());
+    let read: Sample = sample("pc200", FIRST_SAMPLE_NS + 2_000);
+    let ports = ListeningPorts {
+        ports: vec![
+            ListeningPort {
+                family: AddressFamily::Ipv4,
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 5173,
+                wildcard: false,
+            },
+            ListeningPort {
+                family: AddressFamily::Ipv6,
+                address: std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                port: 8080,
+                wildcard: true,
+            },
+        ],
+        truncated: false,
+    };
+    ProcessContext {
+        working_directory: observation(
+            MetricId::new(WORKING_DIRECTORY_METRIC).unwrap(),
+            scope.clone(),
+            path(b"/Users/u/caf\xe9"),
+            Unit::Path,
+            MetricKind::Gauge,
+            &read,
+        ),
+        listening_ports: observation(
+            MetricId::new(LISTENING_TCP_PORTS_METRIC).unwrap(),
+            scope,
+            ports,
+            Unit::Endpoint,
+            MetricKind::Gauge,
+            &read,
+        ),
     }
 }
 

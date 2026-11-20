@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::encoding::{UnrecognizedText, wire_enum};
+use crate::file::LosslessPath;
 use crate::id::{
     AdapterId, BootId, CapacityDomainId, ClockDomainId, CollectorEpochId, IdentityId,
     MembershipSnapshotId, ProcessGenerationId, SampleId, ScanId, VolumeId, WorkerId,
@@ -264,6 +265,12 @@ wire_enum! {
         Percent => "percent",
         /// A value of a defined enumeration.
         State => "state",
+        /// One filesystem path, in the tagged path encoding of
+        /// `docs/INTERFACES.md` section 3. No arithmetic applies.
+        Path => "path",
+        /// A set of socket endpoints (address family, address, and port).
+        /// No arithmetic applies.
+        Endpoint => "endpoint",
     }
 }
 
@@ -508,6 +515,7 @@ observation_value! {
     CounterValue => Byte | Page | Entry | Nanosecond;
     PressureState => State;
     CapabilityState => State;
+    LosslessPath => Path;
 }
 
 /// The reason a serialized observation was rejected.

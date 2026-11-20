@@ -340,6 +340,21 @@ impl<S: ProcessSource> ProcessCollector<S> {
         &self.source
     }
 
+    /// The collector identity that each sample records.
+    pub(super) fn context(&self) -> &CollectionContext {
+        &self.context
+    }
+
+    /// The adapter identity of the source of each observation.
+    pub(super) fn adapter_id(&self) -> &AdapterId {
+        &self.adapter_id
+    }
+
+    /// The clock domain of each sample.
+    pub(super) fn clock_domain(&self) -> &ClockDomainId {
+        &self.clock_domain
+    }
+
     /// Collects the processes of the current effective user.
     ///
     /// The call reads data only. It sends no signal and changes no process.

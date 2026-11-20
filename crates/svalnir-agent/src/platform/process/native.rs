@@ -17,6 +17,9 @@
 //! | CPU time ratio | `mach_timebase_info` |
 //! | Monotonic clock | `clock_gettime(CLOCK_MONOTONIC_RAW)` |
 //! | Boot session | `sysctlbyname("kern.bootsessionuuid")` |
+//! | Working directory | `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, field `pvi_cdir.vip_path` |
+//! | File descriptors | `proc_pidinfo(PROC_PIDLISTFDS)` |
+//! | Socket of a descriptor | `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` |
 //!
 //! `responsibility_get_pid_responsible_for_pid` is not in the public SDK.
 //! The adapter finds it with `dlsym` at run time. When the symbol is absent,
@@ -25,6 +28,7 @@
 
 use std::ffi::{CStr, c_int, c_void};
 use std::mem::MaybeUninit;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
@@ -43,7 +47,8 @@ use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
-    ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication, Timebase,
+    ProcessSource, QueryFailure, RawListeningSocket, RawListeningSockets, RawProcessInfo, RawUsage,
+    RunningApplication, SocketFamily, Timebase,
 };
 
 /// The largest number of process IDs that one list can have. The value is
@@ -307,6 +312,269 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
 }
 
+/// The capacity of `vip_path`: `MAXPATHLEN` in `<sys/param.h>`.
+const VNODE_PATH_CAPACITY: usize = 1024;
+
+// `libc::proc_vnodepathinfo` must have the size and the field offset of
+// `struct proc_vnodepathinfo` in `<sys/proc_info.h>` of the macOS SDK. The
+// values were measured with `sizeof` and `offsetof` against that header.
+const _: () = assert!(size_of::<libc::proc_vnodepathinfo>() == 2352);
+const _: () = assert!(
+    std::mem::offset_of!(libc::proc_vnodepathinfo, pvi_cdir)
+        + std::mem::offset_of!(libc::vnode_info_path, vip_path)
+        == 152
+);
+const _: () = assert!(size_of::<[[libc::c_char; 32]; 32]>() == VNODE_PATH_CAPACITY);
+
+fn working_directory(pid: Pid) -> Result<LosslessPath, QueryFailure> {
+    let mut info: MaybeUninit<libc::proc_vnodepathinfo> = MaybeUninit::zeroed();
+    let size: c_int = c_int::try_from(size_of::<libc::proc_vnodepathinfo>())
+        .map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: `info` is a live, writable `proc_vnodepathinfo` of `size`
+    // bytes. The kernel writes at most `size` bytes for
+    // `PROC_PIDVNODEPATHINFO`.
+    let written: c_int = unsafe {
+        libc::proc_pidinfo(
+            pid.get(),
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(last_failure());
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    // SAFETY: the kernel wrote the full structure, and the buffer was zeroed
+    // before. Each field is an integer or an array of integers, so each bit
+    // pattern is a valid value.
+    let info: libc::proc_vnodepathinfo = unsafe { info.assume_init() };
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .map(|byte| byte.cast_unsigned())
+        .collect();
+    // The path ends at the first NUL. A path with no NUL in the buffer is
+    // not complete.
+    let end: usize = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(QueryFailure::Inconsistent)?;
+    let path: &[u8] = bytes.get(..end).ok_or(QueryFailure::Inconsistent)?;
+    if path.first() != Some(&b'/') {
+        // An empty or relative path is not a working directory.
+        return Err(QueryFailure::Inconsistent);
+    }
+    LosslessPath::from_bytes(path).map_err(|_| QueryFailure::Inconsistent)
+}
+
+/// `PROC_PIDFDSOCKETINFO` in `<sys/proc_info.h>`.
+const PROC_PIDFDSOCKETINFO: c_int = 3;
+
+/// `sizeof(struct socket_fdinfo)` in `<sys/proc_info.h>` of the macOS SDK.
+const SOCKET_FDINFO_SIZE: usize = 792;
+
+/// The offsets in `struct socket_fdinfo` that the adapter reads. The values
+/// were measured with `offsetof` against `<sys/proc_info.h>` of the macOS
+/// SDK. The adapter reads no other field, so it reads no remote address.
+mod socket_offsets {
+    /// `psi.soi_family`, an `int`.
+    pub(super) const FAMILY: usize = 184;
+    /// `psi.soi_kind`, an `int`.
+    pub(super) const KIND: usize = 256;
+    /// `psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport`, an `int` that holds the
+    /// port in network byte order.
+    pub(super) const LOCAL_PORT: usize = 268;
+    /// `psi.soi_proto.pri_tcp.tcpsi_ini.insi_vflag`, a `uint8_t`.
+    pub(super) const VERSION_FLAGS: usize = 288;
+    /// `psi.soi_proto.pri_tcp.tcpsi_ini.insi_laddr`, 16 bytes. An IPv4
+    /// address is the last 4 bytes (`struct in4in6_addr`).
+    pub(super) const LOCAL_ADDRESS: usize = 312;
+    /// `psi.soi_proto.pri_tcp.tcpsi_state`, an `int`.
+    pub(super) const TCP_STATE: usize = 344;
+}
+
+/// `SOCKINFO_TCP` in `<sys/proc_info.h>`.
+const SOCKINFO_TCP: i32 = 2;
+/// `TSI_S_LISTEN` in `<sys/proc_info.h>`.
+const TSI_S_LISTEN: i32 = 1;
+/// `INI_IPV4` in `<sys/proc_info.h>`.
+const INI_IPV4: u8 = 0x1;
+/// `INI_IPV6` in `<sys/proc_info.h>`.
+const INI_IPV6: u8 = 0x2;
+
+/// A buffer with the size and the alignment of `struct socket_fdinfo`. The
+/// kernel writes the structure as bytes, and [`parse_listening_socket`]
+/// reads the fields at their offsets, so no field is read through a type.
+#[repr(C, align(8))]
+pub(super) struct SocketFdInfoBytes(pub(super) [u8; SOCKET_FDINFO_SIZE]);
+
+fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, QueryFailure> {
+    let field: [u8; 4] = bytes
+        .get(offset..offset.saturating_add(4))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    Ok(i32::from_ne_bytes(field))
+}
+
+/// The listening TCP socket of one `struct socket_fdinfo`, or `None` for a
+/// socket that is not a TCP socket of the Internet families in the
+/// listening state.
+pub(super) fn parse_listening_socket(
+    info: &SocketFdInfoBytes,
+) -> Result<Option<RawListeningSocket>, QueryFailure> {
+    let bytes: &[u8] = &info.0;
+    if read_i32(bytes, socket_offsets::KIND)? != SOCKINFO_TCP {
+        return Ok(None);
+    }
+    let family: SocketFamily = match read_i32(bytes, socket_offsets::FAMILY)? {
+        libc::AF_INET => SocketFamily::Ipv4,
+        libc::AF_INET6 => SocketFamily::Ipv6,
+        _ => return Ok(None),
+    };
+    if read_i32(bytes, socket_offsets::TCP_STATE)? != TSI_S_LISTEN {
+        return Ok(None);
+    }
+    let raw_port: u16 = u16::try_from(read_i32(bytes, socket_offsets::LOCAL_PORT)?)
+        .map_err(|_| QueryFailure::Inconsistent)?;
+    let port: u16 = u16::from_be(raw_port);
+    let flags: u8 = *bytes
+        .get(socket_offsets::VERSION_FLAGS)
+        .ok_or(QueryFailure::Inconsistent)?;
+    let address: [u8; 16] = bytes
+        .get(socket_offsets::LOCAL_ADDRESS..socket_offsets::LOCAL_ADDRESS + 16)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    let [.., a, b, c, d] = address;
+    let ipv4: Ipv4Addr = Ipv4Addr::new(a, b, c, d);
+    let address: IpAddr = match family {
+        SocketFamily::Ipv4 => IpAddr::V4(ipv4),
+        SocketFamily::Ipv6 if flags & INI_IPV6 != 0 => IpAddr::V6(Ipv6Addr::from(address)),
+        // An IPv6 socket with an IPv4 address keeps its family: the address
+        // is the IPv4-mapped IPv6 address.
+        SocketFamily::Ipv6 if flags & INI_IPV4 != 0 => IpAddr::V6(ipv4.to_ipv6_mapped()),
+        SocketFamily::Ipv6 => return Err(QueryFailure::Inconsistent),
+    };
+    Ok(Some(RawListeningSocket {
+        family,
+        address,
+        port,
+    }))
+}
+
+/// The socket of one descriptor, or `None` when the descriptor was closed
+/// after the list was read.
+fn socket_of_descriptor(
+    pid: Pid,
+    descriptor: i32,
+) -> Result<Option<RawListeningSocket>, QueryFailure> {
+    let mut info: SocketFdInfoBytes = SocketFdInfoBytes([0; SOCKET_FDINFO_SIZE]);
+    let size: c_int = c_int::try_from(SOCKET_FDINFO_SIZE).map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: `info` is a live, writable buffer of `size` bytes with the
+    // alignment of `struct socket_fdinfo`. The kernel writes at most `size`
+    // bytes for `PROC_PIDFDSOCKETINFO`.
+    let written: c_int = unsafe {
+        libc::proc_pidfdinfo(
+            pid.get(),
+            descriptor,
+            PROC_PIDFDSOCKETINFO,
+            info.0.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            // The descriptor was closed, or it is no longer a socket.
+            Some(libc::EBADF | libc::ENOTSUP | libc::EINVAL) => Ok(None),
+            _ => Err(last_failure()),
+        };
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    parse_listening_socket(&info)
+}
+
+fn listening_tcp_sockets(
+    pid: Pid,
+    max_descriptors: usize,
+) -> Result<RawListeningSockets, QueryFailure> {
+    if max_descriptors == 0 {
+        return Err(QueryFailure::Inconsistent);
+    }
+    // One more entry than the ceiling shows whether the ceiling was reached.
+    let capacity: usize = max_descriptors.saturating_add(1);
+    let entry: libc::proc_fdinfo = libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    };
+    let mut descriptors: Vec<libc::proc_fdinfo> = vec![entry; capacity];
+    let byte_size: c_int = c_int::try_from(capacity.saturating_mul(size_of::<libc::proc_fdinfo>()))
+        .map_err(|_| QueryFailure::Overflow)?;
+    // `proc_pidinfo` gives 0 both for a failure and for a process with no
+    // open descriptor. A zero `errno` before the call tells the two apart.
+    // SAFETY: `__error` has no argument and gives the address of the
+    // `errno` of the calling thread.
+    let errno: *mut c_int = unsafe { libc::__error() };
+    // SAFETY: the address is valid and aligned for the life of the calling
+    // thread, and only this thread writes it.
+    unsafe { errno.write(0) };
+    // SAFETY: `descriptors` is a live allocation of `byte_size` bytes with
+    // the alignment of `proc_fdinfo`. The kernel writes at most `byte_size`
+    // bytes of `proc_fdinfo` records into it.
+    let written: c_int = unsafe {
+        libc::proc_pidinfo(
+            pid.get(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast::<c_void>(),
+            byte_size,
+        )
+    };
+    if written == 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            None | Some(0)
+        )
+    {
+        return Ok(RawListeningSockets {
+            sockets: Vec::new(),
+            descriptors_truncated: false,
+        });
+    }
+    if written <= 0 {
+        return Err(last_failure());
+    }
+    let written: usize = usize::try_from(written).map_err(|_| QueryFailure::Inconsistent)?;
+    if !written.is_multiple_of(size_of::<libc::proc_fdinfo>()) {
+        return Err(QueryFailure::Inconsistent);
+    }
+    let count: usize = written / size_of::<libc::proc_fdinfo>();
+    if count > capacity {
+        return Err(QueryFailure::Inconsistent);
+    }
+    let descriptors_truncated: bool = count > max_descriptors;
+    let examined: usize = count.min(max_descriptors);
+    let mut sockets: Vec<RawListeningSocket> = Vec::new();
+    for descriptor in descriptors.get(..examined).unwrap_or_default() {
+        if descriptor.proc_fdtype != libc::PROX_FDTYPE_SOCKET.cast_unsigned() {
+            continue;
+        }
+        if let Some(socket) = socket_of_descriptor(pid, descriptor.proc_fd)? {
+            sockets.push(socket);
+        }
+    }
+    Ok(RawListeningSockets {
+        sockets,
+        descriptors_truncated,
+    })
+}
+
 fn timebase() -> Result<Timebase, QueryFailure> {
     let mut info: MachTimebaseInfo = MachTimebaseInfo {
         numerator: 0,
@@ -432,5 +700,17 @@ impl ProcessSource for DarwinProcessSource {
 
     fn wall_now(&self) -> Result<WallTime, QueryFailure> {
         WallTime::try_from(SystemTime::now()).map_err(|_| QueryFailure::Inconsistent)
+    }
+
+    fn working_directory(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
+        working_directory(pid)
+    }
+
+    fn listening_tcp_sockets(
+        &self,
+        pid: Pid,
+        max_descriptors: usize,
+    ) -> Result<RawListeningSockets, QueryFailure> {
+        listening_tcp_sockets(pid, max_descriptors)
     }
 }

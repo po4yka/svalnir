@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::id::VolumeId;
+use svalnir_core::observation::Observation;
 use svalnir_core::policy::ControlPlaneProcess;
-use svalnir_core::quantity::Bytes;
+use svalnir_core::quantity::{Bytes, Nanoseconds};
 
 use svalnir_core::state::PressureState;
 use svalnir_core::time::MonotonicNanos;
@@ -71,6 +72,11 @@ pub struct Sample {
     pub control_plane: Option<Vec<ControlPlaneProcess>>,
     /// The collectors that gave no value, as short names.
     pub degraded: Vec<String>,
+    /// The cumulative sleep time of the host, read before the capacity
+    /// collection. The runtime stores it beside the capacity samples as
+    /// the evidence of a sleep boundary between two of them. `None` when
+    /// the clock gave no acquisition window.
+    pub sleep_time: Option<Observation<Nanoseconds>>,
 }
 
 /// The collectors. The collector thread calls it; a collection can take

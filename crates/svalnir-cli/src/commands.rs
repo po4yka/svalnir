@@ -37,6 +37,7 @@ use crate::output::{
 pub(crate) mod agent;
 pub(crate) mod apply;
 pub(crate) mod authority;
+pub(crate) mod capacity;
 #[cfg(unix)]
 pub(crate) mod clean;
 pub(crate) mod config;

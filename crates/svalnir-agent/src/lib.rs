@@ -39,6 +39,7 @@
 //! | [`runtime`] | The agent process: the driver loop, the agent clock with the sleep continuity of the host, the status and lifecycle records, and the renderer of the `LaunchAgent` definition |
 
 pub mod capability;
+pub mod capacity;
 pub mod client;
 pub mod controller;
 pub mod coordinator;

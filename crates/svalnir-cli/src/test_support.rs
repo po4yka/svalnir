@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use svalnir_agent::capability::{
     CapabilityEntry, CapabilityId, CapabilityReport, Evidence, ProbeSubject, Summary, WorkerRole,
 };
-use svalnir_agent::platform::memory::{MemorySnapshot, SwapUsage, VmStatistics};
+use svalnir_agent::platform::memory::{
+    Clock, ClockError, CollectionContext, ContextIdentity, MemorySnapshot, SwapUsage, VmStatistics,
+};
 use svalnir_agent::platform::process::{
     AddressFamily, ForegroundState, LISTENING_TCP_PORTS_METRIC, ListeningPort, ListeningPorts,
     Omissions, ProcessContext, ProcessMetrics, ProcessRecord, ProcessSnapshot,
@@ -296,6 +298,50 @@ pub(crate) fn volume_capacity() -> (VolumeIdentity, VolumeCapacity, FoundationCa
             ),
         },
     )
+}
+
+/// A clock that always reads the time of the first test sample and no sleep.
+#[derive(Debug)]
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn monotonic_now(&self) -> Result<MonotonicNanos, ClockError> {
+        Ok(MonotonicNanos::new(FIRST_SAMPLE_NS))
+    }
+
+    fn wall_now(&self) -> Result<WallTime, ClockError> {
+        Ok(wall_time())
+    }
+
+    fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+        Ok(Nanoseconds::new(0))
+    }
+}
+
+/// A collection context on [`FixedClock`] with the identities of the test
+/// samples.
+pub(crate) fn collection_context() -> CollectionContext {
+    CollectionContext::new(
+        ContextIdentity {
+            host: IdentityId::new("host_local").unwrap(),
+            worker_id: WorkerId::new("worker_test").unwrap(),
+            boot_id: BootId::new(BOOT).unwrap(),
+            collector_epoch: CollectorEpochId::new(EPOCH).unwrap(),
+            clock_domain: ClockDomainId::new(CLOCK_DOMAIN).unwrap(),
+        },
+        std::sync::Arc::new(FixedClock),
+    )
+    .unwrap()
+}
+
+/// The `disk.available_bytes` sample of the test volume `minute` minutes
+/// after the first test sample.
+pub(crate) fn available_sample(minute: u64, bytes: u64) -> Observation<Bytes> {
+    let (_, capacity, _) = volume_capacity();
+    let mut observation: Observation<Bytes> = capacity.available;
+    observation.reading = Reading::Available(Bytes::new(bytes));
+    observation.sample = sample("available", FIRST_SAMPLE_NS + minute * 60_000_000_000);
+    observation
 }
 
 const START_MICROSECONDS: u64 = 1_700_000_000_000_000;

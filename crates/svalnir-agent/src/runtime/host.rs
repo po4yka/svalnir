@@ -503,7 +503,12 @@ impl Collector for SystemCollector {
         // A sleep between two collections is a clock discontinuity. A
         // sleep time that is not available gives no evidence that the
         // host did not sleep.
-        let sleep: Reading<Nanoseconds> = self.context.sleep_time();
+        let observed: Option<Observation<Nanoseconds>> = self.context.sleep_time_observation().ok();
+        let sleep: Reading<Nanoseconds> = observed.as_ref().map_or(
+            Reading::Unavailable(UnavailableReason::NotCollected),
+            |observation| observation.reading.clone(),
+        );
+        sample.sleep_time = observed;
         if sleep_between(&self.last_sleep, &sleep).is_err() {
             sample.woke = true;
             if !sleep.is_available() {

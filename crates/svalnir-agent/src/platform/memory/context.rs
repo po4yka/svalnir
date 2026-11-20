@@ -15,7 +15,7 @@ use svalnir_core::id::{
 };
 use svalnir_core::observation::{
     Coverage, MetricId, MetricKind, Observation, Reading, Sample, Scope, ScopeKind, Source,
-    UnavailableReason, Unit,
+    UnavailableReason, Unit, metric,
 };
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
@@ -176,6 +176,12 @@ pub(crate) struct AdapterIds {
     pub(crate) statfs: AdapterId,
     /// Foundation volume resource values.
     pub(crate) foundation_volume: AdapterId,
+    /// The cumulative sleep time of the host.
+    pub(crate) sleep: AdapterId,
+    /// The derived entries of the capacity report.
+    pub(crate) capacity_report: AdapterId,
+    /// The local snapshot list of a volume.
+    pub(crate) fs_snapshot: AdapterId,
 }
 
 impl AdapterIds {
@@ -187,6 +193,9 @@ impl AdapterIds {
             dispatch_memory_pressure: AdapterId::new("macos.dispatch_memory_pressure")?,
             statfs: AdapterId::new("macos.statfs")?,
             foundation_volume: AdapterId::new("macos.foundation_volume")?,
+            sleep: AdapterId::new("macos.clock_sleep")?,
+            capacity_report: AdapterId::new("svalnir.capacity_report")?,
+            fs_snapshot: AdapterId::new("macos.fs_snapshot")?,
         })
     }
 }
@@ -293,6 +302,38 @@ impl CollectionContext {
     /// The sleep time of the host at this call, for a rate interval.
     pub fn sleep_time(&self) -> Reading<Nanoseconds> {
         sleep::sleep_reading(self.clock.sleep_time())
+    }
+
+    /// The cumulative sleep time of the host as the observation
+    /// `host.sleep_time_ns`, for the evidence of a sleep boundary between
+    /// two stored samples (`docs/RESOURCE_MODEL.md` section 6).
+    ///
+    /// A sleep time that the clock cannot give is an unavailable
+    /// observation: it is no evidence that the host did not sleep.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CollectError`] when the clock gives no acquisition
+    /// window.
+    pub fn sleep_time_observation(&self) -> Result<Observation<Nanoseconds>, CollectError> {
+        let acquisition = self.begin()?;
+        let reading: Reading<Nanoseconds> = self.sleep_time();
+        let sample: Sample = self.finish(acquisition)?;
+        Ok(self.observation(
+            MetricSpec::new(
+                metric::HOST_SLEEP_TIME_NS,
+                Unit::Nanosecond,
+                MetricKind::Counter,
+            ),
+            self.host_scope(),
+            reading,
+            Provenance {
+                adapter: &self.adapters.sleep,
+                native_api: "clock_gettime",
+                native_field: "CLOCK_MONOTONIC_RAW - CLOCK_UPTIME_RAW",
+            },
+            &sample,
+        ))
     }
 
     /// The scope of a host metric.

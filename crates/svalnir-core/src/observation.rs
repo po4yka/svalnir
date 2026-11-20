@@ -124,6 +124,23 @@ pub mod metric {
         DISK_IMPORTANT_AVAILABLE_BYTES => "disk.important_available_bytes",
         /// Foundation capacity for opportunistic usage.
         DISK_OPPORTUNISTIC_AVAILABLE_BYTES => "disk.opportunistic_available_bytes",
+        /// The allocated size that one saved scan of the volume measured
+        /// below its root. An entry of the capacity report only.
+        DISK_SCAN_EXPLAINED_BYTES => "disk.scan_explained_bytes",
+        /// The used capacity of the volume (`disk.total_bytes` minus
+        /// `disk.free_bytes`) that the saved scan does not explain. An entry
+        /// of the capacity report only. Not reclaimable capacity.
+        DISK_SCAN_UNEXPLAINED_BYTES => "disk.scan_unexplained_bytes",
+        /// The number of local snapshots of the volume. An entry of the
+        /// capacity report only.
+        DISK_LOCAL_SNAPSHOT_COUNT => "disk.local_snapshot_count",
+        /// Signed `disk.important_available_bytes` minus
+        /// `disk.available_bytes`. An entry of the capacity report only.
+        DISK_IMPORTANT_MINUS_AVAILABLE_BYTES => "disk.important_minus_available_bytes",
+
+        /// Cumulative sleep time of the host in the current boot. The
+        /// evidence of a sleep boundary between two stored samples.
+        HOST_SLEEP_TIME_NS => "host.sleep_time_ns",
 
         /// Physical memory of the host.
         MEMORY_PHYSICAL_BYTES => "memory.physical_bytes",

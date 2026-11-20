@@ -365,6 +365,7 @@ impl Bench {
             woke: false,
             control_plane: Some(Vec::new()),
             degraded: Vec::new(),
+            sleep_time: None,
         }
     }
 

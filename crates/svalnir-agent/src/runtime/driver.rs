@@ -18,6 +18,7 @@ use svalnir_core::digest::ContentDigest;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::grant::{AuthorityState, ControlClock, InstanceInhibition, MeasurementFloor};
 use svalnir_core::id::{ExecutorEpochId, OperationId, RuleId};
+use svalnir_core::observation::Observation;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{ByteDelta, Bytes, Nanoseconds};
 use svalnir_core::rule::RuleRegistry;
@@ -1036,14 +1037,14 @@ impl Driver {
         self.sample_degraded = sample.degraded;
         self.has_sample = true;
         self.authority.records().control_plane = sample.control_plane;
-        self.retain_sample();
+        self.retain_sample(sample.sleep_time.as_ref());
         woke
     }
 
     /// Writes the pressure and capacity observations of the sample to the
     /// catalog store. Retained samples are optional work: they are dropped
     /// before an action record.
-    fn retain_sample(&mut self) {
+    fn retain_sample(&mut self, sleep_time: Option<&Observation<Nanoseconds>>) {
         // The footprint of this tick counts at once, and not only after
         // the next evaluation.
         if self.optional_reduced || self.over_budget {
@@ -1058,10 +1059,21 @@ impl Driver {
         {
             encoded.push(sample);
         }
+        let mut capacity_samples: usize = 0;
         for volume in &self.observations.volumes {
             if let Ok(sample) = EncodedSample::encode(&volume.available) {
                 encoded.push(sample);
+                capacity_samples += 1;
             }
+        }
+        // The sleep time is the evidence of a sleep boundary between two
+        // stored capacity samples, for the estimate of the time to a
+        // threshold. It has a meaning only beside those samples.
+        if capacity_samples > 0
+            && let Some(sleep) = sleep_time
+            && let Ok(sample) = EncodedSample::encode(sleep)
+        {
+            encoded.push(sample);
         }
         if !encoded.is_empty() && store.insert_samples(&encoded).is_err() {
             self.sample_degraded.push("sample_store".to_owned());

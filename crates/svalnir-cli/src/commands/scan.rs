@@ -24,6 +24,7 @@ use svalnir_core::observation::{Coverage, Observation, Sample, Source};
 use svalnir_core::quantity::{Bytes, EntryCount};
 use svalnir_core::time::WallTime;
 
+use super::capacity::{self, CapacityRequest, CapacityView};
 use super::{CommandFailure, Invocation};
 use crate::cli::{ReportArgs, ScanArgs};
 use crate::environment::Environment;
@@ -103,13 +104,26 @@ pub(crate) struct ScanView {
     note: &'static str,
 }
 
+/// A saved scan record.
+#[derive(Debug, Clone)]
+pub(crate) struct SavedScan {
+    scan: ScanResult,
+    recorded_started_at: WallTime,
+    recorded_finished_at: WallTime,
+}
+
 /// The result of `report`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReportView {
-    scan: ScanResult,
-    /// The wall-clock times of the record in the catalog store.
-    recorded_started_at: WallTime,
-    recorded_finished_at: WallTime,
+    /// The scan that `--scan` named. `null` without `--scan`.
+    scan: Option<ScanResult>,
+    /// The wall-clock times of the record in the catalog store. `null`
+    /// without `--scan`.
+    recorded_started_at: Option<WallTime>,
+    recorded_finished_at: Option<WallTime>,
+    /// The capacity of the startup data volume, its history, and the
+    /// estimate of the time to a threshold.
+    capacity: CapacityView,
     note: &'static str,
 }
 
@@ -347,13 +361,17 @@ impl ScanView {
 
 impl ReportView {
     pub(crate) fn render(&self) -> String {
-        let mut out: String = render_result(&self.scan);
-        put_line!(
-            out,
-            "\nThis is a saved record from {}. The files can be different now.",
-            self.recorded_finished_at
-        );
-        put_line!(out, "{AUTHORITY_NOTE}");
+        let mut out: String = String::new();
+        if let (Some(scan), Some(finished)) = (&self.scan, self.recorded_finished_at) {
+            out = render_result(scan);
+            put_line!(
+                out,
+                "\nThis is a saved record from {finished}. The files can be different now."
+            );
+            put_line!(out, "{AUTHORITY_NOTE}");
+            out.push('\n');
+        }
+        self.capacity.render(&mut out);
         out
     }
 }
@@ -448,7 +466,7 @@ fn store_error(error: &StoreError) -> ErrorBody {
 /// The store options and the retention of the catalog store: the `[history]`
 /// values of the configuration template. This build has no effective
 /// configuration revision, so a proposal file does not change them.
-fn catalog_limits() -> (StoreOptions, Option<RetentionPolicy>) {
+pub(super) fn catalog_limits() -> (StoreOptions, Option<RetentionPolicy>) {
     let template = config::parse_and_validate("schema_version = 1\n");
     match template.config() {
         Some(config) => {
@@ -653,7 +671,7 @@ pub(crate) fn scan_root(
 }
 
 /// Reads a saved scan.
-pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<ReportView, ErrorBody> {
+pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<SavedScan, ErrorBody> {
     let scan_id: ScanId = ScanId::new(scan).map_err(|_| ErrorBody {
         code: "invalid_scan_id".into(),
         family: ErrorFamily::Request,
@@ -713,11 +731,10 @@ pub(crate) fn load_report(scan: &str, environment: &Environment) -> Result<Repor
         plan_id: None,
         next_action: NextAction::RefreshObservation,
     })?;
-    Ok(ReportView {
+    Ok(SavedScan {
         scan: result,
         recorded_started_at: record.started_at,
         recorded_finished_at: record.finished_at,
-        note: AUTHORITY_NOTE,
     })
 }
 
@@ -741,7 +758,30 @@ pub(crate) fn report(
     arguments: &ReportArgs,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
-    let view: ReportView = load_report(&arguments.scan, invocation.environment)?;
+    let saved: Option<SavedScan> = arguments
+        .scan
+        .as_deref()
+        .map(|scan| load_report(scan, invocation.environment))
+        .transpose()?;
+    let capacity: CapacityView = capacity::collect(
+        &CapacityRequest {
+            window: arguments.window,
+            limit: arguments.limit,
+            threshold: arguments.threshold,
+        },
+        saved.as_ref().map(|saved| &saved.scan),
+        invocation
+            .environment
+            .catalog_path()
+            .map_err(|error| error.message),
+    );
+    let view = ReportView {
+        recorded_started_at: saved.as_ref().map(|saved| saved.recorded_started_at),
+        recorded_finished_at: saved.as_ref().map(|saved| saved.recorded_finished_at),
+        scan: saved.map(|saved| saved.scan),
+        capacity,
+        note: AUTHORITY_NOTE,
+    };
     invocation.emit(Kind::Report, &view, ReportView::render)?;
     // The query succeeded. The coverage of the saved scan is in the result.
     Ok(ExitStatus::Success)
@@ -881,9 +921,10 @@ mod tests {
         let result = scan_result(false);
         let finished = result.finished.wall.unwrap();
         let view = ReportView {
-            scan: result,
-            recorded_started_at: finished,
-            recorded_finished_at: finished,
+            scan: Some(result),
+            recorded_started_at: Some(finished),
+            recorded_finished_at: Some(finished),
+            capacity: crate::commands::capacity::tests::view(),
             note: super::AUTHORITY_NOTE,
         };
         let text = view.render();
@@ -891,7 +932,12 @@ mod tests {
             text.contains("This is a saved record from 2026-01-02T03:04:05Z."),
             "{text}"
         );
+        assert!(
+            text.contains("Capacity of the startup data volume"),
+            "{text}"
+        );
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["recorded_finished_at"], "2026-01-02T03:04:05Z");
+        assert_eq!(json["capacity"]["schema_version"], 1);
     }
 }

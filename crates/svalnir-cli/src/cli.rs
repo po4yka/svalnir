@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use svalnir_core::byte_size::parse_byte_size;
 use svalnir_core::duration::parse_duration;
+use svalnir_core::quantity::Bytes;
 
 /// Parses a duration that is longer than zero.
 ///
@@ -73,7 +75,7 @@ pub enum Command {
     Status,
     /// Analyze a selected storage scope.
     Scan(ScanArgs),
-    /// Inspect a recorded scan.
+    /// Inspect a recorded scan and the capacity of the startup data volume.
     Report(ReportArgs),
     /// Prepare, inspect, and apply a cleanup plan.
     Clean {
@@ -222,11 +224,44 @@ pub struct MonitorArgs {
     pub interval: Duration,
 }
 
+/// The longest window of the capacity history of `report`.
+pub const MAX_REPORT_WINDOW: Duration = Duration::from_hours(30 * 24);
+
+/// Parses the window of the capacity history of `report`.
+fn report_window(text: &str) -> Result<Duration, String> {
+    let window: Duration = positive_duration(text)?;
+    if window > MAX_REPORT_WINDOW {
+        return Err(format!("the window `{text}` must be at most 30d"));
+    }
+    Ok(window)
+}
+
+/// Parses a byte size, for example `20GiB`.
+fn byte_size(text: &str) -> Result<Bytes, String> {
+    parse_byte_size(text).map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Args)]
 pub struct ReportArgs {
-    /// Identifier of a recorded scan.
+    /// Identifier of a recorded scan. Without it, the capacity report uses
+    /// the newest saved scan of the startup data volume.
     #[arg(long, value_name = "SCAN_ID")]
-    pub scan: String,
+    pub scan: Option<String>,
+    /// Window of the capacity history, up to 30d.
+    #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = report_window)]
+    pub window: Duration,
+    /// Largest number of capacity samples in the history.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = 2_000,
+        value_parser = clap::value_parser!(u32).range(1..=10_000)
+    )]
+    pub limit: u32,
+    /// Available capacity of the estimate. Default: `disk_guard.warn_below`
+    /// of the configuration template.
+    #[arg(long, value_name = "SIZE", value_parser = byte_size)]
+    pub threshold: Option<Bytes>,
 }
 
 #[derive(Debug, Subcommand)]

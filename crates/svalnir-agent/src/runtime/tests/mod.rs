@@ -727,6 +727,7 @@ impl Bench {
             // The test process is not a member of a target of a test.
             control_plane: Some(Vec::new()),
             degraded: Vec::new(),
+            sleep_time: None,
         }
     }
 
@@ -1385,6 +1386,7 @@ impl Collector for QuietCollector {
             woke: false,
             control_plane: Some(Vec::new()),
             degraded: Vec::new(),
+            sleep_time: None,
         }
     }
 }

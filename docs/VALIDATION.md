@@ -576,7 +576,7 @@ The run found four defects:
 | D-10 | In History, the state line of a cancel overflowed the State column and covered the next column |
 | D-11 | The sidebar and the status line said "Agent reporting" for up to 90 s after a clean stop of the agent, because the state came from the age of the status record only |
 
-Commit `2e3e6f9` corrects the four defects, each with a regression test: the read-only open of the journal applies the page limit of the writer through one shared function, and the row has the label "Size and size limit" (D-8); a button that fits its container (`ActionButton::fit()`) and a dialog footer that wraps keep the button row inside the dialog ([DESIGN.md](../DESIGN.md) §7) (D-9); the state cell of History wraps inside its cell (D-10); a status record with the run state stopped gives `AgentState::Stopped` at each age, and a running record keeps the freshness rule (D-11). No host run examined the corrections.
+Commit `2e3e6f9` corrects the four defects, each with a regression test: the read-only open of the journal applies the page limit of the writer through one shared function, and the row has the label "Size and size limit" (D-8); a button that fits its container (`ActionButton::fit()`) and a dialog footer that wraps keep the button row inside the dialog ([DESIGN.md](../DESIGN.md) §7) (D-9); the state cell of History wraps inside its cell (D-10; a later change, not examined on a host, limits the row to two lines of the sentence and shows the full line in the detail view); a status record with the run state stopped gives `AgentState::Stopped` at each age, and a running record keeps the freshness rule (D-11). No host run examined the corrections.
 
 ### What the records support
 

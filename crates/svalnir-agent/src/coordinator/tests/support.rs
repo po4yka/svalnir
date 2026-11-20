@@ -917,7 +917,9 @@ impl TrashBackend for FakeTrash {
 /// home directory, and a Trash directory.
 #[derive(Debug)]
 pub(super) struct Tree {
-    _temp: TempDir,
+    /// The temporary directory that this value removes. `None` for a tree
+    /// in the directory of a parent test process (`Tree::at`).
+    _temp: Option<TempDir>,
     pub(super) database: PathBuf,
     pub(super) root: PathBuf,
     pub(super) trash: PathBuf,
@@ -930,19 +932,31 @@ impl Tree {
         // The temporary directory of macOS is below the symbolic link
         // `/var`. An approved root has no symbolic link in its path.
         let base: PathBuf = fs::canonicalize(temp.path()).unwrap();
-        let root: PathBuf = base.join("root");
-        let trash: PathBuf = base.join("trash");
-        let home: PathBuf = base.join("home");
-        for directory in [&root, &trash, &home] {
+        let tree: Self = Self {
+            _temp: Some(temp),
+            ..Self::at(&base)
+        };
+        for directory in [&tree.root, &tree.trash, &tree.home] {
             fs::create_dir(directory).unwrap();
         }
+        tree
+    }
+
+    /// The tree that a different process made in `base`. The value does
+    /// not remove the directory: the process that made it does.
+    pub(super) fn at(base: &Path) -> Self {
         Self {
             database: base.join("operations.sqlite"),
-            _temp: temp,
-            root,
-            trash,
-            home,
+            _temp: None,
+            root: base.join("root"),
+            trash: base.join("trash"),
+            home: base.join("home"),
         }
+    }
+
+    /// The directory of the tree.
+    pub(super) fn base(&self) -> &Path {
+        self.database.parent().unwrap()
     }
 
     pub(super) fn roots(&self) -> ApprovedRoots {
@@ -1311,8 +1325,11 @@ impl Journal for FailingJournal {
 
     fn commit_intent(&mut self, envelope: &RequestEnvelope) -> Result<(), JournalError> {
         self.check(FailPoint::CommitIntent)?;
+        super::crash::reach(super::crash::CrashPoint::BeforeIntent);
         self.intents.fetch_add(1, Ordering::SeqCst);
-        self.inner.commit_intent(envelope)
+        self.inner.commit_intent(envelope)?;
+        super::crash::reach(super::crash::CrashPoint::AfterIntent);
+        Ok(())
     }
 
     fn consume_dispatch(
@@ -1322,6 +1339,7 @@ impl Journal for FailingJournal {
     ) -> Result<DispatchReceipt, JournalError> {
         self.check(FailPoint::ConsumeDispatch)?;
         let receipt = self.inner.consume_dispatch(operation_id, step_id)?;
+        super::crash::reach(super::crash::CrashPoint::AfterConsume);
         let hook = self.after_consume.lock().unwrap().0.take();
         if let Some(mut hook) = hook {
             hook();
@@ -1331,11 +1349,17 @@ impl Journal for FailingJournal {
 
     fn record_step(&mut self, operation_id: &OperationId, step: &Step) -> Result<(), JournalError> {
         self.check(FailPoint::RecordStep)?;
+        if !step.results().is_empty() {
+            super::crash::reach(super::crash::CrashPoint::BeforeStepResult);
+        }
         self.inner.record_step(operation_id, step)
     }
 
     fn record_operation(&mut self, operation: &Operation) -> Result<(), JournalError> {
         self.check(FailPoint::RecordOperation)?;
+        if operation.state().is_settled() {
+            super::crash::reach(super::crash::CrashPoint::BeforeOperationResult);
+        }
         if operation.state().is_settled() {
             let present: bool = self
                 .inner
@@ -1570,7 +1594,13 @@ impl Bench {
     }
 
     pub(super) fn with(volatile: bool, trash_mode: TrashMode) -> Self {
-        let tree = Tree::new();
+        Self::on(Tree::new(), volatile, trash_mode, 0)
+    }
+
+    /// A bench on `tree` whose next executor lifetime has the number
+    /// `lifetimes + 1`, so that a test that continues the journal of a
+    /// different process has a new executor epoch.
+    pub(super) fn on(tree: Tree, volatile: bool, trash_mode: TrashMode, lifetimes: u32) -> Self {
         let clock = TestClock::new();
         let host = Host::new(&clock, Some(tree.roots()));
         Self {
@@ -1586,7 +1616,7 @@ impl Bench {
             trash_mode,
             uncertain_submission: false,
             uncertain_member: false,
-            lifetimes: 0,
+            lifetimes,
         }
     }
 

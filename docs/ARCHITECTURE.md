@@ -107,6 +107,8 @@ A native capacity adapter can derive available bytes from `statfs` fields and ex
 
 Incremental scans use bounded batches and cancellation. FSEvents marks catalog regions dirty; it is not a complete audit log. Dropped/coalesced events and root changes require reconciliation, following [Apple's FSEvents guidance][fsevents]. A stale catalog may support display, but mutation requires fresh target checks.
 
+The first release has no FSEvents consumer (owner decision of 2026-11-20). The agent keeps its candidates current with a bounded discovery in the warning band of the disk guard, and examines only the known candidates again in a disk incident. The FSEvents invalidation of catalog regions is the first item of Milestone 4.
+
 Candidates are prepared during ordinary operation. Critical disk pressure must not trigger a whole-disk scan, duplicate hashing, database vacuum, or unbounded cleanup discovery.
 
 ### Memory, swap, and application state

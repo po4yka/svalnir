@@ -260,8 +260,28 @@ Every entry is currently **proposed**. The first two entries have a discovery in
 | `pip.cache` | Verified producer cache scope or selected supported entries | Inspection and manual workflow first |
 | `cargo.build-output` | Explicitly selected generated output set for one workspace | Inspection and manual workflow first |
 | `gradle.cache-inventory` | Attributed cache families and owner-retention information | Inspection and recommendations |
+| `pnpm.content-store` | The content-addressed store of one resolved store path, through the owner operation | Inspection and manual workflow first |
+| `yarn.cache` | The resolved global cache of one Yarn installation | Inspection and manual workflow first |
+| `go.build-cache` | The resolved `GOCACHE` directory of one Go installation | Inspection and manual workflow first |
+| `uv.cache` | The resolved cache directory of one uv installation, through the owner operation | Inspection and manual workflow first |
+| `homebrew.download-cache` | The downloads of the resolved Homebrew cache | Inspection and manual workflow first |
+| `cocoapods.cache` | The resolved download cache of one CocoaPods installation | Inspection and manual workflow first |
+
+The six entries from `pnpm.content-store` to `cocoapods.cache` are package and build caches of the same class as `npm.content-cache` (owner decision of 2026-11-20). They widen the developer coverage of the first release. Each one stays `proposed` until it has its own promotion evidence (section 15).
 
 The registry deliberately omits a universal “all application caches” rule. More adapters can be added when their ownership, lifecycle, and concurrency contracts are known.
+
+### Rule families after the first release
+
+These families are planned for Milestone 4 (owner decision of 2026-11-20). They have no rule ID, no declaration, and no implementation. Each one needs its own rule identity, support matrix, and action gates before it enters the registry.
+
+| Family | Planned unit | Planned limit |
+| --- | --- | --- |
+| Project dependency and build directories | One generated directory of one identified project, for example `node_modules`, `.venv`, or `Pods` | The directory name is not sufficient. The rule needs a project marker in the parent, evidence that the version-control system ignores the directory, and the activity of the build processes of the project. Manual selection first |
+| Simulator devices and runtimes | One device or runtime that the owner tool lists | Removal only through the owner tool as a producer-supported operation (section 9). Simulator contents stay outside generic eviction |
+| Container build cache | The build cache that the container tool reports | Removal only through the owner tool as a producer-supported operation. Persistent volumes, images in use, and databases stay protected |
+| Homebrew cleanup | The old versions and downloads that the owner tool reports | Removal only through the owner tool as a producer-supported operation |
+| Git worktrees | One linked worktree of one identified repository | Manual only, never automatic. A worktree can hold work that exists nowhere else: the plan must show uncommitted changes, files that are not tracked, and commits that no branch has, and must preserve them before the removal or refuse the worktree |
 
 ## 11. Initial automatic targets
 
@@ -358,6 +378,56 @@ The initial integration attributes these categories and explains owner-managed r
 
 Changing Gradle retention is a separate, user-approved configuration action. It is not an implicit side effect of enabling Svalnir cleanup. Shared caches and multiple Gradle versions require producer-aware coordination; daemon absence or an old directory suffix is insufficient permission. A future eviction rule must receive its own identity, support matrix, and action gates.
 
+### `pnpm.content-store`
+
+pnpm documents a content-addressable store, `pnpm store path` for its location, and `pnpm store prune` to remove the packages that no project refers to. [pnpm store documentation][pnpm-store]
+
+Discovery must resolve the store path of the specific pnpm installation and its store version. Keep project `node_modules`, source, lockfiles, credentials, and pnpm configuration outside this rule.
+
+pnpm links files from the store into the `node_modules` directories of projects with hard links or clones. The removal of a store file whose content a project still has thus reclaims no capacity for that file. The reclaim estimate must not be the logical size of the store, and the result is the observed capacity change.
+
+Initial support explains and previews the owner workflow. A direct traversal of the store needs a tested adapter for the store version, with consistency and concurrency evidence.
+
+### `yarn.cache`
+
+Yarn documents a cache with `yarn cache clean`, and a configurable cache folder. The cache of a project and the global mirror are different locations. [Yarn cache documentation][yarn-cache]
+
+Discovery must identify the Yarn major version and resolve the global cache folder from its configuration. A cache inside a project is outside this rule: a project can commit it as its offline store, so it can be data that no registry gives again. Keep source, lockfiles, credentials, and Yarn configuration outside this rule.
+
+Initial support explains and previews the owner workflow. Eviction may require future downloads and a registry that is still available.
+
+### `go.build-cache`
+
+Go documents a build cache at the location that `go env GOCACHE` reports, removes cache entries that are not recently used automatically, and gives `go clean -cache` to remove the cache. [Go build and test caching][go-cache]
+
+Discovery must resolve `GOCACHE` for the specific Go installation. The module cache (`GOMODCACHE`) is a different location with downloaded module source and is outside this rule. Keep `GOPATH` source, installed binaries, and workspaces outside this rule.
+
+An active build or test reads and writes the cache. Admission needs activity evidence for the Go toolchain processes of the user. Initial support explains and previews the owner workflow. The impact is a full rebuild and a rerun of cached tests.
+
+### `uv.cache`
+
+uv documents a cache at the location that `uv cache dir` reports, `uv cache clean` to remove entries, and `uv cache prune` to remove the entries that are not used. [uv cache documentation][uv-cache]
+
+Discovery must resolve the cache directory of the specific uv installation. Keep virtual environments, installed tools, managed Python installations, source, and lockfiles outside this rule.
+
+uv can link files from the cache into virtual environments with clones or hard links. As for `pnpm.content-store`, the reclaim estimate must not be the logical size of the cache. Initial support explains and previews the owner workflow; a running uv process blocks admission.
+
+### `homebrew.download-cache`
+
+Homebrew documents `brew --cache` for the location of its downloads and `brew cleanup` to remove old downloads and old versions. [Homebrew manual][homebrew-manual]
+
+The candidate is a download in the resolved cache directory only. Installed kegs, the Cellar, the Caskroom, taps, and the Homebrew repository are outside this rule. The removal of old installed versions is the separate "Homebrew cleanup" family of section 10.
+
+Initial support explains and previews the owner workflow. A running `brew` process blocks admission. The impact is a new download for a reinstall, which needs a network and a source that is still available.
+
+### `cocoapods.cache`
+
+CocoaPods documents `pod cache list` and `pod cache clean` for its download cache. [CocoaPods command reference][cocoapods-cache]
+
+Discovery must resolve the cache of the specific CocoaPods installation. The `Pods` directory of a project, `Podfile`, `Podfile.lock`, the spec repositories, and credentials are outside this rule.
+
+Initial support explains and previews the owner workflow. A running `pod` process blocks admission. Eviction may require future downloads and sources that are still available.
+
 ## 13. Preview and explainability
 
 A scan may report a potential candidate without declaring it executable. Every preview distinguishes:
@@ -430,6 +500,12 @@ Automatic promotion requires all applicable gates plus compatible policy and act
 - [pip: Caching and supported cache operations][pip-cache]
 - [Cargo: clean command][cargo-clean]
 - [Gradle: Managed directories and caches][gradle-caches]
+- [pnpm: Store commands][pnpm-store]
+- [Yarn: Cache clean command][yarn-cache]
+- [Go: Build and test caching][go-cache]
+- [uv: Cache concepts][uv-cache]
+- [Homebrew: Manual][homebrew-manual]
+- [CocoaPods: Command reference][cocoapods-cache]
 
 [apple-races]: https://developer.apple.com/library/archive/documentation/Security/Conceptual/SecureCodingGuide/Articles/RaceConditions.html
 [unlink]: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/unlink.2.html
@@ -439,3 +515,9 @@ Automatic promotion requires all applicable gates plus compatible policy and act
 [pip-cache]: https://pip.pypa.io/en/stable/topics/caching/
 [cargo-clean]: https://doc.rust-lang.org/cargo/commands/cargo-clean.html
 [gradle-caches]: https://docs.gradle.org/current/userguide/directory_layout.html
+[pnpm-store]: https://pnpm.io/cli/store
+[yarn-cache]: https://yarnpkg.com/cli/cache/clean
+[go-cache]: https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching
+[uv-cache]: https://docs.astral.sh/uv/concepts/cache/
+[homebrew-manual]: https://docs.brew.sh/Manpage
+[cocoapods-cache]: https://guides.cocoapods.org/terminal/commands.html

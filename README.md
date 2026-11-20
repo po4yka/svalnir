@@ -49,7 +49,7 @@ Each document owns one contract. Where a specification is more specific than thi
 | [Validation plan](docs/VALIDATION.md) | Validation families, release gates, and evidence records |
 | [Design](DESIGN.md) | Visual language of the GPUI client: tokens, surfaces, components, data visualization, and motion |
 
-[CONTRIBUTING.md](CONTRIBUTING.md) gives the contribution workflow. [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) give instructions for automated contributors.
+[ROADMAP.md](ROADMAP.md) gives the milestones and the acceptance criteria of the first release. [CONTRIBUTING.md](CONTRIBUTING.md) gives the contribution workflow. [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) give instructions for automated contributors.
 
 ## Product goals
 
@@ -81,12 +81,12 @@ Svalnir does not promise that every cache is disposable or that every large appl
 
 | Area | First release target | Later extensions |
 | --- | --- | --- |
-| Disk analysis | Volume overview, directory sizes, application and developer categories, large-file discovery, partial-scan reporting | Duplicate review, richer storage attribution and historical comparisons |
+| Disk analysis | Volume overview, directory sizes, application and developer categories, large-file discovery, partial-scan reporting | Incremental catalog from filesystem events, duplicate review, a report of capacity outside the scanned categories, richer storage attribution and historical comparisons |
 | Manual cleanup | Previewable, expiring plans; exclusions; Trash or explicitly selected permanent removal | Additional application adapters and uninstall assistance |
 | Disk protection | Persistent monitoring and automatic eviction of approved regenerable files under low-space policies | More workload-aware preparation and forecasting |
 | Memory monitoring | System pressure, RAM composition, compression, swap usage and activity, process footprint and growth | Deeper diagnostic views and optional hardware metrics |
 | Application control | Automatic graceful termination and force quit; per-app budgets; protected identities; cooldowns | More cooperative application integrations |
-| Developer tools | Initial audited cleanup adapters and recognition of common workload owners | Managed job runner, container and model lifecycle adapters |
+| Developer tools | Initial audited cleanup adapters, with the package and build caches of the [rule registry](docs/CLEANUP_RULES.md), and recognition of common workload owners | Project dependency directories, simulator, container, and Homebrew operations through the owner tool, manual Git worktree cleanup, managed job runner, model lifecycle adapters |
 | Interfaces | Full CLI, structured output, core GPUI dashboard, menu bar status, notifications | Richer storage visualization and diagnostic timelines |
 | Permissions | Capability diagnostics, Full Disk Access guidance | Narrow privileged helper, optional system extensions |
 | Operations | Local history, policy simulation, pause/resume, crash recovery, bounded retention | Fleet-oriented configuration and export formats, if justified |
@@ -95,7 +95,7 @@ Automatic force termination belongs to the first release scope. It is an enabled
 
 ## How protection works
 
-The agent combines event notifications with bounded periodic sampling. Filesystem events invalidate affected catalog entries; memory-pressure notifications prompt a fresh assessment. Startup, wake, volume changes, and policy changes also trigger reconciliation.
+The agent combines event notifications with bounded periodic sampling. Filesystem events invalidate affected catalog entries (after the first release; see [Automatic disk protection](#automatic-disk-protection)); memory-pressure notifications prompt a fresh assessment. Startup, wake, volume changes, and policy changes also trigger reconciliation.
 
 The controller evaluates disk and memory together. During simultaneous critical disk and memory pressure, it first reduces its own work, uses already known cleanup candidates, and considers eligible memory-heavy applications. It avoids launching an expensive full-disk scan or hashing job in the middle of an emergency.
 
@@ -161,6 +161,8 @@ The [resource model](docs/RESOURCE_MODEL.md) defines each measurement, its sourc
 ## Automatic disk protection
 
 The disk guard runs while the graphical application is closed. It prepares a compact catalog during normal operation and refreshes affected areas when necessary. FSEvents is an invalidation mechanism; coalesced or dropped events require reconciliation and must not be treated as a complete per-file audit log. See [Apple's FSEvents guidance][fsevents].
+
+The first release has no FSEvents consumer (owner decision of 2026-11-20). The agent refreshes its candidates with a bounded discovery in the warning band of the disk guard. The FSEvents invalidation is the first item of Milestone 4.
 
 ### Trigger and recovery policy
 
@@ -307,6 +309,7 @@ Developer adapters connect resource attribution to the tool that owns the data o
 | JavaScript tooling | Distinguish package caches from project dependencies, lockfiles, and source; prefer tool-supported operations |
 | Docker and other VMs | Attribute VM disk and memory use; distinguish host pressure from guest limits; keep persistent volumes and databases protected |
 | Local model runtimes | Show model process footprint; unload idle models through supported APIs; retain model weights unless explicitly selected |
+| Git worktrees | Later: list the linked worktrees of a repository; manual removal only, with uncommitted work shown and preserved first |
 | Managed builds and scripts | Later: launch a registered job with an identity, budget, priority, stop policy, and restart policy |
 
 An adapter may suggest configuring a workload before it starts, such as Gradle heap/worker settings or Docker Desktop's VM resource settings. It should not silently rewrite global developer configuration. Ollama's documented lifecycle controls provide an example of releasing loaded model memory without deleting model files. See [Gradle build environment][gradle-environment], [Gradle configuration][gradle-config], [Docker resource settings][docker-settings], and [Ollama FAQ][ollama-faq].
@@ -731,7 +734,7 @@ The first validation target is **Apple Silicon macOS**. Intel support and the mi
 
 The intended distribution is a Developer ID-signed and notarized application with its CLI and separately scoped helpers. An ordinary App Sandbox configuration cannot provide all of the planned cross-application operations; for example, Apple documents restrictions on force-terminating other apps from a sandboxed application. The initial distribution plan therefore targets a direct download outside the Mac App Store. See [application force termination][app-force-terminate].
 
-There are currently no release downloads, Homebrew formulae, published Svalnir crates, or installation commands to advertise. `scripts/package.sh` makes a binaries archive, a `Svalnir.app` archive, and `SHA256SUMS`, with the layout of `packaging/README.md`; these artifacts have an ad-hoc signature only and are for development. No Developer ID is available yet (owner decision of 2026-11-19). The binaries archive contains this README. Once the implementation exists, this section should document:
+There are currently no release downloads, Homebrew formulae, published Svalnir crates, or installation commands to advertise. `scripts/package.sh` makes a binaries archive, a `Svalnir.app` archive, and `SHA256SUMS`, with the layout of `packaging/README.md`; these artifacts have an ad-hoc signature only and are for development. No Developer ID is available yet (owner decision of 2026-11-19). A Homebrew cask of the signed and notarized application is planned for the first release, after the Developer ID signature (owner decision of 2026-11-20). The product has no update check and no automatic update: an upgrade is a new install from the package manager or from a download. The binaries archive contains this README. Once the implementation exists, this section should document:
 
 - Verified hardware/OS combinations and minimum Rust version.
 - Signed application and CLI installation.
@@ -796,37 +799,7 @@ Contributions to Svalnir are intended to use the project's GPLv3 license. [CONTR
 
 ## Roadmap and release criteria
 
-### Milestone 1 — Core model and observation
-
-Establish the Rust workspace, CLI contract, macOS collectors, volume-aware scans, process identity model, local state, capability diagnostics, and deterministic policy simulation. This is an internal foundation milestone.
-
-### Milestone 2 — Controlled intervention
-
-Implement manual cleanup plans, the operation coordinator, reviewed cache adapters, background disk protection, application budgets, graceful termination, force escalation, cooldowns, and crash recovery. Validate resource limits. The privileged boundary moves to after the first release.
-
-### Milestone 3 — First usable release
-
-Package the agent, CLI, and core GPUI experience. The privileged helper has no operation in this release (owner decision of 2026-11-19); its code stays, not registered and not called. Its registration, its grant enrollment, and its validation with a signed build come after the release, in a milestone that is not decided. Complete setup, permission diagnostics, background registration, notifications (in this release, a system dialog of the agent for the three urgent kinds only, with no banner; owner decision of 2026-11-20, [INTERFACES.md](docs/INTERFACES.md) section 4), policy controls, history, upgrade behavior, and uninstall.
-
-This release includes **automatic disk eviction and automatic application force termination under enabled policies**. An observation-only prototype does not satisfy the first-release goal.
-
-Release acceptance requires:
-
-- CLI and GUI agree on state, policy, targets, and history.
-- Monitoring continues with both clients closed while the user agent can run.
-- The disk guard reclaims only approved candidates and stops at its budgets.
-- The memory guard supports both global pressure and per-application thresholds.
-- Foreground preferences, protected identities, action limits, and restart controls work.
-- Permanent eviction, Trash operations, estimated reclaim, and observed capacity remain distinct.
-- Degraded permissions and unavailable metrics are visible.
-- Crash recovery and low-space journal failure follow documented behavior.
-- Validation covers the supported hardware and macOS matrix.
-- Distribution includes the license and required source/notice materials.
-- All nine release gates in the [validation plan](docs/VALIDATION.md) pass for the declared release scope.
-
-### Milestone 4 — Deeper integrations
-
-Milestone 4 starts after Milestone 3 (owner decision of 2026-11-19). Expand developer adapters, managed jobs, application storage maps, duplicate review, uninstall assistance, open-file diagnosis, APFS tooling, and optional event/network/energy modules. Each module must preserve the same identity, authorization, and outcome contracts.
+[ROADMAP.md](ROADMAP.md) has the milestones and the acceptance criteria of the first release. The first release includes automatic disk eviction and automatic application force termination under enabled policies.
 
 ## License
 

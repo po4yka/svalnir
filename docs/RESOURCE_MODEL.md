@@ -179,6 +179,8 @@ A missing, unmounted, inaccessible, or read-only volume does not have zero avail
 
 Capacity snapshots can change immediately after collection. Neither collection nor a Svalnir lease reserves space against other applications.
 
+Planned for Milestone 4 (owner decision of 2026-11-20): a report of the capacity that the scanned categories do not explain, with the local snapshots of the volume and the difference between the Foundation capacity values and `disk.available_bytes` as separate, labeled entries. The report is read-only. It removes no snapshot, and it does not add these entries to the available capacity or to a reclaim estimate. Also planned for Milestone 4: a history of `disk.available_bytes` from the stored samples, and an estimate of the time to a threshold, labeled as an estimate. The estimate prepares work and authorizes no action ([POLICY_SPEC.md](POLICY_SPEC.md)).
+
 ## 8. File inventory and cleanup accounting
 
 [Apple's `stat` documentation][stat] distinguishes file length, allocated blocks, and preferred I/O size:
@@ -204,7 +206,7 @@ A cleanup estimate references the exact candidate identities, rule revision, acq
 
 `work_bytes` is a separate conservative admission charge defined by the rule and [POLICY_SPEC.md](POLICY_SPEC.md). For ordinary entries, the documented convention can use checked `max(logical_bytes, allocated_bytes)` aggregation. Hard-link and directory handling must follow the rule's explicit charge convention; optimizing display deduplication must not silently reduce an approved work bound. Unknown or unbounded charges block unattended dispatch.
 
-Moving entries to Trash records transferred entries and the chosen byte convention. It does not report reclaimed capacity. Cloud placeholders must not be hydrated merely to measure or classify them. FSEvents invalidate affected inventory regions; lost or coalesced events require the documented reconciliation strategy, not invented complete coverage. [Source][fsevents]
+Moving entries to Trash records transferred entries and the chosen byte convention. It does not report reclaimed capacity. Cloud placeholders must not be hydrated merely to measure or classify them. FSEvents invalidate affected inventory regions; lost or coalesced events require the documented reconciliation strategy, not invented complete coverage. [Source][fsevents] The first release has no FSEvents consumer; [ARCHITECTURE.md](ARCHITECTURE.md) gives the discovery that it uses.
 
 ## 9. Host memory accounting
 
@@ -265,6 +267,8 @@ Membership requires positive application/job evidence. An association records it
 An exited member is not simply a zero reading. Verify its exit and update the membership snapshot; an inaccessible member remains missing. Partial coverage cannot silently satisfy or clear a complete-application budget predicate. A membership change invalidates the corresponding qualifying window while preserving incident usage and cooldown history.
 
 Foreground state, owner, protected status, and application liveness are independent evidence. Unknown foreground identity is not background. The list of running applications and the active state of each entry are current only when the main run loop of the collecting process ran after the previous read. A collector with no such evidence reports each foreground state as unknown and marks the snapshot as possibly stale. Ordinary collection avoids raw arguments, environment variables, file contents, and unnecessary cross-user inventory.
+
+Planned for Milestone 4 (owner decision of 2026-11-20): the listening TCP ports and the working directory of a process of the user, as optional context in the detail of one process. Each value has the observation envelope of section 4, and a query that fails is unavailable, not empty. The values are evidence for a person before a stop. They are not policy inputs, and they do not establish membership in an application group. A working directory is a path of the user and follows the privacy rules for paths in logs and exports.
 
 ## 12. Swap and optional CPU context
 

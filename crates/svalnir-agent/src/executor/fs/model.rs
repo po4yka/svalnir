@@ -165,6 +165,11 @@ impl ApprovedRoots {
         Ok(Self { roots })
     }
 
+    /// The roots, in the sequence of their identities.
+    pub fn iter(&self) -> impl Iterator<Item = &ApprovedRoot> {
+        self.roots.values().map(|anchored| &anchored.root)
+    }
+
     /// The number of roots.
     pub fn len(&self) -> usize {
         self.roots.len()

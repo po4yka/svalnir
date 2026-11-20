@@ -41,7 +41,11 @@ dispatch2.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 # `CFUserNotification`: the urgent dialog of the agent (`notify`).
-objc2-core-foundation.workspace = true
+# `CFArray`: the watched paths of the event stream (`platform::fsevents`).
+objc2-core-foundation = { workspace = true, features = ["CFArray"] }
+# `FSEvents`: the invalidation of the candidate catalog
+# (`platform::fsevents`).
+objc2-core-services.workspace = true
 objc2-foundation.workspace = true
 
 # `test-support`: a build for tests. The account record of the `HOME`

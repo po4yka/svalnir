@@ -395,11 +395,31 @@ struct TempCandidates {
     registry: Registry,
     root: PathBuf,
     modes: Arc<Mutex<Vec<PreparationMode>>>,
+    /// The answer of [`CandidateSource::invalidated`], as an `FSEvents`
+    /// invalidation of the source gives it.
+    invalidated: Arc<AtomicBool>,
 }
 
 impl CandidateSource for TempCandidates {
+    fn invalidated(&mut self, _at: MonotonicNanos) -> bool {
+        self.invalidated.load(Ordering::SeqCst)
+    }
+
+    fn watch_status(&self) -> Option<crate::runtime::invalidation::CatalogWatchStatus> {
+        Some(crate::runtime::invalidation::CatalogWatchStatus {
+            state: crate::runtime::invalidation::CatalogWatchState::Available,
+            detail: "test".to_owned(),
+            roots: 1,
+            counts: crate::runtime::invalidation::InvalidationCounts::default(),
+        })
+    }
+
     fn prepare(&mut self, request: &Preparation<'_>) -> Option<CandidateSet> {
         let Preparation { mode, time, .. } = *request;
+        // A preparation is a complete discovery: it covers each change.
+        if mode == PreparationMode::Refresh {
+            self.invalidated.store(false, Ordering::SeqCst);
+        }
         self.modes.lock().unwrap().push(mode);
         let rule = self.registry.rules().first().copied()?.clone();
         let mut names: Vec<String> = fs::read_dir(&self.root)
@@ -424,6 +444,7 @@ impl CandidateSource for TempCandidates {
                     prepared(&rule, &spec)
                 })
                 .collect(),
+            invalidated: false,
         })
     }
 }
@@ -497,6 +518,7 @@ struct Bench {
     text: String,
     pressure: Arc<Mutex<PressureState>>,
     modes: Arc<Mutex<Vec<PreparationMode>>>,
+    invalidated: Arc<AtomicBool>,
     notes: Notes,
     /// When set, the driver has the notifier of the agent with this
     /// center, and a capability summary, in place of [`Notes`].
@@ -534,6 +556,7 @@ impl Bench {
             text: config_text(&[]),
             pressure: Arc::new(Mutex::new(PressureState::Normal)),
             modes: Arc::new(Mutex::new(Vec::new())),
+            invalidated: Arc::new(AtomicBool::new(false)),
             notes: Notes::default(),
             center: None,
             footprint: Arc::new(AtomicU64::new(10 * 1024 * 1024)),
@@ -649,6 +672,7 @@ impl Bench {
                 registry: self.registry.clone(),
                 root: self.root.clone(),
                 modes: Arc::clone(&self.modes),
+                invalidated: Arc::clone(&self.invalidated),
             }),
             environment: Arc::new(TestRuleEnvironment(FixtureEnvironment::days_later(0))),
             notifier: match &self.center {
@@ -668,6 +692,7 @@ impl Bench {
                 probed_at: None,
                 lines: Vec::new(),
                 notifications: None,
+                catalog_watch: None,
             }),
         }
     }
@@ -1046,6 +1071,50 @@ fn a_rule_in_the_proposed_state_removes_nothing_and_the_status_says_why() {
     assert_eq!(bench.journal().unsettled_operation_count().unwrap(), 0);
     let controller = bench.status().controller.unwrap();
     assert_eq!(controller.summary, Summary::Warning);
+}
+
+/// An `FSEvents` invalidation of the candidate source makes the controller
+/// evaluate again, and in a warning it asks for a discovery before the set
+/// is old. The status record has the capability of the source.
+#[test]
+fn an_invalidation_asks_for_a_discovery_in_a_warning() {
+    let mut bench = Bench::new(TestClock::fixed(), validated_registry());
+    bench.seed_authority();
+    bench.center = Some(crate::notify::fake::FakeCenter::new(
+        crate::notify::CenterAuthorization::Authorized,
+    ));
+    let mut driver = bench.start();
+    for _ in 0..3 {
+        driver.tick(Some(bench.sample(
+            15 * GIBIBYTE,
+            PressureState::Normal,
+            Vec::new(),
+        )));
+        bench.clock.advance(SAMPLE);
+    }
+    assert_eq!(
+        bench.modes.lock().unwrap().as_slice(),
+        [PreparationMode::Refresh]
+    );
+    // A change of an approved root: the next tick, with no new sample,
+    // asks for a discovery again.
+    bench.invalidated.store(true, Ordering::SeqCst);
+    driver.tick(None);
+    assert_eq!(
+        bench.modes.lock().unwrap().as_slice(),
+        [PreparationMode::Refresh, PreparationMode::Refresh]
+    );
+    assert!(!bench.invalidated.load(Ordering::SeqCst));
+    let watch = bench
+        .status()
+        .capabilities
+        .and_then(|summary| summary.catalog_watch)
+        .expect("the status has the capability of the source");
+    assert_eq!(
+        watch.state,
+        crate::runtime::invalidation::CatalogWatchState::Available
+    );
+    assert!(driver.shutdown(&mut TestIdle(bench.clock.clone())).clean);
 }
 
 #[test]

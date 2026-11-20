@@ -1298,9 +1298,11 @@ impl<'a> Run<'a> {
             .candidates
             .as_ref()
             .is_none_or(|set| {
-                self.now()
-                    .checked_duration_since(set.prepared_at)
-                    .is_none_or(|age| age > CANDIDATE_REFRESH_AGE)
+                set.invalidated
+                    || self
+                        .now()
+                        .checked_duration_since(set.prepared_at)
+                        .is_none_or(|age| age > CANDIDATE_REFRESH_AGE)
             });
         // A discovery does not start in an incident, or while a volume
         // has a trigger that is more than a warning.

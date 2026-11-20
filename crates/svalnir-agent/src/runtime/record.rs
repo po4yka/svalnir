@@ -14,6 +14,7 @@ use svalnir_core::time::WallTime;
 use crate::capability::{CapabilityEntry, CapabilityId, CapabilityReport, Requirement};
 use crate::controller::ControllerStatus;
 use crate::notify::NotificationStatus;
+use crate::runtime::invalidation::CatalogWatchStatus;
 use svalnir_core::state::CapabilityState;
 
 /// The version of the [`AgentStatus`] record.
@@ -82,6 +83,11 @@ pub struct CapabilitySummary {
     /// has no notification service. A status record with no capability
     /// summary has no notification capability either.
     pub notifications: Option<NotificationStatus>,
+    /// The `FSEvents` invalidation of the candidate catalog
+    /// ([`super::invalidation`]), at the time of the status record. As
+    /// [`Self::notifications`], the agent reads it again at each status
+    /// write. `None` when the candidate source has no event stream.
+    pub catalog_watch: Option<CatalogWatchStatus>,
 }
 
 /// One capability of the agent process, as the status record keeps it.
@@ -137,6 +143,7 @@ impl CapabilitySummary {
                 .map(CapabilityLine::of)
                 .collect(),
             notifications: None,
+            catalog_watch: None,
         }
     }
 }

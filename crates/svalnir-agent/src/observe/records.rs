@@ -251,8 +251,9 @@ pub enum AgentCapabilityReading {
     },
     /// The summary that the agent recorded.
     Recorded {
-        /// The summary, with the time of the probes.
-        summary: CapabilitySummary,
+        /// The summary, with the time of the probes. In a box: the
+        /// summary is much larger than the other variants.
+        summary: Box<CapabilitySummary>,
         /// The freshness of the status record that has the summary. A
         /// stale or stopped status is the summary of an agent that does
         /// not run now.
@@ -273,7 +274,7 @@ pub fn agent_capabilities(status: &RecordReading<StatusReading>) -> AgentCapabil
                 freshness: reading.freshness,
             },
             Some(summary) => AgentCapabilityReading::Recorded {
-                summary: summary.clone(),
+                summary: Box::new(summary.clone()),
                 freshness: reading.freshness,
             },
         },

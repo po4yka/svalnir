@@ -569,7 +569,10 @@ pub struct SystemParts {
 /// The candidate source is the discovery of the reviewed rules
 /// ([`RuleCandidateSource`]). Each reviewed rule of this build is in the
 /// `proposed` lifecycle state, so the source examines no rule and each
-/// set is empty.
+/// set is empty. The source has the `FSEvents` stream of the platform
+/// ([`crate::platform::fsevents::system_stream`]); with no rule that
+/// permits automatic eviction, it watches no root and the capability is
+/// `not_started`.
 ///
 /// # Errors
 ///
@@ -597,7 +600,11 @@ pub fn system_parts(
         ProtectedLocations::resolve(Some(&home_directory.to_path_buf()), Some(state_directory)),
         Arc::clone(&environment),
         DiscoveryLimits::default(),
-    );
+    )
+    // The FSEvents stream on the approved roots of the discovery. It
+    // starts with the first discovery, and only for a rule that permits
+    // automatic eviction.
+    .with_event_stream(crate::platform::fsevents::system_stream());
     let roots: ApprovedRoots =
         ApprovedRoots::new(Vec::new()).map_err(|error| HostError::Executor(error.to_string()))?;
     let filesystem: FsExecutor = FsExecutor::with_system_trash(&FsExecutorConfig {

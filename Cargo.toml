@@ -59,6 +59,7 @@ objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDate", "CFString", "CFURL", "CFUserNotification"] }
 objc2-app-kit = "0.3.2"
+objc2-core-services = { version = "0.3.2", default-features = false, features = ["std", "dispatch2", "FSEvents"] }
 dispatch2 = "0.3.1"
 libc = "0.2.191"
 

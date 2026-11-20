@@ -225,6 +225,46 @@ fn a_warning_prepares_candidates_and_makes_no_plan() {
     assert_eq!(bench.state.disk_incidents.len(), 0);
 }
 
+/// `disk` with a candidate set that an `FSEvents` invalidation marked.
+fn invalidated_disk(available: u64, specs: &[CandidateSpec]) -> impl Fn(u64) -> Observations + '_ {
+    move |at| {
+        let mut made: Observations = disk(available, specs)(at);
+        if let Some(set) = &mut made.candidates {
+            set.invalidated = true;
+        }
+        made
+    }
+}
+
+#[test]
+fn an_invalidated_set_asks_for_a_discovery_in_a_warning() {
+    let mut bench = Bench::new();
+    let all = specs();
+    // A fresh set asks for no discovery.
+    let output = bench.run(60 * SECOND, disk(15 * GIBIBYTE, &all));
+    assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Warning);
+    assert_eq!(preparations(&output), Vec::<PreparationMode>::new());
+    // The same set, invalidated: a bounded discovery, as for an old set.
+    let output = bench.run(0, invalidated_disk(15 * GIBIBYTE, &all));
+    assert_eq!(preparations(&output), vec![PreparationMode::Refresh]);
+    assert_eq!(applies(&output).len(), 0);
+}
+
+#[test]
+fn an_invalidated_set_starts_no_discovery_in_an_incident() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(20 * SECOND, disk(5 * GIBIBYTE, &[]));
+    bench.run(10 * SECOND, disk(5 * GIBIBYTE, &[]));
+    assert_eq!(bench.state.disk_incidents.len(), 1);
+    // In an incident the invalidation adds no work: no discovery, and the
+    // set supports a plan whose targets the coordinator checks again.
+    bench.advance(SAMPLE);
+    let output = bench.step(&invalidated_disk(5 * GIBIBYTE, &all)(bench.now), &[]);
+    assert!(!preparations(&output).contains(&PreparationMode::Refresh));
+    assert_eq!(the_apply(&output).plan.targets.len(), 2);
+}
+
 #[test]
 fn a_disk_incident_goes_from_ready_to_acting_to_recovery_and_closes() {
     let mut bench = Bench::new();

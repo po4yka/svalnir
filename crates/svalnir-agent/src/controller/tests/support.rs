@@ -700,6 +700,7 @@ pub(crate) fn candidate_set(rule: &Rule, specs: &[CandidateSpec], at: u64) -> Ca
         prepared_at: MonotonicNanos::new(at),
         complete: true,
         candidates: specs.iter().map(|spec| prepared(rule, spec)).collect(),
+        invalidated: false,
     }
 }
 

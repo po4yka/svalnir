@@ -8,6 +8,7 @@
 //! owns the component boundary.
 
 pub mod account;
+pub mod fsevents;
 pub mod memory;
 pub mod process;
 pub mod run_loop;

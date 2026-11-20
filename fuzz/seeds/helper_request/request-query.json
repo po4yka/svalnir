@@ -1,0 +1,1 @@
+{"protocol":{"major":1,"minor":0},"request_id":"query-step-1","correlation":{"plan_id":"plan-1","plan_digest":"sha256:e26d9cd1dae99fe1f83a87da2f873a25d4c51c62290b003465c57ff544a899fd","operation_id":"operation-1","step_id":"step-1"},"validity":{"clock_domain":"continuous","boot_id":"boot-1","issued_at":"900","expires_at":"1100"},"operation":{"query_step_status":{}}}

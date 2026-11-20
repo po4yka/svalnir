@@ -1,0 +1,5 @@
+# cargo-fuzz output. The seed corpora in seeds/ are tracked.
+/target/
+/corpus/
+/artifacts/
+/coverage/

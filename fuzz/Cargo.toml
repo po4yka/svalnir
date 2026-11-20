@@ -1,0 +1,67 @@
+# Fuzz harnesses of VAL-14 (docs/VALIDATION.md). This crate is not a member
+# of the root workspace: it has its own workspace and its own Cargo.lock, so
+# the checks and the dependency graph of the workspace do not change. It is
+# not part of a release artifact. See README.md for the commands.
+[package]
+name = "svalnir-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+# An empty workspace table: this crate is its own workspace root.
+[workspace]
+
+[dependencies]
+# Pinned exactly, with the versions in fuzz/Cargo.lock.
+libfuzzer-sys = "=0.4.13"
+serde = "=1.0.229"
+serde_json = "=1.0.154"
+svalnir-core = { path = "../crates/svalnir-core" }
+svalnir-agent = { path = "../crates/svalnir-agent" }
+svalnir-privileged = { path = "../crates/svalnir-privileged" }
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plan_document"
+path = "fuzz_targets/plan_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_records"
+path = "fuzz_targets/journal_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helper_request"
+path = "fuzz_targets/helper_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helper_response"
+path = "fuzz_targets/helper_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grammars"
+path = "fuzz_targets/grammars.rs"
+test = false
+doc = false
+bench = false

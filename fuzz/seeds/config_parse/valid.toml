@@ -1,0 +1,18 @@
+# A valid configuration proposal for the tests of `config validate` and
+# `policy simulate`. It enables the two guards in the proposal only.
+schema_version = 1
+
+[agent]
+profile = "balanced"
+
+[disk_guard]
+enabled = true
+volumes = ["startup-data"]
+warn_below = "40GiB"
+reclaim_below = "20GiB"
+emergency_below = "5GiB"
+recover_above = "60GiB"
+
+[memory_guard]
+enabled = true
+eligible_groups = ["background-user-applications"]

@@ -1,0 +1,1 @@
+{"protocol":{"major":1,"minor":0},"request_id":null,"body":{"rejected":{"error":{"code":"helper_request_malformed","family":"request","stage":"admission","dispatch":"not_submitted","plan_id":null,"operation_id":null,"step_id":null}}}}

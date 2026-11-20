@@ -220,6 +220,52 @@ fn a_rule_of_the_build_is_proposed_and_the_evict_mode_is_refused() {
 }
 
 #[test]
+fn the_evict_mode_refuses_each_cache_rule_also_with_a_fixture_lifecycle() {
+    // The registry of this world gives the other rules a state that is
+    // validated for manual eviction. A cache rule has the inspection mode
+    // only, so it keeps its `proposed` state.
+    let world = World::manual();
+    let home: PathBuf = std::fs::canonicalize(world.environment.home.as_ref().unwrap()).unwrap();
+    // A fixture cache at the default location of each rule.
+    for directory in [
+        "Library/pnpm/store/v10/files",
+        "Library/Caches/Yarn/v6",
+        "Library/Caches/go-build",
+        ".cache/uv",
+        "Library/Caches/Homebrew/downloads",
+        "Library/Caches/CocoaPods/Pods",
+    ] {
+        std::fs::create_dir_all(home.join(directory)).unwrap();
+        std::fs::write(home.join(directory).join("entry"), b"cache").unwrap();
+    }
+    for rule in [
+        "pnpm.content-store",
+        "yarn.cache",
+        "go.build-cache",
+        "uv.cache",
+        "homebrew.download-cache",
+        "cocoapods.cache",
+    ] {
+        let outcome = json(
+            &world.environment,
+            &["clean", "plan", "--mode", "evict", "--rule", rule],
+        );
+        assert_eq!(
+            outcome.status,
+            ExitStatus::Unavailable,
+            "{rule}: {}",
+            outcome.stdout
+        );
+        assert_eq!(outcome.error_code(), "rule_mode_not_validated", "{rule}");
+    }
+    assert!(!world.state_has_plans());
+    assert!(
+        home.join("Library/Caches/Homebrew/downloads/entry")
+            .exists()
+    );
+}
+
+#[test]
 fn an_evict_plan_has_the_units_of_the_rule_and_its_apply_removes_them() {
     let world = World::manual();
     let outcome = world.plan(&[]);

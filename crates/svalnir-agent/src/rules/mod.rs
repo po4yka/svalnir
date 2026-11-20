@@ -25,6 +25,14 @@
 //!    the executor, and [`DiscoveredCandidate::file_binding`] for the
 //!    plan builder.
 //!
+//! # Cache rules
+//!
+//! The six package and build cache rules of [`caches`] have the
+//! inspection mode only: [`caches::CacheRule::inspect`] reports the
+//! resolved root, the measured size of each unit, and the owner workflow.
+//! They give no candidate, and the discovery for an eviction does not
+//! examine them.
+//!
 //! # Discovery for an eviction
 //!
 //! [`ReviewedRules::discover_for_eviction`] does steps 2 to 4 for the
@@ -46,6 +54,8 @@
 //! in the result of the `discover` function of a rule, so no candidate of
 //! that result is eligible. The discovery for an eviction sets them.
 
+#[cfg(unix)]
+pub mod caches;
 #[cfg(unix)]
 mod eviction;
 #[cfg(unix)]

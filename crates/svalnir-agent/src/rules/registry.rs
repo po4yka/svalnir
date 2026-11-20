@@ -1,7 +1,9 @@
 //! The registry of the reviewed rules of this build.
 //!
 //! `docs/CLEANUP_RULES.md` sections 2 and 10 own the contract. The
-//! registry has the two rules of Milestone 2. Each layout of each rule is
+//! registry has the two rules of Milestone 2 and the six package and build
+//! cache rules of section 10, which have the inspection mode only
+//! ([`super::caches`]). Each layout of each rule is
 //! `proposed`, because no validation record under `docs/VALIDATION.md`
 //! exists for a rule. The registry has no function that changes a
 //! lifecycle state: a promotion is a new declaration with a reference to
@@ -13,6 +15,7 @@ use svalnir_core::rule::{
 };
 use thiserror::Error;
 
+use super::caches::{CacheRule, cache_rules};
 use super::expired_temporary::ExpiredTemporaryRule;
 use super::model::DiscoveredCandidate;
 use super::overlap::{OverlapResolution, resolve_overlaps};
@@ -80,6 +83,7 @@ pub struct RuleStatus {
 pub struct ReviewedRules {
     expired_temporary: ExpiredTemporaryRule,
     xcode_derived_data: XcodeDerivedDataRule,
+    caches: Vec<CacheRule>,
 }
 
 impl ReviewedRules {
@@ -94,6 +98,7 @@ impl ReviewedRules {
         Ok(Self {
             expired_temporary: ExpiredTemporaryRule::new()?,
             xcode_derived_data: XcodeDerivedDataRule::new()?,
+            caches: cache_rules()?,
         })
     }
 
@@ -107,6 +112,10 @@ impl ReviewedRules {
     /// test names no validation record of `docs/VALIDATION.md`; the test
     /// gives a reference that says so.
     ///
+    /// The cache rules keep the state of their declarations: their
+    /// implementation has the inspection mode only, so no state permits a
+    /// removal under one of them, also in a test build.
+    ///
     /// # Errors
     ///
     /// Returns a [`RegistryError`] when a declaration with the state is
@@ -117,6 +126,7 @@ impl ReviewedRules {
         Ok(Self {
             expired_temporary: registry.expired_temporary.with_lifecycle(lifecycle)?,
             xcode_derived_data: registry.xcode_derived_data.with_lifecycle(lifecycle)?,
+            caches: registry.caches,
         })
     }
 
@@ -128,6 +138,19 @@ impl ReviewedRules {
     /// The rule `xcode.inactive-derived-data`.
     pub fn xcode_derived_data(&self) -> &XcodeDerivedDataRule {
         &self.xcode_derived_data
+    }
+
+    /// The package and build cache rules, in the sequence of
+    /// `docs/CLEANUP_RULES.md` section 10.
+    pub fn caches(&self) -> &[CacheRule] {
+        &self.caches
+    }
+
+    /// The cache rule with the identity `id`.
+    pub fn cache(&self, id: &str) -> Option<&CacheRule> {
+        self.caches
+            .iter()
+            .find(|cache| cache.rule().reference.id.as_str() == id)
     }
 
     /// The exact revision `reference`.
@@ -225,9 +248,11 @@ impl ReviewedRules {
 
 impl RuleRegistry for ReviewedRules {
     fn rules(&self) -> Vec<&Rule> {
-        vec![
+        let mut rules: Vec<&Rule> = vec![
             self.expired_temporary.rule(),
             self.xcode_derived_data.rule(),
-        ]
+        ];
+        rules.extend(self.caches.iter().map(CacheRule::rule));
+        rules
     }
 }

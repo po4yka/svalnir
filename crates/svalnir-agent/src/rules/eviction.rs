@@ -261,7 +261,9 @@ pub fn bind_root(path: &Path) -> Result<BoundRoot, RootProblem> {
 ///
 /// A root is relative to the home directory of the user or to the state
 /// directory of Svalnir. For a root of the base `producer_configuration`,
-/// this build reads no configuration of the producer: the path is the
+/// the discovery for an eviction reads no configuration of the producer
+/// (the inspection of a cache rule does, [`super::caches::resolve`]): the
+/// path is the
 /// default location below the home directory, which the declaration gives
 /// as a discovery hint. A producer that is configured for a different
 /// location has no root here, and the rule finds nothing for it.
@@ -612,7 +614,7 @@ pub struct EvictionDiscovery {
 }
 
 /// A stable name of a discovery refusal, with no path.
-const fn refusal_name(error: &DiscoveryError) -> &'static str {
+pub(super) const fn refusal_name(error: &DiscoveryError) -> &'static str {
     match error {
         DiscoveryError::LimitTooLarge { .. } => "limit_too_large",
         DiscoveryError::RootPath => "root_path_not_plain",

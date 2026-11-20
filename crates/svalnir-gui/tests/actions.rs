@@ -865,3 +865,114 @@ fn a_confirmation_that_sends_nothing_still_closes_the_stop(cx: &mut TestAppConte
         None
     );
 }
+
+/// The groups of the open window that have a protection reason: the
+/// instance and the full reason.
+fn reasoned_groups(view: &Entity<MainWindow>, cx: &mut TestAppContext) -> Vec<(String, String)> {
+    cx.update(|cx| {
+        let model = view.read(cx).model().read(cx);
+        let processes = match &model.processes {
+            Loadable::Ready(processes) => Some(processes),
+            _ => None,
+        }
+        .expect("the processes are read");
+        processes
+            .applications
+            .iter()
+            .filter_map(|row| {
+                svalnir_gui::screens::applications::protection_reason(row.protection)
+                    .map(|reason| (row.instance.clone(), reason.to_owned()))
+            })
+            .collect()
+    })
+}
+
+/// Regression for the cut stop control of host run 4: in its loading state
+/// the stop control adds a spinner, so it was wider than the Stop column,
+/// and the table cut its label to "Stop..". The control stays inside the
+/// row of its group in each state.
+#[gpui_kit::test]
+fn the_stop_control_stays_inside_its_row_while_it_loads(cx: &mut TestAppContext) {
+    for width in [1280.0, 1120.0, 720.0] {
+        let (handle, view) = open_at(
+            FixtureSource::new(FixtureScenario::Healthy).with_actions(ActionScript::Pending),
+            Screen::Applications,
+            width,
+            cx,
+        );
+        let (instance, _name) = stoppable_group(&view, cx);
+        let id: String = format!("applications-stop-{instance}");
+        let row_id: String = format!("applications-row-{instance}");
+        let idle = bounds_of(handle, &id, cx).expect("stop control");
+        let row = bounds_of(handle, &row_id, cx).expect("row");
+        assert!(
+            idle.right() <= row.right() + px(1.0),
+            "{width}: idle control {idle:?}, row {row:?}"
+        );
+        click(handle, &id, cx);
+        click(handle, "confirm-ok", cx);
+        assert!(cx.update(|cx| {
+            view.read(cx)
+                .model()
+                .read(cx)
+                .actions
+                .is_busy(&Slot::Stop(instance.clone()))
+        }));
+        let loading = bounds_of(handle, &id, cx).expect("stop control");
+        let row = bounds_of(handle, &row_id, cx).expect("row");
+        assert!(
+            loading.right() <= row.right() + px(1.0) && loading.right() <= px(width),
+            "{width}: loading control {loading:?}, row {row:?}"
+        );
+        assert_eq!(label(handle, &id, cx).as_deref(), Some("Stop…"));
+    }
+}
+
+/// Regression for the cut protection reason of host run 4: the reason of a
+/// hard protection was wider than its column and was cut at the next
+/// column. It is a short caption: it stays inside its column, shows at most
+/// two lines, has the full reason as its label, and has a tooltip with the
+/// full reason only when it is cut. A reason that wraps onto two lines and
+/// is not cut has no tooltip.
+#[gpui_kit::test]
+fn the_protection_reason_stays_inside_its_column(cx: &mut TestAppContext) {
+    let (mut cut_seen, mut wrapped_whole_seen): (bool, bool) = (false, false);
+    for width in [1800.0, 1280.0, 720.0] {
+        let (handle, view) = open_at(
+            FixtureSource::new(FixtureScenario::Healthy),
+            Screen::Applications,
+            width,
+            cx,
+        );
+        let groups = reasoned_groups(&view, cx);
+        assert!(!groups.is_empty(), "the fixture has a protected group");
+        for (instance, reason) in groups {
+            let id: String = format!("applications-protection-reason-{instance}");
+            let caption = bounds_of(handle, &id, cx).expect("reason");
+            let next = bounds_of(handle, &format!("applications-stop-none-{instance}"), cx)
+                .expect("stop cell");
+            assert!(
+                caption.right() <= next.left(),
+                "{width}: reason {caption:?}, next cell {next:?}"
+            );
+            assert!(
+                caption.size.height <= px(42.0),
+                "{width}: the reason is not short: {caption:?}"
+            );
+            assert_eq!(label(handle, &id, cx).as_deref(), Some(reason.as_str()));
+            match tooltip_of(handle, &id, cx) {
+                Some(tooltip) => {
+                    assert!(width < 1800.0, "{width}: {reason} is cut");
+                    assert_eq!(tooltip, reason, "{width}");
+                    cut_seen = true;
+                }
+                None => wrapped_whole_seen |= caption.size.height > px(24.0),
+            }
+        }
+    }
+    assert!(cut_seen, "no width cuts a reason");
+    assert!(
+        wrapped_whole_seen,
+        "no width wraps a reason that is not cut"
+    );
+}

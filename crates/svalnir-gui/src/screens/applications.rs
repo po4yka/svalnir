@@ -23,7 +23,7 @@ use crate::{
     },
     theme::tokens::{self, Tokens},
     ui::action_button::{ActionButton, ButtonVariant},
-    ui::action_status::action_status_short,
+    ui::action_status::{action_status_short, short_caption},
     ui::{
         pill::{MonoTag, StatusPill, Tone},
         provenance::ProvenanceLine,
@@ -31,7 +31,7 @@ use crate::{
     },
 };
 use gpui_kit::{
-    AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
+    AnyElement, Context, Entity, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
     TestSupportExt as _, Window,
     component::{
         ActiveTheme as _, IconName, Sizable as _, h_flex,
@@ -40,6 +40,7 @@ use gpui_kit::{
     },
     div,
     prelude::*,
+    px,
 };
 use std::time::SystemTime;
 
@@ -180,6 +181,12 @@ pub const STOP_OPEN: &str =
 /// cells.
 const TABLE_SPAN: usize = 20;
 
+/// The minimum width of the Stop column. It holds the stop control in its
+/// widest state: in the `loading` state the control has a spinner before
+/// its label, and a narrower column cut the label to "Stop.." at the right
+/// edge of the table (host run 4). The other columns shrink first.
+pub const STOP_COLUMN_MIN_WIDTH: Pixels = px(112.0);
+
 /// The state row of the last stop of a group, below the row of the group:
 /// the Stop column is too narrow for the pill and the sentence, so the line
 /// spans the table. It is the short state line: at most two lines of the
@@ -310,14 +317,22 @@ fn group_table(
     let rows = snapshot.applications.iter().flat_map(|row| {
         let (footprint, partial) = group_footprint(row);
         let (protection, tone) = protection_pill(row.protection);
-        let mut protection_cell = v_flex().gap(tokens::SPACE_1).items_start().child(
-            StatusPill::new(protection, tone).id(SharedString::from(format!(
-                "applications-protection-{}",
-                row.instance
-            ))),
-        );
+        // The reason is a short caption: the cell lets it shrink, so that it
+        // wraps inside the column and a longer reason ends with an ellipsis,
+        // with the full reason as its label and, when it is cut, its tooltip.
+        let mut protection_cell = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap(tokens::SPACE_1)
+            .items_start()
+            .child(
+                StatusPill::new(protection, tone).id(SharedString::from(format!(
+                    "applications-protection-{}",
+                    row.instance
+                ))),
+            );
         if let Some(reason) = protection_reason(row.protection) {
-            protection_cell = protection_cell.child(caption(
+            protection_cell = protection_cell.child(short_caption(
                 SharedString::from(format!("applications-protection-reason-{}", row.instance)),
                 reason,
                 tokens,
@@ -372,7 +387,9 @@ fn group_table(
             .child(cell(change, 3, true))
             .child(cell(foreground_text(row.foreground), 2, false))
             .child(cell(protection_cell, 3, false))
-            .child(cell(stop_cell(row, entity, model, tokens), 2, false));
+            .child(
+                cell(stop_cell(row, entity, model, tokens), 2, false).min_w(STOP_COLUMN_MIN_WIDTH),
+            );
         std::iter::once(group).chain(stop_state_row(row, entity, model, tokens))
     });
     Table::new()
@@ -388,7 +405,7 @@ fn group_table(
                     .child(head("Growth", 3, true, tokens))
                     .child(head("Foreground", 2, false, tokens))
                     .child(head("Hard protection", 3, false, tokens))
-                    .child(head("Stop", 2, false, tokens)),
+                    .child(head("Stop", 2, false, tokens).min_w(STOP_COLUMN_MIN_WIDTH)),
             ),
         )
         .child(TableBody::new().children(rows))

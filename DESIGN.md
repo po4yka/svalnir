@@ -140,7 +140,7 @@ Each control has full keyboard behavior.
 
 | Control | Rules for Svalnir |
 | --- | --- |
-| Action button | `primary` (silver), `secondary`, `quiet`, `danger`. One `primary` per view. `danger` has a `negative` fill with white text and is never the default button. `loading` replaces the icon with a spinner and disables the button; with Reduce Motion on, a still loader glyph replaces the spinner |
+| Action button | `primary` (silver), `secondary`, `quiet`, `danger`. One `primary` per view. `danger` has a `negative` fill with white text and is never the default button. `loading` replaces the icon with a spinner and disables the button; with Reduce Motion on, a still loader glyph replaces the spinner. A button with no icon gets the spinner before its label, so it is wider while it loads: a table column with a button has a minimum width that holds the button in its `loading` state, and the label stays complete in each state |
 | Segmented control | Active pill slides for a pointer and jumps for the keyboard. Use it for time range, view mode, and scope |
 | Status pill and tag | Five tones. A pill always contains text. A mono tag shows a rule ID, a volume, or a bundle ID |
 | Progress bar and segmented bar | `progress` for work toward an end, `meter` for a level. Stripes mark an estimate or a period in progress |

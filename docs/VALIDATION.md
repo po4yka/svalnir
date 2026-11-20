@@ -1,6 +1,6 @@
 # Svalnir Validation Plan
 
-**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of three host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
+**Status:** Design specification. The repository contains the Milestone 1 build and the Milestone 2 libraries and commands, with the unit and fixture tests of their modules. Those tests are not recorded evidence for a validation family or a release gate, and no release is validated. Section 14 has the case records of four host runs with fixtures; they make no family and no gate pass. Every release gate below is initially **unverified**.  
 **Last reviewed:** 2026-11-19
 
 This document defines the evidence required to implement, change, and release Svalnir. It connects the [resource model](RESOURCE_MODEL.md), [interfaces](INTERFACES.md), [policy specification](POLICY_SPEC.md), [action contracts](ACTION_CONTRACTS.md), and [cleanup rules](CLEANUP_RULES.md) to the boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
@@ -444,7 +444,7 @@ The procedure does not fill a disk, does not change the clock of the host, regis
 
 ## 14. Host validation records
 
-This section has the case records of three runs on one host of the project owner, made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. The authorization excluded each grant, each enabled guard, and each other application, so no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.
+This section has the case records of four runs on one host of the project owner. Runs 1 to 3 were made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. That authorization excluded each grant, each enabled guard, and each other application. Run 4 was made under the owner decisions 21 to 24 of 2026-11-20: fixtures only, no service loaded, no host setting changed, and a guard enabled only on a fixture state directory where no agent ran. In each run, no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.
 
 The evidence files are command records: the command, the UTC time, the standard output, the exit status, and the standard error. They are on the host of the owner, in the directory `.omc/handoffs/` of the main checkout, which Git ignores. The repository does not keep them, so a contributor cannot read them; each record names this limit. No record has a reviewer.
 
@@ -576,16 +576,86 @@ The run found four defects:
 | D-10 | In History, the state line of a cancel overflowed the State column and covered the next column |
 | D-11 | The sidebar and the status line said "Agent reporting" for up to 90 s after a clean stop of the agent, because the state came from the age of the status record only |
 
-Commit `2e3e6f9` corrects the four defects, each with a regression test: the read-only open of the journal applies the page limit of the writer through one shared function, and the row has the label "Size and size limit" (D-8); a button that fits its container (`ActionButton::fit()`) and a dialog footer that wraps keep the button row inside the dialog ([DESIGN.md](../DESIGN.md) §7) (D-9); the state cell of History wraps inside its cell (D-10; a later change, not examined on a host, limits the row to two lines of the sentence and shows the full line in the detail view); a status record with the run state stopped gives `AgentState::Stopped` at each age, and a running record keeps the freshness rule (D-11). No host run examined the corrections.
+Commit `2e3e6f9` corrects the four defects, each with a regression test: the read-only open of the journal applies the page limit of the writer through one shared function, and the row has the label "Size and size limit" (D-8); a button that fits its container (`ActionButton::fit()`) and a dialog footer that wraps keep the button row inside the dialog ([DESIGN.md](../DESIGN.md) §7) (D-9); the state cell of History wraps inside its cell (D-10; a later change, not examined on a host, limits the row to two lines of the sentence and shows the full line in the detail view); a status record with the run state stopped gives `AgentState::Stopped` at each age, and a running record keeps the freshness rule (D-11). Run 4 examined the corrections.
+
+### Host run 4: debug build of `e02677c` with fixtures
+
+The run used the client, the CLI, and the agent of one debug build with the feature `test-support`, with fixtures only. Each process had a temporary home directory (`HOME` and `SVALNIR_TEST_ACCOUNT_HOME`) and a temporary state directory. No service was loaded and no host setting changed. The run had two passes. In the first, the request for screen control was refused, so the run used window captures, launch options, and the CLI, and nine cases were `blocked`. In the second, after the owner answer "Yes, rerun blocked", screen control was granted, and the run did the nine cases with input in the Svalnir window, the menu of its menu bar item, and its dialog only. The table gives the status of each case after both passes.
+
+```yaml
+source_revision: e02677c45139ee67886ff7c347571083ea0c1b22
+artifact_digest: null
+adapter_revision: null
+environment_record: macOS 27.2.1 (26B131), Mac16,7; rustc 1.100.0; debug build of cargo build -p svalnir-agent -p svalnir-cli -p svalnir-gui --features svalnir-agent/test-support --locked (built twice, identical digests); the window executable in an ad-hoc signed bundle dev.po4yka.svalnir, the agent with its linker signature, both started directly; no Developer ID, not notarized; 79 GiB free on the startup volume
+fixture_manifest: fourteen fixture roots, each with a home directory (mode 0700) and a state directory, in the scratchpad of the run; disk-requested.toml (profile balanced, disk guard requested with warn_below 2GiB, memory guard not requested) on roots where no agent ran; the template (schema_version 1) on the root of the stop cases; SvalnirRun4Fixture.app (invalid.svalnir-run4.fixture, LSUIElement, ad-hoc signature, 64 MiB of its own memory, option refuse-quit), started twice by the run
+effective_policy_and_grants: a revision that requests the disk guard, enabled and disabled with no agent on that root; elsewhere no revision or the template with no guard enabled; no grant while an agent ran
+seed_or_trace: SVALNIR_TEST_DIALOG_KIND, one urgent kind for each dialog agent
+reviewer: null
+run_started_at: 2026-11-20T05:20:05Z
+evidence_paths: [.omc/handoffs/m3-host-run-4-done.md, .omc/handoffs/m3-host-run-4-evidence/]
+limitations: [one host, one run in two passes, debug build, ad-hoc signature, input through a computer-use tool, fixture data for three rows, keyboard operation and accessible labels not examined, evidence not tracked]
+```
+
+| `validation_id` | `case_id` | Case of the run | Status | Observed results |
+| --- | --- | --- | --- | --- |
+| VAL-10 | `status_item_without_window` | R4-1 | `passed` | With no window, the item shows the capacity grid, the memory pressure, the agent state, and the pause state; the client has no Dock icon; Open Svalnir opens the window; Quit Svalnir ends the client |
+| VAL-10 | `status_item_pause_resume` | R4-2a | `passed` | Pause and resume from the item menu with the agent running; the item, Automation, and `agent status` agree; defect D-13 |
+| VAL-10 | `gui_and_cli_agree_on_pause_with_agent` | R4-2b | `passed` | A CLI pause and resume with the agent running: Automation and `agent status` show the same state |
+| VAL-10 | `enable_refused_with_no_journal` | R4-3a | `passed` | `policy enable` with no state directory exits 3 with `no_active_policy_revision` and makes no file |
+| VAL-10 | `gui_pause_with_no_state_directory` | R4-3b | `passed` | With no state directory and no agent, the window pause makes the state directory (mode 0700) and the journal and writes the record directly; resume the same; the CLI reads each state |
+| VAL-10 | `private_state_directory_shared_reading` | R4-3c | `passed` | The CLI makes the state directory with mode 0700; the window shows the same pause at its next read |
+| VAL-10 | `gui_enable_disable_guard` | R4-4a | `passed` | Enable with a confirmation that names the revision and the action class, and disable, from the window with no agent; the CLI reads each state |
+| VAL-10 | `gui_guard_enable_control_and_reading` | R4-4b | `passed` | The window shows a CLI enable and disable at its next read |
+| VAL-10 | `gui_stop_waiting_for_admission` | R4-5 | `passed` | With the agent held by `SIGSTOP`, the stop of the fixture application shows "Waiting for admission" with a counter; after `SIGCONT` the agent admits it and the exit is observed; defect D-14 |
+| VAL-06 | `gui_cancel_during_graceful_wait_live` | R4-6a | `passed` | Cancel from History of a running stop: a durable stop fence, `Incomplete`; the row shows two lines with an ellipsis, the detail the full sentence; defects D-15 and D-16 seen on the way |
+| VAL-10 | `gui_history_state_line_fixture` | R4-6b | `passed` | Fixture data: the same layout |
+| VAL-10 | `gui_history_tooltip_on_cut_line` | R4-6c | `passed` | The cut line has a tooltip with the sentence; defect D-17 |
+| VAL-10 | `gui_history_no_tooltip_on_short_line` | R4-6d | `not_run` | No line that fits was reachable |
+| VAL-10 | `diagnostics_journal_size_label` | R4-7a | `passed` | "Size and size limit: 163.8 KB of 67.1 MB" (64 MiB) |
+| VAL-10 | `stop_dialog_buttons_fit` | R4-7b | `passed` | Fixture data and live: the buttons stay inside the dialog |
+| VAL-10 | `history_state_cell_fits` | R4-7c | `passed` | Fixture data and live: the state line stays in its column |
+| VAL-10 | `agent_stopped_state` | R4-7d | `passed` | After a clean stop, the window shows "Agent stopped" at its next read |
+| VAL-10 | `gui_diagnostics_notification_line` | R4-8 | `passed` | The agent list shows "Dialog for urgent notices, no banner"; the window list shows the probes |
+| VAL-13 | `urgent_dialog_memory_pressure_critical` | R4-9a | `passed` | The dialog shows within 1 s from the ad-hoc signed debug agent, with the header and one sentence, no path; it closes after 60 s with no click; `doctor` 1 posted, 0 failed |
+| VAL-13 | `urgent_dialog_incident_budget_exhausted` | R4-9b | `passed` | As R4-9a |
+| VAL-13 | `urgent_dialog_automatic_operation_not_completed` | R4-9c | `passed` | As R4-9a |
+| VAL-13 | `urgent_dialog_closes_on_ok` | R4-9d | `passed` | OK closes the dialog before the timeout; `doctor` 1 posted, 0 failed |
+| VAL-10 | `gui_light_theme` | R4-10a | `passed` | Automation, Diagnostics, History, Applications, and the stop dialog |
+| VAL-10 | `gui_dark_theme` | R4-10b | `passed` | The same screens with `--appearance dark`; the item in the dark menu bar not covered |
+| VAL-10 | `gui_increase_contrast` | R4-11a | `not_run` | Needs a system setting |
+| VAL-10 | `gui_voiceover` | R4-11b | `not_run` | Needs a system setting |
+| VAL-10 | `gui_reduce_motion_system` | R4-11c | `not_run` | Needs a system setting; captures with `--reduce-motion` have no status |
+| VAL-11 | `sleep_and_wake` | R4-11d | `not_run` | Needs a host sleep |
+
+The count is 23 `passed`, 0 `failed`, and 5 `not_run` (R4-6d and R4-11a to R4-11d). The first pass alone had 14 `passed`, 9 `blocked`, and 4 `not_run`; the second pass did the nine `blocked` cases and added R4-6d. Three `passed` rows (R4-6b, R4-7b, R4-7c) use fixture data of the client. No automatic action occurred, each stopped process was a fixture application of the run, and no guard was enabled while an agent ran. The dialog `memory_pressure_critical` was shown three times, one more than the two shows that the cases needed, because one closed by its timeout while the access request was open.
+
+The three urgent dialogs of the agent showed on this host from the ad-hoc signed debug agent with its linker signature, started directly with the trigger `SVALNIR_TEST_DIALOG_KIND` of a debug build with the feature `test-support`. The run did not examine the dialog of a release build, of an agent in `Svalnir.app`, of an agent under `launchd`, or of an incident of the controller. The menu bar item was examined on this host in the light menu bar with a debug build of the client in an ad-hoc signed bundle; the dark menu bar, Increase Contrast, and VoiceOver were not examined.
+
+The record makes no family and no gate pass: each family above has required parts that the run did not exercise, for example keyboard operation, focus, and accessible labels for VAL-10, process identity replacement and force escalation for VAL-06, and the dialog of an installed signed agent for VAL-13.
+
+The run found six defects:
+
+| ID | Defect |
+| --- | --- |
+| D-12 | The sidebar and the status line show "Agent no journal" and "Agent no status", because they join "Agent" and a noun label |
+| D-13 | After a resume from the menu bar item, its menu says "Pause request: Accepted" |
+| D-14 | In Applications, the state of a stop action ("Waiting for admission" and its sentence) is cut at the right edge of the table |
+| D-15 | "Stop…" stays active while its confirmation is open, so a second press opens a second confirmation of the same group |
+| D-16 | The Applications row says an operation "ended in the state Partial" when the journal state is `Incomplete` |
+| D-17 | The tooltip of a cut History state line is one line and is cut at the right edge of the window |
+
+The run shows the corrected behavior of D-8 to D-11 of commit `2e3e6f9`: D-8 (live), D-9 (fixture data), D-10 (fixture data and live), and D-11 (live).
+
+Commit `23f9213` corrects D-12 to D-17, each with a regression test, and no host run examined the corrections: the sidebar and the status line show "Agent has no journal" and "Agent has no status record", and the menu bar item keeps its "Agent: VALUE" line (D-12); the line of the last request of the item is named after the last command, for example "Resume request: Accepted" (D-13); the state of a stop is a short state line in a row below the group that spans the table, with a Details button that opens the full line (D-14); the window has at most one stop confirmation, and each stop control is off while one is open, with the reason in the row of the group (D-15); a settled stop names the operation state of the journal, for example `Incomplete` (D-16); and the tooltip of a cut state line has a maximum width of 320 px, and its text wraps (D-17).
 
 ### What the records support
 
 Each gate of section 9 stays unverified. A record with `passed` is evidence for its case only, on one host, one macOS version, and one build. The cases are partial evidence for:
 
 - G-02 through VAL-04 and VAL-05: the manual Trash path of the two executors, with no permanent removal and no eviction.
-- G-03 through VAL-03, VAL-04, and VAL-06: the stop of a fixture child, the stop and the cancel of a fixture application from the window, and one refused rearm.
+- G-03 through VAL-03, VAL-04, and VAL-06: the stop of a fixture child, the stop and the cancel of a fixture application from the window (also live with the agent running, run 4), and one refused rearm.
 - G-05 and G-09 through VAL-11: install, agent-only operation, pause and resume, a permanent start error, the log location, and uninstall.
-- G-06 through VAL-10 and VAL-13: the read-only commands, the result views, the log of the agent, and the agreement of the window and the CLI on the authority record and the operations of run 3.
+- G-06 through VAL-10 and VAL-13: the read-only commands, the result views, the log of the agent, and the agreement of the window and the CLI on the authority record and the operations of runs 3 and 4; the menu bar item with no window, its pause and resume, and Quit Svalnir (light menu bar, debug build); the enable and disable of a guard from the window with no agent; a stop that waits for admission; the light theme, and the dark theme by the launch option `--appearance`; the corrections of D-8 to D-11; and the three urgent dialogs of the agent and the close by OK (VAL-13, in part: the ad-hoc signed debug agent with the fixture trigger, started directly).
 - G-07 through VAL-14: the reading of the lock only. No fuzzing ran.
 
 They are not evidence for:
@@ -596,7 +666,7 @@ They are not evidence for:
 - VAL-07: no crash at a journal or action boundary.
 - VAL-16: no signed installed artifact.
 - Automatic eviction or automatic application control: no grant existed and each rule is `proposed`.
-- The keyboard operation, the focus, the accessible labels, the two themes, and Reduce Motion of the GPUI client; its enable and disable of a guard; a stop that waits for admission; the menu bar item; and the corrections of D-8 to D-11.
+- The keyboard operation, the focus, the accessible labels, Increase Contrast, VoiceOver, and Reduce Motion as a system setting of the GPUI client; the menu bar item in the dark menu bar and with Increase Contrast; the urgent dialog of a release build, of an installed agent, or of an incident of the controller; and the corrections of D-12 to D-17.
 - Sleep and wake, a crash and restart, a disabled login item, and a non-local root.
 
 The evidence files are not tracked. Whether a record with untracked evidence meets section 12 ("Evidence references must resolve to retained logs") is a decision of the project owner.

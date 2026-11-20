@@ -48,6 +48,7 @@ use svalnir_core::rule::{
 };
 
 pub use config::{ConfigFormat, ConfigProblem, ConfigSource, MAX_CONFIG_BYTES};
+pub(in crate::rules) use inspect::measure_unit;
 pub use inspect::{
     CacheInspection, CacheMeasurement, CacheRootReport, CacheUnitReport, InspectionHost,
     InspectionLimits, ReclaimFigure, RootOutcome, RootResolution, UnitOutcome, resolve,

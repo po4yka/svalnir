@@ -169,15 +169,17 @@ fn reference(id: &str, revision: &str) -> RuleRef {
 }
 
 #[test]
-fn the_registry_has_eight_rules_and_each_layout_is_proposed() {
+fn the_registry_has_nine_rules_and_each_layout_is_proposed() {
     let registry = ReviewedRules::new().unwrap();
     let rules = registry.rules();
-    // The two rules of Milestone 2 and the six cache rules.
-    assert_eq!(rules.len(), 8);
+    // The two rules of Milestone 2, the six cache rules, and
+    // `project.dependency-directory`.
+    assert_eq!(rules.len(), 9);
     let statuses = registry.statuses();
     // One layout for each of the two rules, two for `pnpm.content-store`
-    // and for `yarn.cache`, and one for each other cache rule.
-    assert_eq!(statuses.len(), 10);
+    // and for `yarn.cache`, one for each other cache rule, and three for
+    // `project.dependency-directory`.
+    assert_eq!(statuses.len(), 13);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);

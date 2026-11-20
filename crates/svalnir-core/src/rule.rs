@@ -178,6 +178,12 @@ wire_enum! {
         SvalnirState => "svalnir_state",
         /// The location that the configuration of the producer names.
         ProducerConfiguration => "producer_configuration",
+        /// A project directory that a discovery finds below a directory
+        /// that the user names for the rule. The relative path names the
+        /// generated directory in the project, for example
+        /// `node_modules`. The rule has no default location: with no
+        /// directory that the user names, it examines nothing.
+        UserSelected => "user_selected",
     }
 }
 

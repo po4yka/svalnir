@@ -622,37 +622,54 @@ impl Inspector<'_> {
 
     /// Measures the unit at `path` with the read-only scanner.
     fn measure(&self, path: &Path) -> Option<CacheMeasurement> {
-        let request: ScanRequest = ScanRequest {
-            scan_id: ScanId::new(INSPECTION_SCAN_ID).ok()?,
-            root: LosslessPath::from_path(path).ok()?,
-            limits: ScanLimits {
-                max_depth: self.limits.max_depth,
-                max_entries: self.limits.max_entries_per_unit,
-                max_largest_files: 0,
-                max_largest_directories: 0,
-                max_recorded_regions: 64,
-                max_recorded_boundaries: 16,
-                max_hard_link_objects: 100_000,
-            },
-            volume: None,
-        };
-        let result: ScanResult =
-            run_scan(&request, self.cancel, self.clock, &mut NoObserver).ok()?;
-        let totals = &result.totals;
-        Some(CacheMeasurement {
-            logical_bytes: totals.logical_bytes,
-            allocated_bytes: totals.allocated_bytes,
-            files: totals.files,
-            directories: totals.directories,
-            symlinks: totals.symlinks,
-            completion: result.completion,
-            partial: result.coverage != Coverage::Complete,
-            reclaim: match self.spec.reclaim {
-                ReclaimBasis::AllocatedBytes => ReclaimFigure::AllocatedUpperBound {
-                    bytes: totals.allocated_bytes,
-                },
-                ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
-            },
-        })
+        measure_unit(
+            path,
+            self.limits,
+            self.cancel,
+            self.clock,
+            self.spec.reclaim,
+        )
     }
+}
+
+/// Measures the unit at `path` with the read-only scanner, with the reclaim
+/// figure of `reclaim`. `None` when the scan cannot start.
+pub(in crate::rules) fn measure_unit(
+    path: &Path,
+    limits: InspectionLimits,
+    cancel: &CancellationToken,
+    clock: &dyn ScanClock,
+    reclaim: ReclaimBasis,
+) -> Option<CacheMeasurement> {
+    let request: ScanRequest = ScanRequest {
+        scan_id: ScanId::new(INSPECTION_SCAN_ID).ok()?,
+        root: LosslessPath::from_path(path).ok()?,
+        limits: ScanLimits {
+            max_depth: limits.max_depth,
+            max_entries: limits.max_entries_per_unit,
+            max_largest_files: 0,
+            max_largest_directories: 0,
+            max_recorded_regions: 64,
+            max_recorded_boundaries: 16,
+            max_hard_link_objects: 100_000,
+        },
+        volume: None,
+    };
+    let result: ScanResult = run_scan(&request, cancel, clock, &mut NoObserver).ok()?;
+    let totals = &result.totals;
+    Some(CacheMeasurement {
+        logical_bytes: totals.logical_bytes,
+        allocated_bytes: totals.allocated_bytes,
+        files: totals.files,
+        directories: totals.directories,
+        symlinks: totals.symlinks,
+        completion: result.completion,
+        partial: result.coverage != Coverage::Complete,
+        reclaim: match reclaim {
+            ReclaimBasis::AllocatedBytes => ReclaimFigure::AllocatedUpperBound {
+                bytes: totals.allocated_bytes,
+            },
+            ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
+        },
+    })
 }

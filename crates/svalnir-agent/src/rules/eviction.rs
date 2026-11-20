@@ -266,13 +266,16 @@ pub fn bind_root(path: &Path) -> Result<BoundRoot, RootProblem> {
 /// path is the
 /// default location below the home directory, which the declaration gives
 /// as a discovery hint. A producer that is configured for a different
-/// location has no root here, and the rule finds nothing for it.
+/// location has no root here, and the rule finds nothing for it. A root of
+/// the base `user_selected` has no path here.
 fn declared_path(root: &DeclaredRoot, locations: &ProtectedLocations) -> Option<PathBuf> {
     let base: &Path = match root.base {
         RootBase::UserHome | RootBase::ProducerConfiguration => locations.home_directory()?,
         RootBase::SvalnirState => locations.state_directory()?,
-        // A base that this build does not know gives no path.
-        RootBase::Unrecognized(_) => return None,
+        // A root in a project that the user selects has no fixed path, and
+        // the discovery for an eviction has no selected project. A base
+        // that this build does not know gives no path.
+        RootBase::UserSelected | RootBase::Unrecognized(_) => return None,
     };
     Some(base.join(root.relative.to_path_buf()))
 }

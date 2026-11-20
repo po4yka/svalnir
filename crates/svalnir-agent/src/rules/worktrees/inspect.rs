@@ -258,6 +258,18 @@ fn head(record: &Path, principal: Uid) -> WorktreeHead {
     WorktreeHead::Unknown
 }
 
+/// Whether the file `commondir` of `record` names `git_dir`, the Git
+/// directory of the repository whose records the walk reads. A relative
+/// value is relative to the record, as Git reads it.
+fn commondir_matches(record: &Path, git_dir: &Path, principal: Uid) -> bool {
+    let Some(text) = record_text(&record.join("commondir"), principal) else {
+        return false;
+    };
+    let mut content: Vec<u8> = b"gitdir: ".to_vec();
+    content.extend_from_slice(text.as_bytes());
+    git_file_target(&content, record).as_deref() == Some(git_dir)
+}
+
 /// The directory of the worktree that the `gitdir` file of `record` names:
 /// the parent of the `.git` file that it names.
 fn worktree_path(record: &Path, principal: Uid) -> Option<PathBuf> {
@@ -351,7 +363,8 @@ impl WorktreeRule {
                 host.principal,
                 &walker.mounts,
             ) {
-                Ok(snapshot) => {
+                Ok((path, snapshot)) => {
+                    report.path = Some(path.clone());
                     let completion: SearchCompletion = walker.walk(&path, snapshot, &mut report);
                     report.outcome = SearchRootOutcome::Examined(completion);
                 }
@@ -510,13 +523,19 @@ impl Walker<'_> {
             }
             report
                 .worktrees
-                .push(self.worktree(name, &record, object_format_known));
+                .push(self.worktree(name, &record, git_dir, object_format_known));
         }
         Some(report)
     }
 
     /// The report of the linked worktree with the record `record`.
-    fn worktree(&self, name: String, record: &Path, object_format_known: bool) -> WorktreeReport {
+    fn worktree(
+        &self,
+        name: String,
+        record: &Path,
+        git_dir: &Path,
+        object_format_known: bool,
+    ) -> WorktreeReport {
         let principal: Uid = self.host.principal;
         let path: Option<PathBuf> = worktree_path(record, principal);
         let presence: WorktreePresence = match &path {
@@ -538,7 +557,18 @@ impl Walker<'_> {
             verdict: WorktreeVerdict::NotKnown,
             owner_workflow: WORKFLOW_NOT_KNOWN,
         };
-        if let Ok(git) = self.host.git {
+        // Git reads the objects, the references, and the configuration of
+        // the directory that the file `commondir` of the record names. The
+        // record is in the Git directory that the walk checked, and each
+        // query runs only when `commondir` names that directory again, so
+        // no query reads a repository that the walk did not check.
+        let common: bool = commondir_matches(record, git_dir, principal);
+        if !common {
+            report.staged_changes = Evidence::Unknown("commondir_not_matching");
+            report.untracked_files = Evidence::Unknown("commondir_not_matching");
+            report.ignored_entries = Evidence::Unknown("commondir_not_matching");
+            report.unique_commits = Evidence::Unknown("commondir_not_matching");
+        } else if let Ok(git) = self.host.git {
             // The commits need no work tree, so a worktree whose
             // directory is absent has this fact too.
             report.unique_commits = unique_commits(git, record);

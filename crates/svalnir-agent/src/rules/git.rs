@@ -17,7 +17,12 @@
 //! not on the list: without the developer tools it asks the user to
 //! install them. A Git of a directory that the user or the `admin` group
 //! can change, for example of Homebrew, is refused, so a process of the
-//! user cannot replace the program that the rule runs.
+//! user cannot replace the program that the rule runs. The Git of Xcode
+//! in `/Applications` is not on the list: `/Applications` permits a write
+//! by the `admin` group on a standard host, so it never passes the check.
+//! The check reads the owner and the mode bits; it does not read access
+//! control lists or file flags, so an access control list that permits a
+//! write to another user is not seen.
 //!
 //! # The environment and the configuration
 //!
@@ -31,11 +36,19 @@
 //! `protocol.allow=never`. A `protocol.NAME.allow` key of the repository
 //! has precedence over `protocol.allow`, so the environment variable
 //! `GIT_ALLOW_PROTOCOL` with a list that names no protocol is the control
-//! that permits no transport: Git then ignores each `protocol.*` key. `--no-optional-locks`
-//! keeps Git from a write of the index. A caller gives a pathspec with the
+//! that permits no transport: Git then ignores each `protocol.*` key. Git
+//! has `GIT_ALLOW_PROTOCOL` since 2.6.1, so a lazy fetch of a partial clone
+//! fails also in a Git that does not know `GIT_NO_LAZY_FETCH`, which has an
+//! effect from the releases of May 2024 (2.45.1, and 2.39.4 to 2.44.1).
+//! `--no-optional-locks` keeps Git from a write of the index. A caller gives a pathspec with the
 //! `:(literal)` prefix, so a path is not a pattern. The Git directory and the
 //! work tree are explicit arguments, so Git does not search for a
 //! repository above them.
+//!
+//! With no `HOME` and `GIT_CONFIG_GLOBAL=/dev/null`, Git reads no global
+//! ignore file of the user (`core.excludesFile` or
+//! `~/.config/git/ignore`). A path that only that file ignores is then not
+//! ignored for a query, which gives fewer ignored paths: the safe failure.
 //!
 //! No query of this module compares the content of a work tree with the
 //! index (`git status`, `git diff-files`): such a comparison can run a
@@ -43,28 +56,30 @@
 //!
 //! # Bounds
 //!
-//! Each query has a deadline and a bound of its output. A query that
-//! passes its deadline is stopped and gives [`GitFailure::Timeout`]; a
+//! Each query has a deadline and a bound of its output. The process starts
+//! in a process group of its own. A query that passes its deadline, or
+//! whose output stays open after that time because a child of Git holds
+//! it, has its whole group stopped and gives [`GitFailure::Timeout`]; a
 //! stopped query has made no change, because each command of this module
-//! only reads.
+//! only reads. A read error of the output gives [`GitFailure::ReadFailed`],
+//! never an empty output.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-/// The paths of the executables that [`GitTool::locate`] examines, in
-/// sequence: the command-line developer tools, then Xcode.
-pub const GIT_CANDIDATES: [&str; 2] = [
-    "/Library/Developer/CommandLineTools/usr/bin/git",
-    "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
-];
+/// The paths of the executables that [`GitTool::locate`] examines: the
+/// command-line developer tools.
+pub const GIT_CANDIDATES: [&str; 1] = ["/Library/Developer/CommandLineTools/usr/bin/git"];
 
 /// The only environment variables of a query.
 pub const FIXED_ENVIRONMENT: [(&str, &str); 11] = [
@@ -144,6 +159,9 @@ pub enum GitFailure {
     Timeout,
     /// The process ended with a signal.
     Signaled,
+    /// The output could not be read, or the thread that reads it could not
+    /// start or failed.
+    ReadFailed,
 }
 
 impl GitFailure {
@@ -154,6 +172,7 @@ impl GitFailure {
             Self::NotStarted => "git_not_started",
             Self::Timeout => "git_timeout",
             Self::Signaled => "git_signaled",
+            Self::ReadFailed => "git_read_failed",
         }
     }
 }
@@ -190,15 +209,24 @@ fn verified(path: &Path) -> Result<PathBuf, GitToolProblem> {
     Ok(resolved)
 }
 
+/// The time after the deadline that the reader of the output has to end
+/// after the process group was stopped.
+const READER_GRACE: Duration = Duration::from_millis(500);
+
 /// Reads the output of a query to `limit` bytes and discards the rest, so
-/// that the process does not wait on a full pipe.
-fn read_bounded(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+/// that the process does not wait on a full pipe. A read that a signal
+/// interrupts is read again.
+///
+/// # Errors
+///
+/// Returns [`GitFailure::ReadFailed`] for each other read error.
+fn read_bounded(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), GitFailure> {
     let mut kept: Vec<u8> = Vec::new();
     let mut buffer: [u8; 8192] = [0; 8192];
     let mut overflow: bool = false;
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return Ok((kept, overflow)),
             Ok(count) => {
                 let room: usize = limit.saturating_sub(kept.len());
                 if count > room {
@@ -206,12 +234,30 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
                 }
                 kept.extend_from_slice(&buffer[..count.min(room)]);
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(GitFailure::ReadFailed),
         }
     }
-    (kept, overflow)
 }
 
-/// Waits for `child` until `deadline`, and stops it after that time.
+/// Stops each process of the process group of `child`, then collects
+/// `child`.
+fn stop_group(child: &mut Child) {
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: `kill` takes no pointer. A negative identifier names the
+        // process group that `process_group(0)` made for the child, whose
+        // identifier is the identifier of the child. The system does not
+        // give that identifier to a new process while the child is not
+        // collected or a member of its group lives, so the signal reaches
+        // only the processes of the query.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    drop(child.kill());
+    drop(child.wait());
+}
+
+/// Waits for `child` until `deadline`, and stops its group after that
+/// time.
 fn wait_until(child: &mut Child, deadline: Instant) -> Result<ExitStatus, GitFailure> {
     loop {
         match child.try_wait() {
@@ -219,9 +265,8 @@ fn wait_until(child: &mut Child, deadline: Instant) -> Result<ExitStatus, GitFai
             Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
             Ok(None) | Err(_) => {
                 // The process only reads, so a stop leaves no partial
-                // change. The wait collects the stopped process.
-                drop(child.kill());
-                drop(child.wait());
+                // change.
+                stop_group(child);
                 return Err(GitFailure::Timeout);
             }
         }
@@ -280,6 +325,18 @@ impl GitTool {
         arguments: &[&OsStr],
         max_output: usize,
     ) -> Result<GitOutput, GitFailure> {
+        self.run_until(git_dir, work_tree, arguments, max_output, QUERY_DEADLINE)
+    }
+
+    /// [`GitTool::run`] with the deadline `limit`.
+    fn run_until(
+        &self,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+        arguments: &[&OsStr],
+        max_output: usize,
+        limit: Duration,
+    ) -> Result<GitOutput, GitFailure> {
         let mut command: Command = Command::new(&self.executable);
         command
             .env_clear()
@@ -294,18 +351,43 @@ impl GitTool {
             command.arg(prefixed("--work-tree=", work_tree));
         }
         command.args(arguments);
-        let deadline: Instant = Instant::now() + QUERY_DEADLINE;
+        // A process group of its own, so that a stop reaches each child of
+        // Git too.
+        command.process_group(0);
+        let deadline: Instant = Instant::now() + limit;
         let mut child: Child = command.spawn().map_err(|_| GitFailure::NotStarted)?;
         let Some(stdout) = child.stdout.take() else {
-            drop(child.kill());
-            drop(child.wait());
+            stop_group(&mut child);
             return Err(GitFailure::NotStarted);
         };
-        let reader = thread::spawn(move || read_bounded(stdout, max_output));
+        let (sender, receiver) = mpsc::channel();
+        let started = thread::Builder::new()
+            .name("svalnir-git-output".to_owned())
+            .spawn(move || {
+                // The receiver can be gone after a timeout; the result is
+                // then not needed.
+                drop(sender.send(read_bounded(stdout, max_output)));
+            });
+        if started.is_err() {
+            stop_group(&mut child);
+            return Err(GitFailure::ReadFailed);
+        }
         let status: Result<ExitStatus, GitFailure> = wait_until(&mut child, deadline);
-        // The pipe closes when the process ends, so the thread ends.
-        let (stdout, overflow) = reader.join().unwrap_or_default();
+        // A child of Git can hold the output open after Git ended. The wait
+        // for the reader is thus bounded too, and the group is stopped
+        // when the bound passes.
+        let bound: Duration = deadline.saturating_duration_since(Instant::now()) + READER_GRACE;
+        let read: Result<(Vec<u8>, bool), GitFailure> = match receiver.recv_timeout(bound) {
+            Ok(read) => read,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                stop_group(&mut child);
+                Err(GitFailure::Timeout)
+            }
+            // The reader ended with no result: it failed.
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(GitFailure::ReadFailed),
+        };
         let status: ExitStatus = status?;
+        let (stdout, overflow) = read?;
         let Some(code) = status.code() else {
             return Err(GitFailure::Signaled);
         };
@@ -442,4 +524,80 @@ pub(super) fn find_repository(
         }
     }
     RepositoryLookup::NotFound
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io::{self, Read};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use tempfile::TempDir;
+
+    use super::{GitFailure, GitTool, read_bounded};
+
+    /// A reader that gives the results of `steps`, then the end.
+    struct Steps(Vec<io::Result<Vec<u8>>>);
+
+    impl Read for Steps {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let bytes: Vec<u8> = self.0.remove(0)?;
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_read_again_and_another_error_is_a_failure() {
+        let interrupted = Steps(vec![
+            Ok(b"a\0".to_vec()),
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            Ok(b"b\0".to_vec()),
+        ]);
+        assert_eq!(
+            read_bounded(interrupted, 64),
+            Ok((b"a\0b\0".to_vec(), false))
+        );
+        let failed = Steps(vec![
+            Ok(b"a\0".to_vec()),
+            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        ]);
+        assert_eq!(read_bounded(failed, 64), Err(GitFailure::ReadFailed));
+        let long = Steps(vec![Ok(b"abcdef".to_vec())]);
+        assert_eq!(read_bounded(long, 4), Ok((b"abcd".to_vec(), true)));
+    }
+
+    /// A program that ends at once and leaves a child that holds its
+    /// output open.
+    fn program(directory: &Path) -> PathBuf {
+        let path: PathBuf = directory.join("git");
+        fs::write(&path, "#!/bin/sh\n/bin/sleep 30 &\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_child_that_holds_the_output_open_does_not_hold_the_query() {
+        let directory: TempDir = TempDir::new().unwrap();
+        let tool: GitTool = GitTool {
+            executable: program(directory.path()),
+        };
+        let started: Instant = Instant::now();
+        let result = tool.run_until(
+            directory.path(),
+            None,
+            &[OsStr::new("status")],
+            64,
+            Duration::from_millis(500),
+        );
+        assert_eq!(result, Err(GitFailure::Timeout));
+        // The deadline and the grace time bound the query.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }

@@ -47,8 +47,8 @@ pub use homebrew::{
     PrefixOutcome,
 };
 pub use simulator::{
-    DeviceOutcome, DeviceState, RuntimeLocation, SimulatorDevice, SimulatorInspection,
-    SimulatorLocations, SimulatorRuntime,
+    DeviceOutcome, DeviceState, RuntimeLocation, RuntimeLocationOutcome, RuntimeLocationReport,
+    SimulatorDevice, SimulatorInspection, SimulatorLocations, SimulatorRuntime,
 };
 
 use super::projects::ProcessEvidence;
@@ -90,6 +90,9 @@ struct OwnerToolSpec {
     producer: &'static str,
     layouts: &'static [&'static str],
     roots: &'static [(RootBase, &'static str)],
+    /// Whether the object is a regular file: the disk image of a container
+    /// engine is one, and a device or a keg is a directory.
+    file_unit: bool,
     rebuild_cost: RebuildCost,
 }
 
@@ -107,7 +110,12 @@ const SPECS: [OwnerToolSpec; 3] = [
                 RootBase::ProducerInstallation,
                 "Library/Developer/CoreSimulator/Profiles/Runtimes",
             ),
+            (
+                RootBase::ProducerInstallation,
+                "Library/Developer/CoreSimulator/Volumes",
+            ),
         ],
+        file_unit: false,
         rebuild_cost: RebuildCost::High,
     },
     OwnerToolSpec {
@@ -121,6 +129,7 @@ const SPECS: [OwnerToolSpec; 3] = [
             ),
             (RootBase::UserHome, ".colima"),
         ],
+        file_unit: true,
         rebuild_cost: RebuildCost::Medium,
     },
     OwnerToolSpec {
@@ -128,6 +137,7 @@ const SPECS: [OwnerToolSpec; 3] = [
         producer: "homebrew",
         layouts: &["homebrew-cellar-keg"],
         roots: &[(RootBase::ProducerInstallation, "Cellar")],
+        file_unit: false,
         rebuild_cost: RebuildCost::Low,
     },
 ];
@@ -186,7 +196,11 @@ fn declaration(spec: &OwnerToolSpec) -> Result<RuleDeclaration, RegistryError> {
         },
         exclusions: RuleExclusions {
             descendants: Vec::new(),
-            supported_object_types: vec![FileObjectType::Directory],
+            supported_object_types: vec![if spec.file_unit {
+                FileObjectType::RegularFile
+            } else {
+                FileObjectType::Directory
+            }],
             skip_hard_linked: true,
         },
         modes: vec![RuleMode::Inspection],

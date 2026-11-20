@@ -114,6 +114,30 @@ impl BuildProcesses {
             })
             .map(|process| process.executable.as_path())
     }
+
+    /// The executable of the first build process whose working directory
+    /// is above the project at `project` and in `top`, when one is.
+    ///
+    /// Such a process can write the units of the project: `pnpm install
+    /// -r` at the root of a monorepo, `make -C app`, or `npm --prefix app
+    /// install`. Its working directory does not show which project it
+    /// works on, so the activity of the project is not known.
+    #[must_use]
+    pub fn above(&self, project: &Path, top: &Path) -> Option<&Path> {
+        self.processes
+            .iter()
+            .find(|process| {
+                process
+                    .working_directory
+                    .as_deref()
+                    .is_some_and(|directory| {
+                        is_in(directory, top)
+                            && is_in(project, directory)
+                            && !is_in(directory, project)
+                    })
+            })
+            .map(|process| process.executable.as_path())
+    }
 }
 
 /// What the inspection needs to read the process evidence.
@@ -129,15 +153,17 @@ pub trait ProcessEvidence {
 /// The inventory of the processes of `principal` from `source`, with the
 /// working directory of each build process from `working_directory`.
 ///
-/// A process that exited during the reading is not in the inventory, and a
-/// denied identity query is a process of a different user, as in the
-/// evidence of `xcode.inactive-derived-data`. A failed query of the
+/// A process that exited during the reading is not in the inventory. For
+/// a denied identity query, `owner` gives the effective and the real user
+/// of the process: a process of a different user is out of the scope, and
+/// each other result makes the inventory not complete. A failed query of the
 /// executable of a process of the user, or of the working directory of a
 /// build process of the user, makes the inventory not complete.
 pub(super) fn inventory<S: ProcessSource>(
     source: &S,
     principal: Uid,
     working_directory: impl Fn(Pid) -> Result<PathBuf, QueryFailure>,
+    owner: impl Fn(Pid) -> Result<(Uid, Uid), QueryFailure>,
 ) -> BuildProcesses {
     let mut result: BuildProcesses = BuildProcesses {
         processes: Vec::new(),
@@ -154,7 +180,20 @@ pub(super) fn inventory<S: ProcessSource>(
     for pid in pids {
         let info = match source.process_info(pid) {
             Ok(info) => info,
-            Err(QueryFailure::Gone | QueryFailure::PermissionDenied) => continue,
+            Err(QueryFailure::Gone) => continue,
+            // `proc_pidinfo(PROC_PIDTBSDINFO)` gives no owner for a denied
+            // query. The short query gives the owner of such a process; a
+            // process of a different user is out of the scope, and a
+            // process of the user, or one with no owner, makes the
+            // inventory not complete.
+            Err(QueryFailure::PermissionDenied) => {
+                match owner(pid) {
+                    Ok((effective, real)) if effective != principal && real != principal => {}
+                    Err(QueryFailure::Gone) => {}
+                    _ => result.incomplete = Some("process_query_denied"),
+                }
+                continue;
+            }
             Err(_) => {
                 result.incomplete = Some("process_query_failed");
                 continue;
@@ -206,13 +245,133 @@ impl ProcessEvidence for NativeProcessEvidence {
     fn build_processes(&self, principal: Uid) -> BuildProcesses {
         let source: DarwinProcessSource = DarwinProcessSource::new();
         #[cfg(target_os = "macos")]
-        let query = crate::rules::native::working_directory;
+        let (query, owner) = (
+            crate::rules::native::working_directory,
+            crate::rules::native::process_owner,
+        );
         #[cfg(not(target_os = "macos"))]
-        let query = |_: Pid| -> Result<PathBuf, QueryFailure> { Err(QueryFailure::Unsupported) };
-        inventory(&source, principal, query)
+        let (query, owner) = (
+            |_: Pid| -> Result<PathBuf, QueryFailure> { Err(QueryFailure::Unsupported) },
+            |_: Pid| -> Result<(Uid, Uid), QueryFailure> { Err(QueryFailure::Unsupported) },
+        );
+        inventory(&source, principal, query, owner)
     }
 
     fn monotonic_now(&self) -> Option<MonotonicNanos> {
         DarwinProcessSource::new().monotonic_now().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The inventory with a synthetic process table.
+
+    use std::path::PathBuf;
+
+    use svalnir_core::file::{FileObjectEvidence, LosslessPath};
+    use svalnir_core::observation::UnavailableReason;
+    use svalnir_core::process::{Pid, ProcessStartTime, Uid};
+    use svalnir_core::quantity::Nanoseconds;
+    use svalnir_core::time::{MonotonicNanos, WallTime};
+
+    use super::inventory;
+    use crate::platform::process::{
+        ProcessSource, QueryFailure, RawProcessInfo, RawUsage, RunningApplication, Timebase,
+    };
+
+    const USER: Uid = Uid::new(501);
+
+    /// The process 10 of the user and the process 20, whose identity
+    /// query is denied.
+    struct Table;
+
+    impl ProcessSource for Table {
+        fn effective_uid(&self) -> Uid {
+            USER
+        }
+
+        fn list_pids(&self) -> Result<Vec<Pid>, QueryFailure> {
+            Ok(vec![Pid::new(10).unwrap(), Pid::new(20).unwrap()])
+        }
+
+        fn process_info(&self, pid: Pid) -> Result<RawProcessInfo, QueryFailure> {
+            if pid.get() == 20 {
+                return Err(QueryFailure::PermissionDenied);
+            }
+            Ok(RawProcessInfo {
+                pid,
+                parent_pid: None,
+                effective_uid: USER,
+                real_uid: USER,
+                start_time: ProcessStartTime::from_timeval(1_000, 0).unwrap(),
+                zombie: false,
+            })
+        }
+
+        fn executable_path(&self, _pid: Pid) -> Result<LosslessPath, QueryFailure> {
+            Ok(LosslessPath::from_bytes("/usr/bin/login").unwrap())
+        }
+
+        fn file_evidence(&self, _path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+            Err(QueryFailure::Unsupported)
+        }
+
+        fn usage(&self, _pid: Pid) -> Result<RawUsage, QueryFailure> {
+            Err(QueryFailure::Unsupported)
+        }
+
+        fn responsible_pid(&self, _pid: Pid) -> Result<Pid, QueryFailure> {
+            Err(QueryFailure::Unsupported)
+        }
+
+        fn application_list_current(&self) -> bool {
+            false
+        }
+
+        fn running_applications(&self) -> Result<Vec<RunningApplication>, QueryFailure> {
+            Err(QueryFailure::Unsupported)
+        }
+
+        fn timebase(&self) -> Result<Timebase, QueryFailure> {
+            Err(QueryFailure::Unsupported)
+        }
+
+        fn monotonic_now(&self) -> Result<MonotonicNanos, QueryFailure> {
+            Ok(MonotonicNanos::new(7_000))
+        }
+
+        fn sleep_time(&self) -> Result<Nanoseconds, UnavailableReason> {
+            Err(UnavailableReason::Unsupported)
+        }
+
+        fn wall_now(&self) -> Result<WallTime, QueryFailure> {
+            Err(QueryFailure::Unsupported)
+        }
+    }
+
+    fn no_directory(_: Pid) -> Result<PathBuf, QueryFailure> {
+        Err(QueryFailure::Unsupported)
+    }
+
+    #[test]
+    fn a_denied_query_keeps_the_inventory_complete_only_for_another_user() {
+        let other = |_: Pid| Ok((Uid::new(0), Uid::new(0)));
+        let complete = inventory(&Table, USER, no_directory, other);
+        assert_eq!(complete.incomplete, None);
+        assert_eq!(complete.processes.len(), 1);
+        // A denied process of the user, or one with no owner, is not
+        // evidence of inactivity.
+        for owner in [
+            |_: Pid| Ok((USER, USER)),
+            |_: Pid| Ok((Uid::new(0), USER)),
+            |_: Pid| Err(QueryFailure::PermissionDenied),
+        ] {
+            let found = inventory(&Table, USER, no_directory, owner);
+            assert_eq!(found.incomplete, Some("process_query_denied"));
+        }
+        // A process that exited between the two queries is not in the
+        // inventory.
+        let gone = inventory(&Table, USER, no_directory, |_: Pid| Err(QueryFailure::Gone));
+        assert_eq!(gone.incomplete, None);
     }
 }

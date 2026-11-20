@@ -30,6 +30,10 @@ const MAX_DEVICE_PLIST_BYTES: u64 = 64 * 1024;
 /// The largest number of devices and of runtimes in a report.
 const MAX_ENTRIES: usize = 512;
 
+/// The largest number of entries of one directory that the inspection
+/// reads.
+const MAX_READ: usize = 100_000;
+
 /// The suffix of a runtime bundle.
 const RUNTIME_SUFFIX: &str = ".simruntime";
 
@@ -137,6 +141,30 @@ pub struct SimulatorRuntime {
     pub location: RuntimeLocation,
 }
 
+/// The result of one location of runtime bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum RuntimeLocationOutcome {
+    /// The directory was read.
+    Read,
+    /// The directory does not exist.
+    Absent,
+    /// The directory failed a check or could not be read. The reason is a
+    /// stable name.
+    Refused(&'static str),
+}
+
+/// The report of one location of runtime bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeLocationReport {
+    /// The directory.
+    pub path: PathBuf,
+    /// What the location is.
+    pub location: RuntimeLocation,
+    /// The result.
+    pub outcome: RuntimeLocationOutcome,
+}
+
 /// The inspection of `simulator.devices`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SimulatorInspection {
@@ -149,8 +177,17 @@ pub struct SimulatorInspection {
     pub devices_refused: Option<&'static str>,
     /// The devices, in the sequence of their names.
     pub devices: Vec<SimulatorDevice>,
+    /// Whether the list of devices is cut: the directory had more devices
+    /// than the bound, more entries than the inspection reads, or the
+    /// caller cancelled the inspection.
+    pub devices_truncated: bool,
     /// The runtime bundles.
     pub runtimes: Vec<SimulatorRuntime>,
+    /// The result of each location of runtime bundles that the inspection
+    /// examined. A location that is refused gives no bundle.
+    pub runtime_locations: Vec<RuntimeLocationReport>,
+    /// Whether the list of runtimes is cut.
+    pub runtimes_truncated: bool,
     /// The owner workflow for the runtimes. Svalnir does not run it.
     pub runtime_workflow: &'static str,
 }
@@ -168,17 +205,27 @@ fn is_udid(name: &str) -> bool {
         })
 }
 
-/// The names of the entries of the directory `path`, sorted, at most
-/// [`MAX_ENTRIES`]. `None` when the directory cannot be read.
-fn entries(path: &Path) -> Option<Vec<String>> {
-    let mut names: Vec<String> = fs::read_dir(path)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
+/// The names of the entries of the directory `path` that `keep` accepts,
+/// sorted, at most [`MAX_ENTRIES`], from at most [`MAX_READ`] entries.
+/// The second value is `true` when a bound cut the list. `None` when the
+/// directory cannot be read.
+pub(super) fn entries(path: &Path, keep: impl Fn(&str) -> bool) -> Option<(Vec<String>, bool)> {
+    let mut read: usize = 0;
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(path).ok()?.take(MAX_READ) {
+        read += 1;
+        if let Some(name) = entry
+            .ok()
+            .and_then(|entry| entry.file_name().into_string().ok())
+            && keep(&name)
+        {
+            names.push(name);
+        }
+    }
     names.sort();
+    let truncated: bool = read >= MAX_READ || names.len() > MAX_ENTRIES;
     names.truncate(MAX_ENTRIES);
-    Some(names)
+    Some((names, truncated))
 }
 
 impl OwnerToolRules {
@@ -211,7 +258,10 @@ impl OwnerToolRules {
             layouts: rule.layouts.clone(),
             devices_refused: None,
             devices: Vec::new(),
+            devices_truncated: false,
             runtimes: Vec::new(),
+            runtime_locations: Vec::new(),
+            runtimes_truncated: false,
             runtime_workflow: "Run `xcrun simctl runtime list` to see the runtimes and the devices that use them, then `xcrun simctl runtime delete IDENTIFIER`, or remove a platform in the Components settings of Xcode. Svalnir does not run them. A runtime that a device uses makes the device unavailable.",
         };
         let Ok(table) = mounts() else {
@@ -219,10 +269,13 @@ impl OwnerToolRules {
             return inspection;
         };
         match devices(host, &locations.devices, &table, limits, cancel, clock) {
-            Ok(found) => inspection.devices = found,
+            Ok((found, truncated)) => {
+                inspection.devices = found;
+                inspection.devices_truncated = truncated;
+            }
             Err(reason) => inspection.devices_refused = Some(reason),
         }
-        inspection.runtimes = runtimes(locations, &table);
+        runtimes(locations, &table, cancel, &mut inspection);
         inspection
     }
 }
@@ -235,7 +288,7 @@ fn devices(
     limits: InspectionLimits,
     cancel: &CancellationToken,
     clock: &dyn ScanClock,
-) -> Result<Vec<SimulatorDevice>, &'static str> {
+) -> Result<(Vec<SimulatorDevice>, bool), &'static str> {
     match host.locations.of_text(directory) {
         ProtectionFact::NotProtected => {}
         ProtectionFact::Protected => return Err("root_protected"),
@@ -243,15 +296,21 @@ fn devices(
     }
     let root = match walk_local(directory, mounts) {
         Ok(root) => root,
-        Err(crate::rules::unit::WalkStop::Absent) => return Ok(Vec::new()),
+        Err(crate::rules::unit::WalkStop::Absent) => return Ok((Vec::new(), false)),
         Err(_) => return Err("root_not_local_or_not_readable"),
     };
     if root.kind != ObjectKind::Directory || root.owner != host.principal {
         return Err("root_not_directory_of_user");
     }
-    let names: Vec<String> = entries(directory).ok_or("root_not_readable")?;
+    // The filter comes before the bound, so other names cannot push a
+    // device out of the list.
+    let (names, mut truncated) = entries(directory, is_udid).ok_or("root_not_readable")?;
     let mut found: Vec<SimulatorDevice> = Vec::new();
-    for udid in names.into_iter().filter(|name| is_udid(name)) {
+    for udid in names {
+        if cancel.is_cancelled() {
+            truncated = true;
+            break;
+        }
         let path: PathBuf = directory.join(&udid);
         let mut device: SimulatorDevice = SimulatorDevice {
             owner_workflow: format!(
@@ -290,7 +349,7 @@ fn devices(
         };
         found.push(device);
     }
-    Ok(found)
+    Ok((found, truncated))
 }
 
 /// Reads the `device.plist` of the device at `path` and measures it.
@@ -302,12 +361,25 @@ fn describe(
     cancel: &CancellationToken,
     clock: &dyn ScanClock,
 ) -> DeviceOutcome {
-    let RecordRead::Read { bytes, .. } = read_record(
+    let bytes: Vec<u8> = match read_record(
         &path.join("device.plist"),
         MAX_DEVICE_PLIST_BYTES,
         host.principal,
-    ) else {
-        return DeviceOutcome::UnsupportedLayout;
+    ) {
+        RecordRead::Read { bytes, .. } => bytes,
+        RecordRead::Absent => return DeviceOutcome::UnsupportedLayout,
+        RecordRead::Denied => {
+            return DeviceOutcome::Refused {
+                reason: "device_plist_denied",
+            };
+        }
+        // Not a plain file with one name and the user as owner, too
+        // large, changed during the read, or a failed read.
+        RecordRead::Invalid => {
+            return DeviceOutcome::Refused {
+                reason: "device_plist_not_readable",
+            };
+        }
     };
     // CoreSimulator writes the file as XML; the binary form is also
     // accepted.
@@ -362,38 +434,95 @@ fn describe(
     }
 }
 
-/// The runtime bundles of `locations`. A location that is not on a local
-/// filesystem or cannot be read gives no bundle.
-fn runtimes(locations: &SimulatorLocations, mounts: &MountTable) -> Vec<SimulatorRuntime> {
-    let mut found: Vec<SimulatorRuntime> = Vec::new();
-    let mut bundles = |directory: &Path, location: RuntimeLocation| {
-        if walk_local(directory, mounts).is_err() {
-            return;
+/// The result of the directory `directory` of runtime bundles.
+fn open_location(directory: &Path, mounts: &MountTable) -> RuntimeLocationOutcome {
+    match walk_local(directory, mounts) {
+        // A symbolic link is not followed: the directory must be one.
+        Ok(found) if found.kind == ObjectKind::Directory => RuntimeLocationOutcome::Read,
+        Ok(_) => RuntimeLocationOutcome::Refused("location_not_directory"),
+        Err(crate::rules::unit::WalkStop::Absent) => RuntimeLocationOutcome::Absent,
+        Err(crate::rules::unit::WalkStop::NotLocal) => {
+            RuntimeLocationOutcome::Refused("location_not_local")
         }
-        for name in entries(directory).unwrap_or_default() {
-            let Some(runtime) = name.strip_suffix(RUNTIME_SUFFIX) else {
-                continue;
-            };
-            let path: PathBuf = directory.join(&name);
-            if lstat(&path).is_ok_and(|bundle| bundle.kind == ObjectKind::Directory)
-                && found.len() < MAX_ENTRIES
-            {
-                found.push(SimulatorRuntime {
-                    name: runtime.to_owned(),
-                    path,
-                    location,
-                });
+        Err(_) => RuntimeLocationOutcome::Refused("location_not_readable"),
+    }
+}
+
+/// The runtime bundles of `locations`, with the result of each location.
+fn runtimes(
+    locations: &SimulatorLocations,
+    mounts: &MountTable,
+    cancel: &CancellationToken,
+    inspection: &mut SimulatorInspection,
+) {
+    let is_bundle = |name: &str| name.ends_with(RUNTIME_SUFFIX);
+    let bundles = |directory: &Path,
+                   location: RuntimeLocation,
+                   inspection: &mut SimulatorInspection| {
+        let mut outcome: RuntimeLocationOutcome = open_location(directory, mounts);
+        if outcome == RuntimeLocationOutcome::Read {
+            match entries(directory, is_bundle) {
+                None => outcome = RuntimeLocationOutcome::Refused("location_not_readable"),
+                Some((names, truncated)) => {
+                    inspection.runtimes_truncated |= truncated;
+                    for name in names {
+                        let path: PathBuf = directory.join(&name);
+                        let Some(runtime) = name.strip_suffix(RUNTIME_SUFFIX) else {
+                            continue;
+                        };
+                        if inspection.runtimes.len() >= MAX_ENTRIES {
+                            inspection.runtimes_truncated = true;
+                            break;
+                        }
+                        if lstat(&path).is_ok_and(|bundle| bundle.kind == ObjectKind::Directory) {
+                            inspection.runtimes.push(SimulatorRuntime {
+                                name: runtime.to_owned(),
+                                path,
+                                location,
+                            });
+                        }
+                    }
+                }
             }
         }
+        inspection.runtime_locations.push(RuntimeLocationReport {
+            path: directory.to_path_buf(),
+            location,
+            outcome,
+        });
     };
-    bundles(&locations.profiles, RuntimeLocation::Profile);
-    if walk_local(&locations.volumes, mounts).is_ok() {
-        for volume in entries(&locations.volumes).unwrap_or_default() {
+    bundles(&locations.profiles, RuntimeLocation::Profile, inspection);
+    let volumes: RuntimeLocationOutcome = open_location(&locations.volumes, mounts);
+    let listed: Option<(Vec<String>, bool)> = if volumes == RuntimeLocationOutcome::Read {
+        entries(&locations.volumes, |_| true)
+    } else {
+        None
+    };
+    inspection.runtime_locations.push(RuntimeLocationReport {
+        path: locations.volumes.clone(),
+        location: RuntimeLocation::Volume,
+        outcome: match (&volumes, &listed) {
+            (RuntimeLocationOutcome::Read, None) => {
+                RuntimeLocationOutcome::Refused("location_not_readable")
+            }
+            _ => volumes.clone(),
+        },
+    });
+    if let Some((names, truncated)) = listed {
+        inspection.runtimes_truncated |= truncated;
+        for volume in names {
+            if cancel.is_cancelled() {
+                inspection.runtimes_truncated = true;
+                break;
+            }
             let path: PathBuf = locations.volumes.join(volume);
             if lstat(&path).is_ok_and(|entry| entry.kind == ObjectKind::Directory) {
-                bundles(&path.join(VOLUME_RUNTIMES), RuntimeLocation::Volume);
+                bundles(
+                    &path.join(VOLUME_RUNTIMES),
+                    RuntimeLocation::Volume,
+                    inspection,
+                );
             }
         }
     }
-    found
 }

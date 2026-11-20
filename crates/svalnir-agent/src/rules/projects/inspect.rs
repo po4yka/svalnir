@@ -307,7 +307,8 @@ fn overlaps(first: &Path, second: &Path) -> bool {
     first.starts_with(second) || second.starts_with(first)
 }
 
-/// The checks of the search root at `path`, and its snapshot.
+/// The checks of the search root at `path`, and its path with the stored
+/// names and its snapshot.
 ///
 /// # Errors
 ///
@@ -319,7 +320,7 @@ pub(in crate::rules) fn open_search_root(
     user_exclusions: &[PathBuf],
     principal: Uid,
     mounts: &MountTable,
-) -> Result<ObjectSnapshot, SearchRootOutcome> {
+) -> Result<(PathBuf, ObjectSnapshot), SearchRootOutcome> {
     let refused = SearchRootOutcome::Refused;
     // The text checks make no call on the path.
     match locations.of_text(path) {
@@ -347,7 +348,32 @@ pub(in crate::rules) fn open_search_root(
     if snapshot.owner != principal {
         return Err(refused("root_owner"));
     }
-    Ok(snapshot)
+    Ok((stored_case(path), snapshot))
+}
+
+/// The path with the names that the filesystem stores, when they differ
+/// from `path` in case only.
+///
+/// A volume that ignores case finds `~/code` for a directory `~/Code`, and
+/// the kernel gives the stored names in the working directory of a
+/// process. The walk reads the names below the root from the directory, so
+/// only the root itself can have the case of the caller. The path has no
+/// symbolic link (the walk of the local filesystems shows it), so its
+/// resolved form differs from it in the case of its names only; a resolved
+/// form that differs in more is not used.
+fn stored_case(path: &Path) -> PathBuf {
+    match fs::canonicalize(path) {
+        Ok(resolved)
+            if resolved.as_os_str().len() == path.as_os_str().len()
+                && resolved
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(path.as_os_str().as_encoded_bytes()) =>
+        {
+            resolved
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 impl ProjectRule {
@@ -438,19 +464,20 @@ impl Inspector<'_> {
             outcome: SearchRootOutcome::Absent,
             unreadable_directories: 0,
         };
-        let snapshot: ObjectSnapshot = match open_search_root(
+        let (path, snapshot): (PathBuf, ObjectSnapshot) = match open_search_root(
             &path,
             self.host.locations,
             self.host.user_exclusions,
             self.host.principal,
             &self.mounts,
         ) {
-            Ok(snapshot) => snapshot,
+            Ok(opened) => opened,
             Err(outcome) => {
                 report.outcome = outcome;
                 return report;
             }
         };
+        report.path = Some(path.clone());
         let completion: SearchCompletion = self.walk(&path, snapshot, &mut report);
         report.outcome = SearchRootOutcome::Examined(completion);
         report
@@ -638,7 +665,7 @@ impl Inspector<'_> {
             VersionControl::NoRepository => return refused("no_repository"),
             VersionControl::Unknown { .. } => return refused("version_control_unknown"),
         }
-        let activity: ProjectActivity = self.activity(project);
+        let activity: ProjectActivity = self.activity(project, root);
         report.activity = Some(activity.clone());
         match activity {
             ProjectActivity::Inactive => {}
@@ -718,7 +745,7 @@ impl Inspector<'_> {
 
     /// The process evidence for the project at `project`. Evidence that is
     /// older than the expiry of the rule is read again.
-    fn activity(&mut self, project: &Path) -> ProjectActivity {
+    fn activity(&mut self, project: &Path, root: &Path) -> ProjectActivity {
         let expiry: Nanoseconds = self.expiry;
         let is_current = |processes: &BuildProcesses, now: Option<MonotonicNanos>| {
             processes
@@ -733,6 +760,11 @@ impl Inspector<'_> {
         if let Some(executable) = self.processes.blocking(project) {
             return ProjectActivity::Active {
                 executable: executable.to_path_buf(),
+            };
+        }
+        if self.processes.above(project, root).is_some() {
+            return ProjectActivity::Unknown {
+                reason: "build_process_above_project",
             };
         }
         if let Some(reason) = self.processes.incomplete {

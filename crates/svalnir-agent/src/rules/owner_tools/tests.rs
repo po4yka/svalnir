@@ -4,10 +4,11 @@
 //! and no test runs `simctl`, `docker`, or `brew`.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use svalnir_core::action::FileObjectType;
 use svalnir_core::process::Uid;
 use svalnir_core::rule::{DeletionMethod, LifecycleState, RuleMode, RuleRefusal, RuleRegistry};
 use svalnir_core::time::MonotonicNanos;
@@ -16,7 +17,7 @@ use tempfile::TempDir;
 use super::bplist::{Scalar, parse_dictionary};
 use super::{
     DeviceOutcome, DeviceState, DiskOutcome, KegOutcome, OwnerToolHost, PrefixOutcome,
-    RuntimeLocation, SimulatorLocations,
+    RuntimeLocation, RuntimeLocationOutcome, SimulatorInspection, SimulatorLocations,
 };
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
@@ -451,7 +452,9 @@ fn the_old_kegs_of_a_formula_are_attributed_and_the_current_keg_is_not() {
         ReclaimFigure::AllocatedUpperBound { .. }
     ));
     assert_eq!(*outcome("wget", "1.24"), KegOutcome::Current);
+    // Each keg of a pinned formula is pinned, the current one too.
     assert_eq!(*outcome("node", "20.1"), KegOutcome::Pinned);
+    assert_eq!(*outcome("node", "22.0"), KegOutcome::Pinned);
     assert_eq!(*outcome("jq", "1.6"), KegOutcome::CurrentVersionUnknown);
     assert_eq!(*outcome("jq", "1.7"), KegOutcome::CurrentVersionUnknown);
     assert_eq!(
@@ -516,4 +519,159 @@ fn a_cellar_that_is_a_symbolic_link_is_not_followed() {
         PrefixOutcome::Refused("root_not_directory")
     );
     assert_eq!(inspection.prefixes[0].kegs, []);
+}
+
+#[test]
+fn the_declarations_name_each_root_and_the_object_type_of_a_unit() {
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let rules = registry.owner_tools();
+    assert_eq!(rules.simulator().roots.len(), 3);
+    assert_eq!(
+        rules.container().exclusions.supported_object_types,
+        [FileObjectType::RegularFile]
+    );
+    assert_eq!(
+        rules.homebrew().exclusions.supported_object_types,
+        [FileObjectType::Directory]
+    );
+}
+
+fn inspect_simulator(home: &Home) -> SimulatorInspection {
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let evidence = processes(&[]);
+    registry.owner_tools().inspect_simulator(
+        home.host(&evidence),
+        &simulator_locations(home),
+        InspectionLimits::default(),
+        &CancellationToken::new(),
+        &WallScanClock,
+    )
+}
+
+/// Makes the directory at `path` not readable for the test, and readable
+/// again when the guard is dropped.
+struct Locked(PathBuf);
+
+impl Locked {
+    fn new(path: PathBuf) -> Self {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        drop(fs::set_permissions(
+            &self.0,
+            fs::Permissions::from_mode(0o755),
+        ));
+    }
+}
+
+#[test]
+fn a_runtime_location_that_is_a_link_or_not_readable_has_its_reason() {
+    let home = Home::new();
+    home.write("real/Runtimes/iOS 17.0.simruntime/Contents/Info.plist", b"");
+    fs::create_dir_all(home.path.join("system/Profiles")).unwrap();
+    symlink(
+        home.path.join("real/Runtimes"),
+        home.path.join("system/Profiles/Runtimes"),
+    )
+    .unwrap();
+    let inspection = inspect_simulator(&home);
+    assert_eq!(inspection.runtimes, []);
+    assert_eq!(
+        inspection.runtime_locations[0].outcome,
+        RuntimeLocationOutcome::Refused("location_not_directory")
+    );
+    assert_eq!(
+        inspection.runtime_locations[1].outcome,
+        RuntimeLocationOutcome::Absent
+    );
+    fs::create_dir_all(home.path.join("system/Volumes")).unwrap();
+    let _locked = Locked::new(home.path.join("system/Volumes"));
+    let inspection = inspect_simulator(&home);
+    assert_eq!(
+        inspection.runtime_locations[1].outcome,
+        RuntimeLocationOutcome::Refused("location_not_readable")
+    );
+}
+
+#[test]
+fn other_names_do_not_push_a_device_out_and_a_cut_list_is_marked() {
+    let home = Home::new();
+    let devices: &str = "Library/Developer/CoreSimulator/Devices";
+    for index in 0..600 {
+        home.write(&format!("{devices}/0-other-{index:04}"), b"");
+    }
+    home.write(
+        &format!("{devices}/FFFFFFFF-2222-3333-4444-555555555555/device.plist"),
+        device_plist("FFFFFFFF-2222-3333-4444-555555555555", 1).as_bytes(),
+    );
+    let inspection = inspect_simulator(&home);
+    assert_eq!(inspection.devices.len(), 1);
+    assert!(!inspection.devices_truncated);
+    for index in 0..512 {
+        fs::create_dir_all(
+            home.path
+                .join(devices)
+                .join(format!("{index:08X}-2222-3333-4444-555555555555")),
+        )
+        .unwrap();
+    }
+    let inspection = inspect_simulator(&home);
+    assert_eq!(inspection.devices.len(), 512);
+    assert!(inspection.devices_truncated);
+}
+
+#[test]
+fn a_device_plist_that_cannot_be_read_is_refused_and_not_a_layout() {
+    let home = Home::new();
+    let path: PathBuf = home.write(
+        &format!("Library/Developer/CoreSimulator/Devices/{UDID}/device.plist"),
+        device_plist(UDID, 1).as_bytes(),
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let inspection = inspect_simulator(&home);
+    assert_eq!(
+        inspection.devices[0].outcome,
+        DeviceOutcome::Refused {
+            reason: "device_plist_denied"
+        }
+    );
+}
+
+#[test]
+fn an_unknown_pin_state_and_a_cut_keg_list_are_reported() {
+    let home = Home::new();
+    let prefix: PathBuf = home.path.join("homebrew");
+    formula(&prefix, "wget", &["1.21", "1.24"], Some("1.24"));
+    let versions: Vec<String> = (0..70).map(|index| format!("1.{index}")).collect();
+    let versions: Vec<&str> = versions.iter().map(String::as_str).collect();
+    formula(&prefix, "many", &versions, Some("1.0"));
+    fs::create_dir_all(prefix.join("var/homebrew/pinned")).unwrap();
+    let locked = Locked::new(prefix.join("var/homebrew/pinned"));
+    let evidence = processes(&[]);
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let inspection = registry.owner_tools().inspect_homebrew(
+        home.host(&evidence),
+        std::slice::from_ref(&prefix),
+        InspectionLimits::default(),
+        &CancellationToken::new(),
+        &WallScanClock,
+    );
+    drop(locked);
+    let report = &inspection.prefixes[0];
+    assert_eq!(report.truncated_formulae, ["many"]);
+    let wget = report
+        .kegs
+        .iter()
+        .find(|keg| keg.formula == "wget" && keg.version == "1.21")
+        .unwrap();
+    assert_eq!(
+        wget.outcome,
+        KegOutcome::Refused {
+            reason: "pin_state_unknown"
+        }
+    );
 }

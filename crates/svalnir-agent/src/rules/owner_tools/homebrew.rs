@@ -41,8 +41,8 @@ const MAX_KEGS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
 pub enum PrefixOutcome {
-    /// The Cellar was read. `true` when the formula bound stopped the
-    /// reading.
+    /// The Cellar was read. `true` when the formula bound, the entry bound,
+    /// or a cancellation stopped the reading.
     Examined(bool),
     /// The prefix has no Cellar.
     Absent,
@@ -105,6 +105,9 @@ pub struct HomebrewPrefixReport {
     pub outcome: PrefixOutcome,
     /// The kegs of each formula with more than one keg.
     pub kegs: Vec<HomebrewKeg>,
+    /// The formulae whose kegs the inspection did not read in full: more
+    /// than 64 kegs, more entries than it reads, or a cancelled inspection.
+    pub truncated_formulae: Vec<String>,
 }
 
 /// The inspection of `homebrew.cleanup`.
@@ -120,29 +123,70 @@ pub struct HomebrewInspection {
     pub owner_workflow: &'static str,
 }
 
-/// The names of the entries of `path` that are directories of `owner`,
-/// with no symbolic link, sorted, at most `limit`. `None` when the
-/// directory cannot be read. The second value is `true` when the bound
-/// stopped the reading.
-fn directories(
-    path: &Path,
-    owner: svalnir_core::process::Uid,
-    limit: usize,
-) -> Option<(Vec<String>, bool)> {
-    let mut names: Vec<String> = fs::read_dir(path)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.'))
-        .filter(|name| {
-            lstat(&path.join(name))
-                .is_ok_and(|found| found.kind == ObjectKind::Directory && found.owner == owner)
-        })
-        .collect();
+/// The largest number of entries of one directory that the inspection
+/// reads.
+const MAX_READ: usize = 100_000;
+
+/// The names of the entries of `path` that do not start with `.`, sorted,
+/// at most `limit`, from at most [`MAX_READ`] entries. The second value is
+/// `true` when a bound cut the list. `None` when the directory cannot be
+/// read. The caller examines the kind and the owner of each name.
+fn names(path: &Path, limit: usize) -> Option<(Vec<String>, bool)> {
+    let mut read: usize = 0;
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(path).ok()?.take(MAX_READ) {
+        read += 1;
+        if let Some(name) = entry
+            .ok()
+            .and_then(|entry| entry.file_name().into_string().ok())
+            && !name.starts_with('.')
+        {
+            names.push(name);
+        }
+    }
     names.sort();
-    let truncated: bool = names.len() > limit;
+    let truncated: bool = read >= MAX_READ || names.len() > limit;
     names.truncate(limit);
     Some((names, truncated))
+}
+
+/// The kegs among `entries` of the formula directory `directory`, each with
+/// its refusal. Each keg is a directory of `principal` on the filesystem
+/// `device` of the Cellar; another one is reported as refused, not left
+/// out.
+fn kegs(
+    directory: &Path,
+    entries: Vec<String>,
+    principal: svalnir_core::process::Uid,
+    device: svalnir_core::file::DeviceNumber,
+) -> Vec<(String, Option<&'static str>)> {
+    entries
+        .into_iter()
+        .filter_map(|version| {
+            let found = lstat(&directory.join(&version)).ok()?;
+            if found.kind != ObjectKind::Directory {
+                return None;
+            }
+            let refusal: Option<&'static str> = if found.owner != principal {
+                Some("keg_owner")
+            } else if found.object.device != device {
+                Some("keg_device")
+            } else {
+                None
+            };
+            Some((version, refusal))
+        })
+        .collect()
+}
+
+/// Whether the formula `formula` of `prefix` is pinned. Only an absent
+/// entry means that it is not; another read error gives `None`.
+fn is_pinned(prefix: &Path, formula: &str) -> Option<bool> {
+    match lstat(&prefix.join("var/homebrew/pinned").join(formula)) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// The version that the link `PREFIX/opt/FORMULA` names, when it is a
@@ -197,6 +241,7 @@ impl OwnerToolRules {
                     prefix: prefix.clone(),
                     outcome: PrefixOutcome::Refused("root_locality_unknown"),
                     kegs: Vec::new(),
+                    truncated_formulae: Vec::new(),
                 },
             })
             .collect();
@@ -222,6 +267,7 @@ fn prefix_report(
         prefix: prefix.to_path_buf(),
         outcome: PrefixOutcome::Absent,
         kegs: Vec::new(),
+        truncated_formulae: Vec::new(),
     };
     let cellar: PathBuf = prefix.join("Cellar");
     if host.locations.of_text(&cellar) != ProtectionFact::NotProtected {
@@ -250,31 +296,51 @@ fn prefix_report(
         report.outcome = PrefixOutcome::Refused("root_owner");
         return report;
     }
-    let Some((formulae, truncated)) = directories(&cellar, host.principal, MAX_FORMULAE) else {
+    let Some((formulae, mut truncated)) = names(&cellar, MAX_FORMULAE) else {
         report.outcome = PrefixOutcome::Refused("root_not_readable");
         return report;
     };
     let processes: BuildProcesses = host.processes.build_processes(host.principal);
     for formula in formulae {
-        let Some((versions, _)) = directories(&cellar.join(&formula), host.principal, MAX_KEGS)
-        else {
+        if cancel.is_cancelled() {
+            truncated = true;
+            break;
+        }
+        let directory: PathBuf = cellar.join(&formula);
+        if !lstat(&directory).is_ok_and(|found| found.kind == ObjectKind::Directory) {
+            continue;
+        }
+        let Some((entries, cut)) = names(&directory, MAX_KEGS) else {
             continue;
         };
+        if cut {
+            report.truncated_formulae.push(formula.clone());
+        }
+        let versions: Vec<(String, Option<&'static str>)> =
+            kegs(&directory, entries, host.principal, root.object.device);
         // A formula with one keg has nothing for `brew cleanup`.
         if versions.len() < 2 {
             continue;
         }
-        let current: Option<String> =
-            current_version(prefix, &formula).filter(|version| versions.contains(version));
-        let pinned: bool = lstat(&prefix.join("var/homebrew/pinned").join(&formula)).is_ok();
-        for version in versions {
-            let path: PathBuf = cellar.join(&formula).join(&version);
-            let outcome: KegOutcome = if current.as_deref() == Some(version.as_str()) {
-                KegOutcome::Current
+        let current: Option<String> = current_version(prefix, &formula)
+            .filter(|version| versions.iter().any(|(known, _)| known == version));
+        let pinned: Option<bool> = is_pinned(prefix, &formula);
+        for (version, refusal) in versions {
+            let path: PathBuf = directory.join(&version);
+            // `brew cleanup` keeps each keg of a pinned formula, the current
+            // one too.
+            let outcome: KegOutcome = if let Some(reason) = refusal {
+                KegOutcome::Refused { reason }
+            } else if pinned == Some(true) {
+                KegOutcome::Pinned
+            } else if pinned.is_none() {
+                KegOutcome::Refused {
+                    reason: "pin_state_unknown",
+                }
             } else if current.is_none() {
                 KegOutcome::CurrentVersionUnknown
-            } else if pinned {
-                KegOutcome::Pinned
+            } else if current.as_deref() == Some(version.as_str()) {
+                KegOutcome::Current
             } else {
                 old_keg(host, &processes, &path, limits, cancel, clock)
             };

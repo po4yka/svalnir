@@ -654,3 +654,81 @@ fn the_build_process_names() {
         assert!(!is_build_process(name), "{name}");
     }
 }
+
+#[test]
+fn a_build_process_above_the_project_makes_the_activity_unknown() {
+    let home = Home::new();
+    // A monorepo with a package below its root.
+    home.write("Code/mono/package.json", b"{}");
+    home.write("Code/mono/.gitignore", b"node_modules/\n");
+    home.write("Code/mono/packages/app/package.json", b"{}");
+    home.repository("Code/mono");
+    home.write("Code/mono/node_modules/a/index.js", b"1;\n");
+    home.write("Code/mono/packages/app/node_modules/b/index.js", b"1;\n");
+    let app: PathBuf = home.path.join("Code/mono/packages/app/node_modules");
+    // `pnpm install -r` at the root of the monorepo, and `make -C` from
+    // the search root.
+    for directory in [home.path.join("Code/mono"), home.path.join("Code")] {
+        let evidence = inventory(vec![ProjectProcess {
+            executable: PathBuf::from("/opt/homebrew/bin/pnpm"),
+            working_directory: Some(directory.clone()),
+        }]);
+        let inspection: ProjectInspection = home.inspect(&evidence);
+        let report = unit(&inspection, &app);
+        assert_eq!(
+            refusal(report),
+            "activity_unknown",
+            "{}",
+            directory.display()
+        );
+        assert_eq!(
+            report.activity,
+            Some(ProjectActivity::Unknown {
+                reason: "build_process_above_project"
+            })
+        );
+    }
+    // A build process above the search root is not seen; that is a
+    // limit of the revision (docs/CLEANUP_RULES.md section 12).
+    let evidence = inventory(vec![ProjectProcess {
+        executable: PathBuf::from("/opt/homebrew/bin/npm"),
+        working_directory: Some(home.path.clone()),
+    }]);
+    let inspection: ProjectInspection = home.inspect(&evidence);
+    assert_eq!(
+        unit(&inspection, &app).activity,
+        Some(ProjectActivity::Inactive)
+    );
+}
+
+#[test]
+fn a_search_root_in_another_case_has_the_stored_names() {
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    // The temporary directory of a macOS host is on a volume that ignores
+    // case, as the default volume is.
+    assert!(
+        home.path.join("code").exists(),
+        "the test needs a volume that ignores case"
+    );
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let mut child: Child = build_process(&home, &project);
+    let inspection: ProjectInspection = registry.projects().inspect(
+        ProjectHost {
+            principal: home.principal,
+            locations: &home.locations,
+            user_exclusions: &[],
+            git: Ok(&home.git),
+            processes: &NativeProcessEvidence,
+        },
+        &SearchRoots::new(vec![PathBuf::from("code")]).unwrap(),
+        ProjectLimits::default(),
+        &CancellationToken::new(),
+        &WallScanClock,
+    );
+    drop(child.kill());
+    drop(child.wait());
+    assert_eq!(inspection.roots[0].path, Some(home.path.join("Code")));
+    let report = unit(&inspection, &project.join("node_modules"));
+    assert_eq!(refusal(report), "producer_active");
+}

@@ -446,3 +446,24 @@ fn the_entries_that_git_ignores_are_reported_apart_from_the_verdict() {
     );
     assert!(ignored.owner_workflow.contains("status --ignored"));
 }
+
+#[test]
+fn a_record_whose_commondir_names_another_directory_has_no_query() {
+    let home = Home::new();
+    home.repository();
+    home.worktree("moved");
+    let commondir: PathBuf = home.path.join("Code/repo/.git/worktrees/moved/commondir");
+    assert_eq!(fs::read(&commondir).unwrap(), b"../..\n");
+    fs::write(&commondir, b"/tmp/elsewhere\n").unwrap();
+    let inspection: WorktreeInspection = home.inspect();
+    let moved = worktree(&inspection, "moved");
+    assert_eq!(
+        moved.unique_commits,
+        Evidence::Unknown("commondir_not_matching")
+    );
+    assert_eq!(
+        moved.staged_changes,
+        Evidence::Unknown("commondir_not_matching")
+    );
+    assert_eq!(moved.verdict, WorktreeVerdict::NotKnown);
+}

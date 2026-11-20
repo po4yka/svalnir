@@ -427,7 +427,7 @@ These rules apply the contracts in [INTERFACES.md §14](docs/INTERFACES.md#14-gp
 
 ### Action states
 
-A control that changes state shows the state of its last request in a line below the control: a status pill and one sentence. The line has the label "{pill}: {sentence}". In a dense table row, such as the State column of History, the line shows at most two lines of the sentence, and a longer sentence ends with an ellipsis. The full line is the accessible label and the tooltip of the line, and the detail view of the row shows it in full, so that the keyboard reaches the full text through the Details button of the row.
+A control that changes state shows the state of its last request in a line below the control: a status pill and one sentence. The line has the label "{pill}: {sentence}". In a dense table row, such as the State column of History, the line shows at most two lines of the sentence, and a longer sentence ends with an ellipsis. The full line is the accessible label of the line in each case and its tooltip only when the sentence is cut, and the detail view of the row shows it in full, so that the keyboard reaches the full text through the Details button of the row.
 
 | State | Pill | Tone | Icon | Sentence |
 | --- | --- | --- | --- | --- |

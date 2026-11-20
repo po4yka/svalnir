@@ -9,10 +9,14 @@
 )]
 
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Pixels, Point, TestAppContext, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, IntoElement, ParentElement as _,
+    Pixels, Point, Render, Styled as _, TestAppContext, Window, WindowOptions, div, px, size,
     test::TestWindowExt as _,
 };
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use svalnir_gui::{
     actions::{ActionState, Slot, fixture::ActionScript},
     app::open_main_window,
@@ -25,6 +29,8 @@ use svalnir_gui::{
         nav::{self, Screen},
         window::MainWindow,
     },
+    theme::tokens::Tokens,
+    ui::action_status::action_status_short,
 };
 
 /// Opens the window with `source` and shows `screen`.
@@ -81,6 +87,17 @@ fn bounds_of(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> Opti
     })
     .unwrap();
     found
+}
+
+/// Moves the pointer over `id` and waits longer than the show delay of a
+/// tooltip. Gives the accessible label of the tooltip of `id`, or `None`
+/// when no tooltip shows.
+fn tooltip_of(handle: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> Option<String> {
+    cx.update_window(handle, |_, window, cx| window.hover(id.to_owned(), cx))
+        .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    label(handle, &format!("{id}-tooltip"), cx)
 }
 
 fn state_of(
@@ -580,6 +597,12 @@ fn the_state_line_of_a_cancel_stays_in_the_state_column(cx: &mut TestAppContext)
         label(handle, "history-action-op_fixture_0002", cx).as_deref(),
         Some(full.as_str())
     );
+    // The pointer path: the sentence is cut, so the line has a tooltip with
+    // the full text.
+    assert_eq!(
+        tooltip_of(handle, "history-action-op_fixture_0002", cx).as_deref(),
+        Some(full.as_str())
+    );
     // The keyboard path to the full text: the Details button of the row.
     assert_eq!(
         label(handle, "history-detail-action-op_fixture_0002", cx),
@@ -590,4 +613,65 @@ fn the_state_line_of_a_cancel_stays_in_the_state_column(cx: &mut TestAppContext)
         label(handle, "history-detail-action-op_fixture_0002", cx).as_deref(),
         Some(full.as_str())
     );
+}
+
+/// Two short state lines in cells of the same width: one sentence fits in
+/// two lines, the other does not.
+struct ShortLines;
+
+/// The width of a cell of [`ShortLines`].
+const CELL_WIDTH: f32 = 240.0;
+
+/// A sentence that fits in two lines of [`CELL_WIDTH`].
+const FITS: &str = "Done.";
+
+/// A sentence that needs more than two lines of [`CELL_WIDTH`].
+const CUT: &str = "The stop fence is recorded. The agent stops the operation at the next safe point and records the result in the journal.";
+
+impl Render for ShortLines {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let tokens: Tokens = *Tokens::for_dark(false);
+        let now: SystemTime = SystemTime::UNIX_EPOCH;
+        let line = |id: &'static str, detail: &str| {
+            div().w(px(CELL_WIDTH)).child(action_status_short(
+                id,
+                &ActionState::Accepted {
+                    detail: detail.to_owned(),
+                },
+                now,
+                &tokens,
+            ))
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(40.0))
+            .child(line("fits", FITS))
+            .child(line("cut", CUT))
+    }
+}
+
+/// The tooltip of a short state line shows only when the line cuts the
+/// sentence. The accessible label has the full text in each case.
+#[gpui_kit::test]
+fn a_short_line_has_a_tooltip_only_when_its_sentence_is_cut(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let window = cx.update(|cx| {
+        cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| ShortLines))
+            .expect("open test window")
+    });
+    let handle: AnyWindowHandle = window.into();
+    cx.run_until_parked();
+    let fits: String = format!("Accepted: {FITS}");
+    let cut: String = format!("Accepted: {CUT}");
+    assert_eq!(label(handle, "fits", cx).as_deref(), Some(fits.as_str()));
+    assert_eq!(label(handle, "cut", cx).as_deref(), Some(cut.as_str()));
+    let cut_sentence = bounds_of(handle, "cut-sentence", cx).expect("sentence");
+    assert!(
+        cut_sentence.size.height <= px(42.0),
+        "the sentence is not cut: {cut_sentence:?}"
+    );
+    assert_eq!(tooltip_of(handle, "fits", cx), None);
+    assert_eq!(tooltip_of(handle, "cut", cx).as_deref(), Some(cut.as_str()));
 }

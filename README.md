@@ -148,7 +148,7 @@ The default scan remains within the selected filesystem boundary. Crossing mount
 | Trashed size | Content moved to Trash; not a claim that disk capacity was freed |
 | Observed capacity change | Before/after change in available capacity, with timestamp and measurement source |
 
-Hard links, APFS clones, snapshots, compression, sparse files, and open file descriptors complicate reclamation estimates. Summing allocated sizes does not establish how much unique storage can be recovered. Exact exclusive allocation is allowed to be unavailable.
+Hard links, APFS clones, snapshots, compression, sparse files, and open file descriptors complicate reclamation estimates. Summing allocated sizes does not establish how much unique storage can be recovered. Exact exclusive allocation is allowed to be unavailable. On APFS, the scanner reports the private allocated bytes of a unit: the sum of the bytes that only each file uses. This is a lower figure, and the reclaim estimate uses only it. The shared blocks of clone families that are complete in the unit are a separate figure that is not a reclaim figure ([RESOURCE_MODEL.md](docs/RESOURCE_MODEL.md) section 8).
 
 The baseline filesystem sample uses the appropriate `statfs` fields, including `f_bavail * f_bsize` for available bytes under that interface's semantics. Foundation's capacity estimates for important and opportunistic usage are additional, explicitly labeled signals. They must not be silently presented as already-free physical space. See [statfs][statfs] and [Apple's capacity guidance][capacity].
 

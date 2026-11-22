@@ -198,12 +198,21 @@ fn executable_path(pid: Pid) -> Result<LosslessPath, QueryFailure> {
 }
 
 fn file_evidence(path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
-    let metadata: std::fs::Metadata =
-        std::fs::metadata(path.to_path_buf()).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => QueryFailure::Gone,
-            std::io::ErrorKind::PermissionDenied => QueryFailure::PermissionDenied,
-            _ => QueryFailure::Failed(error.raw_os_error().unwrap_or(0)),
-        })?;
+    object_of(std::fs::metadata(path.to_path_buf()))
+}
+
+fn link_evidence(path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+    object_of(std::fs::symlink_metadata(path.to_path_buf()))
+}
+
+fn object_of(
+    metadata: std::io::Result<std::fs::Metadata>,
+) -> Result<FileObjectEvidence, QueryFailure> {
+    let metadata: std::fs::Metadata = metadata.map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => QueryFailure::Gone,
+        std::io::ErrorKind::PermissionDenied => QueryFailure::PermissionDenied,
+        _ => QueryFailure::Failed(error.raw_os_error().unwrap_or(0)),
+    })?;
     // The standard library widens the signed 32-bit `dev_t` to `u64`. The
     // low 32 bits are the native value.
     let device_bits: u32 = u32::try_from(metadata.dev() & u64::from(u32::MAX))
@@ -1244,6 +1253,10 @@ impl ProcessSource for DarwinProcessSource {
 
     fn file_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
         file_evidence(path)
+    }
+
+    fn link_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        link_evidence(path)
     }
 
     fn usage(&self, pid: Pid) -> Result<RawUsage, QueryFailure> {

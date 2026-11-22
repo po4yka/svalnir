@@ -275,6 +275,20 @@ pub trait ProcessSource {
     /// attributes.
     fn file_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure>;
 
+    /// The file object at `path` now, with no resolution of a symbolic
+    /// link at its end (`lstat`).
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the collector cannot read the file
+    /// attributes.
+    fn link_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        let _ = path;
+        Err(QueryFailure::Unsupported)
+    }
+
     /// The resource use of the process that has this PID now.
     ///
     /// # Errors

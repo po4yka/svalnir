@@ -191,6 +191,13 @@ impl ProcessSource for Table {
         Ok(object_of(path.as_bytes()))
     }
 
+    /// The synthetic link identity: a different object than the target.
+    fn link_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        Ok(object_of(
+            format!("lstat:{}", path.to_path_buf().display()).as_bytes(),
+        ))
+    }
+
     fn usage(&self, _pid: Pid) -> Result<RawUsage, QueryFailure> {
         Err(QueryFailure::Unsupported)
     }
@@ -468,7 +475,9 @@ fn a_path_from_the_kernel_is_evidence_only_when_its_identity_matches() {
     };
     // A path that is not complete: the file at the text is a different
     // object, or there is none.
-    let mut truncated: RawVnode = vn("/Users/u/x/y");
+    // A path long enough to be cut by the kernel.
+    let long: String = format!("/Users/u/{}", "d/".repeat(260));
+    let mut truncated: RawVnode = vn(&long);
     truncated.vnode.object = object_of(b"the real deep file");
     let inventory = unverified(truncated.clone());
     assert_eq!(
@@ -485,6 +494,18 @@ fn a_path_from_the_kernel_is_evidence_only_when_its_identity_matches() {
     // A vnode with no link is in no unit.
     nameless.vnode.links = 0;
     let inventory = unverified(nameless);
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
+    // A short path is complete text: it is evidence with no file query,
+    // also when the file there is a different object now.
+    let mut short: RawVnode = vn("/private/var/db/analyticsd/events.allowlist");
+    short.vnode.object = object_of(b"not readable by the user");
+    let inventory = unverified(short);
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
+    // A long path whose file matches without the resolution of a final
+    // symbolic link is verified.
+    let mut linked: RawVnode = vn(&long);
+    linked.vnode.object = object_of(format!("lstat:{long}").as_bytes());
+    let inventory = unverified(linked);
     assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
     // A path in the scope is a use with no other check.
     let mut inside: RawVnode = vn("/Users/u/app/node_modules/a");
@@ -520,7 +541,8 @@ fn an_executable_with_no_current_name_is_known_only_when_the_rest_is_verified() 
     assert_eq!(collect(&Table::new(vec![failed])).unknown.len(), 1);
     // A path that is not verified keeps it unknown.
     let mut moved: Entry = replaced;
-    let mut vnode: RawVnode = vn("/Applications/A.app/Contents/MacOS/A");
+    let long: String = format!("/Applications/A.app/{}", "d/".repeat(260));
+    let mut vnode: RawVnode = vn(&long);
     vnode.vnode.object = object_of(b"the old executable");
     moved.mapped = Ok(RawPaths {
         paths: vec![vnode],

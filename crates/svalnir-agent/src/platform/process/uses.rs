@@ -393,20 +393,38 @@ const MAX_VERIFIED_PATHS: usize = 65_536;
 /// The file identity of each path that an inventory verified.
 struct Verifier<'a, S: ProcessSource + ?Sized> {
     source: &'a S,
-    known: HashMap<LosslessPath, Option<FileObjectEvidence>>,
+    known: HashMap<LosslessPath, Vec<FileObjectEvidence>>,
 }
 
+/// The shortest path from the kernel that is verified. A cut path fills
+/// the buffer of `MAXPATHLEN` (1024) bytes, so a shorter path than half of
+/// it is complete (`docs/CLEANUP_RULES.md` section 6).
+pub(super) const MIN_VERIFIED_PATH_BYTES: usize = 512;
+
 impl<S: ProcessSource + ?Sized> Verifier<'_, S> {
-    /// Whether the file at `path` now has the identity `object`.
+    /// Whether the path from the kernel is evidence for the vnode
+    /// `object`: a complete path, or a longer path at which the file now
+    /// has that identity, with or without the resolution of a symbolic link
+    /// at its end.
     fn matches(&mut self, path: &LosslessPath, object: FileObjectEvidence) -> bool {
-        if let Some(found) = self.known.get(path) {
-            return *found == Some(object);
+        if path.as_bytes().len() < MIN_VERIFIED_PATH_BYTES {
+            return true;
         }
-        let found: Option<FileObjectEvidence> = self.source.file_evidence(path).ok();
+        if let Some(found) = self.known.get(path) {
+            return found.contains(&object);
+        }
+        let found: Vec<FileObjectEvidence> = [
+            self.source.file_evidence(path).ok(),
+            self.source.link_evidence(path).ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let result: bool = found.contains(&object);
         if self.known.len() < MAX_VERIFIED_PATHS {
             self.known.insert(path.clone(), found);
         }
-        found == Some(object)
+        result
     }
 }
 

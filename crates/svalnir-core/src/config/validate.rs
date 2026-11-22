@@ -932,6 +932,8 @@ fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cl
             projects_table.boolean(context, "paseo_agents"),
             defaults.projects.paseo_agents,
         ),
+        search_roots: super::layout::read_search_roots(context, &mut projects_table)
+            .unwrap_or_else(|| defaults.projects.search_roots.clone()),
         layouts: super::layout::read_layouts(context, &mut projects_table),
     };
     projects_table.finish(context);

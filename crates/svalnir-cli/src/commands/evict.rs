@@ -16,6 +16,10 @@
 use serde::Serialize;
 use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::protection::ProtectedLocations;
+use svalnir_agent::rules::projects::{
+    GitHeadActivity, MiseDiscovery, PROJECT_RULE_ID, ProjectLimits, ProjectRequest,
+    SearchRootReport,
+};
 use svalnir_agent::rules::{
     DiscoveryCompletion, DiscoveryHost, DiscoveryLimits, EvictionCandidate, EvictionDiscovery,
     EvictionRequest, ReviewedRules, RootResult, SkipReason,
@@ -23,6 +27,7 @@ use svalnir_agent::rules::{
 use svalnir_agent::scan::CancellationToken;
 use svalnir_core::action::WorkCharge;
 use svalnir_core::authority::AuthorityBinding;
+use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::id::{PlanId, RuleId, StepId, TargetId};
 use svalnir_core::plan::{
@@ -33,6 +38,7 @@ use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
 use svalnir_core::rule::{Rule, RuleMode, RuleRef, RuleRefusal, RuleRegistry as _};
 
 use super::clean::{self, PlanView};
+use super::inspect::{self, ProjectRoots, ProjectSources};
 use super::plan_store::{self, PlanDocument, RootRecord};
 use super::session::{self, ActiveConfig, Now, journal_error};
 use super::{CommandFailure, Invocation};
@@ -142,6 +148,18 @@ pub(crate) struct DiscoveryView {
     /// The number of blocked candidates that are not in `blocked`.
     pub(crate) blocked_omitted: usize,
     pub(crate) roots: Vec<RootView>,
+    /// For `project.dependency-directory`: each root of the request, with
+    /// its kind (`search` or `project`) and its source (`configuration`,
+    /// `argument`, or `mise` with the configuration file).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_roots: Option<Vec<SearchRootReport>>,
+    /// For `project.dependency-directory`: the read of the tracked-configs
+    /// directory of mise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mise: Option<MiseDiscovery>,
+    /// The candidates that `--min-size` leaves out, to a bound.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) below_minimum_size: Vec<LosslessPath>,
 }
 
 impl DiscoveryView {
@@ -214,7 +232,30 @@ impl DiscoveryView {
                     }
                 })
                 .collect(),
+            project_roots: None,
+            mise: None,
+            below_minimum_size: Vec::new(),
         }
+    }
+
+    /// The view with the roots of `project.dependency-directory`, the read
+    /// of mise, and the candidates that `--min-size` leaves out.
+    fn with_projects(
+        mut self,
+        discovery: &EvictionDiscovery,
+        mise: Option<MiseDiscovery>,
+        below: &[EvictionCandidate],
+    ) -> Self {
+        if let Some(mise) = mise {
+            self.mise = Some(mise);
+            self.project_roots = Some(discovery.project_roots.clone());
+        }
+        self.below_minimum_size = below
+            .iter()
+            .take(SKIPPED_LIMIT)
+            .map(|candidate| candidate.candidate.candidate.path.clone())
+            .collect();
+        self
     }
 
     pub(crate) fn render(&self, out: &mut String) {
@@ -339,6 +380,7 @@ fn discover(
     rule: &Rule,
     host: &DiscoveryHost,
     environment: &Environment,
+    projects: Option<&ProjectRequest<'_>>,
 ) -> EvictionDiscovery {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -374,10 +416,129 @@ fn discover(
                 known: None,
                 limits: DiscoveryLimits::default(),
                 cancel: &cancel,
+                projects,
             },
             evidence.as_ref(),
         )
     })
+}
+
+/// The roots of the request of `project.dependency-directory`: the
+/// configuration, `--root`, and mise. `None` for each other rule.
+///
+/// # Errors
+///
+/// Returns the error of [`inspect::project_roots`], or `no_search_roots`
+/// when the request has no root.
+fn request_roots(
+    arguments: &CleanPlanArgs,
+    environment: &Environment,
+    rule: &Rule,
+    config: &ValidatedConfig,
+    locations: &ProtectedLocations,
+) -> Result<Option<ProjectRoots>, ErrorBody> {
+    if rule.reference.id.as_str() != PROJECT_RULE_ID {
+        return Ok(None);
+    }
+    let roots: ProjectRoots =
+        inspect::project_roots(environment, config, &arguments.projects, locations, true)?;
+    if roots.roots.is_empty() {
+        return Err(inspect::no_search_roots());
+    }
+    Ok(Some(roots))
+}
+
+/// The inputs of the discovery of `project.dependency-directory`.
+struct DiscoveryOptions<'a> {
+    config: &'a ValidatedConfig,
+    roots: Option<&'a ProjectRoots>,
+    include_active: bool,
+}
+
+/// [`discover`] with the request of `project.dependency-directory` when
+/// `options` has its roots.
+fn discover_with_roots(
+    registry: &ReviewedRules,
+    rule: &Rule,
+    host: &DiscoveryHost,
+    environment: &Environment,
+    options: &DiscoveryOptions<'_>,
+) -> EvictionDiscovery {
+    let sources: ProjectSources =
+        ProjectSources::new(options.config, host.locations.home_directory());
+    let head: GitHeadActivity<'_> = GitHeadActivity::new(sources.git());
+    let request: Option<ProjectRequest<'_>> = options.roots.map(|roots| ProjectRequest {
+        roots: &roots.roots,
+        git: sources.git(),
+        recency: sources.recency(&head),
+        layouts: &options.config.cleanup().projects.layouts,
+        include_active: options.include_active,
+        limits: ProjectLimits::default(),
+    });
+    discover(registry, rule, host, environment, request.as_ref())
+}
+
+/// The inputs of the plan builder beside the entries.
+struct PlanInputs<'a> {
+    plan_id: PlanId,
+    policy_revision: svalnir_core::id::PolicyRevisionId,
+    config: &'a ValidatedConfig,
+    now: &'a Now,
+    locations: &'a ProtectedLocations,
+}
+
+/// The plan of `entries` for a manual eviction under `rule`.
+///
+/// # Errors
+///
+/// Returns the error of the plan builder.
+fn build_outcome(
+    registry: &ReviewedRules,
+    rule: &Rule,
+    entries: &[CleanupEntry],
+    preset: Option<&SelectionPreset>,
+    inputs: &PlanInputs<'_>,
+) -> Result<PlanOutcome, ErrorBody> {
+    let home: Option<LosslessPath> = inputs
+        .locations
+        .home_directory()
+        .and_then(|home| LosslessPath::from_path(home).ok());
+    let lifetime: Nanoseconds = manual_plan_lifetime(inputs.config)
+        .ok_or_else(|| clean::plan_error(&PlanBuildError::Lifetime))?;
+    let context = PlanContext {
+        plan_id: inputs.plan_id.clone(),
+        principal: session::principal(),
+        // A manual plan has no action grant: its authority is the approval
+        // that is bound to the plan.
+        authority: AuthorityBinding {
+            policy_revision: inputs.policy_revision.clone(),
+            action_grants: Vec::new(),
+            privilege_grant: None,
+        },
+        clock: &inputs.now.clock,
+        created_wall: inputs.now.wall,
+        lifetime,
+        protections: inputs.config.protections(),
+        home_directory: home.as_ref(),
+    };
+    let selected: Result<&Rule, RuleRefusal> = registry.lookup(&rule.reference);
+    let request = CleanupRequest {
+        mode: ModeSelection::Evict { rule: selected },
+        entries,
+        preset,
+        // The builder charges no more than one pass of the rule, and the
+        // rule gives the ceiling of one candidate.
+        limits: CleanupLimits {
+            plan: rule.budget.per_pass,
+            batch: WorkCharge::new(
+                rule.budget.per_pass.work_bytes.max(Bytes::new(1)),
+                rule.budget.per_pass.items.max(EntryCount::new(1)),
+            ),
+            execution_deadline: clean::EXECUTION_DEADLINE,
+            verification_window: clean::VERIFICATION_WINDOW,
+        },
+    };
+    build_cleanup_plan(&context, &request).map_err(|error| clean::plan_error(&error))
 }
 
 /// The entries of the plan builder for the candidates of a discovery.
@@ -449,56 +610,51 @@ pub(crate) fn plan(
     );
     let discovery_host: DiscoveryHost =
         DiscoveryHost::manual(session::current_uid(), locations.clone(), &config);
-    let discovery: EvictionDiscovery = discover(&registry, rule, &discovery_host, environment);
+    let project_roots: Option<ProjectRoots> =
+        request_roots(arguments, environment, rule, &config, &locations)?;
+    let discovery: EvictionDiscovery = discover_with_roots(
+        &registry,
+        rule,
+        &discovery_host,
+        environment,
+        &DiscoveryOptions {
+            config: &config,
+            roots: project_roots.as_ref(),
+            include_active: arguments.include_active,
+        },
+    );
     // An interrupted discovery has a part of the candidates. No plan is
     // made from a part: the result has the discovery and no target.
     let interrupted: bool = environment.interrupt.is_requested();
 
+    // `--min-size` only filters: a candidate whose estimate is smaller is
+    // not given to the plan builder, and the result names it.
+    let (selected, below_minimum): (Vec<EvictionCandidate>, Vec<EvictionCandidate>) =
+        discovery.candidates.iter().cloned().partition(|candidate| {
+            arguments
+                .min_size
+                .is_none_or(|minimum| candidate.discovered.measurement.estimate.bytes >= minimum)
+        });
     let plan_text: String = session::new_id("plan");
     let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
     let entries: Vec<CleanupEntry> = if interrupted {
         Vec::new()
     } else {
-        entries(&discovery.candidates, &plan_text)?
+        entries(&selected, &plan_text)?
     };
-    let home: Option<LosslessPath> = locations
-        .home_directory()
-        .and_then(|home| LosslessPath::from_path(home).ok());
-    let lifetime: Nanoseconds = manual_plan_lifetime(&config)
-        .ok_or_else(|| clean::plan_error(&PlanBuildError::Lifetime))?;
-    let context = PlanContext {
-        plan_id: plan_id.clone(),
-        principal: session::principal(),
-        authority: AuthorityBinding {
+    let outcome: PlanOutcome = build_outcome(
+        &registry,
+        rule,
+        &entries,
+        preset.as_ref(),
+        &PlanInputs {
+            plan_id: plan_id.clone(),
             policy_revision: active.revision.revision_id.clone(),
-            action_grants: Vec::new(),
-            privilege_grant: None,
+            config: &config,
+            now: &now,
+            locations: &locations,
         },
-        clock: &now.clock,
-        created_wall: now.wall,
-        lifetime,
-        protections: config.protections(),
-        home_directory: home.as_ref(),
-    };
-    let selected: Result<&Rule, RuleRefusal> = registry.lookup(&rule.reference);
-    let request = CleanupRequest {
-        mode: ModeSelection::Evict { rule: selected },
-        entries: &entries,
-        preset: preset.as_ref(),
-        // The builder charges no more than one pass of the rule, and the
-        // rule gives the ceiling of one candidate.
-        limits: CleanupLimits {
-            plan: rule.budget.per_pass,
-            batch: WorkCharge::new(
-                rule.budget.per_pass.work_bytes.max(Bytes::new(1)),
-                rule.budget.per_pass.items.max(EntryCount::new(1)),
-            ),
-            execution_deadline: clean::EXECUTION_DEADLINE,
-            verification_window: clean::VERIFICATION_WINDOW,
-        },
-    };
-    let outcome: PlanOutcome =
-        build_cleanup_plan(&context, &request).map_err(|error| clean::plan_error(&error))?;
+    )?;
     let roots: Vec<RootRecord> = root_records(&discovery, &outcome);
     let has_plan: bool = outcome.plan.is_some();
     if let Some(plan) = &outcome.plan {
@@ -520,7 +676,13 @@ pub(crate) fn plan(
         cleanup_roots: roots.into_iter().map(|root| root.path).collect(),
         has_plan_document: has_plan,
         plan_document: if has_plan { "used" } else { "absent" },
-        discovery: Some(DiscoveryView::new(rule.reference.clone(), &discovery)),
+        discovery: Some(
+            DiscoveryView::new(rule.reference.clone(), &discovery).with_projects(
+                &discovery,
+                project_roots.map(|roots| roots.mise),
+                &below_minimum,
+            ),
+        ),
         repository_warnings: Vec::new(),
         note: if interrupted {
             INTERRUPTED_NOTE

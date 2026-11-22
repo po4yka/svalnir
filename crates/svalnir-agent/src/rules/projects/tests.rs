@@ -110,8 +110,8 @@ pub(super) fn no_recency() -> RecencyHost<'static> {
 pub(super) struct Home {
     _directory: TempDir,
     pub(super) path: PathBuf,
-    locations: ProtectedLocations,
-    principal: Uid,
+    pub(super) locations: ProtectedLocations,
+    pub(super) principal: Uid,
     pub(super) git: GitTool,
 }
 
@@ -288,11 +288,12 @@ pub(super) fn refusal(report: &ProjectUnitReport) -> &'static str {
 // ---------------------------------------------------------------------
 
 #[test]
-fn the_rule_is_registered_proposed_with_the_inspection_mode_only() {
+fn the_rule_is_registered_proposed_with_no_automatic_mode() {
     let registry: ReviewedRules = ReviewedRules::new().unwrap();
     let rule = registry.projects().rule();
     assert_eq!(rule.reference.id.as_str(), "project.dependency-directory");
-    assert_eq!(rule.modes, [RuleMode::Inspection]);
+    assert_eq!(rule.reference.revision.as_str(), "r3");
+    assert_eq!(rule.modes, [RuleMode::Inspection, RuleMode::ManualEviction]);
     let layouts: Vec<&str> = rule
         .layouts
         .iter()
@@ -341,13 +342,23 @@ fn the_rule_is_registered_proposed_with_the_inspection_mode_only() {
 }
 
 #[test]
-fn a_fixture_lifecycle_does_not_change_the_rule() {
+fn a_fixture_lifecycle_gives_the_rule_a_manual_state_at_most() {
     for state in [manual_action_validated(), automatic_eviction_validated()] {
         let registry: ReviewedRules = ReviewedRules::with_fixture_lifecycle(&state).unwrap();
-        for layout in &registry.projects().rule().layouts {
-            assert_eq!(layout.lifecycle, LifecycleState::Proposed);
-            assert!(!layout.lifecycle.permits(&RuleMode::ManualEviction));
-            assert!(!layout.lifecycle.permits(&RuleMode::AutomaticEviction));
+        let rule = registry.projects().rule();
+        for layout in &rule.layouts {
+            assert_eq!(layout.lifecycle, manual_action_validated());
+            assert!(layout.permits(&RuleMode::ManualEviction));
+            assert!(!layout.permits(&RuleMode::AutomaticEviction));
+            assert!(
+                registry
+                    .resolve(
+                        &rule.reference,
+                        &layout.layout,
+                        &RuleMode::AutomaticEviction
+                    )
+                    .is_err()
+            );
         }
     }
 }
@@ -362,10 +373,7 @@ fn a_search_root_is_a_plain_path_below_the_home_directory() {
     }
     assert!(SearchRoots::new(vec![PathBuf::from("Code"), PathBuf::from("Code")]).is_err());
     assert_eq!(SearchRoots::new(vec![PathBuf::from("Code"); 17]), Err(None));
-    assert_eq!(
-        SearchRoots::new(Vec::new()).unwrap().paths(),
-        &[] as &[PathBuf]
-    );
+    assert!(SearchRoots::new(Vec::new()).unwrap().is_empty());
 }
 
 #[test]

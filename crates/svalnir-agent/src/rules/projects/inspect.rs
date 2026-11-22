@@ -51,16 +51,60 @@ use crate::scan::{CancellationToken, ScanClock};
 /// The largest number of search roots of one inspection.
 pub const MAX_SEARCH_ROOTS: usize = 16;
 
+/// The largest number of project roots of one inspection, for example the
+/// project roots that mise records.
+pub const MAX_PROJECT_ROOTS: usize = 256;
+
 /// The largest output of a Git query of this rule, in bytes.
 const MAX_GIT_OUTPUT: usize = 4 * 1024;
 
-/// The directories that the user names for the rule, each relative to the
-/// home directory.
+/// How the inspection examines a root of its request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKind {
+    /// A search root: the walk reads the directories below it.
+    Search,
+    /// A project directory: the inspection examines the units of that
+    /// directory only, and the walk reads no directory below it.
+    Project,
+}
+
+/// Where a root of a request comes from. The report of each root has it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RootSource {
+    /// The caller of the library function.
+    Caller,
+    /// `[cleanup.projects].search_roots` of the configuration.
+    Configuration,
+    /// A `--root` argument of the command.
+    Argument,
+    /// A configuration file that mise records in its tracked-configs
+    /// directory. The path is the target of the link that mise made.
+    Mise {
+        /// The configuration file.
+        config: PathBuf,
+    },
+}
+
+/// One root of a request, relative to the home directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchRoots(Vec<PathBuf>);
+pub struct SearchRootEntry {
+    /// The path, relative to the home directory.
+    pub relative: PathBuf,
+    /// How the inspection examines the root.
+    pub kind: RootKind,
+    /// Where the root comes from.
+    pub source: RootSource,
+}
+
+/// The roots of one request, each relative to the home directory: the
+/// search roots, then the project roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRoots(Vec<SearchRootEntry>);
 
 impl SearchRoots {
-    /// The search roots `relative`.
+    /// The search roots `relative`, from the caller.
     ///
     /// # Errors
     ///
@@ -76,13 +120,157 @@ impl SearchRoots {
                 return Err(Some(path.clone()));
             }
         }
-        Ok(Self(relative))
+        Ok(Self(
+            relative
+                .into_iter()
+                .map(|relative| SearchRootEntry {
+                    relative,
+                    kind: RootKind::Search,
+                    source: RootSource::Caller,
+                })
+                .collect(),
+        ))
     }
 
-    /// The search roots, relative to the home directory.
+    /// The roots of `entries`, in their sequence, with the search roots
+    /// before the project roots.
+    ///
+    /// A root with the path of an earlier root of the same kind is left out,
+    /// and so is a project root that is a search root or is below one: the
+    /// walk of the search root examines it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first path that is not a plain relative path, or `None`
+    /// when the list has more than [`MAX_SEARCH_ROOTS`] search roots or
+    /// more than [`MAX_PROJECT_ROOTS`] project roots after the removals.
+    pub fn with_entries(entries: Vec<SearchRootEntry>) -> Result<Self, Option<PathBuf>> {
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| !is_plain_relative(&entry.relative))
+        {
+            return Err(Some(entry.relative.clone()));
+        }
+        let (search, projects): (Vec<SearchRootEntry>, Vec<SearchRootEntry>) = entries
+            .into_iter()
+            .partition(|entry| entry.kind == RootKind::Search);
+        let mut kept: Vec<SearchRootEntry> = Vec::new();
+        for entry in search {
+            if !kept.iter().any(|known| known.relative == entry.relative) {
+                kept.push(entry);
+            }
+        }
+        let searches: usize = kept.len();
+        for entry in projects {
+            let covered: bool = kept.iter().any(|known| {
+                (known.kind == RootKind::Search && entry.relative.starts_with(&known.relative))
+                    || known.relative == entry.relative
+            });
+            if !covered {
+                kept.push(entry);
+            }
+        }
+        if searches > MAX_SEARCH_ROOTS || kept.len() - searches > MAX_PROJECT_ROOTS {
+            return Err(None);
+        }
+        Ok(Self(kept))
+    }
+
+    /// The roots, in their sequence.
     #[must_use]
-    pub fn paths(&self) -> &[PathBuf] {
+    pub fn entries(&self) -> &[SearchRootEntry] {
         &self.0
+    }
+
+    /// Whether the request has no root.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Why a root that the user names on the command line is not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentRootError {
+    /// The path is not absolute.
+    NotAbsolute,
+    /// The path is not below the home directory, or it is the home
+    /// directory.
+    NotBelowHome,
+    /// The path does not exist.
+    NotFound,
+    /// The object at the path is not a directory. A symbolic link is not a
+    /// directory.
+    NotDirectory,
+}
+
+impl ArgumentRootError {
+    /// The stable name of the error.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAbsolute => "search_root_not_absolute",
+            Self::NotBelowHome => "search_root_not_below_home",
+            Self::NotFound => "search_root_not_found",
+            Self::NotDirectory => "search_root_not_directory",
+        }
+    }
+}
+
+/// The path `path` with each `.` component removed and each `..` component
+/// applied to the component before it, with no call on the filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut result: PathBuf = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other),
+        }
+    }
+    result
+}
+
+/// The search root of a `--root PATH` argument, relative to the home
+/// directory `home` (with its symbolic links resolved).
+///
+/// `path` is absolute: the caller resolved a relative argument against the
+/// invocation directory. The `.` and `..` components are applied to the
+/// text. A path whose text is not below `home` is compared again in its
+/// resolved form, so that `/var` and `/private/var` name one directory.
+/// The root must be a directory below the home directory; the walk then
+/// makes each check of a search root (`docs/CLEANUP_RULES.md` section 4).
+///
+/// # Errors
+///
+/// Returns an [`ArgumentRootError`].
+pub fn argument_root(path: &Path, home: &Path) -> Result<PathBuf, ArgumentRootError> {
+    if !path.is_absolute() {
+        return Err(ArgumentRootError::NotAbsolute);
+    }
+    let mut absolute: PathBuf = lexical(path);
+    if !absolute.starts_with(home) {
+        absolute = match fs::canonicalize(&absolute) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ArgumentRootError::NotFound);
+            }
+            Err(_) => return Err(ArgumentRootError::NotBelowHome),
+        };
+    }
+    let relative: PathBuf = match absolute.strip_prefix(home) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        _ => return Err(ArgumentRootError::NotBelowHome),
+    };
+    match fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.is_dir() => Ok(relative),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(ArgumentRootError::NotFound),
+        // A symbolic link, another kind of object, or an object that cannot
+        // be read.
+        Ok(_) | Err(_) => Err(ArgumentRootError::NotDirectory),
     }
 }
 
@@ -179,10 +367,29 @@ pub struct SearchRootReport {
     pub relative: PathBuf,
     /// The path, when the home directory is known.
     pub path: Option<PathBuf>,
+    /// How the inspection examined the root.
+    pub kind: RootKind,
+    /// Where the root comes from.
+    pub source: RootSource,
     /// The result.
     pub outcome: SearchRootOutcome,
     /// The directories below the root that could not be read.
     pub unreadable_directories: u64,
+}
+
+impl SearchRootReport {
+    /// The report of `entry` with the outcome `outcome`, before the walk.
+    #[must_use]
+    pub fn of(entry: &SearchRootEntry, home: Option<&Path>, outcome: SearchRootOutcome) -> Self {
+        Self {
+            relative: entry.relative.clone(),
+            path: home.map(|home| home.join(&entry.relative)),
+            kind: entry.kind,
+            source: entry.source.clone(),
+            outcome,
+            unreadable_directories: 0,
+        }
+    }
 }
 
 /// The evidence of Git for one unit.
@@ -241,6 +448,11 @@ pub enum ProjectUnitOutcome {
     /// not examine each entry (`docs/CLEANUP_RULES.md` section 6,
     /// "Repositories in a unit"). It is not measured.
     RepositoryRefused(RepositoryRefusal),
+    /// Each check before the measurement is satisfied, and the unit was not
+    /// measured: the discovery for an eviction measures it
+    /// ([`super::ProjectRequest`]). An inspection never gives this
+    /// result.
+    Checked,
 }
 
 /// The report of one generated directory.
@@ -248,6 +460,8 @@ pub enum ProjectUnitOutcome {
 pub struct ProjectUnitReport {
     /// The path of the generated directory.
     pub path: PathBuf,
+    /// The path of the root of the request whose walk found the unit.
+    pub search_root: PathBuf,
     /// The project directory.
     pub project: PathBuf,
     /// The layout name: a layout of the catalog, or `user-configured`.
@@ -334,6 +548,12 @@ struct Inspector<'a> {
     matched: BTreeSet<PathBuf>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
+    /// False for the discovery for an eviction: a unit that passes each
+    /// check before the measurement is [`ProjectUnitOutcome::Checked`], and
+    /// the discovery measures it.
+    measure: bool,
+    /// The root of the walk now.
+    current_root: PathBuf,
 }
 
 /// One layout as the inspection uses it: a layout of the catalog or of the
@@ -653,10 +873,10 @@ fn stored_case(path: &Path) -> PathBuf {
 }
 
 impl ProjectRule {
-    /// Inspects the search roots `roots` below the home directory.
+    /// Inspects the roots `roots` below the home directory.
     ///
-    /// The function never fails as a whole: each search root and each
-    /// unit has its result.
+    /// The function never fails as a whole: each root and each unit has its
+    /// result.
     pub fn inspect(
         &self,
         host: ProjectHost<'_>,
@@ -678,6 +898,26 @@ impl ProjectRule {
         clock: &dyn ScanClock,
         mounts: MountTableSource,
     ) -> ProjectInspection {
+        self.examine(host, roots, limits, cancel, clock, mounts, true)
+    }
+
+    /// The walk and the checks of the inspection. With `measure` false, a
+    /// unit that passes each check before the measurement is
+    /// [`ProjectUnitOutcome::Checked`] and is not measured.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the inspection and the discovery share one walk with these inputs"
+    )]
+    pub(super) fn examine(
+        &self,
+        host: ProjectHost<'_>,
+        roots: &SearchRoots,
+        limits: ProjectLimits,
+        cancel: &CancellationToken,
+        clock: &dyn ScanClock,
+        mounts: MountTableSource,
+        measure: bool,
+    ) -> ProjectInspection {
         let git: GitAvailability = match host.git {
             Ok(tool) => GitAvailability::Located {
                 executable: tool.executable().to_path_buf(),
@@ -688,14 +928,9 @@ impl ProjectRule {
         let mut units: Vec<ProjectUnitReport> = Vec::new();
         let refuse_all = |reason: &'static str, home: Option<&Path>| {
             roots
-                .paths()
+                .entries()
                 .iter()
-                .map(|relative| SearchRootReport {
-                    relative: relative.clone(),
-                    path: home.map(|home| home.join(relative)),
-                    outcome: SearchRootOutcome::Refused(reason),
-                    unreadable_directories: 0,
-                })
+                .map(|entry| SearchRootReport::of(entry, home, SearchRootOutcome::Refused(reason)))
                 .collect::<Vec<SearchRootReport>>()
         };
         match (host.locations.home_directory(), mounts()) {
@@ -719,9 +954,11 @@ impl ProjectRule {
                     matched: BTreeSet::new(),
                     directories: 0,
                     units: Vec::new(),
+                    measure,
+                    current_root: PathBuf::new(),
                 };
-                for relative in roots.paths() {
-                    reports.push(inspector.root(relative));
+                for entry in roots.entries() {
+                    reports.push(inspector.root(entry));
                 }
                 units = inspector.units;
             }
@@ -737,14 +974,10 @@ impl ProjectRule {
 }
 
 impl Inspector<'_> {
-    fn root(&mut self, relative: &Path) -> SearchRootReport {
-        let path: PathBuf = self.home.join(relative);
-        let mut report: SearchRootReport = SearchRootReport {
-            relative: relative.to_path_buf(),
-            path: Some(path.clone()),
-            outcome: SearchRootOutcome::Absent,
-            unreadable_directories: 0,
-        };
+    fn root(&mut self, entry: &SearchRootEntry) -> SearchRootReport {
+        let path: PathBuf = self.home.join(&entry.relative);
+        let mut report: SearchRootReport =
+            SearchRootReport::of(entry, Some(self.home), SearchRootOutcome::Absent);
         let (path, snapshot): (PathBuf, ObjectSnapshot) = match open_search_root(
             &path,
             self.host.locations,
@@ -759,16 +992,40 @@ impl Inspector<'_> {
             }
         };
         report.path = Some(path.clone());
-        // One inventory for each search root, with the root as its scope.
+        self.current_root.clone_from(&path);
+        // One inventory for each root, with the root as its scope.
         let scope: UnitScope = UnitScope::new(&path);
         let inventory: PathInventory = self
             .host
             .processes
             .path_uses(self.host.principal, std::slice::from_ref(&scope));
         self.uses = Some((scope, inventory));
-        let completion: SearchCompletion = self.walk(&path, snapshot, &mut report);
+        let completion: SearchCompletion = match entry.kind {
+            RootKind::Search => self.walk(&path, snapshot, &mut report),
+            RootKind::Project => self.project_only(&path, &mut report),
+        };
         report.outcome = SearchRootOutcome::Examined(completion);
         report
+    }
+
+    /// The units of the project directory `project` only: a project root
+    /// is not a search root, so no directory below it is read.
+    fn project_only(&mut self, project: &Path, report: &mut SearchRootReport) -> SearchCompletion {
+        if let Some(stop) = self.stop() {
+            return stop;
+        }
+        self.directories += 1;
+        let Ok(entries) = fs::read_dir(project) else {
+            report.unreadable_directories += 1;
+            return SearchCompletion::Complete;
+        };
+        let names: BTreeSet<OsString> = entries
+            .take(crate::rules::worktrees::MAX_DIRECTORY_ENTRIES)
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        self.project(project, project, &names);
+        SearchCompletion::Complete
     }
 
     /// The stop of the walk now, when one applies.
@@ -896,6 +1153,7 @@ impl Inspector<'_> {
             };
             let mut report: ProjectUnitReport = ProjectUnitReport {
                 path: path.clone(),
+                search_root: self.current_root.clone(),
                 project: project.to_path_buf(),
                 layout: layout.id,
                 protected_child: None,
@@ -936,67 +1194,85 @@ impl Inspector<'_> {
         path: &Path,
         report: &mut ProjectUnitReport,
     ) -> Result<(), &'static str> {
-        let Ok(parent) = lstat(project) else {
-            return Err("project_not_readable");
-        };
-        // Each directory between the project and the unit, for a path of
-        // two names, is a directory of the user on the same device, not a
-        // symbolic link.
-        let mut between: PathBuf = project.to_path_buf();
-        let mut components = layout.directory.split('/').peekable();
-        while let Some(component) = components.next() {
-            if components.peek().is_none() {
-                break;
-            }
-            between.push(component);
-            match lstat(&between) {
-                Ok(found)
-                    if found.kind == ObjectKind::Directory
-                        && found.owner == self.host.principal
-                        && found.object.device == parent.object.device => {}
-                Ok(_) => return Err("unit_path_not_plain"),
-                Err(_) => return Err("unit_not_readable"),
-            }
+        unit_shape(self.host.principal, layout, project, names, path).map_err(|(reason, child)| {
+            report.protected_child = child;
+            reason
+        })
+    }
+}
+
+/// The checks of the objects of one unit of `layout` at `path`, in the
+/// project directory `project` whose entries are `names`: the directories
+/// on the way, the unit, the project marker, the inner marker, and the
+/// protected children. The error is the stable reason of the refusal, with
+/// the protected child that the check found.
+fn unit_shape(
+    principal: Uid,
+    layout: &Layout<'_>,
+    project: &Path,
+    names: &BTreeSet<OsString>,
+    path: &Path,
+) -> Result<(), (&'static str, Option<PathBuf>)> {
+    let plain = |reason: &'static str| Err((reason, None));
+    let Ok(parent) = lstat(project) else {
+        return plain("project_not_readable");
+    };
+    // Each directory between the project and the unit, for a path of two
+    // names, is a directory of the user on the same device, not a symbolic
+    // link.
+    let mut between: PathBuf = project.to_path_buf();
+    let mut components = layout.directory.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
         }
-        let snapshot: ObjectSnapshot = match lstat(path) {
-            Ok(snapshot) => snapshot,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err("unit_absent"),
-            Err(_) => return Err("unit_not_readable"),
-        };
-        match snapshot.kind {
-            ObjectKind::Directory => {}
-            ObjectKind::SymbolicLink => return Err("unit_symbolic_link"),
-            _ => return Err("unit_not_directory"),
-        }
-        if snapshot.owner != self.host.principal {
-            return Err("unit_owner");
-        }
-        if snapshot.object.device != parent.object.device {
-            return Err("unit_device");
-        }
-        if !has_marker(layout, project, names) {
-            return Err("project_marker_missing");
-        }
-        if let Some(inner) = layout.inner_marker
-            && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
-        {
-            return Err("unsupported_layout");
-        }
-        if let Some(file) = layout.project_file
-            && !is_plain_file(project, file)
-        {
-            return Err("unsupported_layout");
-        }
-        match find_protected(path, &layout.protected) {
-            ChildSearch::Clear => Ok(()),
-            ChildSearch::Found(child) => {
-                report.protected_child = Some(child);
-                Err("protected_child")
-            }
-            ChildSearch::Unknown => Err("protected_child_unknown"),
+        between.push(component);
+        match lstat(&between) {
+            Ok(found)
+                if found.kind == ObjectKind::Directory
+                    && found.owner == principal
+                    && found.object.device == parent.object.device => {}
+            Ok(_) => return plain("unit_path_not_plain"),
+            Err(_) => return plain("unit_not_readable"),
         }
     }
+    let snapshot: ObjectSnapshot = match lstat(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return plain("unit_absent"),
+        Err(_) => return plain("unit_not_readable"),
+    };
+    match snapshot.kind {
+        ObjectKind::Directory => {}
+        ObjectKind::SymbolicLink => return plain("unit_symbolic_link"),
+        _ => return plain("unit_not_directory"),
+    }
+    if snapshot.owner != principal {
+        return plain("unit_owner");
+    }
+    if snapshot.object.device != parent.object.device {
+        return plain("unit_device");
+    }
+    if !has_marker(layout, project, names) {
+        return plain("project_marker_missing");
+    }
+    if let Some(inner) = layout.inner_marker
+        && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
+    {
+        return plain("unsupported_layout");
+    }
+    if let Some(file) = layout.project_file
+        && !is_plain_file(project, file)
+    {
+        return plain("unsupported_layout");
+    }
+    match find_protected(path, &layout.protected) {
+        ChildSearch::Clear => Ok(()),
+        ChildSearch::Found(child) => Err(("protected_child", Some(child))),
+        ChildSearch::Unknown => plain("protected_child_unknown"),
+    }
+}
 
+impl Inspector<'_> {
     /// The checks of one unit, in sequence, and its measurement.
     fn unit(
         &mut self,
@@ -1055,6 +1331,9 @@ impl Inspector<'_> {
         report.uses = Some(uses.clone());
         if let Some(reason) = uses.refusal() {
             return refused(reason);
+        }
+        if !self.measure {
+            return ProjectUnitOutcome::Checked;
         }
         // The measurement also looks for a clone with commits or changes
         // that exist nowhere else. For a layout with the checkouts of Swift
@@ -1325,4 +1604,143 @@ fn is_plain_file(project: &Path, relative: &str) -> bool {
         }
     }
     true
+}
+
+/// The result of the checks of a planned unit, made again immediately
+/// before the step of an eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnitRecheck {
+    /// Each check is satisfied.
+    Passed,
+    /// A check refuses the unit. The name is a stable code.
+    Refused(&'static str),
+    /// The evidence of a check is not known. The name is a stable code.
+    Unknown(&'static str),
+}
+
+/// The inputs of [`recheck_unit`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecheckInput<'a> {
+    /// The user. The unit and each directory on its way must have this
+    /// owner.
+    pub principal: Uid,
+    /// The layout that the sealed plan binds for the unit.
+    pub layout: &'a str,
+    /// The approved root of the unit: a search root or a project root.
+    pub root: &'a Path,
+    /// The unit.
+    pub unit: &'a Path,
+    /// The layouts of the configuration in effect.
+    pub user_layouts: &'a [UserLayout],
+    /// The build processes, read now.
+    pub processes: &'a BuildProcesses,
+    /// The monotonic time now, on the timeline of the processes.
+    pub now: Option<MonotonicNanos>,
+    /// The age after which the process evidence is not current.
+    pub expiry: Nanoseconds,
+}
+
+/// Makes the checks of the unit `input.unit` of `project.dependency-directory`
+/// again, immediately before the step of an eviction
+/// (`docs/CLEANUP_RULES.md` section 12, "Manual eviction"): the unit has
+/// the same layout (its project marker, with no earlier layout of the same
+/// directory whose marker is now present, and its inner marker), it has no
+/// entry at a protected path of the layout, and no build process of the
+/// user works in its project.
+///
+/// The Git evidence, the project activity, and the measurement are not
+/// examined again here: the use check of the coordinator and the walk of
+/// the executor examine the unit before and during the removal.
+#[must_use]
+pub fn recheck_unit(input: &RecheckInput<'_>) -> UnitRecheck {
+    let layouts: Vec<Layout<'_>> = catalog(input.user_layouts);
+    let mut first: Option<UnitRecheck> = None;
+    let mut found: bool = false;
+    for layout in layouts.iter().filter(|layout| layout.id == input.layout) {
+        let directory: &Path = Path::new(layout.directory);
+        if !input.unit.ends_with(directory) {
+            continue;
+        }
+        let Some(project) =
+            (0..directory.components().count()).try_fold(input.unit, |path, _| path.parent())
+        else {
+            continue;
+        };
+        found = true;
+        let result: UnitRecheck = recheck_layout(input, &layouts, layout, project);
+        if result == UnitRecheck::Passed {
+            return result;
+        }
+        first.get_or_insert(result);
+    }
+    match first {
+        Some(result) => result,
+        // A layout of the configuration that the configuration in effect
+        // does not have, for example after a change of the configuration.
+        None if !found && input.layout == svalnir_core::rule::USER_CONFIGURED_LAYOUT => {
+            UnitRecheck::Unknown("unit_layout_unknown")
+        }
+        None => UnitRecheck::Refused("unit_layout_changed"),
+    }
+}
+
+/// The checks of [`recheck_unit`] for one layout and one project directory.
+fn recheck_layout(
+    input: &RecheckInput<'_>,
+    layouts: &[Layout<'_>],
+    layout: &Layout<'_>,
+    project: &Path,
+) -> UnitRecheck {
+    let Ok(entries) = fs::read_dir(project) else {
+        return UnitRecheck::Unknown("project_not_readable");
+    };
+    let limit: usize = crate::rules::worktrees::MAX_DIRECTORY_ENTRIES;
+    let mut names: BTreeSet<OsString> = BTreeSet::new();
+    for entry in entries.take(limit + 1) {
+        let Ok(entry) = entry else {
+            return UnitRecheck::Unknown("project_not_readable");
+        };
+        names.insert(entry.file_name());
+    }
+    if names.len() > limit {
+        return UnitRecheck::Unknown("project_not_readable");
+    }
+    // The first layout of the directory whose marker is present gives the
+    // unit. A different one now means that the unit is a different kind of
+    // directory than at the plan.
+    let chosen: Option<&Layout<'_>> = layouts
+        .iter()
+        .filter(|other| other.directory == layout.directory)
+        .find(|other| has_marker(other, project, &names));
+    if chosen.is_some_and(|chosen| chosen.id != layout.id) {
+        return UnitRecheck::Refused("unit_layout_changed");
+    }
+    if let Err((reason, _)) = unit_shape(input.principal, layout, project, &names, input.unit) {
+        return match reason {
+            "project_not_readable" | "unit_not_readable" | "protected_child_unknown" => {
+                UnitRecheck::Unknown(reason)
+            }
+            _ => UnitRecheck::Refused(reason),
+        };
+    }
+    let processes: &BuildProcesses = input.processes;
+    if processes.blocking(project).is_some() {
+        return UnitRecheck::Refused("producer_active");
+    }
+    if processes.above(project, input.root).is_some() {
+        return UnitRecheck::Unknown("build_process_above_project");
+    }
+    if processes.incomplete.is_some() {
+        return UnitRecheck::Unknown("activity_unknown");
+    }
+    let current: bool = processes
+        .observed_at
+        .zip(input.now)
+        .and_then(|(observed, now)| now.checked_duration_since(observed))
+        .is_some_and(|age| age <= input.expiry);
+    if current {
+        UnitRecheck::Passed
+    } else {
+        UnitRecheck::Unknown("activity_unknown")
+    }
 }

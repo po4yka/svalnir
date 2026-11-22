@@ -328,14 +328,9 @@ impl WorktreeRule {
                 "root_locality_unknown"
             };
             inspection.roots = roots
-                .paths()
+                .entries()
                 .iter()
-                .map(|relative| SearchRootReport {
-                    relative: relative.clone(),
-                    path: home.map(|home| home.join(relative)),
-                    outcome: SearchRootOutcome::Refused(reason),
-                    unreadable_directories: 0,
-                })
+                .map(|entry| SearchRootReport::of(entry, home, SearchRootOutcome::Refused(reason)))
                 .collect();
             return inspection;
         };
@@ -348,14 +343,10 @@ impl WorktreeRule {
             directories: 0,
             repositories: Vec::new(),
         };
-        for relative in roots.paths() {
-            let path: PathBuf = home.join(relative);
-            let mut report: SearchRootReport = SearchRootReport {
-                relative: relative.clone(),
-                path: Some(path.clone()),
-                outcome: SearchRootOutcome::Absent,
-                unreadable_directories: 0,
-            };
+        for entry in roots.entries() {
+            let path: PathBuf = home.join(&entry.relative);
+            let mut report: SearchRootReport =
+                SearchRootReport::of(entry, Some(home), SearchRootOutcome::Absent);
             match open_search_root(
                 &path,
                 host.locations,

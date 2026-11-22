@@ -32,7 +32,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use svalnir_core::action::WorkCharge;
-use svalnir_core::config::ValidatedConfig;
+use svalnir_core::config::{UserLayout, ValidatedConfig};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{RootId, RuleId, StepId, TargetId, VolumeId};
 use svalnir_core::plan::{CleanupEntry, RuleEvidence, SizeEstimate};
@@ -53,6 +53,11 @@ use super::model::{
     DiscoveryLimits, DiscoveryMode, DiscoveryScope, RootBinding, SkipReason, SkippedUnit,
 };
 use super::overlap::{OverlapConflict, OverlapResolution};
+use super::projects::{
+    BuildProcesses, PROJECT_EVIDENCE_EXPIRY, PROJECT_RULE_ID, ProjectDiscoveryInput,
+    ProjectRequest, RecheckInput, SearchRootReport, UnitRecheck, examined_for,
+    inventory as project_inventory, recheck_unit,
+};
 use super::registry::ReviewedRules;
 use super::xcode::{ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XcodeEvidence};
 use crate::executor::fs::{ApprovedRoot, ApprovedRoots};
@@ -324,7 +329,10 @@ pub fn automatic_roots(
 ) -> ApprovedRoots {
     let mut roots: Vec<ApprovedRoot> = Vec::new();
     for rule in registry.rules() {
-        let permits: bool = approved.contains(&rule.reference.id)
+        // The rule of the project directories is for a manual eviction
+        // only, whatever its lifecycle state.
+        let permits: bool = rule.reference.id.as_str() != PROJECT_RULE_ID
+            && approved.contains(&rule.reference.id)
             && rule
                 .layouts
                 .iter()
@@ -459,7 +467,16 @@ pub trait DiscoveryEnvironment: ScanClock {
     /// - `svalnir.expired-temporary`: the use leases, which this build
     ///   does not record, so the activity is not known.
     /// - A rule that this build does not know: not known.
+    ///
+    /// `project.dependency-directory` has no producer of the rule as a
+    /// whole: its producer evidence is the build processes of the project of
+    /// each unit, which [`DiscoveryEnvironment::unit_recheck`] reads for the
+    /// unit of the step. The activity of the rule is thus `Inactive`, and
+    /// the recheck decides.
     fn producer_activity(&self, rule: &RuleId, principal: Uid) -> ProducerActivity {
+        if rule.as_str() == PROJECT_RULE_ID {
+            return ProducerActivity::Inactive;
+        }
         if rule.as_str() != XCODE_DERIVED_DATA_RULE_ID {
             return ProducerActivity::Unknown;
         }
@@ -468,6 +485,56 @@ pub trait DiscoveryEnvironment: ScanClock {
             ProducerProcesses::Running => ProducerActivity::Active,
             ProducerProcesses::Unknown => ProducerActivity::Unknown,
         }
+    }
+
+    /// The build processes of `principal`, read now, for
+    /// `project.dependency-directory`. An environment with no process
+    /// evidence gives an inventory that is not complete, which refuses each
+    /// unit of the rule.
+    fn build_processes(&self, _principal: Uid) -> BuildProcesses {
+        BuildProcesses {
+            processes: Vec::new(),
+            incomplete: Some("no_process_evidence"),
+            observed_at: None,
+        }
+    }
+
+    /// The checks of the unit at `path` below the approved root `root`,
+    /// made again immediately before each step of an eviction, after the
+    /// use check (`docs/ACTION_CONTRACTS.md` section 7).
+    ///
+    /// For `project.dependency-directory`, the unit must still have the
+    /// layout `layout` that the sealed plan binds, with its project marker
+    /// and its inner marker, no entry at a protected path of the layout,
+    /// and no build process of the user in its project ([`recheck_unit`]).
+    /// The layouts of the configuration in effect are `user_layouts`. A
+    /// rule with no such check gives [`UnitRecheck::Passed`].
+    fn unit_recheck(
+        &self,
+        principal: Uid,
+        rule: &RuleRef,
+        layout: Option<&str>,
+        root: &Path,
+        path: &Path,
+        user_layouts: &[UserLayout],
+    ) -> UnitRecheck {
+        if rule.id.as_str() != PROJECT_RULE_ID {
+            return UnitRecheck::Passed;
+        }
+        let Some(layout) = layout else {
+            return UnitRecheck::Unknown("unit_layout_unknown");
+        };
+        let processes: BuildProcesses = self.build_processes(principal);
+        recheck_unit(&RecheckInput {
+            principal,
+            layout,
+            root,
+            unit: path,
+            user_layouts,
+            processes: &processes,
+            now: self.now().monotonic_ns,
+            expiry: PROJECT_EVIDENCE_EXPIRY,
+        })
     }
 }
 
@@ -495,6 +562,20 @@ impl<S: ProcessSource> DiscoveryEnvironment for SourceEnvironment<S> {
 
     fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory {
         inventory_of(&self.0, principal, scopes)
+    }
+
+    fn build_processes(&self, principal: Uid) -> BuildProcesses {
+        #[cfg(target_os = "macos")]
+        let (query, owner) = (
+            crate::rules::native::working_directory,
+            crate::rules::native::process_owner,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (query, owner) = (
+            |_: Pid| -> Result<PathBuf, QueryFailure> { Err(QueryFailure::Unsupported) },
+            |_: Pid| -> Result<(Uid, Uid), QueryFailure> { Err(QueryFailure::Unsupported) },
+        );
+        project_inventory(&self.0, principal, query, owner)
     }
 }
 
@@ -532,6 +613,11 @@ pub struct EvictionRequest<'a> {
     pub limits: DiscoveryLimits,
     /// The flag that stops the discovery from a different thread.
     pub cancel: &'a CancellationToken,
+    /// The roots and the sources of `project.dependency-directory`, for a
+    /// manual eviction. The rule has no root in its declaration, so with
+    /// `None` it is not examined. It is never examined for an automatic
+    /// eviction or for known candidates.
+    pub projects: Option<&'a ProjectRequest<'a>>,
 }
 
 impl std::fmt::Debug for EvictionRequest<'_> {
@@ -658,6 +744,9 @@ pub struct EvictionDiscovery {
     /// The binding of each root that a discovery examined, with its
     /// volume. A client records it with the plan of its candidates.
     pub bound_roots: Vec<BoundRoot>,
+    /// The report of each root of `project.dependency-directory`, with its
+    /// kind and its source, when the request examined the rule.
+    pub project_roots: Vec<SearchRootReport>,
 }
 
 /// A stable name of a discovery refusal, with no path.
@@ -852,6 +941,21 @@ impl ReviewedRules {
             if !selected {
                 continue;
             }
+            if rule.reference.id.as_str() == PROJECT_RULE_ID {
+                // The rule of the project directories is examined for a
+                // manual eviction only, with the roots of the request, and
+                // never for known candidates (an automatic operation).
+                if examined_for(request.purpose) && request.known.is_none() {
+                    found.extend(self.examine_projects(
+                        rule,
+                        request,
+                        &protected,
+                        environment,
+                        &mut result,
+                    ));
+                }
+                continue;
+            }
             for (declared, bound) in rule.roots.iter().zip(resolve_roots(rule, &host.locations)) {
                 let (root_result, candidates) = match &bound {
                     Ok(bound) => self.examine_root(rule, bound, request, &protected, environment),
@@ -916,6 +1020,61 @@ impl ReviewedRules {
             }
         }
         result
+    }
+
+    /// The discovery of `project.dependency-directory` with the roots of the
+    /// request: the candidates. The report of each root is added to
+    /// `result`.
+    fn examine_projects(
+        &self,
+        rule: &Rule,
+        request: &EvictionRequest<'_>,
+        protected: &[PathBuf],
+        environment: &dyn DiscoveryEnvironment,
+        result: &mut EvictionDiscovery,
+    ) -> Vec<DiscoveredCandidate> {
+        let Some(projects) = request.projects else {
+            // With no root, the rule has no place to look.
+            result.complete = false;
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: None,
+                result: RootResult::Refused("no_search_roots"),
+            });
+            return Vec::new();
+        };
+        let (reports, roots) = self.projects().discover_roots(&ProjectDiscoveryInput {
+            host: request.host,
+            request: projects,
+            protected,
+            limits: request.limits,
+            cancel: request.cancel,
+            environment,
+            mounts: crate::platform::volume::MountTable::read,
+        });
+        result.project_roots = reports;
+        let mut found: Vec<DiscoveredCandidate> = Vec::new();
+        for root in roots {
+            match &root.result {
+                RootResult::Examined { completion, .. } => {
+                    if *completion != DiscoveryCompletion::Finished {
+                        result.complete = false;
+                    }
+                }
+                RootResult::NotBound(RootProblem::Absent)
+                | RootResult::OtherVolume
+                | RootResult::NothingKnown => {}
+                RootResult::NotBound(_) | RootResult::Refused(_) => result.complete = false,
+            }
+            result.bound_roots.extend(root.bound);
+            found.extend(root.candidates);
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: root.path,
+                result: root.result,
+            });
+        }
+        found
     }
 
     /// The discovery of one bound root of one rule: the result for the

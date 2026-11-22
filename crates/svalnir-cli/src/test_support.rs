@@ -113,6 +113,8 @@ pub(crate) fn environment() -> (Environment, TempDirectory) {
             state_directory_override: Some(directory.path().join("state").into_os_string()),
             home: Some(home),
             current_directory: Some(directory.path().to_path_buf()),
+            xdg_state_home: None,
+            xdg_config_home: None,
             interrupt,
             seams,
         },

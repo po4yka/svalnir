@@ -137,6 +137,7 @@ impl Command {
             Self::Scan(_) => "scan",
             Self::Report(_) => "report",
             Self::Clean { command } => match command {
+                CleanCommand::Inspect(_) => "clean inspect",
                 CleanCommand::Plan(_) => "clean plan",
                 CleanCommand::Show(_) => "clean show",
                 CleanCommand::Apply(_) => "clean apply",
@@ -266,6 +267,9 @@ pub struct ReportArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CleanCommand {
+    /// Report what a reviewed rule finds and why. This command changes no
+    /// file.
+    Inspect(CleanInspectArgs),
     /// Prepare a bounded cleanup plan. This command changes no file.
     Plan(CleanPlanArgs),
     /// Explain the targets, estimates, exclusions, and expiry of a plan.
@@ -296,6 +300,41 @@ pub struct CleanPlanArgs {
     /// entry.
     #[arg(long = "entry", value_name = "PATH")]
     pub entries: Vec<PathBuf>,
+    #[command(flatten)]
+    pub projects: ProjectRootArgs,
+    /// Also select the units of a project whose activity state is `active`.
+    /// A `busy` project is never selected. Only `--rule
+    /// project.dependency-directory` accepts it.
+    #[arg(long)]
+    pub include_active: bool,
+    /// Leave out each candidate whose estimate of reclaimable bytes is
+    /// smaller than SIZE. Only `--rule project.dependency-directory`
+    /// accepts it.
+    #[arg(long, value_name = "SIZE", value_parser = byte_size)]
+    pub min_size: Option<Bytes>,
+}
+
+/// The roots of the rules that search the projects of the user.
+#[derive(Debug, Args)]
+pub struct ProjectRootArgs {
+    /// A search root: an absolute path, or a path relative to the
+    /// invocation directory, below the home directory. Repeat it for each
+    /// root. It adds to `[cleanup.projects].search_roots`.
+    #[arg(long = "root", value_name = "PATH")]
+    pub roots: Vec<PathBuf>,
+    /// Do not add the project roots that mise records in its
+    /// tracked-configs directory.
+    #[arg(long)]
+    pub no_mise: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CleanInspectArgs {
+    /// Reviewed cleanup rule with the inspection mode.
+    #[arg(long, value_name = "RULE_ID")]
+    pub rule: String,
+    #[command(flatten)]
+    pub projects: ProjectRootArgs,
 }
 
 /// Manual cleanup mode.

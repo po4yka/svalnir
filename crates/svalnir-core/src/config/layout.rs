@@ -16,7 +16,8 @@ use super::finding::FindingCode;
 use super::reader::{Context, Read, TableReader};
 use super::schema::{
     BUILT_IN_LAYOUT_NAMES, KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_ENTRIES, MAX_QUIET_PERIOD,
-    MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES, SKIPPED_DIRECTORY_NAMES, UserLayout,
+    MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES,
+    SKIPPED_DIRECTORY_NAMES, UserLayout,
 };
 
 /// The largest length of one name, in bytes: the name limit of APFS.
@@ -24,6 +25,9 @@ const MAX_NAME_BYTES: usize = 255;
 
 /// The largest number of components of `directory`.
 const MAX_DIRECTORY_COMPONENTS: usize = 2;
+
+/// The largest number of components of a search root.
+const MAX_SEARCH_ROOT_COMPONENTS: usize = 16;
 
 /// The largest number of components of a protected path.
 const MAX_PROTECTED_COMPONENTS: usize = 4;
@@ -286,6 +290,55 @@ fn read_layout(
         protected: protected?,
         quiet_period: quiet_period?,
     })
+}
+
+/// Reads `search_roots` of `[cleanup.projects]`: plain relative paths below
+/// the home directory, at most [`MAX_SEARCH_ROOTS`]. `None` when the key is
+/// absent or has a finding.
+pub(super) fn read_search_roots(
+    context: &mut Context,
+    table: &mut TableReader<'_>,
+) -> Option<Vec<String>> {
+    let Read::Valid(items) = table.text_list(context, "search_roots") else {
+        return None;
+    };
+    if items.len() > MAX_SEARCH_ROOTS {
+        context.report(
+            FindingCode::TooManyEntries,
+            &table.key_path("search_roots"),
+            format!("must have no more than {MAX_SEARCH_ROOTS} entries"),
+        );
+        return None;
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut roots: Vec<String> = Vec::with_capacity(items.len());
+    let mut complete: bool = true;
+    for (item_path, text) in items {
+        let problem: Option<&'static str> = if text.starts_with('/') {
+            Some("must be relative to the home directory")
+        } else if text.split('/').count() > MAX_SEARCH_ROOT_COMPONENTS {
+            Some("must have no more than 16 components")
+        } else {
+            text.split('/')
+                .find_map(|component| name_problem(component, false))
+        };
+        if let Some(problem) = problem {
+            context.report(FindingCode::InvalidPath, &item_path, problem);
+            complete = false;
+            continue;
+        }
+        if !seen.insert(text.to_ascii_lowercase()) {
+            context.report(
+                FindingCode::DuplicateIdentifier,
+                &item_path,
+                "an earlier search root has the same path",
+            );
+            complete = false;
+            continue;
+        }
+        roots.push(text.to_owned());
+    }
+    complete.then_some(roots)
 }
 
 /// Reads the `layouts` array of tables of `[cleanup.projects]`, at most

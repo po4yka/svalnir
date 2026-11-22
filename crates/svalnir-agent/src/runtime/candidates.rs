@@ -273,6 +273,9 @@ impl RuleCandidateSource {
                         known: None,
                         limits,
                         cancel: &token,
+                        // An automatic operation never examines the rule of
+                        // the project directories.
+                        projects: None,
                     },
                     environment.as_ref(),
                 )
@@ -322,6 +325,7 @@ impl CandidateSource for RuleCandidateSource {
                             ..self.limits
                         },
                         cancel: &cancel,
+                        projects: None,
                     },
                     self.environment.as_ref(),
                 );

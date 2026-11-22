@@ -2,21 +2,26 @@
 //! section 12: the generated dependency directories of the projects below
 //! the directories that the user names.
 //!
-//! The rule has the inspection mode only, and each of its layouts is
-//! `proposed`. It finds no candidate, has no discovery for an eviction,
-//! and removes nothing. The inspection reports each generated directory
-//! with its evidence: the project marker, whether Git ignores it and
-//! tracks no file in it, the activity of the build processes of the
-//! project, the project activity, and its measured size.
+//! The rule has the inspection mode and the manual eviction, and no
+//! automatic mode. Each of its layouts is `proposed`, so a released build
+//! permits no removal under it. The inspection reports each generated
+//! directory with its evidence: the project marker, whether Git ignores it
+//! and tracks no file in it, the activity of the build processes of the
+//! project, the project activity, and its measured size. The discovery for
+//! a manual eviction ([`ProjectRequest`]) gives the candidates of each
+//! check, and [`recheck_unit`] makes the checks of the layout again before
+//! each step.
 //!
-//! # Search roots
+//! # Roots
 //!
-//! The inspection examines only the directories that its caller names
-//! ([`SearchRoots`]), each relative to the home directory, for example
-//! `Developer`. It has no default directory, and the home directory
-//! itself is not a search root. The walk is bounded by depth, by entries,
-//! and by time, follows no symbolic link, and does not cross into another
-//! device.
+//! The inspection examines only the roots of its request ([`SearchRoots`]),
+//! each relative to the home directory: the search roots of
+//! `[cleanup.projects].search_roots` and of `--root`, which the walk reads,
+//! and the project roots that mise records ([`tracked_projects`]), whose
+//! units are those of the project directory only. It has no default
+//! directory, and the home directory itself is not a root. The walk is
+//! bounded by depth, by entries, and by time, follows no symbolic link,
+//! and does not cross into another device.
 //!
 //! # Project activity
 //!
@@ -24,8 +29,9 @@
 //! ignores (`docs/CLEANUP_RULES.md` section 6): the reflog of `HEAD`, the
 //! Claude Code transcripts, and, when the configuration turns it on, the
 //! Paseo agents. A busy project refuses its unit. A quiet or active project
-//! does not: the state is evidence for a later selection, and
-//! [`ProjectRecency::fact`] gives its value for predicate 5.
+//! does not refuse it in the inspection. For an eviction, only a quiet
+//! project gives predicate 5, or an active project when the request
+//! includes active projects ([`ProjectRequest::include_active`]).
 //!
 //! # A name is not sufficient
 //!
@@ -35,7 +41,7 @@
 //! a project marker of the layout (a name or a pattern such as `*.csproj`),
 //! the unit has the inner marker of the layout when the layout has one, and
 //! the unit has no entry at a protected path of the layout. It is a
-//! candidate of a future manual mode only when Git ignores it and the index
+//! candidate of the manual mode only when Git ignores it and the index
 //! of the repository has no path in it, so a committed directory with the
 //! same name is never a unit. A directory with a generic name, such as
 //! `build`, and no marker is an ordinary directory, which the walk enters.
@@ -50,10 +56,14 @@
 //! ([`svalnir_core::rule::LayoutSupport::permits`]).
 
 mod activity;
+mod discover;
 mod inspect;
 mod layouts;
+mod mise;
 mod recency;
 
+#[cfg(test)]
+mod discover_tests;
 #[cfg(test)]
 mod layouts_tests;
 #[cfg(test)]
@@ -72,19 +82,27 @@ use svalnir_core::rule::{
     RuleExclusions, RuleMode, RuleOwner, RuleRef, USER_CONFIGURED_LAYOUT,
 };
 
+pub(in crate::rules) use activity::inventory;
 pub use activity::{
     BUILD_PROCESS_NAMES, BuildProcesses, NativeProcessEvidence, ProcessEvidence, ProjectProcess,
     is_build_process,
 };
+pub(in crate::rules) use discover::ProjectDiscoveryInput;
+pub use discover::{EnvironmentEvidence, ProjectRequest, examined_for};
 pub(in crate::rules) use inspect::open_search_root;
 pub use inspect::{
-    GitAvailability, MAX_SEARCH_ROOTS, ProjectActivity, ProjectHost, ProjectInspection,
-    ProjectLimits, ProjectUnitOutcome, ProjectUnitReport, SearchCompletion, SearchRootOutcome,
-    SearchRootReport, SearchRoots, VersionControl,
+    ArgumentRootError, GitAvailability, MAX_PROJECT_ROOTS, MAX_SEARCH_ROOTS, ProjectActivity,
+    ProjectHost, ProjectInspection, ProjectLimits, ProjectUnitOutcome, ProjectUnitReport,
+    RecheckInput, RootKind, RootSource, SearchCompletion, SearchRootEntry, SearchRootOutcome,
+    SearchRootReport, SearchRoots, UnitRecheck, VersionControl, argument_root, recheck_unit,
 };
 pub use layouts::{
     DirectoryName, MarkerKind, PROJECT_LAYOUT_COUNT, PROJECT_LAYOUTS, PackageCheckouts,
     ProjectLayout, ProjectMarker, USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW,
+};
+pub use mise::{
+    IgnoredLink, MAX_LINK_BYTES, MAX_TRACKED_CONFIGS, MiseDiscovery, MiseLocations, MiseRoot,
+    MiseState, project_root, tracked_projects,
 };
 pub use recency::{
     ActivitySource, AgentListing, AgentReading, AgentStatus, ClaudeTranscripts, GitHeadActivity,
@@ -99,16 +117,21 @@ use super::registry::RegistryError;
 /// The identity of the rule.
 pub const PROJECT_RULE_ID: &str = "project.dependency-directory";
 
-/// The revision of the rule.
-pub const PROJECT_RULE_REVISION: &str = "r2";
+/// The revision of the rule. Revision `r3` adds the manual eviction and
+/// accepts a symbolic link below a unit, which the executor removes and
+/// does not follow.
+pub const PROJECT_RULE_REVISION: &str = "r3";
 
 const MINUTE: u64 = 60_000_000_000;
 const DAY: u64 = 86_400_000_000_000;
 const GIBIBYTE: u64 = 1 << 30;
 
-/// The declaration of the rule. Each layout is `proposed`, and the
-/// implementation has the inspection mode only, so no lifecycle state,
-/// also a fixture state, can permit a removal.
+/// The age after which the process evidence of the rule is not current.
+pub const PROJECT_EVIDENCE_EXPIRY: Nanoseconds = Nanoseconds::new(30_000_000_000);
+
+/// The declaration of the rule. Each layout is `proposed`; the
+/// implementation has the inspection mode and the manual eviction, and no
+/// automatic eviction.
 ///
 /// The retention, the activity windows, and the budget are values of a
 /// proposed rule. No promotion record confirms them (section 3).
@@ -120,12 +143,11 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
     // same directory, for example `target`. The roots of the base
     // `user_selected` are hints only: the discovery for an eviction gives
     // them no path, and the approved root of a unit is its generated
-    // directory below a search root of the inspection. A layout of the
-    // configuration has no entry here, because its directory is known only
-    // at run time. The binding of a manual plan to the search roots, for
-    // each layout and for `user-configured`, is planned for phase 2b
-    // (`docs/CLEANUP_RULES.md` section 12, "Approved roots"); this build has
-    // no manual mode for the rule, so no plan can refuse or accept a unit.
+    // directory below a root of the request. A layout of the configuration
+    // has no entry here, because its directory is known only at run time.
+    // The approved root of a manual plan is the root of the request that
+    // the discovery bound (`docs/CLEANUP_RULES.md` section 12, "Approved
+    // roots"), for each layout and for `user-configured`.
     let mut roots: Vec<ApprovedRoot> = Vec::new();
     for layout in &PROJECT_LAYOUTS {
         let root: ApprovedRoot = ApprovedRoot {
@@ -167,14 +189,23 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
         activity: ActivityProtocol {
             checks: vec![ActivityCheck::ProducerProcessAbsent],
             quiescence: Nanoseconds::new(10 * MINUTE),
-            evidence_expiry: Nanoseconds::new(30_000_000_000),
+            evidence_expiry: PROJECT_EVIDENCE_EXPIRY,
         },
         exclusions: RuleExclusions {
             descendants: Vec::new(),
-            supported_object_types: vec![FileObjectType::RegularFile, FileObjectType::Directory],
+            // A unit such as `node_modules` has symbolic links, for example
+            // in `.bin`. The executor removes a link and does not follow
+            // it, and the measurement does not count its target.
+            supported_object_types: vec![
+                FileObjectType::RegularFile,
+                FileObjectType::Directory,
+                FileObjectType::SymbolicLink,
+            ],
             skip_hard_linked: true,
         },
-        modes: vec![RuleMode::Inspection],
+        // No automatic mode: the rule is for a manual eviction only
+        // (owner decision of 2026-11-22).
+        modes: vec![RuleMode::Inspection, RuleMode::ManualEviction],
         deletion_method: DeletionMethod::BoundedUnlink,
         executor: ExecutorRole::User,
         rebuild_cost: RebuildCost::Medium,
@@ -201,6 +232,26 @@ impl ProjectRule {
     pub(super) fn new() -> Result<Self, RegistryError> {
         let rule: Rule = Checked::new(declaration()?).map_err(RegistryError::Incomplete)?;
         Ok(Self { rule })
+    }
+
+    /// The rule with `lifecycle` for each layout, limited to a manual
+    /// mode: a state that permits an automatic eviction becomes
+    /// [`LifecycleState::ManualActionValidated`] with the same evidence.
+    /// Only a test build has this function
+    /// ([`super::ReviewedRules::with_fixture_lifecycle`]).
+    #[cfg(any(test, all(feature = "test-support", debug_assertions)))]
+    pub(super) fn with_lifecycle(self, lifecycle: &LifecycleState) -> Result<Self, RegistryError> {
+        let manual: LifecycleState = match lifecycle {
+            LifecycleState::AutomaticEvictionValidated { evidence } => {
+                LifecycleState::ManualActionValidated {
+                    evidence: evidence.clone(),
+                }
+            }
+            other => other.clone(),
+        };
+        Ok(Self {
+            rule: super::registry::with_lifecycle(&self.rule, &manual)?,
+        })
     }
 
     /// The checked declaration of the rule revision.

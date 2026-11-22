@@ -6,7 +6,9 @@
 //! project dependency directories ([`super::projects`]), and the three
 //! rules of the data that only its owner tool removes
 //! ([`super::owner_tools`]), and the rule of the linked Git worktrees
-//! ([`super::worktrees`]). The last eleven have the inspection mode only. Each layout of each rule is
+//! ([`super::worktrees`]). Of the last eleven, the project rule has the
+//! inspection mode and the manual eviction, and the other ten have the
+//! inspection mode only. Each layout of each rule is
 //! `proposed`, because no validation record under `docs/VALIDATION.md`
 //! exists for a rule. The registry has no function that changes a
 //! lifecycle state: a promotion is a new declaration with a reference to
@@ -124,11 +126,12 @@ impl ReviewedRules {
     /// test names no validation record of `docs/VALIDATION.md`; the test
     /// gives a reference that says so.
     ///
-    /// The cache rules, `project.dependency-directory`, the rules of
-    /// [`super::owner_tools`], and `git.linked-worktree` keep the state of
-    /// their declarations: their implementation has the inspection mode
-    /// only, so no state permits a removal under one of them, also in a
-    /// test build.
+    /// The cache rules, the rules of [`super::owner_tools`], and
+    /// `git.linked-worktree` keep the state of their declarations: their
+    /// implementation has the inspection mode only, so no state permits a
+    /// removal under one of them, also in a test build.
+    /// `project.dependency-directory` gets at most
+    /// [`LifecycleState::ManualActionValidated`]: it has no automatic mode.
     ///
     /// # Errors
     ///
@@ -141,7 +144,7 @@ impl ReviewedRules {
             expired_temporary: registry.expired_temporary.with_lifecycle(lifecycle)?,
             xcode_derived_data: registry.xcode_derived_data.with_lifecycle(lifecycle)?,
             caches: registry.caches,
-            projects: registry.projects,
+            projects: registry.projects.with_lifecycle(lifecycle)?,
             owner_tools: registry.owner_tools,
             worktrees: registry.worktrees,
         })
@@ -171,7 +174,7 @@ impl ReviewedRules {
     }
 
     /// The rule `project.dependency-directory`. It has the inspection mode
-    /// only.
+    /// and the manual eviction.
     pub fn projects(&self) -> &ProjectRule {
         &self.projects
     }

@@ -37,6 +37,7 @@ use crate::executor::process::{
 };
 use crate::rules::ProducerActivity;
 use crate::rules::in_use::UnitUse;
+use crate::rules::projects::UnitRecheck;
 
 /// The result of one unit of work on the active operation.
 #[derive(Debug)]
@@ -755,6 +756,26 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         )
     }
 
+    /// The checks of the rule for a file target, immediately before its
+    /// step, after the use check: for example the layout and the protected
+    /// children of a unit of a project directory. `None` permits the step.
+    fn rule_recheck(
+        &self,
+        rule: &svalnir_core::rule::RuleRef,
+        file: &svalnir_core::action::FileBinding,
+    ) -> Option<(&'static str, ErrorFamily)> {
+        let root: PathBuf = file.root_path.to_path_buf();
+        let path: PathBuf = root.join(file.relative_entry.to_path_buf());
+        match self
+            .authority
+            .unit_recheck(rule, file.layout.as_deref(), &root, &path)
+        {
+            UnitRecheck::Passed => None,
+            UnitRecheck::Refused(code) => Some((code, ErrorFamily::Eligibility)),
+            UnitRecheck::Unknown(code) => Some((code, ErrorFamily::Evidence)),
+        }
+    }
+
     fn advance_filesystem(
         &mut self,
         active: &mut Active,
@@ -833,6 +854,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     }
                 }
             });
+            let refusal = refusal.or_else(|| self.rule_recheck(rule, &file));
             if let Some((code, family)) = refusal {
                 let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
                 self.end_without_call(

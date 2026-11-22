@@ -687,8 +687,15 @@ impl Driver {
             self.authority_revision = None;
             self.authority_unread = true;
         }
+        // The layouts of the configuration in effect, for the check of a
+        // unit of `project.dependency-directory` before its step.
+        let layouts: Vec<svalnir_core::config::UserLayout> = effective
+            .as_ref()
+            .map_or_else(Vec::new, |config| config.cleanup().projects.layouts.clone());
         self.effective = effective;
-        self.authority.records().state = state;
+        let mut records = self.authority.records();
+        records.state = state;
+        records.project_layouts = layouts;
         true
     }
 

@@ -23,7 +23,7 @@ fn changes_state(command: &Command) -> bool {
     match command {
         Command::Clean { command } => match command {
             CleanCommand::Plan { .. } | CleanCommand::Apply { .. } => true,
-            CleanCommand::Show { .. } => false,
+            CleanCommand::Show { .. } | CleanCommand::Inspect { .. } => false,
         },
         Command::Processes { command } => match command {
             ProcessesCommand::Stop { .. } => true,

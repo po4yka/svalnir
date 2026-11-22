@@ -186,7 +186,7 @@ pub trait ProcessEvidence {
 /// each other result makes the inventory not complete. A failed query of the
 /// executable of a process of the user, or of the working directory of a
 /// build process of the user, makes the inventory not complete.
-pub(super) fn inventory<S: ProcessSource>(
+pub(in crate::rules) fn inventory<S: ProcessSource>(
     source: &S,
     principal: Uid,
     working_directory: impl Fn(Pid) -> Result<PathBuf, QueryFailure>,

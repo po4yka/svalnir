@@ -45,11 +45,16 @@
 //!   moves out of the root during the scan is still read to its end.
 //! - A failure below the root leaves the measured part in place and is
 //!   recorded as a [`ScanRegion`]. The coverage is then `partial`.
+//! - On APFS, the scan also reads the private size and the clone family of
+//!   each counted regular file with `getattrlistat`, and gives the private
+//!   allocated bytes of the root as a [`PrivateAllocation`].
 
 mod control;
 mod model;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod native;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod private;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod top;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -64,9 +69,10 @@ pub use model::{
     DirectoryRecord, EntryKind, EntryRecord, LargeDirectory, LargeFile, MAX_DEPTH_LIMIT,
     MAX_HARD_LINK_OBJECTS_LIMIT, MAX_LARGEST_ITEMS_LIMIT, MAX_RECORDED_REGIONS_LIMIT,
     METRIC_SCAN_ALLOCATED_BYTES, METRIC_SCAN_ENTRIES, METRIC_SCAN_EXCLUSIVE_BYTES,
-    METRIC_SCAN_LOGICAL_BYTES, MountBoundary, RegionCause, RegionKind, SCAN_RESULT_SCHEMA_VERSION,
-    ScanCompletion, ScanError, ScanLimits, ScanObservations, ScanRegion, ScanRequest, ScanResult,
-    ScanTimestamp, ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
+    METRIC_SCAN_LOGICAL_BYTES, MountBoundary, PrivateAllocation, PrivateBytes,
+    PrivateSizeUnavailable, RegionCause, RegionKind, SCAN_RESULT_SCHEMA_VERSION, ScanCompletion,
+    ScanError, ScanLimits, ScanObservations, ScanRegion, ScanRequest, ScanResult, ScanTimestamp,
+    ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use walk::run_scan;

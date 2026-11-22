@@ -308,6 +308,9 @@ fn scan_of(identity: Option<VolumeIdentity>, allocated: u64, coverage: Coverage)
             compressed_files: EntryCount::new(0),
             files_allocated_below_logical: EntryCount::new(0),
         },
+        private_allocation: crate::scan::PrivateAllocation::unavailable(
+            crate::scan::PrivateSizeUnavailable::NotReported,
+        ),
         largest_files: Vec::new(),
         largest_directories: Vec::new(),
         boundaries: Vec::new(),

@@ -372,10 +372,21 @@ fn a_sealed_expired_item_is_a_candidate_with_its_evidence() {
     assert!(measurement.logical_bytes.get() >= 4_196);
     assert!(measurement.charge.work_bytes >= measurement.logical_bytes);
     assert!(measurement.charge.work_bytes >= measurement.allocated_bytes);
-    // The estimate is the allocated size, and it is marked as not
-    // exclusive.
-    assert_eq!(measurement.estimate.bytes, measurement.allocated_bytes);
-    assert_eq!(measurement.estimate.measure, SizeMeasure::AllocatedBytes);
+    // On a volume that reports the private size, the estimate is the
+    // private allocated size; otherwise it is the allocated size. Neither
+    // is marked as exclusive. The files of the fixture have no clones, so
+    // the two sizes are equal.
+    if let Some(private) = measurement.private_allocated_bytes.value() {
+        assert_eq!(measurement.estimate.bytes, private);
+        assert_eq!(
+            measurement.estimate.measure,
+            SizeMeasure::PrivateAllocatedBytes
+        );
+        assert_eq!(private, measurement.allocated_bytes);
+    } else {
+        assert_eq!(measurement.estimate.bytes, measurement.allocated_bytes);
+        assert_eq!(measurement.estimate.measure, SizeMeasure::AllocatedBytes);
+    }
     assert!(!measurement.estimate.exclusive_storage_known);
 
     // The facts. Predicates 3, 9, and 10 belong to admission.

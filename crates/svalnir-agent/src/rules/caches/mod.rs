@@ -52,7 +52,7 @@ pub use inspect::{
     CacheInspection, CacheMeasurement, CacheRootReport, CacheUnitReport, InspectionHost,
     InspectionLimits, ReclaimFigure, RootOutcome, RootResolution, UnitOutcome, resolve,
 };
-pub(in crate::rules) use inspect::{measure_unit, measure_unit_observed};
+pub(in crate::rules) use inspect::{check_scope_root, measure_unit, measure_unit_observed};
 
 use super::registry::RegistryError;
 
@@ -252,7 +252,7 @@ pub const PNPM: CacheSpec = CacheSpec {
     reclaim: ReclaimBasis::LinkedIntoProjects,
     activity: &[ActivityCheck::ProducerProcessAbsent],
     rebuild_cost: RebuildCost::Medium,
-    owner_workflow: "Run `pnpm store prune` to remove the packages that no project refers to. Svalnir does not run it.",
+    owner_workflow: "Run `pnpm store prune` to remove the packages that no project refers to. Svalnir runs it only in a plan of `svalnir clean plan --mode owner` that you approve.",
     rebuild_impact: "A later install downloads each removed package again and needs a registry that is still available.",
 };
 
@@ -297,7 +297,7 @@ pub const YARN: CacheSpec = CacheSpec {
     reclaim: ReclaimBasis::AllocatedBytes,
     activity: &[ActivityCheck::ProducerProcessAbsent],
     rebuild_cost: RebuildCost::Medium,
-    owner_workflow: "Run `yarn cache clean` outside a project to clean the global cache. Svalnir does not run it. The cache of a project is outside this rule.",
+    owner_workflow: "Run `yarn cache clean` outside a project to clean the global cache. Svalnir runs it for Yarn 1 only in a plan of `svalnir clean plan --mode owner` that you approve. The cache of a project is outside this rule.",
     rebuild_impact: "A later install downloads each removed package again and needs a registry that is still available.",
 };
 
@@ -344,7 +344,7 @@ pub const GO: CacheSpec = CacheSpec {
     reclaim: ReclaimBasis::AllocatedBytes,
     activity: &[ActivityCheck::ProducerProcessAbsent],
     rebuild_cost: RebuildCost::Medium,
-    owner_workflow: "Run `go clean -cache` to remove the build cache. Svalnir does not run it. The module cache (`GOMODCACHE`) is outside this rule.",
+    owner_workflow: "Run `go clean -cache` to remove the build cache. Svalnir runs it only in a plan of `svalnir clean plan --mode owner` that you approve. The module cache (`GOMODCACHE`) is outside this rule.",
     rebuild_impact: "The next build compiles each package again, and the next test run runs each test again.",
 };
 
@@ -393,7 +393,7 @@ pub const UV: CacheSpec = CacheSpec {
         ActivityCheck::ProducerLock,
     ],
     rebuild_cost: RebuildCost::Medium,
-    owner_workflow: "Run `uv cache prune` to remove the entries that are not used, or `uv cache clean` to remove the cache. Svalnir does not run them.",
+    owner_workflow: "Run `uv cache prune` to remove the entries that are not used, or `uv cache clean` to remove the cache. Svalnir runs `uv cache prune` only in a plan of `svalnir clean plan --mode owner` that you approve.",
     rebuild_impact: "A later install downloads and builds each removed package again and needs an index that is still available.",
 };
 
@@ -565,6 +565,16 @@ impl CacheRule {
     pub(super) fn new(spec: &'static CacheSpec) -> Result<Self, RegistryError> {
         let rule: Rule = Checked::new(declaration(spec)?).map_err(RegistryError::Incomplete)?;
         Ok(Self { rule, spec })
+    }
+
+    /// The rule with the declaration `rule` in place of its own: the new
+    /// revision of a rule with an owner operation
+    /// ([`super::producers`]).
+    pub(super) fn with_rule(&self, rule: Rule) -> Self {
+        Self {
+            rule,
+            spec: self.spec,
+        }
     }
 
     /// The checked declaration of the rule revision.

@@ -407,6 +407,73 @@ fn walk_refusal(stop: &WalkStop) -> &'static str {
     }
 }
 
+/// The checks of the root of a cache at `path` as the scope of an owner
+/// operation, and its binding: the checks of an inspected root
+/// ([`CacheRule::inspect`]) with no unit. The root must have no protection,
+/// overlap no location of `exclusions`, be a local directory of the user
+/// with no symbolic link from `/`, overlap no user exclusion, and be in no
+/// project directory.
+///
+/// # Errors
+///
+/// Returns [`RootOutcome::Absent`] when nothing is at the path, and
+/// [`RootOutcome::Refused`] with the stable name of the first check that
+/// fails.
+pub(in crate::rules) fn check_scope_root(
+    exclusions: &[ExclusionSpec],
+    path: &Path,
+    host: &InspectionHost<'_>,
+    home: &Path,
+    mounts: &MountTable,
+) -> Result<crate::rules::eviction::BoundRoot, RootOutcome> {
+    let refused = RootOutcome::Refused;
+    match host.locations.of_text(path) {
+        ProtectionFact::NotProtected => {}
+        ProtectionFact::Protected => return Err(refused("root_protected")),
+        ProtectionFact::Unknown => return Err(refused("root_protection_unknown")),
+    }
+    if path == home || home.starts_with(path) {
+        return Err(refused("root_contains_home"));
+    }
+    for exclusion in exclusions {
+        let Some(excluded) = excluded_paths(exclusion, home, host.principal, mounts) else {
+            return Err(refused("exclusion_not_resolved"));
+        };
+        if excluded.iter().any(|entry| overlaps(path, entry)) {
+            return Err(refused("root_overlaps_excluded"));
+        }
+    }
+    match walk_local(path, mounts) {
+        Ok(_) => {}
+        Err(WalkStop::Absent) => return Err(RootOutcome::Absent),
+        Err(stop) => return Err(refused(walk_refusal(&stop))),
+    }
+    let bound = bind_root(path).map_err(|problem| match problem {
+        RootProblem::Absent => RootOutcome::Absent,
+        other => refused(other.as_str()),
+    })?;
+    let protected: Vec<PathBuf> = host
+        .locations
+        .state_directory()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    let scope: DiscoveryScope<'_> = DiscoveryScope {
+        root: &bound.binding,
+        principal: host.principal,
+        protected_paths: &protected,
+        user_exclusions: host.user_exclusions,
+    };
+    let view: RootView =
+        RootView::open(&scope, mounts).map_err(|error| refused(refusal_name(&error)))?;
+    if is_in_project(path, home) {
+        return Err(refused("root_in_project"));
+    }
+    view.verify_unchanged()
+        .map_err(|error| refused(refusal_name(&error)))?;
+    Ok(bound)
+}
+
 /// The context of the inspection of one rule.
 struct Inspector<'a> {
     spec: &'static CacheSpec,

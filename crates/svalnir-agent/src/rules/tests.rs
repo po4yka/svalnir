@@ -169,20 +169,22 @@ fn reference(id: &str, revision: &str) -> RuleRef {
 }
 
 #[test]
-fn the_registry_has_thirteen_rules_and_each_layout_is_proposed() {
+fn the_registry_has_eighteen_rules_and_each_layout_is_proposed() {
     let registry = ReviewedRules::new().unwrap();
     let rules = registry.rules();
     // The two rules of Milestone 2, the six cache rules,
     // `project.dependency-directory`, and the three rules of the owner
-    // tools, and `git.linked-worktree`.
-    assert_eq!(rules.len(), 13);
+    // tools, `git.linked-worktree`, and the five rules of
+    // `rules::producers` with their own declaration.
+    assert_eq!(rules.len(), 18);
     let statuses = registry.statuses();
     // One layout for each of the two rules, two for `pnpm.content-store`
     // and for `yarn.cache`, one for each other cache rule, 32 for
     // `project.dependency-directory` (the catalog and `user-configured`),
     // two for `simulator.devices` and for `container.build-cache`, and one
-    // for `homebrew.cleanup` and for `git.linked-worktree`.
-    assert_eq!(statuses.len(), 48);
+    // for `homebrew.cleanup` and for `git.linked-worktree`, and the layout
+    // of the scope root of each of the ten rules with an owner operation.
+    assert_eq!(statuses.len(), 58);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);

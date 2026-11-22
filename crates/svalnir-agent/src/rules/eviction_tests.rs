@@ -1006,8 +1006,50 @@ fn the_fresh_activity_check_reads_the_producer_state_now() {
     );
     // A rule that this build does not know.
     assert_eq!(
-        month_later().producer_activity(&RuleId::new("npm.content-cache").unwrap(), USER),
+        month_later().producer_activity(&RuleId::new("gradle.cache-inventory").unwrap(), USER),
         ProducerActivity::Unknown
+    );
+    // A rule with an owner operation reads the state of its producer.
+    let environment = month_later();
+    let npm = RuleId::new("npm.content-cache").unwrap();
+    assert_eq!(
+        environment.producer_activity(&npm, USER),
+        ProducerActivity::Inactive
+    );
+    environment.set_producer(ProducerProcesses::Running);
+    assert_eq!(
+        environment.producer_activity(&npm, USER),
+        ProducerActivity::Active
+    );
+}
+
+#[test]
+fn the_producer_inventory_matches_the_names_of_a_rule_with_an_owner_operation() {
+    use crate::rules::producer_processes;
+    let table = shell_and(Table::default());
+    assert_eq!(
+        producer_processes(&table, USER, &["uv", "python*"]),
+        ProducerProcesses::NotRunning
+    );
+    let table = table.with(101, USER, "/opt/homebrew/bin/python3.15");
+    assert_eq!(
+        producer_processes(&table, USER, &["uv", "python*"]),
+        ProducerProcesses::Running
+    );
+    assert_eq!(
+        producer_processes(&table, USER, &["python"]),
+        ProducerProcesses::NotRunning
+    );
+    // A process of a different user is not a process of the producer.
+    let other = shell_and(Table::default()).with(102, OTHER_USER, "/usr/local/bin/uv");
+    assert_eq!(
+        producer_processes(&other, USER, &["uv"]),
+        ProducerProcesses::NotRunning
+    );
+    // An inventory with no process is a failed query.
+    assert_eq!(
+        producer_processes(&Table::default(), USER, &["uv"]),
+        ProducerProcesses::Unknown
     );
 }
 

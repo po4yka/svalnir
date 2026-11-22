@@ -48,6 +48,9 @@ mod evict_tests;
 mod intervention_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
+mod owner_tests;
+#[cfg(test)]
+#[cfg(target_os = "macos")]
 mod parity_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]

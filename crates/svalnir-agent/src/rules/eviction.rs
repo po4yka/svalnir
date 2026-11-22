@@ -374,10 +374,56 @@ pub fn automatic_roots(
 /// `docs/CLEANUP_RULES.md` section 6. Each other such process makes the
 /// evidence [`ProducerProcesses::Unknown`].
 pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvidence {
-    let unknown = |observed_at: MonotonicNanos| XcodeEvidence {
-        producer_processes: ProducerProcesses::Unknown,
+    let (observed_at, names) = executable_names(source, principal);
+    XcodeEvidence {
+        producer_processes: names.map_or(ProducerProcesses::Unknown, |names| {
+            ProducerProcesses::from_complete_inventory(names.iter().map(String::as_str))
+        }),
         observed_at,
-    };
+    }
+}
+
+/// Whether a process of `principal` runs an executable whose file name is
+/// in `names`, from one complete inventory of the process table, as
+/// [`xcode_evidence`] reads it. A name that ends with `*` matches each
+/// file name with the text before it as a prefix. An inventory that is not
+/// complete, or that has no process, gives [`ProducerProcesses::Unknown`].
+pub fn producer_processes<S: ProcessSource>(
+    source: &S,
+    principal: Uid,
+    names: &[&str],
+) -> ProducerProcesses {
+    let (_, found) = executable_names(source, principal);
+    match found {
+        None => ProducerProcesses::Unknown,
+        Some(found) if found.is_empty() => ProducerProcesses::Unknown,
+        Some(found) => {
+            if found.iter().any(|name| matches_any(name, names)) {
+                ProducerProcesses::Running
+            } else {
+                ProducerProcesses::NotRunning
+            }
+        }
+    }
+}
+
+/// Whether the file name `name` is one of `names`, with a trailing `*` as
+/// a prefix match.
+fn matches_any(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|wanted| match wanted.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == *wanted,
+    })
+}
+
+/// The file names of the executables of the processes of `principal`, with
+/// the time before the first query. `None` when the inventory is not
+/// complete; see [`xcode_evidence`].
+fn executable_names<S: ProcessSource>(
+    source: &S,
+    principal: Uid,
+) -> (MonotonicNanos, Option<Vec<String>>) {
+    let unknown = |observed_at: MonotonicNanos| (observed_at, None);
     let Ok(observed_at) = source.monotonic_now() else {
         return unknown(MonotonicNanos::new(0));
     };
@@ -424,12 +470,7 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
             Err(_) => return unknown(observed_at),
         }
     }
-    XcodeEvidence {
-        producer_processes: ProducerProcesses::from_complete_inventory(
-            names.iter().map(String::as_str),
-        ),
-        observed_at,
-    }
+    (observed_at, Some(names))
 }
 
 /// What a discovery needs from its environment beside the filesystem: the
@@ -464,6 +505,9 @@ pub trait DiscoveryEnvironment: ScanClock {
     /// caller:
     ///
     /// - `xcode.inactive-derived-data`: the process inventory.
+    /// - A rule with an owner operation ([`super::producers`]): the
+    ///   process inventory, for the executable names of the producer of the
+    ///   rule ([`DiscoveryEnvironment::producer_processes`]).
     /// - `svalnir.expired-temporary`: the use leases, which this build
     ///   does not record, so the activity is not known.
     /// - A rule that this build does not know: not known.
@@ -477,6 +521,13 @@ pub trait DiscoveryEnvironment: ScanClock {
         if rule.as_str() == PROJECT_RULE_ID {
             return ProducerActivity::Inactive;
         }
+        if let Some(names) = super::producers::producer_process_names(rule.as_str()) {
+            return match self.producer_processes(principal, names) {
+                ProducerProcesses::NotRunning => ProducerActivity::Inactive,
+                ProducerProcesses::Running => ProducerActivity::Active,
+                ProducerProcesses::Unknown => ProducerActivity::Unknown,
+            };
+        }
         if rule.as_str() != XCODE_DERIVED_DATA_RULE_ID {
             return ProducerActivity::Unknown;
         }
@@ -485,6 +536,13 @@ pub trait DiscoveryEnvironment: ScanClock {
             ProducerProcesses::Running => ProducerActivity::Active,
             ProducerProcesses::Unknown => ProducerActivity::Unknown,
         }
+    }
+
+    /// Whether a process of `principal` runs an executable of `names` now
+    /// ([`producer_processes`]). An environment with no process evidence
+    /// gives [`ProducerProcesses::Unknown`], which inhibits the step.
+    fn producer_processes(&self, _principal: Uid, _names: &[&str]) -> ProducerProcesses {
+        ProducerProcesses::Unknown
     }
 
     /// The build processes of `principal`, read now, for
@@ -562,6 +620,10 @@ impl<S: ProcessSource> DiscoveryEnvironment for SourceEnvironment<S> {
 
     fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory {
         inventory_of(&self.0, principal, scopes)
+    }
+
+    fn producer_processes(&self, principal: Uid, names: &[&str]) -> ProducerProcesses {
+        producer_processes(&self.0, principal, names)
     }
 
     fn build_processes(&self, principal: Uid) -> BuildProcesses {

@@ -37,7 +37,7 @@ use crate::executor::process::{
 };
 use crate::rules::ProducerActivity;
 use crate::rules::in_use::UnitUse;
-use crate::rules::projects::UnitRecheck;
+use crate::rules::projects::{UNIT_ABSENT, UnitRecheck};
 
 /// The result of one unit of work on the active operation.
 #[derive(Debug)]
@@ -773,7 +773,51 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             UnitRecheck::Passed => None,
             UnitRecheck::Refused(code) => Some((code, ErrorFamily::Eligibility)),
             UnitRecheck::Unknown(code) => Some((code, ErrorFamily::Evidence)),
+            UnitRecheck::Absent => Some((UNIT_ABSENT, ErrorFamily::Evidence)),
         }
+    }
+
+    /// Ends a file step that a check before the call refused, with no
+    /// call. A unit that is gone has the result `AlreadyAbsent`, as a
+    /// target that the executor finds absent; each other refusal is a
+    /// skipped target with its error.
+    fn end_refused(
+        &mut self,
+        active: &mut Active,
+        step: &PlannedStep,
+        (charge, charged): (Option<WorkCharge>, bool),
+        code: &str,
+        family: ErrorFamily,
+    ) -> Result<(), Fault> {
+        if code != UNIT_ABSENT {
+            let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
+            return self.end_without_call(
+                active,
+                step,
+                charge,
+                charged,
+                StopReason::TargetSkipped,
+                Some(error),
+            );
+        }
+        if charged {
+            self.ledger
+                .refund(&mut active.hold, charge)
+                .map_err(|_| Fault)?;
+        }
+        let result: TargetResult = Checked::new(TargetResultRecord {
+            target_id: step.target_id.clone(),
+            member: None,
+            dispatch: DispatchState::NotSubmitted,
+            effect: TargetEffect::AlreadyAbsent,
+            evidence: EffectEvidence::none(),
+            attribution: Attribution::NotApplicable,
+            durability: Durability::Durable,
+            stop_reason: StopReason::Completed,
+            failure: None,
+        })
+        .map_err(|_| Fault)?;
+        self.record(active, &step.step_id, &Change::Settle(vec![result]))
     }
 
     fn advance_filesystem(
@@ -856,15 +900,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             });
             let refusal = refusal.or_else(|| self.rule_recheck(rule, &file));
             if let Some((code, family)) = refusal {
-                let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
-                self.end_without_call(
-                    active,
-                    step,
-                    charge,
-                    charged,
-                    StopReason::TargetSkipped,
-                    Some(error),
-                )?;
+                self.end_refused(active, step, (charge, charged), code, family)?;
                 return Ok(StepEnd::Next);
             }
         }

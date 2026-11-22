@@ -363,6 +363,12 @@ impl WorktreeRule {
             }
             inspection.roots.push(report);
         }
+        // A root that the request left out is not walked twice.
+        inspection
+            .roots
+            .extend(roots.dropped().iter().map(|(entry, reason)| {
+                SearchRootReport::of(entry, Some(home), SearchRootOutcome::Covered(reason))
+            }));
         inspection.repositories = walker.repositories;
         inspection
     }

@@ -91,10 +91,11 @@ pub(in crate::rules) use discover::ProjectDiscoveryInput;
 pub use discover::{EnvironmentEvidence, ProjectRequest, examined_for};
 pub(in crate::rules) use inspect::open_search_root;
 pub use inspect::{
-    ArgumentRootError, GitAvailability, MAX_PROJECT_ROOTS, MAX_SEARCH_ROOTS, ProjectActivity,
-    ProjectHost, ProjectInspection, ProjectLimits, ProjectUnitOutcome, ProjectUnitReport,
-    RecheckInput, RootKind, RootSource, SearchCompletion, SearchRootEntry, SearchRootOutcome,
-    SearchRootReport, SearchRoots, UnitRecheck, VersionControl, argument_root, recheck_unit,
+    ArgumentRootError, GitAvailability, IN_SEARCH_ROOT, MAX_PROJECT_ROOTS, MAX_SEARCH_ROOTS,
+    ProjectActivity, ProjectHost, ProjectInspection, ProjectLimits, ProjectUnitOutcome,
+    ProjectUnitReport, REPEATED_ROOT, RecheckInput, RootKind, RootSource, SearchCompletion,
+    SearchRootEntry, SearchRootOutcome, SearchRootReport, SearchRoots, UNIT_ABSENT, UnitRecheck,
+    VersionControl, argument_root, recheck_unit,
 };
 pub use layouts::{
     DirectoryName, MarkerKind, PROJECT_LAYOUT_COUNT, PROJECT_LAYOUTS, PackageCheckouts,

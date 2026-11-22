@@ -42,10 +42,15 @@ fn an_argument_root_is_an_existing_directory_below_the_home_directory() {
         argument_root(&home.path.join("Code/app"), &home.path),
         Ok(PathBuf::from("Code/app"))
     );
-    // `.` and `..` are applied to the text.
+    // A `.` is removed; a `..` is refused, also when the text stays below
+    // the home directory.
     assert_eq!(
-        argument_root(&home.path.join("Code/./app/../app"), &home.path),
+        argument_root(&home.path.join("Code/./app"), &home.path),
         Ok(PathBuf::from("Code/app"))
+    );
+    assert_eq!(
+        argument_root(&home.path.join("Code/app/../app"), &home.path),
+        Err(ArgumentRootError::NotPlain)
     );
     assert_eq!(
         argument_root(Path::new("Code"), &home.path),
@@ -57,7 +62,7 @@ fn an_argument_root_is_an_existing_directory_below_the_home_directory() {
     );
     assert_eq!(
         argument_root(&home.path.join("Code/.."), &home.path),
-        Err(ArgumentRootError::NotBelowHome)
+        Err(ArgumentRootError::NotPlain)
     );
     assert_eq!(
         argument_root(Path::new("/usr"), &home.path),
@@ -136,6 +141,99 @@ fn the_roots_of_a_request_have_no_repeated_root_and_no_covered_project_root() {
         .map(|index| entry(&format!("r{index}"), RootKind::Search, RootSource::Argument))
         .collect();
     assert_eq!(SearchRoots::with_entries(many), Err(None));
+    let reasons: Vec<(&Path, &str)> = roots
+        .dropped()
+        .iter()
+        .map(|(entry, reason)| (entry.relative.as_path(), *reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (Path::new("Code"), super::REPEATED_ROOT),
+            (Path::new("Code/app"), super::IN_SEARCH_ROOT),
+            (Path::new("Other/app"), super::REPEATED_ROOT),
+        ]
+    );
+}
+
+#[test]
+fn a_search_root_in_another_search_root_is_left_out_in_each_order() {
+    for order in [["Code", "code/app"], ["Code/app", "Code"]] {
+        let roots = SearchRoots::with_entries(
+            order
+                .iter()
+                .map(|path| entry(path, RootKind::Search, RootSource::Argument))
+                .collect(),
+        )
+        .unwrap();
+        let kept: Vec<&Path> = roots
+            .entries()
+            .iter()
+            .map(|entry| entry.relative.as_path())
+            .collect();
+        assert_eq!(kept, [Path::new("Code")], "{order:?}");
+        assert_eq!(roots.dropped()[0].1, super::IN_SEARCH_ROOT);
+    }
+    // The walk of the kept root finds each unit one time, and the report
+    // names the root that was left out.
+    let world = World::new();
+    world.home.node_project("app");
+    let roots = SearchRoots::with_entries(vec![
+        entry("Code/app", RootKind::Search, RootSource::Argument),
+        entry("Code", RootKind::Search, RootSource::Configuration),
+    ])
+    .unwrap();
+    let head = GitHeadActivity::new(Ok(&world.home.git));
+    let discovery =
+        world.discover_with(&roots, false, &head, &NoActivity, &RuleMode::ManualEviction);
+    assert_eq!(eligible(&discovery).len(), 1);
+    assert!(discovery.complete);
+    assert_eq!(
+        discovery.project_roots[1].outcome,
+        super::SearchRootOutcome::Covered(super::IN_SEARCH_ROOT)
+    );
+}
+
+#[test]
+fn an_excluded_location_refuses_a_root_whose_case_differs() {
+    let world = World::new();
+    world.home.node_project("app");
+    fs::create_dir_all(world.home.path.join("Documents/work")).unwrap();
+    let mut host = world.host();
+    host.user_exclusions = vec![world.home.path.join("Documents")];
+    let head = GitHeadActivity::new(Ok(&world.home.git));
+    let request = ProjectRequest {
+        roots: &SearchRoots::new(vec![PathBuf::from("documents/work"), PathBuf::from("Code")])
+            .unwrap(),
+        git: Ok(&world.home.git),
+        recency: RecencyHost {
+            quiet_period: DAY,
+            head: &head,
+            transcripts: &NoActivity,
+            agents: &NoActivity,
+        },
+        layouts: &[],
+        include_active: false,
+        limits: ProjectLimits::default(),
+    };
+    let discovery = world.registry.discover_for_eviction(
+        &EvictionRequest {
+            host: &host,
+            purpose: &RuleMode::ManualEviction,
+            rules: None,
+            volumes: None,
+            known: None,
+            limits: DiscoveryLimits::default(),
+            cancel: &CancellationToken::new(),
+            projects: Some(&request),
+        },
+        &world.evidence,
+    );
+    assert_eq!(
+        discovery.project_roots[0].outcome,
+        super::SearchRootOutcome::Refused("root_excluded")
+    );
+    assert_eq!(eligible(&discovery).len(), 1);
 }
 
 // ---------------------------------------------------------------------
@@ -733,6 +831,7 @@ fn the_check_before_a_step_refuses_a_unit_that_changed_after_the_plan() {
     );
     // A layout of the configuration that the configuration in effect does
     // not have.
+    home.write("Code/x/out/a", b"x");
     assert_eq!(
         recheck(
             &home,
@@ -783,6 +882,20 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
     assert_eq!(
         evidence.unit_recheck(home.principal, &project_rule, None, &root, &modules, &[]),
         UnitRecheck::Unknown("unit_layout_unknown")
+    );
+    // A unit that is gone is absent, not refused.
+    evidence.set_build_process(None);
+    fs::remove_dir_all(&modules).unwrap();
+    assert_eq!(
+        evidence.unit_recheck(
+            home.principal,
+            &project_rule,
+            Some("node-modules"),
+            &root,
+            &modules,
+            &[]
+        ),
+        UnitRecheck::Absent
     );
     // Another rule has no such check.
     let xcode = svalnir_core::rule::RuleRef {

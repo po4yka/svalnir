@@ -99,9 +99,20 @@ pub struct SearchRootEntry {
 }
 
 /// The roots of one request, each relative to the home directory: the
-/// search roots, then the project roots.
+/// search roots, then the project roots, and the roots that the request
+/// left out, each with its reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchRoots(Vec<SearchRootEntry>);
+pub struct SearchRoots {
+    entries: Vec<SearchRootEntry>,
+    dropped: Vec<(SearchRootEntry, &'static str)>,
+}
+
+/// The reason of a root that has the path of an earlier root.
+pub const REPEATED_ROOT: &str = "repeated_root";
+
+/// The reason of a root that is in a search root of the request: the walk
+/// of that search root examines it.
+pub const IN_SEARCH_ROOT: &str = "in_search_root";
 
 impl SearchRoots {
     /// The search roots `relative`, from the caller.
@@ -120,7 +131,7 @@ impl SearchRoots {
                 return Err(Some(path.clone()));
             }
         }
-        Ok(Self(
+        Self::with_entries(
             relative
                 .into_iter()
                 .map(|relative| SearchRootEntry {
@@ -129,15 +140,17 @@ impl SearchRoots {
                     source: RootSource::Caller,
                 })
                 .collect(),
-        ))
+        )
     }
 
     /// The roots of `entries`, in their sequence, with the search roots
-    /// before the project roots.
+    /// before the project roots, so that no directory is walked twice.
     ///
-    /// A root with the path of an earlier root of the same kind is left out,
-    /// and so is a project root that is a search root or is below one: the
-    /// walk of the search root examines it.
+    /// The comparisons ignore the case of ASCII letters. A root with the
+    /// path of an earlier root is left out ([`REPEATED_ROOT`]), and so is
+    /// a search root below another search root, and a project root that is
+    /// a search root or is below one ([`IN_SEARCH_ROOT`]).
+    /// [`SearchRoots::dropped`] has each root that is left out.
     ///
     /// # Errors
     ///
@@ -154,38 +167,70 @@ impl SearchRoots {
         let (search, projects): (Vec<SearchRootEntry>, Vec<SearchRootEntry>) = entries
             .into_iter()
             .partition(|entry| entry.kind == RootKind::Search);
-        let mut kept: Vec<SearchRootEntry> = Vec::new();
+        let same = |left: &Path, right: &Path| is_within(left, right) && is_within(right, left);
+        let mut dropped: Vec<(SearchRootEntry, &'static str)> = Vec::new();
+        let mut unique: Vec<SearchRootEntry> = Vec::new();
         for entry in search {
-            if !kept.iter().any(|known| known.relative == entry.relative) {
-                kept.push(entry);
+            if unique
+                .iter()
+                .any(|known| same(&known.relative, &entry.relative))
+            {
+                dropped.push((entry, REPEATED_ROOT));
+            } else {
+                unique.push(entry);
+            }
+        }
+        let mut kept: Vec<SearchRootEntry> = Vec::new();
+        for (index, entry) in unique.iter().enumerate() {
+            let nested: bool = unique.iter().enumerate().any(|(other, known)| {
+                other != index && is_within(&entry.relative, &known.relative)
+            });
+            if nested {
+                dropped.push((entry.clone(), IN_SEARCH_ROOT));
+            } else {
+                kept.push(entry.clone());
             }
         }
         let searches: usize = kept.len();
         for entry in projects {
-            let covered: bool = kept.iter().any(|known| {
-                (known.kind == RootKind::Search && entry.relative.starts_with(&known.relative))
-                    || known.relative == entry.relative
-            });
-            if !covered {
+            if kept.iter().any(|known| {
+                known.kind == RootKind::Search && is_within(&entry.relative, &known.relative)
+            }) {
+                dropped.push((entry, IN_SEARCH_ROOT));
+            } else if kept
+                .iter()
+                .any(|known| same(&known.relative, &entry.relative))
+            {
+                dropped.push((entry, REPEATED_ROOT));
+            } else {
                 kept.push(entry);
             }
         }
         if searches > MAX_SEARCH_ROOTS || kept.len() - searches > MAX_PROJECT_ROOTS {
             return Err(None);
         }
-        Ok(Self(kept))
+        Ok(Self {
+            entries: kept,
+            dropped,
+        })
     }
 
     /// The roots, in their sequence.
     #[must_use]
     pub fn entries(&self) -> &[SearchRootEntry] {
-        &self.0
+        &self.entries
+    }
+
+    /// The roots that the request left out, each with its reason.
+    #[must_use]
+    pub fn dropped(&self) -> &[(SearchRootEntry, &'static str)] {
+        &self.dropped
     }
 
     /// Whether the request has no root.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -195,6 +240,8 @@ impl SearchRoots {
 pub enum ArgumentRootError {
     /// The path is not absolute.
     NotAbsolute,
+    /// The path has a `..` component.
+    NotPlain,
     /// The path is not below the home directory, or it is the home
     /// directory.
     NotBelowHome,
@@ -211,6 +258,7 @@ impl ArgumentRootError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotAbsolute => "search_root_not_absolute",
+            Self::NotPlain => "search_root_not_plain",
             Self::NotBelowHome => "search_root_not_below_home",
             Self::NotFound => "search_root_not_found",
             Self::NotDirectory => "search_root_not_directory",
@@ -218,31 +266,32 @@ impl ArgumentRootError {
     }
 }
 
-/// The path `path` with each `.` component removed and each `..` component
-/// applied to the component before it, with no call on the filesystem.
-fn lexical(path: &Path) -> PathBuf {
+/// The path `path` with each `.` component removed, or `None` when it has a
+/// `..` component. A `..` is not applied to the text: after a symbolic link
+/// it names a different directory than the text shows, so the argument is
+/// refused (fail closed).
+fn without_current(path: &Path) -> Option<PathBuf> {
     let mut result: PathBuf = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
+            std::path::Component::ParentDir => return None,
             other => result.push(other),
         }
     }
-    result
+    Some(result)
 }
 
 /// The search root of a `--root PATH` argument, relative to the home
 /// directory `home` (with its symbolic links resolved).
 ///
 /// `path` is absolute: the caller resolved a relative argument against the
-/// invocation directory. The `.` and `..` components are applied to the
-/// text. A path whose text is not below `home` is compared again in its
-/// resolved form, so that `/var` and `/private/var` name one directory.
-/// The root must be a directory below the home directory; the walk then
-/// makes each check of a search root (`docs/CLEANUP_RULES.md` section 4).
+/// invocation directory. A `.` component is removed, and a path with a
+/// `..` component is refused. A path whose text is not below `home` is
+/// compared again in its resolved form, so that `/var` and `/private/var`
+/// name one directory. The root must be a directory below the home
+/// directory; the walk then makes each check of a search root
+/// (`docs/CLEANUP_RULES.md` section 4).
 ///
 /// # Errors
 ///
@@ -251,7 +300,7 @@ pub fn argument_root(path: &Path, home: &Path) -> Result<PathBuf, ArgumentRootEr
     if !path.is_absolute() {
         return Err(ArgumentRootError::NotAbsolute);
     }
-    let mut absolute: PathBuf = lexical(path);
+    let mut absolute: PathBuf = without_current(path).ok_or(ArgumentRootError::NotPlain)?;
     if !absolute.starts_with(home) {
         absolute = match fs::canonicalize(&absolute) {
             Ok(resolved) => resolved,
@@ -358,6 +407,10 @@ pub enum SearchRootOutcome {
     Absent,
     /// The root failed a check. The reason is a stable name.
     Refused(&'static str),
+    /// The request left the root out, because another root of the request
+    /// examines it ([`REPEATED_ROOT`] or [`IN_SEARCH_ROOT`]). It was not
+    /// walked.
+    Covered(&'static str),
 }
 
 /// The report of one search root.
@@ -798,9 +851,25 @@ fn is_skipped(name: &OsStr) -> bool {
     })
 }
 
-/// Whether one path is the other path or is below it, by component.
+/// Whether one path is the other path or is below it, by component, with
+/// the case of ASCII letters ignored: a volume that ignores case finds
+/// `~/documents` for `~/Documents`, so the exclusion check fails closed.
 fn overlaps(first: &Path, second: &Path) -> bool {
-    first.starts_with(second) || second.starts_with(first)
+    is_within(first, second) || is_within(second, first)
+}
+
+/// Whether `path` is `directory` or is below it, by component, with the
+/// case of ASCII letters ignored.
+pub(super) fn is_within(path: &Path, directory: &Path) -> bool {
+    let mut components = path.components();
+    directory.components().all(|expected| {
+        components.next().is_some_and(|found| {
+            found
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
+        })
+    })
 }
 
 /// The checks of the search root at `path`, and its path with the stored
@@ -824,10 +893,14 @@ pub(in crate::rules) fn open_search_root(
         ProtectionFact::Protected => return Err(refused("root_protected")),
         ProtectionFact::Unknown => return Err(refused("root_protection_unknown")),
     }
-    if user_exclusions
-        .iter()
-        .any(|excluded| path.starts_with(excluded))
-    {
+    // The comparison ignores the case of ASCII letters, and it is made
+    // again with the stored names below.
+    let is_excluded = |path: &Path| {
+        user_exclusions
+            .iter()
+            .any(|excluded| is_within(path, excluded))
+    };
+    if is_excluded(path) {
         return Err(refused("root_excluded"));
     }
     let snapshot: ObjectSnapshot = match walk_local(path, mounts) {
@@ -844,7 +917,14 @@ pub(in crate::rules) fn open_search_root(
     if snapshot.owner != principal {
         return Err(refused("root_owner"));
     }
-    Ok((stored_case(path), snapshot))
+    let stored: PathBuf = stored_case(path);
+    if locations.of_text(&stored) != ProtectionFact::NotProtected {
+        return Err(refused("root_protected"));
+    }
+    if is_excluded(&stored) {
+        return Err(refused("root_excluded"));
+    }
+    Ok((stored, snapshot))
 }
 
 /// The path with the names that the filesystem stores, when they differ
@@ -961,6 +1041,9 @@ impl ProjectRule {
                     reports.push(inspector.root(entry));
                 }
                 units = inspector.units;
+                reports.extend(roots.dropped().iter().map(|(entry, reason)| {
+                    SearchRootReport::of(entry, Some(home), SearchRootOutcome::Covered(reason))
+                }));
             }
         }
         ProjectInspection {
@@ -1091,7 +1174,7 @@ impl Inspector<'_> {
                         .host
                         .user_exclusions
                         .iter()
-                        .any(|excluded| child.starts_with(excluded))
+                        .any(|excluded| is_within(&child, excluded))
                 {
                     continue;
                 }
@@ -1616,7 +1699,13 @@ pub enum UnitRecheck {
     Refused(&'static str),
     /// The evidence of a check is not known. The name is a stable code.
     Unknown(&'static str),
+    /// The unit is gone. The coordinator records it as a target that is
+    /// already absent ([`UNIT_ABSENT`]), not as a skipped target.
+    Absent,
 }
+
+/// The stable code of a unit that is gone at the check before its step.
+pub const UNIT_ABSENT: &str = "unit_absent";
 
 /// The inputs of [`recheck_unit`].
 #[derive(Debug, Clone, Copy)]
@@ -1653,6 +1742,10 @@ pub struct RecheckInput<'a> {
 /// the executor examine the unit before and during the removal.
 #[must_use]
 pub fn recheck_unit(input: &RecheckInput<'_>) -> UnitRecheck {
+    match fs::symlink_metadata(input.unit) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return UnitRecheck::Absent,
+        _ => {}
+    }
     let layouts: Vec<Layout<'_>> = catalog(input.user_layouts);
     let mut first: Option<UnitRecheck> = None;
     let mut found: bool = false;
@@ -1717,6 +1810,7 @@ fn recheck_layout(
     }
     if let Err((reason, _)) = unit_shape(input.principal, layout, project, &names, input.unit) {
         return match reason {
+            UNIT_ABSENT => UnitRecheck::Absent,
             "project_not_readable" | "unit_not_readable" | "protected_child_unknown" => {
                 UnitRecheck::Unknown(reason)
             }

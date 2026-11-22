@@ -244,6 +244,7 @@ fn outcome_label(outcome: &SearchRootOutcome) -> String {
             .unwrap_or_else(|| "examined".to_owned()),
         SearchRootOutcome::Absent => "absent".to_owned(),
         SearchRootOutcome::Refused(reason) => format!("refused: {reason}"),
+        SearchRootOutcome::Covered(reason) => format!("left out: {reason}"),
     }
 }
 

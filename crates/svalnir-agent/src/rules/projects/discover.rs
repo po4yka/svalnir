@@ -171,7 +171,8 @@ const fn completion_of(outcome: &SearchRootOutcome) -> DiscoveryCompletion {
             SearchCompletion::Complete | SearchCompletion::DepthLimitReached,
         )
         | SearchRootOutcome::Absent
-        | SearchRootOutcome::Refused(_) => DiscoveryCompletion::Finished,
+        | SearchRootOutcome::Refused(_)
+        | SearchRootOutcome::Covered(_) => DiscoveryCompletion::Finished,
         SearchRootOutcome::Examined(
             SearchCompletion::DirectoryLimitReached | SearchCompletion::UnitLimitReached,
         ) => DiscoveryCompletion::UnitLimitReached,
@@ -221,9 +222,12 @@ impl ProjectRule {
             false,
         );
         let mounts: Option<MountTable> = (input.mounts)().ok();
+        // A root that the request left out has no result: another root of
+        // the request examines its units.
         let results: Vec<ProjectRootResult> = inspection
             .roots
             .iter()
+            .filter(|report| !matches!(report.outcome, SearchRootOutcome::Covered(_)))
             .map(|report| {
                 let units: Vec<&ProjectUnitReport> = inspection
                     .units
@@ -260,7 +264,9 @@ impl ProjectRule {
                 result.result = RootResult::Refused(reason);
                 return result;
             }
-            (SearchRootOutcome::Examined(_), None) => return result,
+            (SearchRootOutcome::Examined(_), None) | (SearchRootOutcome::Covered(_), _) => {
+                return result;
+            }
         };
         let bound: BoundRoot = match bind_root(&path) {
             Ok(bound) => bound,
@@ -451,10 +457,19 @@ impl ProjectRule {
     ) {
         let rule = self.rule();
         let required: Nanoseconds = rule.retention.minimum_age.max(rule.activity.quiescence);
-        let newest: Option<WallTime> = before.modified().map(|modified| {
+        // The modification and the status change of the unit itself, and
+        // the newest change of an object below it. A time that is not known
+        // leaves the age unknown.
+        let changed: Option<WallTime> = u32::try_from(before.stamp.changed_nanoseconds)
+            .ok()
+            .and_then(|nanoseconds| {
+                WallTime::from_unix(before.stamp.changed_seconds, nanoseconds).ok()
+            });
+        let newest: Option<WallTime> = before.modified().zip(changed).map(|(modified, changed)| {
+            let own: WallTime = modified.max(changed);
             assessment
                 .newest_content_change
-                .map_or(modified, |content| content.max(modified))
+                .map_or(own, |content| content.max(own))
         });
         let mut inactive_for: Option<Nanoseconds> = None;
         let age: Fact = match (newest, now) {

@@ -360,6 +360,51 @@ fn a_unit_of_a_layout_of_the_configuration_is_planned_and_checked_with_that_layo
 }
 
 #[test]
+fn a_symbolic_link_in_a_unit_is_removed_and_its_target_stays() {
+    let world = World::manual();
+    let app: PathBuf = world.node_project("app");
+    world.write(
+        "Code/app/node_modules/tool/cli.js",
+        b"#!/usr/bin/env node\n",
+    );
+    std::fs::create_dir_all(app.join("node_modules/.bin")).unwrap();
+    std::os::unix::fs::symlink("../tool/cli.js", app.join("node_modules/.bin/tool")).unwrap();
+    // A link to a directory outside the home directory.
+    let outside: PathBuf = world.directory.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, app.join("node_modules/linked")).unwrap();
+    let (plan_id, result) = world.planned();
+    assert_eq!(target_paths(&result), [text(&app.join("node_modules"))]);
+    let applied = world.apply(&plan_id);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(!app.join("node_modules").exists());
+    assert!(std::fs::symlink_metadata(app.join("node_modules")).is_err());
+    // The target of the link outside the unit stays with its content.
+    assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn a_unit_that_is_gone_at_its_step_is_already_absent_and_not_skipped() {
+    let world = World::manual();
+    let app: PathBuf = world.node_project("app");
+    let (plan_id, _) = world.planned();
+    std::fs::remove_dir_all(app.join("node_modules")).unwrap();
+    let applied = world.apply(&plan_id);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(
+        !applied.stdout.contains("unit_absent"),
+        "{}",
+        applied.stdout
+    );
+    assert!(
+        applied.stdout.contains("AlreadyAbsent"),
+        "{}",
+        applied.stdout
+    );
+}
+
+#[test]
 fn a_build_process_after_the_plan_skips_the_step() {
     let world = World::manual();
     let app: PathBuf = world.node_project("app");
@@ -444,7 +489,14 @@ fn the_project_options_are_checked_before_a_directory_is_read() {
         .to_owned();
     std::fs::create_dir_all(&outside).unwrap();
     let missing: String = world.home.join("Code/missing").to_str().unwrap().to_owned();
-    let cases: [(&[&str], ExitStatus, &str); 4] = [
+    // A `..` component is refused, also when the text stays below home.
+    let parent: String = world.home.join("Code/../Code").to_str().unwrap().to_owned();
+    let cases: [(&[&str], ExitStatus, &str); 5] = [
+        (
+            &["--root", &parent],
+            ExitStatus::Usage,
+            "invalid_search_root",
+        ),
         (
             &["--root", &outside],
             ExitStatus::Usage,

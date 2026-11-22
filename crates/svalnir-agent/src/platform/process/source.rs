@@ -401,6 +401,22 @@ pub trait ProcessSource {
         let _ = (pid, max_bytes);
         Err(QueryFailure::Unsupported)
     }
+
+    /// Whether the running code of the process is an Apple platform
+    /// binary: its dynamic code signature is valid for the requirement
+    /// `anchor apple`, and its signing information has a platform
+    /// identifier (code signed as part of an operating system release).
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the signature cannot be examined. A
+    /// failure is not evidence either way.
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        let _ = pid;
+        Err(QueryFailure::Unsupported)
+    }
 }
 
 #[cfg(test)]

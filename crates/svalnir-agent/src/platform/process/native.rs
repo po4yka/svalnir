@@ -23,6 +23,7 @@
 //! | File of a descriptor | `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` |
 //! | Mapped files | `proc_pidinfo(PROC_PIDREGIONPATHINFO2)`, confirmed with `PROC_PIDREGIONPATHINFO`, one region per call |
 //! | Arguments | `sysctl(CTL_KERN, KERN_PROCARGS2)`; the environment is not read |
+//! | Apple platform code | `SecCodeCopyGuestWithAttributes(kSecGuestAttributePid)`, `SecCodeCheckValidity` with `anchor apple`, `kSecCodeInfoPlatformIdentifier` |
 //! | Owner of a denied process | `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` |
 //!
 //! `responsibility_get_pid_responsible_for_pid` is not in the public SDK.
@@ -41,6 +42,7 @@ use std::time::SystemTime;
 static FIRST_APPLICATION_LIST: AtomicBool = AtomicBool::new(true);
 
 use objc2::rc::autoreleasepool;
+use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType};
 
 use crate::platform::run_loop;
 use objc2_app_kit::NSWorkspace;
@@ -820,12 +822,20 @@ pub(super) fn parse_procargs(buffer: &[u8], complete: bool) -> Result<RawArgumen
 /// can also come from a kernel that does not know the flavor, so it is
 /// confirmed with the public flavor [`PROC_PIDREGIONPATHINFO`].
 fn mapped_file_paths(pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+    // SAFETY: of the result, not of memory (owner decision of 2026-11-22).
+    // The private flavor is kept because the public flavor walks each
+    // region, also each region with no file, and made the inventory of one
+    // host take 9 s instead of 0.3 s; both flavors gave the same paths for
+    // each of its 1079 processes. A kernel that does not know the private
+    // flavor fails the call or gives no region. For each failure other
+    // than an exit, and for a result with no path, the public flavor reads
+    // the regions again, so the private flavor can only add speed and
+    // never removes a path from the result. The buffer and its layout are
+    // the same for the two flavors.
     match mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO2) {
         Ok(found) if !found.paths.is_empty() || found.truncated => Ok(found),
-        Ok(_) | Err(QueryFailure::Unsupported) => {
-            mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO)
-        }
-        Err(failure) => Err(failure),
+        Err(QueryFailure::Gone) => Err(QueryFailure::Gone),
+        Ok(_) | Err(_) => mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO),
     }
 }
 
@@ -883,6 +893,152 @@ fn process_owner(pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
         return Err(QueryFailure::Inconsistent);
     }
     Ok((Uid::new(info.pbsi_uid), Uid::new(info.pbsi_ruid)))
+}
+
+// The Security framework calls of the platform-code check. Each code,
+// requirement, and dictionary reference is a Core Foundation object.
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    /// `const CFStringRef kSecGuestAttributePid` in `<Security/SecCode.h>`.
+    static kSecGuestAttributePid: Option<&'static CFString>;
+    /// `const CFStringRef kSecCodeInfoPlatformIdentifier` in
+    /// `<Security/SecCode.h>`: present when the code was signed as part of
+    /// an operating system release.
+    static kSecCodeInfoPlatformIdentifier: Option<&'static CFString>;
+    /// `OSStatus SecCodeCopyGuestWithAttributes(SecCodeRef host,
+    /// CFDictionaryRef attributes, SecCSFlags flags, SecCodeRef *guest)`.
+    fn SecCodeCopyGuestWithAttributes(
+        host: *const CFType,
+        attributes: *const CFDictionary,
+        flags: u32,
+        guest: *mut *mut CFType,
+    ) -> i32;
+    /// `OSStatus SecRequirementCreateWithString(CFStringRef text,
+    /// SecCSFlags flags, SecRequirementRef *requirement)`.
+    fn SecRequirementCreateWithString(
+        text: *const CFString,
+        flags: u32,
+        requirement: *mut *mut CFType,
+    ) -> i32;
+    /// `OSStatus SecCodeCheckValidity(SecCodeRef code, SecCSFlags flags,
+    /// SecRequirementRef requirement)`.
+    fn SecCodeCheckValidity(code: *const CFType, flags: u32, requirement: *const CFType) -> i32;
+    /// `OSStatus SecCodeCopySigningInformation(SecStaticCodeRef code,
+    /// SecCSFlags flags, CFDictionaryRef *information)`. A `SecCodeRef` is
+    /// accepted for the static code.
+    fn SecCodeCopySigningInformation(
+        code: *const CFType,
+        flags: u32,
+        information: *mut *mut CFDictionary,
+    ) -> i32;
+}
+
+/// `kSecCSDefaultFlags` in `<Security/CSCommon.h>`.
+const SEC_CS_DEFAULT_FLAGS: u32 = 0;
+/// `errSecCSReqFailed` in `<Security/CSCommon.h>`: the code is valid and
+/// does not satisfy the requirement.
+const ERR_SEC_CS_REQ_FAILED: i32 = -67050;
+
+/// Takes ownership of a reference that a `Copy` or `Create` call returned.
+///
+/// # Safety
+///
+/// `pointer` must be null or a Core Foundation object of type `T` with a
+/// +1 retain count that the caller owns.
+unsafe fn owned<T: objc2_core_foundation::Type>(pointer: *mut T) -> Option<CFRetained<T>> {
+    // SAFETY: the caller guarantees the type and the ownership.
+    std::ptr::NonNull::new(pointer).map(|pointer| unsafe { CFRetained::from_raw(pointer) })
+}
+
+/// Whether the process `pid` runs Apple platform code: the dynamic code
+/// signature is valid for `anchor apple`, and the signing information has a
+/// platform identifier.
+///
+/// The guest is found by its PID, which the documentation of
+/// `kSecGuestAttributePid` names as less precise than an audit token: a
+/// process that exits and whose PID a new process takes between this check
+/// and the use queries is examined as the new process. The caller applies
+/// the result only to a process of the user whose executable is on the
+/// sealed system volume, so the new process must also be such a process.
+fn apple_platform_code(pid: Pid) -> Result<bool, QueryFailure> {
+    // SAFETY: the statics are constant strings of the framework. A null
+    // value is `None`.
+    let (Some(pid_key), Some(platform_key)) = (unsafe { kSecGuestAttributePid }, unsafe {
+        kSecCodeInfoPlatformIdentifier
+    }) else {
+        return Err(QueryFailure::Unsupported);
+    };
+    let value: CFRetained<CFNumber> = CFNumber::new_i32(pid.get());
+    let attributes: CFRetained<CFDictionary<CFString, CFNumber>> =
+        CFDictionary::from_slices(&[pid_key], &[&*value]);
+    let mut guest: *mut CFType = std::ptr::null_mut();
+    // SAFETY: a null host is the documented request for the system root
+    // host. The dictionary lives for the call. The call writes one owned
+    // reference into `guest` on success.
+    let status: i32 = unsafe {
+        SecCodeCopyGuestWithAttributes(
+            std::ptr::null(),
+            CFRetained::as_ptr(&attributes)
+                .as_ptr()
+                .cast::<CFDictionary>(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut guest,
+        )
+    };
+    // SAFETY: on success `guest` is an owned `SecCodeRef`; it is null
+    // otherwise.
+    let guest: Option<CFRetained<CFType>> = unsafe { owned(guest) };
+    let Some(guest) = guest.filter(|_| status == 0) else {
+        return Err(QueryFailure::Failed(status));
+    };
+    let text: CFRetained<CFString> = CFString::from_static_str("anchor apple");
+    let mut requirement: *mut CFType = std::ptr::null_mut();
+    // SAFETY: `text` lives for the call. The call writes one owned
+    // `SecRequirementRef` into `requirement` on success.
+    let status: i32 = unsafe {
+        SecRequirementCreateWithString(
+            CFRetained::as_ptr(&text).as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut requirement,
+        )
+    };
+    // SAFETY: as for `guest`.
+    let requirement: Option<CFRetained<CFType>> = unsafe { owned(requirement) };
+    let Some(requirement) = requirement.filter(|_| status == 0) else {
+        return Err(QueryFailure::Failed(status));
+    };
+    // SAFETY: both references are live owned objects of the expected types
+    // for the call.
+    let validity: i32 = unsafe {
+        SecCodeCheckValidity(
+            CFRetained::as_ptr(&guest).as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            CFRetained::as_ptr(&requirement).as_ptr(),
+        )
+    };
+    match validity {
+        0 => {}
+        ERR_SEC_CS_REQ_FAILED => return Ok(false),
+        other => return Err(QueryFailure::Failed(other)),
+    }
+    let mut information: *mut CFDictionary = std::ptr::null_mut();
+    // SAFETY: `guest` is a live code object. The call writes one owned
+    // dictionary into `information` on success.
+    let status: i32 = unsafe {
+        SecCodeCopySigningInformation(
+            CFRetained::as_ptr(&guest).as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut information,
+        )
+    };
+    // SAFETY: as for `guest`; the dictionary has string keys.
+    let information: Option<CFRetained<CFDictionary>> = unsafe { owned(information) };
+    let Some(information) = information.filter(|_| status == 0) else {
+        return Err(QueryFailure::Failed(status));
+    };
+    // SAFETY: the keys of the signing information are strings.
+    let information: &CFDictionary<CFString, CFType> = unsafe { information.cast_unchecked() };
+    Ok(information.get(platform_key).is_some())
 }
 
 fn timebase() -> Result<Timebase, QueryFailure> {
@@ -1038,5 +1194,9 @@ impl ProcessSource for DarwinProcessSource {
 
     fn arguments(&self, pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
         arguments(pid, max_bytes)
+    }
+
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        apple_platform_code(pid)
     }
 }

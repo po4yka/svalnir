@@ -166,6 +166,11 @@ pub struct PathInventory {
     pub unknown: Vec<UnknownProcess>,
     /// The number of unknown processes that are not in `unknown`.
     pub unknown_omitted: u64,
+    /// The number of processes of the user that refused a use query and
+    /// that run Apple platform code from the sealed system volume. The
+    /// check does not see their uses (owner decision of 2026-11-22,
+    /// `docs/CLEANUP_RULES.md` section 6).
+    pub platform_refused: u64,
     /// The number of processes whose identity query the system denied and
     /// whose owner query did not show a different user: for example a
     /// set-user-ID process or a process that the platform protects. The
@@ -187,6 +192,7 @@ impl PathInventory {
             processes: Vec::new(),
             unknown: Vec::new(),
             unknown_omitted: 0,
+            platform_refused: 0,
             not_visible: 0,
             gap: Some(gap),
             observed_at,
@@ -256,6 +262,32 @@ pub(super) fn argument_paths(
         }
     }
     paths
+}
+
+/// The directories of the sealed system volume whose executables the
+/// platform blind spot accepts (owner decision of 2026-11-22). The data
+/// volume below `/System/Volumes` is not sealed and is not accepted.
+const SEALED_SYSTEM_DIRECTORIES: [&str; 6] = [
+    "/System",
+    "/usr/libexec",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// Whether `path` is below a directory of the sealed system volume.
+pub(super) fn is_on_sealed_system_volume(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        || path.starts_with("/System/Volumes")
+    {
+        return false;
+    }
+    SEALED_SYSTEM_DIRECTORIES
+        .iter()
+        .any(|directory| path.starts_with(directory) && path != Path::new(directory))
 }
 
 /// The file name of `path`, at most [`MAX_NAME_BYTES`] bytes.
@@ -343,10 +375,25 @@ pub fn collect_path_uses<S: ProcessSource + ?Sized>(
         match examine(source, pid, keep, limits) {
             Examined::Exited => {}
             Examined::Known(uses) => inventory.processes.extend(uses),
-            Examined::Unknown { name, reason, uses } => {
+            Examined::Unknown {
+                name,
+                reason,
+                uses,
+                executable,
+                only_refused,
+            } => {
                 // A use that was read before the failure is still a use.
                 inventory.processes.extend(uses);
-                inventory.unknown_process(pid, name, reason);
+                let platform: bool = only_refused
+                    && executable
+                        .as_deref()
+                        .is_some_and(is_on_sealed_system_volume)
+                    && source.apple_platform_code(pid) == Ok(true);
+                if platform {
+                    inventory.platform_refused = inventory.platform_refused.saturating_add(1);
+                } else {
+                    inventory.unknown_process(pid, name, reason);
+                }
             }
         }
     }
@@ -376,6 +423,11 @@ enum Examined {
         name: String,
         reason: InventoryGap,
         uses: Option<ProcessUses>,
+        /// The executable, when its query answered.
+        executable: Option<PathBuf>,
+        /// Each failure was a refusal (`PermissionDenied`), and no bound
+        /// was reached.
+        only_refused: bool,
     },
 }
 
@@ -387,6 +439,14 @@ fn examine<S: ProcessSource + ?Sized>(
     limits: UseLimits,
 ) -> Examined {
     let mut reason: Option<InventoryGap> = None;
+    let mut only_refused: bool = true;
+    let mut fail = |reason: &mut Option<InventoryGap>, failure: QueryFailure| {
+        if failure != QueryFailure::PermissionDenied {
+            only_refused = false;
+        }
+        reason.get_or_insert(gap_of(failure));
+    };
+    let mut bounded: bool = false;
     let mut uses: Vec<ProcessPathUse> = Vec::new();
     let mut add = |kind: PathUseKind, path: PathBuf| {
         if keep(&path) {
@@ -400,7 +460,7 @@ fn examine<S: ProcessSource + ?Sized>(
         Ok(path) => Some(path.to_path_buf()),
         Err(QueryFailure::Gone) => return Examined::Exited,
         Err(failure) => {
-            reason.get_or_insert(gap_of(failure));
+            fail(&mut reason, failure);
             None
         }
     };
@@ -412,7 +472,7 @@ fn examine<S: ProcessSource + ?Sized>(
         Ok(path) => Some(path.to_path_buf()),
         Err(QueryFailure::Gone) => return Examined::Exited,
         Err(failure) => {
-            reason.get_or_insert(gap_of(failure));
+            fail(&mut reason, failure);
             None
         }
     };
@@ -435,6 +495,7 @@ fn examine<S: ProcessSource + ?Sized>(
         match result {
             Ok(found) => {
                 if found.truncated {
+                    bounded = true;
                     reason.get_or_insert(bound);
                 }
                 for path in found.paths {
@@ -443,13 +504,14 @@ fn examine<S: ProcessSource + ?Sized>(
             }
             Err(QueryFailure::Gone) => return Examined::Exited,
             Err(failure) => {
-                reason.get_or_insert(gap_of(failure));
+                fail(&mut reason, failure);
             }
         }
     }
     match source.arguments(pid, limits.max_argument_bytes) {
         Ok(arguments) => {
             if arguments.truncated {
+                bounded = true;
                 reason.get_or_insert(InventoryGap::ArgumentsTruncated);
             }
             // The arguments are compared here and dropped with `arguments`.
@@ -459,7 +521,7 @@ fn examine<S: ProcessSource + ?Sized>(
         }
         Err(QueryFailure::Gone) => return Examined::Exited,
         Err(failure) => {
-            reason.get_or_insert(gap_of(failure));
+            fail(&mut reason, failure);
         }
     }
     let record: Option<ProcessUses> = (!uses.is_empty()).then(|| ProcessUses {
@@ -473,6 +535,8 @@ fn examine<S: ProcessSource + ?Sized>(
             name,
             reason,
             uses: record,
+            executable,
+            only_refused: only_refused && !bounded,
         },
     }
 }

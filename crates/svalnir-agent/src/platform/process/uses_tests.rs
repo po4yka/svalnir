@@ -37,6 +37,7 @@ struct Entry {
     arguments: Result<RawArguments, QueryFailure>,
     working_directory: &'static str,
     executable: &'static str,
+    platform: Result<bool, QueryFailure>,
 }
 
 impl Entry {
@@ -50,6 +51,7 @@ impl Entry {
             arguments: Ok(RawArguments::default()),
             working_directory: "/Users/u",
             executable: "/usr/bin/true",
+            platform: Err(QueryFailure::Unsupported),
         }
     }
 }
@@ -131,6 +133,10 @@ impl ProcessSource for Table {
 
     fn arguments(&self, pid: Pid, _max: usize) -> Result<RawArguments, QueryFailure> {
         self.entry(pid)?.arguments.clone()
+    }
+
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        self.entry(pid)?.platform
     }
 
     fn file_evidence(&self, _path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
@@ -442,6 +448,87 @@ fn each_bound_of_one_process_makes_it_unknown_and_the_global_bounds_make_a_gap()
     let inventory = collect_path_uses(&table, USER, &under_unit, limits);
     assert_eq!(inventory.gap, Some(InventoryGap::DeadlineReached));
     assert_eq!(table.queries.get(), 0);
+}
+
+/// A process of the user that refuses its descriptor query, with the
+/// executable `executable` and the result `platform` of the signature check.
+fn refused(executable: &'static str, platform: Result<bool, QueryFailure>) -> Entry {
+    let mut entry: Entry = Entry::plain(10);
+    entry.open = Err(QueryFailure::PermissionDenied);
+    entry.executable = executable;
+    entry.platform = platform;
+    entry
+}
+
+#[test]
+fn a_refused_apple_platform_process_on_the_system_volume_does_not_block() {
+    for executable in [
+        "/usr/libexec/dmd",
+        "/System/Library/PrivateFrameworks/ScreenTimeCore.framework/Versions/A/ScreenTimeAgent",
+        "/usr/sbin/cfprefsd",
+        "/bin/sh",
+    ] {
+        let inventory = collect(&Table::new(vec![
+            refused(executable, Ok(true)),
+            Entry::plain(11),
+        ]));
+        assert_eq!(inventory.gap, None, "{executable}");
+        assert_eq!(inventory.unknown, Vec::new(), "{executable}");
+        assert_eq!(inventory.platform_refused, 1, "{executable}");
+    }
+}
+
+#[test]
+fn a_refused_process_without_platform_code_or_a_system_path_blocks() {
+    for (executable, platform) in [
+        // A signature that is not Apple platform code.
+        ("/usr/libexec/dmd", Ok(false)),
+        // The signature check failed.
+        ("/usr/libexec/dmd", Err(QueryFailure::Failed(-67062))),
+        ("/usr/libexec/dmd", Err(QueryFailure::Unsupported)),
+        // Platform code outside the sealed system volume.
+        ("/Users/u/bin/dmd", Ok(true)),
+        ("/Applications/Tool.app/Contents/MacOS/tool", Ok(true)),
+        ("/System/Volumes/Data/usr/libexec/dmd", Ok(true)),
+        ("/usr/local/bin/tool", Ok(true)),
+        ("/usr/libexec/../../Users/u/tool", Ok(true)),
+    ] {
+        let inventory = collect(&Table::new(vec![
+            refused(executable, platform),
+            Entry::plain(11),
+        ]));
+        assert_eq!(inventory.platform_refused, 0, "{executable} {platform:?}");
+        assert_eq!(
+            unknown_reason(&inventory),
+            Some(InventoryGap::ProcessQueryDenied),
+            "{executable} {platform:?}"
+        );
+    }
+}
+
+#[test]
+fn only_a_refusal_with_no_other_failure_or_bound_is_the_platform_blind_spot() {
+    // A failure that is not a refusal.
+    let mut failed: Entry = refused("/usr/libexec/dmd", Ok(true));
+    failed.open = Err(QueryFailure::Failed(5));
+    // A refusal and a bound of the same process.
+    let mut bounded: Entry = refused("/usr/libexec/dmd", Ok(true));
+    bounded.mapped = Ok(RawPaths {
+        paths: Vec::new(),
+        truncated: true,
+    });
+    for entry in [failed, bounded] {
+        let inventory = collect(&Table::new(vec![entry, Entry::plain(11)]));
+        assert_eq!(inventory.platform_refused, 0);
+        assert_eq!(inventory.unknown.len(), 1);
+    }
+    // A use that the process gave before the refusal still blocks: the
+    // record of the use stays.
+    let mut used: Entry = refused("/usr/libexec/dmd", Ok(true));
+    used.working_directory = "/Users/u/app/node_modules";
+    let inventory = collect(&Table::new(vec![used]));
+    assert_eq!(inventory.platform_refused, 1);
+    assert_eq!(inventory.processes.len(), 1);
 }
 
 #[cfg(target_os = "macos")]

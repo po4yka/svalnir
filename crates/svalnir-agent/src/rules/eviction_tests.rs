@@ -732,6 +732,10 @@ struct Table {
     list_fails: bool,
     clock_fails: bool,
     processes: BTreeMap<i32, Answers>,
+    /// The answer of the owner query of each PID; no entry is a failure.
+    owners: BTreeMap<i32, Uid>,
+    /// The PIDs whose code is Apple platform code.
+    platform: Vec<i32>,
 }
 
 impl Table {
@@ -783,6 +787,15 @@ impl ProcessSource for Table {
     fn executable_path(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
         let (_, path) = self.processes.get(&pid.get()).ok_or(QueryFailure::Gone)?;
         Ok(LosslessPath::from_bytes((*path)?).unwrap())
+    }
+
+    fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+        let owner: Uid = *self.owners.get(&pid.get()).ok_or(QueryFailure::Failed(5))?;
+        Ok((owner, owner))
+    }
+
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        Ok(self.platform.contains(&pid.get()))
     }
 
     fn file_evidence(&self, _path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
@@ -911,6 +924,44 @@ fn an_inventory_that_is_not_complete_does_not_show_inactivity() {
 }
 
 #[test]
+fn a_denied_process_of_the_user_is_out_of_the_inventory_only_through_the_platform_gate() {
+    let denied = |failure: QueryFailure, path: &'static str, platform: bool| Table {
+        owners: BTreeMap::from([(202, USER)]),
+        platform: if platform { vec![202] } else { Vec::new() },
+        ..shell_and(Table::default()).with_answers(202, Err(failure), Ok(path))
+    };
+    // `login`: Apple platform code on the sealed system volume.
+    assert_eq!(
+        xcode_evidence(
+            &denied(QueryFailure::PermissionDenied, "/usr/bin/login", true),
+            USER
+        )
+        .producer_processes,
+        ProducerProcesses::NotRunning
+    );
+    // With no owner answer, the gate still decides.
+    let no_owner: Table = Table {
+        owners: BTreeMap::new(),
+        ..denied(QueryFailure::PermissionDenied, "/usr/bin/login", true)
+    };
+    assert_eq!(
+        xcode_evidence(&no_owner, USER).producer_processes,
+        ProducerProcesses::NotRunning
+    );
+    // Each other denied process of the user can be the producer.
+    for table in [
+        denied(QueryFailure::PermissionDenied, "/usr/bin/login", false),
+        denied(QueryFailure::PermissionDenied, "/Users/u/bin/tool", true),
+        denied(QueryFailure::AccessDenied, "/usr/bin/login", true),
+    ] {
+        assert_eq!(
+            xcode_evidence(&table, USER).producer_processes,
+            ProducerProcesses::Unknown
+        );
+    }
+}
+
+#[test]
 fn a_process_that_exited_and_a_process_of_a_different_user_keep_the_inventory_complete() {
     let table = shell_and(Table::default())
         .with_answers(200, Err(QueryFailure::Gone), Ok("/usr/bin/true"))
@@ -921,6 +972,11 @@ fn a_process_that_exited_and_a_process_of_a_different_user_keep_the_inventory_co
             Ok("/usr/bin/true"),
         )
         .with_answers(203, Ok(OTHER_USER), Err(QueryFailure::Failed(5)));
+    // The owner query of the denied process gives a different user.
+    let table = Table {
+        owners: BTreeMap::from([(202, OTHER_USER)]),
+        ..table
+    };
     assert_eq!(
         xcode_evidence(&table, USER).producer_processes,
         ProducerProcesses::NotRunning
@@ -964,5 +1020,135 @@ fn the_fixture_lifecycle_names_no_validation_record() {
     // The registry of a build has each layout in the proposed state.
     for status in ReviewedRules::new().unwrap().statuses() {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The use check of a running process (`docs/CLEANUP_RULES.md` section 6).
+// ---------------------------------------------------------------------
+
+/// A fixture environment whose path-use inventory the test gives.
+struct WithUses {
+    inner: FixtureEnvironment,
+    inventory: crate::platform::process::PathInventory,
+    scopes: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+impl crate::scan::ScanClock for WithUses {
+    fn now(&self) -> crate::scan::ScanTimestamp {
+        self.inner.now()
+    }
+}
+
+impl super::eviction::DiscoveryEnvironment for WithUses {
+    fn xcode_evidence(&self, principal: Uid) -> super::xcode::XcodeEvidence {
+        self.inner.xcode_evidence(principal)
+    }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        scopes: &[super::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        self.scopes
+            .lock()
+            .unwrap()
+            .extend(scopes.iter().map(|scope| scope.path().to_path_buf()));
+        self.inventory.clone()
+    }
+}
+
+fn discover_with(
+    home: &UserTree,
+    inventory: crate::platform::process::PathInventory,
+) -> (EvictionDiscovery, Vec<PathBuf>) {
+    let environment = WithUses {
+        inner: month_later(),
+        inventory,
+        scopes: std::sync::Mutex::default(),
+    };
+    let cancel = CancellationToken::new();
+    let discovery = automatic_registry().discover_for_eviction(
+        &EvictionRequest {
+            host: &home.host(),
+            purpose: &RuleMode::AutomaticEviction,
+            rules: Some(&[xcode_rule()]),
+            volumes: None,
+            known: None,
+            limits: DiscoveryLimits::default(),
+            cancel: &cancel,
+        },
+        &environment,
+    );
+    let scopes = environment.scopes.into_inner().unwrap();
+    (discovery, scopes)
+}
+
+#[test]
+fn a_unit_that_a_process_uses_is_skipped_and_the_others_stay_candidates() {
+    use crate::platform::process::{PathInventory, PathUseKind, ProcessPathUse, ProcessUses};
+
+    let home = UserTree::with_project();
+    let used: PathBuf = home.root.join(PROJECT).join("Build/Products/Debug");
+    let inventory = PathInventory {
+        processes: vec![ProcessUses {
+            pid: Pid::new(77).unwrap(),
+            name: "lldb".to_owned(),
+            uses: vec![ProcessPathUse {
+                kind: PathUseKind::WorkingDirectory,
+                path: used,
+            }],
+        }],
+        ..PathInventory::default()
+    };
+    let (discovery, scopes) = discover_with(&home, inventory);
+    // The scope of the inventory is the bound root.
+    assert_eq!(scopes, vec![home.root.clone()]);
+    let mut expected: Vec<String> = units(PROJECT);
+    expected.retain(|unit| !unit.ends_with("Build/Products"));
+    assert_eq!(relative_entries(&discovery), expected);
+    assert_eq!(skip_reasons(&discovery), vec![SkipReason::UnitInUse]);
+    let RootResult::Examined { skipped, .. } = &discovery.roots[0].result else {
+        panic!("{:?}", discovery.roots);
+    };
+    assert_eq!(
+        skipped[0].relative_entry.as_utf8().unwrap(),
+        format!("{PROJECT}/Build/Products")
+    );
+    assert_eq!(
+        skipped[0].eligibility.protocols_valid,
+        svalnir_core::rule::Fact::NotSatisfied
+    );
+    assert!(discovery.complete);
+}
+
+#[test]
+fn an_unknown_process_or_an_incomplete_inventory_gives_no_candidate() {
+    use crate::platform::process::{InventoryGap, PathInventory, UnknownProcess};
+
+    let home = UserTree::with_project();
+    let unknown = PathInventory {
+        unknown: vec![UnknownProcess {
+            pid: Pid::new(9).unwrap(),
+            name: "dmd".to_owned(),
+            reason: InventoryGap::ProcessQueryDenied,
+        }],
+        ..PathInventory::default()
+    };
+    let gap = PathInventory::incomplete(InventoryGap::ProcessListUnavailable, None);
+    for inventory in [unknown, gap] {
+        let (discovery, _) = discover_with(&home, inventory);
+        assert_eq!(discovery.candidates.len(), 0);
+        assert_eq!(
+            skip_reasons(&discovery),
+            vec![SkipReason::UnitUseUnknown; 3]
+        );
+        let RootResult::Examined { skipped, .. } = &discovery.roots[0].result else {
+            panic!("{:?}", discovery.roots);
+        };
+        assert_eq!(
+            skipped[0].eligibility.protocols_valid,
+            svalnir_core::rule::Fact::Unknown
+        );
     }
 }

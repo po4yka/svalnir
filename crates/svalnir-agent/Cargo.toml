@@ -42,7 +42,7 @@ objc2.workspace = true
 objc2-app-kit.workspace = true
 # `CFUserNotification`: the urgent dialog of the agent (`notify`).
 # `CFArray`: the watched paths of the event stream (`platform::fsevents`).
-objc2-core-foundation = { workspace = true, features = ["CFArray"] }
+objc2-core-foundation = { workspace = true, features = ["CFArray", "CFDictionary", "CFNumber"] }
 # `FSEvents`: the invalidation of the candidate catalog
 # (`platform::fsevents`).
 objc2-core-services.workspace = true

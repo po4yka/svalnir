@@ -65,6 +65,8 @@ pub mod fixture;
 #[cfg(unix)]
 pub mod git;
 #[cfg(unix)]
+pub mod in_use;
+#[cfg(unix)]
 mod model;
 #[cfg(unix)]
 mod native;

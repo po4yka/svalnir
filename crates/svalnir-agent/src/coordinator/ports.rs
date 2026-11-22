@@ -33,6 +33,8 @@ use crate::journal::{
 use crate::platform::process::ProcessSource;
 use crate::protection::ProtectedLocations;
 use crate::rules::ProducerActivity;
+use crate::rules::in_use::UnitUse;
+use std::path::Path;
 use svalnir_core::rule::RuleRef;
 
 /// One reading of the clocks.
@@ -130,6 +132,13 @@ pub trait AuthoritySource: Debug {
     /// before each step of an eviction. Only
     /// [`ProducerActivity::Inactive`] permits the step.
     fn producer_activity(&self, rule: &RuleRef) -> ProducerActivity;
+
+    /// Whether a process of the user uses the file target at `path` now,
+    /// from an inventory that this call reads (`docs/CLEANUP_RULES.md`
+    /// section 6). The coordinator asks immediately before each step of an
+    /// eviction, after [`producer_activity`](Self::producer_activity). Only
+    /// [`UnitUse::NotInUse`] permits the step.
+    fn unit_use(&self, path: &Path) -> UnitUse;
 }
 
 /// The measurements of outcome verification.

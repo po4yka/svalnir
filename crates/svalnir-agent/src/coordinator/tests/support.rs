@@ -252,6 +252,10 @@ pub(super) struct Records {
     /// The activity of the producer at the fresh check of an eviction
     /// step.
     pub(super) activity: ProducerActivity,
+    /// The result of each use check before a step.
+    pub(super) unit_use: crate::rules::in_use::UnitUse,
+    /// The target path of each use check, in sequence.
+    pub(super) use_checks: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 /// The authority records of a test, behind the grant module.
@@ -314,6 +318,8 @@ impl TestAuthority {
             ),
             automatic_roots: ApprovedRoots::default(),
             activity: ProducerActivity::Inactive,
+            unit_use: crate::rules::in_use::UnitUse::NotInUse,
+            use_checks: Arc::default(),
         })))
     }
 
@@ -451,6 +457,12 @@ impl AuthoritySource for TestAuthority {
 
     fn producer_activity(&self, _rule: &svalnir_core::rule::RuleRef) -> ProducerActivity {
         self.records().activity
+    }
+
+    fn unit_use(&self, path: &Path) -> crate::rules::in_use::UnitUse {
+        let records = self.records();
+        records.use_checks.lock().unwrap().push(path.to_path_buf());
+        records.unit_use.clone()
     }
 }
 

@@ -36,6 +36,18 @@ impl ProcessEvidence for Fixed {
     fn monotonic_now(&self) -> Option<MonotonicNanos> {
         self.0.observed_at
     }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        // A complete inventory with no use, at the time of the evidence.
+        crate::platform::process::PathInventory {
+            observed_at: self.0.observed_at,
+            ..crate::platform::process::PathInventory::default()
+        }
+    }
 }
 
 /// A complete inventory with the processes `processes`.
@@ -731,4 +743,115 @@ fn a_search_root_in_another_case_has_the_stored_names() {
     assert_eq!(inspection.roots[0].path, Some(home.path.join("Code")));
     let report = unit(&inspection, &project.join("node_modules"));
     assert_eq!(refusal(report), "producer_active");
+}
+
+// ---------------------------------------------------------------------
+// The use check of a running process (`docs/CLEANUP_RULES.md` section 6).
+// ---------------------------------------------------------------------
+
+/// The build-process evidence of `quiet`, with the path-use inventory of
+/// `uses`.
+struct WithUses<
+    F: Fn(&[crate::rules::in_use::UnitScope]) -> crate::platform::process::PathInventory,
+>(Fixed, F);
+
+impl<F: Fn(&[crate::rules::in_use::UnitScope]) -> crate::platform::process::PathInventory>
+    ProcessEvidence for WithUses<F>
+{
+    fn build_processes(&self, principal: Uid) -> BuildProcesses {
+        self.0.build_processes(principal)
+    }
+
+    fn monotonic_now(&self) -> Option<MonotonicNanos> {
+        self.0.monotonic_now()
+    }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        let mut inventory = (self.1)(scopes);
+        inventory.observed_at = self.0.monotonic_now();
+        inventory
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_unit_that_a_child_process_names_in_an_argument_is_refused() {
+    use crate::platform::process::{DarwinProcessSource, PathUseKind};
+    use crate::rules::in_use::{UnitUse, inventory_of};
+
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    let named: PathBuf = fs::canonicalize(project.join("node_modules/left-pad/index.js")).unwrap();
+    // A disposable child that names the file as `$0` and runs `sleep`.
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("/bin/sleep 30; :")
+        .arg(&named)
+        .spawn()
+        .unwrap();
+    let evidence = WithUses(quiet(), |scopes: &[crate::rules::in_use::UnitScope]| {
+        let source: DarwinProcessSource = DarwinProcessSource::new();
+        inventory_of(
+            &source,
+            crate::platform::process::ProcessSource::effective_uid(&source),
+            scopes,
+        )
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let report = loop {
+        let inspection: ProjectInspection = home.inspect(&evidence);
+        let report = unit(&inspection, &project.join("node_modules")).clone();
+        if matches!(report.uses, Some(UnitUse::InUse { .. }))
+            || std::time::Instant::now() > deadline
+        {
+            break report;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _killed: std::io::Result<()> = child.kill();
+    let _waited: std::io::Result<std::process::ExitStatus> = child.wait();
+    assert_eq!(refusal(&report), "unit_in_use");
+    let Some(UnitUse::InUse { uses, .. }) = &report.uses else {
+        panic!("{:?}", report.uses);
+    };
+    let found = uses
+        .iter()
+        .find(|found| found.kind == PathUseKind::Argument)
+        .unwrap_or_else(|| panic!("{uses:?}"));
+    assert_eq!(found.name, "sh");
+    assert_eq!(found.relative, PathBuf::from("left-pad"));
+    // The report has no other part of the command line.
+    let text: String = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("sleep 30"), "{text}");
+}
+
+#[test]
+fn a_unit_with_an_unknown_process_is_refused_with_its_name() {
+    use crate::platform::process::{InventoryGap, PathInventory, UnknownProcess};
+    use crate::rules::in_use::UnitUse;
+    use svalnir_core::process::Pid;
+
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    let evidence = WithUses(quiet(), |_: &[crate::rules::in_use::UnitScope]| {
+        PathInventory {
+            unknown: vec![UnknownProcess {
+                pid: Pid::new(9).unwrap(),
+                name: "routined".to_owned(),
+                reason: InventoryGap::ProcessQueryDenied,
+            }],
+            ..PathInventory::default()
+        }
+    });
+    let inspection: ProjectInspection = home.inspect(&evidence);
+    let report = unit(&inspection, &project.join("node_modules"));
+    assert_eq!(refusal(report), "unit_use_unknown");
+    let Some(UnitUse::Unknown { processes, .. }) = &report.uses else {
+        panic!("{:?}", report.uses);
+    };
+    assert_eq!(processes[0].name, "routined");
 }

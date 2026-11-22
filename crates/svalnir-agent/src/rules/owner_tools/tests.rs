@@ -36,6 +36,18 @@ impl ProcessEvidence for Fixed {
     fn monotonic_now(&self) -> Option<MonotonicNanos> {
         self.0.observed_at
     }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        // A complete inventory with no use, at the time of the evidence.
+        crate::platform::process::PathInventory {
+            observed_at: self.0.observed_at,
+            ..crate::platform::process::PathInventory::default()
+        }
+    }
 }
 
 fn processes(executables: &[PathBuf]) -> Fixed {

@@ -1072,7 +1072,7 @@ fn signal_outcome(result: SignalResult) -> Call {
 /// The result of a member whose identity query failed before a call.
 fn query_failure(failure: QueryFailure) -> Outcome {
     let code: &'static str = match failure {
-        QueryFailure::PermissionDenied => code::PROCESS_QUERY_DENIED,
+        QueryFailure::PermissionDenied | QueryFailure::AccessDenied => code::PROCESS_QUERY_DENIED,
         _ => code::PROCESS_QUERY_FAILED,
     };
     Outcome::skipped(Failure::evidence(code), true)

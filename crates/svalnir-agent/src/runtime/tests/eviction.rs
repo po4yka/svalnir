@@ -681,6 +681,60 @@ fn a_producer_that_starts_after_the_admission_inhibits_each_later_step() {
 }
 
 #[test]
+fn a_use_that_starts_after_the_admission_inhibits_each_later_step() {
+    for (state, code) in [
+        (crate::rules::fixture::FixtureUse::InUse, "unit_in_use"),
+        (
+            crate::rules::fixture::FixtureUse::Unknown,
+            "unit_use_unknown",
+        ),
+    ] {
+        let mut bench = Bench::validated(&[]);
+        bench.coordinator_units = 1;
+        bench.gain.store(GIBIBYTE, Ordering::SeqCst);
+        bench.seed_authority();
+        let mut driver = bench.start();
+        bench.discover(&mut driver);
+        let mut operation_id: Option<OperationId> = None;
+        for _ in 0..40 {
+            driver.tick(Some(bench.sample(bench.measurements().available())));
+            bench.clock.advance(SAMPLE);
+            operation_id = driver
+                .controller_state()
+                .outstanding
+                .as_ref()
+                .and_then(|outstanding| outstanding.operation_id.clone());
+            if operation_id.is_some() {
+                break;
+            }
+        }
+        let operation_id: OperationId = operation_id.expect("an operation was admitted");
+        let before: usize = bench.remaining().len();
+        assert!(
+            before >= 2,
+            "the operation ended in the tick of its admission"
+        );
+        // A process starts to use the units after the plan was admitted.
+        bench.environment.set_use(state);
+        bench.run_low(&mut driver, 20);
+        assert_eq!(bench.remaining().len(), before);
+        let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
+        let skipped: Vec<String> = operation
+            .steps()
+            .iter()
+            .flat_map(svalnir_core::action::Step::results)
+            .filter(|result| result.effect == TargetEffect::Skipped)
+            .filter_map(|result| result.failure.as_ref())
+            .map(|failure| failure.code.as_str().to_owned())
+            .collect();
+        assert_eq!(skipped.len(), before, "{:?}", operation.steps());
+        assert!(skipped.iter().all(|found| found == code), "{skipped:?}");
+        assert_eq!(bench.journal().unsettled_operation_count().unwrap(), 0);
+        stop(&bench, driver);
+    }
+}
+
+#[test]
 fn a_unit_that_is_replaced_after_the_discovery_is_not_removed() {
     let mut bench = Bench::validated(&[]);
     bench.seed_authority();

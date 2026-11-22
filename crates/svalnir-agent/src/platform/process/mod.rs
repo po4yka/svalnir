@@ -15,6 +15,7 @@
 //! | [`footprint_growth`], [`cpu_usage`], [`derive_between`] | Pure functions over injected samples |
 //! | [`rank_processes`] | The order for `processes top` |
 //! | [`application_candidates`], [`control_plane`] | The instances of a snapshot as candidates of a memory-guard evaluation, with their hard protection |
+//! | [`collect_path_uses`] | The paths that the processes of the user use now (open files, mapped files, working directory, executable, arguments), in a scope; for the use check of a file rule |
 //! | [`ProcessCollector::collect_context`] | The working directory and the listening TCP ports of one process generation, on request, for a person; not a policy input |
 //!
 //! # Identity
@@ -55,6 +56,7 @@ mod inventory;
 mod native;
 mod rank;
 mod source;
+mod uses;
 
 #[cfg(test)]
 #[cfg(target_os = "macos")]
@@ -68,6 +70,8 @@ mod fake;
 mod smoke_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod uses_tests;
 
 pub use candidates::{
     MAX_CONTROL_PLANE_ANCESTORS, application_candidates, control_plane,
@@ -91,8 +95,13 @@ pub use inventory::{
 pub use native::DarwinProcessSource;
 pub use rank::{RankMetric, RankValue, RankedProcess, Ranking, rank_processes};
 pub use source::{
-    ProcessSource, QueryFailure, RawListeningSocket, RawListeningSockets, RawProcessInfo, RawUsage,
-    RunningApplication, SocketFamily, Timebase,
+    ProcessSource, QueryFailure, RawArguments, RawListeningSocket, RawListeningSockets, RawPaths,
+    RawProcessInfo, RawUsage, RawVnode, RunningApplication, SocketFamily, Timebase, VnodeObject,
+};
+pub use uses::{
+    InventoryGap, MAX_NAME_BYTES, MAX_UNKNOWN_PROCESSES, PathInventory, PathUseKind,
+    ProcessPathUse, ProcessUses, UnknownProcess, UseLimits, collect_path_uses,
+    refused_process_passes_platform_gate,
 };
 
 #[cfg(target_os = "macos")]

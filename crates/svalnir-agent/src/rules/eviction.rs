@@ -16,7 +16,12 @@
 //!    flag, in the full mode or for known candidates only.
 //! 4. It gives the candidates of all rules to the overlap resolution of
 //!    the registry.
-//! 5. It applies the catalog of protected file locations to each candidate
+//! 5. It makes the use check of `docs/CLEANUP_RULES.md` section 6 for each
+//!    candidate, with one process inventory whose scope is the bound
+//!    roots ([`super::in_use`]). A unit that a process of the user uses, or
+//!    whose use is not known, is a skipped unit with the reason
+//!    `unit_in_use` or `unit_use_unknown`.
+//! 6. It applies the catalog of protected file locations to each candidate
 //!    and sets the three eligibility predicates that a rule leaves
 //!    `unknown` (3, 9, and 10).
 //!
@@ -42,15 +47,18 @@ use svalnir_core::time::MonotonicNanos;
 use svalnir_core::volume::VolumeIdentity;
 
 use super::expired_temporary::{EXPIRED_TEMPORARY_RULE_ID, TemporaryEvidence, UseLeases};
+use super::in_use::{UnitScope, UnitUse, inventory_of, uses_of};
 use super::model::{
     DiscoveredCandidate, Discovery, DiscoveryCompletion, DiscoveryControl, DiscoveryError,
-    DiscoveryLimits, DiscoveryMode, DiscoveryScope, RootBinding, SkippedUnit,
+    DiscoveryLimits, DiscoveryMode, DiscoveryScope, RootBinding, SkipReason, SkippedUnit,
 };
 use super::overlap::{OverlapConflict, OverlapResolution};
 use super::registry::ReviewedRules;
 use super::xcode::{ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XcodeEvidence};
 use crate::executor::fs::{ApprovedRoot, ApprovedRoots};
-use crate::platform::process::{ProcessSource, QueryFailure};
+use crate::platform::process::{
+    PathInventory, ProcessSource, QueryFailure, refused_process_passes_platform_gate,
+};
 use crate::platform::volume::volume_at;
 use crate::protection::ProtectedLocations;
 use crate::scan::{CancellationToken, ScanClock};
@@ -352,12 +360,11 @@ pub fn automatic_roots(
 /// The observation time is the time before the first query, so the
 /// evidence is never newer than its time says.
 ///
-/// A denied identity query gives no owner. The inventory reads it as a
-/// process of a different user, as the process inventory of the memory
-/// guard does: the system denies the query for a process of a different
-/// user. A process of this user whose identity query is denied is thus
-/// not seen. This is a residual risk of the evidence; the lock check of
-/// the build database is the second check of the rule.
+/// For a denied identity query, the owner query decides: a process of a
+/// different user is out of the scope, and a process of the user is out
+/// of the inventory only when it passes the platform gate of
+/// `docs/CLEANUP_RULES.md` section 6. Each other such process makes the
+/// evidence [`ProducerProcesses::Unknown`].
 pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvidence {
     let unknown = |observed_at: MonotonicNanos| XcodeEvidence {
         producer_processes: ProducerProcesses::Unknown,
@@ -376,7 +383,21 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
             Ok(info) => info,
             // A process that exited is not a process of the inventory. A
             // denied identity query is a process of a different user.
-            Err(QueryFailure::Gone | QueryFailure::PermissionDenied) => continue,
+            Err(QueryFailure::Gone) => continue,
+            // A denied identity query: the owner query decides. A process
+            // of a different user is out of the scope; a process of the
+            // user is out of the inventory only through the platform gate
+            // (`docs/CLEANUP_RULES.md` sections 6 and 11).
+            Err(failure @ (QueryFailure::PermissionDenied | QueryFailure::AccessDenied)) => {
+                match source.process_owner(pid) {
+                    Ok((effective, real)) if effective != principal && real != principal => {}
+                    Err(QueryFailure::Gone) => {}
+                    _ if failure == QueryFailure::PermissionDenied
+                        && refused_process_passes_platform_gate(source, pid) => {}
+                    _ => return unknown(observed_at),
+                }
+                continue;
+            }
             Err(_) => return unknown(observed_at),
         };
         if info.zombie || (info.effective_uid != principal && info.real_uid != principal) {
@@ -408,6 +429,23 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
 pub trait DiscoveryEnvironment: ScanClock {
     /// The process evidence of `xcode.inactive-derived-data`, read now.
     fn xcode_evidence(&self, principal: Uid) -> XcodeEvidence;
+
+    /// The path-use inventory of the processes of `principal`, read now,
+    /// with the paths in `scopes` only (`docs/CLEANUP_RULES.md` section 6).
+    fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory;
+
+    /// The use of the unit at `path` by a process of `principal`, read now.
+    ///
+    /// The coordinator asks this immediately before each step of an
+    /// eviction, after the producer activity. Only
+    /// [`UnitUse::NotInUse`] permits the step.
+    fn unit_use(&self, principal: Uid, path: &Path) -> UnitUse {
+        let scope: UnitScope = UnitScope::new(path);
+        uses_of(
+            &self.path_uses(principal, std::slice::from_ref(&scope)),
+            &scope,
+        )
+    }
 
     /// The activity of the producer of `rule` for `principal`, read now.
     ///
@@ -453,6 +491,10 @@ impl<S: ProcessSource> ScanClock for SourceEnvironment<S> {
 impl<S: ProcessSource> DiscoveryEnvironment for SourceEnvironment<S> {
     fn xcode_evidence(&self, principal: Uid) -> XcodeEvidence {
         xcode_evidence(&self.0, principal)
+    }
+
+    fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory {
+        inventory_of(&self.0, principal, scopes)
     }
 }
 
@@ -639,6 +681,89 @@ pub(super) const fn refusal_name(error: &DiscoveryError) -> &'static str {
     }
 }
 
+/// The use check of the candidates of one discovery: one inventory for
+/// all candidates, with the bound roots as its scope, read after the walk
+/// of the roots. A unit that is in use, or whose use is not known, is
+/// added to the report of its root and is not kept.
+fn use_check(
+    result: &mut EvictionDiscovery,
+    candidates: Vec<DiscoveredCandidate>,
+    principal: Uid,
+    environment: &dyn DiscoveryEnvironment,
+) -> Vec<DiscoveredCandidate> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let scopes: Vec<UnitScope> = result
+        .bound_roots
+        .iter()
+        .map(|bound| UnitScope::new(&bound.binding.path))
+        .collect();
+    let inventory: PathInventory = environment.path_uses(principal, &scopes);
+    let mut kept: Vec<DiscoveredCandidate> = Vec::new();
+    for discovered in candidates {
+        let scope: UnitScope = UnitScope::new(&discovered.candidate.candidate.path.to_path_buf());
+        match use_skip(&uses_of(&inventory, &scope)) {
+            None => kept.push(discovered),
+            Some(reason) => {
+                if !skip_in_report(&mut result.roots, &discovered, reason) {
+                    // A unit with no root report is not shown.
+                    result.complete = false;
+                }
+            }
+        }
+    }
+    kept
+}
+
+/// The skip reason of the result of the use check, or `None` when it
+/// permits the unit.
+const fn use_skip(found: &UnitUse) -> Option<SkipReason> {
+    match found {
+        UnitUse::NotInUse => None,
+        UnitUse::InUse { .. } => Some(SkipReason::UnitInUse),
+        UnitUse::Unknown { .. } => Some(SkipReason::UnitUseUnknown),
+    }
+}
+
+/// Adds `discovered` as a skipped unit with `reason` to the report of its
+/// root. Predicate 6 is `not_satisfied` for a use and `unknown` for an
+/// unknown use. Returns false when the root has no report that was
+/// examined.
+fn skip_in_report(
+    roots: &mut [RootReport],
+    discovered: &DiscoveredCandidate,
+    reason: SkipReason,
+) -> bool {
+    let record = &discovered.candidate;
+    let root_path: PathBuf = discovered.root.path.to_path_buf();
+    let report: Option<&mut RootReport> = roots.iter_mut().find(|report| {
+        report.rule == record.rule && report.path.as_deref() == Some(root_path.as_path())
+    });
+    let Some(RootReport {
+        result: RootResult::Examined { skipped, .. },
+        ..
+    }) = report
+    else {
+        return false;
+    };
+    skipped.push(SkippedUnit {
+        relative_entry: discovered.evidence.relative_entry.clone(),
+        layout: Some(record.layout.clone()),
+        reasons: vec![reason],
+        eligibility: CandidateEligibility {
+            protocols_valid: if reason == SkipReason::UnitInUse {
+                Fact::NotSatisfied
+            } else {
+                Fact::Unknown
+            },
+            ..record.eligibility.clone()
+        },
+        evidence: Some(discovered.evidence.clone()),
+    });
+    true
+}
+
 /// The candidate with the fact of the catalog and the three predicates of
 /// admission.
 ///
@@ -772,6 +897,8 @@ impl ReviewedRules {
         if conflicts_omitted > 0 {
             result.complete = false;
         }
+        let candidates: Vec<DiscoveredCandidate> =
+            use_check(&mut result, candidates, host.principal, environment);
         for discovered in candidates {
             let candidate: Option<RuleCandidate> = self
                 .lookup(&discovered.candidate.rule)

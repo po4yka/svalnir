@@ -20,6 +20,11 @@
 //! | Working directory | `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, field `pvi_cdir.vip_path` |
 //! | File descriptors | `proc_pidinfo(PROC_PIDLISTFDS)` |
 //! | Socket of a descriptor | `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` |
+//! | File of a descriptor | `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` |
+//! | Mapped files | `proc_pidinfo(PROC_PIDREGIONPATHINFO2)`, confirmed with `PROC_PIDREGIONPATHINFO`, one region per call |
+//! | Arguments | `sysctl(CTL_KERN, KERN_PROCARGS2)`; the environment is not read |
+//! | Apple platform code | `SecCodeCopyGuestWithAttributes(kSecGuestAttributePid)`, `SecCodeCheckValidity` with `anchor apple`, `kSecCodeInfoPlatformIdentifier` |
+//! | Owner of a denied process | `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` |
 //!
 //! `responsibility_get_pid_responsible_for_pid` is not in the public SDK.
 //! The adapter finds it with `dlsym` at run time. When the symbol is absent,
@@ -37,6 +42,7 @@ use std::time::SystemTime;
 static FIRST_APPLICATION_LIST: AtomicBool = AtomicBool::new(true);
 
 use objc2::rc::autoreleasepool;
+use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType};
 
 use crate::platform::run_loop;
 use objc2_app_kit::NSWorkspace;
@@ -47,8 +53,8 @@ use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
-    ProcessSource, QueryFailure, RawListeningSocket, RawListeningSockets, RawProcessInfo, RawUsage,
-    RunningApplication, SocketFamily, Timebase,
+    ProcessSource, QueryFailure, RawArguments, RawListeningSocket, RawListeningSockets, RawPaths,
+    RawProcessInfo, RawUsage, RawVnode, RunningApplication, SocketFamily, Timebase, VnodeObject,
 };
 
 /// The largest number of process IDs that one list can have. The value is
@@ -73,7 +79,8 @@ impl DarwinProcessSource {
 fn last_failure() -> QueryFailure {
     match std::io::Error::last_os_error().raw_os_error() {
         Some(libc::ESRCH) => QueryFailure::Gone,
-        Some(libc::EPERM | libc::EACCES) => QueryFailure::PermissionDenied,
+        Some(libc::EPERM) => QueryFailure::PermissionDenied,
+        Some(libc::EACCES) => QueryFailure::AccessDenied,
         Some(libc::ENOTSUP | libc::ENOSYS) => QueryFailure::Unsupported,
         Some(code) => QueryFailure::Failed(code),
         None => QueryFailure::Failed(0),
@@ -191,12 +198,37 @@ fn executable_path(pid: Pid) -> Result<LosslessPath, QueryFailure> {
 }
 
 fn file_evidence(path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
-    let metadata: std::fs::Metadata =
-        std::fs::metadata(path.to_path_buf()).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => QueryFailure::Gone,
-            std::io::ErrorKind::PermissionDenied => QueryFailure::PermissionDenied,
-            _ => QueryFailure::Failed(error.raw_os_error().unwrap_or(0)),
-        })?;
+    object_of(std::fs::metadata(path.to_path_buf()))
+}
+
+fn link_evidence(path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+    object_of(std::fs::symlink_metadata(path.to_path_buf()))
+}
+
+fn root_entries(max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let entries = std::fs::read_dir("/")
+        .map_err(|error| QueryFailure::Failed(error.raw_os_error().unwrap_or(0)))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| QueryFailure::Failed(error.raw_os_error().unwrap_or(0)))?;
+        if names.len() >= max {
+            return Err(QueryFailure::Overflow);
+        }
+        names.push(entry.file_name().as_bytes().to_vec());
+    }
+    Ok(names)
+}
+
+fn object_of(
+    metadata: std::io::Result<std::fs::Metadata>,
+) -> Result<FileObjectEvidence, QueryFailure> {
+    let metadata: std::fs::Metadata = metadata.map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => QueryFailure::Gone,
+        std::io::ErrorKind::PermissionDenied => QueryFailure::PermissionDenied,
+        _ => QueryFailure::Failed(error.raw_os_error().unwrap_or(0)),
+    })?;
     // The standard library widens the signed 32-bit `dev_t` to `u64`. The
     // low 32 bits are the native value.
     let device_bits: u32 = u32::try_from(metadata.dev() & u64::from(u32::MAX))
@@ -373,6 +405,59 @@ fn working_directory(pid: Pid) -> Result<LosslessPath, QueryFailure> {
     LosslessPath::from_bytes(path).map_err(|_| QueryFailure::Inconsistent)
 }
 
+/// The working directory of `pid` with the identity of its vnode.
+fn working_directory_vnode(pid: Pid) -> Result<RawVnode, QueryFailure> {
+    let path: LosslessPath = working_directory(pid)?;
+    let mut info: MaybeUninit<libc::proc_vnodepathinfo> = MaybeUninit::zeroed();
+    let size: c_int = c_int::try_from(size_of::<libc::proc_vnodepathinfo>())
+        .map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: as in `working_directory`.
+    let written: c_int = unsafe {
+        libc::proc_pidinfo(
+            pid.get(),
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(last_failure());
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    // SAFETY: as in `working_directory`.
+    let info: libc::proc_vnodepathinfo = unsafe { info.assume_init() };
+    let stat: libc::vinfo_stat = info.pvi_cdir.vip_vi.vi_stat;
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .map(|byte| byte.cast_unsigned())
+        .collect();
+    // The two readings must name one path; a different path is a change
+    // of the working directory between them.
+    let end: usize = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(QueryFailure::Inconsistent)?;
+    if bytes.get(..end) != Some(path.as_bytes()) {
+        return Err(QueryFailure::Inconsistent);
+    }
+    Ok(RawVnode {
+        path: Some(path),
+        vnode: VnodeObject {
+            object: FileObjectEvidence {
+                device: DeviceNumber::new(stat.vst_dev.cast_signed()),
+                inode: InodeNumber::new(stat.vst_ino),
+            },
+            links: stat.vst_nlink,
+        },
+    })
+}
+
 /// `PROC_PIDFDSOCKETINFO` in `<sys/proc_info.h>`.
 const PROC_PIDFDSOCKETINFO: c_int = 3;
 
@@ -500,10 +585,12 @@ fn socket_of_descriptor(
     parse_listening_socket(&info)
 }
 
-fn listening_tcp_sockets(
+/// The open file descriptors of `pid`, at most `max_descriptors` of them,
+/// and whether the process has more.
+fn list_descriptors(
     pid: Pid,
     max_descriptors: usize,
-) -> Result<RawListeningSockets, QueryFailure> {
+) -> Result<(Vec<libc::proc_fdinfo>, bool), QueryFailure> {
     if max_descriptors == 0 {
         return Err(QueryFailure::Inconsistent);
     }
@@ -542,10 +629,7 @@ fn listening_tcp_sockets(
             None | Some(0)
         )
     {
-        return Ok(RawListeningSockets {
-            sockets: Vec::new(),
-            descriptors_truncated: false,
-        });
+        return Ok((Vec::new(), false));
     }
     if written <= 0 {
         return Err(last_failure());
@@ -558,10 +642,17 @@ fn listening_tcp_sockets(
     if count > capacity {
         return Err(QueryFailure::Inconsistent);
     }
-    let descriptors_truncated: bool = count > max_descriptors;
-    let examined: usize = count.min(max_descriptors);
+    descriptors.truncate(count.min(max_descriptors));
+    Ok((descriptors, count > max_descriptors))
+}
+
+fn listening_tcp_sockets(
+    pid: Pid,
+    max_descriptors: usize,
+) -> Result<RawListeningSockets, QueryFailure> {
+    let (descriptors, descriptors_truncated) = list_descriptors(pid, max_descriptors)?;
     let mut sockets: Vec<RawListeningSocket> = Vec::new();
-    for descriptor in descriptors.get(..examined).unwrap_or_default() {
+    for descriptor in &descriptors {
         if descriptor.proc_fdtype != libc::PROX_FDTYPE_SOCKET.cast_unsigned() {
             continue;
         }
@@ -573,6 +664,519 @@ fn listening_tcp_sockets(
         sockets,
         descriptors_truncated,
     })
+}
+
+/// `PROC_PIDFDVNODEPATHINFO` in `<sys/proc_info.h>`.
+const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+/// `PROC_PIDREGIONPATHINFO` in `<sys/proc_info.h>`.
+const PROC_PIDREGIONPATHINFO: c_int = 8;
+/// `PROC_PIDREGIONPATHINFO2` of the kernel source (`bsd/sys/proc_info.h`
+/// of XNU): the next region that maps a vnode. The public SDK header does
+/// not declare it. Its result has the layout of `PROC_PIDREGIONPATHINFO`.
+const PROC_PIDREGIONPATHINFO2: c_int = 22;
+/// `sizeof(struct vnode_fdinfowithpath)` in `<sys/proc_info.h>`.
+const VNODE_FDINFOWITHPATH_SIZE: usize = 1200;
+/// `offsetof(struct vnode_fdinfowithpath, pvip.vip_path)`.
+const VNODE_FDINFOWITHPATH_PATH: usize = 176;
+/// `offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat)`.
+const VNODE_FDINFOWITHPATH_INFO: usize = 24;
+/// `sizeof(struct proc_regionwithpathinfo)` in `<sys/proc_info.h>`.
+const REGIONWITHPATHINFO_SIZE: usize = 1272;
+/// `offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_address)`, a
+/// `uint64_t`.
+const REGION_ADDRESS: usize = 80;
+/// `offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_size)`, a
+/// `uint64_t`.
+const REGION_SIZE: usize = 88;
+/// `offsetof(struct proc_regionwithpathinfo, prp_vip.vip_path)`.
+const REGIONWITHPATHINFO_PATH: usize = 248;
+/// `offsetof(struct proc_regionwithpathinfo, prp_vip.vip_vi.vi_stat)`.
+const REGIONWITHPATHINFO_INFO: usize = 96;
+
+// The sizes and offsets above were measured with `sizeof` and `offsetof`
+// against `<sys/proc_info.h>` of the macOS SDK. Each path field is a
+// `vip_path` of `MAXPATHLEN` bytes, and each one ends inside its structure.
+const _: () = assert!(VNODE_FDINFOWITHPATH_PATH + VNODE_PATH_CAPACITY <= VNODE_FDINFOWITHPATH_SIZE);
+const _: () = assert!(REGIONWITHPATHINFO_PATH + VNODE_PATH_CAPACITY <= REGIONWITHPATHINFO_SIZE);
+const _: () = assert!(REGION_SIZE + 8 <= REGIONWITHPATHINFO_INFO);
+const _: () = assert!(REGIONWITHPATHINFO_INFO + VST_INO + 8 <= REGIONWITHPATHINFO_PATH);
+const _: () = assert!(VNODE_FDINFOWITHPATH_INFO + VST_INO + 8 <= VNODE_FDINFOWITHPATH_PATH);
+// `libc::vinfo_stat` has the field offsets that the byte reads use.
+const _: () = assert!(std::mem::offset_of!(libc::vinfo_stat, vst_dev) == VST_DEV);
+const _: () = assert!(std::mem::offset_of!(libc::vinfo_stat, vst_nlink) == VST_NLINK);
+const _: () = assert!(std::mem::offset_of!(libc::vinfo_stat, vst_ino) == VST_INO);
+const _: () = assert!(libc::PROX_FDTYPE_VNODE == 1);
+const _: () = assert!(libc::KERN_PROCARGS2 == 49);
+const _: () = assert!(libc::MAXPATHLEN as usize == VNODE_PATH_CAPACITY);
+
+/// A buffer with the size and the alignment of `struct
+/// vnode_fdinfowithpath`. The fields are read at their offsets.
+#[repr(C, align(8))]
+struct FdVnodeBytes([u8; VNODE_FDINFOWITHPATH_SIZE]);
+
+/// A buffer with the size and the alignment of `struct
+/// proc_regionwithpathinfo`. The fields are read at their offsets.
+#[repr(C, align(8))]
+struct RegionBytes([u8; REGIONWITHPATHINFO_SIZE]);
+
+/// The NUL-terminated absolute path of the `vip_path` field at `offset` of
+/// `bytes`. An empty path is `None`: the kernel gave no path for the vnode.
+pub(super) fn vnode_path_at(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<Option<LosslessPath>, QueryFailure> {
+    let field: &[u8] = bytes
+        .get(offset..offset.saturating_add(VNODE_PATH_CAPACITY))
+        .ok_or(QueryFailure::Inconsistent)?;
+    let end: usize = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(QueryFailure::Inconsistent)?;
+    let path: &[u8] = field.get(..end).ok_or(QueryFailure::Inconsistent)?;
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if path.first() != Some(&b'/') {
+        return Err(QueryFailure::Inconsistent);
+    }
+    LosslessPath::from_bytes(path)
+        .map(Some)
+        .map_err(|_| QueryFailure::Inconsistent)
+}
+
+/// The offsets of `vst_dev` (`uint32_t`), `vst_nlink` (`uint16_t`), and
+/// `vst_ino` (`uint64_t`) of `vip_vi.vi_stat`, relative to the start of the
+/// `struct vnode_info_path`, measured against `<sys/proc_info.h>`.
+const VST_DEV: usize = 0;
+const VST_NLINK: usize = 6;
+const VST_INO: usize = 8;
+
+/// The vnode identity of the `struct vnode_info_path` at `info` of `bytes`,
+/// with the path at `path`. `None` for an identity of zeros, which the
+/// kernel gives for a region that maps no vnode.
+pub(super) fn vnode_at(
+    bytes: &[u8],
+    info: usize,
+    path: usize,
+) -> Result<Option<RawVnode>, QueryFailure> {
+    let device: u32 = read_u32(bytes, info + VST_DEV)?;
+    let links: [u8; 2] = bytes
+        .get(info + VST_NLINK..info + VST_NLINK + 2)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    let inode: u64 = read_u64(bytes, info + VST_INO)?;
+    let path: Option<LosslessPath> = vnode_path_at(bytes, path)?;
+    if device == 0 && inode == 0 && path.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(RawVnode {
+        path,
+        vnode: VnodeObject {
+            object: FileObjectEvidence {
+                device: DeviceNumber::new(device.cast_signed()),
+                inode: InodeNumber::new(inode),
+            },
+            links: u16::from_ne_bytes(links),
+        },
+    }))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, QueryFailure> {
+    let field: [u8; 4] = bytes
+        .get(offset..offset.saturating_add(4))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    Ok(u32::from_ne_bytes(field))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, QueryFailure> {
+    let field: [u8; 8] = bytes
+        .get(offset..offset.saturating_add(8))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    Ok(u64::from_ne_bytes(field))
+}
+
+/// Adds `vnode` to `vnodes` when it is not there.
+fn push_unique(vnodes: &mut Vec<RawVnode>, vnode: RawVnode) {
+    if !vnodes.contains(&vnode) {
+        vnodes.push(vnode);
+    }
+}
+
+/// The vnode of one descriptor, or `None` when the descriptor closed after
+/// the list was read.
+fn vnode_of_descriptor(pid: Pid, descriptor: i32) -> Result<Option<RawVnode>, QueryFailure> {
+    let mut info: FdVnodeBytes = FdVnodeBytes([0; VNODE_FDINFOWITHPATH_SIZE]);
+    let size: c_int =
+        c_int::try_from(VNODE_FDINFOWITHPATH_SIZE).map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: `info` is a live, writable buffer of `size` bytes with the
+    // alignment of `struct vnode_fdinfowithpath`. The kernel writes at most
+    // `size` bytes for `PROC_PIDFDVNODEPATHINFO`.
+    let written: c_int = unsafe {
+        libc::proc_pidfdinfo(
+            pid.get(),
+            descriptor,
+            PROC_PIDFDVNODEPATHINFO,
+            info.0.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            // The descriptor closed, or it is no longer a vnode.
+            Some(libc::EBADF | libc::ENOTSUP | libc::EINVAL | libc::ENOENT) => Ok(None),
+            _ => Err(last_failure()),
+        };
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    vnode_at(
+        &info.0,
+        VNODE_FDINFOWITHPATH_INFO,
+        VNODE_FDINFOWITHPATH_PATH,
+    )
+}
+
+fn open_file_paths(pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
+    let (descriptors, truncated) = list_descriptors(pid, max_descriptors)?;
+    let mut paths: Vec<RawVnode> = Vec::new();
+    for descriptor in &descriptors {
+        if descriptor.proc_fdtype != libc::PROX_FDTYPE_VNODE.cast_unsigned() {
+            continue;
+        }
+        if let Some(vnode) = vnode_of_descriptor(pid, descriptor.proc_fd)? {
+            push_unique(&mut paths, vnode);
+        }
+    }
+    Ok(RawPaths { paths, truncated })
+}
+
+fn mapped_file_paths_flavor(
+    pid: Pid,
+    max_regions: usize,
+    flavor: c_int,
+) -> Result<RawPaths, QueryFailure> {
+    let size: c_int =
+        c_int::try_from(REGIONWITHPATHINFO_SIZE).map_err(|_| QueryFailure::Overflow)?;
+    let mut paths: Vec<RawVnode> = Vec::new();
+    let mut address: u64 = 0;
+    for _ in 0..max_regions {
+        let mut info: RegionBytes = RegionBytes([0; REGIONWITHPATHINFO_SIZE]);
+        // SAFETY: `info` is a live, writable buffer of `size` bytes with the
+        // alignment of `struct proc_regionwithpathinfo`. The kernel writes at
+        // most `size` bytes for `PROC_PIDREGIONPATHINFO`. The argument is the
+        // address from which the kernel looks for the next region.
+        let written: c_int = unsafe {
+            libc::proc_pidinfo(
+                pid.get(),
+                flavor,
+                address,
+                info.0.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+        if written <= 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                // No region is at or after the address: the list is at its
+                // end.
+                Some(libc::EINVAL) => Ok(RawPaths {
+                    paths,
+                    truncated: false,
+                }),
+                _ => Err(last_failure()),
+            };
+        }
+        if written != size {
+            return Err(QueryFailure::Inconsistent);
+        }
+        if let Some(vnode) = vnode_at(&info.0, REGIONWITHPATHINFO_INFO, REGIONWITHPATHINFO_PATH)? {
+            push_unique(&mut paths, vnode);
+        }
+        let start: u64 = read_u64(&info.0, REGION_ADDRESS)?;
+        let length: u64 = read_u64(&info.0, REGION_SIZE)?;
+        let Some(next) = start.checked_add(length) else {
+            // The region ends at the top of the address space.
+            return Ok(RawPaths {
+                paths,
+                truncated: false,
+            });
+        };
+        if next <= address {
+            return Err(QueryFailure::Inconsistent);
+        }
+        address = next;
+    }
+    Ok(RawPaths {
+        paths,
+        truncated: true,
+    })
+}
+
+/// The arguments in a `KERN_PROCARGS2` buffer: an `int` count, the
+/// executable path, NUL padding, and the count of NUL-terminated arguments.
+/// The environment after the arguments is not read. `complete` is false
+/// when the buffer has fewer arguments than the count.
+pub(super) fn parse_procargs(buffer: &[u8], complete: bool) -> Result<RawArguments, QueryFailure> {
+    let count: [u8; 4] = buffer
+        .get(..4)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    let count: usize =
+        usize::try_from(i32::from_ne_bytes(count)).map_err(|_| QueryFailure::Inconsistent)?;
+    let rest: &[u8] = buffer.get(4..).unwrap_or_default();
+    // The executable path, then the padding.
+    let after_path: usize = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(rest.len());
+    let mut position: usize = after_path;
+    while rest.get(position) == Some(&0) {
+        position += 1;
+    }
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(count.min(4096));
+    while values.len() < count {
+        let Some(tail) = rest.get(position..).filter(|tail| !tail.is_empty()) else {
+            break;
+        };
+        let Some(end) = tail.iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        values.push(tail.get(..end).unwrap_or_default().to_vec());
+        position += end + 1;
+    }
+    let truncated: bool = values.len() < count;
+    if truncated && complete {
+        return Err(QueryFailure::Inconsistent);
+    }
+    Ok(RawArguments { values, truncated })
+}
+
+/// The mapped files of `pid`. The query is first the flavor
+/// [`PROC_PIDREGIONPATHINFO2`], which gives only the regions that map a
+/// vnode; on the hosts that were measured it gave the same paths as the
+/// public flavor in about one thirtieth of the time. A result with no path
+/// can also come from a kernel that does not know the flavor, so it is
+/// confirmed with the public flavor [`PROC_PIDREGIONPATHINFO`].
+fn mapped_file_paths(pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+    // SAFETY: of the result, not of memory (owner decision of 2026-11-22).
+    // The private flavor is kept because the public flavor walks each
+    // region, also each region with no file, and made the inventory of one
+    // host take 9 s instead of 0.3 s; both flavors gave the same paths for
+    // each of its 1079 processes. A kernel that does not know the private
+    // flavor fails the call or gives no region. For each failure other
+    // than an exit, and for a result with no path, the public flavor reads
+    // the regions again, so the private flavor can only add speed and
+    // never removes a path from the result. The buffer and its layout are
+    // the same for the two flavors.
+    match mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO2) {
+        Ok(found) if !found.paths.is_empty() || found.truncated => Ok(found),
+        Err(QueryFailure::Gone) => Err(QueryFailure::Gone),
+        Ok(_) | Err(_) => mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO),
+    }
+}
+
+fn arguments(pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
+    let mut name: [c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.get()];
+    let mut buffer: Vec<u8> = vec![0; max_bytes.max(8)];
+    let mut length: libc::size_t = buffer.len();
+    // SAFETY: `name` is a live array of 3 integers. `buffer` is a live,
+    // writable allocation and `length` holds its size, so the kernel writes
+    // at most that number of bytes. The call sets no new value.
+    let status: c_int = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(last_failure());
+    }
+    let written: &[u8] = buffer.get(..length).ok_or(QueryFailure::Inconsistent)?;
+    // A full buffer can be the start of a longer argument area.
+    parse_procargs(written, length < buffer.len())
+}
+
+fn process_owner(pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+    let mut info: MaybeUninit<libc::proc_bsdshortinfo> = MaybeUninit::zeroed();
+    let size: c_int = c_int::try_from(size_of::<libc::proc_bsdshortinfo>())
+        .map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: `info` is a live, writable `proc_bsdshortinfo` of `size`
+    // bytes. The kernel writes at most `size` bytes for
+    // `PROC_PIDT_SHORTBSDINFO`.
+    let written: c_int = unsafe {
+        libc::proc_pidinfo(
+            pid.get(),
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(last_failure());
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    // SAFETY: the kernel wrote the full structure. Each field is an integer
+    // or an array of integers, so each bit pattern is a valid value.
+    let info: libc::proc_bsdshortinfo = unsafe { info.assume_init() };
+    if i32::try_from(info.pbsi_pid).ok() != Some(pid.get()) {
+        return Err(QueryFailure::Inconsistent);
+    }
+    Ok((Uid::new(info.pbsi_uid), Uid::new(info.pbsi_ruid)))
+}
+
+// The Security framework calls of the platform-code check. Each code,
+// requirement, and dictionary reference is a Core Foundation object.
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    /// `const CFStringRef kSecGuestAttributePid` in `<Security/SecCode.h>`.
+    static kSecGuestAttributePid: Option<&'static CFString>;
+    /// `const CFStringRef kSecCodeInfoPlatformIdentifier` in
+    /// `<Security/SecCode.h>`: present when the code was signed as part of
+    /// an operating system release.
+    static kSecCodeInfoPlatformIdentifier: Option<&'static CFString>;
+    /// `OSStatus SecCodeCopyGuestWithAttributes(SecCodeRef host,
+    /// CFDictionaryRef attributes, SecCSFlags flags, SecCodeRef *guest)`.
+    fn SecCodeCopyGuestWithAttributes(
+        host: *const CFType,
+        attributes: *const CFDictionary,
+        flags: u32,
+        guest: *mut *mut CFType,
+    ) -> i32;
+    /// `OSStatus SecRequirementCreateWithString(CFStringRef text,
+    /// SecCSFlags flags, SecRequirementRef *requirement)`.
+    fn SecRequirementCreateWithString(
+        text: *const CFString,
+        flags: u32,
+        requirement: *mut *mut CFType,
+    ) -> i32;
+    /// `OSStatus SecCodeCheckValidity(SecCodeRef code, SecCSFlags flags,
+    /// SecRequirementRef requirement)`.
+    fn SecCodeCheckValidity(code: *const CFType, flags: u32, requirement: *const CFType) -> i32;
+    /// `OSStatus SecCodeCopySigningInformation(SecStaticCodeRef code,
+    /// SecCSFlags flags, CFDictionaryRef *information)`. A `SecCodeRef` is
+    /// accepted for the static code.
+    fn SecCodeCopySigningInformation(
+        code: *const CFType,
+        flags: u32,
+        information: *mut *mut CFDictionary,
+    ) -> i32;
+}
+
+/// `kSecCSDefaultFlags` in `<Security/CSCommon.h>`.
+const SEC_CS_DEFAULT_FLAGS: u32 = 0;
+/// `errSecCSReqFailed` in `<Security/CSCommon.h>`: the code is valid and
+/// does not satisfy the requirement.
+const ERR_SEC_CS_REQ_FAILED: i32 = -67050;
+
+/// Takes ownership of a reference that a `Copy` or `Create` call returned.
+///
+/// # Safety
+///
+/// `pointer` must be null or a Core Foundation object of type `T` with a
+/// +1 retain count that the caller owns.
+unsafe fn owned<T: objc2_core_foundation::Type>(pointer: *mut T) -> Option<CFRetained<T>> {
+    // SAFETY: the caller guarantees the type and the ownership.
+    std::ptr::NonNull::new(pointer).map(|pointer| unsafe { CFRetained::from_raw(pointer) })
+}
+
+/// Whether the process `pid` runs Apple platform code: the dynamic code
+/// signature is valid for `anchor apple`, and the signing information has a
+/// platform identifier.
+///
+/// The guest is found by its PID, which the documentation of
+/// `kSecGuestAttributePid` names as less precise than an audit token: a
+/// process that exits and whose PID a new process takes between this check
+/// and the use queries is examined as the new process. The caller applies
+/// the result only to a process of the user whose executable is on the
+/// sealed system volume, so the new process must also be such a process.
+fn apple_platform_code(pid: Pid) -> Result<bool, QueryFailure> {
+    // SAFETY: the statics are constant strings of the framework. A null
+    // value is `None`.
+    let (Some(pid_key), Some(platform_key)) = (unsafe { kSecGuestAttributePid }, unsafe {
+        kSecCodeInfoPlatformIdentifier
+    }) else {
+        return Err(QueryFailure::Unsupported);
+    };
+    let value: CFRetained<CFNumber> = CFNumber::new_i32(pid.get());
+    let attributes: CFRetained<CFDictionary<CFString, CFNumber>> =
+        CFDictionary::from_slices(&[pid_key], &[&*value]);
+    let mut guest: *mut CFType = std::ptr::null_mut();
+    // SAFETY: a null host is the documented request for the system root
+    // host. The dictionary lives for the call. The call writes one owned
+    // reference into `guest` on success.
+    let status: i32 = unsafe {
+        SecCodeCopyGuestWithAttributes(
+            std::ptr::null(),
+            CFRetained::as_ptr(&attributes)
+                .as_ptr()
+                .cast::<CFDictionary>(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut guest,
+        )
+    };
+    // SAFETY: on success `guest` is an owned `SecCodeRef`; it is null
+    // otherwise.
+    let guest: Option<CFRetained<CFType>> = unsafe { owned(guest) };
+    let Some(guest) = guest.filter(|_| status == 0) else {
+        return Err(QueryFailure::Failed(status));
+    };
+    let text: CFRetained<CFString> = CFString::from_static_str("anchor apple");
+    let mut requirement: *mut CFType = std::ptr::null_mut();
+    // SAFETY: `text` lives for the call. The call writes one owned
+    // `SecRequirementRef` into `requirement` on success.
+    let status: i32 = unsafe {
+        SecRequirementCreateWithString(
+            CFRetained::as_ptr(&text).as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut requirement,
+        )
+    };
+    // SAFETY: as for `guest`.
+    let requirement: Option<CFRetained<CFType>> = unsafe { owned(requirement) };
+    let Some(requirement) = requirement.filter(|_| status == 0) else {
+        return Err(QueryFailure::Failed(status));
+    };
+    // SAFETY: both references are live owned objects of the expected types
+    // for the call.
+    let validity: i32 = unsafe {
+        SecCodeCheckValidity(
+            CFRetained::as_ptr(&guest).as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            CFRetained::as_ptr(&requirement).as_ptr(),
+        )
+    };
+    match validity {
+        0 => {}
+        ERR_SEC_CS_REQ_FAILED => return Ok(false),
+        other => return Err(QueryFailure::Failed(other)),
+    }
+    let mut information: *mut CFDictionary = std::ptr::null_mut();
+    // SAFETY: `guest` is a live code object. The call writes one owned
+    // dictionary into `information` on success.
+    let status: i32 = unsafe {
+        SecCodeCopySigningInformation(
+            CFRetained::as_ptr(&guest).as_ptr(),
+            SEC_CS_DEFAULT_FLAGS,
+            &raw mut information,
+        )
+    };
+    // SAFETY: as for `guest`; the dictionary has string keys.
+    let information: Option<CFRetained<CFDictionary>> = unsafe { owned(information) };
+    let Some(information) = information.filter(|_| status == 0) else {
+        return Err(QueryFailure::Failed(status));
+    };
+    // SAFETY: the keys of the signing information are strings.
+    let information: &CFDictionary<CFString, CFType> = unsafe { information.cast_unchecked() };
+    Ok(information.get(platform_key).is_some())
 }
 
 fn timebase() -> Result<Timebase, QueryFailure> {
@@ -667,6 +1271,14 @@ impl ProcessSource for DarwinProcessSource {
         file_evidence(path)
     }
 
+    fn link_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        link_evidence(path)
+    }
+
+    fn root_entries(&self, max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+        root_entries(max)
+    }
+
     fn usage(&self, pid: Pid) -> Result<RawUsage, QueryFailure> {
         usage(pid)
     }
@@ -712,5 +1324,29 @@ impl ProcessSource for DarwinProcessSource {
         max_descriptors: usize,
     ) -> Result<RawListeningSockets, QueryFailure> {
         listening_tcp_sockets(pid, max_descriptors)
+    }
+
+    fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+        process_owner(pid)
+    }
+
+    fn working_directory_vnode(&self, pid: Pid) -> Result<RawVnode, QueryFailure> {
+        working_directory_vnode(pid)
+    }
+
+    fn open_file_paths(&self, pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
+        open_file_paths(pid, max_descriptors)
+    }
+
+    fn mapped_file_paths(&self, pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+        mapped_file_paths(pid, max_regions)
+    }
+
+    fn arguments(&self, pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
+        arguments(pid, max_bytes)
+    }
+
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        apple_platform_code(pid)
     }
 }

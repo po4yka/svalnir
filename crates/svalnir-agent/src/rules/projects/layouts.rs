@@ -83,6 +83,11 @@ pub struct ProjectLayout {
     pub project_markers: &'static [ProjectMarker],
     /// A regular file that the unit must have, when the layout has one.
     pub inner_marker: Option<&'static str>,
+    /// A regular file, relative to the project directory, that the project
+    /// must have beside the unit, when the layout has one: for example
+    /// `obj/project.assets.json` beside `bin` of .NET. Each directory on
+    /// its way must be a directory, not a symbolic link.
+    pub project_file: Option<&'static str>,
     /// The protected children, relative to the unit. Each component is a
     /// name or a pattern with `*` and `?`. A unit with an entry at one of
     /// them is refused (`protected_child`).
@@ -132,6 +137,7 @@ const fn plain(
         layout,
         project_markers,
         inner_marker: None,
+        project_file: None,
         protected: &[],
         name,
         checkouts: PackageCheckouts::None,
@@ -411,14 +417,19 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         ),
         "project.assets.json",
     ),
-    plain(
-        "bin",
-        "dotnet-bin",
-        DOTNET_PROJECT,
-        Generic,
-        "Run `dotnet clean` in the project, or remove the directory. Svalnir does not run them.",
-        "The next build makes the programs and the libraries again. A file that a person put in the directory is lost.",
-    ),
+    // `bin` is a generic name: the restore output beside it shows that the
+    // .NET SDK builds the project.
+    ProjectLayout {
+        project_file: Some("obj/project.assets.json"),
+        ..plain(
+            "bin",
+            "dotnet-bin",
+            DOTNET_PROJECT,
+            Generic,
+            "Run `dotnet clean` in the project, or remove the directory. Svalnir does not run them.",
+            "The next build makes the programs and the libraries again. A file that a person put in the directory is lost.",
+        )
+    },
     ProjectLayout {
         checkouts: PackageCheckouts::PackageBuild,
         ..with_inner(

@@ -255,6 +255,9 @@ pub struct ProjectUnitReport {
     /// The entry at a protected path of the layout, relative to the unit,
     /// when the check found one (`protected_child`).
     pub protected_child: Option<PathBuf>,
+    /// The layout of the earlier unit of the project that this unit is,
+    /// holds, or is in (`overlaps_unit`). That unit has the checks.
+    pub overlapping_layout: Option<&'static str>,
     /// The evidence of Git, when the checks came to it.
     pub version_control: Option<VersionControl>,
     /// The process evidence, when the checks came to it.
@@ -341,6 +344,7 @@ struct Layout<'a> {
     directory: &'a str,
     markers: Vec<(&'a str, MarkerKind)>,
     inner_marker: Option<&'a str>,
+    project_file: Option<&'a str>,
     protected: Vec<&'a str>,
     name: DirectoryName,
     checkouts: PackageCheckouts,
@@ -362,6 +366,7 @@ impl<'a> Layout<'a> {
                 .map(|marker| (marker.name, marker.kind))
                 .collect(),
             inner_marker: layout.inner_marker,
+            project_file: layout.project_file,
             protected: layout.protected.to_vec(),
             name: layout.name,
             checkouts: layout.checkouts,
@@ -384,6 +389,7 @@ impl<'a> Layout<'a> {
                 .map(|marker| (marker.as_str(), MarkerKind::File))
                 .collect(),
             inner_marker: layout.inner_marker.as_deref(),
+            project_file: None,
             protected: layout.protected.iter().map(String::as_str).collect(),
             name: DirectoryName::Generic,
             checkouts: PackageCheckouts::None,
@@ -861,6 +867,8 @@ impl Inspector<'_> {
                 directories.push(layout.directory);
             }
         }
+        // The units of this project so far, with their layouts.
+        let mut earlier: Vec<(PathBuf, &'static str)> = Vec::new();
         for directory in directories {
             if self.stop().is_some() {
                 return;
@@ -891,6 +899,7 @@ impl Inspector<'_> {
                 project: project.to_path_buf(),
                 layout: layout.id,
                 protected_child: None,
+                overlapping_layout: None,
                 version_control: None,
                 activity: None,
                 uses: None,
@@ -899,7 +908,18 @@ impl Inspector<'_> {
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
             };
-            report.outcome = self.unit(&layout, project, root, names, &path, &mut report);
+            // One directory is never in two units: a unit that is, holds, or
+            // is in an earlier unit of the project is refused, and only the
+            // earlier unit is measured.
+            if let Some((_, other)) = earlier.iter().find(|(unit, _)| overlaps(unit, &path)) {
+                report.overlapping_layout = Some(other);
+                report.outcome = ProjectUnitOutcome::Refused {
+                    reason: "overlaps_unit",
+                };
+            } else {
+                report.outcome = self.unit(&layout, project, root, names, &path, &mut report);
+            }
+            earlier.push((path.clone(), layout.id));
             self.matched.insert(path);
             self.units.push(report);
         }
@@ -959,6 +979,11 @@ impl Inspector<'_> {
         }
         if let Some(inner) = layout.inner_marker
             && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
+        {
+            return Err("unsupported_layout");
+        }
+        if let Some(file) = layout.project_file
+            && !is_plain_file(project, file)
         {
             return Err("unsupported_layout");
         }
@@ -1278,4 +1303,26 @@ fn pin_container(project: &Path, names: &BTreeSet<OsString>) -> Option<PathBuf> 
         }
     }
     None
+}
+
+/// Whether `relative`, below `project`, is a regular file, with each
+/// directory on its way a directory and not a symbolic link.
+fn is_plain_file(project: &Path, relative: &str) -> bool {
+    let mut path: PathBuf = project.to_path_buf();
+    let mut components = relative.split('/').peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        let Ok(found) = lstat(&path) else {
+            return false;
+        };
+        let expected: ObjectKind = if components.peek().is_some() {
+            ObjectKind::Directory
+        } else {
+            ObjectKind::RegularFile
+        };
+        if found.kind != expected {
+            return false;
+        }
+    }
+    true
 }

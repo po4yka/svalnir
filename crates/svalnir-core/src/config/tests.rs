@@ -1263,7 +1263,7 @@ fn layout_document(body: &str) -> String {
 #[test]
 fn a_user_layout_is_read_with_each_field() {
     let config: ValidatedConfig = valid(&format!(
-        "{}\n[[cleanup.projects.layouts]]\ndirectory = \"vendor/cache2\"\nmarkers = [\"Gemfile\"]\n",
+        "{}\n[[cleanup.projects.layouts]]\ndirectory = \"out2/cache\"\nmarkers = [\"Gemfile\"]\n",
         layout_document(
             "directory = \"out\"\nmarkers = [\"meson.build\", \"*.meson\"]\ninner_marker = \"meson-info.json\"\nprotected = [\"keep\", \"*/release\"]\nquiet_period = \"2h\""
         )
@@ -1275,7 +1275,7 @@ fn a_user_layout_is_read_with_each_field() {
     assert_eq!(layouts[0].inner_marker.as_deref(), Some("meson-info.json"));
     assert_eq!(layouts[0].protected, ["keep", "*/release"]);
     assert_eq!(layouts[0].quiet_period, Some(Duration::from_hours(2)));
-    assert_eq!(layouts[1].directory, "vendor/cache2");
+    assert_eq!(layouts[1].directory, "out2/cache");
     assert_eq!(layouts[1].inner_marker, None);
     assert_eq!(layouts[1].protected, Vec::<String>::new());
     assert_eq!(layouts[1].quiet_period, None);
@@ -1503,4 +1503,53 @@ fn the_user_layout_example_of_the_policy_spec_validates() {
     let layout = &config.cleanup().projects.layouts[0];
     assert_eq!(layout.directory, "builddir");
     assert_eq!(layout.quiet_period, Some(Duration::from_hours(72)));
+}
+
+#[test]
+fn a_user_layout_cannot_overlap_a_built_in_layout_or_a_kept_out_name() {
+    let directory = "cleanup.projects.layouts[0].directory";
+    for name in [
+        "node_modules",
+        "node_modules/foo",
+        "Vendor/x",
+        "vendor",
+        "tmp",
+        "tmp/sessions",
+        "build/cache",
+        "_build",
+        "target",
+        "zig-out",
+        "deps",
+        "DEPS/x",
+    ] {
+        assert_one(
+            &layout_document(&format!(
+                "directory = \"{name}\"\nmarkers = [\"rebar.config\"]"
+            )),
+            FindingCode::InvalidPath,
+            directory,
+        );
+    }
+    // A built-in name as the second name does not overlap a built-in unit:
+    // the walk does not enter a unit.
+    valid(&layout_document(
+        "directory = \"out/build\"\nmarkers = [\"m\"]",
+    ));
+}
+
+#[test]
+fn a_pattern_marker_needs_a_specific_literal_part() {
+    let marker = "cleanup.projects.layouts[0].markers[0]";
+    for pattern in ["*.*", "a*", ".*", "*e", "?.?", "*..*", "*", "**", "*.?s"] {
+        assert_one(
+            &layout_document(&format!("directory = \"out\"\nmarkers = [\"{pattern}\"]")),
+            FindingCode::InvalidPath,
+            marker,
+        );
+    }
+    for pattern in ["*.csproj", "*.py", "ab*", "x"] {
+        valid(&layout_document(&format!(
+            "directory = \"out\"\nmarkers = [\"{pattern}\"]"
+        )));
+    }
 }

@@ -15,8 +15,8 @@ use std::time::Duration;
 use super::finding::FindingCode;
 use super::reader::{Context, Read, TableReader};
 use super::schema::{
-    MAX_LAYOUT_ENTRIES, MAX_QUIET_PERIOD, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES,
-    SKIPPED_DIRECTORY_NAMES, UserLayout,
+    BUILT_IN_LAYOUT_NAMES, KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_ENTRIES, MAX_QUIET_PERIOD,
+    MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES, SKIPPED_DIRECTORY_NAMES, UserLayout,
 };
 
 /// The largest length of one name, in bytes: the name limit of APFS.
@@ -100,6 +100,25 @@ fn read_directory(
             return None;
         }
     }
+    // The first name decides the overlap: a layout of the configuration
+    // that starts with the directory of a built-in layout, or with the
+    // first name of a built-in directory of two names, would have units in
+    // or around the units of that layout.
+    let first: &str = components.first().copied().unwrap_or(text);
+    if is_one_of(first, &BUILT_IN_LAYOUT_NAMES) {
+        report(
+            context,
+            "starts with the directory of a built-in layout; a layout of the configuration cannot overlap it",
+        );
+        return None;
+    }
+    if is_one_of(first, &KEPT_OUT_LAYOUT_NAMES) {
+        report(
+            context,
+            "names a directory that the rule keeps out, because a removal can lose data that no tool makes again",
+        );
+        return None;
+    }
     if !seen.insert(text.to_ascii_lowercase()) {
         context.report(
             FindingCode::DuplicateIdentifier,
@@ -152,18 +171,25 @@ fn marker_problem(marker: &str) -> Option<&'static str> {
     if let Some(problem) = name_problem(marker, true) {
         return Some(problem);
     }
-    // A pattern of `*` and `?` only matches each file, so the layout would
-    // be a name alone.
-    if marker
-        .chars()
-        .all(|character| matches!(character, '*' | '?'))
-    {
-        return Some("a marker must have a character that is not `*` or `?`");
+    // A pattern with no specific literal part, such as `*`, `*.*`, `a*`, or
+    // `*e`, matches almost each file, so the layout would be a name alone.
+    if marker.contains(['*', '?']) && !has_specific_literal(marker) {
+        return Some(
+            "a pattern marker must have a literal part of two or more characters that is not only `.`",
+        );
     }
     if is_one_of(marker, &SKIPPED_DIRECTORY_NAMES) {
         return Some("a version-control or cache name is not a project marker");
     }
     None
+}
+
+/// Whether `pattern` has a run of two or more bytes with no `*` and no
+/// `?` that is not only `.`, for example `.csproj` of `*.csproj`.
+fn has_specific_literal(pattern: &str) -> bool {
+    pattern
+        .split(['*', '?'])
+        .any(|literal| literal.len() >= 2 && literal.bytes().any(|byte| byte != b'.'))
 }
 
 /// Why `path` is not a protected path, or `None`.

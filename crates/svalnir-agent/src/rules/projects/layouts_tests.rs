@@ -69,7 +69,63 @@ fn project_with(
     if let Some(inner) = inner {
         home.write(&format!("{project}/{directory}/{inner}"), b"tag\n");
     }
+    if let Some(file) = project_file(directory, marker) {
+        home.write(&format!("{project}/{file}"), b"{}");
+    }
     home.path.join(project)
+}
+
+/// The project file of the layout of `directory` with the first marker
+/// `marker`, when it has one.
+fn project_file(directory: &str, marker: &ProjectMarker) -> Option<&'static str> {
+    PROJECT_LAYOUTS
+        .iter()
+        .find(|layout| layout.directory == directory && layout.project_markers[0] == *marker)
+        .and_then(|layout| layout.project_file)
+}
+
+#[test]
+fn the_bin_directory_of_dotnet_needs_the_restore_output_beside_it() {
+    let home = Home::new();
+    for project in ["Code/a", "Code/b", "Code/c"] {
+        home.write(&format!("{project}/App.csproj"), b"<Project/>\n");
+        home.write(&format!("{project}/.gitignore"), b"/bin/\n/obj/\n");
+        home.repository(project);
+        home.write(&format!("{project}/bin/Debug/app.dll"), b"1\n");
+    }
+    home.write("Code/a/obj/project.assets.json", b"{}");
+    // The file is a directory, or is reached through a symbolic link.
+    fs::create_dir_all(home.path.join("Code/b/obj/project.assets.json")).unwrap();
+    home.write("Code/elsewhere/project.assets.json", b"{}");
+    symlink(
+        home.path.join("Code/elsewhere"),
+        home.path.join("Code/c/obj"),
+    )
+    .unwrap();
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let bin = unit(&inspection, &home.path.join("Code/a/bin"));
+    assert_eq!(bin.layout, "dotnet-bin");
+    assert!(matches!(bin.outcome, ProjectUnitOutcome::Measured(_)));
+    for project in ["Code/b", "Code/c"] {
+        assert_eq!(
+            refusal(unit(&inspection, &home.path.join(project).join("bin"))),
+            "unsupported_layout",
+            "{project}"
+        );
+    }
+}
+
+#[test]
+fn the_first_names_of_the_catalog_are_reserved_in_the_configuration() {
+    let mut names: Vec<&str> = PROJECT_LAYOUTS
+        .iter()
+        .map(|layout| layout.directory.split('/').next().unwrap())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut reserved: Vec<&str> = svalnir_core::config::BUILT_IN_LAYOUT_NAMES.to_vec();
+    reserved.sort_unstable();
+    assert_eq!(names, reserved);
 }
 
 /// The layouts of the configuration document `text`.
@@ -412,7 +468,11 @@ protected = [\"keep\"]
 quiet_period = \"2h\"
 
 [[cleanup.projects.layouts]]
-directory = \"build\"
+directory = \"gen\"
+markers = [\"meson.build\"]
+
+[[cleanup.projects.layouts]]
+directory = \"gen/cache\"
 markers = [\"meson.build\"]
 ";
 
@@ -422,17 +482,16 @@ fn a_layout_of_the_configuration_has_each_check() {
     let layouts: Vec<UserLayout> = configured(USER_LAYOUTS);
     for project in ["Code/u1", "Code/u2", "Code/u4", "Code/u5"] {
         home.write(&format!("{project}/meson.build"), b"project('a')\n");
-        home.write(&format!("{project}/.gitignore"), b"/out/\n/build/\n");
+        home.write(&format!("{project}/.gitignore"), b"/out/\n/gen/\n");
     }
-    home.write("Code/u5/build.gradle", b"plugins {}\n");
     for project in ["Code/u1", "Code/u2", "Code/u4", "Code/u5"] {
         home.repository(project);
     }
     home.write("Code/u1/out/a.o", b"o\n");
     home.write("Code/u2/out/keep/notes.txt", b"mine\n");
     home.write("Code/u3/out/a.o", b"o\n");
-    home.write("Code/u4/build/a.o", b"o\n");
-    home.write("Code/u5/build/a.o", b"o\n");
+    home.write("Code/u4/gen/a.o", b"o\n");
+    home.write("Code/u4/gen/cache/b.o", b"o\n");
     // A directory of the layout that Git does not ignore.
     home.write("Code/u6/meson.build", b"project('a')\n");
     home.repository("Code/u6");
@@ -454,15 +513,14 @@ fn a_layout_of_the_configuration_has_each_check() {
     assert_eq!(refusal(protected), "protected_child");
     assert_eq!(protected.protected_child, Some(PathBuf::from("keep")));
     assert!(!is_listed(&inspection, &home.path.join("Code/u3/out")));
-    assert_eq!(
-        unit(&inspection, &home.path.join("Code/u4/build")).layout,
-        "user-configured"
-    );
-    // A layout of the catalog comes first.
-    assert_eq!(
-        unit(&inspection, &home.path.join("Code/u5/build")).layout,
-        "gradle-build"
-    );
+    // One directory is never in two units: the earlier layout measures it,
+    // and the unit in it is refused.
+    let outer = unit(&inspection, &home.path.join("Code/u4/gen"));
+    assert!(matches!(outer.outcome, ProjectUnitOutcome::Measured(_)));
+    let inner = unit(&inspection, &home.path.join("Code/u4/gen/cache"));
+    assert_eq!(refusal(inner), "overlaps_unit");
+    assert_eq!(inner.overlapping_layout, Some("user-configured"));
+    assert_eq!(inner.version_control, None);
     assert_eq!(
         refusal(unit(&inspection, &home.path.join("Code/u6/out"))),
         "not_ignored"

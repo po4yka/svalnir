@@ -117,7 +117,15 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
         LosslessPath::from_bytes(text).map_err(|_| RegistryError::Declaration("a path"))
     };
     // One root for each directory of the catalog: two layouts can have the
-    // same directory, for example `target`.
+    // same directory, for example `target`. The roots of the base
+    // `user_selected` are hints only: the discovery for an eviction gives
+    // them no path, and the approved root of a unit is its generated
+    // directory below a search root of the inspection. A layout of the
+    // configuration has no entry here, because its directory is known only
+    // at run time. The binding of a manual plan to the search roots, for
+    // each layout and for `user-configured`, is planned for phase 2b
+    // (`docs/CLEANUP_RULES.md` section 12, "Approved roots"); this build has
+    // no manual mode for the rule, so no plan can refuse or accept a unit.
     let mut roots: Vec<ApprovedRoot> = Vec::new();
     for layout in &PROJECT_LAYOUTS {
         let root: ApprovedRoot = ApprovedRoot {

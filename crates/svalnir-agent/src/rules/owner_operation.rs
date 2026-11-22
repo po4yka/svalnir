@@ -22,12 +22,15 @@ use svalnir_core::file::LosslessPath;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::owner::{
-    ExecutableBase, ExecutableLocation, OwnerCommand, OwnerOperation, ParameterValues,
+    ExecutableBase, ExecutableLocation, InterpreterLocation, OwnerCommand, OwnerOperation,
+    ParameterValues,
 };
 use thiserror::Error;
 
 use crate::executor::fs::ApprovedRoot;
-use crate::executor::owner::{ExecutableProblem, ScopeLimits, examine_program, measure_scope};
+use crate::executor::owner::{
+    ExecutableKind, ExecutableProblem, ScopeLimits, examine_program, executable_kind, measure_scope,
+};
 use crate::scan::{CancellationToken, ScanClock};
 
 /// The reason no binding is made.
@@ -107,13 +110,28 @@ pub fn canonical_locations(locations: &[ExecutableLocation], home: &Path) -> Vec
         .collect()
 }
 
+/// The canonical paths of the interpreters of a declaration below `home`,
+/// each with its permitted interpreter arguments.
+pub fn canonical_interpreters(
+    interpreters: &[InterpreterLocation],
+    home: &Path,
+) -> Vec<(PathBuf, Vec<String>)> {
+    interpreters
+        .iter()
+        .filter_map(|interpreter| {
+            resolve_location(interpreter.location.base, &interpreter.location.path, home)
+                .map(|path| (path, interpreter.arguments()))
+        })
+        .collect()
+}
+
 /// The executable of the declaration, with the interpreter of a script:
 /// the first path that passes the checks of the owner executor.
 fn bind_executable(
     request: &OwnerBindRequest<'_>,
 ) -> Result<(ExecutableBinding, Option<InterpreterBinding>), OwnerBindError> {
-    let interpreters: Vec<PathBuf> =
-        canonical_locations(&request.declaration.interpreters, request.home_directory);
+    let interpreters: Vec<(PathBuf, Vec<String>)> =
+        canonical_interpreters(&request.declaration.interpreters, request.home_directory);
     let mut problem: OwnerBindError = OwnerBindError::ExecutableNotFound;
     for path in canonical_locations(&request.declaration.executables, request.home_directory) {
         match examine_program(
@@ -148,11 +166,22 @@ pub fn binding_agrees(
     let located = |path: &LosslessPath, locations: &[ExecutableLocation]| {
         canonical_locations(locations, home).contains(&path.to_path_buf())
     };
+    // The interpreter and its arguments are one declared pair, and a
+    // binding has an interpreter exactly when its executable is a script.
+    let interpreter_agrees: bool = match &binding.interpreter {
+        Some(interpreter) => canonical_interpreters(&declaration.interpreters, home).contains(&(
+            interpreter.executable.path.to_path_buf(),
+            interpreter.arguments.clone(),
+        )),
+        None => true,
+    };
+    let is_script: Option<bool> = executable_kind(&binding.executable.path.to_path_buf())
+        .ok()
+        .map(|kind| matches!(kind, ExecutableKind::Script { .. }));
     declaration.agrees_with(binding, home_text)
         && located(&binding.executable.path, &declaration.executables)
-        && binding.interpreter.as_ref().is_none_or(|interpreter| {
-            located(&interpreter.executable.path, &declaration.interpreters)
-        })
+        && interpreter_agrees
+        && is_script == Some(binding.interpreter.is_some())
 }
 
 /// Makes the binding of `request`.

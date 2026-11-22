@@ -15,6 +15,7 @@ use svalnir_core::process::ProcessStartTime;
 
 use super::native::{self, Responsibility, Wait};
 use crate::executor::fs::Stop;
+use crate::journal::ProcessRecord;
 
 /// The bytes of the end of one output stream that the tail keeps.
 const TAIL_BYTES_PER_STREAM: usize = 2048;
@@ -170,20 +171,30 @@ struct Family {
     responsibility: Responsibility,
     owner: u32,
     tracked: BTreeMap<libc::pid_t, ProcessStartTime>,
+    /// The descendants that the worker found and did not report yet.
+    unreported: Vec<ProcessRecord>,
 }
 
 impl Family {
+    /// Adds `pid` to the set when it is new and the set has room.
+    fn add(&mut self, pid: libc::pid_t, started: ProcessStartTime) -> bool {
+        if self.tracked.len() >= MAX_TRACKED || self.tracked.contains_key(&pid) {
+            return false;
+        }
+        self.tracked.insert(pid, started);
+        self.unreported.push(ProcessRecord { pid, started });
+        true
+    }
+
     /// Adds the live descendants of the leader and of each tracked process.
     fn track(&mut self) {
         let mut queue: Vec<libc::pid_t> = vec![self.leader];
         queue.extend(self.tracked.keys().copied());
         while let Some(parent) = queue.pop() {
             for child in native::children(parent) {
-                if self.tracked.len() >= MAX_TRACKED || self.tracked.contains_key(&child) {
-                    continue;
-                }
-                if let Some(started) = native::start_time(child) {
-                    self.tracked.insert(child, started);
+                if let Some(started) = native::start_time(child)
+                    && self.add(child, started)
+                {
                     queue.push(child);
                 }
             }
@@ -193,12 +204,11 @@ impl Family {
     /// Adds the processes for which the leader is responsible now. The
     /// system gives that responsibility only while the leader lives: after
     /// its exit, a process that it left is its own responsible process. So
-    /// the worker reads it at each stop interval while the command runs.
+    /// the worker reads it at each reading of the exit while the command
+    /// runs.
     fn track_responsible(&mut self) {
         for (pid, started) in self.responsible_survivors() {
-            if self.tracked.len() < MAX_TRACKED {
-                self.tracked.entry(pid).or_insert(started);
-            }
+            self.add(pid, started);
         }
     }
 
@@ -305,6 +315,7 @@ pub(super) fn run(
     responsibility: Responsibility,
     limits: &Supervision,
     stop: &StopCell,
+    report: &dyn Fn(&[ProcessRecord]),
 ) -> Supervised {
     let Command {
         pid,
@@ -320,6 +331,7 @@ pub(super) fn run(
         responsibility,
         owner: native::owner_of(pid).unwrap_or(u32::MAX),
         tracked: BTreeMap::new(),
+        unreported: Vec::new(),
     };
     native::signal(pid, libc::SIGCONT);
     let begun: Instant = Instant::now();
@@ -329,6 +341,7 @@ pub(super) fn run(
         match native::try_wait(pid) {
             Wait::Ended(status) => {
                 family.track();
+                report(&std::mem::take(&mut family.unreported));
                 let readers_until: Instant = Instant::now() + READER_GRACE;
                 let (out, out_end) = stdout.finish(readers_until);
                 let (err, err_end) = stderr.finish(readers_until);
@@ -352,13 +365,16 @@ pub(super) fn run(
             Wait::Running => {}
         }
         family.track();
+        family.track_responsible();
+        if !family.unreported.is_empty() {
+            report(&std::mem::take(&mut family.unreported));
+        }
         let now: Instant = Instant::now();
         if now >= deadline {
             family.stop(limits.stop_grace, false);
             break Ending::Deadline;
         }
         if now >= next_stop {
-            family.track_responsible();
             if let Some(halt) = requested(stop) {
                 family.stop(limits.stop_grace, false);
                 break Ending::Stopped(halt);

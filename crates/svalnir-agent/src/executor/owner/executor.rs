@@ -24,9 +24,11 @@ use super::model::{
 };
 use super::native::{self, Responsibility, StartFailure, Started};
 use super::supervise::{self, Command, Ending, StopCell, Supervised, Supervision};
-use super::verify::{ExecutableRefusal, check_executable, has_planned_identity, is_planned_root};
+use super::verify::{
+    ExecutableRefusal, check_executable, has_planned_identity, is_planned_root, script_agrees,
+};
 use crate::executor::fs::{ApprovedRoots, Stop};
-use crate::journal::OwnerProcess;
+use crate::journal::{OwnerProcess, ProcessRecord};
 use crate::platform::volume::{Locality, MountTable};
 use crate::scan::{CancellationToken, WallScanClock};
 
@@ -61,6 +63,9 @@ enum Event {
     /// The command is started and suspended. The worker waits for the
     /// answer of [`OwnerRun::recorded`] before it lets the command run.
     Started(OwnerProcess),
+    /// The worker found descendants of the command that it did not report
+    /// before.
+    Descendants(Vec<ProcessRecord>),
     /// The step has its result.
     Finished(Box<OwnerStepOutcome>),
 }
@@ -73,6 +78,9 @@ pub enum OwnerPoll {
     /// The command is started and suspended. The coordinator records the
     /// process in the journal and answers with [`OwnerRun::recorded`].
     Started(OwnerProcess),
+    /// The worker found these descendants of the command. The coordinator
+    /// records them in the journal.
+    Descendants(Vec<ProcessRecord>),
     /// The step has its result. The worker thread has ended.
     Finished(Box<OwnerStepOutcome>),
 }
@@ -83,6 +91,7 @@ pub struct OwnerRun {
     events: Receiver<Event>,
     answer: SyncSender<bool>,
     stop: Arc<StopCell>,
+    cancel: CancellationToken,
     thread: Option<JoinHandle<()>>,
     started: bool,
 }
@@ -96,6 +105,7 @@ impl OwnerRun {
                 self.started = true;
                 OwnerPoll::Started(process)
             }
+            Ok(Event::Descendants(descendants)) => OwnerPoll::Descendants(descendants),
             Ok(Event::Finished(outcome)) => {
                 self.join();
                 OwnerPoll::Finished(outcome)
@@ -123,13 +133,16 @@ impl OwnerRun {
         let _answered: Result<(), mpsc::TrySendError<bool>> = self.answer.try_send(recorded);
     }
 
-    /// Asks the worker to stop the command. The first request is kept.
+    /// Asks the worker to stop the command. The first request is kept. A
+    /// measurement of the scope or a digest of an executable in progress
+    /// ends at once, so the stop stays bounded.
     pub fn stop(&self, stop: Stop) {
         if let Ok(mut cell) = self.stop.lock()
             && cell.is_none()
         {
             *cell = Some(stop);
         }
+        self.cancel.cancel();
     }
 
     fn join(&mut self) {
@@ -172,11 +185,13 @@ impl OwnerExecutor {
         let (events, receiver) = mpsc::channel();
         let (answer, answers) = mpsc::sync_channel(1);
         let request: Arc<StopCell> = Arc::new(Mutex::new(None));
+        let cancel: CancellationToken = CancellationToken::new();
         let worker = Worker {
             config: self.config.clone(),
             roots: roots.clone(),
             envelope: envelope.clone(),
             stop: Arc::clone(&request),
+            cancel: cancel.clone(),
         };
         let thread = thread::Builder::new()
             .name("owner-operation".to_owned())
@@ -189,32 +204,11 @@ impl OwnerExecutor {
             events: receiver,
             answer,
             stop: request,
+            cancel,
             thread,
             started: false,
         }
     }
-}
-
-/// Whether a process of the recorded command `process` lives: the command
-/// itself (the same process ID and start time), a process of its process
-/// group, or a process whose responsible process is the command. When the
-/// responsibility functions are absent, the answer is `true`: a process
-/// that cannot be excluded is taken as alive.
-pub fn process_lives(process: &OwnerProcess) -> bool {
-    if native::lives(process.pid, process.started) || native::signal(-process.group, 0) {
-        return true;
-    }
-    let Some(responsibility) = Responsibility::resolve(&native::ResponsibilitySymbols::default())
-    else {
-        return true;
-    };
-    // SAFETY: `getpid` has no argument and cannot fail.
-    let own: libc::pid_t = unsafe { libc::getpid() };
-    native::all_processes().into_iter().any(|pid| {
-        pid != own
-            && responsibility.responsible_for(pid) == Some(process.pid)
-            && native::start_time(pid).is_some_and(|started| started >= process.started)
-    })
 }
 
 /// The record of the live process `pid` as the leader of its own process
@@ -224,6 +218,7 @@ pub fn process_record_of(pid: i32) -> Option<OwnerProcess> {
         pid,
         started: native::start_time(pid)?,
         group: pid,
+        descendants: Vec::new(),
     })
 }
 
@@ -233,6 +228,7 @@ struct Worker {
     roots: ApprovedRoots,
     envelope: RequestEnvelope,
     stop: Arc<StopCell>,
+    cancel: CancellationToken,
 }
 
 /// The Mach-O file that the worker starts, its argument vector, and the
@@ -293,6 +289,30 @@ impl Worker {
         }
     }
 
+    /// The result of a stop request that arrived before the command ran.
+    fn stopped(&self, halt: Stop) -> OwnerStepOutcome {
+        let result: TargetResult = self
+            .draft()
+            .stopped_before_run(halt.stop_reason())
+            .map_err(|NoRecord| no_record(DispatchState::NotSubmitted, None))?;
+        Ok(OwnerOutcome {
+            result,
+            scope: None,
+            exit_status: None,
+            diagnostic_tail: None,
+        })
+    }
+
+    /// The result of a refused check, or of the stop request that ended
+    /// the check: a cancelled measurement or digest is a stop and not a
+    /// changed scope or executable.
+    fn refused(&self, refusal: Refusal) -> OwnerStepOutcome {
+        match supervise::requested(&self.stop) {
+            Some(halt) => self.stopped(halt),
+            None => self.skipped(refusal),
+        }
+    }
+
     fn skipped(&self, refusal: Refusal) -> OwnerStepOutcome {
         let result: TargetResult = self
             .draft()
@@ -313,7 +333,7 @@ impl Worker {
         };
         let before: ScopeMeasurement = match self.check_before_start(owner) {
             Ok(before) => before,
-            Err(refusal) => return self.skipped(refusal),
+            Err(refusal) => return self.refused(refusal),
         };
         let Some(responsibility) = Responsibility::resolve(&self.config.responsibility) else {
             return self.skipped((code::OWNER_DISCLAIM_UNAVAILABLE, ErrorFamily::Native));
@@ -324,16 +344,27 @@ impl Worker {
         // The last check before the start: each file of the program, with
         // its digest, one time for the step.
         for file in &program.files {
-            match check_executable(file, owner.owner, self.config.max_executable_bytes) {
+            match check_executable(
+                file,
+                owner.owner,
+                self.config.max_executable_bytes,
+                &self.cancel,
+            ) {
                 Ok(()) => {}
                 Err(ExecutableRefusal::Changed) => {
-                    return self.skipped((code::OWNER_EXECUTABLE_CHANGED, ErrorFamily::Evidence));
+                    return self.refused((code::OWNER_EXECUTABLE_CHANGED, ErrorFamily::Evidence));
                 }
                 Err(ExecutableRefusal::NotTrusted) => {
                     return self
-                        .skipped((code::OWNER_EXECUTABLE_NOT_TRUSTED, ErrorFamily::Eligibility));
+                        .refused((code::OWNER_EXECUTABLE_NOT_TRUSTED, ErrorFamily::Eligibility));
                 }
             }
+        }
+        // The `#!` line of the verified script, read again, is the
+        // interpreter and the interpreter argument of the binding, and a
+        // binding has an interpreter exactly for a script.
+        if !script_agrees(&owner.executable, owner.interpreter.as_ref()) {
+            return self.skipped((code::OWNER_EXECUTABLE_CHANGED, ErrorFamily::Evidence));
         }
         let environment: Option<Vec<CString>> = owner
             .environment
@@ -345,6 +376,10 @@ impl Worker {
         else {
             return self.skipped((code::OWNER_OPERATION_NOT_STARTED, ErrorFamily::Native));
         };
+        // A stop that arrived during the checks starts no command.
+        if let Some(halt) = supervise::requested(&self.stop) {
+            return self.stopped(halt);
+        }
         let started: Started = match native::spawn_suspended(
             responsibility,
             &program.path,
@@ -391,7 +426,7 @@ impl Worker {
         // The suspended process ran no instruction of the command: its main
         // text must be the bound Mach-O file, and each file must have its
         // planned identity and change time.
-        let identical: bool = native::main_text_is(pid, &program.main.object)
+        let identical: bool = native::main_text_agrees(pid, &program.main.object)
             && program.files.iter().all(has_planned_identity);
         let start_time = native::start_time(pid);
         let (true, Some(start_time)) = (identical, start_time) else {
@@ -407,6 +442,7 @@ impl Worker {
             pid,
             started: start_time,
             group: pid,
+            descendants: Vec::new(),
         };
         // The coordinator records the process before it runs.
         let recorded: bool =
@@ -417,16 +453,7 @@ impl Worker {
         }
         if let Some(halt) = supervise::requested(&self.stop) {
             supervise::kill_suspended(pid);
-            let result: TargetResult = self
-                .draft()
-                .stopped_before_run(halt.stop_reason())
-                .map_err(|NoRecord| no_record(DispatchState::NotSubmitted, None))?;
-            return Ok(OwnerOutcome {
-                result,
-                scope: None,
-                exit_status: None,
-                diagnostic_tail: None,
-            });
+            return self.stopped(halt);
         }
         let limits = Supervision {
             deadline: Duration::from_nanos(owner.command_deadline.get()),
@@ -443,6 +470,9 @@ impl Worker {
             responsibility,
             &limits,
             &self.stop,
+            &|found: &[ProcessRecord]| {
+                drop(events.send(Event::Descendants(found.to_vec())));
+            },
         );
         self.finish(owner, before, &supervised)
     }
@@ -565,12 +595,7 @@ impl Worker {
     }
 
     fn measure(&self, root: &Path) -> Option<ScopeMeasurement> {
-        measure_scope(
-            root,
-            self.config.scope,
-            &CancellationToken::new(),
-            &WallScanClock,
-        )
+        measure_scope(root, self.config.scope, &self.cancel, &WallScanClock)
     }
 }
 

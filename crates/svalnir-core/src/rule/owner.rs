@@ -47,6 +47,28 @@ pub struct ExecutableLocation {
     pub path: LosslessPath,
 }
 
+/// One interpreter of a declaration: its path and the interpreter
+/// argument that the `#!` line of the script must have. An interpreter
+/// argument of a plan that is not this value is refused, so a plan cannot
+/// give the interpreter an option such as `--eval`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterpreterLocation {
+    /// The path of the interpreter.
+    pub location: ExecutableLocation,
+    /// The interpreter argument of the `#!` line, or `None` for a line
+    /// with no argument. A `#!/usr/bin/env NAME` line passes no argument,
+    /// so its interpreter has `None`.
+    pub argument: Option<String>,
+}
+
+impl InterpreterLocation {
+    /// The interpreter arguments of a binding of this interpreter.
+    pub fn arguments(&self) -> Vec<String> {
+        self.argument.iter().cloned().collect()
+    }
+}
+
 /// One part of an argument or of an environment value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "part", content = "text", rename_all = "snake_case")]
@@ -95,10 +117,11 @@ pub struct OwnerOperationDeclaration {
     /// The paths of the executable, in the sequence in which the plan
     /// builder examines them.
     pub executables: Vec<ExecutableLocation>,
-    /// The paths of the interpreters that a script executable can name in
-    /// its `#!` line (owner decision D2 of 2026-11-22). Empty for a
-    /// producer whose executable is a Mach-O file.
-    pub interpreters: Vec<ExecutableLocation>,
+    /// The interpreters that a script executable can name in its `#!`
+    /// line, each with its one permitted interpreter argument (owner
+    /// decision D2 of 2026-11-22). Empty for a producer whose executable is
+    /// a Mach-O file.
+    pub interpreters: Vec<InterpreterLocation>,
     /// One command for each supported kind.
     pub commands: Vec<OwnerCommand>,
     /// The only entries of the environment of a command.
@@ -171,7 +194,14 @@ impl Check for OwnerOperationDeclaration {
             && self.executables.len() <= MAX_OWNER_EXECUTABLES
             && self.interpreters.len() <= MAX_OWNER_EXECUTABLES
             && self.executables.iter().all(confined)
-            && self.interpreters.iter().all(confined);
+            && self.interpreters.iter().all(|interpreter| {
+                confined(&interpreter.location)
+                    && interpreter.argument.as_ref().is_none_or(|argument| {
+                        !argument.is_empty()
+                            && argument.len() <= MAX_OWNER_TEXT_BYTES
+                            && !argument.contains(['\0', ' ', '\t', '\n'])
+                    })
+            });
         if !executables_agree {
             return Err(OwnerDeclarationError::Executable);
         }
@@ -267,7 +297,15 @@ impl OwnerOperationDeclaration {
             scope_root,
             home_directory,
         };
+        // An interpreter argument of the plan is the argument of a declared
+        // interpreter; the caller compares the path of that interpreter.
+        let interpreter_agrees: bool = binding.interpreter.as_ref().is_none_or(|interpreter| {
+            self.interpreters
+                .iter()
+                .any(|declared| declared.arguments() == interpreter.arguments)
+        });
         binding.rule == self.rule
+            && interpreter_agrees
             && binding.arguments == command.resolved_arguments(&values)
             && binding.environment == self.resolved_environment(&values)
             && binding.bound == command.bound
@@ -382,6 +420,7 @@ mod tests {
     type Change = Box<dyn Fn(&mut OwnerOperationDeclaration)>;
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "the test is one table of cases")]
     fn an_incomplete_declaration_is_refused() {
         let cases: Vec<(Change, OwnerDeclarationError)> = vec![
             (
@@ -452,9 +491,24 @@ mod tests {
             ),
             (
                 Box::new(|d| {
-                    d.interpreters = vec![ExecutableLocation {
-                        base: ExecutableBase::Absolute,
-                        path: LosslessPath::from_bytes(b"bin/sh".to_vec()).unwrap(),
+                    d.interpreters = vec![super::InterpreterLocation {
+                        location: ExecutableLocation {
+                            base: ExecutableBase::Absolute,
+                            path: LosslessPath::from_bytes(b"bin/sh".to_vec()).unwrap(),
+                        },
+                        argument: None,
+                    }];
+                }),
+                OwnerDeclarationError::Executable,
+            ),
+            (
+                Box::new(|d| {
+                    d.interpreters = vec![super::InterpreterLocation {
+                        location: ExecutableLocation {
+                            base: ExecutableBase::Absolute,
+                            path: LosslessPath::from_bytes(b"/bin/sh".to_vec()).unwrap(),
+                        },
+                        argument: Some("-e -x".to_owned()),
                     }];
                 }),
                 OwnerDeclarationError::Executable,

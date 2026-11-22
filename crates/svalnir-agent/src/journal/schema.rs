@@ -72,6 +72,10 @@ pub(super) const APPLICATION_ID: i64 = 0x5356_4C4A;
 ///   the process group of the command of an owner step, which the
 ///   coordinator records before the command runs. Version 5 added it. The
 ///   row goes with its operation (`ON DELETE CASCADE`).
+/// - `owner_descendant`: the descendants of the command of an owner step,
+///   by their process ID and start time, as the worker finds them, at most
+///   4096 for one step. Version 5 added it. The row goes with its
+///   operation (`ON DELETE CASCADE`).
 const SCHEMA: &str = "
 CREATE TABLE plan (
     plan_id TEXT NOT NULL PRIMARY KEY,
@@ -187,6 +191,13 @@ CREATE TABLE owner_process (
     started_us INTEGER NOT NULL CHECK (started_us >= 0),
     process_group INTEGER NOT NULL CHECK (process_group > 0),
     PRIMARY KEY (operation_seq, step_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE owner_descendant (
+    operation_seq INTEGER NOT NULL REFERENCES operation (seq) ON DELETE CASCADE,
+    step_id TEXT NOT NULL,
+    pid INTEGER NOT NULL CHECK (pid > 0),
+    started_us INTEGER NOT NULL CHECK (started_us >= 0),
+    PRIMARY KEY (operation_seq, step_id, pid, started_us)
 ) STRICT, WITHOUT ROWID;
 ";
 

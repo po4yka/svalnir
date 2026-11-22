@@ -979,6 +979,25 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 active.owner_run = Some(running);
                 Ok(StepEnd::Wait(wake))
             }
+            OwnerPoll::Descendants(descendants) => {
+                // The journal keeps each descendant that the worker found,
+                // so a reconciliation and an acknowledgment can find it by
+                // its identity. A record that fails makes the recording
+                // degraded; the record of the command stays.
+                if self
+                    .journal
+                    .record_owner_descendants(
+                        active.operation.operation_id(),
+                        &step.step_id,
+                        &descendants,
+                    )
+                    .is_err()
+                {
+                    active.degraded = true;
+                }
+                active.owner_run = Some(running);
+                Ok(StepEnd::Wait(time.clock.now))
+            }
             OwnerPoll::Started(process) => {
                 // The process is suspended until the journal has it.
                 let recorded: bool = !active.volatile

@@ -1,7 +1,9 @@
 //! The identity checks of the executable and of the scope root.
 
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::Read as _;
+use std::io::Read;
+
+use crate::scan::CancellationToken;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -81,6 +83,32 @@ pub fn examine_executable(
     principal: Uid,
     limit: u64,
 ) -> Result<ExecutableBinding, ExecutableProblem> {
+    examine_cancellable(path, principal, limit, &CancellationToken::new())
+}
+
+/// A reader that ends with an error when its token is cancelled, so that
+/// a stop does not wait for the digest of a large file.
+struct Cancellable<'a, R> {
+    inner: R,
+    cancel: &'a CancellationToken,
+}
+
+impl<R: Read> Read for Cancellable<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other("the digest was cancelled"));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+/// [`examine_executable`] whose digest ends when `cancel` is cancelled.
+fn examine_cancellable(
+    path: &Path,
+    principal: Uid,
+    limit: u64,
+    cancel: &CancellationToken,
+) -> Result<ExecutableBinding, ExecutableProblem> {
     if !path.is_absolute() {
         return Err(ExecutableProblem::NotFound);
     }
@@ -118,8 +146,14 @@ pub fn examine_executable(
     if opened.len() > limit {
         return Err(ExecutableProblem::NotReadable);
     }
-    let digest: ContentDigest =
-        ContentDigest::of_reader(&file, limit).map_err(|_| ExecutableProblem::NotReadable)?;
+    let digest: ContentDigest = ContentDigest::of_reader(
+        Cancellable {
+            inner: &file,
+            cancel,
+        },
+        limit,
+    )
+    .map_err(|_| ExecutableProblem::NotReadable)?;
     let after: Metadata = file
         .metadata()
         .map_err(|_| ExecutableProblem::NotReadable)?;
@@ -234,53 +268,25 @@ const ENV_PATH: &str = "/usr/bin/env";
 /// (owner decision D2 of 2026-11-22).
 ///
 /// `interpreters` are the canonical interpreter locations of the
-/// declaration. The interpreter of the `#!` line must be one of them, with
-/// its symbolic links resolved; for `#!/usr/bin/env NAME`, it is the one
-/// whose file name is `NAME`, so `env` never searches `PATH`. The
-/// interpreter must be a Mach-O file.
+/// declaration, each with its permitted interpreter arguments. The
+/// interpreter of the `#!` line must be one of them, with its symbolic
+/// links resolved, and the argument of the line must be the permitted
+/// argument of that location; for `#!/usr/bin/env NAME`, it is the
+/// location with no argument whose file name is `NAME`, so `env` never
+/// searches `PATH`. The interpreter must be a Mach-O file.
 ///
 /// # Errors
 ///
 /// Returns the [`ExecutableProblem`] of the first check that fails.
 pub fn examine_program(
     path: &Path,
-    interpreters: &[PathBuf],
+    interpreters: &[(PathBuf, Vec<String>)],
     principal: Uid,
     limit: u64,
 ) -> Result<(ExecutableBinding, Option<InterpreterBinding>), ExecutableProblem> {
     let executable: ExecutableBinding = examine_executable(path, principal, limit)?;
-    let (interpreter, arguments): (PathBuf, Vec<String>) = match executable_kind(path)? {
-        ExecutableKind::MachO => return Ok((executable, None)),
-        ExecutableKind::Script {
-            interpreter,
-            argument,
-        } if interpreter == Path::new(ENV_PATH) => {
-            let name: String = argument.ok_or(ExecutableProblem::NotExecutable)?;
-            if name.starts_with('-') || name.contains('=') {
-                return Err(ExecutableProblem::NotExecutable);
-            }
-            let found: PathBuf = interpreters
-                .iter()
-                .find(|candidate| {
-                    candidate
-                        .file_name()
-                        .is_some_and(|file| file == name.as_str())
-                })
-                .cloned()
-                .ok_or(ExecutableProblem::InterpreterNotDeclared)?;
-            (found, Vec::new())
-        }
-        ExecutableKind::Script {
-            interpreter,
-            argument,
-        } => {
-            let resolved: PathBuf = fs::canonicalize(&interpreter)
-                .map_err(|_| ExecutableProblem::InterpreterNotDeclared)?;
-            if !interpreters.contains(&resolved) {
-                return Err(ExecutableProblem::InterpreterNotDeclared);
-            }
-            (resolved, argument.into_iter().collect())
-        }
+    let Some((interpreter, arguments)) = script_interpreter(path, interpreters)? else {
+        return Ok((executable, None));
     };
     if executable_kind(&interpreter)? != ExecutableKind::MachO {
         return Err(ExecutableProblem::NotExecutable);
@@ -293,6 +299,74 @@ pub fn examine_program(
             arguments,
         }),
     ))
+}
+
+/// The interpreter and the interpreter arguments of the script at `path`,
+/// from its `#!` line and the declared `interpreters`. `None` for a Mach-O
+/// file.
+fn script_interpreter(
+    path: &Path,
+    interpreters: &[(PathBuf, Vec<String>)],
+) -> Result<Option<(PathBuf, Vec<String>)>, ExecutableProblem> {
+    match executable_kind(path)? {
+        ExecutableKind::MachO => Ok(None),
+        ExecutableKind::Script {
+            interpreter,
+            argument,
+        } if interpreter == Path::new(ENV_PATH) => {
+            let name: String = argument.ok_or(ExecutableProblem::NotExecutable)?;
+            if name.starts_with('-') || name.contains('=') {
+                return Err(ExecutableProblem::NotExecutable);
+            }
+            interpreters
+                .iter()
+                .find(|(candidate, arguments)| {
+                    arguments.is_empty()
+                        && candidate
+                            .file_name()
+                            .is_some_and(|file| file == name.as_str())
+                })
+                .map(|(candidate, _)| Some((candidate.clone(), Vec::new())))
+                .ok_or(ExecutableProblem::InterpreterNotDeclared)
+        }
+        ExecutableKind::Script {
+            interpreter,
+            argument,
+        } => {
+            let resolved: PathBuf = fs::canonicalize(&interpreter)
+                .map_err(|_| ExecutableProblem::InterpreterNotDeclared)?;
+            let arguments: Vec<String> = argument.into_iter().collect();
+            if !interpreters.contains(&(resolved.clone(), arguments.clone())) {
+                return Err(ExecutableProblem::InterpreterNotDeclared);
+            }
+            Ok(Some((resolved, arguments)))
+        }
+    }
+}
+
+/// Whether the `#!` line of the executable of a binding, read again, gives
+/// the interpreter and the interpreter arguments of the binding: a Mach-O
+/// file has no interpreter, and a script has the bound one. The check after
+/// the digest of the start, so that the interpreter does not read a line
+/// that the plan does not have.
+pub(super) fn script_agrees(
+    executable: &ExecutableBinding,
+    interpreter: Option<&InterpreterBinding>,
+) -> bool {
+    let path: PathBuf = executable.path.to_path_buf();
+    let declared: Vec<(PathBuf, Vec<String>)> = interpreter.map_or_else(Vec::new, |interpreter| {
+        vec![(
+            interpreter.executable.path.to_path_buf(),
+            interpreter.arguments.clone(),
+        )]
+    });
+    match (script_interpreter(&path, &declared), interpreter) {
+        (Ok(None), None) => true,
+        (Ok(Some((found, arguments))), Some(interpreter)) => {
+            found == interpreter.executable.path.to_path_buf() && arguments == interpreter.arguments
+        }
+        _ => false,
+    }
 }
 
 /// Why the executor refuses the executable of a step.
@@ -311,9 +385,10 @@ pub(super) fn check_executable(
     planned: &ExecutableBinding,
     principal: Uid,
     limit: u64,
+    cancel: &CancellationToken,
 ) -> Result<(), ExecutableRefusal> {
     let path = planned.path.to_path_buf();
-    match examine_executable(&path, principal, limit) {
+    match examine_cancellable(&path, principal, limit, cancel) {
         Ok(current) => {
             // The code-signing identity is not read in this build; each
             // other value must be the value of the plan.

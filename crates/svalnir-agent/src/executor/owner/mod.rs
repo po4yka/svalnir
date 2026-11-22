@@ -23,6 +23,7 @@
 //! (`docs/THREAT_MODEL.md` T-09).
 
 mod executor;
+mod family;
 mod measure;
 mod model;
 mod native;
@@ -32,7 +33,8 @@ mod verify;
 #[cfg(test)]
 mod tests;
 
-pub use executor::{OwnerExecutor, OwnerPoll, OwnerRun, process_lives, process_record_of};
+pub use executor::{OwnerExecutor, OwnerPoll, OwnerRun, process_record_of};
+pub use family::{RECORDED_STOP_GRACE, process_lives, stop_recorded};
 pub use measure::{ScopeLimits, measure_scope};
 pub use model::{
     AdmittedOwnerStep, OwnerAdmissionRefusal, OwnerExecutorConfig, OwnerFault, OwnerOutcome,

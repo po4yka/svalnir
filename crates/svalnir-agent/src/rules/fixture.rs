@@ -398,10 +398,13 @@ pub fn owner_fixture_declaration(
                 OwnerOperationBound::Unbounded,
             ),
         ],
-        interpreters: vec![ExecutableLocation {
-            base: ExecutableBase::Absolute,
-            path: LosslessPath::from_bytes("/bin/sh")
-                .map_err(|_| OwnerDeclarationError::Executable)?,
+        interpreters: vec![svalnir_core::rule::owner::InterpreterLocation {
+            location: ExecutableLocation {
+                base: ExecutableBase::Absolute,
+                path: LosslessPath::from_bytes("/bin/sh")
+                    .map_err(|_| OwnerDeclarationError::Executable)?,
+            },
+            argument: None,
         }],
         environment: vec![
             EnvironmentDeclaration {

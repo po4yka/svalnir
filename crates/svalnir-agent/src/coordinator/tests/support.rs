@@ -1639,6 +1639,16 @@ impl CoordinatorJournal for FailingJournal {
     ) -> Result<Vec<crate::journal::OwnerProcess>, OperationJournalError> {
         self.inner.owner_processes(operation_id)
     }
+
+    fn record_owner_descendants(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        descendants: &[crate::journal::ProcessRecord],
+    ) -> Result<(), OperationJournalError> {
+        self.inner
+            .record_owner_descendants(operation_id, step_id, descendants)
+    }
 }
 
 // The assembled coordinator.

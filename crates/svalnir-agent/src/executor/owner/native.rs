@@ -350,14 +350,19 @@ const PROC_PIDREGIONPATHINFO: c_int = 8;
 /// The execute bit of a region protection (`VM_PROT_EXECUTE`).
 const VM_PROT_EXECUTE: u32 = 4;
 
-/// The largest number of regions that the reading examines.
-const MAX_REGIONS: usize = 256;
+/// The largest number of regions that the reading examines. A suspended
+/// process has few: its main executable, `dyld`, and its stacks and heaps.
+const MAX_REGIONS: usize = 4096;
 
-/// The device and the inode of the main text of the process `pid`: the
-/// first file-backed executable region. `None` when the reading fails.
-pub(super) fn main_text(pid: libc::pid_t) -> Option<(u32, u64)> {
+/// The dynamic loader, which the kernel maps in each new process.
+const DYLD_PATH: &str = "/usr/lib/dyld";
+
+/// The device and the inode of each file-backed executable region of the
+/// process `pid`, in address sequence. `None` when the reading fails.
+pub(super) fn executable_regions(pid: libc::pid_t) -> Option<Vec<(u32, u64)>> {
     let mut address: u64 = 0;
     let size: c_int = c_int::try_from(size_of::<RegionWithPath>()).ok()?;
+    let mut regions: Vec<(u32, u64)> = Vec::new();
     for _ in 0..MAX_REGIONS {
         let mut info = MaybeUninit::<RegionWithPath>::zeroed();
         // SAFETY: `info` has room for one `proc_regionwithpathinfo`, whose
@@ -371,6 +376,11 @@ pub(super) fn main_text(pid: libc::pid_t) -> Option<(u32, u64)> {
                 size,
             )
         };
+        if written <= 0 {
+            // No region at or above the address: the end of the map. A
+            // process that is gone has no region, which no check accepts.
+            return Some(regions);
+        }
         if written != size {
             return None;
         }
@@ -380,19 +390,38 @@ pub(super) fn main_text(pid: libc::pid_t) -> Option<(u32, u64)> {
         let has_path: bool = info.vnode.vip_path[0][0] != 0;
         if has_path && info.region.protection & VM_PROT_EXECUTE != 0 {
             let stat = &info.vnode.vip_vi.vi_stat;
-            return Some((stat.vst_dev, stat.vst_ino));
+            regions.push((stat.vst_dev, stat.vst_ino));
         }
         address = info.region.address.checked_add(info.region.size)?;
     }
     None
 }
 
-/// Whether the main text of `pid` is the file `object`.
-pub(super) fn main_text_is(pid: libc::pid_t, object: &FileObjectEvidence) -> bool {
-    main_text(pid).is_some_and(|(device, inode)| {
-        device == u32::from_ne_bytes(object.device.get().to_ne_bytes())
-            && inode == object.inode.get()
-    })
+/// The device and the inode of a file object, as a region reports them.
+fn region_identity(object: &FileObjectEvidence) -> (u32, u64) {
+    (
+        u32::from_ne_bytes(object.device.get().to_ne_bytes()),
+        object.inode.get(),
+    )
+}
+
+/// Whether the executable regions of the suspended process `pid` are the
+/// bound file `object` and the dynamic loader only: the first file-backed
+/// executable region is `object`, and each other one is `/usr/lib/dyld`.
+pub(super) fn main_text_agrees(pid: libc::pid_t, object: &FileObjectEvidence) -> bool {
+    let Ok(loader) = std::fs::symlink_metadata(DYLD_PATH) else {
+        return false;
+    };
+    let Some(loader) = super::verify::object_of(&loader).map(|object| region_identity(&object))
+    else {
+        return false;
+    };
+    match executable_regions(pid).as_deref() {
+        Some([first, rest @ ..]) => {
+            *first == region_identity(object) && rest.iter().all(|region| *region == loader)
+        }
+        _ => false,
+    }
 }
 
 /// The BSD information of the process `pid`. `None` when it has none.
@@ -417,6 +446,22 @@ fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
 /// The real user of the process `pid`. `None` when it has none.
 pub(super) fn owner_of(pid: libc::pid_t) -> Option<u32> {
     bsd_info(pid).map(|info| info.pbi_uid)
+}
+
+/// Whether the process `pid` is stopped (`SSTOP`), as a process that
+/// `POSIX_SPAWN_START_SUSPENDED` started and that did not resume.
+pub(super) fn is_stopped(pid: libc::pid_t) -> bool {
+    /// `SSTOP` of `<sys/proc.h>`.
+    const SSTOP: u32 = 4;
+    bsd_info(pid).is_some_and(|info| info.pbi_status == SSTOP)
+}
+
+/// The members of the process group `group`.
+pub(super) fn group_members(group: libc::pid_t) -> Vec<libc::pid_t> {
+    list(4096, |buffer, bytes| {
+        // SAFETY: `buffer` has room for `bytes` bytes.
+        unsafe { libc::proc_listpgrppids(group, buffer, bytes) }
+    })
 }
 
 /// The start time of the process `pid`. `None` when it has none.

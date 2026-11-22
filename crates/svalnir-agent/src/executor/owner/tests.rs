@@ -15,7 +15,7 @@ use svalnir_core::process::Uid;
 use svalnir_core::quantity::EntryCount;
 use tempfile::TempDir;
 
-use super::executor::process_lives;
+use super::family::{process_lives, stop_recorded};
 use super::measure::{ScopeLimits, measure_scope};
 use super::model::code;
 use super::native::{self, Responsibility, ResponsibilitySymbols};
@@ -170,7 +170,7 @@ fn an_executable_that_a_different_user_can_change_is_refused() {
 fn a_script_binds_its_interpreter_from_the_declared_locations_only() {
     let (_temp, base) = base();
     let shell: PathBuf = fs::canonicalize("/bin/sh").unwrap();
-    let interpreters: Vec<PathBuf> = vec![shell.clone()];
+    let interpreters: Vec<(PathBuf, Vec<String>)> = vec![(shell.clone(), Vec::new())];
     assert_eq!(
         super::verify::executable_kind(&shell).unwrap(),
         ExecutableKind::MachO
@@ -238,7 +238,7 @@ fn a_suspended_command_is_its_own_responsible_process_with_its_main_text() {
         |_| super::verify::object_of(&fs::metadata("/bin/sh").unwrap()).unwrap(),
         |shell| shell.object,
     );
-    assert!(native::main_text_is(command.pid, &object));
+    assert!(native::main_text_agrees(command.pid, &object));
     supervise::kill_suspended(command.pid);
 }
 
@@ -256,6 +256,7 @@ fn the_command_has_only_the_environment_and_the_arguments_of_the_plan() {
         responsibility(),
         &limits(Duration::from_secs(10)),
         &no_stop(),
+        &|_| {},
     );
     let Ending::Exited { status, clean } = supervised.ending else {
         panic!("the command did not exit: {:?}", supervised.ending);
@@ -283,6 +284,7 @@ fn a_command_past_its_deadline_has_its_whole_family_stopped() {
         responsibility(),
         &limits(Duration::from_millis(500)),
         &no_stop(),
+        &|_| {},
     );
     assert_eq!(supervised.ending, Ending::Deadline);
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -300,6 +302,7 @@ fn a_stop_request_stops_a_running_command() {
         responsibility(),
         &limits(Duration::from_secs(30)),
         &stop,
+        &|_| {},
     );
     assert_eq!(supervised.ending, Ending::Stopped(Stop::Canceled));
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -319,6 +322,7 @@ fn a_child_in_the_group_after_the_exit_is_seen_and_stopped() {
         responsibility(),
         &limits(Duration::from_secs(10)),
         &no_stop(),
+        &|_| {},
     );
     assert!(matches!(
         supervised.ending,
@@ -348,6 +352,7 @@ fn a_child_that_leaves_the_group_with_setsid_is_seen_by_its_responsibility() {
         responsibility(),
         &limits(Duration::from_secs(20)),
         &no_stop(),
+        &|_| {},
     );
     assert!(
         matches!(supervised.ending, Ending::Exited { clean: false, .. }),
@@ -366,6 +371,7 @@ fn a_recorded_process_lives_until_its_whole_family_ends() {
         pid: command.pid,
         started: command.started,
         group: command.pid,
+        descendants: Vec::new(),
     };
     assert!(process_lives(&process));
     supervise::kill_suspended(command.pid);
@@ -418,4 +424,143 @@ fn a_scope_measurement_is_complete_within_its_bounds() {
     };
     let partial = measure_scope(&scope, small, &CancellationToken::new(), &WallScanClock).unwrap();
     assert!(!partial.complete);
+}
+
+#[test]
+fn the_line_of_a_script_must_give_the_bound_interpreter_and_argument() {
+    use super::verify::script_agrees;
+    let (_temp, base) = base();
+    let shell: PathBuf = fs::canonicalize("/bin/sh").unwrap();
+    let interpreters: Vec<(PathBuf, Vec<String>)> = vec![(shell.clone(), Vec::new())];
+    let path: PathBuf = script(&base, "tool", "exit 0");
+    let (executable, interpreter) = examine_program(&path, &interpreters, user(), 1 << 20).unwrap();
+    let interpreter = interpreter.unwrap();
+    assert!(script_agrees(&executable, Some(&interpreter)));
+    // A plan cannot give the interpreter an option, a second argument, or
+    // no interpreter at all for a script.
+    let mut option = interpreter.clone();
+    option.arguments = vec!["--eval=1".to_owned()];
+    assert!(!script_agrees(&executable, Some(&option)));
+    let mut extra = interpreter.clone();
+    extra.arguments = vec!["-e".to_owned(), "-x".to_owned()];
+    assert!(!script_agrees(&executable, Some(&extra)));
+    assert!(!script_agrees(&executable, None));
+    // A Mach-O file has no interpreter.
+    if let Ok(machine) = examine_executable(&shell, user(), 1 << 22) {
+        assert!(script_agrees(&machine, None));
+        assert!(!script_agrees(&machine, Some(&interpreter)));
+    }
+    // A declared argument is a part of the location: the line must have it.
+    let with_argument: Vec<(PathBuf, Vec<String>)> = vec![(shell, vec!["-e".to_owned()])];
+    assert_eq!(
+        examine_program(&path, &with_argument, user(), 1 << 20),
+        Err(ExecutableProblem::InterpreterNotDeclared)
+    );
+}
+
+#[test]
+fn a_cancelled_token_ends_the_digest_and_the_measurement() {
+    let (_temp, base) = base();
+    let path: PathBuf = script(&base, "tool", "exit 0");
+    let binding = examine_executable(&path, user(), 1 << 20).unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(super::verify::check_executable(&binding, user(), 1 << 20, &cancelled).is_err());
+    assert!(
+        super::verify::check_executable(&binding, user(), 1 << 20, &CancellationToken::new())
+            .is_ok()
+    );
+    let measurement =
+        measure_scope(&base, ScopeLimits::default(), &cancelled, &WallScanClock).unwrap();
+    assert!(!measurement.complete);
+}
+
+#[test]
+fn the_main_text_must_be_the_bound_file_and_dyld_only() {
+    let (_temp, base) = base();
+    let path: PathBuf = script(&base, "tool", "exit 0");
+    let command: Command = start(&path, &base, &[]);
+    let sleep = super::verify::object_of(&fs::metadata("/bin/sleep").unwrap()).unwrap();
+    assert!(!native::main_text_agrees(command.pid, &sleep));
+    let regions = native::executable_regions(command.pid).unwrap();
+    assert_eq!(regions.len(), 2, "{regions:?}");
+    supervise::kill_suspended(command.pid);
+}
+
+#[test]
+fn a_recorded_suspended_command_is_stopped_at_once() {
+    let (_temp, base) = base();
+    let path: PathBuf = script(&base, "tool", "sleep 30");
+    let command: Command = start(&path, &base, &[]);
+    let pid = command.pid;
+    let process = OwnerProcess {
+        pid,
+        started: command.started,
+        group: pid,
+        descendants: Vec::new(),
+    };
+    assert!(process_lives(&process));
+    let started: Instant = Instant::now();
+    // The test process is the parent: a thread collects the child, as
+    // `launchd` collects an orphan after a crash.
+    let reaper = std::thread::spawn(move || {
+        while matches!(native::try_wait(pid), native::Wait::Running) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    assert!(!stop_recorded(&process, Duration::from_secs(2)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    reaper.join().unwrap();
+    assert!(!process_lives(&process));
+}
+
+#[test]
+fn a_recorded_family_lives_by_its_group_and_its_descendants() {
+    let (_temp, base) = base();
+    let group_child: PathBuf = base.join("group.pid");
+    let session_child: PathBuf = base.join("session.pid");
+    let path: PathBuf = script(
+        &base,
+        "tool",
+        &format!(
+            "sleep 30 &\necho $! > '{}'\n/usr/bin/perl -e 'use POSIX; my $p = fork(); \
+             if ($p == 0) {{ POSIX::setsid(); close(STDOUT); close(STDERR); sleep 30; exit 0 }} \
+             open(my $f, \">\", \"{}\"); print $f $p; close($f);'\nsleep 30",
+            group_child.display(),
+            session_child.display()
+        ),
+    );
+    let command: Command = start(&path, &base, &[]);
+    let pid = command.pid;
+    native::signal(pid, libc::SIGCONT);
+    let until: Instant = Instant::now() + Duration::from_secs(10);
+    while !(session_child.exists() && group_child.exists()) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let session_pid: libc::pid_t = fs::read_to_string(&session_child)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let process = OwnerProcess {
+        pid,
+        started: command.started,
+        group: pid,
+        descendants: vec![crate::journal::ProcessRecord {
+            pid: session_pid,
+            started: native::start_time(session_pid).unwrap(),
+        }],
+    };
+    // The command ends as at a crash: its group member and its child in a
+    // new session live on.
+    native::signal(pid, libc::SIGKILL);
+    while matches!(native::try_wait(pid), native::Wait::Running) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(process_lives(&process));
+    assert!(!stop_recorded(&process, Duration::from_secs(2)));
+    assert!(!process_lives(&process));
+    assert!(gone(&group_child));
+    assert!(gone(&session_child));
 }

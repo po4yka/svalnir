@@ -260,6 +260,21 @@ impl<J: CoordinatorJournal> Coordinator<J> {
 
     /// Settles what the evidence establishes for one operation. Returns
     /// false when a write of the journal failed.
+    /// Stops each recorded owner command of `operation` that still lives
+    /// after a restart: the command, the members of its group, and each
+    /// recorded descendant, by their start times (`docs/ACTION_CONTRACTS.md`
+    /// section 7). The step stays `UnknownOutcome`; an acknowledgment then
+    /// finds no live process. A journal that cannot be read leaves the
+    /// processes, and the acknowledgment examines them again.
+    fn stop_owner_commands(&self, operation: &Operation) {
+        let Ok(processes) = self.journal.owner_processes(operation.operation_id()) else {
+            return;
+        };
+        for process in &processes {
+            self.probe.stop_owner_process(process);
+        }
+    }
+
     fn reconcile_record(&mut self, record: RecoveryRecord) -> bool {
         let RecoveryRecord {
             mut operation,
@@ -267,6 +282,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             unsettled_steps,
         } = record;
         let plan: Option<Plan> = self.journal.plan(operation.plan_id()).ok().flatten();
+        self.stop_owner_commands(&operation);
         let before_reconciliation: OperationState = operation.state().clone();
         let mut written: bool = true;
         for recovery in &unsettled_steps {

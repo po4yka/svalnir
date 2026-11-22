@@ -30,8 +30,8 @@ use crate::executor::process::{
 };
 use crate::journal::{
     Acknowledged, Acknowledgment, ClaimedRequest, CoordinationStart, CoordinatorLock,
-    IncidentUsage, OperationJournal, OperationJournalError, OwnerProcess, RecoveryRecord,
-    RequestCompletion, VolatilePersistReport, VolatileRecord,
+    IncidentUsage, OperationJournal, OperationJournalError, OwnerProcess, ProcessRecord,
+    RecoveryRecord, RequestCompletion, VolatilePersistReport, VolatileRecord,
 };
 use crate::platform::process::ProcessSource;
 use crate::protection::ProtectedLocations;
@@ -293,6 +293,15 @@ pub trait TargetProbe: Debug {
     fn owner_process_lives(&self, process: &OwnerProcess) -> bool {
         crate::executor::owner::process_lives(process)
     }
+
+    /// Stops each live process of the recorded command of an owner step,
+    /// for the reconciliation after a restart. Returns whether a process
+    /// of the command lives after the stop. The default signals the
+    /// processes of the host by their identities
+    /// ([`crate::executor::owner::stop_recorded`]).
+    fn stop_owner_process(&self, process: &OwnerProcess) -> bool {
+        crate::executor::owner::stop_recorded(process, crate::executor::owner::RECORDED_STOP_GRACE)
+    }
 }
 
 /// The probe of the running system: `lstat` on the approved root, on each
@@ -544,6 +553,19 @@ pub trait CoordinatorJournal: Journal {
         process: &OwnerProcess,
     ) -> Result<(), OperationJournalError>;
 
+    /// Adds descendants to the process record of an owner step. See
+    /// [`OperationJournal::record_owner_descendants`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn record_owner_descendants(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        descendants: &[ProcessRecord],
+    ) -> Result<(), OperationJournalError>;
+
     /// The process records of the owner steps of an operation. See
     /// [`OperationJournal::owner_processes`].
     ///
@@ -671,5 +693,14 @@ impl CoordinatorJournal for OperationJournal {
         operation_id: &OperationId,
     ) -> Result<Vec<OwnerProcess>, OperationJournalError> {
         Self::owner_processes(self, operation_id)
+    }
+
+    fn record_owner_descendants(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        descendants: &[ProcessRecord],
+    ) -> Result<(), OperationJournalError> {
+        Self::record_owner_descendants(self, operation_id, step_id, descendants)
     }
 }

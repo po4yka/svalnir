@@ -947,3 +947,219 @@ fn an_acknowledgment_is_refused_while_a_recorded_process_lives() {
         .acknowledge(&operation_id, &super::support::principal())
         .unwrap();
 }
+
+#[test]
+fn admission_refuses_an_interpreter_argument_that_the_declaration_does_not_permit() {
+    let (mut bench, script) = owner_bench(PRUNE);
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plans: Vec<Plan> = vec![
+        crafted(&bench, "plan_eval", &owner, |owner| {
+            if let Some(interpreter) = owner.interpreter.as_mut() {
+                interpreter.arguments = vec!["--eval=1".to_owned()];
+            }
+        }),
+        // An argument where the declaration permits none. Two arguments
+        // are refused when the plan is sealed.
+        crafted(&bench, "plan_extra", &owner, |owner| {
+            if let Some(interpreter) = owner.interpreter.as_mut() {
+                interpreter.arguments = vec!["-x".to_owned()];
+            }
+        }),
+        crafted(&bench, "plan_no_interpreter", &owner, |owner| {
+            owner.interpreter = None;
+        }),
+    ];
+    let mut coordinator = bench.start();
+    for plan in &plans {
+        assert_eq!(
+            refusal(&mut coordinator, stored_request(plan))
+                .code
+                .as_str(),
+            code::OWNER_BINDING_MISMATCH,
+            "{}",
+            plan.plan_id
+        );
+    }
+    assert_eq!(runs(&bench), 0);
+}
+
+#[test]
+fn the_journal_keeps_each_descendant_that_the_worker_finds() {
+    let (mut bench, script) = owner_bench("echo \"$1\" >> \"$HOME/runs\"\nsleep 1 &\nsleep 1");
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_descendants", owner);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    run_owner(&mut coordinator, &bench, &operation_id);
+    let processes = open_journal(&bench.tree.database)
+        .owner_processes(&operation_id)
+        .unwrap();
+    assert_eq!(processes.len(), 1);
+    assert_ne!(processes[0].descendants, Vec::new());
+    assert!(
+        processes[0]
+            .descendants
+            .iter()
+            .all(|descendant| descendant.pid != processes[0].pid)
+    );
+}
+
+#[test]
+fn a_stop_during_the_checks_before_the_start_ends_at_once() {
+    let (mut bench, script) = owner_bench(PRUNE);
+    // A scope whose measurement takes long enough for the stop to arrive
+    // during it.
+    let many: PathBuf = bench.tree.root.join("many");
+    fs::create_dir(&many).unwrap();
+    for index in 0..20_000 {
+        fs::write(many.join(format!("f{index}")), b"").unwrap();
+    }
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_early_stop", owner);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    for _ in 0..100 {
+        coordinator.step();
+        if coordinator
+            .active
+            .as_ref()
+            .is_some_and(|active| active.owner_run.is_some())
+        {
+            break;
+        }
+    }
+    let started = std::time::Instant::now();
+    drop(coordinator.cancel(&operation_id));
+    let view = run_owner(&mut coordinator, &bench, &operation_id);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(runs(&bench), 0);
+    assert_eq!(effect(&view), TargetEffect::Skipped);
+    assert_eq!(
+        view.operation.steps()[0].results()[0].stop_reason,
+        svalnir_core::action::StopReason::Canceled
+    );
+}
+
+/// Leaves the worker of the running owner step with no coordinator, as a
+/// crash of the agent leaves its command: the handle is not dropped, so
+/// the command is not stopped.
+fn crash(mut coordinator: Box<super::support::TestCoordinator>) {
+    let run = coordinator
+        .active
+        .as_mut()
+        .and_then(|active| active.owner_run.take());
+    let _leaked = Box::leak(Box::new(run));
+    drop(coordinator);
+}
+
+#[test]
+fn a_restart_stops_a_command_that_runs_and_then_accepts_the_acknowledgment() {
+    let (mut bench, script) = owner_bench("echo \"$1\" >> \"$HOME/runs\"\nsleep 30");
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_crash_running", owner);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    until_running(&mut coordinator, &bench);
+    crash(coordinator);
+    let processes = open_journal(&bench.tree.database)
+        .owner_processes(&operation_id)
+        .unwrap();
+    assert!(crate::executor::owner::process_lives(&processes[0]));
+    let mut coordinator = bench.start();
+    coordinator.step();
+    assert!(!crate::executor::owner::process_lives(&processes[0]));
+    let stored = open_journal(&bench.tree.database)
+        .operation(&operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state(), &OperationState::UnknownOutcome);
+    coordinator
+        .acknowledge(&operation_id, &super::support::principal())
+        .unwrap();
+    assert_eq!(runs(&bench), 1);
+}
+
+#[test]
+fn a_restart_stops_a_suspended_command_that_never_ran() {
+    let (mut bench, script) = owner_bench(PRUNE);
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_crash_suspended", owner);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    for _ in 0..100 {
+        coordinator.step();
+        if coordinator
+            .active
+            .as_ref()
+            .is_some_and(|active| active.owner_run.is_some())
+        {
+            break;
+        }
+    }
+    // The handle leaves the coordinator, so nothing answers the start: the
+    // command stays suspended, as at a crash before the resume.
+    let mut run = coordinator
+        .active
+        .as_mut()
+        .and_then(|active| active.owner_run.take())
+        .unwrap()
+        .run;
+    let process = loop {
+        if let crate::executor::owner::OwnerPoll::Started(process) = run.poll() {
+            break process;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    open_journal(&bench.tree.database)
+        .record_owner_process(
+            &operation_id,
+            &StepId::new("plan_crash_suspended_step").unwrap(),
+            &process,
+        )
+        .unwrap();
+    let _leaked = Box::leak(Box::new(run));
+    drop(coordinator);
+    // This test process is the parent of the command; after a crash of the
+    // agent, `launchd` collects it.
+    let pid = process.pid;
+    let reaper = std::thread::spawn(move || {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid pointer for the call.
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    });
+    let started = std::time::Instant::now();
+    let mut coordinator = bench.start();
+    coordinator.step();
+    reaper.join().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!crate::executor::owner::process_lives(&process));
+    assert_eq!(runs(&bench), 0);
+    coordinator
+        .acknowledge(&operation_id, &super::support::principal())
+        .unwrap();
+}

@@ -30,7 +30,7 @@ use crate::executor::process::{
 };
 use crate::journal::{
     Acknowledged, Acknowledgment, ClaimedRequest, CoordinationStart, CoordinatorLock,
-    IncidentUsage, OperationJournal, OperationJournalError, OwnerProcess, ProcessRecord,
+    DescendantChange, IncidentUsage, OperationJournal, OperationJournalError, OwnerProcess,
     RecoveryRecord, RequestCompletion, VolatilePersistReport, VolatileRecord,
 };
 use crate::platform::process::ProcessSource;
@@ -553,7 +553,8 @@ pub trait CoordinatorJournal: Journal {
         process: &OwnerProcess,
     ) -> Result<(), OperationJournalError>;
 
-    /// Adds descendants to the process record of an owner step. See
+    /// Applies a change of the descendants to the process record of an
+    /// owner step. See
     /// [`OperationJournal::record_owner_descendants`].
     ///
     /// # Errors
@@ -563,7 +564,7 @@ pub trait CoordinatorJournal: Journal {
         &mut self,
         operation_id: &OperationId,
         step_id: &StepId,
-        descendants: &[ProcessRecord],
+        change: &DescendantChange,
     ) -> Result<(), OperationJournalError>;
 
     /// The process records of the owner steps of an operation. See
@@ -699,8 +700,8 @@ impl CoordinatorJournal for OperationJournal {
         &mut self,
         operation_id: &OperationId,
         step_id: &StepId,
-        descendants: &[ProcessRecord],
+        change: &DescendantChange,
     ) -> Result<(), OperationJournalError> {
-        Self::record_owner_descendants(self, operation_id, step_id, descendants)
+        Self::record_owner_descendants(self, operation_id, step_id, change)
     }
 }

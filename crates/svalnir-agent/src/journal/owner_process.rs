@@ -3,9 +3,11 @@
 //!
 //! The coordinator records the process ID, the start time, and the process
 //! group of the command while the process is suspended, before it runs, and
-//! then each descendant that the worker finds, as the set grows. A
-//! reconciliation stops each recorded process that still lives, and an
-//! acknowledgment of the operation is refused while one lives. The rows go
+//! then each change of the set of its live descendants that the worker
+//! finds. A record whose set overflowed, or whose change the journal could
+//! not write, is truncated. A reconciliation stops each recorded process
+//! that still lives, and an acknowledgment of the operation is refused
+//! while one lives or while a truncated record is not cleared. The rows go
 //! with their operation (`ON DELETE CASCADE`).
 
 use rusqlite::params;
@@ -33,9 +35,25 @@ pub struct OwnerProcess {
     pub started: ProcessStartTime,
     /// The process group of the command. The command is its leader.
     pub group: i32,
-    /// The descendants that the worker recorded, at most
+    /// The live descendants that the worker recorded, at most
     /// [`MAX_OWNER_DESCENDANTS`].
     pub descendants: Vec<ProcessRecord>,
+    /// True when the set of descendants is not complete: it overflowed,
+    /// or the journal did not write a change of it. A truncated record
+    /// counts as a live process until the system started again after the
+    /// command (`docs/ACTION_CONTRACTS.md` section 7, "Recovery").
+    pub truncated: bool,
+}
+
+/// One change of the set of the live descendants of a command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescendantChange {
+    /// The descendants that the worker found since its last report.
+    pub found: Vec<ProcessRecord>,
+    /// The reported descendants that ended and left the set.
+    pub gone: Vec<ProcessRecord>,
+    /// True when a live descendant found no room in the set.
+    pub truncated: bool,
 }
 
 /// The largest number of process records that one operation has: one for
@@ -83,17 +101,27 @@ impl OperationJournal {
             .seq;
         transaction.execute(
             "INSERT OR REPLACE INTO owner_process \
-             (operation_seq, step_id, pid, started_us, process_group) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seq, step_id.as_str(), process.pid, started, process.group],
+             (operation_seq, step_id, pid, started_us, process_group, truncated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                seq,
+                step_id.as_str(),
+                process.pid,
+                started,
+                process.group,
+                i64::from(process.truncated)
+            ],
         )?;
         commit(transaction, commit_fault)?;
         Ok(())
     }
 
-    /// Adds `descendants` to the descendants of the command of the step
-    /// `step_id`. A descendant that the journal has is not added again, and
-    /// the journal keeps at most [`MAX_OWNER_DESCENDANTS`] for one step.
+    /// Applies `change` to the descendants of the command of the step
+    /// `step_id`: the gone descendants go, and the found ones are added. A
+    /// descendant that the journal has is not added again. The journal
+    /// keeps at most [`MAX_OWNER_DESCENDANTS`] for one step: a found
+    /// descendant with no room, or a truncated change, makes the record
+    /// truncated, and a truncated record stays truncated.
     ///
     /// # Errors
     ///
@@ -104,7 +132,7 @@ impl OperationJournal {
         &mut self,
         operation_id: &OperationId,
         step_id: &StepId,
-        descendants: &[ProcessRecord],
+        change: &DescendantChange,
     ) -> Result<(), OperationJournalError> {
         let Self {
             connection,
@@ -115,20 +143,18 @@ impl OperationJournal {
         let seq: i64 = row::find_operation(&transaction, operation_id)?
             .ok_or(OperationJournalError::NotFound)?
             .seq;
-        let count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM owner_descendant WHERE operation_seq = ?1 AND step_id = ?2",
+        let leaders: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM owner_process WHERE operation_seq = ?1 AND step_id = ?2",
             params![seq, step_id.as_str()],
             |row| row.get(0),
         )?;
-        let mut room: usize =
-            MAX_OWNER_DESCENDANTS.saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
-        for descendant in descendants {
-            if room == 0 {
-                break;
-            }
-            let added: usize = transaction.execute(
-                "INSERT OR IGNORE INTO owner_descendant \
-                 (operation_seq, step_id, pid, started_us) VALUES (?1, ?2, ?3, ?4)",
+        if leaders == 0 {
+            return Err(OperationJournalError::NotFound);
+        }
+        for descendant in &change.gone {
+            transaction.execute(
+                "DELETE FROM owner_descendant \
+                 WHERE operation_seq = ?1 AND step_id = ?2 AND pid = ?3 AND started_us = ?4",
                 params![
                     seq,
                     step_id.as_str(),
@@ -136,7 +162,39 @@ impl OperationJournal {
                     started_of(descendant.started)?
                 ],
             )?;
+        }
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM owner_descendant WHERE operation_seq = ?1 AND step_id = ?2",
+            params![seq, step_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut room: usize =
+            MAX_OWNER_DESCENDANTS.saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+        let mut truncated: bool = change.truncated;
+        for descendant in &change.found {
+            let started: i64 = started_of(descendant.started)?;
+            if room == 0 {
+                let known: bool = transaction.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM owner_descendant \
+                     WHERE operation_seq = ?1 AND step_id = ?2 AND pid = ?3 AND started_us = ?4)",
+                    params![seq, step_id.as_str(), descendant.pid, started],
+                    |row| row.get(0),
+                )?;
+                truncated |= !known;
+                continue;
+            }
+            let added: usize = transaction.execute(
+                "INSERT OR IGNORE INTO owner_descendant \
+                 (operation_seq, step_id, pid, started_us) VALUES (?1, ?2, ?3, ?4)",
+                params![seq, step_id.as_str(), descendant.pid, started],
+            )?;
             room = room.saturating_sub(added);
+        }
+        if truncated {
+            transaction.execute(
+                "UPDATE owner_process SET truncated = 1 WHERE operation_seq = ?1 AND step_id = ?2",
+                params![seq, step_id.as_str()],
+            )?;
         }
         commit(transaction, commit_fault)?;
         Ok(())
@@ -159,7 +217,7 @@ impl OperationJournal {
             return Ok(Vec::new());
         };
         let mut statement = transaction.prepare(
-            "SELECT step_id, pid, started_us, process_group FROM owner_process \
+            "SELECT step_id, pid, started_us, process_group, truncated FROM owner_process \
              WHERE operation_seq = ?1 ORDER BY step_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![stored.seq, MAX_OWNER_PROCESSES], |row| {
@@ -168,9 +226,10 @@ impl OperationJournal {
                 row.get::<_, i32>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i32>(3)?,
+                row.get::<_, i64>(4)? != 0,
             ))
         })?;
-        let mut leaders: Vec<(String, i32, i64, i32)> = Vec::new();
+        let mut leaders: Vec<(String, i32, i64, i32, bool)> = Vec::new();
         for entry in rows {
             leaders.push(entry?);
         }
@@ -180,7 +239,7 @@ impl OperationJournal {
         )?;
         let limit: i64 = i64::try_from(MAX_OWNER_DESCENDANTS).unwrap_or(i64::MAX);
         let mut processes: Vec<OwnerProcess> = Vec::new();
-        for (step_id, pid, started, group) in leaders {
+        for (step_id, pid, started, group, truncated) in leaders {
             let rows = descendants_of.query_map(params![stored.seq, step_id, limit], |row| {
                 Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
             })?;
@@ -197,6 +256,7 @@ impl OperationJournal {
                 started: start_time(started)?,
                 group,
                 descendants,
+                truncated,
             });
         }
         Ok(processes)

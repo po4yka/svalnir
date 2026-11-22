@@ -22,7 +22,7 @@ use super::native::{self, Responsibility, ResponsibilitySymbols};
 use super::supervise::{self, Command, Ending, StopCell, Supervision};
 use super::verify::{ExecutableKind, ExecutableProblem, examine_executable, examine_program};
 use crate::executor::fs::Stop;
-use crate::journal::OwnerProcess;
+use crate::journal::{DescendantChange, OwnerProcess};
 use crate::scan::{CancellationToken, WallScanClock};
 
 fn user() -> Uid {
@@ -80,6 +80,7 @@ fn limits(deadline: Duration) -> Supervision {
         deadline,
         stop_poll: Duration::from_millis(20),
         stop_grace: Duration::from_millis(500),
+        max_tracked: crate::journal::MAX_OWNER_DESCENDANTS,
     }
 }
 
@@ -372,6 +373,7 @@ fn a_recorded_process_lives_until_its_whole_family_ends() {
         started: command.started,
         group: command.pid,
         descendants: Vec::new(),
+        truncated: false,
     };
     assert!(process_lives(&process));
     supervise::kill_suspended(command.pid);
@@ -435,20 +437,30 @@ fn the_line_of_a_script_must_give_the_bound_interpreter_and_argument() {
     let path: PathBuf = script(&base, "tool", "exit 0");
     let (executable, interpreter) = examine_program(&path, &interpreters, user(), 1 << 20).unwrap();
     let interpreter = interpreter.unwrap();
-    assert!(script_agrees(&executable, Some(&interpreter)));
+    let kind = |binding| {
+        super::verify::check_executable(binding, user(), 1 << 22, &CancellationToken::new())
+            .unwrap()
+    };
+    let script_kind = kind(&executable);
+    let script_kind = script_kind.as_ref();
+    assert!(script_agrees(script_kind, Some(&interpreter)));
     // A plan cannot give the interpreter an option, a second argument, or
     // no interpreter at all for a script.
     let mut option = interpreter.clone();
     option.arguments = vec!["--eval=1".to_owned()];
-    assert!(!script_agrees(&executable, Some(&option)));
+    assert!(!script_agrees(script_kind, Some(&option)));
     let mut extra = interpreter.clone();
     extra.arguments = vec!["-e".to_owned(), "-x".to_owned()];
-    assert!(!script_agrees(&executable, Some(&extra)));
-    assert!(!script_agrees(&executable, None));
+    assert!(!script_agrees(script_kind, Some(&extra)));
+    assert!(!script_agrees(script_kind, None));
+    // A file with no valid kind agrees with no binding.
+    assert!(!script_agrees(None, None));
     // A Mach-O file has no interpreter.
     if let Ok(machine) = examine_executable(&shell, user(), 1 << 22) {
-        assert!(script_agrees(&machine, None));
-        assert!(!script_agrees(&machine, Some(&interpreter)));
+        let machine_kind = kind(&machine);
+        assert_eq!(machine_kind, Some(ExecutableKind::MachO));
+        assert!(script_agrees(machine_kind.as_ref(), None));
+        assert!(!script_agrees(machine_kind.as_ref(), Some(&interpreter)));
     }
     // A declared argument is a part of the location: the line must have it.
     let with_argument: Vec<(PathBuf, Vec<String>)> = vec![(shell, vec!["-e".to_owned()])];
@@ -498,6 +510,7 @@ fn a_recorded_suspended_command_is_stopped_at_once() {
         started: command.started,
         group: pid,
         descendants: Vec::new(),
+        truncated: false,
     };
     assert!(process_lives(&process));
     let started: Instant = Instant::now();
@@ -551,6 +564,7 @@ fn a_recorded_family_lives_by_its_group_and_its_descendants() {
             pid: session_pid,
             started: native::start_time(session_pid).unwrap(),
         }],
+        truncated: false,
     };
     // The command ends as at a crash: its group member and its child in a
     // new session live on.
@@ -563,4 +577,104 @@ fn a_recorded_family_lives_by_its_group_and_its_descendants() {
     assert!(!process_lives(&process));
     assert!(gone(&group_child));
     assert!(gone(&session_child));
+}
+
+fn small_limits(max_tracked: usize) -> Supervision {
+    Supervision {
+        max_tracked,
+        ..limits(Duration::from_secs(30))
+    }
+}
+
+#[test]
+fn dead_descendants_leave_the_set_so_a_later_survivor_is_still_seen() {
+    let (_temp, base) = base();
+    let child_pid: PathBuf = base.join("child.pid");
+    // Thirty short-lived children pass through a set of eight; then a child
+    // of `perl` leaves the group with `setsid` and stays.
+    let path: PathBuf = script(
+        &base,
+        "tool",
+        &format!(
+            "i=0\nwhile [ $i -lt 30 ]; do sleep 0.05; i=$((i+1)); done\n\
+             /usr/bin/perl -e 'use POSIX; my $p = fork(); if ($p == 0) {{ POSIX::setsid(); \
+             close(STDOUT); close(STDERR); sleep 30; exit 0 }} open(my $f, \">\", \"{}\"); \
+             print $f $p; close($f);'\nsleep 1\nexit 0",
+            child_pid.display()
+        ),
+    );
+    let changes: Mutex<Vec<DescendantChange>> = Mutex::new(Vec::new());
+    let supervised = supervise::run(
+        start(&path, &base, &[]),
+        responsibility(),
+        &small_limits(8),
+        &no_stop(),
+        &|change| changes.lock().unwrap().push(change.clone()),
+    );
+    assert!(
+        matches!(supervised.ending, Ending::Exited { clean: false, .. }),
+        "{:?}",
+        supervised.ending
+    );
+    assert!(!supervised.truncated);
+    assert!(gone(&child_pid));
+    let changes: Vec<DescendantChange> = changes.into_inner().unwrap();
+    let found: usize = changes.iter().map(|change| change.found.len()).sum();
+    let left: usize = changes.iter().map(|change| change.gone.len()).sum();
+    assert!(found > 8, "{found}");
+    assert!(left > 0, "{left}");
+    assert!(changes.iter().all(|change| !change.truncated));
+}
+
+#[test]
+fn a_set_full_of_live_descendants_is_truncated_and_never_clean() {
+    let (_temp, base) = base();
+    let path: PathBuf = script(
+        &base,
+        "tool",
+        "sleep 1 &\nsleep 1 &\nsleep 1 &\nsleep 1 &\nwait\nexit 0",
+    );
+    let changes: Mutex<Vec<DescendantChange>> = Mutex::new(Vec::new());
+    let supervised = supervise::run(
+        start(&path, &base, &[]),
+        responsibility(),
+        &small_limits(2),
+        &no_stop(),
+        &|change| changes.lock().unwrap().push(change.clone()),
+    );
+    let Ending::Exited { status, clean } = supervised.ending else {
+        panic!("the command did not exit: {:?}", supervised.ending);
+    };
+    assert!(supervise::is_success(status));
+    assert!(!clean);
+    assert!(supervised.truncated);
+    assert!(
+        changes
+            .into_inner()
+            .unwrap()
+            .iter()
+            .any(|change| change.truncated)
+    );
+}
+
+#[test]
+fn a_truncated_record_counts_as_live_after_its_processes_ended() {
+    let (_temp, base) = base();
+    let path: PathBuf = script(&base, "tool", "exit 0");
+    let command: Command = start(&path, &base, &[]);
+    let process = OwnerProcess {
+        pid: command.pid,
+        started: command.started,
+        group: command.pid,
+        descendants: Vec::new(),
+        truncated: true,
+    };
+    supervise::kill_suspended(command.pid);
+    assert!(process_lives(&process));
+    assert!(stop_recorded(&process, Duration::from_millis(100)));
+    let complete = OwnerProcess {
+        truncated: false,
+        ..process
+    };
+    assert!(!process_lives(&complete));
 }

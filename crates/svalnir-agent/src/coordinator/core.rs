@@ -214,6 +214,28 @@ pub(super) struct OwnerRunning {
     pub(super) next_check: MonotonicNanos,
     /// The stop that the coordinator gave the worker.
     pub(super) stop: Option<StopReason>,
+    /// True after the journal did not record a change of the descendants
+    /// of the command: the step cannot complete.
+    pub(super) descendants_lost: bool,
+}
+
+impl OwnerRunning {
+    /// The state of a step whose worker started now.
+    pub(super) fn new(
+        run: crate::executor::owner::OwnerRun,
+        charge: Option<WorkCharge>,
+        charged: bool,
+        now: MonotonicNanos,
+    ) -> Self {
+        Self {
+            run,
+            charge,
+            charged,
+            next_check: now,
+            stop: None,
+            descendants_lost: false,
+        }
+    }
 }
 
 /// The measurements before the first step.

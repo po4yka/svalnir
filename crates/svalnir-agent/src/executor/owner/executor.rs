@@ -25,10 +25,11 @@ use super::model::{
 use super::native::{self, Responsibility, StartFailure, Started};
 use super::supervise::{self, Command, Ending, StopCell, Supervised, Supervision};
 use super::verify::{
-    ExecutableRefusal, check_executable, has_planned_identity, is_planned_root, script_agrees,
+    ExecutableKind, ExecutableRefusal, check_executable, has_planned_identity, is_planned_root,
+    script_agrees,
 };
 use crate::executor::fs::{ApprovedRoots, Stop};
-use crate::journal::{OwnerProcess, ProcessRecord};
+use crate::journal::{DescendantChange, MAX_OWNER_DESCENDANTS, OwnerProcess};
 use crate::platform::volume::{Locality, MountTable};
 use crate::scan::{CancellationToken, WallScanClock};
 
@@ -63,9 +64,9 @@ enum Event {
     /// The command is started and suspended. The worker waits for the
     /// answer of [`OwnerRun::recorded`] before it lets the command run.
     Started(OwnerProcess),
-    /// The worker found descendants of the command that it did not report
-    /// before.
-    Descendants(Vec<ProcessRecord>),
+    /// The set of the live descendants of the command changed since the
+    /// last report.
+    Descendants(DescendantChange),
     /// The step has its result.
     Finished(Box<OwnerStepOutcome>),
 }
@@ -78,9 +79,9 @@ pub enum OwnerPoll {
     /// The command is started and suspended. The coordinator records the
     /// process in the journal and answers with [`OwnerRun::recorded`].
     Started(OwnerProcess),
-    /// The worker found these descendants of the command. The coordinator
-    /// records them in the journal.
-    Descendants(Vec<ProcessRecord>),
+    /// The set of the live descendants of the command changed. The
+    /// coordinator records the change in the journal.
+    Descendants(DescendantChange),
     /// The step has its result. The worker thread has ended.
     Finished(Box<OwnerStepOutcome>),
 }
@@ -105,7 +106,7 @@ impl OwnerRun {
                 self.started = true;
                 OwnerPoll::Started(process)
             }
-            Ok(Event::Descendants(descendants)) => OwnerPoll::Descendants(descendants),
+            Ok(Event::Descendants(change)) => OwnerPoll::Descendants(change),
             Ok(Event::Finished(outcome)) => {
                 self.join();
                 OwnerPoll::Finished(outcome)
@@ -163,11 +164,13 @@ impl Drop for OwnerRun {
 }
 
 impl OwnerExecutor {
-    /// Makes the executor. The stop interval is at most 100 ms and the stop
-    /// grace at most 2 seconds; a longer value is cut to that bound.
+    /// Makes the executor. The stop interval is at most 100 ms, the stop
+    /// grace at most 2 seconds, and the set of descendants at most
+    /// [`MAX_OWNER_DESCENDANTS`]; a larger value is cut to that bound.
     pub fn new(mut config: OwnerExecutorConfig) -> Self {
         config.stop_poll = config.stop_poll.min(MAX_STOP_POLL);
         config.stop_grace = config.stop_grace.min(MAX_STOP_GRACE);
+        config.max_descendants = config.max_descendants.min(MAX_OWNER_DESCENDANTS);
         Self { config }
     }
 
@@ -219,6 +222,7 @@ pub fn process_record_of(pid: i32) -> Option<OwnerProcess> {
         started: native::start_time(pid)?,
         group: pid,
         descendants: Vec::new(),
+        truncated: false,
     })
 }
 
@@ -342,7 +346,9 @@ impl Worker {
             return self.skipped((code::OWNER_OPERATION_NOT_STARTED, ErrorFamily::Native));
         };
         // The last check before the start: each file of the program, with
-        // its digest, one time for the step.
+        // its digest, one time for the step. The kind of each file is read
+        // from the descriptor of its digest.
+        let mut script_kind: Option<ExecutableKind> = None;
         for file in &program.files {
             match check_executable(
                 file,
@@ -350,7 +356,14 @@ impl Worker {
                 self.config.max_executable_bytes,
                 &self.cancel,
             ) {
-                Ok(()) => {}
+                Ok(kind) if file.path == owner.executable.path => script_kind = kind,
+                // The interpreter of a script is a Mach-O file.
+                Ok(kind) => {
+                    if kind != Some(ExecutableKind::MachO) {
+                        return self
+                            .refused((code::OWNER_EXECUTABLE_CHANGED, ErrorFamily::Evidence));
+                    }
+                }
                 Err(ExecutableRefusal::Changed) => {
                     return self.refused((code::OWNER_EXECUTABLE_CHANGED, ErrorFamily::Evidence));
                 }
@@ -360,10 +373,10 @@ impl Worker {
                 }
             }
         }
-        // The `#!` line of the verified script, read again, is the
-        // interpreter and the interpreter argument of the binding, and a
-        // binding has an interpreter exactly for a script.
-        if !script_agrees(&owner.executable, owner.interpreter.as_ref()) {
+        // The `#!` line of the verified script is the interpreter and the
+        // interpreter argument of the binding, and a binding has an
+        // interpreter exactly for a script.
+        if !script_agrees(script_kind.as_ref(), owner.interpreter.as_ref()) {
             return self.skipped((code::OWNER_EXECUTABLE_CHANGED, ErrorFamily::Evidence));
         }
         let environment: Option<Vec<CString>> = owner
@@ -443,6 +456,7 @@ impl Worker {
             started: start_time,
             group: pid,
             descendants: Vec::new(),
+            truncated: false,
         };
         // The coordinator records the process before it runs.
         let recorded: bool =
@@ -459,6 +473,7 @@ impl Worker {
             deadline: Duration::from_nanos(owner.command_deadline.get()),
             stop_poll: self.config.stop_poll,
             stop_grace: self.config.stop_grace,
+            max_tracked: self.config.max_descendants,
         };
         let supervised: Supervised = supervise::run(
             Command {
@@ -470,8 +485,8 @@ impl Worker {
             responsibility,
             &limits,
             &self.stop,
-            &|found: &[ProcessRecord]| {
-                drop(events.send(Event::Descendants(found.to_vec())));
+            &|change: &DescendantChange| {
+                drop(events.send(Event::Descendants(change.clone())));
             },
         );
         self.finish(owner, before, &supervised)
@@ -531,7 +546,7 @@ impl Worker {
         };
         match self
             .draft()
-            .of_ending(supervised.ending, exit_status, bound_verified)
+            .of_ending(supervised, exit_status, bound_verified)
         {
             Ok(result) => Ok(OwnerOutcome {
                 result,
@@ -618,11 +633,20 @@ impl Draft<'_> {
     /// The result of a command that started, from the way it ended.
     fn of_ending(
         &self,
-        ending: Ending,
+        supervised: &Supervised,
         exit_status: Option<i32>,
         bound_verified: bool,
     ) -> Result<TargetResult, NoRecord> {
-        match ending {
+        match supervised.ending {
+            Ending::Exited { status, .. }
+                if supervise::is_success(status) && supervised.truncated =>
+            {
+                self.unknown(
+                    exit_status,
+                    StopReason::Failed,
+                    Some(code::OWNER_DESCENDANTS_TRUNCATED),
+                )
+            }
             Ending::Exited { status, clean } if supervise::is_success(status) => {
                 if !clean {
                     self.unknown(

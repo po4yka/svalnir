@@ -17,7 +17,7 @@ use super::error::OperationJournalError;
 ///
 /// It is independent of the configuration, CLI, IPC, and state-store
 /// versions.
-pub const JOURNAL_VERSION: u32 = 5;
+pub const JOURNAL_VERSION: u32 = 6;
 
 /// The `application_id` of a Svalnir operation journal: the ASCII text
 /// `SVLJ`. The catalog store has a different value, so that one file is
@@ -70,12 +70,14 @@ pub(super) const APPLICATION_ID: i64 = 0x5356_4C4A;
 ///   The row goes with its operation (`ON DELETE CASCADE`).
 /// - `owner_process`: the process ID, the start time in microseconds, and
 ///   the process group of the command of an owner step, which the
-///   coordinator records before the command runs. Version 5 added it. The
-///   row goes with its operation (`ON DELETE CASCADE`).
-/// - `owner_descendant`: the descendants of the command of an owner step,
-///   by their process ID and start time, as the worker finds them, at most
-///   4096 for one step. Version 5 added it. The row goes with its
-///   operation (`ON DELETE CASCADE`).
+///   coordinator records before the command runs, and whether its set of
+///   descendants is truncated. Version 5 added it, and version 6 added the
+///   column `truncated`. The row goes with its operation (`ON DELETE
+///   CASCADE`).
+/// - `owner_descendant`: the live descendants of the command of an owner
+///   step, by their process ID and start time, as the worker finds them, at
+///   most 4096 for one step. A descendant that ended goes. Version 5 added
+///   it. The row goes with its operation (`ON DELETE CASCADE`).
 const SCHEMA: &str = "
 CREATE TABLE plan (
     plan_id TEXT NOT NULL PRIMARY KEY,
@@ -190,6 +192,7 @@ CREATE TABLE owner_process (
     pid INTEGER NOT NULL CHECK (pid > 0),
     started_us INTEGER NOT NULL CHECK (started_us >= 0),
     process_group INTEGER NOT NULL CHECK (process_group > 0),
+    truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     PRIMARY KEY (operation_seq, step_id)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE owner_descendant (

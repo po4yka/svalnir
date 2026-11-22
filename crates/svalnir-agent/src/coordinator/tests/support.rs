@@ -1307,6 +1307,9 @@ pub(super) enum FailPoint {
     IncidentUsageFailed,
     /// The record of the process of an owner command fails.
     RecordOwnerProcess,
+    /// A record of the descendants of an owner command fails, other than a
+    /// record of the truncation only.
+    RecordOwnerDescendants,
 }
 
 /// A function that a test runs inside a journal call.
@@ -1644,10 +1647,21 @@ impl CoordinatorJournal for FailingJournal {
         &mut self,
         operation_id: &OperationId,
         step_id: &StepId,
-        descendants: &[crate::journal::ProcessRecord],
+        change: &crate::journal::DescendantChange,
     ) -> Result<(), OperationJournalError> {
+        let truncation_only: bool =
+            change.truncated && change.found.is_empty() && change.gone.is_empty();
+        if !truncation_only
+            && self
+                .failing
+                .lock()
+                .unwrap()
+                .contains(&FailPoint::RecordOwnerDescendants)
+        {
+            return Err(OperationJournalError::NotFound);
+        }
         self.inner
-            .record_owner_descendants(operation_id, step_id, descendants)
+            .record_owner_descendants(operation_id, step_id, change)
     }
 }
 

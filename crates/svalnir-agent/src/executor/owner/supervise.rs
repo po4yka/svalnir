@@ -2,7 +2,7 @@
 //! descendants, the processes for which it is responsible, its deadline,
 //! the stop request, and the bounded tail of its output.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_int;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use svalnir_core::process::ProcessStartTime;
 
 use super::native::{self, Responsibility, Wait};
 use crate::executor::fs::Stop;
-use crate::journal::ProcessRecord;
+use crate::journal::{DescendantChange, ProcessRecord};
 
 /// The bytes of the end of one output stream that the tail keeps.
 const TAIL_BYTES_PER_STREAM: usize = 2048;
@@ -30,14 +30,12 @@ pub(super) const READER_GRACE: Duration = Duration::from_millis(500);
 /// The timeout of one `poll` call of a reader.
 const READER_POLL_MS: c_int = 50;
 
-/// The largest number of descendants that the set keeps.
-const MAX_TRACKED: usize = 4096;
-
 /// How the command ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Ending {
     /// The command exited with this status word. `clean` is true when no
-    /// process of the command is left and each output stream ended.
+    /// process of the command is left, each output stream ended, and the
+    /// set of descendants was never truncated.
     Exited { status: c_int, clean: bool },
     /// The command passed its deadline. Its processes were stopped.
     Deadline,
@@ -53,6 +51,9 @@ pub(super) enum Ending {
 #[derive(Debug, Clone)]
 pub(super) struct Supervised {
     pub(super) ending: Ending,
+    /// True when a live descendant found no room in the set of the
+    /// descendants: the worker cannot know each process of the command.
+    pub(super) truncated: bool,
     /// The raw end of the standard output and of the standard error,
     /// before the redaction.
     pub(super) stdout: Vec<u8>,
@@ -65,6 +66,10 @@ pub(super) struct Supervision {
     pub(super) deadline: Duration,
     pub(super) stop_poll: Duration,
     pub(super) stop_grace: Duration,
+    /// The largest number of live descendants that the set keeps. When a
+    /// new descendant finds no room after the dead ones went, the set is
+    /// truncated, and the command cannot end clean.
+    pub(super) max_tracked: usize,
 }
 
 /// The stop request of the coordinator, which the worker reads.
@@ -170,15 +175,46 @@ struct Family {
     leader_started: ProcessStartTime,
     responsibility: Responsibility,
     owner: u32,
+    /// The descendants that the worker saw, at most `limit`. A dead one
+    /// goes when a new one needs its room.
     tracked: BTreeMap<libc::pid_t, ProcessStartTime>,
+    limit: usize,
+    /// True after a live descendant found no room in the set.
+    truncated: bool,
+    /// The process IDs of the last listing of the host, so that a
+    /// responsibility reading examines only the processes that are new.
+    listed: BTreeSet<libc::pid_t>,
     /// The descendants that the worker found and did not report yet.
     unreported: Vec<ProcessRecord>,
+    /// The reported descendants that went from the set and that the
+    /// worker did not report as gone yet.
+    gone: Vec<ProcessRecord>,
+    /// True after the worker reported the truncation.
+    truncation_reported: bool,
 }
 
 impl Family {
-    /// Adds `pid` to the set when it is new and the set has room.
+    /// Adds `pid` to the set when it is new. When the set is full, the
+    /// dead descendants go first; when it is full of live ones, the set is
+    /// truncated.
     fn add(&mut self, pid: libc::pid_t, started: ProcessStartTime) -> bool {
-        if self.tracked.len() >= MAX_TRACKED || self.tracked.contains_key(&pid) {
+        match self.tracked.get(&pid) {
+            Some(known) if *known == started => return false,
+            // The process ID was given again: the earlier process ended.
+            Some(known) => {
+                let earlier = ProcessRecord {
+                    pid,
+                    started: *known,
+                };
+                self.forget(earlier);
+            }
+            None => {}
+        }
+        if self.tracked.len() >= self.limit {
+            self.prune();
+        }
+        if self.tracked.len() >= self.limit {
+            self.truncated = true;
             return false;
         }
         self.tracked.insert(pid, started);
@@ -186,8 +222,52 @@ impl Family {
         true
     }
 
+    /// Removes `record` from the set, and from the journal by the next
+    /// report when the worker reported it before.
+    fn forget(&mut self, record: ProcessRecord) {
+        self.tracked.remove(&record.pid);
+        if let Some(index) = self.unreported.iter().position(|found| *found == record) {
+            self.unreported.swap_remove(index);
+        } else {
+            self.gone.push(record);
+        }
+    }
+
+    /// Removes each dead descendant from the set.
+    fn prune(&mut self) {
+        let dead: Vec<ProcessRecord> = self
+            .tracked
+            .iter()
+            .filter(|(pid, started)| !native::lives(**pid, **started))
+            .map(|(pid, started)| ProcessRecord {
+                pid: *pid,
+                started: *started,
+            })
+            .collect();
+        for record in dead {
+            self.forget(record);
+        }
+    }
+
+    /// The change of the set since the last report, or `None` when it has
+    /// none.
+    fn change(&mut self) -> Option<DescendantChange> {
+        let truncated: bool = self.truncated && !self.truncation_reported;
+        if self.unreported.is_empty() && self.gone.is_empty() && !truncated {
+            return None;
+        }
+        self.truncation_reported = self.truncated;
+        Some(DescendantChange {
+            found: std::mem::take(&mut self.unreported),
+            gone: std::mem::take(&mut self.gone),
+            truncated: self.truncated,
+        })
+    }
+
     /// Adds the live descendants of the leader and of each tracked process.
-    fn track(&mut self) {
+    /// Returns whether a descendant was new.
+    fn track(&mut self) -> bool {
+        let mut grew: bool = false;
         let mut queue: Vec<libc::pid_t> = vec![self.leader];
         queue.extend(self.tracked.keys().copied());
         while let Some(parent) = queue.pop() {
@@ -195,29 +275,42 @@ impl Family {
                 if let Some(started) = native::start_time(child)
                     && self.add(child, started)
                 {
+                    grew = true;
                     queue.push(child);
                 }
             }
         }
+        grew
     }
 
     /// Adds the processes for which the leader is responsible now. The
     /// system gives that responsibility only while the leader lives: after
     /// its exit, a process that it left is its own responsible process. So
-    /// the worker reads it at each reading of the exit while the command
-    /// runs.
-    fn track_responsible(&mut self) {
-        for (pid, started) in self.responsible_survivors() {
-            self.add(pid, started);
+    /// the worker reads it while the command runs. The responsibility of a
+    /// process is set at its start, so each reading examines only the
+    /// processes that the last listing of the host did not have. Returns
+    /// whether a process was new.
+    fn track_responsible(&mut self) -> bool {
+        let listed: BTreeSet<libc::pid_t> = native::all_processes().into_iter().collect();
+        let new: Vec<libc::pid_t> = listed.difference(&self.listed).copied().collect();
+        self.listed = listed;
+        let mut grew: bool = false;
+        for (pid, started) in self.responsible(new) {
+            grew |= self.add(pid, started);
         }
+        grew
     }
 
-    /// The live processes of the user, other than this process, whose
-    /// responsible process is the leader and that started after it.
-    fn responsible_survivors(&self) -> Vec<(libc::pid_t, ProcessStartTime)> {
+    /// The processes of `candidates` of the user, other than this process
+    /// and the leader, whose responsible process is the leader and that
+    /// started after it.
+    fn responsible(
+        &self,
+        candidates: impl IntoIterator<Item = libc::pid_t>,
+    ) -> Vec<(libc::pid_t, ProcessStartTime)> {
         // SAFETY: `getpid` has no argument and cannot fail.
         let own: libc::pid_t = unsafe { libc::getpid() };
-        native::all_processes()
+        candidates
             .into_iter()
             .filter(|pid| *pid != own && *pid != self.leader)
             .filter(|pid| self.responsibility.responsible_for(*pid) == Some(self.leader))
@@ -225,6 +318,12 @@ impl Family {
             .filter_map(|pid| native::start_time(pid).map(|started| (pid, started)))
             .filter(|(_, started)| *started >= self.leader_started)
             .collect()
+    }
+
+    /// The live processes of the user for which the leader is responsible:
+    /// a full reading of the host.
+    fn responsible_survivors(&self) -> Vec<(libc::pid_t, ProcessStartTime)> {
+        self.responsible(native::all_processes())
     }
 
     /// The live tracked descendants and the responsible survivors.
@@ -315,7 +414,7 @@ pub(super) fn run(
     responsibility: Responsibility,
     limits: &Supervision,
     stop: &StopCell,
-    report: &dyn Fn(&[ProcessRecord]),
+    report: &dyn Fn(&DescendantChange),
 ) -> Supervised {
     let Command {
         pid,
@@ -331,7 +430,12 @@ pub(super) fn run(
         responsibility,
         owner: native::owner_of(pid).unwrap_or(u32::MAX),
         tracked: BTreeMap::new(),
+        limit: limits.max_tracked,
+        truncated: false,
+        listed: BTreeSet::new(),
         unreported: Vec::new(),
+        gone: Vec::new(),
+        truncation_reported: false,
     };
     native::signal(pid, libc::SIGCONT);
     let begun: Instant = Instant::now();
@@ -341,7 +445,9 @@ pub(super) fn run(
         match native::try_wait(pid) {
             Wait::Ended(status) => {
                 family.track();
-                report(&std::mem::take(&mut family.unreported));
+                if let Some(change) = family.change() {
+                    report(&change);
+                }
                 let readers_until: Instant = Instant::now() + READER_GRACE;
                 let (out, out_end) = stdout.finish(readers_until);
                 let (err, err_end) = stderr.finish(readers_until);
@@ -352,8 +458,9 @@ pub(super) fn run(
                 return Supervised {
                     ending: Ending::Exited {
                         status,
-                        clean: !left && out_end && err_end,
+                        clean: !left && out_end && err_end && !family.truncated,
                     },
+                    truncated: family.truncated,
                     stdout: out,
                     stderr: err,
                 };
@@ -366,8 +473,8 @@ pub(super) fn run(
         }
         family.track();
         family.track_responsible();
-        if !family.unreported.is_empty() {
-            report(&std::mem::take(&mut family.unreported));
+        if let Some(change) = family.change() {
+            report(&change);
         }
         let now: Instant = Instant::now();
         if now >= deadline {
@@ -388,6 +495,7 @@ pub(super) fn run(
     let (err, _) = stderr.finish(until);
     Supervised {
         ending,
+        truncated: family.truncated,
         stdout: out,
         stderr: err,
     }

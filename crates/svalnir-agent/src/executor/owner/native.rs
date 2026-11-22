@@ -473,6 +473,35 @@ pub(super) fn start_time(pid: libc::pid_t) -> Option<ProcessStartTime> {
     )
 }
 
+/// The time of the last start of the system (`kern.boottime`). `None`
+/// when the system does not give it.
+pub(super) fn boot_time() -> Option<ProcessStartTime> {
+    let mut value = MaybeUninit::<libc::timeval>::zeroed();
+    let mut size: libc::size_t = size_of::<libc::timeval>();
+    let mut name: [c_int; 2] = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    // SAFETY: `name` names two levels, `value` has room for `size` bytes,
+    // and the call sets no new value.
+    let result: c_int = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            2,
+            value.as_mut_ptr().cast(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size != size_of::<libc::timeval>() {
+        return None;
+    }
+    // SAFETY: the call wrote the whole value, and each field is plain data.
+    let value: libc::timeval = unsafe { value.assume_init() };
+    ProcessStartTime::from_timeval(
+        u64::try_from(value.tv_sec).ok()?,
+        u32::try_from(value.tv_usec).ok()?,
+    )
+}
+
 /// The process IDs of a list call with a buffer for `capacity` IDs.
 fn list(capacity: usize, call: impl Fn(*mut c_void, c_int) -> c_int) -> Vec<libc::pid_t> {
     let mut buffer: Vec<libc::pid_t> = vec![0; capacity];

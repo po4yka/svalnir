@@ -85,8 +85,8 @@ fn json(environment: &Environment, arguments: &[&str]) -> Outcome {
 const PRODUCER: &str = "echo \"$*\" >> \"$HOME/runs\"\nfor last; do :; done\nroot=\"${GOCACHE:-$last}\"\nrm -f \"$root\"/stale-*";
 
 /// One temporary world with a home directory and a directory of scripts.
-struct World {
-    environment: Environment,
+pub(crate) struct World {
+    pub(crate) environment: Environment,
     directory: TempDirectory,
     home: PathBuf,
     evidence: FixtureEnvironment,
@@ -120,7 +120,7 @@ impl World {
         world
     }
 
-    fn manual() -> Self {
+    pub(crate) fn manual() -> Self {
         Self::new(Some(manual_action_validated()))
     }
 
@@ -143,7 +143,7 @@ impl World {
 
     /// A cache below the home directory with two stale files and one file
     /// that the producer keeps.
-    fn cache(&self, relative: &str) -> PathBuf {
+    pub(crate) fn cache(&self, relative: &str) -> PathBuf {
         let root: PathBuf = self.home.join(relative);
         std::fs::create_dir_all(&root).unwrap();
         for name in ["stale-a", "stale-b", "kept"] {
@@ -158,7 +158,7 @@ impl World {
         json(&self.environment, &arguments)
     }
 
-    fn planned(&self, rule: &str, extra: &[&str]) -> (String, Value) {
+    pub(crate) fn planned(&self, rule: &str, extra: &[&str]) -> (String, Value) {
         let outcome = self.plan(rule, extra);
         assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
         let result: Value = outcome.result();
@@ -176,7 +176,7 @@ impl World {
         )
     }
 
-    fn runs(&self) -> Vec<String> {
+    pub(crate) fn runs(&self) -> Vec<String> {
         std::fs::read_to_string(self.home.join("runs")).map_or_else(
             |_| Vec::new(),
             |text| text.lines().map(str::to_owned).collect(),

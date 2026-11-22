@@ -22,6 +22,7 @@
 //! | `commands` | The dispatcher and one module for each command family |
 //! | `environment` | The state directory, the home directory, and the invocation directory |
 //! | `host` | The collection context of this process |
+//! | `mcp` | The MCP server of `svalnir mcp`, whose tools run the commands of this crate |
 //! | `interrupt` | The Ctrl+C flag of `scan`, `monitor`, and a wait for an operation, and the stop signals of a transient coordinator |
 //! | `seams` | The terminal question, the Trash operation, and the service manager, which a test replaces |
 //! | `text` | Escaping and formatting of the human-readable output |
@@ -36,6 +37,7 @@ mod commands;
 mod environment;
 mod host;
 mod interrupt;
+mod mcp;
 pub mod output;
 mod seams;
 mod text;
@@ -46,6 +48,9 @@ mod evict_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod intervention_tests;
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod mcp_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod owner_tests;

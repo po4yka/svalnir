@@ -131,10 +131,23 @@ pub struct HostReading {
 /// unavailable.
 #[must_use]
 pub fn collect_disk(host: &Host) -> DiskReading {
-    let mounted = match Host::startup_data_volume() {
-        Ok(mounted) => mounted,
-        Err(error) => return DiskReading::Unresolved(error.to_string()),
-    };
+    match Host::startup_data_volume() {
+        Ok(mounted) => measure_volume(host, mounted),
+        Err(error) => DiskReading::Unresolved(error.to_string()),
+    }
+}
+
+/// Reads the disk capacity of the volume that has `path`, for example the
+/// home directory. The reading has the form of [`collect_disk`].
+#[must_use]
+pub fn collect_disk_at(host: &Host, path: &Path) -> DiskReading {
+    match volume::volume_at(path) {
+        Ok(mounted) => measure_volume(host, mounted),
+        Err(error) => DiskReading::Unresolved(error.to_string()),
+    }
+}
+
+fn measure_volume(host: &Host, mounted: MountedVolume) -> DiskReading {
     let capacity: VolumeCapacity = match volume::collect_capacity(host.context(), &mounted.identity)
     {
         Ok(capacity) => capacity,

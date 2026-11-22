@@ -506,6 +506,7 @@ pub(crate) fn stop(
                 StopKey::Process(_) => "the stop of the process",
                 StopKey::Group(_) => "the stop of the group",
             },
+            require_agent: false,
         },
         invocation,
     )

@@ -54,11 +54,19 @@ pub mod code {
     pub const OWNER_DISCLAIM_UNAVAILABLE: &str = "owner_disclaim_unavailable";
     /// The journal did not record the process of the command.
     pub const OWNER_PROCESS_NOT_RECORDED: &str = "owner_process_not_recorded";
+    /// A live descendant of the command found no room in the set of the
+    /// descendants, so the worker cannot know each process of the command.
+    pub const OWNER_DESCENDANTS_TRUNCATED: &str = "owner_descendants_truncated";
+    /// The journal did not record a change of the descendants of the
+    /// command.
+    pub const OWNER_DESCENDANTS_NOT_RECORDED: &str = "owner_descendants_not_recorded";
 
     /// Each code of this module.
-    pub const ALL: [&str; 16] = [
+    pub const ALL: [&str; 18] = [
         OWNER_DISCLAIM_UNAVAILABLE,
         OWNER_PROCESS_NOT_RECORDED,
+        OWNER_DESCENDANTS_TRUNCATED,
+        OWNER_DESCENDANTS_NOT_RECORDED,
         SCOPE_ROOT_CHANGED,
         OWNER_EXECUTABLE_CHANGED,
         OWNER_EXECUTABLE_NOT_TRUSTED,
@@ -101,6 +109,12 @@ pub struct OwnerExecutorConfig {
     /// The longest wait of the worker for the record of the process of the
     /// command in the journal.
     pub record_wait: Duration,
+    /// The largest number of live descendants that the worker keeps for one
+    /// command. At most [`MAX_OWNER_DESCENDANTS`]; a test sets a smaller
+    /// value to show the truncation.
+    ///
+    /// [`MAX_OWNER_DESCENDANTS`]: crate::journal::MAX_OWNER_DESCENDANTS
+    pub max_descendants: usize,
 }
 
 impl OwnerExecutorConfig {
@@ -115,6 +129,7 @@ impl OwnerExecutorConfig {
             stop_poll: Duration::from_millis(100),
             stop_grace: Duration::from_secs(2),
             responsibility: ResponsibilitySymbols::default(),
+            max_descendants: crate::journal::MAX_OWNER_DESCENDANTS,
             record_wait: Duration::from_secs(30),
         }
     }

@@ -4,7 +4,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::Read;
 
 use crate::scan::CancellationToken;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use svalnir_core::action::{
@@ -102,6 +102,13 @@ impl<R: Read> Read for Cancellable<'_, R> {
     }
 }
 
+/// An executable with its binding and its kind, which the examination
+/// read from the descriptor of its digest.
+struct Examined {
+    binding: ExecutableBinding,
+    kind: Result<ExecutableKind, ExecutableProblem>,
+}
+
 /// [`examine_executable`] whose digest ends when `cancel` is cancelled.
 fn examine_cancellable(
     path: &Path,
@@ -109,6 +116,19 @@ fn examine_cancellable(
     limit: u64,
     cancel: &CancellationToken,
 ) -> Result<ExecutableBinding, ExecutableProblem> {
+    examine_file(path, principal, limit, cancel).map(|examined| examined.binding)
+}
+
+/// [`examine_cancellable`] that also reads the kind of the file. The first
+/// bytes are read from the descriptor of the digest, before the check that
+/// the file did not change, so the kind is the kind of the bytes of the
+/// digest.
+fn examine_file(
+    path: &Path,
+    principal: Uid,
+    limit: u64,
+    cancel: &CancellationToken,
+) -> Result<Examined, ExecutableProblem> {
     if !path.is_absolute() {
         return Err(ExecutableProblem::NotFound);
     }
@@ -154,6 +174,8 @@ fn examine_cancellable(
         limit,
     )
     .map_err(|_| ExecutableProblem::NotReadable)?;
+    let kind: Result<ExecutableKind, ExecutableProblem> =
+        head_of(&file).and_then(|head| kind_of(&head));
     let after: Metadata = file
         .metadata()
         .map_err(|_| ExecutableProblem::NotReadable)?;
@@ -165,7 +187,7 @@ fn examine_cancellable(
     if !unchanged {
         return Err(ExecutableProblem::Changed);
     }
-    Ok(ExecutableBinding {
+    let binding = ExecutableBinding {
         path: LosslessPath::from_path(path).map_err(|_| ExecutableProblem::NotFound)?,
         object: object_of(&opened).ok_or(ExecutableProblem::NotReadable)?,
         owner: Uid::new(opened.uid()),
@@ -175,7 +197,8 @@ fn examine_cancellable(
         modified_at,
         digest,
         signature: None,
-    })
+    };
+    Ok(Examined { binding, kind })
 }
 
 /// A file time from its seconds and its nanoseconds.
@@ -224,15 +247,22 @@ const MAX_SHEBANG_BYTES: usize = 256;
 /// limit, that is not UTF-8, that has no absolute interpreter path, or
 /// that has more than one argument.
 pub fn executable_kind(path: &Path) -> Result<ExecutableKind, ExecutableProblem> {
-    let mut file: File = OpenOptions::new()
+    let file: File = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|_| ExecutableProblem::NotReadable)?;
+    kind_of(&head_of(&file)?)
+}
+
+/// At most the first 256 bytes of `file`, from the offset 0, with no change
+/// of the position of the descriptor.
+fn head_of(file: &File) -> Result<Vec<u8>, ExecutableProblem> {
     let mut head: Vec<u8> = vec![0; MAX_SHEBANG_BYTES];
     let mut filled: usize = 0;
     while filled < head.len() {
-        match file.read(&mut head[filled..]) {
+        let offset: u64 = u64::try_from(filled).map_err(|_| ExecutableProblem::NotReadable)?;
+        match file.read_at(&mut head[filled..], offset) {
             Ok(0) => break,
             Ok(count) => filled += count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -240,6 +270,11 @@ pub fn executable_kind(path: &Path) -> Result<ExecutableKind, ExecutableProblem>
         }
     }
     head.truncate(filled);
+    Ok(head)
+}
+
+/// The kind of a file from its first bytes `head`. See [`executable_kind`].
+fn kind_of(head: &[u8]) -> Result<ExecutableKind, ExecutableProblem> {
     if head.len() >= 4 && MACH_O_MAGIC.iter().any(|magic| head[..4] == *magic) {
         return Ok(ExecutableKind::MachO);
     }
@@ -284,31 +319,32 @@ pub fn examine_program(
     principal: Uid,
     limit: u64,
 ) -> Result<(ExecutableBinding, Option<InterpreterBinding>), ExecutableProblem> {
-    let executable: ExecutableBinding = examine_executable(path, principal, limit)?;
-    let Some((interpreter, arguments)) = script_interpreter(path, interpreters)? else {
-        return Ok((executable, None));
+    let cancel = CancellationToken::new();
+    let examined: Examined = examine_file(path, principal, limit, &cancel)?;
+    let Some((interpreter, arguments)) = script_interpreter(examined.kind?, interpreters)? else {
+        return Ok((examined.binding, None));
     };
-    if executable_kind(&interpreter)? != ExecutableKind::MachO {
+    let interpreter: Examined = examine_file(&interpreter, principal, limit, &cancel)?;
+    if interpreter.kind? != ExecutableKind::MachO {
         return Err(ExecutableProblem::NotExecutable);
     }
-    let interpreter: ExecutableBinding = examine_executable(&interpreter, principal, limit)?;
     Ok((
-        executable,
+        examined.binding,
         Some(InterpreterBinding {
-            executable: interpreter,
+            executable: interpreter.binding,
             arguments,
         }),
     ))
 }
 
-/// The interpreter and the interpreter arguments of the script at `path`,
+/// The interpreter and the interpreter arguments of a script of `kind`,
 /// from its `#!` line and the declared `interpreters`. `None` for a Mach-O
 /// file.
 fn script_interpreter(
-    path: &Path,
+    kind: ExecutableKind,
     interpreters: &[(PathBuf, Vec<String>)],
 ) -> Result<Option<(PathBuf, Vec<String>)>, ExecutableProblem> {
-    match executable_kind(path)? {
+    match kind {
         ExecutableKind::MachO => Ok(None),
         ExecutableKind::Script {
             interpreter,
@@ -344,23 +380,26 @@ fn script_interpreter(
     }
 }
 
-/// Whether the `#!` line of the executable of a binding, read again, gives
-/// the interpreter and the interpreter arguments of the binding: a Mach-O
-/// file has no interpreter, and a script has the bound one. The check after
-/// the digest of the start, so that the interpreter does not read a line
-/// that the plan does not have.
+/// Whether the `#!` line of the executable of a binding gives the
+/// interpreter and the interpreter arguments of the binding: a Mach-O file
+/// has no interpreter, and a script has the bound one. `kind` is the kind
+/// that [`check_executable`] read from the descriptor of the digest of the
+/// start, so that the interpreter does not read a line that the plan does
+/// not have.
 pub(super) fn script_agrees(
-    executable: &ExecutableBinding,
+    kind: Option<&ExecutableKind>,
     interpreter: Option<&InterpreterBinding>,
 ) -> bool {
-    let path: PathBuf = executable.path.to_path_buf();
+    let Some(kind) = kind else {
+        return false;
+    };
     let declared: Vec<(PathBuf, Vec<String>)> = interpreter.map_or_else(Vec::new, |interpreter| {
         vec![(
             interpreter.executable.path.to_path_buf(),
             interpreter.arguments.clone(),
         )]
     });
-    match (script_interpreter(&path, &declared), interpreter) {
+    match (script_interpreter(kind.clone(), &declared), interpreter) {
         (Ok(None), None) => true,
         (Ok(Some((found, arguments))), Some(interpreter)) => {
             found == interpreter.executable.path.to_path_buf() && arguments == interpreter.arguments
@@ -380,16 +419,21 @@ pub(super) enum ExecutableRefusal {
 }
 
 /// Compares the executable at the path of `planned` with the plan, and
-/// examines its owner and its mode again.
+/// examines its owner and its mode again. Returns the kind of the file,
+/// read from the descriptor of the digest, or `None` when the file has no
+/// valid kind.
 pub(super) fn check_executable(
     planned: &ExecutableBinding,
     principal: Uid,
     limit: u64,
     cancel: &CancellationToken,
-) -> Result<(), ExecutableRefusal> {
+) -> Result<Option<ExecutableKind>, ExecutableRefusal> {
     let path = planned.path.to_path_buf();
-    match examine_cancellable(&path, principal, limit, cancel) {
-        Ok(current) => {
+    match examine_file(&path, principal, limit, cancel) {
+        Ok(Examined {
+            binding: current,
+            kind,
+        }) => {
             // The code-signing identity is not read in this build; each
             // other value must be the value of the plan.
             let same: bool = current.path == planned.path
@@ -401,7 +445,7 @@ pub(super) fn check_executable(
                 && current.modified_at == planned.modified_at
                 && current.digest == planned.digest;
             if same {
-                Ok(())
+                Ok(kind.ok())
             } else {
                 Err(ExecutableRefusal::Changed)
             }

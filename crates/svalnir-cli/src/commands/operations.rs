@@ -215,6 +215,15 @@ pub(crate) fn wait(
         if environment.interrupt.is_requested() {
             break ("interrupted", operation, Some(INTERRUPT_NOTE));
         }
+        // The wait executes nothing, so a stop signal that a handler
+        // recorded, for example in `svalnir mcp`, ends it at once.
+        if let Some(signal) = environment.interrupt.stop_signal() {
+            break (
+                super::apply::stopped_wait(signal),
+                operation,
+                Some(super::apply::STOP_WAIT_NOTE),
+            );
+        }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             break ("timed_out", operation, Some(TIMEOUT_NOTE));
         }

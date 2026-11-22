@@ -36,10 +36,12 @@ use crate::executor::fs::{
 };
 use crate::executor::owner::{
     AdmittedOwnerStep, OwnerFault, OwnerOutcome, OwnerPoll, OwnerRun, OwnerStepOutcome,
+    code as owner_code,
 };
 use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
+use crate::journal::DescendantChange;
 use crate::rules::ProducerActivity;
 use crate::rules::in_use::UnitUse;
 use crate::rules::projects::{UNIT_ABSENT, UnitRecheck};
@@ -1083,21 +1085,30 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 active.owner_run = Some(running);
                 Ok(StepEnd::Wait(wake))
             }
-            OwnerPoll::Descendants(descendants) => {
-                // The journal keeps each descendant that the worker found,
-                // so a reconciliation and an acknowledgment can find it by
-                // its identity. A record that fails makes the recording
-                // degraded; the record of the command stays.
+            OwnerPoll::Descendants(change) => {
+                // The journal keeps each live descendant that the worker
+                // found, so a reconciliation and an acknowledgment can find
+                // it by its identity. A record that fails makes the
+                // recording degraded and the step `UnknownOutcome`, and the
+                // record of the command becomes truncated when the journal
+                // can still write that.
+                let operation_id = active.operation.operation_id().clone();
                 if self
                     .journal
-                    .record_owner_descendants(
-                        active.operation.operation_id(),
-                        &step.step_id,
-                        &descendants,
-                    )
+                    .record_owner_descendants(&operation_id, &step.step_id, &change)
                     .is_err()
                 {
                     active.degraded = true;
+                    running.descendants_lost = true;
+                    let truncation = DescendantChange {
+                        truncated: true,
+                        ..DescendantChange::default()
+                    };
+                    drop(self.journal.record_owner_descendants(
+                        &operation_id,
+                        &step.step_id,
+                        &truncation,
+                    ));
                 }
                 active.owner_run = Some(running);
                 Ok(StepEnd::Wait(time.clock.now))
@@ -1118,7 +1129,25 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 Ok(StepEnd::Wait(time.clock.now))
             }
             OwnerPoll::Finished(outcome) => {
-                let result: TargetResult = Self::owner_result(active, step, *outcome)?;
+                let mut result: TargetResult = Self::owner_result(active, step, *outcome)?;
+                if running.descendants_lost
+                    && matches!(result.effect, TargetEffect::OperationCompleted)
+                {
+                    let dispatch: DispatchState = result.dispatch.clone();
+                    result = unknown_outcome(
+                        &step.target_id,
+                        dispatch.clone(),
+                        action_error_with(
+                            owner_code::OWNER_DESCENDANTS_NOT_RECORDED,
+                            ErrorFamily::Recording,
+                            ActionStage::Execution,
+                            dispatch,
+                            Some(&active.plan.plan_id),
+                            Some(active.operation.operation_id()),
+                            Some(&step.step_id),
+                        ),
+                    )?;
+                }
                 self.settle_called(
                     active,
                     step,
@@ -1234,13 +1263,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             // does not wait for the command.
             Admitted::Owner(admitted) => {
                 let run: OwnerRun = self.owner.begin(&active.roots, admitted);
-                active.owner_run = Some(OwnerRunning {
-                    run,
-                    charge,
-                    charged,
-                    next_check: time.clock.now,
-                    stop: None,
-                });
+                active.owner_run = Some(OwnerRunning::new(run, charge, charged, time.clock.now));
                 return Ok(StepEnd::Wait(time.clock.now));
             }
         };

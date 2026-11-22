@@ -21,11 +21,15 @@
 //! state directory and the journal through the shared function of the CLI
 //! (`client::create_state_directory`); no other action makes them.
 
+pub mod cleanup;
 pub mod fixture;
+pub mod fixture_cleanup;
 pub mod live;
+mod live_cleanup;
 
 use crate::data::model::OperationPhase;
 use crate::ui::pill::Tone;
+use cleanup::{CleanupProposal, CleanupRequest, CleanupSnapshot};
 use gpui_kit::component::IconName;
 use std::{
     collections::HashMap,
@@ -49,6 +53,8 @@ pub enum Slot {
     Operation(String),
     /// The stop control of one application or job instance.
     Stop(String),
+    /// The plan control of one cleanup rule.
+    Cleanup(String),
 }
 
 /// What the user asks for. Each value has the identities that the user
@@ -104,6 +110,11 @@ pub enum Action {
         /// `true`: the force-quit plan; `false`: the quit plan.
         force: bool,
     },
+    /// Apply the sealed cleanup plan that the confirmation showed.
+    Clean {
+        /// The reviewed plan and what it binds.
+        proposal: Arc<CleanupProposal>,
+    },
 }
 
 impl Action {
@@ -118,12 +129,13 @@ impl Action {
                 Slot::Operation(operation.clone())
             }
             Self::Stop { proposal, .. } => Slot::Stop(proposal.instance.clone()),
+            Self::Clean { proposal } => Slot::Cleanup(proposal.rule.clone()),
         }
     }
 
     /// The name of the action for a state line, for example "Pause".
     #[must_use]
-    pub const fn verb(&self) -> &'static str {
+    pub fn verb(&self) -> &'static str {
         match self {
             Self::Pause { .. } => "Pause",
             Self::Resume => "Resume",
@@ -134,6 +146,10 @@ impl Action {
             Self::Acknowledge { .. } => "Acknowledge",
             Self::Stop { force: false, .. } => "Quit",
             Self::Stop { force: true, .. } => "Force quit",
+            Self::Clean { proposal } => match proposal.kind {
+                cleanup::PlanKind::Evict => "Remove",
+                cleanup::PlanKind::Owner => "Run",
+            },
         }
     }
 }
@@ -253,7 +269,7 @@ impl Unavailable {
     #[must_use]
     pub fn sentence(&self) -> String {
         match self {
-            Self::NoAgent => "No agent holds the coordinator lock, so no process can decide the request. This window does not act in place of the agent. Start the agent with `svalnir agent install`.".to_owned(),
+            Self::NoAgent => "No agent holds the coordinator lock, so no process can decide the request (agent_not_running). This window does not act in place of the agent. Start the agent with `svalnir agent install`.".to_owned(),
             Self::OtherCoordinator => "A command-line client holds the coordinator lock, not the agent. Wait for the command to end, then try again.".to_owned(),
             Self::AgentUnknown => "The coordinator lock cannot be read, so it is not known whether the agent runs.".to_owned(),
             Self::NoJournal => "The state directory has no operation journal, so no agent runs on it. The window does not make one.".to_owned(),
@@ -365,6 +381,29 @@ pub enum ActionState {
         /// this process.
         since: Instant,
     },
+    /// The agent admitted a cleanup plan. Its result is not read yet.
+    Running {
+        /// The operation of the cleanup.
+        operation: String,
+        /// When the window read the admission, on the monotonic clock of
+        /// this process.
+        since: Instant,
+    },
+    /// The cleanup operation has its final record.
+    Finished {
+        /// The operation of the cleanup.
+        operation: String,
+        /// The phase of its final record.
+        phase: OperationPhase,
+        /// The operation-state name of its final record in the journal.
+        state: String,
+    },
+    /// The window did not read the final record of the cleanup operation in
+    /// time. The operation can still end; History shows it.
+    ResultNotRead {
+        /// The operation of the cleanup.
+        operation: String,
+    },
     /// The stop operation has its final record.
     Settled {
         /// The operation of the stop.
@@ -419,7 +458,10 @@ impl ActionState {
     pub const fn is_busy(&self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::AwaitingAdmission { .. } | Self::WaitingForExit { .. }
+            Self::Pending
+                | Self::AwaitingAdmission { .. }
+                | Self::WaitingForExit { .. }
+                | Self::Running { .. }
         )
     }
 
@@ -434,6 +476,18 @@ impl ActionState {
                 ("Waiting for admission", Tone::Brand, IconName::Loader)
             }
             Self::WaitingForExit { .. } => ("Waiting for exit", Tone::Brand, IconName::Loader),
+            Self::Running { .. } => ("Running", Tone::Brand, IconName::Loader),
+            Self::Finished { phase, state, .. } => match phase {
+                OperationPhase::Completed => ("Completed", Tone::Positive, IconName::CircleCheck),
+                OperationPhase::Partial if state == "Incomplete" => {
+                    ("Incomplete", Tone::Warning, IconName::TriangleAlert)
+                }
+                OperationPhase::Partial => ("Partial", Tone::Warning, IconName::TriangleAlert),
+                OperationPhase::NoAction => ("No action", Tone::Neutral, IconName::Minus),
+                OperationPhase::Failed => ("Failed", Tone::Negative, IconName::CircleX),
+                _ => ("Unknown outcome", Tone::Warning, IconName::Info),
+            },
+            Self::ResultNotRead { .. } => ("Result not read", Tone::Warning, IconName::Info),
             Self::Settled { phase, state, .. } => match phase {
                 OperationPhase::Completed => ("Exited", Tone::Positive, IconName::CircleCheck),
                 OperationPhase::Partial if state == "Incomplete" => {
@@ -469,6 +523,20 @@ impl ActionState {
                 let seconds: u64 = now.saturating_duration_since(*since).as_secs();
                 format!("The agent admitted operation {operation}. Waiting for exit: {seconds} s.")
             }
+            Self::Running { operation, since } => {
+                let seconds: u64 = now.saturating_duration_since(*since).as_secs();
+                format!("The agent admitted operation {operation} and runs its steps: {seconds} s.")
+            }
+            Self::Finished {
+                operation,
+                phase,
+                state,
+            } => match phase {
+                OperationPhase::Completed => format!(
+                    "Operation {operation} completed. History shows the effect of each target and the observed change of the volume."
+                ),
+                _ => format!("Operation {operation} ended in the state {state}. See History."),
+            },
             Self::Settled {
                 operation,
                 phase,
@@ -479,7 +547,7 @@ impl ActionState {
                 }
                 _ => format!("Operation {operation} ended in the state {state}. See History."),
             },
-            Self::ExitNotConfirmed { operation } => format!("The window did not read the final record of operation {operation} in 5 min. The operation can still end; History shows its state."),
+            Self::ExitNotConfirmed { operation } | Self::ResultNotRead { operation } => format!("The window did not read the final record of operation {operation} in 5 min. The operation can still end; History shows its state."),
             Self::Queued => "The request is in the queue, and the window read no answer from the agent. The agent can decide it later. See History.".to_owned(),
             Self::NotAdmitted { .. } => "The window read no admission before the plan expired. The agent refuses an expired plan; History shows an operation only if the agent admitted it. Prepare a new plan to stop the group.".to_owned(),
             Self::Refused { code, reason } if code == UNEXPECTED_COMPLETION => {
@@ -542,7 +610,27 @@ pub fn reason_of(code: &str) -> &'static str {
         "journal_full" => "The operation journal has no space for new work",
         "journal_conflict" => "The journal has a different request with this identity",
         "identity_unavailable" => "An identity of the request cannot be made",
-        "plan_not_buildable" => "The stop plan cannot be made",
+        "plan_not_buildable" => "The plan cannot be made",
+        "rule_mode_not_validated" => {
+            "This rule is in the lifecycle state proposed. No validation is recorded for a manual plan under it, so this build makes no plan, and the agent admits none"
+        }
+        "clear_not_included" => {
+            "This plan clears cache data of the producer, also data that a project uses now. Check the consent to plan it"
+        }
+        "unknown_rule" => "This build has no rule with this identity",
+        "owner_operation_not_available" => "The rule has no owner command in this build",
+        "rule_registry_unavailable" => "The rule registry of this build is not usable",
+        "owner_scope_unavailable" => {
+            "The rule has no scope root that a plan can bind. The inspection shows why"
+        }
+        "no_search_roots" => {
+            "The rule has no search root. Set `[cleanup.projects].search_roots`, or let mise record a project"
+        }
+        "home_directory_unavailable" => "The home directory of this user is not known",
+        "discovery_not_complete" => {
+            "The discovery of the rule did not end, so no plan was made from a part of it"
+        }
+        "journal_unavailable" => "The operation journal cannot be opened",
         "process_reading_unavailable" => "The processes of this user cannot be read",
         UNEXPECTED_COMPLETION => {
             "The agent answered with a result of a different kind, so its effect is not known here. See History"
@@ -583,6 +671,21 @@ pub trait ActionPort: Send + Sync + Debug {
     /// `WaitingForExit` when the agent admitted the plan, or the refusal.
     /// `None` while the request has no completion or cannot be read now.
     fn admission_state(&self, request: &str) -> Option<ActionState>;
+
+    /// Inspects each cleanup rule of this build. Read-only: it makes no plan
+    /// and removes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when no rule can be inspected.
+    fn inspect_rules(&self) -> Result<CleanupSnapshot, String>;
+
+    /// Makes the sealed plan of `request`. Nothing is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the state of a refusal or of an unavailable agent.
+    fn prepare_cleanup(&self, request: &CleanupRequest) -> Result<CleanupProposal, ActionState>;
 }
 
 /// The states of the controls, and the stop plans of the open dialog.
@@ -697,6 +800,14 @@ impl ActionBook {
                     };
                     changed = true;
                 }
+                ActionState::Running { operation, since }
+                    if now.saturating_duration_since(*since) > limit =>
+                {
+                    *state = ActionState::ResultNotRead {
+                        operation: operation.clone(),
+                    };
+                    changed = true;
+                }
                 ActionState::AwaitingAdmission { request, until, .. } if now > *until => {
                     *state = ActionState::NotAdmitted {
                         request: request.clone(),
@@ -733,6 +844,14 @@ impl ActionBook {
         if matches!(state, ActionState::AwaitingAdmission { .. }) {
             return;
         }
+        // The admission of a cleanup plan starts its operation; no process
+        // exits.
+        let state: ActionState = match (slot, state) {
+            (Slot::Cleanup(_), ActionState::WaitingForExit { operation, since }) => {
+                ActionState::Running { operation, since }
+            }
+            (_, state) => state,
+        };
         if let Some(current) = self.states.get_mut(slot)
             && matches!(current, ActionState::AwaitingAdmission { request: waiting, .. }
                 | ActionState::NotAdmitted { request: waiting } if waiting == request)
@@ -758,9 +877,8 @@ impl ActionBook {
         self.states
             .iter()
             .filter_map(|(slot, state)| match state {
-                ActionState::WaitingForExit { operation, .. } => {
-                    Some((slot.clone(), operation.clone()))
-                }
+                ActionState::WaitingForExit { operation, .. }
+                | ActionState::Running { operation, .. } => Some((slot.clone(), operation.clone())),
                 _ => None,
             })
             .collect()
@@ -773,14 +891,29 @@ impl ActionBook {
         if matches!(phase, OperationPhase::Pending | OperationPhase::Running) {
             return;
         }
-        if let Some(current) = self.states.get_mut(slot)
-            && matches!(current, ActionState::WaitingForExit { operation: waiting, .. } if waiting == operation)
-        {
-            *current = ActionState::Settled {
-                operation: operation.to_owned(),
-                phase,
-                state: state.to_owned(),
-            };
+        let Some(current) = self.states.get_mut(slot) else {
+            return;
+        };
+        match current {
+            ActionState::WaitingForExit {
+                operation: waiting, ..
+            } if waiting == operation => {
+                *current = ActionState::Settled {
+                    operation: operation.to_owned(),
+                    phase,
+                    state: state.to_owned(),
+                };
+            }
+            ActionState::Running {
+                operation: waiting, ..
+            } if waiting == operation => {
+                *current = ActionState::Finished {
+                    operation: operation.to_owned(),
+                    phase,
+                    state: state.to_owned(),
+                };
+            }
+            _ => {}
         }
     }
 }
@@ -1119,5 +1252,73 @@ mod tests {
         let plans = proposal(at);
         assert!(!plans.expired(at - Duration::from_secs(1)));
         assert!(plans.expired(at));
+    }
+
+    #[test]
+    fn an_admitted_cleanup_runs_and_then_finishes_with_the_state_of_the_journal() {
+        let mut book = ActionBook::default();
+        let slot = Slot::Cleanup("project.dependency-directory".to_owned());
+        let now = Instant::now();
+        book.set(
+            slot.clone(),
+            ActionState::AwaitingAdmission {
+                request: "r-1".to_owned(),
+                since: now,
+                until: now + Duration::from_secs(60),
+            },
+        );
+        // The port reads the completion of an apply as a wait for an exit;
+        // for a cleanup the window shows that its operation runs.
+        book.admit(
+            &slot,
+            "r-1",
+            ActionState::WaitingForExit {
+                operation: "op-1".to_owned(),
+                since: now,
+            },
+        );
+        assert!(
+            matches!(book.state(&slot), Some(ActionState::Running { operation, .. }) if operation == "op-1")
+        );
+        assert!(book.is_busy(&slot));
+        assert_eq!(book.waiting(), vec![(slot.clone(), "op-1".to_owned())]);
+        book.settle(&slot, "op-1", OperationPhase::Partial, "Incomplete");
+        let state = book.state(&slot).cloned().expect("state");
+        assert_eq!(state.pill().0, "Incomplete");
+        assert_eq!(
+            state.sentence(now),
+            "Operation op-1 ended in the state Incomplete. See History."
+        );
+        assert!(!book.is_busy(&slot));
+    }
+
+    #[test]
+    fn a_completed_cleanup_is_not_an_exit_and_a_long_wait_ends() {
+        let mut book = ActionBook::default();
+        let slot = Slot::Cleanup("go.build-cache".to_owned());
+        let start = Instant::now();
+        book.set(
+            slot.clone(),
+            ActionState::Running {
+                operation: "op-2".to_owned(),
+                since: start,
+            },
+        );
+        book.settle(&slot, "op-2", OperationPhase::Completed, "Completed");
+        assert_eq!(
+            book.state(&slot).map(|state| state.pill().0),
+            Some("Completed")
+        );
+        book.set(
+            slot.clone(),
+            ActionState::Running {
+                operation: "op-3".to_owned(),
+                since: start,
+            },
+        );
+        assert!(book.end_long_waits(start + Duration::from_secs(301), Duration::from_secs(300)));
+        assert!(
+            matches!(book.state(&slot), Some(ActionState::ResultNotRead { operation }) if operation == "op-3")
+        );
     }
 }

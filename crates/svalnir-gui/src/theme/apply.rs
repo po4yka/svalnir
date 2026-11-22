@@ -47,9 +47,12 @@ pub fn apply_tokens(theme: &mut Theme, tokens: &Tokens, bundled_fonts: bool) {
     }
     colors.status_bar_border = c(tokens.border);
 
-    for slot in [&mut colors.list, &mut colors.table, &mut colors.input] {
+    for slot in [&mut colors.list, &mut colors.table] {
         *slot = c(tokens.surface_inset);
     }
+    // `input` is the edge of a checkbox and of a text field in `gpui-kit`,
+    // so it has the control edge and not the panel fill.
+    colors.input = c(tokens.control_border);
 
     for slot in [
         &mut colors.popover,

@@ -1,7 +1,11 @@
 //! Application bootstrap: gpui-kit, fonts, theme, key bindings, main window.
 
 use crate::{
-    actions::{Action, fixture::ActionScript},
+    actions::{
+        Action,
+        cleanup::{CleanupRequest, PlanKind},
+        fixture::ActionScript,
+    },
     data::{
         DataSource,
         fixture::{FixtureScenario, FixtureSource},
@@ -9,7 +13,7 @@ use crate::{
         store::AppModel,
     },
     shell::{
-        nav::{self, Screen},
+        nav::{self, Screen, Section},
         window::MainWindow,
     },
     theme::{apply, fonts},
@@ -64,6 +68,13 @@ Options:
   --send-stop          With --fixture only: send the quit of the first group
                        that the catalog does not protect at launch, so that
                        its row on Applications shows the state of the stop
+  --section NAME       Scroll to a section of its screen at launch
+                       (cleanup)
+  --open-plan RULE     With --fixture only: open the plan confirmation of the
+                       cleanup rule RULE on Storage
+  --send-plan RULE     With --fixture only: send the plan of the cleanup rule
+                       RULE at launch, so that its row on Storage shows the
+                       state of the plan
   --no-status-item     Add no item to the menu bar. The client then quits
                        when its last window closes
   --help               Print this text
@@ -131,6 +142,13 @@ pub struct LaunchOptions {
     /// Whether the quit of the first group that the catalog does not
     /// protect is sent at launch. Fixture only.
     pub send_stop: bool,
+    /// The section that the window scrolls to at launch.
+    pub section: Option<Section>,
+    /// The cleanup rule whose plan confirmation opens at launch. Fixture
+    /// only.
+    pub open_plan: Option<String>,
+    /// The cleanup rule whose plan is sent at launch. Fixture only.
+    pub send_plan: Option<String>,
     /// Whether the menu bar item is off.
     pub no_status_item: bool,
     /// Whether `--help` was given.
@@ -276,6 +294,27 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
                 );
             }
             "--open-stop" => options.open_stop = true,
+            "--section" => {
+                let name: String = args
+                    .next()
+                    .ok_or_else(|| "`--section` needs a name".to_owned())?;
+                options.section = Some(match name.as_str() {
+                    "cleanup" => Section::Cleanup,
+                    other => return Err(format!("unknown section `{other}`; use cleanup")),
+                });
+            }
+            "--open-plan" => {
+                options.open_plan = Some(
+                    args.next()
+                        .ok_or_else(|| "`--open-plan` needs a rule".to_owned())?,
+                );
+            }
+            "--send-plan" => {
+                options.send_plan = Some(
+                    args.next()
+                        .ok_or_else(|| "`--send-plan` needs a rule".to_owned())?,
+                );
+            }
             "--send-stop" => options.send_stop = true,
             "--no-status-item" => options.no_status_item = true,
             "--help" | "-h" => options.help = true,
@@ -306,6 +345,15 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchOption
     // takes only a fixture, which records nothing and signals nothing.
     if options.send_stop && options.fixture.is_none() {
         return Err("`--send-stop` is valid only with `--fixture`".to_owned());
+    }
+    // A plan of the live source reads the disk, and its apply removes data,
+    // so the launch options take only a fixture, which reads and writes
+    // nothing.
+    if options.open_plan.is_some() && options.fixture.is_none() {
+        return Err("`--open-plan` is valid only with `--fixture`".to_owned());
+    }
+    if options.send_plan.is_some() && options.fixture.is_none() {
+        return Err("`--send-plan` is valid only with `--fixture`".to_owned());
     }
     Ok(options)
 }
@@ -378,8 +426,73 @@ fn send_fixture_stop(
     model.update(cx, |model, cx| model.run_action(action, cx));
 }
 
+/// The plan of the fixture cleanup rule `rule`: the plan kind of the rule.
+fn fixture_plan_kind(rule: &str) -> Option<PlanKind> {
+    crate::actions::fixture_cleanup::inspections()
+        .into_iter()
+        .find(|inspection| inspection.rule == rule)
+        .and_then(|inspection| inspection.plan)
+}
+
+/// Sends the plan of the fixture cleanup rule `rule` through the model, as
+/// the apply button of its confirmation does. The fixture path reads and
+/// records nothing.
+fn send_fixture_plan(
+    view: &Entity<MainWindow>,
+    scenario: FixtureScenario,
+    script: ActionScript,
+    rule: &str,
+    cx: &mut App,
+) {
+    let Some(kind) = fixture_plan_kind(rule) else {
+        tracing::error!(
+            rule,
+            "the fixture has no cleanup rule with a plan of this name"
+        );
+        return;
+    };
+    let source: FixtureSource = FixtureSource::new(scenario).with_actions(script);
+    let request = CleanupRequest {
+        rule: rule.to_owned(),
+        kind,
+        options: crate::actions::cleanup::CleanupOptions::default(),
+        cancel: svalnir_agent::scan::CancellationToken::new(),
+    };
+    let proposal = match source.actions().prepare_cleanup(&request) {
+        Ok(proposal) => proposal,
+        Err(state) => {
+            tracing::error!(?state, "the fixture made no cleanup plan");
+            return;
+        }
+    };
+    let model: Entity<AppModel> = view.read(cx).model().clone();
+    let action = Action::Clean {
+        proposal: Arc::new(proposal),
+    };
+    model.update(cx, |model, cx| model.run_action(action, cx));
+}
+
+/// Opens the plan confirmation of the fixture cleanup rule `rule`.
+fn open_fixture_plan(handle: AnyWindowHandle, view: &Entity<MainWindow>, rule: &str, cx: &mut App) {
+    let Some(kind) = fixture_plan_kind(rule) else {
+        tracing::error!(
+            rule,
+            "the fixture has no cleanup rule with a plan of this name"
+        );
+        return;
+    };
+    let model: Entity<AppModel> = view.read(cx).model().clone();
+    let opened = handle.update(cx, |_, window, cx| {
+        crate::screens::cleanup::open_cleanup(&model, rule, kind, window, cx);
+    });
+    if let Err(error) = opened {
+        tracing::error!(%error, "cannot open the plan confirmation");
+    }
+}
+
 /// Applies the launch options that open a detail or a dialog, or send a
-/// fixture action: `--detail`, `--cancel`, `--send-stop`, and `--open-stop`.
+/// fixture action: `--detail`, `--cancel`, `--send-stop`, `--open-stop`,
+/// `--section`, `--send-plan`, and `--open-plan`.
 fn apply_launch_actions(
     handle: AnyWindowHandle,
     view: &Entity<MainWindow>,
@@ -400,6 +513,33 @@ fn apply_launch_actions(
     }
     if let (true, Some(scenario)) = (options.open_stop, options.fixture) {
         open_fixture_stop(handle, view, scenario, cx);
+    }
+    if let Some(section) = options.section {
+        // The cards above and in the section get their height from their
+        // first reads, so the scroll waits for them; it is a launch option
+        // for screenshots only.
+        let view: Entity<MainWindow> = view.clone();
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let scrolled = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.scroll_to_section(section, window, cx));
+            });
+            if let Err(error) = scrolled {
+                tracing::error!(%error, "cannot scroll to the section");
+            }
+        })
+        .detach();
+    }
+    if let (Some(rule), Some(scenario)) = (&options.send_plan, options.fixture) {
+        let script: ActionScript = options
+            .actions
+            .unwrap_or_else(|| ActionScript::of(scenario));
+        send_fixture_plan(view, scenario, script, rule, cx);
+    }
+    if let (Some(rule), Some(_)) = (&options.open_plan, options.fixture) {
+        open_fixture_plan(handle, view, rule, cx);
     }
 }
 
@@ -710,6 +850,12 @@ mod tests {
             "op-2",
             "--open-stop",
             "--send-stop",
+            "--section",
+            "cleanup",
+            "--open-plan",
+            "go.build-cache",
+            "--send-plan",
+            "project.dependency-directory",
             "--no-status-item",
             "--help",
         ]);
@@ -732,6 +878,9 @@ mod tests {
                 cancel: Some("op-2".to_owned()),
                 open_stop: true,
                 send_stop: true,
+                section: Some(Section::Cleanup),
+                open_plan: Some("go.build-cache".to_owned()),
+                send_plan: Some("project.dependency-directory".to_owned()),
                 no_status_item: true,
                 help: true,
             })
@@ -756,6 +905,15 @@ mod tests {
             Ok(Some(false))
         );
         assert!(parse(&["--rescan"]).is_err(), "needs a scan");
+        assert!(
+            parse(&["--open-plan", "go.build-cache"]).is_err(),
+            "needs a fixture"
+        );
+        assert!(
+            parse(&["--send-plan", "go.build-cache"]).is_err(),
+            "needs a fixture"
+        );
+        assert!(parse(&["--section", "nowhere"]).is_err());
         assert!(parse(&["--actions", "accept"]).is_err(), "needs a fixture");
         assert!(parse(&["--fixture", "healthy", "--actions", "maybe"]).is_err());
         assert!(parse(&["--rescan", "--scan", "/tmp/a"]).is_ok());

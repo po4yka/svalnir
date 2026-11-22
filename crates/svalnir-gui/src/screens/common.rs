@@ -320,11 +320,7 @@ pub fn fact(
 
 /// The problem lines of a snapshot, in the `warning` tone with the word
 /// "Problem" so that the tone is not the only signal.
-pub fn problem_lines(
-    prefix: &'static str,
-    problems: &[String],
-    tokens: &Tokens,
-) -> Vec<AnyElement> {
+pub fn problem_lines(prefix: &str, problems: &[String], tokens: &Tokens) -> Vec<AnyElement> {
     problems
         .iter()
         .enumerate()

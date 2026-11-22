@@ -58,10 +58,12 @@ const PLAN_WORK_ITEMS: u64 = 4_000_000;
 const BATCH_WORK_ITEMS: u64 = 100_000;
 
 /// The time that the execution of a manual cleanup plan can use.
-pub(crate) const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000_000);
+pub(crate) const EXECUTION_DEADLINE: Nanoseconds =
+    svalnir_agent::client::cleanup::EXECUTION_DEADLINE;
 
 /// The time in which the executor verifies the effect of one step.
-pub(crate) const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
+pub(crate) const VERIFICATION_WINDOW: Nanoseconds =
+    svalnir_agent::client::cleanup::VERIFICATION_WINDOW;
 
 pub(crate) const PLAN_NOTE: &str = "This command changed no file. The plan gives no authority: apply it with `svalnir clean apply --plan PLAN_ID`, which asks for the approval of this plan and checks each target again.";
 

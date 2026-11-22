@@ -11,7 +11,12 @@ use super::{
         MemorySnapshot, ProcessesSnapshot,
     },
 };
-use crate::actions::{Action, ActionBook, ActionPort, ActionState, Proposal, Slot};
+use crate::actions::{
+    Action, ActionBook, ActionPort, ActionState, Proposal, Slot,
+    cleanup::{
+        CleanupBook, CleanupDraft, CleanupOptions, CleanupRequest, CleanupSnapshot, PlanKind,
+    },
+};
 use crate::ui::data_state::capture_age;
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
@@ -29,6 +34,11 @@ const PRESSURE_REFUSAL: &str = "A scan does not start while memory pressure is n
 
 /// The refusal while the pressure reading is stale.
 const STALE_REFUSAL: &str = "The memory pressure reading is stale. Refresh, then scan again.";
+
+/// The reason that an inspection of the cleanup rules does not start under
+/// memory pressure.
+const INSPECTION_PRESSURE_REFUSAL: &str =
+    "An inspection of the cleanup rules does not start while memory pressure is not normal.";
 
 /// The decision of the scan gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +183,17 @@ macro_rules! start_read {
     };
 }
 
+/// The state of the inspection of the cleanup rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inspection {
+    /// No inspection runs.
+    Idle,
+    /// An inspection waits for the first host reading.
+    Waiting,
+    /// An inspection runs on a background thread.
+    Running,
+}
+
 /// The most scan roots that keep an earlier result.
 pub const SCAN_ROOTS_MAX: usize = 8;
 
@@ -239,6 +260,13 @@ pub struct AppModel {
     /// The state of each control after its last action, and the stop plans
     /// of the open dialog.
     pub actions: ActionBook,
+    /// The inspections of the cleanup rules. `Loading` until the Storage
+    /// screen asks for them.
+    pub cleanup: Loadable<CleanupSnapshot>,
+    /// The options of each cleanup rule, and the plan dialog that is open.
+    pub cleanup_book: CleanupBook,
+    /// The inspection of the cleanup rules that runs or waits.
+    inspection: Inspection,
     /// The state of the scan of the Storage screen.
     pub scan: ScanState,
     /// A refusal that does not replace a finished result.
@@ -323,6 +351,9 @@ impl AppModel {
             diagnostics: Loadable::Loading,
             topics: Vec::new(),
             standing: Vec::new(),
+            cleanup: Loadable::Loading,
+            cleanup_book: CleanupBook::default(),
+            inspection: Inspection::Idle,
             scan: ScanState::Idle,
             scan_notice: None,
             default_root: None,
@@ -564,6 +595,10 @@ impl AppModel {
         if matches!(action, Action::Stop { .. }) {
             self.actions.close_stop();
         }
+        // A cleanup comes from its plan dialog, which closes with it.
+        if matches!(action, Action::Clean { .. }) {
+            self.cleanup_book.close();
+        }
         if self.actions.is_busy(&slot) {
             return;
         }
@@ -641,6 +676,137 @@ impl AppModel {
     /// Closes the stop dialog. Its plans are not recorded.
     pub fn close_stop(&mut self, cx: &mut Context<Self>) {
         self.actions.close_stop();
+        cx.notify();
+    }
+
+    /// Inspects the cleanup rules on a background thread, unless an
+    /// inspection runs. The inspection is read-only and bounded. It does
+    /// not start while memory pressure is not normal, and it waits for the
+    /// first host reading.
+    pub fn inspect_cleanup(&mut self, cx: &mut Context<Self>) {
+        if self.inspection == Inspection::Running {
+            return;
+        }
+        match scan_allowed(&self.host) {
+            ScanGate::Start => {}
+            ScanGate::Wait => {
+                self.inspection = Inspection::Waiting;
+                return;
+            }
+            ScanGate::Refuse(_) => {
+                if !matches!(self.cleanup, Loadable::Ready(_) | Loadable::Stale(_)) {
+                    self.cleanup = Loadable::Unavailable(INSPECTION_PRESSURE_REFUSAL.to_owned());
+                }
+                cx.notify();
+                return;
+            }
+        }
+        self.inspection = Inspection::Running;
+        cx.notify();
+        let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = cx
+                .background_spawn(async move { port.inspect_rules() })
+                .await;
+            if this
+                .update(cx, |model, cx| {
+                    model.inspection = Inspection::Idle;
+                    model.cleanup = loaded(result);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                tracing::debug!("the model closed before the inspection finished");
+            }
+        })
+        .detach();
+    }
+
+    /// Whether an inspection of the cleanup rules runs or waits for the
+    /// first host reading.
+    #[must_use]
+    pub fn is_inspecting(&self) -> bool {
+        self.inspection != Inspection::Idle
+    }
+
+    /// Inspects the cleanup rules when no inspection result is here.
+    pub fn ensure_cleanup(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.cleanup, Loadable::Loading) {
+            self.inspect_cleanup(cx);
+        }
+    }
+
+    /// Sets the options of the plan of `rule`.
+    pub fn set_cleanup_options(
+        &mut self,
+        rule: &str,
+        options: CleanupOptions,
+        cx: &mut Context<Self>,
+    ) {
+        self.cleanup_book.set_options(rule, options);
+        cx.notify();
+    }
+
+    /// Opens the plan dialog of `rule` and makes its plan on a background
+    /// thread with the options of the rule. Nothing is recorded until a
+    /// confirmation. Returns `false` and does nothing while a plan dialog
+    /// is open.
+    pub fn prepare_cleanup(&mut self, rule: &str, kind: PlanKind, cx: &mut Context<Self>) -> bool {
+        let Some((request, cancel)) = self.cleanup_book.open(rule) else {
+            return false;
+        };
+        self.make_cleanup_plan(request, cancel, rule, kind, cx);
+        true
+    }
+
+    /// Makes a new plan in the open plan dialog of `rule`.
+    pub fn renew_cleanup(&mut self, rule: &str, kind: PlanKind, cx: &mut Context<Self>) {
+        if let Some((request, cancel)) = self.cleanup_book.renew(rule) {
+            self.make_cleanup_plan(request, cancel, rule, kind, cx);
+        }
+    }
+
+    fn make_cleanup_plan(
+        &self,
+        request: u64,
+        cancel: CancellationToken,
+        rule: &str,
+        kind: PlanKind,
+        cx: &mut Context<Self>,
+    ) {
+        cx.notify();
+        let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
+        let plan_request = CleanupRequest {
+            rule: rule.to_owned(),
+            kind,
+            options: self.cleanup_book.options(rule),
+            cancel,
+        };
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = cx
+                .background_spawn(async move { port.prepare_cleanup(&plan_request) })
+                .await;
+            if this
+                .update(cx, |model, cx| {
+                    let draft: CleanupDraft = match result {
+                        Ok(proposal) => CleanupDraft::Ready(Arc::new(proposal)),
+                        Err(state) => CleanupDraft::Failed(state),
+                    };
+                    if model.cleanup_book.finish(request, draft) {
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                tracing::debug!("the model closed before the plan was made");
+            }
+        })
+        .detach();
+    }
+
+    /// Closes the plan dialog. Its plan is not recorded.
+    pub fn close_cleanup(&mut self, cx: &mut Context<Self>) {
+        self.cleanup_book.close();
         cx.notify();
     }
 
@@ -831,6 +997,10 @@ impl AppModel {
                         model.mark_stale();
                         if let Some(root) = model.pending_scan.take() {
                             model.start_scan(&root, cx);
+                        }
+                        if model.inspection == Inspection::Waiting {
+                            model.inspection = Inspection::Idle;
+                            model.inspect_cleanup(cx);
                         }
                         cx.notify();
                     })

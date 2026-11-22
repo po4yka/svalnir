@@ -9,6 +9,13 @@
 //!
 //! No function here admits a plan, executes a step, or takes the
 //! coordinator lock. The coordinator of the agent decides each request.
+//!
+//! [`cleanup`] has the rule checks, the discoveries, the inspections, and
+//! the plan builder calls of the manual cleanup plans that the clients
+//! share.
+
+#[cfg(unix)]
+pub mod cleanup;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

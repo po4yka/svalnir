@@ -3,6 +3,7 @@
 pub mod agent_state;
 pub mod applications;
 pub mod automation;
+pub mod cleanup;
 pub mod common;
 pub mod controls;
 pub mod diagnostics;

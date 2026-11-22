@@ -15,28 +15,22 @@
 //! with `rule_mode_not_validated` before it reads a file.
 
 use serde::Serialize;
-use svalnir_agent::executor::owner::ScopeLimits;
+use svalnir_agent::client::cleanup::{self, ManualPlanInputs, RuleSelectionError};
 use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::protection::ProtectedLocations;
-use svalnir_agent::rules::caches::{InspectionHost, RootOutcome};
+use svalnir_agent::rules::caches::RootOutcome;
 use svalnir_agent::rules::producers::{
-    GuardOutcome, MAX_PRODUCER_EXECUTABLE_BYTES, OWNER_SCOPE_UNMARKED, ProducerBindError,
-    ProducerBindRequest, ProducerBinding, ProducerRule, guard_code,
+    GuardOutcome, OWNER_SCOPE_UNMARKED, ProducerBindError, ProducerBindRequest, ProducerBinding,
+    ProducerRule, guard_code,
 };
 use svalnir_agent::rules::{DiscoveryHost, ReviewedRules};
 use svalnir_agent::scan::{CancellationToken, WallScanClock};
 use svalnir_core::action::{EnvironmentEntry, OwnerOperationKind};
-use svalnir_core::authority::AuthorityBinding;
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::id::PolicyRevisionId;
-use svalnir_core::id::{PlanId, StepId, TargetId};
-use svalnir_core::plan::{
-    OwnerPlanRequest, PlanBuildError, PlanContext, PlanMode, PlanOutcome, PlanPreview,
-    build_owner_plan, explain, manual_plan_lifetime,
-};
+use svalnir_core::plan::{PlanMode, PlanOutcome, PlanPreview, explain};
 use svalnir_core::quantity::Nanoseconds;
-use svalnir_core::rule::{RuleMode, RuleRegistry as _};
 
 use super::clean::{self, PlanView};
 use super::plan_store::RootRecord;
@@ -132,51 +126,37 @@ fn rule_error(code: &'static str, message: &'static str) -> ErrorBody {
 
 /// The rule `name` of the registry with an owner operation whose layout of
 /// the scope root is validated for manual action, and whose kind the
-/// request permits.
+/// request permits. The checks are the shared ones of
+/// [`cleanup::owner_rule`]; this function gives their messages.
 fn selected_rule<'a>(
     registry: &'a ReviewedRules,
     name: &str,
     include_clear: bool,
 ) -> Result<&'a ProducerRule, ErrorBody> {
-    let Some(rule) = registry.producer(name) else {
-        let known: bool = registry
-            .rules()
-            .iter()
-            .any(|rule| rule.reference.id.as_str() == name);
-        return Err(if known {
-            rule_error(
-                "owner_operation_not_available",
-                "the rule has no owner operation in this build; the command made no change",
-            )
-        } else {
-            rule_error(
-                "unknown_rule",
-                "the rule registry of this build has no rule with this ID; the command made no change",
-            )
-        });
-    };
-    let validated: bool = rule
-        .layout()
-        .is_some_and(|layout| layout.permits(&RuleMode::ManualEviction));
-    if !validated {
-        return Err(ErrorBody::new(
+    cleanup::owner_rule(registry, name, include_clear).map_err(|error| match error {
+        RuleSelectionError::OwnerOperationNotAvailable => rule_error(
+            "owner_operation_not_available",
+            "the rule has no owner operation in this build; the command made no change",
+        ),
+        RuleSelectionError::UnknownRule => rule_error(
+            "unknown_rule",
+            "the rule registry of this build has no rule with this ID; the command made no change",
+        ),
+        RuleSelectionError::ModeNotValidated => ErrorBody::new(
             "rule_mode_not_validated",
             ErrorFamily::Eligibility,
             ErrorStage::Admission,
             "the rule has no recorded validation for its owner operation, so the `owner` mode is not permitted for it; the command made no change",
         )
-        .with_fields(&["rule", "mode"]));
-    }
-    if matches!(rule.spec().kind, OwnerOperationKind::Clear) && !include_clear {
-        return Err(ErrorBody::new(
+        .with_fields(&["rule", "mode"]),
+        RuleSelectionError::ClearNotIncluded => ErrorBody::new(
             "clear_not_included",
             ErrorFamily::Request,
             ErrorStage::Arguments,
             "the owner command of this rule has the kind `clear`: the producer removes its cache, also data that a project uses now; add `--include-clear` to plan it; the command made no change",
         )
-        .with_fields(&["rule", "include_clear"]));
-    }
-    Ok(rule)
+        .with_fields(&["rule", "include_clear"]),
+    })
 }
 
 /// The error of a rule that gives no binding.
@@ -324,14 +304,14 @@ fn interrupted_view(kind: OwnerOperationKind, now: &Now) -> PlanView {
 /// The inputs of the plan builder beside the binding.
 struct PlanInputs<'a> {
     plan_text: &'a str,
-    plan_id: &'a PlanId,
     policy_revision: &'a PolicyRevisionId,
     config: &'a ValidatedConfig,
     now: &'a Now,
     locations: &'a ProtectedLocations,
 }
 
-/// The manual plan of the binding `bound`.
+/// The manual plan of the binding `bound`
+/// ([`cleanup::build_owner_operation_plan`]).
 ///
 /// # Errors
 ///
@@ -345,39 +325,22 @@ fn build_outcome(
         .locations
         .home_directory()
         .and_then(|home| LosslessPath::from_path(home).ok());
-    let lifetime: Nanoseconds = manual_plan_lifetime(inputs.config)
-        .ok_or_else(|| clean::plan_error(&PlanBuildError::Lifetime))?;
-    let context = PlanContext {
-        plan_id: inputs.plan_id.clone(),
-        principal: session::principal(),
-        // A manual plan has no action grant: its authority is the approval
-        // that is bound to the plan.
-        authority: AuthorityBinding {
-            policy_revision: inputs.policy_revision.clone(),
-            action_grants: Vec::new(),
-            privilege_grant: None,
-        },
-        clock: &inputs.now.clock,
-        created_wall: inputs.now.wall,
-        lifetime,
-        protections: inputs.config.protections(),
-        home_directory: home.as_ref(),
-    };
-    let plan_text: &str = inputs.plan_text;
-    build_owner_plan(
-        &context,
-        &OwnerPlanRequest {
-            target_id: TargetId::new(format!("{plan_text}-t0000"))
-                .map_err(|_| session::identity_error())?,
-            step_id: StepId::new(format!("{plan_text}-s0000"))
-                .map_err(|_| session::identity_error())?,
-            binding: &bound.binding,
-            rule: registry.lookup(&bound.binding.rule),
-            protection: inputs.locations.of_text(&bound.root.binding.path),
-            verification_window: clean::VERIFICATION_WINDOW,
+    let principal = session::principal();
+    cleanup::build_owner_operation_plan(
+        registry,
+        bound,
+        inputs.locations,
+        &ManualPlanInputs {
+            plan_text: inputs.plan_text,
+            principal: &principal,
+            policy_revision: inputs.policy_revision,
+            config: inputs.config,
+            clock: &inputs.now.clock,
+            created_wall: inputs.now.wall,
+            home_directory: home.as_ref(),
         },
     )
-    .map_err(|error| clean::plan_error(&error))
+    .map_err(|error| super::evict::manual_plan_error(&error))
 }
 
 pub(crate) fn plan(
@@ -421,16 +384,12 @@ pub(crate) fn plan(
     let principal = session::current_uid();
     let discovery_host: DiscoveryHost =
         DiscoveryHost::manual(principal, locations.clone(), &config);
-    let request = ProducerBindRequest {
-        host: InspectionHost {
-            principal,
-            locations: &locations,
-            user_exclusions: &discovery_host.user_exclusions,
-        },
-        include_clear: arguments.include_clear,
-        max_executable_bytes: MAX_PRODUCER_EXECUTABLE_BYTES,
-        scope_limits: ScopeLimits::default(),
-    };
+    let request = cleanup::owner_bind_request(
+        principal,
+        &locations,
+        &discovery_host.user_exclusions,
+        arguments.include_clear,
+    );
     let result: Result<ProducerBinding, ProducerBindError> = bind(rule, &request, environment);
     if environment.interrupt.is_requested() {
         let view: PlanView = interrupted_view(rule.spec().kind, &now);
@@ -439,13 +398,11 @@ pub(crate) fn plan(
     }
     let bound: ProducerBinding = result.map_err(|error| bind_error(&error))?;
     let plan_text: String = session::new_id("plan");
-    let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
     let outcome: PlanOutcome = build_outcome(
         &registry,
         &bound,
         &PlanInputs {
             plan_text: &plan_text,
-            plan_id: &plan_id,
             policy_revision: &active.revision.revision_id,
             config: &config,
             now: &now,

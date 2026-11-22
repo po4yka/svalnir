@@ -3,6 +3,8 @@
 
 use super::{
     Action, ActionPort, ActionState, AuthorityPath, StopProposal, StopTarget, Unavailable,
+    cleanup::{CleanupProposal, CleanupRequest, CleanupSnapshot},
+    fixture_cleanup,
 };
 use crate::data::{
     DataSource as _,
@@ -128,6 +130,16 @@ impl ActionPort for FixturePort {
             }
             ActionScript::Unavailable => ActionState::Unavailable(Unavailable::NoAgent),
             ActionScript::Pending => match action {
+                Action::Clean { proposal } => ActionState::AwaitingAdmission {
+                    request: "gui-request-fixture".to_owned(),
+                    since: Instant::now(),
+                    until: Instant::now()
+                        + proposal
+                            .expires_at
+                            .duration_since(SystemTime::now())
+                            .unwrap_or_default()
+                        + super::ADMISSION_GRACE,
+                },
                 Action::Stop { proposal, .. } => ActionState::AwaitingAdmission {
                     request: "gui-request-fixture".to_owned(),
                     since: Instant::now(),
@@ -143,6 +155,10 @@ impl ActionPort for FixturePort {
             ActionScript::Accept => match action {
                 Action::Stop { .. } => ActionState::WaitingForExit {
                     operation: "op-fixture-stop".to_owned(),
+                    since: Instant::now(),
+                },
+                Action::Clean { .. } => ActionState::Running {
+                    operation: "op-fixture-clean".to_owned(),
                     since: Instant::now(),
                 },
                 _ if is_authority(action) => AuthorityPath::Agent.annotate(accepted(action), true),
@@ -219,6 +235,19 @@ impl ActionPort for FixturePort {
 
     fn admission_state(&self, _request: &str) -> Option<ActionState> {
         None
+    }
+
+    fn inspect_rules(&self) -> Result<CleanupSnapshot, String> {
+        match self.scenario {
+            FixtureScenario::Unavailable => {
+                Err("The rule registry of this fixture cannot be read.".to_owned())
+            }
+            _ => Ok(fixture_cleanup::snapshot()),
+        }
+    }
+
+    fn prepare_cleanup(&self, request: &CleanupRequest) -> Result<CleanupProposal, ActionState> {
+        fixture_cleanup::proposal(request, self.script != ActionScript::Unavailable)
     }
 }
 

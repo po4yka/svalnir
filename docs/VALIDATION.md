@@ -363,10 +363,10 @@ A promotion record is a case record of section 12 with `validation_id: VAL-05` a
 
 ```yaml
 rule_id: xcode.inactive-derived-data
-rule_revision: r1
+rule_revision: r2
 layout: derived-data-project-v1
 lifecycle_target: automatic_eviction_validated
-record_id: VAL-05/xcode.inactive-derived-data/r1/derived-data-project-v1/automatic
+record_id: VAL-05/xcode.inactive-derived-data/r2/derived-data-project-v1/automatic
 producer_versions: []
 host_versions: []
 filesystems: []
@@ -390,7 +390,7 @@ owner_approval: null
 | `open_points_closed` | Each open point of the rule documentation that the record decides |
 | `owner_approval` | The name of the owner and the date. A record with no approval promotes nothing |
 
-The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names. [validation/README.md](validation/README.md) has the owner checklist of the host procedure below, and [validation/xcode.inactive-derived-data-r1.md](validation/xcode.inactive-derived-data-r1.md) is an empty record; neither is a record of a run.
+The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names. [validation/README.md](validation/README.md) has the owner checklist of the host procedure below, and [validation/xcode.inactive-derived-data-r2.md](validation/xcode.inactive-derived-data-r2.md) is an empty record; neither is a record of a run.
 
 ### Stages and the build of the run
 
@@ -447,6 +447,10 @@ Only the project owner starts this procedure, on a host that the owner selects. 
 18. Apply of a plan with no change: `svalnir clean apply --plan PLAN_ID`, then `svalnir history --format json`. Expected: each unit is removed, `permanently_removed` has the count, `moved_to_trash` is 0, and `Logs`, `info.plist`, and the sources stay.
 19. Regeneration: build and test each project again with each Xcode version. Expected: each succeeds with no manual step. Record the time of the first build and of the indexing: this is the rebuild cost of the declaration.
 
+**Orphan layout (`manual_action_validated` only)**
+
+The layout `derived-data-orphan-v1` has its own record (record identity `VAL-05/xcode.inactive-derived-data/r2/derived-data-orphan-v1/manual`; the layout has no automatic stage). Build one project, then move its source folder to the Trash and empty it; build a second project from an external disk, then eject the disk; make a third orphan whose `SourcePackages/checkouts` has a checkout with an edit. Make a plan. Expected: one target, the project directory of the first project; the second project directory has no orphan unit; the third is skipped with `nested_repository`; the units of `derived-data-project-v1` of the three projects are skipped with `not_regenerable` or `regenerability_unknown`. Make a plan again, connect the disk of the second project, restore the first project from a copy, and apply. Expected: the target is skipped with `workspace_present`, and its files stay.
+
 **Automatic eviction (`automatic_eviction_validated`)**
 
 20. Read the available capacity of the data volume with `svalnir status --format json`. Write a configuration with the disk guard enabled, `volumes = ["startup-data"]`, `approved_rules = ["xcode.inactive-derived-data"]`, `warn_below` 10 GiB above the available capacity, `reclaim_below` 5 GiB below it, and the other thresholds in the relation that [POLICY_SPEC.md](POLICY_SPEC.md) section 3 gives. Apply it, and run `svalnir policy enable disk-guard --accept-permanent-eviction`.
@@ -491,6 +495,38 @@ The rule has no automatic mode, so the last stage of a record is `manual_action_
 **Not in this procedure**
 
 The procedure makes no automatic operation: the rule has none. A layout, a tool version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
+
+### Host procedure for the clear rules
+
+The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules") have no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/RULE/r1/LAYOUT/manual`, one record for each rule). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects. The procedure removes the caches of that account, so the account must have no work that needs them offline. A rule whose producer is not installed on the host is `not_run`.
+
+**Preparation**
+
+1. Log in as the validation user. Record `sw_vers`, `diskutil info /System/Volumes/Data`, `git rev-parse HEAD`, and the version of each producer under test (`cargo --version`, `gradle --version`, `mvn --version`, `ruby --version` and `gem --version`, `deno --version`, `dotnet --version`, `swift --version`, `zig version`, `mix hex.info`, `rebar3 version`, `bun --version`).
+2. On a branch, set the lifecycle state of the layouts under validation in `crates/svalnir-agent/src/rules/clear/mod.rs` to `manual_action_validated`, with the `record_id` as the reference. Run `scripts/check.sh`, record its exit status, and build with `cargo build --release --locked`.
+3. `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`, then `svalnir config apply --config ./config.toml --expected-revision none` with `schema_version = 1`.
+4. For each producer, make a disposable project below `~/Validation` and run its fetch or build command (for example `cargo fetch`, `gradle build`, `mvn package`, `bundle install`, `deno cache`, `dotnet restore`, `swift package resolve`, `zig build`, `mix deps.get`, `rebar3 get-deps`, `bun install`) so that the producer fills its cache. Record each cache root that the producer reports (`gem env gemdir`, `deno info --json`, `dotnet nuget locals all --list`, `zig env`) and compare it with the root of the rule.
+5. Make the guard fixtures: a Git checkout in `~/.cargo/git/checkouts` with an edit; `mvn install` of one project, so that `maven-metadata-local.xml` is in the local repository; a Gemfile with a Git source, so that `cache/bundler/git` has a clone; a script that writes localStorage, so that the Deno directory has `location_data`; a driver `.jar` and `.pom` copied by hand into `~/.m2/repository`; a package restored from a local folder feed of NuGet; and, for `maven.repository`, a second run with `localRepository` in `~/.m2/settings.xml`.
+
+**Inspection**
+
+6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: `resolved_roots` has the root of step 4; each unit has a size; the units of step 5 are not eligible (`protected_data` for `bundler`, for the artifact directory of the local install and of the hand-copied driver, and for the package of the local feed, `nested_repository` for `repositories` of SwiftPM); the other artifacts of the group of the local install are units. Keep the output.
+
+**Consent and activity**
+
+7. `svalnir clean plan --mode evict --rule RULE --format json` with no `--include-clear`. Expected: `clear_not_included`, exit `2`, and no plan.
+8. With a build of the producer in progress, make a plan with `--include-clear`. Expected: each unit is blocked with `active_producer`.
+
+**Manual eviction**
+
+9. Make a plan with `--include-clear`. Expected: one target for each unit that each check accepts, the cleanup root of step 4, `discovery.complete` true, and no target for a unit of step 5.
+10. Check before a step: make a plan of `maven.repository`, then run `mvn install` of a project whose artifact directory is a target; `svalnir clean apply --plan PLAN_ID`. Expected: that target is skipped with `protected_child`, and its files stay; each other target is removed.
+11. `svalnir history --format json`. Expected: `permanently_removed` has the count. The root directory of each rule, `~/.cargo/git`, `~/.cargo/bin`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `location_data`, and `deno_history.txt` stay.
+12. Regeneration: run the fetch or build command of each project of step 4 again. Expected: each succeeds with a network and no manual step. Record the time and the downloaded bytes: this is the rebuild cost of the rule. Record the result of an offline build (`cargo build --offline`, `mvn -o package`), which is expected to fail for a removed item.
+
+**Not in this procedure**
+
+The procedure makes no automatic operation: a clear rule has none. A root that an environment variable moves is not covered by the rule, and the procedure does not set one. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
 
 ## 14. Host validation records
 

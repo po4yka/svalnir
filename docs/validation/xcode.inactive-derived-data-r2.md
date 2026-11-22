@@ -1,4 +1,4 @@
-# Promotion record: `xcode.inactive-derived-data` r1
+# Promotion record: `xcode.inactive-derived-data` r2
 
 **Status:** Empty template. No promotion record exists. The host procedure of [VALIDATION.md](../VALIDATION.md#13-rule-promotion-record-and-host-procedure) section 13 did not run, each field below is empty, and `owner_approval` is `null`, so this file promotes nothing. The layout `derived-data-project-v1` stays `proposed`.
 
@@ -26,10 +26,10 @@ limitations: []
 reviewer: null
 run_started_at: null
 rule_id: xcode.inactive-derived-data
-rule_revision: r1
+rule_revision: r2
 layout: derived-data-project-v1
 lifecycle_target: automatic_eviction_validated
-record_id: VAL-05/xcode.inactive-derived-data/r1/derived-data-project-v1/automatic
+record_id: VAL-05/xcode.inactive-derived-data/r2/derived-data-project-v1/automatic
 producer_versions: []
 host_versions: []
 filesystems: []

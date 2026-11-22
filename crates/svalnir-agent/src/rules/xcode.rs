@@ -2,8 +2,11 @@
 //!
 //! `docs/CLEANUP_RULES.md` section 11 owns the contract. The rule finds a
 //! fixed generated subset of one identified project directory of a
-//! `DerivedData` root. It removes nothing, and it never selects the root or
-//! a full project directory.
+//! `DerivedData` root. It removes nothing, and it never selects the root.
+//! It selects a full project directory only for the layout
+//! [`XCODE_ORPHAN_LAYOUT`], when the project of `WorkspacePath` is gone
+//! (section 11, "Orphan project directories"); that layout is for a manual
+//! eviction only.
 //!
 //! # Identification
 //!
@@ -98,11 +101,21 @@ use crate::scan::EntryKind;
 /// The identity of the rule.
 pub const XCODE_DERIVED_DATA_RULE_ID: &str = "xcode.inactive-derived-data";
 
-/// The implementation revision of the rule in this build.
-pub const XCODE_DERIVED_DATA_REVISION: &str = "r1";
+/// The implementation revision of the rule in this build. Revision `r2`
+/// adds the layout [`XCODE_ORPHAN_LAYOUT`].
+pub const XCODE_DERIVED_DATA_REVISION: &str = "r2";
 
-/// The one layout that the revision supports.
+/// The layout of the generated subset of a project directory whose project
+/// is present.
 pub const XCODE_DERIVED_DATA_LAYOUT: &str = "derived-data-project-v1";
+
+/// The layout of a whole project directory whose project is gone: the
+/// `WorkspacePath` of its `info.plist` names a path that does not exist on
+/// a mounted volume. The layout is for a manual eviction only: no
+/// lifecycle state, also a fixture state, permits an automatic eviction
+/// of it, and the discovery for an automatic eviction gives none of its
+/// units.
+pub const XCODE_ORPHAN_LAYOUT: &str = "derived-data-orphan-v1";
 
 /// The units of one project directory, relative to it.
 pub const UNIT_PATHS: [&str; 3] = [
@@ -303,10 +316,16 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
             producer: "xcode".to_owned(),
             attribution: OwnerAttribution::ProducerIndex,
         },
-        layouts: vec![LayoutSupport {
-            layout: XCODE_DERIVED_DATA_LAYOUT.to_owned(),
-            lifecycle: LifecycleState::Proposed,
-        }],
+        layouts: vec![
+            LayoutSupport {
+                layout: XCODE_DERIVED_DATA_LAYOUT.to_owned(),
+                lifecycle: LifecycleState::Proposed,
+            },
+            LayoutSupport {
+                layout: XCODE_ORPHAN_LAYOUT.to_owned(),
+                lifecycle: LifecycleState::Proposed,
+            },
+        ],
         roots: vec![ApprovedRoot {
             base: RootBase::ProducerConfiguration,
             relative: path("Library/Developer/Xcode/DerivedData")?,
@@ -420,6 +439,22 @@ fn is_known_child(unit: &Path, name: &str, kind: EntryKind) -> bool {
 /// then compared with a deny-list of names. A name is a rejection hint
 /// only: an entry with no such name is not shown to be disposable.
 fn classify_entry(unit: &Path, relative: &Path, kind: EntryKind) -> Option<SkipReason> {
+    if let Some(reason) = deny_listed(unit, relative) {
+        return Some(reason);
+    }
+    // A child of the unit, which is a path of one component.
+    let is_child: bool = relative.parent() == Some(Path::new(""));
+    let is_known: bool = relative
+        .to_str()
+        .is_some_and(|child| is_known_child(unit, child, kind));
+    (is_child && !is_known).then_some(SkipReason::UnsupportedLayout)
+}
+
+/// The reason of the deny-list of names for an entry at `relative` below
+/// the unit `unit` (an empty path for a whole project directory), at each
+/// depth: a debug-symbol bundle, an archive, a test result bundle, signing
+/// material, an installer, or a database that is not a build database.
+fn deny_listed(unit: &Path, relative: &Path) -> Option<SkipReason> {
     const PRESERVED_SUFFIXES: [&str; 17] = [
         ".dsym",
         ".xcarchive",
@@ -462,15 +497,7 @@ fn classify_entry(unit: &Path, relative: &Path, kind: EntryKind) -> Option<SkipR
     let is_preserved: bool = has_suffix(&PRESERVED_SUFFIXES)
         || name == "archiveintermediates"
         || (has_suffix(&DATABASE_SUFFIXES) && !is_build_database(unit, relative));
-    if is_preserved {
-        return Some(SkipReason::ProtectedData);
-    }
-    // A child of the unit, which is a path of one component.
-    let is_child: bool = relative.parent() == Some(Path::new(""));
-    let is_known: bool = relative
-        .to_str()
-        .is_some_and(|child| is_known_child(unit, child, kind));
-    (is_child && !is_known).then_some(SkipReason::UnsupportedLayout)
+    is_preserved.then_some(SkipReason::ProtectedData)
 }
 
 /// The lock state of the build databases of one project directory.
@@ -501,6 +528,59 @@ struct Project {
     /// `None`: the path has a symbolic link, so its text does not show
     /// the location of the project.
     overlaps_source: Option<bool>,
+    /// Whether the project of `WorkspacePath` is gone, for the layout
+    /// [`XCODE_ORPHAN_LAYOUT`].
+    gone: WorkspaceGone,
+}
+
+/// Whether the project that `WorkspacePath` names is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceGone {
+    /// The path is a plain absolute path on a local filesystem, each
+    /// component up to a missing one is a directory with no symbolic link,
+    /// and the path is not on a volume of `/Volumes` that is not mounted.
+    Gone,
+    /// The project is present.
+    Present,
+    /// The rule cannot show that the project is gone: the path is on a
+    /// volume of `/Volumes` that is not mounted, on a filesystem that is not
+    /// local, has a symbolic link, or cannot be examined.
+    Unknown,
+}
+
+/// Whether `path` is below `/Volumes/NAME` and no mount of `mounts` has the
+/// mount point `/Volumes/NAME`: the volume of an external or a network disk
+/// that is not connected. A path on such a volume is not gone.
+pub(super) fn is_on_unmounted_volume(path: &Path, mounts: &MountTable) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut components = path.components();
+    let (Some(std::path::Component::RootDir), Some(volumes), Some(name)) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    if volumes.as_os_str() != "Volumes" {
+        return false;
+    }
+    let mut point: Vec<u8> = b"/Volumes/".to_vec();
+    point.extend_from_slice(name.as_os_str().as_bytes());
+    !mounts
+        .mounts()
+        .iter()
+        .any(|mount| mount.mount_point.as_slice() == point.as_slice())
+}
+
+/// Whether the project at `workspace`, a `WorkspacePath`, is gone.
+pub(super) fn workspace_gone(workspace: &Path, mounts: &MountTable) -> WorkspaceGone {
+    if !is_plain_absolute(workspace) || is_on_unmounted_volume(workspace, mounts) {
+        return WorkspaceGone::Unknown;
+    }
+    match walk_local(workspace, mounts) {
+        Err(WalkStop::Absent) => WorkspaceGone::Gone,
+        Ok(_) => WorkspaceGone::Present,
+        Err(_) => WorkspaceGone::Unknown,
+    }
 }
 
 /// The assessment of one unit, or the bound that stopped it.
@@ -536,10 +616,24 @@ impl XcodeDerivedDataRule {
 
     /// The rule with `lifecycle` for each layout. Only a test build has
     /// this function ([`super::ReviewedRules::with_fixture_lifecycle`]).
+    /// The layout [`XCODE_ORPHAN_LAYOUT`] gets at most
+    /// [`LifecycleState::ManualActionValidated`]: it has no automatic mode.
     #[cfg(any(test, all(feature = "test-support", debug_assertions)))]
     pub(super) fn with_lifecycle(self, lifecycle: &LifecycleState) -> Result<Self, RegistryError> {
+        let rule: Rule = super::registry::with_lifecycle(&self.rule, lifecycle)?;
+        let mut declaration: RuleDeclaration = (*rule).clone();
+        for layout in &mut declaration.layouts {
+            if layout.layout != XCODE_ORPHAN_LAYOUT {
+                continue;
+            }
+            if let LifecycleState::AutomaticEvictionValidated { evidence } = &layout.lifecycle {
+                layout.lifecycle = LifecycleState::ManualActionValidated {
+                    evidence: evidence.clone(),
+                };
+            }
+        }
         Ok(Self {
-            rule: super::registry::with_lifecycle(&self.rule, lifecycle)?,
+            rule: Checked::new(declaration).map_err(RegistryError::Incomplete)?,
             ..self
         })
     }
@@ -652,6 +746,20 @@ impl UnitContext<'_> {
                     Outcome::Stopped(stopped) => return Ok(stopped),
                 }
             }
+            // A project directory whose project is gone is also one unit of
+            // the layout of an orphan.
+            if project.gone == WorkspaceGone::Gone {
+                if !collector.has_candidate_room() {
+                    return Ok(DiscoveryCompletion::CandidateLimitReached);
+                }
+                match self.assess_orphan(&project, collector)? {
+                    Outcome::Assessed(assessment) => {
+                        collector.add(&self.rule.rule, self.root, *assessment)?;
+                    }
+                    Outcome::Absent => {}
+                    Outcome::Stopped(stopped) => return Ok(stopped),
+                }
+            }
         }
         Ok(DiscoveryCompletion::Finished)
     }
@@ -748,6 +856,7 @@ impl UnitContext<'_> {
             Err((fact, reason)) => return reject(skip, fact, reason),
         };
         let (regenerable, overlaps_source) = self.workspace_state(&info.workspace_path);
+        let gone: WorkspaceGone = workspace_gone(&info.workspace_path, self.mounts);
         Ok(Project {
             relative: skip.relative,
             snapshot,
@@ -756,6 +865,7 @@ impl UnitContext<'_> {
             info_snapshot,
             regenerable,
             overlaps_source,
+            gone,
         })
     }
 
@@ -1109,6 +1219,155 @@ impl UnitContext<'_> {
         Ok(Outcome::Assessed(Box::new(assessment)))
     }
 
+    /// Assesses the whole project directory of `project`, whose project is
+    /// gone, as one unit of the layout [`XCODE_ORPHAN_LAYOUT`].
+    ///
+    /// The data of a project that no longer exists has no use, so predicate
+    /// 4 is satisfied by the absence of the project, which the rule
+    /// examined ([`workspace_gone`]). The measurement refuses a unit with a
+    /// Git repository at any depth, also a checkout of Swift Package
+    /// Manager in `SourcePackages/checkouts`, because the filesystem
+    /// executor of an eviction refuses each repository: a checkout with an
+    /// edit or a local commit thus stays. The deny-list of the rule applies
+    /// at each depth; the allow-list of the children of a unit does not.
+    fn assess_orphan(
+        &mut self,
+        project: &Project,
+        collector: &mut Collector<'_>,
+    ) -> Result<Outcome, DiscoveryError> {
+        let relative: PathBuf = project.relative.clone();
+        let path: PathBuf = self.root.path.join(&relative);
+        let before: ObjectSnapshot = project.snapshot;
+        let mut assessment: Assessment = Assessment::new(relative);
+        assessment.layout = Some(XCODE_ORPHAN_LAYOUT);
+        assessment.eligibility.rule_supports_layout = Fact::Satisfied;
+        assessment.evidence = target_evidence(&assessment.relative, &before);
+        if before.owner != self.scope.principal || before.object.device != self.root.device() {
+            assessment.eligibility.identity_matches = Fact::NotSatisfied;
+            assessment.reasons.insert(SkipReason::WrongOwner);
+            return Ok(Outcome::Assessed(Box::new(assessment)));
+        }
+        assessment.eligibility.identity_matches = Fact::Satisfied;
+        assessment.eligibility.regenerable = Fact::Satisfied;
+        if self.root.is_excluded(&assessment.relative) {
+            assessment.eligibility.no_exclusion_overlap = Fact::NotSatisfied;
+            assessment.reasons.insert(SkipReason::ExclusionOverlap);
+            return Ok(Outcome::Assessed(Box::new(assessment)));
+        }
+        assessment.eligibility.no_exclusion_overlap = Fact::Satisfied;
+        let stopped: Option<DiscoveryCompletion> = establish_charge(
+            &mut assessment,
+            None,
+            &UnitUnderMeasurement {
+                path: &path,
+                before: &before,
+                principal: self.scope.principal,
+            },
+            &self.rule.rule,
+            &mut collector.bounds,
+            &mut |relative: &Path, _kind: EntryKind| deny_listed(Path::new(""), relative),
+        )?;
+        if let Some(stopped) = stopped {
+            return Ok(Outcome::Stopped(stopped));
+        }
+        if !assessment.reasons.is_empty() {
+            return Ok(Outcome::Assessed(Box::new(assessment)));
+        }
+        (self.after_measurement)(&path);
+        let processes: ProducerProcesses = self.evidence.processes_at(
+            collector.bounds.monotonic_now(),
+            self.rule.rule.activity.evidence_expiry,
+        );
+        self.assess_orphan_activity(&mut assessment, project, processes, collector.observed_at());
+        let unchanged: bool = lstat(&path).is_ok_and(|after| after == before)
+            && self
+                .read_info(&path)
+                .is_ok_and(|(_, bytes, _)| bytes == project.info_bytes)
+            && workspace_gone(&project.info.workspace_path, self.mounts) == WorkspaceGone::Gone;
+        if !unchanged {
+            assessment.eligibility.identity_matches = Fact::NotSatisfied;
+            assessment.reasons.insert(SkipReason::IdentityChanged);
+        }
+        Ok(Outcome::Assessed(Box::new(assessment)))
+    }
+
+    /// Establishes the producer processes, the lock of the build
+    /// databases, and the age of an orphan unit (predicates 5 and 6). A
+    /// project directory with no build database has no lock to examine: no
+    /// build can run for a project that is gone, so only a held lock
+    /// blocks the unit. The age is the time since the newest of
+    /// `LastAccessedDate`, the times of the project directory and of
+    /// `info.plist`, and the newest change below the unit.
+    fn assess_orphan_activity(
+        &self,
+        assessment: &mut Assessment,
+        project: &Project,
+        processes: ProducerProcesses,
+        now: Option<WallTime>,
+    ) {
+        let (lock, _) = self.build_database_state(project);
+        let times: [Option<WallTime>; 4] = [
+            Some(project.info.last_accessed),
+            project.snapshot.modified(),
+            project.info_snapshot.modified(),
+            assessment.newest_content_change,
+        ];
+        let newest: Option<WallTime> = times.into_iter().flatten().max();
+        let required: Nanoseconds = self
+            .rule
+            .rule
+            .retention
+            .minimum_age
+            .max(self.rule.rule.activity.quiescence);
+        let mut inactive_for: Option<Nanoseconds> = None;
+        let age: Fact = match (newest, now) {
+            (Some(newest), Some(now)) if newest > now => {
+                assessment.reasons.insert(SkipReason::FutureTimestamp);
+                Fact::Unknown
+            }
+            (Some(newest), Some(now)) => {
+                inactive_for = elapsed_between(newest, now);
+                if inactive_for.is_some_and(|elapsed| elapsed >= required) {
+                    Fact::Satisfied
+                } else {
+                    assessment.reasons.insert(SkipReason::RetentionNotElapsed);
+                    Fact::NotSatisfied
+                }
+            }
+            _ => {
+                assessment.reasons.insert(SkipReason::AgeUnknown);
+                Fact::Unknown
+            }
+        };
+        let is_active: bool = processes == ProducerProcesses::Running || lock == LockState::Held;
+        let is_unknown: bool = processes == ProducerProcesses::Unknown;
+        if is_active {
+            assessment.reasons.insert(SkipReason::ActiveProducer);
+        }
+        if is_unknown {
+            assessment.reasons.insert(SkipReason::ActivityUnknown);
+        }
+        assessment.eligibility.age_and_inactivity = if is_active || age == Fact::NotSatisfied {
+            Fact::NotSatisfied
+        } else if is_unknown {
+            Fact::Unknown
+        } else {
+            age
+        };
+        assessment.activity = match (
+            is_active,
+            &assessment.eligibility.age_and_inactivity,
+            inactive_for,
+        ) {
+            (true, _, _) => ActivityFact::Active,
+            (false, Fact::Satisfied, Some(inactive_for)) => ActivityFact::Inactive { inactive_for },
+            _ => ActivityFact::Unknown,
+        };
+        if !is_unknown {
+            assessment.eligibility.protocols_valid = Fact::Satisfied;
+        }
+    }
+
     /// Establishes the producer processes, the lock of the build
     /// database, and the age of a unit (predicates 5 and 6).
     fn assess_activity(
@@ -1197,6 +1456,56 @@ impl UnitContext<'_> {
         if assessment.eligibility.protocols_valid == Fact::Unknown && !is_unknown {
             assessment.eligibility.protocols_valid = Fact::Satisfied;
         }
+    }
+}
+
+/// The check of a unit of the layout [`XCODE_ORPHAN_LAYOUT`] immediately
+/// before its step: the unit at `path` is still a project directory of the
+/// root `root` with the name form of the rule, a directory of the user
+/// `principal`, with an `info.plist` whose project is still gone. A
+/// project that is present again, or a volume of `/Volumes` that is not
+/// mounted, refuses the step.
+#[must_use]
+pub(super) fn recheck_orphan(
+    principal: svalnir_core::process::Uid,
+    root: &Path,
+    path: &Path,
+) -> super::projects::UnitRecheck {
+    use super::projects::UnitRecheck;
+
+    let Ok(relative) = path.strip_prefix(root) else {
+        return UnitRecheck::Refused("unit_layout_changed");
+    };
+    if relative.components().count() != 1 || !has_project_name_form(relative) {
+        return UnitRecheck::Refused("unit_layout_changed");
+    }
+    match lstat(path) {
+        Ok(snapshot) if snapshot.kind == ObjectKind::Directory && snapshot.owner == principal => {}
+        Ok(snapshot) if snapshot.kind != ObjectKind::Directory => {
+            return UnitRecheck::Refused("unit_not_directory");
+        }
+        Ok(_) => return UnitRecheck::Refused("unit_owner"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return UnitRecheck::Absent,
+        Err(_) => return UnitRecheck::Unknown("unit_not_readable"),
+    }
+    let info: ProjectInfo =
+        match read_record(&path.join(INFO_PLIST), MAX_INFO_PLIST_BYTES, principal) {
+            RecordRead::Read { bytes, .. } => match parse_project_info(&bytes) {
+                Some(info) => info,
+                None => return UnitRecheck::Refused("unit_layout_changed"),
+            },
+            RecordRead::Absent | RecordRead::Invalid => {
+                return UnitRecheck::Refused("unit_layout_changed");
+            }
+            RecordRead::Denied => return UnitRecheck::Unknown("unit_not_readable"),
+        };
+    let Ok(mounts) = MountTable::read() else {
+        return UnitRecheck::Unknown("workspace_state_unknown");
+    };
+    match workspace_gone(&info.workspace_path, &mounts) {
+        WorkspaceGone::Gone => UnitRecheck::Passed,
+        WorkspaceGone::Present => UnitRecheck::Refused("workspace_present"),
+        WorkspaceGone::Unknown => UnitRecheck::Unknown("workspace_state_unknown"),
     }
 }
 

@@ -97,11 +97,58 @@ pub struct ExecutableBinding {
     pub mode: u32,
     /// The size of the file.
     pub size: Bytes,
+    /// The change time of the file (`st_ctimespec`).
+    pub changed_at: FileTimestamp,
+    /// The modification time of the file (`st_mtimespec`).
+    pub modified_at: FileTimestamp,
     /// The SHA-256 digest of the content of the file.
     pub digest: ContentDigest,
     /// The code-signing identity of the file, when the builder read one.
     /// This build reads none, so the value is `None`.
     pub signature: Option<String>,
+}
+
+/// A time of a file as the filesystem reports it: seconds and nanoseconds
+/// since the Unix epoch. It is compared for equality only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileTimestamp {
+    /// The seconds.
+    pub seconds: i64,
+    /// The nanoseconds, below one second.
+    pub nanoseconds: u32,
+}
+
+/// The interpreter of a script executable (owner decision D2 of
+/// 2026-11-22): the executor starts this Mach-O file with `arguments` and
+/// the path of the script, so no `#!` line is read by the kernel and no
+/// `env` searches `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterpreterBinding {
+    /// The interpreter, a canonical interpreter location of the
+    /// declaration.
+    pub executable: ExecutableBinding,
+    /// The interpreter argument of the `#!` line: none or one.
+    pub arguments: Vec<String>,
+}
+
+/// The environment names that a binding and a declaration never have:
+/// each one changes the code that a process loads.
+pub const DENIED_ENVIRONMENT_NAMES: [&str; 5] =
+    ["NODE_OPTIONS", "BASH_ENV", "ENV", "RUBYOPT", "PERL5OPT"];
+
+/// The prefixes of the environment names that a binding and a declaration
+/// never have.
+pub const DENIED_ENVIRONMENT_PREFIXES: [&str; 3] = ["DYLD_", "LD_", "PYTHON"];
+
+/// Whether `name` is an environment name that changes the code that a
+/// process loads.
+pub fn is_denied_environment(name: &str) -> bool {
+    DENIED_ENVIRONMENT_NAMES.contains(&name)
+        || DENIED_ENVIRONMENT_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 /// One entry of the environment of a command.
@@ -187,6 +234,9 @@ pub struct OwnerOperationBinding {
     pub bound: OwnerOperationBound,
     /// The executable.
     pub executable: ExecutableBinding,
+    /// The interpreter of a script executable. `None` for a Mach-O
+    /// executable.
+    pub interpreter: Option<InterpreterBinding>,
     /// The arguments after the name of the executable.
     pub arguments: Vec<String>,
     /// The only entries of the environment of the command.
@@ -382,10 +432,11 @@ pub(super) fn check_owner_binding(
             .all(|argument| is_bounded_text(argument))
         && binding.environment.len() <= MAX_OWNER_ENVIRONMENT
         && names.len() == binding.environment.len()
-        && binding
-            .environment
-            .iter()
-            .all(|entry| is_environment_name(&entry.name) && is_bounded_text(&entry.value))
+        && binding.environment.iter().all(|entry| {
+            is_environment_name(&entry.name)
+                && !is_denied_environment(&entry.name)
+                && is_bounded_text(&entry.value)
+        })
         && !binding.layout.is_empty()
         && is_bounded_text(&binding.layout)
         && !binding.expected_effect.is_empty()
@@ -408,6 +459,16 @@ pub(super) fn check_owner_binding(
         && deadline_agrees
         && charge_agrees
         && executable_is_trusted(&binding.executable, principal)
+        && binding.interpreter.as_ref().is_none_or(|interpreter| {
+            is_absolute_path(&interpreter.executable.path)
+                && executable_is_trusted(&interpreter.executable, principal)
+                && interpreter.executable.signature.is_none()
+                && interpreter.arguments.len() <= 1
+                && interpreter
+                    .arguments
+                    .iter()
+                    .all(|argument| is_bounded_text(argument))
+        })
     {
         Ok(())
     } else {

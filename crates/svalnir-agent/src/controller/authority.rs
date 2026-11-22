@@ -258,6 +258,10 @@ impl AuthoritySource for SharedAuthority {
         })
     }
 
+    fn owner_operation(&self, rule: &RuleRef) -> Option<svalnir_core::rule::owner::OwnerOperation> {
+        self.records().registry.owner_operation(rule).cloned()
+    }
+
     fn unit_use(&self, path: &std::path::Path) -> crate::rules::in_use::UnitUse {
         // The reading of the process table is outside the critical
         // section.

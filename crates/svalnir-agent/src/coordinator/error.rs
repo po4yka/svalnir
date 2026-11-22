@@ -73,6 +73,15 @@ pub mod code {
     /// The producer of the data of an eviction target is active at the
     /// fresh check before the step. The target is skipped with no call.
     pub const PRODUCER_ACTIVE: &str = "producer_active";
+    /// At admission: the owner-operation binding of a plan is not the
+    /// command of the reviewed declaration of its rule.
+    pub const OWNER_BINDING_MISMATCH: &str = "owner_binding_mismatch";
+    /// At admission: the deadline of an owner command is longer than the
+    /// time that the plan has left.
+    pub const OWNER_DEADLINE_BEYOND_PLAN: &str = "owner_deadline_beyond_plan";
+    /// An acknowledgment is refused while a process of an owner command
+    /// lives.
+    pub const OWNER_PROCESS_ALIVE: &str = "owner_process_alive";
     /// The fresh check before an eviction step gave no evidence that the
     /// producer of the data is inactive. The target is skipped with no
     /// call.

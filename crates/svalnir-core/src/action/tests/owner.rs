@@ -60,9 +60,18 @@ fn owner_binding(kind: OwnerOperationKind) -> OwnerOperationBinding {
             owner: Uid::new(501),
             mode: 0o755,
             size: Bytes::new(120),
+            changed_at: super::super::FileTimestamp {
+                seconds: 1_794_830_000,
+                nanoseconds: 5,
+            },
+            modified_at: super::super::FileTimestamp {
+                seconds: 1_794_830_000,
+                nanoseconds: 4,
+            },
             digest: ContentDigest::of_bytes(b"#!/bin/sh\nexit 0\n"),
             signature: None,
         },
+        interpreter: None,
         arguments: vec!["cache".to_owned(), "prune".to_owned()],
         environment: vec![EnvironmentEntry {
             name: "HOME".to_owned(),
@@ -79,7 +88,7 @@ fn owner_binding(kind: OwnerOperationKind) -> OwnerOperationBinding {
 fn owner_target(kind: OwnerOperationKind) -> PlanTarget {
     PlanTarget {
         target_id: target_id("owner"),
-        binding: TargetBinding::OwnerOperation(owner_binding(kind)),
+        binding: TargetBinding::OwnerOperation(Box::new(owner_binding(kind))),
     }
 }
 
@@ -221,6 +230,39 @@ fn an_owner_operation_plan_that_does_not_agree_with_itself_is_rejected() {
             Box::new(|c| {
                 let again = owner_of(c).environment[0].clone();
                 owner_of(c).environment.push(again);
+            }),
+            PlanError::Binding,
+        ),
+        (
+            "environment that changes the loaded code",
+            Box::new(|c| owner_of(c).environment[0].name = "DYLD_INSERT_LIBRARIES".to_owned()),
+            PlanError::Binding,
+        ),
+        (
+            "environment of an interpreter option",
+            Box::new(|c| owner_of(c).environment[0].name = "NODE_OPTIONS".to_owned()),
+            PlanError::Binding,
+        ),
+        (
+            "interpreter with two arguments",
+            Box::new(|c| {
+                let executable = owner_of(c).executable.clone();
+                owner_of(c).interpreter = Some(super::super::InterpreterBinding {
+                    executable,
+                    arguments: vec!["-e".to_owned(), "-x".to_owned()],
+                });
+            }),
+            PlanError::Binding,
+        ),
+        (
+            "interpreter that the group can change",
+            Box::new(|c| {
+                let mut executable = owner_of(c).executable.clone();
+                executable.mode = 0o775;
+                owner_of(c).interpreter = Some(super::super::InterpreterBinding {
+                    executable,
+                    arguments: Vec::new(),
+                });
             }),
             PlanError::Binding,
         ),

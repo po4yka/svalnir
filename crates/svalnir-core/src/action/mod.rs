@@ -59,10 +59,11 @@ pub use outcome::{
     aggregate_step,
 };
 pub use owner::{
-    EnvironmentEntry, ExecutableBinding, GROUP_OR_OTHER_WRITE, MAX_OWNER_ARGUMENTS,
+    DENIED_ENVIRONMENT_NAMES, DENIED_ENVIRONMENT_PREFIXES, EnvironmentEntry, ExecutableBinding,
+    FileTimestamp, GROUP_OR_OTHER_WRITE, InterpreterBinding, MAX_OWNER_ARGUMENTS,
     MAX_OWNER_DEADLINE, MAX_OWNER_ENVIRONMENT, MAX_OWNER_TEXT_BYTES, OwnerOperationBinding,
     OwnerOperationBound, OwnerOperationKind, ScopeAllocationEffect, ScopeAllocationError,
-    ScopeMeasurement, executable_is_trusted, is_environment_name,
+    ScopeMeasurement, executable_is_trusted, is_denied_environment, is_environment_name,
 };
 pub use plan::{
     ApplicationBinding, CandidateBindingError, ClientRole, Escalation, ExecutorRole, FileBinding,

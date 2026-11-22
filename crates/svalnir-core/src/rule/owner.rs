@@ -7,7 +7,7 @@
 //! supplies no part of it: the executable is a fixed list of paths, and
 //! each argument and each environment value is literal text or a typed
 //! parameter of this module. The plan builder resolves the parameters and
-//! seals the result in an [`OwnerOperationBinding`](crate::action::OwnerOperationBinding).
+//! seals the result in an [`OwnerOperationBinding`].
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,7 +16,8 @@ use super::RuleRef;
 use crate::action::Checked;
 use crate::action::{
     Check, EnvironmentEntry, MAX_OWNER_ARGUMENTS, MAX_OWNER_DEADLINE, MAX_OWNER_ENVIRONMENT,
-    MAX_OWNER_TEXT_BYTES, OwnerOperationBound, OwnerOperationKind, is_environment_name,
+    MAX_OWNER_TEXT_BYTES, OwnerOperationBinding, OwnerOperationBound, OwnerOperationKind,
+    is_denied_environment, is_environment_name,
 };
 use crate::file::LosslessPath;
 use crate::quantity::Nanoseconds;
@@ -94,6 +95,10 @@ pub struct OwnerOperationDeclaration {
     /// The paths of the executable, in the sequence in which the plan
     /// builder examines them.
     pub executables: Vec<ExecutableLocation>,
+    /// The paths of the interpreters that a script executable can name in
+    /// its `#!` line (owner decision D2 of 2026-11-22). Empty for a
+    /// producer whose executable is a Mach-O file.
+    pub interpreters: Vec<ExecutableLocation>,
     /// One command for each supported kind.
     pub commands: Vec<OwnerCommand>,
     /// The only entries of the environment of a command.
@@ -121,7 +126,8 @@ pub enum OwnerDeclarationError {
     #[error("a text of the declaration is not valid")]
     Text,
     /// The environment has more entries than the limit, a name that is not
-    /// an environment name, or one name two times.
+    /// an environment name, a name that changes the code that a process
+    /// loads, or one name two times.
     #[error("the environment of the declaration is not valid")]
     Environment,
     /// The deadline is zero or longer than one hour.
@@ -155,14 +161,17 @@ impl Check for OwnerOperationDeclaration {
     type Error = OwnerDeclarationError;
 
     fn check(&self) -> Result<(), OwnerDeclarationError> {
+        let confined = |location: &ExecutableLocation| {
+            is_confined_path(
+                &location.path,
+                matches!(location.base, ExecutableBase::Absolute),
+            )
+        };
         let executables_agree: bool = !self.executables.is_empty()
             && self.executables.len() <= MAX_OWNER_EXECUTABLES
-            && self.executables.iter().all(|location| {
-                is_confined_path(
-                    &location.path,
-                    matches!(location.base, ExecutableBase::Absolute),
-                )
-            });
+            && self.interpreters.len() <= MAX_OWNER_EXECUTABLES
+            && self.executables.iter().all(confined)
+            && self.interpreters.iter().all(confined);
         if !executables_agree {
             return Err(OwnerDeclarationError::Executable);
         }
@@ -200,10 +209,9 @@ impl Check for OwnerOperationDeclaration {
         names.dedup();
         let environment_agrees: bool = self.environment.len() <= MAX_OWNER_ENVIRONMENT
             && names.len() == self.environment.len()
-            && self
-                .environment
-                .iter()
-                .all(|entry| is_environment_name(&entry.name));
+            && self.environment.iter().all(|entry| {
+                is_environment_name(&entry.name) && !is_denied_environment(&entry.name)
+            });
         if !environment_agrees {
             return Err(OwnerDeclarationError::Environment);
         }
@@ -239,6 +247,33 @@ impl OwnerOperationDeclaration {
     /// The command of `kind`, when the declaration has one.
     pub fn command(&self, kind: OwnerOperationKind) -> Option<&OwnerCommand> {
         self.commands.iter().find(|command| command.kind == kind)
+    }
+
+    /// Whether `binding` is the command that this declaration gives for its
+    /// scope root and the home directory `home_directory`: the same rule
+    /// revision, a command of its kind, the same arguments, environment,
+    /// bound, expected effect statement, and deadline, and the home
+    /// directory as its working directory. The paths of the executable
+    /// and of the interpreter need the filesystem, so the caller compares
+    /// them with the canonical locations of the declaration.
+    pub fn agrees_with(&self, binding: &OwnerOperationBinding, home_directory: &str) -> bool {
+        let Some(command) = self.command(binding.operation) else {
+            return false;
+        };
+        let Some(scope_root) = binding.root_path.as_utf8() else {
+            return false;
+        };
+        let values = ParameterValues {
+            scope_root,
+            home_directory,
+        };
+        binding.rule == self.rule
+            && binding.arguments == command.resolved_arguments(&values)
+            && binding.environment == self.resolved_environment(&values)
+            && binding.bound == command.bound
+            && binding.expected_effect == command.expected_effect
+            && binding.command_deadline == self.command_deadline
+            && binding.working_directory.as_bytes() == home_directory.as_bytes()
     }
 
     /// The environment with `values`, sorted by name.
@@ -303,7 +338,26 @@ mod tests {
                 value: ParameterPart::HomeDirectory,
             }],
             command_deadline: Nanoseconds::new(60_000_000_000),
+            interpreters: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_denied_environment_names_are_refused_in_each_declaration() {
+        for name in [
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "BASH_ENV",
+            "ENV",
+            "PYTHONSTARTUP",
+            "RUBYOPT",
+            "PERL5OPT",
+        ] {
+            assert!(crate::action::is_denied_environment(name), "{name}");
+        }
+        assert!(!crate::action::is_denied_environment("HOME"));
+        assert!(!crate::action::is_denied_environment("PATH"));
     }
 
     #[test]
@@ -387,6 +441,23 @@ mod tests {
                     d.environment.push(again);
                 }),
                 OwnerDeclarationError::Environment,
+            ),
+            (
+                Box::new(|d| d.environment[0].name = "DYLD_INSERT_LIBRARIES".to_owned()),
+                OwnerDeclarationError::Environment,
+            ),
+            (
+                Box::new(|d| d.environment[0].name = "PYTHONPATH".to_owned()),
+                OwnerDeclarationError::Environment,
+            ),
+            (
+                Box::new(|d| {
+                    d.interpreters = vec![ExecutableLocation {
+                        base: ExecutableBase::Absolute,
+                        path: LosslessPath::from_bytes(b"bin/sh".to_vec()).unwrap(),
+                    }];
+                }),
+                OwnerDeclarationError::Executable,
             ),
             (
                 Box::new(|d| d.command_deadline = Nanoseconds::ZERO),

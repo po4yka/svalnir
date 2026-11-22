@@ -561,6 +561,13 @@ pub trait RuleRegistry {
             .find(|rule| &rule.reference == reference)
     }
 
+    /// The reviewed owner-operation declaration of the exact revision
+    /// `reference` (`docs/CLEANUP_RULES.md` section 9). `None` for a rule
+    /// with no owner operation; the default has none.
+    fn owner_operation(&self, _reference: &RuleRef) -> Option<&owner::OwnerOperation> {
+        None
+    }
+
     /// The exact revision `reference`, when it can do `mode` for
     /// `layout`.
     ///

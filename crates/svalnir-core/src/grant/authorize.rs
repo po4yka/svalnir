@@ -538,7 +538,7 @@ impl StepCheck<'_> {
             TargetBinding::File(file) => {
                 let rule: &RuleRef = file.rule.as_ref().ok_or(RefusalReason::RuleNotGranted)?;
                 let approved: bool = self.active.scope.rules(PolicyId::DiskGuard).contains(rule);
-                if !approved || !grant.covers_rule(rule, now) {
+                if !approved || !grant.covers_rule(&self.step.action_class, rule, now) {
                     return Err(RefusalReason::RuleNotGranted);
                 }
                 self.check_rule_mode(rule, &RuleMode::AutomaticEviction)
@@ -549,7 +549,7 @@ impl StepCheck<'_> {
             TargetBinding::OwnerOperation(owner) => {
                 let rule: &RuleRef = &owner.rule;
                 let approved: bool = self.active.scope.rules(PolicyId::DiskGuard).contains(rule);
-                if !approved || !grant.covers_rule(rule, now) {
+                if !approved || !grant.covers_rule(&self.step.action_class, rule, now) {
                     return Err(RefusalReason::RuleNotGranted);
                 }
                 let bounded: bool = matches!(owner.operation, OwnerOperationKind::Prune)
@@ -660,7 +660,11 @@ impl StepCheck<'_> {
         }
         let grant: &ActionGrant = self.standing_grant(policy)?;
         self.check_scope(grant)?;
-        self.check_evidence()?;
+        // The trigger evidence is a condition of the start of a step and not
+        // of a command that runs (the stage `execution`).
+        if !matches!(self.request.stage, ActionStage::Execution) {
+            self.check_evidence()?;
+        }
         if matches!(
             self.request.recording,
             RecordingMode::VolatileCriticalException
@@ -710,7 +714,11 @@ fn decide(
     if plan.authority.policy_revision != active.revision.revision_id {
         return Err(RefusalReason::PolicyRevisionMismatch);
     }
-    if plan.is_expired(context.clock.clock) {
+    // The stage `execution` is the check while a command of an owner
+    // operation runs: the expiry of the plan does not stop a call that was
+    // issued (`docs/ACTION_CONTRACTS.md` section 7).
+    let running: bool = matches!(request.stage, ActionStage::Execution);
+    if !running && plan.is_expired(context.clock.clock) {
         return Err(RefusalReason::PlanExpired);
     }
     if !class.accepts_trigger(trigger) {

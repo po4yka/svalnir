@@ -12,11 +12,10 @@ use std::path::{Path, PathBuf};
 use svalnir_core::action::{
     ActionClass, ActionError, ActionStage, Attribution, CapacityEffect, Checked, Correlation,
     DispatchConsumption, DispatchReceipt, DispatchState, Durability, EffectEvidence,
-    EnvelopeContent, ErrorFamily, Escalation, EvidenceBinding, FileBinding, NativeResult,
-    Operation, OperationState, OwnerOperationBinding, PLAN_SCHEMA_VERSION, PlanTarget, PlannedStep,
-    RequestEnvelope, Reservation, ResourceEffect, StepLimits, StepState, StopReason, TargetBinding,
-    TargetEffect, TargetResult, TargetResultRecord, VolatileJournal, VolatileJournalError,
-    WorkCharge,
+    EnvelopeContent, ErrorFamily, Escalation, EvidenceBinding, NativeResult, Operation,
+    OperationState, PLAN_SCHEMA_VERSION, PlanTarget, PlannedStep, RequestEnvelope, Reservation,
+    ResourceEffect, StepLimits, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
+    TargetResultRecord, VolatileJournal, VolatileJournalError, WorkCharge,
 };
 use svalnir_core::grant::{ActionRequest, RefusalReason};
 use svalnir_core::id::{OperationId, StepId, TargetId, VolumeId};
@@ -26,19 +25,24 @@ use svalnir_core::state::PressureState;
 use svalnir_core::time::MonotonicNanos;
 
 use super::board::{Phase, StopAcknowledgement, StopView, WorkTotals};
-use super::core::{Active, Coordinator, GracefulOutcome, MAX_MEASURED_VOLUMES, Observing};
+use super::core::{
+    Active, Coordinator, GracefulOutcome, MAX_MEASURED_VOLUMES, Observing, OwnerRunning,
+};
 use super::error::{action_error, action_error_with, code};
 use super::ledger::Benefit;
 use super::ports::{CoordinatorJournal, TimeReading, TriggerStanding};
 use crate::executor::fs::{
     AdmittedStep, ExecutionFault, FsTargetOutcome, ProcessedWork, StepOutcome, Stop,
 };
-use crate::executor::owner::{AdmittedOwnerStep, OwnerFault, OwnerOutcome, OwnerStepOutcome};
+use crate::executor::owner::{
+    AdmittedOwnerStep, OwnerFault, OwnerOutcome, OwnerPoll, OwnerRun, OwnerStepOutcome,
+};
 use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
 use crate::rules::ProducerActivity;
 use crate::rules::in_use::UnitUse;
+use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::RuleRef;
 
 /// The result of one unit of work on the active operation.
@@ -75,10 +79,25 @@ enum Admitted<'a> {
     Owner(AdmittedOwnerStep<'a>),
 }
 
-/// The result of the executor call of a filesystem step.
-enum CallOutcome {
-    File(StepOutcome),
-    Owner(OwnerStepOutcome),
+/// The interval of the readings of the worker of an owner step.
+const OWNER_POLL: Nanoseconds = Nanoseconds::new(100_000_000);
+
+/// The longest interval between two readings of the stop conditions of a
+/// running owner command.
+const OWNER_CHECK_INTERVAL: Nanoseconds = Nanoseconds::new(1_000_000_000);
+
+/// Whether a refusal of the authorization stops a running owner command.
+/// Only the authority stops it: a refusal for the trigger evidence or the
+/// plan expiry does not (`docs/ACTION_CONTRACTS.md` section 7). The stage
+/// `execution` gives neither of them; the check stays for a defect.
+pub(super) fn stops_running_command(reason: RefusalReason) -> bool {
+    !matches!(
+        reason,
+        RefusalReason::PlanExpired
+            | RefusalReason::TriggerEvidenceMissing
+            | RefusalReason::TriggerEvidenceStale
+            | RefusalReason::MeasurementBeforeResume
+    )
 }
 
 /// A change of one step.
@@ -817,16 +836,31 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                         .push(ResourceEffect::ScopeAllocation(scope));
                 }
                 // The tail is redacted and bounded, and it goes to the log
-                // only: the journal does not keep it.
+                // only: the journal does not keep it. A completed command
+                // logs it at the level `debug`, each other result at `info`.
                 if let Some(tail) = diagnostic_tail {
-                    tracing::info!(
-                        operation = active.operation.operation_id().as_str(),
-                        step = step.step_id.as_str(),
-                        exit_status,
-                        effect = result.effect.as_str(),
-                        tail = tail.as_str(),
-                        "owner operation ended"
-                    );
+                    let operation: &str = active.operation.operation_id().as_str();
+                    let step_id: &str = step.step_id.as_str();
+                    let effect: &str = result.effect.as_str();
+                    if matches!(result.effect, TargetEffect::OperationCompleted) {
+                        tracing::debug!(
+                            operation,
+                            step = step_id,
+                            exit_status,
+                            effect,
+                            tail = tail.as_str(),
+                            "owner operation ended"
+                        );
+                    } else {
+                        tracing::info!(
+                            operation,
+                            step = step_id,
+                            exit_status,
+                            effect,
+                            tail = tail.as_str(),
+                            "owner operation ended"
+                        );
+                    }
                 }
                 Ok(result)
             }
@@ -861,6 +895,119 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                         Some(&step.step_id),
                     ),
                 )
+            }
+        }
+    }
+
+    /// The stop condition of a running owner command, or `None`: the stop
+    /// of the operation, a cancel request, and, at most one time each
+    /// second, the lease, the stop fence of the journal, and the authority
+    /// records at the stage `execution`. Neither the trigger standing nor
+    /// the plan expiry is read.
+    fn running_stop(
+        &self,
+        active: &Active,
+        step: &PlannedStep,
+        running: &mut OwnerRunning,
+        time: &TimeReading,
+    ) -> Option<StopReason> {
+        let operation_id: &OperationId = active.operation.operation_id();
+        if let Some(stop) = &active.stop {
+            return Some(stop.reason.clone());
+        }
+        if self.board.stop_requested(operation_id) {
+            return Some(StopReason::Canceled);
+        }
+        let now: MonotonicNanos = time.clock.now;
+        if now < running.next_check {
+            return None;
+        }
+        running.next_check = now.checked_add(OWNER_CHECK_INTERVAL).unwrap_or(now);
+        if !self.ledger.holds(&active.leases, operation_id, now) {
+            return Some(StopReason::DeadlineExpired);
+        }
+        match self.journal.has_stop_fence(operation_id) {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return Some(StopReason::Canceled),
+        }
+        let incident = active
+            .plan
+            .trigger
+            .incident_id
+            .as_ref()
+            .and_then(|incident_id| self.authority.incident(incident_id));
+        let recording = active.recording();
+        let request = ActionRequest {
+            principal: active.principal.uid,
+            plan: &active.plan,
+            step_id: &step.step_id,
+            stage: ActionStage::Execution,
+            approval: Some(&active.approval),
+            recording: &recording,
+            incident: incident.as_ref(),
+            evidence: None,
+        };
+        match self.authority.authorize(&request, time) {
+            Err(refusal) if stops_running_command(refusal.reason) => {
+                Some(stop_reason_of(refusal.reason))
+            }
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// Reads the worker of a running owner step one time.
+    fn advance_owner(
+        &mut self,
+        active: &mut Active,
+        step: &PlannedStep,
+        mut running: OwnerRunning,
+        time: &TimeReading,
+    ) -> Result<StepEnd, Fault> {
+        if running.stop.is_none()
+            && let Some(reason) = self.running_stop(active, step, &mut running, time)
+        {
+            running.run.stop(stop_signal_of(&reason));
+            running.stop = Some(reason);
+        }
+        let wake: MonotonicNanos = time
+            .clock
+            .now
+            .checked_add(OWNER_POLL)
+            .unwrap_or(time.clock.now);
+        match running.run.poll() {
+            OwnerPoll::Pending => {
+                active.owner_run = Some(running);
+                Ok(StepEnd::Wait(wake))
+            }
+            OwnerPoll::Started(process) => {
+                // The process is suspended until the journal has it.
+                let recorded: bool = !active.volatile
+                    && self
+                        .journal
+                        .record_owner_process(
+                            active.operation.operation_id(),
+                            &step.step_id,
+                            &process,
+                        )
+                        .is_ok();
+                running.run.recorded(recorded);
+                active.owner_run = Some(running);
+                Ok(StepEnd::Wait(time.clock.now))
+            }
+            OwnerPoll::Finished(outcome) => {
+                let result: TargetResult = Self::owner_result(active, step, *outcome)?;
+                self.settle_called(
+                    active,
+                    step,
+                    vec![result],
+                    running.charge,
+                    running.charged,
+                    false,
+                )?;
+                if let Some(reason) = running.stop {
+                    return Ok(StepEnd::Stop(reason, None));
+                }
+                Ok(StepEnd::Next)
             }
         }
     }
@@ -963,32 +1110,39 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             )?;
             return Ok(StepEnd::Next);
         }
+        let admitted: AdmittedStep<'_> = match admitted {
+            Admitted::File(admitted) => admitted,
+            // An owner step runs on the worker thread of the owner
+            // executor. The coordinator reads it at each later call and
+            // does not wait for the command.
+            Admitted::Owner(admitted) => {
+                let run: OwnerRun = self.owner.begin(&active.roots, admitted);
+                active.owner_run = Some(OwnerRunning {
+                    run,
+                    charge,
+                    charged,
+                    next_check: time.clock.now,
+                    stop: None,
+                });
+                return Ok(StepEnd::Wait(time.clock.now));
+            }
+        };
         // The executor call. The status board is not locked here. The
         // executor reads the signal between the entries of a directory
         // target. The signal is the final check, read again: the stop
         // request, the deadline, the plan expiry, the leases, the trigger,
         // the authorization, and the durable stop fence.
         let stopped: Cell<Option<StopReason>> = Cell::new(None);
-        let outcome: CallOutcome = {
+        let outcome: StepOutcome = {
             let active: &Active = active;
             let signal = || -> Option<Stop> {
                 let halt: Stop = stop_signal_of(&self.final_check(active, step)?);
                 stopped.set(Some(halt.stop_reason()));
                 Some(halt)
             };
-            match admitted {
-                Admitted::File(admitted) => {
-                    CallOutcome::File(self.filesystem.execute(&active.roots, admitted, &signal))
-                }
-                Admitted::Owner(admitted) => {
-                    CallOutcome::Owner(self.owner.execute(&active.roots, admitted, &signal))
-                }
-            }
+            self.filesystem.execute(&active.roots, admitted, &signal)
         };
-        let result: TargetResult = match outcome {
-            CallOutcome::File(outcome) => Self::filesystem_result(active, step, outcome)?,
-            CallOutcome::Owner(outcome) => Self::owner_result(active, step, outcome)?,
-        };
+        let result: TargetResult = Self::filesystem_result(active, step, outcome)?;
         self.settle_called(active, step, vec![result], charge, charged, false)?;
         // A stop inside a directory target ends the operation: the target
         // has the result that the executor gave (no call, a part removed,
@@ -1426,6 +1580,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         if !active.volatile
             && !active.unsaved.is_empty()
             && active.observing.is_none()
+            && active.owner_run.is_none()
             && !self.flush(&mut active)
         {
             let error: ActionError = action_error(
@@ -1449,10 +1604,14 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             active.plan.target(&step.target_id).map(|t| &t.binding),
             Some(TargetBinding::File(_) | TargetBinding::OwnerOperation(_))
         );
-        let end: Result<StepEnd, Fault> = match active.observing.take() {
-            Some(observing) => self.advance_observation(&mut active, &step, observing, time),
-            None if is_file => self.advance_filesystem(&mut active, &step, time),
-            None => self.advance_application(&mut active, &step, time),
+        let end: Result<StepEnd, Fault> = if let Some(running) = active.owner_run.take() {
+            self.advance_owner(&mut active, &step, running, time)
+        } else {
+            match active.observing.take() {
+                Some(observing) => self.advance_observation(&mut active, &step, observing, time),
+                None if is_file => self.advance_filesystem(&mut active, &step, time),
+                None => self.advance_application(&mut active, &step, time),
+            }
         };
         match end {
             Ok(StepEnd::Next) => {
@@ -1572,16 +1731,18 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let mut volumes: Vec<VolumeId> = Vec::new();
         let mut has_application: bool = false;
         for target in &active.plan.targets {
-            match &target.binding {
-                TargetBinding::File(FileBinding { volume_id, .. })
-                | TargetBinding::OwnerOperation(OwnerOperationBinding { volume_id, .. }) => {
+            let volume: Option<&VolumeId> = match &target.binding {
+                TargetBinding::File(file) => Some(&file.volume_id),
+                TargetBinding::OwnerOperation(owner) => Some(&owner.volume_id),
+                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+            };
+            match volume {
+                Some(volume_id) => {
                     if !volumes.contains(volume_id) && volumes.len() < MAX_MEASURED_VOLUMES {
                         volumes.push(volume_id.clone());
                     }
                 }
-                TargetBinding::Application(_) | TargetBinding::Process(_) => {
-                    has_application = true;
-                }
+                None => has_application = true,
             }
         }
         for volume in volumes {

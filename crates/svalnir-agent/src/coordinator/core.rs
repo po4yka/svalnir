@@ -201,6 +201,21 @@ pub(super) struct Observing {
     pub(super) charged: bool,
 }
 
+/// An owner step whose command runs on its worker thread.
+#[derive(Debug)]
+pub(super) struct OwnerRunning {
+    /// The handle of the worker.
+    pub(super) run: crate::executor::owner::OwnerRun,
+    /// The charge of the step, and whether the ledger charged it.
+    pub(super) charge: Option<WorkCharge>,
+    pub(super) charged: bool,
+    /// The time of the next reading of the lease, the stop fence, and the
+    /// authority records.
+    pub(super) next_check: MonotonicNanos,
+    /// The stop that the coordinator gave the worker.
+    pub(super) stop: Option<StopReason>,
+}
+
 /// The measurements before the first step.
 #[derive(Debug, Default)]
 pub(super) struct Baseline {
@@ -224,6 +239,9 @@ pub(super) struct Active {
     pub(super) volatile: bool,
     pub(super) next_step: usize,
     pub(super) observing: Option<Observing>,
+    /// The owner step whose command runs on the worker of the owner
+    /// executor.
+    pub(super) owner_run: Option<OwnerRunning>,
     pub(super) graceful: BTreeMap<TargetId, GracefulOutcome>,
     /// The clock continuity at the dispatch of the latest application
     /// step.
@@ -795,6 +813,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             }
         }
         self.check_file_protection(plan)?;
+        self.check_owner_bindings(plan, time)?;
         Ok(None)
     }
 
@@ -843,6 +862,60 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             };
             if let Some((code, family)) = refusal {
                 return Err(Box::new(admission_error(code, family, &plan.plan_id)));
+            }
+        }
+        Ok(())
+    }
+
+    /// The command of each owner-operation target, made again from the
+    /// reviewed declaration of its rule with the scope root of the binding
+    /// and the home directory of this process (`docs/ACTION_CONTRACTS.md`
+    /// section 7). A plan whose binding differs, whose rule has no
+    /// declaration, or whose command deadline does not fit in the time
+    /// that the plan has left, is refused.
+    fn check_owner_bindings(
+        &self,
+        plan: &Plan,
+        time: &TimeReading,
+    ) -> Result<(), Box<ActionError>> {
+        let owners: Vec<&svalnir_core::action::OwnerOperationBinding> = plan
+            .targets
+            .iter()
+            .filter_map(|target| match &target.binding {
+                TargetBinding::OwnerOperation(owner) => Some(&**owner),
+                _ => None,
+            })
+            .collect();
+        if owners.is_empty() {
+            return Ok(());
+        }
+        let mismatch = || {
+            Box::new(admission_error(
+                code::OWNER_BINDING_MISMATCH,
+                ErrorFamily::Evidence,
+                &plan.plan_id,
+            ))
+        };
+        let locations: ProtectedLocations = self.authority.protected_locations();
+        let home: &Path = locations.home_directory().ok_or_else(mismatch)?;
+        let left: Option<Nanoseconds> = plan
+            .validity
+            .expires_at
+            .checked_duration_since(time.clock.now);
+        for owner in owners {
+            let declaration = self
+                .authority
+                .owner_operation(&owner.rule)
+                .ok_or_else(mismatch)?;
+            if !crate::rules::owner_operation::binding_agrees(owner, &declaration, home) {
+                return Err(mismatch());
+            }
+            if left.is_none_or(|left| owner.command_deadline > left) {
+                return Err(Box::new(admission_error(
+                    code::OWNER_DEADLINE_BEYOND_PLAN,
+                    ErrorFamily::Limits,
+                    &plan.plan_id,
+                )));
             }
         }
         Ok(())
@@ -1100,6 +1173,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             volatile,
             next_step: 0,
             observing: None,
+            owner_run: None,
             graceful: BTreeMap::new(),
             step_continuity: None,
             stop: None,

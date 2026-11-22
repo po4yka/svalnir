@@ -11,6 +11,7 @@ use svalnir_core::id::AdapterId;
 use thiserror::Error;
 
 use super::measure::ScopeLimits;
+use super::native::ResponsibilitySymbols;
 
 /// The error codes of the owner executor (`docs/INTERFACES.md` section 4).
 pub mod code {
@@ -48,9 +49,16 @@ pub mod code {
     pub const ROOT_LOCALITY_UNKNOWN: &str = "root_locality_unknown";
     /// The effective user of the process is not the principal of the step.
     pub const PRINCIPAL_MISMATCH: &str = "principal_mismatch";
+    /// The responsibility functions of the system are absent, or a call of
+    /// one failed (owner decision D1 of 2026-11-22).
+    pub const OWNER_DISCLAIM_UNAVAILABLE: &str = "owner_disclaim_unavailable";
+    /// The journal did not record the process of the command.
+    pub const OWNER_PROCESS_NOT_RECORDED: &str = "owner_process_not_recorded";
 
     /// Each code of this module.
-    pub const ALL: [&str; 14] = [
+    pub const ALL: [&str; 16] = [
+        OWNER_DISCLAIM_UNAVAILABLE,
+        OWNER_PROCESS_NOT_RECORDED,
         SCOPE_ROOT_CHANGED,
         OWNER_EXECUTABLE_CHANGED,
         OWNER_EXECUTABLE_NOT_TRUSTED,
@@ -86,6 +94,13 @@ pub struct OwnerExecutorConfig {
     /// The time between `SIGTERM` and `SIGKILL` to the group at a stop.
     /// At most 2 seconds.
     pub stop_grace: Duration,
+    /// The names of the responsibility functions (owner decision D1 of
+    /// 2026-11-22). A test names a function that is absent to show that no
+    /// command starts without the disclaim.
+    pub responsibility: ResponsibilitySymbols,
+    /// The longest wait of the worker for the record of the process of the
+    /// command in the journal.
+    pub record_wait: Duration,
 }
 
 impl OwnerExecutorConfig {
@@ -99,6 +114,8 @@ impl OwnerExecutorConfig {
             scope: ScopeLimits::default(),
             stop_poll: Duration::from_millis(100),
             stop_grace: Duration::from_secs(2),
+            responsibility: ResponsibilitySymbols::default(),
+            record_wait: Duration::from_secs(30),
         }
     }
 }

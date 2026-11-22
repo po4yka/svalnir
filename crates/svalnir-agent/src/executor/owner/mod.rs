@@ -25,16 +25,20 @@
 mod executor;
 mod measure;
 mod model;
+mod native;
 mod supervise;
 mod verify;
 
 #[cfg(test)]
 mod tests;
 
-pub use executor::OwnerExecutor;
+pub use executor::{OwnerExecutor, OwnerPoll, OwnerRun, process_lives, process_record_of};
 pub use measure::{ScopeLimits, measure_scope};
 pub use model::{
     AdmittedOwnerStep, OwnerAdmissionRefusal, OwnerExecutorConfig, OwnerFault, OwnerOutcome,
     OwnerStepOutcome, code,
 };
-pub use verify::{ExecutableProblem, examine_executable};
+pub use native::ResponsibilitySymbols;
+pub use verify::{
+    ExecutableKind, ExecutableProblem, examine_executable, examine_program, executable_kind,
+};

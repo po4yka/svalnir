@@ -398,6 +398,11 @@ pub fn owner_fixture_declaration(
                 OwnerOperationBound::Unbounded,
             ),
         ],
+        interpreters: vec![ExecutableLocation {
+            base: ExecutableBase::Absolute,
+            path: LosslessPath::from_bytes("/bin/sh")
+                .map_err(|_| OwnerDeclarationError::Executable)?,
+        }],
         environment: vec![
             EnvironmentDeclaration {
                 name: "HOME".to_owned(),

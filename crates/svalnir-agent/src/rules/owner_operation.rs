@@ -15,16 +15,19 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use svalnir_core::action::{
-    ExecutableBinding, OwnerOperationBinding, OwnerOperationKind, ScopeMeasurement,
+    ExecutableBinding, InterpreterBinding, OwnerOperationBinding, OwnerOperationKind,
+    ScopeMeasurement,
 };
 use svalnir_core::file::LosslessPath;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::Nanoseconds;
-use svalnir_core::rule::owner::{ExecutableBase, OwnerCommand, OwnerOperation, ParameterValues};
+use svalnir_core::rule::owner::{
+    ExecutableBase, ExecutableLocation, OwnerCommand, OwnerOperation, ParameterValues,
+};
 use thiserror::Error;
 
 use crate::executor::fs::ApprovedRoot;
-use crate::executor::owner::{ExecutableProblem, ScopeLimits, examine_executable, measure_scope};
+use crate::executor::owner::{ExecutableProblem, ScopeLimits, examine_program, measure_scope};
 use crate::scan::{CancellationToken, ScanClock};
 
 /// The reason no binding is made.
@@ -39,6 +42,10 @@ pub enum OwnerBindError {
     /// No path of the declaration has an executable.
     #[error("no path of the declaration has an executable")]
     ExecutableNotFound,
+    /// The `#!` line of a script names an interpreter that is not an
+    /// interpreter location of the declaration.
+    #[error("the interpreter of the script is not a location of the declaration")]
+    InterpreterNotDeclared,
     /// An executable exists, and it or a directory above it does not pass
     /// the owner and mode checks.
     #[error("the executable does not pass the owner and mode checks")]
@@ -91,22 +98,61 @@ fn resolve_location(base: ExecutableBase, path: &LosslessPath, home: &Path) -> O
     fs::canonicalize(path).ok()
 }
 
-/// The executable of the declaration: the first path that passes the
-/// checks of the owner executor.
-fn bind_executable(request: &OwnerBindRequest<'_>) -> Result<ExecutableBinding, OwnerBindError> {
+/// The canonical paths of `locations` below `home`, in their sequence.
+/// A location with nothing at its path has none.
+pub fn canonical_locations(locations: &[ExecutableLocation], home: &Path) -> Vec<PathBuf> {
+    locations
+        .iter()
+        .filter_map(|location| resolve_location(location.base, &location.path, home))
+        .collect()
+}
+
+/// The executable of the declaration, with the interpreter of a script:
+/// the first path that passes the checks of the owner executor.
+fn bind_executable(
+    request: &OwnerBindRequest<'_>,
+) -> Result<(ExecutableBinding, Option<InterpreterBinding>), OwnerBindError> {
+    let interpreters: Vec<PathBuf> =
+        canonical_locations(&request.declaration.interpreters, request.home_directory);
     let mut problem: OwnerBindError = OwnerBindError::ExecutableNotFound;
-    for location in &request.declaration.executables {
-        let Some(path) = resolve_location(location.base, &location.path, request.home_directory)
-        else {
-            continue;
-        };
-        match examine_executable(&path, request.principal, request.max_executable_bytes) {
-            Ok(executable) => return Ok(executable),
+    for path in canonical_locations(&request.declaration.executables, request.home_directory) {
+        match examine_program(
+            &path,
+            &interpreters,
+            request.principal,
+            request.max_executable_bytes,
+        ) {
+            Ok(program) => return Ok(program),
             Err(ExecutableProblem::NotFound) => {}
+            Err(ExecutableProblem::InterpreterNotDeclared) => {
+                problem = OwnerBindError::InterpreterNotDeclared;
+            }
             Err(_) => problem = OwnerBindError::ExecutableNotTrusted,
         }
     }
     Err(problem)
+}
+
+/// Whether the paths of the executable and of the interpreter of `binding`
+/// are canonical locations of `declaration` below `home`: the check of the
+/// coordinator at admission, with the command check of
+/// [`OwnerOperationDeclaration::agrees_with`](svalnir_core::rule::owner::OwnerOperationDeclaration::agrees_with).
+pub fn binding_agrees(
+    binding: &OwnerOperationBinding,
+    declaration: &OwnerOperation,
+    home: &Path,
+) -> bool {
+    let Some(home_text) = home.to_str() else {
+        return false;
+    };
+    let located = |path: &LosslessPath, locations: &[ExecutableLocation]| {
+        canonical_locations(locations, home).contains(&path.to_path_buf())
+    };
+    declaration.agrees_with(binding, home_text)
+        && located(&binding.executable.path, &declaration.executables)
+        && binding.interpreter.as_ref().is_none_or(|interpreter| {
+            located(&interpreter.executable.path, &declaration.interpreters)
+        })
 }
 
 /// Makes the binding of `request`.
@@ -142,7 +188,7 @@ pub fn bind_owner_operation(
     if !root_agrees {
         return Err(OwnerBindError::ScopeRootChanged);
     }
-    let executable: ExecutableBinding = bind_executable(request)?;
+    let (executable, interpreter) = bind_executable(request)?;
     let values = ParameterValues {
         scope_root: request
             .scope
@@ -171,6 +217,7 @@ pub fn bind_owner_operation(
         clear_opt_in: is_clear,
         bound: command.bound,
         executable,
+        interpreter,
         arguments: command.resolved_arguments(&values),
         environment: declaration.resolved_environment(&values),
         working_directory: LosslessPath::from_path(request.home_directory)

@@ -143,6 +143,7 @@ mod durable;
 mod effects;
 mod error;
 mod incident;
+mod owner_process;
 mod record;
 mod recovery;
 mod request;
@@ -173,6 +174,7 @@ pub use self::coordination::{
 pub use self::effects::MAX_RESOURCE_EFFECTS_BYTES;
 pub use self::error::{AdmissionStop, OperationJournalError, SequenceViolation};
 pub use self::incident::IncidentUsage;
+pub use self::owner_process::OwnerProcess;
 pub use self::record::{AgentRecord, MAX_AGENT_RECORD_BYTES, StoredAgentRecord};
 pub use self::recovery::{ConsumedDispatch, RecoveryPosition, RecoveryRecord, StepRecovery};
 pub use self::request::{

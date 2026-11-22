@@ -163,7 +163,8 @@ fn a_plan_for_the_helper_and_a_protected_target_are_refused() {
 #[test]
 fn a_manual_eviction_with_a_proposed_rule_is_refused_and_the_trash_mode_is_not() {
     let bench = Bench::new();
-    bench.authority.records().registry = NoRules(Some(ReviewedRules::new().unwrap()), Vec::new());
+    bench.authority.records().registry =
+        NoRules(Some(ReviewedRules::new().unwrap()), Vec::new(), Vec::new());
     let file = bench.tree.file("a");
     let trashed = bench.tree.file("b");
     let mut content: PlanContent = cleanup_content(

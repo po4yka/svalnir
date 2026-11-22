@@ -375,7 +375,7 @@ pub enum TargetBinding {
     /// One process with no verified membership.
     Process(ProcessBinding),
     /// One fixed command of a producer on one measured scope.
-    OwnerOperation(OwnerOperationBinding),
+    OwnerOperation(Box<OwnerOperationBinding>),
 }
 
 impl TargetBinding {

@@ -570,8 +570,8 @@ struct UnitObserver<'a> {
     /// The newest modification or status change of an object below the
     /// unit.
     newest_change: Option<WallTime>,
-    /// The first Git marker below the unit, relative to the unit.
-    repository_marker: Option<PathBuf>,
+    /// The Git markers and the Git directories below the unit.
+    repositories: nested_git::MarkerTracker,
 }
 
 /// Examines the owner and the times of one measured entry below a unit.
@@ -650,13 +650,8 @@ impl ScanObserver for UnitObserver<'_> {
                 // unit"). The unit of a rule of this build has no
                 // checkouts of Swift Package Manager, so no exception
                 // applies.
-                if relative
-                    .file_name()
-                    .is_some_and(|name| nested_git::is_marker(name.as_bytes()))
-                {
+                if self.repositories.note(relative, entry.kind) {
                     self.reasons.insert(SkipReason::NestedRepository);
-                    self.repository_marker
-                        .get_or_insert_with(|| relative.to_path_buf());
                 }
             }
             // An entry that the rule cannot classify is not shown to be
@@ -676,7 +671,8 @@ struct MeasuredUnit {
     /// The newest modification or status change of an object below the
     /// unit.
     newest_change: Option<WallTime>,
-    /// The first Git marker below the unit, relative to the unit.
+    /// The first Git marker or Git directory below the unit, relative to
+    /// the unit.
     repository_marker: Option<PathBuf>,
 }
 
@@ -783,7 +779,7 @@ fn measure_unit(
         classify,
         owner: principal,
         newest_change: None,
-        repository_marker: None,
+        repositories: nested_git::MarkerTracker::default(),
     };
     let scanned: Result<ScanResult, ScanError> =
         run_scan(&request, &scan_cancel, bounds.control.clock, &mut observer);
@@ -799,7 +795,7 @@ fn measure_unit(
         .saturating_add(result.entries_examined.get());
 
     let newest_change: Option<WallTime> = observer.newest_change;
-    let repository_marker: Option<PathBuf> = observer.repository_marker;
+    let repository_marker: Option<PathBuf> = observer.repositories.first().map(Path::to_path_buf);
     let scan: FinishedScan<'_> = FinishedScan {
         result: &result,
         reasons: observer.reasons,
@@ -961,8 +957,8 @@ pub(super) struct Assessment {
     /// unit. `None` when the unit was not measured in this discovery or
     /// has no object below it.
     pub(super) newest_content_change: Option<WallTime>,
-    /// The first Git marker below the unit, relative to the unit, when
-    /// the measurement found one.
+    /// The first Git marker or Git directory below the unit, relative to
+    /// the unit, when the measurement found one.
     pub(super) repository_marker: Option<PathBuf>,
 }
 

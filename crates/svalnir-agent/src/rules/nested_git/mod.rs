@@ -10,29 +10,35 @@
 //! # Use
 //!
 //! 1. [`detect`] walks one unit and reports each `.git` object
-//!    ([`is_marker`]) that it finds, and the first directory that it cannot
-//!    read. The walk is bounded by depth, by entries, and by time, follows
-//!    no symbolic link, does not enter another device, and reads each name
+//!    ([`is_marker`]), each Git directory with no such name
+//!    (`is_git_directory`: a bare repository or a separate Git
+//!    directory), and the first directory that it cannot read. The walk
+//!    is bounded by depth, by entries, and by time, follows no symbolic
+//!    link, does not enter another device, and reads each name
 //!    relative to an open directory.
 //! 2. [`judge`] gives the verdict of a detection. Each problem of the walk
 //!    refuses the unit: a directory that the walk cannot read can hold a
 //!    repository. Each repository refuses the unit, with one exception: a
-//!    clone that Swift Package Manager made in its `checkouts` directory
-//!    and can make again ([`SwiftPmCheckouts`], [`swiftpm`]).
+//!    clone or a mirror that Swift Package Manager made in its `checkouts`
+//!    or `repositories` directory and can make again
+//!    ([`SwiftPmCheckouts`], [`swiftpm`]).
 //! 3. [`check_unit`] does the two steps.
 //!
-//! The discovery of an eviction does not call [`detect`]: its measurement
-//! with the scanner already reads each entry of a unit, so it applies
-//! [`is_marker`] to each entry (`rules::unit`). The filesystem executor
-//! applies [`is_marker`] in the measurement of a directory target, before
-//! its first removal call.
+//! The discovery of an eviction and the inspection of
+//! `project.dependency-directory` do not call [`detect`]: their measurement
+//! with the scanner already reads each entry of a unit, so they give each
+//! entry to a `MarkerTracker`. The filesystem executor applies
+//! [`is_marker`] and `is_git_directory` in the measurement of a directory
+//! target, before its first removal call, and `holds_repository_now` to
+//! each directory of the removal pass before it removes the entries of
+//! that directory.
 //!
-//! # What the walk cannot see
+//! # What the checks cannot see
 //!
-//! The walk finds a repository by the name `.git`. A bare repository has no
-//! such name, and the walk does not report it. A name check is a check at
-//! one time: a repository that a process makes after the walk is not seen
-//! until the next check.
+//! A check is a check of names at one time. A repository that a process
+//! makes after the last check of a directory is not seen. A Git directory
+//! outside the unit whose `core.worktree` names a directory in the unit
+//! leaves no Git object in the unit, so no check finds that work tree.
 
 pub mod swiftpm;
 
@@ -41,17 +47,20 @@ mod tests;
 
 use std::ffi::{CStr, CString, OsStr};
 use std::io;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use svalnir_core::file::DeviceNumber;
+use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
 
 use crate::executor::fs::native::{self, DirStream, Kind, Metadata};
 use crate::rules::git::{GitTool, GitToolProblem};
-use crate::scan::CancellationToken;
+use crate::scan::{
+    CancellationToken, EntryRecord, RegionCause, ScanCompletion, ScanObserver, ScanResult,
+};
+use svalnir_core::observation::Coverage;
 
 pub use swiftpm::{Pin, PinsProblem, SwiftPmCheckouts, read_pins};
 
@@ -59,6 +68,15 @@ pub use swiftpm::{Pin, PinsProblem, SwiftPmCheckouts, read_pins};
 /// file that names the Git directory of a submodule or of a linked
 /// worktree.
 pub const GIT_MARKER: &str = ".git";
+
+/// The names that make a directory a Git directory: the file or symbolic
+/// link `HEAD`, and the directories `objects` and `refs`. That is the test
+/// of Git for a Git directory, with no check of the content of `HEAD`.
+pub const GIT_DIRECTORY_NAMES: [&str; 3] = ["HEAD", "objects", "refs"];
+
+/// The largest number of directories that a `MarkerTracker` follows for
+/// [`GIT_DIRECTORY_NAMES`]. More such directories count as a repository.
+const MAX_TRACKED_FRAMES: usize = 65_536;
 
 /// The number of entries that the walk reads between two readings of the
 /// clock and of the cancellation.
@@ -107,16 +125,24 @@ pub enum MarkerKind {
     File,
     /// A `.git` object of another kind, for example a symbolic link.
     Other,
+    /// A Git directory with no `.git` name: a directory with
+    /// [`GIT_DIRECTORY_NAMES`], as of a bare repository, a mirror, or a
+    /// separate Git directory.
+    Bare,
 }
 
 /// One repository that the walk found.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FoundRepository {
-    /// The directory that holds the marker, relative to the unit. Empty
-    /// for the unit itself.
+    /// The directory that holds the marker, or the Git directory of a
+    /// [`MarkerKind::Bare`] repository, relative to the unit. Empty for the
+    /// unit itself.
     pub work_tree: PathBuf,
     /// The kind of the marker.
     pub marker: MarkerKind,
+    /// The device and the inode of the marker, or of the Git directory of
+    /// a [`MarkerKind::Bare`] repository, as the walk measured them.
+    pub object: Option<FileObjectEvidence>,
 }
 
 /// Why a walk did not examine each entry of the unit.
@@ -201,6 +227,18 @@ pub enum RefusalReason {
     /// The configuration of the checkout names a filter driver, which
     /// `git status` would run.
     FilterDriver,
+    /// The checkout does not record the updates of its references
+    /// (`core.logAllRefUpdates` is false), so its reflogs do not show a
+    /// push.
+    ReflogDisabled,
+    /// A reflog has an entry that is not a fetch or a clone, for example
+    /// a push.
+    ReflogNotFetch,
+    /// A repository in the `repositories` directory is not a bare mirror
+    /// with one remote.
+    NotMirror,
+    /// The Git directory is not the object that the walk measured.
+    IdentityChanged,
     /// No trusted Git executable is available for the checks.
     GitUnavailable,
     /// A Git query failed.
@@ -226,6 +264,10 @@ impl RefusalReason {
             Self::Stash => "swiftpm_checkout_stash",
             Self::LinkedWorktrees => "swiftpm_checkout_linked_worktrees",
             Self::FilterDriver => "swiftpm_checkout_filter_driver",
+            Self::ReflogDisabled => "swiftpm_checkout_reflog_disabled",
+            Self::ReflogNotFetch => "swiftpm_reflog_not_fetch",
+            Self::NotMirror => "swiftpm_mirror_not_valid",
+            Self::IdentityChanged => "repository_identity_changed",
             Self::GitUnavailable => "swiftpm_git_unavailable",
             Self::GitFailed => "swiftpm_git_failed",
         }
@@ -261,6 +303,211 @@ struct Walk<'a> {
     device: Option<DeviceNumber>,
     entries: u64,
     found: Vec<FoundRepository>,
+}
+
+/// The device and the inode of a measured object.
+fn identity(metadata: &Metadata) -> Option<FileObjectEvidence> {
+    Some(FileObjectEvidence {
+        device: metadata.device?,
+        inode: metadata.inode.into(),
+    })
+}
+
+/// The kind of the entry `name` of the open directory `directory`, or
+/// `None` when it is absent.
+fn kind_at(directory: BorrowedFd<'_>, name: &CStr) -> io::Result<Option<Kind>> {
+    match native::stat_at(directory, name) {
+        Ok(metadata) => Ok(Some(metadata.kind)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the open directory `directory` is a Git directory: it has
+/// `HEAD` as a file or a symbolic link, and `objects` and `refs` as
+/// directories ([`GIT_DIRECTORY_NAMES`]). Each name is read relative to
+/// the open directory, with no symbolic link followed.
+///
+/// # Errors
+///
+/// Returns the error of a read that is not an absent name.
+pub(crate) fn is_git_directory(directory: BorrowedFd<'_>) -> io::Result<bool> {
+    if !matches!(
+        kind_at(directory, c"HEAD")?,
+        Some(Kind::File | Kind::Symlink)
+    ) {
+        return Ok(false);
+    }
+    Ok(kind_at(directory, c"objects")? == Some(Kind::Directory)
+        && kind_at(directory, c"refs")? == Some(Kind::Directory))
+}
+
+/// Whether the open directory `directory` has a Git marker
+/// ([`is_marker`]) now, or is a Git directory (`is_git_directory`). The
+/// names are read again from the directory.
+///
+/// # Errors
+///
+/// Returns the error of a read.
+pub(crate) fn holds_repository_now(directory: BorrowedFd<'_>) -> io::Result<bool> {
+    if is_git_directory(directory)? {
+        return Ok(true);
+    }
+    let again: OwnedFd = native::open_directory_at(directory, c".")?;
+    let mut stream: DirStream = DirStream::from_descriptor(again)?;
+    let mut name: Vec<u8> = Vec::new();
+    while stream.next_name(&mut name)? {
+        // The name ends with its NUL terminator.
+        if is_marker(name.strip_suffix(&[0]).unwrap_or(&name)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Finds the repositories of a unit from the entries of a walk that
+/// another module does, for example the scanner: each `.git` entry, and
+/// each directory with the names of [`GIT_DIRECTORY_NAMES`].
+#[derive(Debug, Default)]
+pub(crate) struct MarkerTracker {
+    /// The names of [`GIT_DIRECTORY_NAMES`] that each directory has, as
+    /// bits.
+    frames: std::collections::BTreeMap<PathBuf, u8>,
+    /// The first repository: the `.git` entry, or the Git directory.
+    first: Option<PathBuf>,
+}
+
+impl MarkerTracker {
+    /// Examines one entry of the walk, at `relative` below the unit.
+    /// Returns whether this entry shows a repository.
+    pub(crate) fn note(&mut self, relative: &Path, kind: crate::scan::EntryKind) -> bool {
+        use crate::scan::EntryKind;
+        let Some(name) = relative.file_name() else {
+            return false;
+        };
+        let name: &[u8] = name.as_bytes();
+        if is_marker(name) {
+            self.first.get_or_insert_with(|| relative.to_path_buf());
+            return true;
+        }
+        let bit: u8 = match GIT_DIRECTORY_NAMES
+            .iter()
+            .position(|frame| name.eq_ignore_ascii_case(frame.as_bytes()))
+        {
+            Some(0) if matches!(kind, EntryKind::File | EntryKind::Symlink) => 1,
+            Some(1) if kind == EntryKind::Directory => 2,
+            Some(2) if kind == EntryKind::Directory => 4,
+            _ => return false,
+        };
+        let parent: PathBuf = relative
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        // A walk with more such directories than the bound counts as a
+        // repository: the tracker cannot follow them.
+        let full: bool =
+            self.frames.len() >= MAX_TRACKED_FRAMES && !self.frames.contains_key(&parent);
+        let bits: u8 = if full {
+            7
+        } else {
+            let bits: &mut u8 = self.frames.entry(parent.clone()).or_default();
+            *bits |= bit;
+            *bits
+        };
+        if bits == 7 {
+            self.first.get_or_insert(parent);
+            return true;
+        }
+        false
+    }
+
+    /// The first repository, relative to the unit: the path of the `.git`
+    /// entry, or of the Git directory.
+    pub(crate) fn first(&self) -> Option<&Path> {
+        self.first.as_deref()
+    }
+}
+
+/// A scan observer that gives each measured entry of a unit to a
+/// [`MarkerTracker`], so that a measurement with the scanner also looks
+/// for repositories, with no second walk.
+#[derive(Debug)]
+pub(crate) struct MarkerObserver<'a> {
+    unit: &'a Path,
+    tracker: MarkerTracker,
+    /// Whether an entry was not below the unit.
+    outside: bool,
+}
+
+impl<'a> MarkerObserver<'a> {
+    /// An observer for the scan of the unit at `unit`.
+    pub(crate) fn new(unit: &'a Path) -> Self {
+        Self {
+            unit,
+            tracker: MarkerTracker::default(),
+            outside: false,
+        }
+    }
+
+    /// The verdict on the unit after the scan that gave `result`. A
+    /// repository refuses the unit, and so does a scan that did not read
+    /// each entry: a part that it did not read can hold a repository.
+    pub(crate) fn verdict(&self, result: &ScanResult) -> Verdict {
+        let refuse = |reason: RefusalReason, path: Option<PathBuf>| {
+            Verdict::Refused(RepositoryRefusal { reason, path })
+        };
+        if let Some(first) = self.tracker.first() {
+            // A `.git` entry names its work tree; a Git directory is its
+            // own path.
+            let is_marker_entry: bool = first
+                .file_name()
+                .is_some_and(|name| is_marker(name.as_bytes()));
+            let path: PathBuf = if is_marker_entry {
+                first.parent().map_or_else(PathBuf::new, Path::to_path_buf)
+            } else {
+                first.to_path_buf()
+            };
+            return refuse(RefusalReason::NestedRepository, Some(path));
+        }
+        let relative = |path: &svalnir_core::file::LosslessPath| {
+            path.to_path_buf()
+                .strip_prefix(self.unit)
+                .ok()
+                .map(Path::to_path_buf)
+        };
+        if let Some(region) = result.regions.first() {
+            let reason: RefusalReason = if region.cause == RegionCause::PermissionDenied {
+                RefusalReason::UnreadableDirectory
+            } else {
+                RefusalReason::DetectionIncomplete
+            };
+            return refuse(reason, relative(&region.path));
+        }
+        if let Some(boundary) = result.boundaries.first() {
+            return refuse(RefusalReason::OtherDevice, relative(&boundary.path));
+        }
+        let is_complete: bool = !self.outside
+            && result.completion == ScanCompletion::Finished
+            && matches!(result.coverage, Coverage::Complete)
+            && result.regions_omitted == svalnir_core::quantity::EntryCount::ZERO
+            && result.boundaries_omitted == svalnir_core::quantity::EntryCount::ZERO;
+        if is_complete {
+            Verdict::Clear
+        } else {
+            refuse(RefusalReason::DetectionIncomplete, None)
+        }
+    }
+}
+
+impl ScanObserver for MarkerObserver<'_> {
+    fn entry_measured(&mut self, entry: &EntryRecord<'_>) {
+        match entry.path.strip_prefix(self.unit) {
+            Ok(relative) => {
+                self.tracker.note(relative, entry.kind);
+            }
+            Err(_) => self.outside = true,
+        }
+    }
 }
 
 /// The marker kind of an object.
@@ -323,6 +570,28 @@ impl Walk<'_> {
         let unreadable = |relative: &Path| DetectionProblem::Unreadable {
             directory: relative.to_path_buf(),
         };
+        // A Git directory with no `.git` name. Its content is the
+        // repository itself, so the walk does not enter it.
+        match is_git_directory(descriptor.as_fd()) {
+            Ok(false) => {}
+            Ok(true) => {
+                if self.found.len() >= self.limits.max_repositories {
+                    return Err(DetectionProblem::RepositoryLimit);
+                }
+                let object: Option<FileObjectEvidence> =
+                    native::stat_descriptor(descriptor.as_fd())
+                        .ok()
+                        .as_ref()
+                        .and_then(identity);
+                self.found.push(FoundRepository {
+                    work_tree: relative.clone(),
+                    marker: MarkerKind::Bare,
+                    object,
+                });
+                return Ok(());
+            }
+            Err(_) => return Err(unreadable(relative)),
+        }
         let mut stream: DirStream =
             DirStream::from_descriptor(descriptor).map_err(|_| unreadable(relative))?;
         let mut buffer: Vec<u8> = Vec::new();
@@ -350,6 +619,7 @@ impl Walk<'_> {
                 self.found.push(FoundRepository {
                     work_tree: relative.clone(),
                     marker: marker_kind(metadata.kind),
+                    object: identity(&metadata),
                 });
                 // The Git directory is not a part of the work tree, and
                 // its content is the repository itself.
@@ -480,7 +750,8 @@ fn refusal_of(problem: &DetectionProblem) -> RepositoryRefusal {
 ///
 /// A problem of the walk refuses the unit. A repository refuses the unit,
 /// unless `checkouts` is given and the repository is a checkout that
-/// [`swiftpm::check_checkout`] accepts. The first refusal is the verdict.
+/// [`swiftpm::check_checkout`] accepts or a mirror that
+/// [`swiftpm::check_mirror`] accepts. The first refusal is the verdict.
 /// Without a Git executable (`git`), each checkout is refused.
 #[must_use]
 pub fn judge(
@@ -501,10 +772,10 @@ pub fn judge(
             })
         };
         let work_tree: PathBuf = unit.join(&repository.work_tree);
-        let Some((checkouts, name)) = checkouts.and_then(|checkouts| {
+        let Some((checkouts, managed)) = checkouts.and_then(|checkouts| {
             checkouts
-                .checkout_name(&work_tree, repository.marker)
-                .map(|name| (checkouts, name))
+                .managed(&work_tree, repository.marker)
+                .map(|managed| (checkouts, managed))
         }) else {
             return refuse(RefusalReason::NestedRepository);
         };
@@ -514,7 +785,15 @@ pub fn judge(
         let Ok(pins) = pins.get_or_insert_with(|| read_pins(checkouts.resolved())) else {
             return refuse(RefusalReason::PinsUnavailable);
         };
-        if let Err(reason) = swiftpm::check_checkout(git, &work_tree, &name, pins, checkouts) {
+        let checked: Result<(), RefusalReason> = match managed {
+            swiftpm::Managed::Checkout(name) => {
+                swiftpm::check_checkout(git, &work_tree, &name, pins, checkouts, repository.object)
+            }
+            swiftpm::Managed::Mirror => {
+                swiftpm::check_mirror(git, &work_tree, pins, repository.object).map(|_| ())
+            }
+        };
+        if let Err(reason) = checked {
             return refuse(reason);
         }
     }

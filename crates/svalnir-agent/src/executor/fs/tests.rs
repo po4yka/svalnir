@@ -3457,6 +3457,70 @@ fn an_eviction_refuses_a_tree_with_a_repository_that_appeared_after_the_plan() {
     }
 }
 
+/// Makes the names of a Git directory with no `.git` name in `directory`:
+/// the file `HEAD` and the directories `objects` and `refs`.
+fn make_git_directory(directory: &Path) {
+    fs::write(directory.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::create_dir_all(directory.join("objects")).unwrap();
+    fs::create_dir_all(directory.join("refs")).unwrap();
+}
+
+#[test]
+fn an_eviction_refuses_a_tree_with_a_bare_repository() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let mirror: PathBuf = tree.join("a").join("mirror");
+    fs::create_dir(&mirror).unwrap();
+    make_git_directory(&mirror);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(mirror.join("HEAD").exists());
+    assert!(tree.join("top.bin").exists());
+}
+
+#[test]
+fn a_repository_that_appears_after_the_measurement_stops_the_removal() {
+    for marker in ["git", "bare"] {
+        let fixture = Fixture::new();
+        let tree: PathBuf = make_tree(&fixture);
+        let work_tree: PathBuf = tree.join("a").join("b");
+        let target: PathBuf = work_tree.clone();
+        // The repository appears after the measurement and before the
+        // first removal call.
+        let hook = once(
+            move |_| {
+                if marker == "git" {
+                    fs::create_dir(target.join(".git")).unwrap();
+                } else {
+                    make_git_directory(&target);
+                }
+            },
+            Checkpoint::TreeEnumerated,
+        );
+        let executor = fixture.executor_with(checkpoint_injection(hook));
+        let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+        let outcome = run(&executor, &fixture.roots(), &envelope);
+
+        assert_eq!(
+            failure_code(&outcome.result),
+            code::NESTED_REPOSITORY,
+            "{marker}"
+        );
+        // The measured entries of the new work tree stay.
+        assert!(work_tree.join("two.bin").exists(), "{marker}");
+        assert!(work_tree.join("three.bin").exists(), "{marker}");
+        assert!(tree.exists(), "{marker}");
+        assert!(
+            outcome.work.remaining_entries > EntryCount::ZERO,
+            "{marker}"
+        );
+    }
+}
+
 #[test]
 fn a_manual_deletion_of_a_tree_with_a_repository_is_not_refused() {
     let fixture = Fixture::new();

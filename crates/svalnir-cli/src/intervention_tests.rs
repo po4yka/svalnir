@@ -281,6 +281,61 @@ fn a_plan_with_no_entry_lists_the_candidates_and_makes_no_plan() {
 }
 
 #[test]
+fn a_manual_plan_warns_about_a_selected_tree_with_a_repository() {
+    let world = World::new();
+    world.activate("schema_version = 1\n", "none");
+    let tree: PathBuf = world.tree();
+    std::fs::create_dir_all(tree.join("build/vendor/dep/.git")).unwrap();
+    std::fs::write(
+        tree.join("build/vendor/dep/.git/HEAD"),
+        b"ref: refs/heads/main\n",
+    )
+    .unwrap();
+    let scan: String = world.scan(&tree);
+    let build: PathBuf = tree.join("build");
+    let cache: PathBuf = tree.join("cache");
+    for mode in ["trash", "permanent"] {
+        let planned = plan_with(&world, &scan, mode, &[&build, &cache]);
+        assert_eq!(planned.status, ExitStatus::Success, "{}", planned.stdout);
+        let warnings = planned.result()["repository_warnings"].clone();
+        let warnings = warnings.as_array().unwrap();
+        // The tree with no repository has no warning.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "nested_repository");
+        assert_eq!(warnings[0]["entry"]["value"], build.to_str().unwrap());
+        assert_eq!(warnings[0]["path"]["value"], "vendor/dep");
+        // The plan still has both entries.
+        assert_eq!(planned.result()["explanation"]["totals"]["targets"], 2);
+
+        let text = run(
+            &world.environment,
+            &[
+                "clean",
+                "plan",
+                "--scan",
+                &scan,
+                "--mode",
+                mode,
+                "--entry",
+                build.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(text.status, ExitStatus::Success, "{}", text.stdout);
+        assert!(
+            text.stdout
+                .contains("Warning: 1 selected entries hold a Git repository"),
+            "{}",
+            text.stdout
+        );
+        assert!(text.stdout.contains("nested_repository"), "{}", text.stdout);
+        assert!(text.stdout.contains("(at vendor/dep)"), "{}", text.stdout);
+    }
+    // A plan with no repository has no warning list.
+    let planned = plan_with(&world, &scan, "permanent", &[&cache]);
+    assert!(planned.result().get("repository_warnings").is_none());
+}
+
+#[test]
 fn a_named_entry_is_the_only_target_and_an_entry_not_in_the_scan_is_refused() {
     let world = World::new();
     world.activate("schema_version = 1\n", "none");

@@ -98,6 +98,15 @@ impl Place {
     }
 }
 
+/// The work tree and the marker kind of each repository of a detection.
+fn found(detection: &Detection) -> Vec<(PathBuf, MarkerKind)> {
+    detection
+        .repositories
+        .iter()
+        .map(|repository: &FoundRepository| (repository.work_tree.clone(), repository.marker))
+        .collect()
+}
+
 fn refused(reason: RefusalReason, path: &str) -> Verdict {
     Verdict::Refused(RepositoryRefusal {
         reason,
@@ -136,11 +145,8 @@ fn a_repository_at_depth_three_refuses_the_unit() {
     let detection: Detection = detect(&place.join("unit"), &DetectionLimits::default(), None);
     assert_eq!(detection.problem, None);
     assert_eq!(
-        detection.repositories,
-        [FoundRepository {
-            work_tree: PathBuf::from("a/b/c"),
-            marker: MarkerKind::Directory,
-        }]
+        found(&detection),
+        [(PathBuf::from("a/b/c"), MarkerKind::Directory)]
     );
     assert_eq!(
         place.check(&place.join("unit"), None),
@@ -165,11 +171,8 @@ fn a_git_file_of_a_submodule_or_a_worktree_refuses_the_unit() {
 
     let detection: Detection = detect(&place.join("unit"), &DetectionLimits::default(), None);
     assert_eq!(
-        detection.repositories,
-        [FoundRepository {
-            work_tree: PathBuf::from("vendor/dep"),
-            marker: MarkerKind::File,
-        }]
+        found(&detection),
+        [(PathBuf::from("vendor/dep"), MarkerKind::File)]
     );
     assert_eq!(
         place.check(&place.join("unit"), None),
@@ -188,12 +191,64 @@ fn a_git_symbolic_link_refuses_the_unit_and_is_not_followed() {
 
     let detection: Detection = detect(&place.join("unit"), &DetectionLimits::default(), None);
     assert_eq!(
-        detection.repositories,
-        [FoundRepository {
-            work_tree: PathBuf::from("dep"),
-            marker: MarkerKind::Other,
-        }]
+        found(&detection),
+        [(PathBuf::from("dep"), MarkerKind::Other)]
     );
+}
+
+#[test]
+fn a_bare_repository_or_a_separate_git_directory_refuses_the_unit() {
+    let place = Place::new();
+    fs::create_dir_all(place.join("unit/vendor")).unwrap();
+    place.git(
+        &place.join("unit/vendor"),
+        &["init", "-q", "--bare", "mirror.git"],
+    );
+    let detection: Detection = detect(&place.join("unit"), &DetectionLimits::default(), None);
+    assert_eq!(
+        found(&detection),
+        [(PathBuf::from("vendor/mirror.git"), MarkerKind::Bare)]
+    );
+    assert_eq!(
+        place.check(&place.join("unit"), None),
+        refused(RefusalReason::NestedRepository, "vendor/mirror.git")
+    );
+
+    // A work tree outside the unit whose Git directory is in the unit.
+    let other = Place::new();
+    fs::create_dir_all(other.join("unit")).unwrap();
+    fs::create_dir_all(other.join("work")).unwrap();
+    let separate: PathBuf = other.join("unit/state");
+    other.git(
+        &other.join("work"),
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            separate.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        other.check(&other.join("unit"), None),
+        refused(RefusalReason::NestedRepository, "state")
+    );
+}
+
+#[test]
+fn the_tracker_of_a_scan_finds_a_marker_and_a_git_directory() {
+    use super::MarkerTracker;
+    use crate::scan::EntryKind;
+    let mut tracker = MarkerTracker::default();
+    assert!(!tracker.note(Path::new("a/objects"), EntryKind::Directory));
+    assert!(!tracker.note(Path::new("a/HEAD"), EntryKind::Directory));
+    assert!(!tracker.note(Path::new("a/refs"), EntryKind::Directory));
+    assert_eq!(tracker.first(), None);
+    assert!(tracker.note(Path::new("a/HEAD"), EntryKind::File));
+    assert_eq!(tracker.first(), Some(Path::new("a")));
+
+    let mut tracker = MarkerTracker::default();
+    assert!(tracker.note(Path::new("dep/.Git"), EntryKind::File));
+    assert_eq!(tracker.first(), Some(Path::new("dep/.Git")));
 }
 
 #[test]
@@ -568,6 +623,73 @@ fn a_repository_beside_the_checkouts_is_refused() {
 #[test]
 fn a_checkout_cloned_from_a_mirror_of_its_pin_is_accepted() {
     let package = Package::new();
+    let mirror: PathBuf = with_mirror(&package);
+    assert_eq!(package.check(), Verdict::Clear);
+
+    // A mirror whose remote is not the location of the pin is not
+    // accepted.
+    let other: PathBuf = package.place.repository("other");
+    package.place.git(
+        &mirror,
+        &["remote", "set-url", "origin", other.to_str().unwrap()],
+    );
+    // The walk can reach the mirror or the checkout first; each one is
+    // refused for its location.
+    let Verdict::Refused(refusal) = package.check() else {
+        panic!("the mirror was accepted");
+    };
+    assert_eq!(refusal.reason, RefusalReason::LocationNotPinned);
+}
+
+#[test]
+fn a_checkout_whose_git_directory_was_replaced_is_refused() {
+    let package = Package::new();
+    let detection: Detection = detect(&package.unit, &DetectionLimits::default(), None);
+    // After the walk, the name `.git` names another object: a link to the
+    // directory that the walk measured.
+    let git_dir: PathBuf = package.checkout.join(".git");
+    fs::rename(&git_dir, package.checkout.join("moved")).unwrap();
+    symlink("moved", &git_dir).unwrap();
+    assert_eq!(
+        super::judge(
+            &package.unit,
+            &detection,
+            Some(&package.checkouts()),
+            Ok(&package.place.git),
+        ),
+        checkout_refused(RefusalReason::IdentityChanged)
+    );
+}
+
+#[test]
+fn a_checkout_with_no_reflog_is_refused() {
+    let package = Package::new();
+    package.git(&["config", "core.logAllRefUpdates", "false"]);
+    assert_eq!(
+        package.check(),
+        checkout_refused(RefusalReason::ReflogDisabled)
+    );
+}
+
+#[test]
+fn a_checkout_with_a_pushed_remote_tracking_reference_is_refused() {
+    let package = Package::new();
+    package.git(&[
+        "update-ref",
+        "-m",
+        "update by push",
+        "refs/remotes/origin/pushed",
+        &package.pinned,
+    ]);
+    assert_eq!(
+        package.check(),
+        checkout_refused(RefusalReason::ReflogNotFetch)
+    );
+}
+
+/// Makes the mirror `repositories/dep-1234` of the upstream repository and
+/// makes it the remote of the checkout.
+fn with_mirror(package: &Package) -> PathBuf {
     let repositories: PathBuf = package.unit.join("repositories");
     fs::create_dir_all(&repositories).unwrap();
     package.place.git(
@@ -583,17 +705,106 @@ fn a_checkout_cloned_from_a_mirror_of_its_pin_is_accepted() {
     let mirror: PathBuf = repositories.join("dep-1234");
     package.git(&["remote", "set-url", "origin", mirror.to_str().unwrap()]);
     package.git(&["fetch", "-q", "origin"]);
-    assert_eq!(package.check(), Verdict::Clear);
+    mirror
+}
 
-    // A mirror whose remote is not the location of the pin is not
-    // accepted.
-    let other: PathBuf = package.place.repository("other");
+#[test]
+fn a_mirror_with_an_update_that_is_not_a_fetch_is_refused() {
+    let package = Package::new();
+    let mirror: PathBuf = with_mirror(&package);
+    assert_eq!(package.check(), Verdict::Clear);
     package.place.git(
         &mirror,
-        &["remote", "set-url", "origin", other.to_str().unwrap()],
+        &[
+            "-c",
+            "core.logAllRefUpdates=always",
+            "update-ref",
+            "-m",
+            "update by push",
+            "refs/heads/extra",
+            &package.pinned,
+        ],
     );
-    assert_eq!(
-        package.check(),
-        checkout_refused(RefusalReason::LocationNotPinned)
+    // The walk can reach the mirror or the checkout first; the checkout
+    // checks its mirror too.
+    let Verdict::Refused(refusal) = package.check() else {
+        panic!("the mirror was accepted");
+    };
+    assert_eq!(refusal.reason, RefusalReason::ReflogNotFetch);
+}
+
+/// Writes an executable script at `path` that makes the file `marker`.
+fn marker_program(path: &Path, marker: &Path) {
+    fs::write(path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Replaces `HEAD` of the repository at `repository` with a commit that
+/// has a signature header of `kind` (`PGP` or `SSH`). The signature is not
+/// valid; a verification only runs the program of the configuration.
+fn signed_commit(place: &Place, repository: &Path, kind: &str) -> String {
+    let tree: String = place.git(repository, &["rev-parse", "HEAD^{tree}"]);
+    let parent: String = place.git(repository, &["rev-parse", "HEAD"]);
+    let content: String = format!(
+        "tree {tree}\nparent {parent}\nauthor Test <test@example.invalid> 1700000000 +0000\n\
+         committer Test <test@example.invalid> 1700000000 +0000\n\
+         gpgsig -----BEGIN {kind} SIGNATURE-----\n U0lH\n -----END {kind} SIGNATURE-----\n\nsigned\n"
     );
+    let file: PathBuf = place.write("commit.txt", content.as_bytes());
+    let commit: String = place.git(
+        repository,
+        &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()],
+    );
+    place.git(repository, &["update-ref", "refs/heads/main", &commit]);
+    place.git(repository, &["reset", "-q", "--hard", &commit]);
+    commit
+}
+
+#[test]
+fn the_checks_run_no_signature_program_of_the_configuration() {
+    let place = Place::new();
+    let upstream: PathBuf = place.repository("upstream");
+    signed_commit(&place, &upstream, "PGP");
+    let pinned: String = signed_commit(&place, &upstream, "SSH");
+    place.write("pkg/Package.swift", b"// swift-tools-version:5.9\n");
+    let unit: PathBuf = place.join("pkg/.build");
+    fs::create_dir_all(unit.join("checkouts")).unwrap();
+    place.git(
+        &unit.join("checkouts"),
+        &["clone", "-q", upstream.to_str().unwrap(), "dep"],
+    );
+    let checkout: PathBuf = unit.join("checkouts/dep");
+    place.git(&checkout, &["checkout", "-q", "--detach", &pinned]);
+    let package = Package {
+        place,
+        upstream,
+        unit,
+        checkout,
+        pinned,
+    };
+    package.pin("dep", &package.pinned.clone());
+
+    let pgp_marker: PathBuf = package.place.join("pgp-ran");
+    let ssh_marker: PathBuf = package.place.join("ssh-ran");
+    let pgp_program: PathBuf = package.place.join("pgp.sh");
+    let ssh_program: PathBuf = package.place.join("ssh.sh");
+    marker_program(&pgp_program, &pgp_marker);
+    marker_program(&ssh_program, &ssh_marker);
+    package.git(&["config", "log.showSignature", "true"]);
+    package.git(&["config", "gpg.program", pgp_program.to_str().unwrap()]);
+    package.git(&["config", "gpg.ssh.program", ssh_program.to_str().unwrap()]);
+    package.git(&[
+        "config",
+        "gpg.ssh.allowedSignersFile",
+        package.place.join("allowed").to_str().unwrap(),
+    ]);
+    // The fixture runs the programs for a plain `git log`.
+    package.git(&["log", "--format=%h"]);
+    assert!(pgp_marker.exists() && ssh_marker.exists());
+    fs::remove_file(&pgp_marker).unwrap();
+    fs::remove_file(&ssh_marker).unwrap();
+
+    assert_eq!(package.check(), Verdict::Clear);
+    assert!(!pgp_marker.exists(), "the checks ran gpg.program");
+    assert!(!ssh_marker.exists(), "the checks ran gpg.ssh.program");
 }

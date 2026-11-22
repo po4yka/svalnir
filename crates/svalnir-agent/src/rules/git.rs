@@ -31,9 +31,13 @@
 //! terminal prompt, no optional lock, no lazy fetch of a partial clone, and
 //! no replacement object. The command line sets the keys of the
 //! configuration of the repository that can run a program for these
-//! commands, and the command-line value has precedence over the file:
-//! `core.fsmonitor` is off, `core.hooksPath` is `/dev/null`, and
-//! `protocol.allow=never`. A `protocol.NAME.allow` key of the repository
+//! commands ([`FIXED_ARGUMENTS`]), and the command-line value has
+//! precedence over each file, also over a file that `include.path` or
+//! `includeIf` adds: `core.fsmonitor` is off, `core.hooksPath` is
+//! `/dev/null`, `log.showSignature` is off (with it, `git log` runs the
+//! verification program of a signed commit), `gpg.program`,
+//! `gpg.ssh.program`, and `gpg.x509.program` are `/usr/bin/false`,
+//! `credential.helper` is empty, and `protocol.allow=never`. A `protocol.NAME.allow` key of the repository
 //! has precedence over `protocol.allow`, so the environment variable
 //! `GIT_ALLOW_PROTOCOL` with a list that names no protocol is the control
 //! that permits no transport: Git then ignores each `protocol.*` key. Git
@@ -50,12 +54,25 @@
 //! `~/.config/git/ignore`). A path that only that file ignores is then not
 //! ignored for a query, which gives fewer ignored paths: the safe failure.
 //!
-//! No query of this module compares the content of a work tree with the
-//! index (`git status`, `git diff-files`): such a comparison can run a
-//! clean filter that the configuration of the repository names. The one
-//! caller that runs `git status`, the check of a checkout of Swift Package
-//! Manager (`rules::nested_git::swiftpm`), first refuses a repository whose
-//! configuration names a filter driver.
+//! The other keys that can run a program do not apply to the commands of
+//! the callers, or have another control:
+//!
+//! - `core.pager` and `pager.*`: `--no-pager` and `GIT_PAGER=cat`.
+//! - `core.sshCommand`, `core.askPass`, `credential.*`, and the transport
+//!   keys: no command of a caller uses a transport, `GIT_ALLOW_PROTOCOL`
+//!   permits none, and `GIT_TERMINAL_PROMPT=0`.
+//! - `diff.external` and `diff.*.textconv`: no command of a caller makes a
+//!   diff or a patch.
+//! - `uploadpack.packObjectsHook` and `core.alternateRefsCommand`: only a
+//!   transport or an option that no caller gives uses them.
+//! - `filter.*.clean` and `filter.*.process`: no command-line value turns
+//!   off a filter driver of the configuration. No query of this module
+//!   compares the content of a work tree with the index (`git status`,
+//!   `git diff-files`), which can run such a driver. The one caller that
+//!   runs `git status`, the check of a checkout of Swift Package Manager
+//!   (`rules::nested_git::swiftpm`), first refuses a repository whose
+//!   configuration names a filter driver, and gives
+//!   `--ignore-submodules=all`, so no submodule is examined.
 //!
 //! # Bounds
 //!
@@ -102,8 +119,9 @@ pub const FIXED_ENVIRONMENT: [(&str, &str); 11] = [
     ("GIT_PAGER", "cat"),
 ];
 
-/// The arguments before the command of each query.
-const FIXED_ARGUMENTS: [&str; 8] = [
+/// The arguments before the command of each query. Each `-c` value turns
+/// off a configuration key that can run a program.
+pub const FIXED_ARGUMENTS: [&str; 18] = [
     "--no-optional-locks",
     "--no-pager",
     "-c",
@@ -112,6 +130,21 @@ const FIXED_ARGUMENTS: [&str; 8] = [
     "core.hooksPath=/dev/null",
     "-c",
     "protocol.allow=never",
+    // `git log` with this key verifies each signed commit with the
+    // program of `gpg.*`.
+    "-c",
+    "log.showSignature=false",
+    // A program of the system that does nothing, in place of a
+    // verification program of the configuration.
+    "-c",
+    "gpg.program=/usr/bin/false",
+    "-c",
+    "gpg.ssh.program=/usr/bin/false",
+    "-c",
+    "gpg.x509.program=/usr/bin/false",
+    // An empty value clears the list of credential helpers.
+    "-c",
+    "credential.helper=",
 ];
 
 /// The deadline of one query.

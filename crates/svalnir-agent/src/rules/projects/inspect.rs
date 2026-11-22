@@ -23,11 +23,11 @@ use super::activity::{BuildProcesses, ProcessEvidence};
 use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, ProjectRule};
 use crate::platform::volume::{MountTable, MountTableSource};
 use crate::protection::ProtectedLocations;
-use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit};
+use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit_observed};
 use crate::rules::git::{
     GitFailure, GitOutput, GitTool, GitToolProblem, RepositoryLookup, find_repository,
 };
-use crate::rules::nested_git::{self, DetectionLimits, RepositoryRefusal, Verdict};
+use crate::rules::nested_git::{MarkerObserver, RepositoryRefusal, Verdict};
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
 };
@@ -677,29 +677,22 @@ impl Inspector<'_> {
             ProjectActivity::Active { .. } => return refused("producer_active"),
             ProjectActivity::Unknown { .. } => return refused("activity_unknown"),
         }
-        // A clone with commits or changes that exist nowhere else. The
-        // layouts of this rule have no checkouts of Swift Package Manager.
-        if let Verdict::Refused(refusal) = nested_git::check_unit(
-            path,
-            None,
-            self.host.git,
-            &DetectionLimits {
-                max_depth: self.limits.measure.max_depth,
-                max_entries: self.limits.measure.max_entries_per_unit.get(),
-                ..DetectionLimits::default()
-            },
-            Some(self.cancel),
-        ) {
-            return ProjectUnitOutcome::RepositoryRefused(refusal);
-        }
-        match measure_unit(
+        // The measurement also looks for a clone with commits or changes
+        // that exist nowhere else. The layouts of this rule have no
+        // checkouts of Swift Package Manager, so no exception applies.
+        let mut repositories: MarkerObserver<'_> = MarkerObserver::new(path);
+        match measure_unit_observed(
             path,
             self.limits.measure,
             self.cancel,
             self.clock,
             layout.reclaim,
+            &mut repositories,
         ) {
-            Some(measurement) => ProjectUnitOutcome::Measured(measurement),
+            Some((measurement, result)) => match repositories.verdict(&result) {
+                Verdict::Clear => ProjectUnitOutcome::Measured(measurement),
+                Verdict::Refused(refusal) => ProjectUnitOutcome::RepositoryRefused(refusal),
+            },
             None => refused("unit_not_readable"),
         }
     }

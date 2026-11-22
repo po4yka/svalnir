@@ -13,26 +13,36 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use svalnir_core::config::{SKIPPED_DIRECTORY_NAMES, UserLayout};
 use svalnir_core::policy::ProtectionFact;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::{LayoutSupport, RuleRef};
 use svalnir_core::time::MonotonicNanos;
 
+use super::ProjectRule;
 use super::activity::{BuildProcesses, ProcessEvidence};
+use super::layouts::{
+    DirectoryName, MarkerKind, PROJECT_LAYOUTS, PackageCheckouts, ProjectLayout,
+    USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW,
+};
 use super::recency::{
     AgentListing, ProjectRecency, RecencyHost, RecencyState, SourceReading, assess_with_head,
 };
-use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, ProjectRule};
 use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
 use crate::protection::ProtectedLocations;
-use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit_observed};
+use crate::rules::caches::{
+    CacheMeasurement, InspectionLimits, ReclaimBasis, measure_unit_observed,
+};
 use crate::rules::git::{
     GitFailure, GitOutput, GitTool, GitToolProblem, Repository, RepositoryLookup, find_repository,
 };
 use crate::rules::in_use::{UnitScope, UnitUse, uses_of};
-use crate::rules::nested_git::{MarkerObserver, RepositoryRefusal, Verdict};
+use crate::rules::nested_git::{
+    DetectionLimits, MarkerObserver, RefusalReason, RepositoryRefusal, SwiftPmCheckouts, Verdict,
+    check_unit,
+};
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
 };
@@ -96,6 +106,10 @@ pub struct ProjectHost<'a> {
     pub processes: &'a dyn ProcessEvidence,
     /// The sources and the quiet period of the project activity.
     pub recency: RecencyHost<'a>,
+    /// The layouts of `[[cleanup.projects.layouts]]`, which the
+    /// configuration validated. Each one has the layout name
+    /// `user-configured`.
+    pub layouts: &'a [UserLayout],
 }
 
 /// The bounds of an inspection.
@@ -227,12 +241,6 @@ pub enum ProjectUnitOutcome {
     /// not examine each entry (`docs/CLEANUP_RULES.md` section 6,
     /// "Repositories in a unit"). It is not measured.
     RepositoryRefused(RepositoryRefusal),
-    /// Another rule owns the directory (`docs/CLEANUP_RULES.md` section
-    /// 8). It is not measured.
-    OwnedByOtherRule {
-        /// The identity of that rule.
-        rule: &'static str,
-    },
 }
 
 /// The report of one generated directory.
@@ -242,8 +250,11 @@ pub struct ProjectUnitReport {
     pub path: PathBuf,
     /// The project directory.
     pub project: PathBuf,
-    /// The layout. Empty for a directory of another rule.
+    /// The layout name: a layout of the catalog, or `user-configured`.
     pub layout: &'static str,
+    /// The entry at a protected path of the layout, relative to the unit,
+    /// when the check found one (`protected_child`).
+    pub protected_child: Option<PathBuf>,
     /// The evidence of Git, when the checks came to it.
     pub version_control: Option<VersionControl>,
     /// The process evidence, when the checks came to it.
@@ -285,7 +296,8 @@ pub struct ProjectInspection {
     /// The exact rule revision.
     pub rule: RuleRef,
     /// Each layout of the declaration with its lifecycle state. Each
-    /// layout of this build is `proposed`.
+    /// layout of this build is `proposed`, and `user-configured` permits at
+    /// most a manual mode in each state.
     pub layouts: Vec<LayoutSupport>,
     /// The Git executable.
     pub git: GitAvailability,
@@ -313,18 +325,251 @@ struct Inspector<'a> {
     /// The reading of the Git source of each Git directory, read one time
     /// for the inspection. The unit bound bounds it.
     heads: BTreeMap<PathBuf, SourceReading>,
+    /// The layouts of the catalog, then the layouts of the configuration.
+    layouts: Vec<Layout<'a>>,
+    /// The path of each unit of the report. The walk does not enter it.
+    matched: BTreeSet<PathBuf>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
 }
 
-/// The names of the directories that the walk does not enter: the Git
-/// directory and the generated directories of each layout.
-fn is_not_entered(name: &OsStr, names: &BTreeSet<OsString>) -> bool {
-    name == ".git"
-        || PROJECT_LAYOUTS
-            .iter()
-            .any(|layout| name == layout.directory)
-        || (name == CARGO_TARGET.0 && names.contains(OsStr::new(CARGO_TARGET.1)))
+/// One layout as the inspection uses it: a layout of the catalog or of the
+/// configuration.
+#[derive(Debug, Clone)]
+struct Layout<'a> {
+    id: &'static str,
+    directory: &'a str,
+    markers: Vec<(&'a str, MarkerKind)>,
+    inner_marker: Option<&'a str>,
+    protected: Vec<&'a str>,
+    name: DirectoryName,
+    checkouts: PackageCheckouts,
+    reclaim: ReclaimBasis,
+    owner_workflow: &'static str,
+    rebuild_impact: &'static str,
+    /// The quiet period of the layout, in place of the period of the host.
+    quiet_period: Option<Nanoseconds>,
+}
+
+impl<'a> Layout<'a> {
+    fn built_in(layout: &'static ProjectLayout) -> Self {
+        Self {
+            id: layout.layout,
+            directory: layout.directory,
+            markers: layout
+                .project_markers
+                .iter()
+                .map(|marker| (marker.name, marker.kind))
+                .collect(),
+            inner_marker: layout.inner_marker,
+            protected: layout.protected.to_vec(),
+            name: layout.name,
+            checkouts: layout.checkouts,
+            reclaim: layout.reclaim,
+            owner_workflow: layout.owner_workflow,
+            rebuild_impact: layout.rebuild_impact,
+            quiet_period: None,
+        }
+    }
+
+    /// A layout of the configuration. Its name is generic: a directory with
+    /// no marker is not listed. Its markers are regular files.
+    fn configured(layout: &'a UserLayout) -> Self {
+        Self {
+            id: svalnir_core::rule::USER_CONFIGURED_LAYOUT,
+            directory: &layout.directory,
+            markers: layout
+                .markers
+                .iter()
+                .map(|marker| (marker.as_str(), MarkerKind::File))
+                .collect(),
+            inner_marker: layout.inner_marker.as_deref(),
+            protected: layout.protected.iter().map(String::as_str).collect(),
+            name: DirectoryName::Generic,
+            checkouts: PackageCheckouts::None,
+            reclaim: ReclaimBasis::AllocatedBytes,
+            owner_workflow: USER_LAYOUT_WORKFLOW,
+            rebuild_impact: USER_LAYOUT_IMPACT,
+            // The validation bounds the period to 90 days, so it fits.
+            quiet_period: layout
+                .quiet_period
+                .and_then(|period| Nanoseconds::try_from(period).ok()),
+        }
+    }
+
+    /// The first name of the directory, which is an entry of the project
+    /// directory.
+    fn first_name(&self) -> &'a str {
+        self.directory.split('/').next().unwrap_or(self.directory)
+    }
+}
+
+/// The layouts of the catalog, then the layouts of `configured`.
+fn catalog(configured: &[UserLayout]) -> Vec<Layout<'_>> {
+    PROJECT_LAYOUTS
+        .iter()
+        .map(Layout::built_in)
+        .chain(configured.iter().map(Layout::configured))
+        .collect()
+}
+
+/// Whether `name` matches `pattern`: `*` matches each sequence of bytes,
+/// also an empty one, `?` matches one byte, and each other byte matches
+/// itself. With `fold`, the case of ASCII letters is ignored.
+pub(super) fn glob_matches(pattern: &[u8], name: &[u8], fold: bool) -> bool {
+    let same = |left: u8, right: u8| {
+        if fold {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
+        }
+    };
+    let (mut at_pattern, mut at_name): (usize, usize) = (0, 0);
+    // The position after the last `*`, and the name position that it
+    // matched up to.
+    let mut star: Option<(usize, usize)> = None;
+    while at_name < name.len() {
+        match (pattern.get(at_pattern), name.get(at_name)) {
+            (Some(b'*'), _) => {
+                at_pattern += 1;
+                star = Some((at_pattern, at_name));
+            }
+            (Some(&byte), Some(&found)) if byte == b'?' || same(byte, found) => {
+                at_pattern += 1;
+                at_name += 1;
+            }
+            _ => match star {
+                Some((after, matched)) => {
+                    at_pattern = after;
+                    at_name = matched + 1;
+                    star = Some((after, matched + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern
+        .get(at_pattern..)
+        .is_some_and(|rest| rest.iter().all(|byte| *byte == b'*'))
+}
+
+/// Whether `marker` is a pattern: it has `*` or `?`.
+fn is_pattern(marker: &str) -> bool {
+    marker.contains(['*', '?'])
+}
+
+/// The result of the search for a protected child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ChildSearch {
+    /// No entry is at a protected path.
+    Clear,
+    /// The entry at a protected path, relative to the unit.
+    Found(PathBuf),
+    /// A directory on the way could not be read completely, or the search
+    /// passed its bound.
+    Unknown,
+}
+
+/// The largest number of directories that the search for the protected
+/// children of one unit reads.
+const MAX_PROTECTED_DIRECTORIES: usize = 4_096;
+
+/// The first entry below `unit` whose path matches one of `patterns`, by
+/// component. The comparison ignores the case of ASCII letters, so it
+/// finds more entries on a volume that ignores case, not fewer. No symbolic
+/// link is followed: only a directory is entered on the way, and the last
+/// component matches an entry of each type.
+pub(super) fn find_protected(unit: &Path, patterns: &[&str]) -> ChildSearch {
+    let mut budget: usize = MAX_PROTECTED_DIRECTORIES;
+    for pattern in patterns {
+        let components: Vec<&str> = pattern.split('/').collect();
+        match search_child(unit, Path::new(""), &components, &mut budget) {
+            ChildSearch::Clear => {}
+            other => return other,
+        }
+    }
+    ChildSearch::Clear
+}
+
+fn search_child(
+    directory: &Path,
+    relative: &Path,
+    components: &[&str],
+    budget: &mut usize,
+) -> ChildSearch {
+    let Some((first, rest)) = components.split_first() else {
+        return ChildSearch::Clear;
+    };
+    if *budget == 0 {
+        return ChildSearch::Unknown;
+    }
+    *budget -= 1;
+    let Ok(entries) = fs::read_dir(directory) else {
+        return ChildSearch::Unknown;
+    };
+    let limit: usize = crate::rules::worktrees::MAX_DIRECTORY_ENTRIES;
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in entries.take(limit + 1) {
+        let Ok(entry) = entry else {
+            return ChildSearch::Unknown;
+        };
+        names.push(entry.file_name());
+    }
+    if names.len() > limit {
+        return ChildSearch::Unknown;
+    }
+    for name in names {
+        if !glob_matches(first.as_bytes(), name.as_encoded_bytes(), true) {
+            continue;
+        }
+        let found: PathBuf = relative.join(&name);
+        if rest.is_empty() {
+            return ChildSearch::Found(found);
+        }
+        let child: PathBuf = directory.join(&name);
+        match lstat(&child) {
+            Ok(snapshot) if snapshot.kind == ObjectKind::Directory => {}
+            Ok(_) => continue,
+            Err(_) => return ChildSearch::Unknown,
+        }
+        match search_child(&child, &found, rest, budget) {
+            ChildSearch::Clear => {}
+            other => return other,
+        }
+    }
+    ChildSearch::Clear
+}
+
+/// Whether the directory `project`, whose entries are `names`, has a marker
+/// of `layout`.
+fn has_marker(layout: &Layout<'_>, project: &Path, names: &BTreeSet<OsString>) -> bool {
+    let is_kind = |name: &OsStr, kind: MarkerKind| {
+        lstat(&project.join(name)).is_ok_and(|found| match kind {
+            MarkerKind::File => found.kind == ObjectKind::RegularFile,
+            MarkerKind::Directory => found.kind == ObjectKind::Directory,
+        })
+    };
+    layout.markers.iter().any(|(marker, kind)| {
+        if is_pattern(marker) {
+            names
+                .iter()
+                .filter(|name| glob_matches(marker.as_bytes(), name.as_encoded_bytes(), false))
+                .any(|name| is_kind(name, *kind))
+        } else {
+            is_kind(OsStr::new(marker), *kind)
+        }
+    })
+}
+
+/// Whether the walk never enters a directory with the name `name`: a
+/// directory of version control or the shared cache directory
+/// ([`SKIPPED_DIRECTORY_NAMES`]). The comparison ignores the case of ASCII
+/// letters.
+fn is_skipped(name: &OsStr) -> bool {
+    SKIPPED_DIRECTORY_NAMES.iter().any(|skipped| {
+        name.as_encoded_bytes()
+            .eq_ignore_ascii_case(skipped.as_bytes())
+    })
 }
 
 /// Whether one path is the other path or is below it, by component.
@@ -464,6 +709,8 @@ impl ProjectRule {
                     uses: None,
                     agents: None,
                     heads: BTreeMap::new(),
+                    layouts: catalog(host.layouts),
+                    matched: BTreeSet::new(),
                     directories: 0,
                     units: Vec::new(),
                 };
@@ -559,10 +806,12 @@ impl Inspector<'_> {
                 .collect();
             self.project(&directory, root, &names);
             for name in &names {
-                if is_not_entered(name, &names) {
+                let child: PathBuf = directory.join(name);
+                // A unit, a directory of version control, and the shared
+                // cache directory are not entered.
+                if is_skipped(name) || self.matched.contains(&child) {
                     continue;
                 }
-                let child: PathBuf = directory.join(name);
                 let Ok(found) = lstat(&child) else {
                     continue;
                 };
@@ -598,16 +847,50 @@ impl Inspector<'_> {
     }
 
     /// The units of the directory `project`, whose entries are `names`.
+    ///
+    /// For each directory of the layouts, the first layout whose marker is
+    /// present gives the unit. With no such layout, a distinctive name gives
+    /// a unit that the checks refuse (`project_marker_missing`), and a
+    /// generic name gives no unit.
     fn project(&mut self, project: &Path, root: &Path, names: &BTreeSet<OsString>) {
-        for layout in &PROJECT_LAYOUTS {
-            if !names.contains(OsStr::new(layout.directory)) || self.stop().is_some() {
+        let mut directories: Vec<&str> = Vec::new();
+        for layout in &self.layouts {
+            if !directories.contains(&layout.directory)
+                && names.contains(OsStr::new(layout.first_name()))
+            {
+                directories.push(layout.directory);
+            }
+        }
+        for directory in directories {
+            if self.stop().is_some() {
+                return;
+            }
+            let path: PathBuf = project.join(directory);
+            // A path of two names needs its second name.
+            if directory.contains('/') && lstat(&path).is_err() {
                 continue;
             }
-            let path: PathBuf = project.join(layout.directory);
+            let chosen: Option<Layout<'_>> = {
+                let mut of_directory = self
+                    .layouts
+                    .iter()
+                    .filter(|layout| layout.directory == directory);
+                of_directory
+                    .clone()
+                    .find(|layout| has_marker(layout, project, names))
+                    .or_else(|| {
+                        of_directory.find(|layout| layout.name == DirectoryName::Distinctive)
+                    })
+                    .cloned()
+            };
+            let Some(layout) = chosen else {
+                continue;
+            };
             let mut report: ProjectUnitReport = ProjectUnitReport {
                 path: path.clone(),
                 project: project.to_path_buf(),
-                layout: layout.layout,
+                layout: layout.id,
+                protected_child: None,
                 version_control: None,
                 activity: None,
                 uses: None,
@@ -616,37 +899,86 @@ impl Inspector<'_> {
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
             };
-            report.outcome = self.unit(layout, project, root, &path, &mut report);
+            report.outcome = self.unit(&layout, project, root, names, &path, &mut report);
+            self.matched.insert(path);
             self.units.push(report);
         }
-        let (target, manifest) = CARGO_TARGET;
-        if names.contains(OsStr::new(target))
-            && names.contains(OsStr::new(manifest))
-            && self.stop().is_none()
+    }
+
+    /// The checks of the objects of one unit: the directories on the way,
+    /// the unit, the project marker, the inner marker, and the protected
+    /// children. The error is the stable reason of the refusal.
+    fn shape(
+        &self,
+        layout: &Layout<'_>,
+        project: &Path,
+        names: &BTreeSet<OsString>,
+        path: &Path,
+        report: &mut ProjectUnitReport,
+    ) -> Result<(), &'static str> {
+        let Ok(parent) = lstat(project) else {
+            return Err("project_not_readable");
+        };
+        // Each directory between the project and the unit, for a path of
+        // two names, is a directory of the user on the same device, not a
+        // symbolic link.
+        let mut between: PathBuf = project.to_path_buf();
+        let mut components = layout.directory.split('/').peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                break;
+            }
+            between.push(component);
+            match lstat(&between) {
+                Ok(found)
+                    if found.kind == ObjectKind::Directory
+                        && found.owner == self.host.principal
+                        && found.object.device == parent.object.device => {}
+                Ok(_) => return Err("unit_path_not_plain"),
+                Err(_) => return Err("unit_not_readable"),
+            }
+        }
+        let snapshot: ObjectSnapshot = match lstat(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err("unit_absent"),
+            Err(_) => return Err("unit_not_readable"),
+        };
+        match snapshot.kind {
+            ObjectKind::Directory => {}
+            ObjectKind::SymbolicLink => return Err("unit_symbolic_link"),
+            _ => return Err("unit_not_directory"),
+        }
+        if snapshot.owner != self.host.principal {
+            return Err("unit_owner");
+        }
+        if snapshot.object.device != parent.object.device {
+            return Err("unit_device");
+        }
+        if !has_marker(layout, project, names) {
+            return Err("project_marker_missing");
+        }
+        if let Some(inner) = layout.inner_marker
+            && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
         {
-            self.units.push(ProjectUnitReport {
-                path: project.join(target),
-                project: project.to_path_buf(),
-                layout: "",
-                version_control: None,
-                activity: None,
-                uses: None,
-                recency: None,
-                outcome: ProjectUnitOutcome::OwnedByOtherRule {
-                    rule: CARGO_RULE_ID,
-                },
-                owner_workflow: "Run `cargo clean` in the workspace. Svalnir does not run it. The rule `cargo.build-output` owns this directory.",
-                rebuild_impact: "The next build compiles the workspace and its dependencies again.",
-            });
+            return Err("unsupported_layout");
+        }
+        match find_protected(path, &layout.protected) {
+            ChildSearch::Clear => Ok(()),
+            ChildSearch::Found(child) => {
+                report.protected_child = Some(child);
+                Err("protected_child")
+            }
+            ChildSearch::Unknown => Err("protected_child_unknown"),
         }
     }
 
     /// The checks of one unit, in sequence, and its measurement.
     fn unit(
         &mut self,
-        layout: &ProjectLayout,
+        layout: &Layout<'_>,
         project: &Path,
         root: &Path,
+        names: &BTreeSet<OsString>,
         path: &Path,
         report: &mut ProjectUnitReport,
     ) -> ProjectUnitOutcome {
@@ -665,35 +997,8 @@ impl Inspector<'_> {
         {
             return refused("unit_excluded");
         }
-        let Ok(parent) = lstat(project) else {
-            return refused("project_not_readable");
-        };
-        let snapshot: ObjectSnapshot = match lstat(path) {
-            Ok(snapshot) => snapshot,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return refused("unit_absent"),
-            Err(_) => return refused("unit_not_readable"),
-        };
-        match snapshot.kind {
-            ObjectKind::Directory => {}
-            ObjectKind::SymbolicLink => return refused("unit_symbolic_link"),
-            _ => return refused("unit_not_directory"),
-        }
-        if snapshot.owner != self.host.principal {
-            return refused("unit_owner");
-        }
-        if snapshot.object.device != parent.object.device {
-            return refused("unit_device");
-        }
-        let has_marker: bool = layout.project_markers.iter().any(|marker| {
-            lstat(&project.join(marker)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
-        });
-        if !has_marker {
-            return refused("project_marker_missing");
-        }
-        if let Some(inner) = layout.inner_marker
-            && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
-        {
-            return refused("unsupported_layout");
+        if let Err(reason) = self.shape(layout, project, names, path, report) {
+            return refused(reason);
         }
         let (version_control, repository): (VersionControl, Option<Repository>) =
             self.version_control(project, root, path);
@@ -708,7 +1013,7 @@ impl Inspector<'_> {
         let Some(repository) = repository else {
             return refused("version_control_unknown");
         };
-        let recency: ProjectRecency = self.recency(&repository);
+        let recency: ProjectRecency = self.recency(&repository, layout.quiet_period);
         let busy: bool = recency.state == RecencyState::Busy;
         report.recency = Some(recency);
         if busy {
@@ -727,8 +1032,9 @@ impl Inspector<'_> {
             return refused(reason);
         }
         // The measurement also looks for a clone with commits or changes
-        // that exist nowhere else. The layouts of this rule have no
-        // checkouts of Swift Package Manager, so no exception applies.
+        // that exist nowhere else. For a layout with the checkouts of Swift
+        // Package Manager, a unit with a repository is examined again with
+        // the exception of `docs/CLEANUP_RULES.md` section 6.
         let mut repositories: MarkerObserver<'_> = MarkerObserver::new(path);
         match measure_unit_observed(
             path,
@@ -740,10 +1046,57 @@ impl Inspector<'_> {
         ) {
             Some((measurement, result)) => match repositories.verdict(&result) {
                 Verdict::Clear => ProjectUnitOutcome::Measured(measurement),
-                Verdict::Refused(refusal) => ProjectUnitOutcome::RepositoryRefused(refusal),
+                Verdict::Refused(refusal) => {
+                    match self.package_checkouts(layout, project, names, path, &refusal) {
+                        Some(Verdict::Clear) => ProjectUnitOutcome::Measured(measurement),
+                        Some(Verdict::Refused(refusal)) => {
+                            ProjectUnitOutcome::RepositoryRefused(refusal)
+                        }
+                        None => ProjectUnitOutcome::RepositoryRefused(refusal),
+                    }
+                }
             },
             None => refused("unit_not_readable"),
         }
+    }
+
+    /// The verdict of the exception for the checkouts of Swift Package
+    /// Manager, for a unit whose measurement found a repository, or `None`
+    /// when the exception does not apply: the layout has no checkouts, the
+    /// refusal is not a repository, or no one package, workspace, or
+    /// project gives the pins.
+    fn package_checkouts(
+        &self,
+        layout: &Layout<'_>,
+        project: &Path,
+        names: &BTreeSet<OsString>,
+        path: &Path,
+        refusal: &RepositoryRefusal,
+    ) -> Option<Verdict> {
+        if refusal.reason != RefusalReason::NestedRepository {
+            return None;
+        }
+        let checkouts: SwiftPmCheckouts = match layout.checkouts {
+            PackageCheckouts::None => return None,
+            PackageCheckouts::PackageBuild => SwiftPmCheckouts::of_package_build(path)?,
+            PackageCheckouts::XcodeDerivedData => {
+                SwiftPmCheckouts::of_xcode_project(path, &pin_container(project, names)?)?
+            }
+        };
+        let limits: DetectionLimits = DetectionLimits {
+            max_duration: self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(DetectionLimits::default().max_duration),
+            ..DetectionLimits::default()
+        };
+        Some(check_unit(
+            path,
+            Some(&checkouts),
+            self.host.git,
+            &limits,
+            Some(self.cancel),
+        ))
     }
 
     /// Whether Git ignores the unit at `path` and tracks no path in it,
@@ -821,8 +1174,11 @@ impl Inspector<'_> {
     /// The project activity of `repository`. The Paseo listing is read one
     /// time for the inspection, and the Git source one time for each Git
     /// directory.
-    fn recency(&mut self, repository: &Repository) -> ProjectRecency {
-        let host: RecencyHost<'_> = self.host.recency;
+    fn recency(&mut self, repository: &Repository, quiet: Option<Nanoseconds>) -> ProjectRecency {
+        let mut host: RecencyHost<'_> = self.host.recency;
+        if let Some(quiet) = quiet {
+            host.quiet_period = quiet;
+        }
         let git: SourceReading = *self
             .heads
             .entry(repository.git_dir.clone())
@@ -894,4 +1250,32 @@ impl Inspector<'_> {
             }
         }
     }
+}
+
+/// The package, workspace, or project beside a `DerivedData` directory of
+/// a project whose pins its checkouts have: `Package.swift`, else the one
+/// `*.xcworkspace`, else the one `*.xcodeproj`. `None` when no one of them
+/// is beside it.
+fn pin_container(project: &Path, names: &BTreeSet<OsString>) -> Option<PathBuf> {
+    let is = |name: &OsStr, kind: ObjectKind| {
+        lstat(&project.join(name)).is_ok_and(|found| found.kind == kind)
+    };
+    if is(OsStr::new("Package.swift"), ObjectKind::RegularFile) {
+        return Some(project.to_path_buf());
+    }
+    for extension in ["xcworkspace", "xcodeproj"] {
+        let found: Vec<&OsString> = names
+            .iter()
+            .filter(|name| {
+                Path::new(name).extension() == Some(OsStr::new(extension))
+                    && is(name, ObjectKind::Directory)
+            })
+            .collect();
+        match found.as_slice() {
+            [one] => return Some(project.join(one)),
+            [] => {}
+            _ => return None,
+        }
+    }
+    None
 }

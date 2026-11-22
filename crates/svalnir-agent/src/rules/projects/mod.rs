@@ -29,19 +29,33 @@
 //!
 //! # A name is not sufficient
 //!
-//! A directory with the name `node_modules`, `.venv`, or `Pods` is a unit
-//! only when the parent has the project marker of its layout as a regular
-//! file, and the unit has the inner marker of its layout when the layout
-//! has one. It is a candidate of a future manual mode only when Git
-//! ignores it and the index of the repository has no path in it, so a
-//! committed directory with the same name is never a unit. A Cargo
-//! `target` directory belongs to `cargo.build-output` (section 8): the
-//! inspection names that rule for it and does not measure it.
+//! The layouts are data ([`PROJECT_LAYOUTS`], and the layouts of the
+//! configuration with the layout name `user-configured`). A directory with
+//! the name of a layout is a unit only when the directory that holds it has
+//! a project marker of the layout (a name or a pattern such as `*.csproj`),
+//! the unit has the inner marker of the layout when the layout has one, and
+//! the unit has no entry at a protected path of the layout. It is a
+//! candidate of a future manual mode only when Git ignores it and the index
+//! of the repository has no path in it, so a committed directory with the
+//! same name is never a unit. A directory with a generic name, such as
+//! `build`, and no marker is an ordinary directory, which the walk enters.
+//! A Cargo `target` directory is the layout `cargo-target`; the rule
+//! `cargo.build-output` is retired and its identity stays reserved.
+//!
+//! # Layouts of the configuration
+//!
+//! `[[cleanup.projects.layouts]]` supplies more layouts as parameters of
+//! this rule. Each check applies to them unchanged. Their layout name
+//! `user-configured` never permits an automatic mode
+//! ([`svalnir_core::rule::LayoutSupport::permits`]).
 
 mod activity;
 mod inspect;
+mod layouts;
 mod recency;
 
+#[cfg(test)]
+mod layouts_tests;
 #[cfg(test)]
 mod recency_tests;
 #[cfg(test)]
@@ -55,7 +69,7 @@ use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
 use svalnir_core::rule::{
     ActivityCheck, ActivityProtocol, AgeBasis, ApprovedRoot, DeletionMethod, LayoutSupport,
     LifecycleState, OwnerAttribution, Retention, RootBase, Rule, RuleBudget, RuleDeclaration,
-    RuleExclusions, RuleMode, RuleOwner, RuleRef,
+    RuleExclusions, RuleMode, RuleOwner, RuleRef, USER_CONFIGURED_LAYOUT,
 };
 
 pub use activity::{
@@ -68,6 +82,10 @@ pub use inspect::{
     ProjectLimits, ProjectUnitOutcome, ProjectUnitReport, SearchCompletion, SearchRootOutcome,
     SearchRootReport, SearchRoots, VersionControl,
 };
+pub use layouts::{
+    DirectoryName, MarkerKind, PROJECT_LAYOUT_COUNT, PROJECT_LAYOUTS, PackageCheckouts,
+    ProjectLayout, ProjectMarker, USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW,
+};
 pub use recency::{
     ActivitySource, AgentListing, AgentReading, AgentStatus, ClaudeTranscripts, GitHeadActivity,
     HeadActivity, MAX_FOLDER_UNITS, MAX_PASEO_OUTPUT, MAX_TRANSCRIPT_ENTRIES,
@@ -76,79 +94,13 @@ pub use recency::{
     assess_with_head, encode_folder, quiet_period,
 };
 
-use super::caches::ReclaimBasis;
 use super::registry::RegistryError;
 
 /// The identity of the rule.
 pub const PROJECT_RULE_ID: &str = "project.dependency-directory";
 
 /// The revision of the rule.
-pub const PROJECT_RULE_REVISION: &str = "r1";
-
-/// The rule that owns a Cargo `target` directory (section 8). The
-/// inspection names it and does not measure the directory.
-pub const CARGO_RULE_ID: &str = "cargo.build-output";
-
-/// One layout of the rule: the name of the generated directory, the
-/// project marker in its parent, and the marker in the unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProjectLayout {
-    /// The name of the generated directory in the project directory.
-    pub directory: &'static str,
-    /// The layout name of the declaration.
-    pub layout: &'static str,
-    /// The names of the project markers. One of them must be a regular
-    /// file in the parent.
-    pub project_markers: &'static [&'static str],
-    /// A regular file that the unit must have, when the layout has one.
-    pub inner_marker: Option<&'static str>,
-    /// What the reclaim figure of a measured unit is.
-    pub reclaim: ReclaimBasis,
-    /// The owner workflow, as a text for the user. Svalnir does not run it.
-    pub owner_workflow: &'static str,
-    /// The consequence of a removal.
-    pub rebuild_impact: &'static str,
-}
-
-/// The layouts of the rule, in the sequence of the specification.
-pub const PROJECT_LAYOUTS: [ProjectLayout; 3] = [
-    ProjectLayout {
-        directory: "node_modules",
-        layout: "node-modules",
-        project_markers: &["package.json"],
-        inner_marker: None,
-        // pnpm and Bun link package files from a store with hard links or
-        // clones, so the size of the directory is not its exclusive
-        // storage.
-        reclaim: ReclaimBasis::LinkedIntoProjects,
-        owner_workflow: "Remove the directory in the project, then run the install command of the package manager of the project (`npm install`, `pnpm install`, or `yarn install`) when you need it again. Svalnir does not run them.",
-        rebuild_impact: "The next install downloads or links each package again, and can run the install scripts of the packages.",
-    },
-    ProjectLayout {
-        directory: ".venv",
-        layout: "python-venv",
-        project_markers: &["pyproject.toml"],
-        inner_marker: Some("pyvenv.cfg"),
-        // uv can link files from its cache into an environment with clones
-        // or hard links.
-        reclaim: ReclaimBasis::LinkedIntoProjects,
-        owner_workflow: "Remove the environment, then make it again with the tool of the project (for example `uv sync` or `python3 -m venv .venv` and an install). Svalnir does not run them.",
-        rebuild_impact: "The next sync makes the environment again and downloads each package that no cache has. Packages that a person installed by hand are not in the project files and are lost.",
-    },
-    ProjectLayout {
-        directory: "Pods",
-        layout: "cocoapods-pods",
-        project_markers: &["Podfile"],
-        inner_marker: Some("Manifest.lock"),
-        reclaim: ReclaimBasis::AllocatedBytes,
-        owner_workflow: "Remove the directory, then run `pod install` in the project when you need it again. Svalnir does not run it.",
-        rebuild_impact: "The next `pod install` downloads each pod that the cache of CocoaPods does not have, and needs sources that are still available.",
-    },
-];
-
-/// The directory name and the project marker of the output of Cargo,
-/// which [`CARGO_RULE_ID`] owns.
-pub const CARGO_TARGET: (&str, &str) = ("target", "Cargo.toml");
+pub const PROJECT_RULE_REVISION: &str = "r2";
 
 const MINUTE: u64 = 60_000_000_000;
 const DAY: u64 = 86_400_000_000_000;
@@ -164,6 +116,18 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
     let path = |text: &str| {
         LosslessPath::from_bytes(text).map_err(|_| RegistryError::Declaration("a path"))
     };
+    // One root for each directory of the catalog: two layouts can have the
+    // same directory, for example `target`.
+    let mut roots: Vec<ApprovedRoot> = Vec::new();
+    for layout in &PROJECT_LAYOUTS {
+        let root: ApprovedRoot = ApprovedRoot {
+            base: RootBase::UserSelected,
+            relative: path(layout.directory)?,
+        };
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
     Ok(RuleDeclaration {
         reference: RuleRef {
             id: RuleId::new(PROJECT_RULE_ID)
@@ -175,22 +139,19 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
             producer: "project".to_owned(),
             attribution: OwnerAttribution::ProducerLayout,
         },
+        // The layouts of the catalog, then the one layout of the layouts of
+        // the configuration. Each one is `proposed`; `user-configured`
+        // permits at most a manual mode also after a promotion.
         layouts: PROJECT_LAYOUTS
             .iter()
+            .map(|layout| layout.layout)
+            .chain([USER_CONFIGURED_LAYOUT])
             .map(|layout| LayoutSupport {
-                layout: layout.layout.to_owned(),
+                layout: layout.to_owned(),
                 lifecycle: LifecycleState::Proposed,
             })
             .collect(),
-        roots: PROJECT_LAYOUTS
-            .iter()
-            .map(|layout| {
-                Ok(ApprovedRoot {
-                    base: RootBase::UserSelected,
-                    relative: path(layout.directory)?,
-                })
-            })
-            .collect::<Result<Vec<ApprovedRoot>, RegistryError>>()?,
+        roots,
         retention: Retention {
             age_basis: AgeBasis::FilesystemMetadata,
             minimum_age: Nanoseconds::new(7 * DAY),

@@ -317,6 +317,21 @@ struct HistoryView {
 struct ProjectCleanupView {
     quiet_period: Nanoseconds,
     paseo_agents: bool,
+    /// The `[[cleanup.projects.layouts]]` tables. Each one has the layout
+    /// name `user-configured`, which never permits an automatic action.
+    layouts: Vec<UserLayoutView>,
+}
+
+/// One `[[cleanup.projects.layouts]]` table.
+#[derive(Debug, Clone, Serialize)]
+struct UserLayoutView {
+    directory: String,
+    markers: Vec<String>,
+    inner_marker: Option<String>,
+    protected: Vec<String>,
+    /// The quiet period of the layout, or `None` for the period of the
+    /// table.
+    quiet_period: Option<Nanoseconds>,
 }
 
 /// The `[cleanup]` table.
@@ -379,6 +394,20 @@ impl ShowView {
                     quiet_period: Nanoseconds::try_from(projects.quiet_period)
                         .unwrap_or(Nanoseconds::MAX),
                     paseo_agents: projects.paseo_agents,
+                    layouts: projects
+                        .layouts
+                        .iter()
+                        .map(|layout| UserLayoutView {
+                            directory: layout.directory.clone(),
+                            markers: layout.markers.clone(),
+                            inner_marker: layout.inner_marker.clone(),
+                            protected: layout.protected.clone(),
+                            // The validation bounds the period to 90 days.
+                            quiet_period: layout.quiet_period.map(|period| {
+                                Nanoseconds::try_from(period).unwrap_or(Nanoseconds::MAX)
+                            }),
+                        })
+                        .collect(),
                 },
             },
             history: HistoryView {

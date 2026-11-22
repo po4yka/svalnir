@@ -178,11 +178,11 @@ fn the_registry_has_thirteen_rules_and_each_layout_is_proposed() {
     assert_eq!(rules.len(), 13);
     let statuses = registry.statuses();
     // One layout for each of the two rules, two for `pnpm.content-store`
-    // and for `yarn.cache`, one for each other cache rule, three for
-    // `project.dependency-directory`, two for `simulator.devices` and for
-    // `container.build-cache`, and one for `homebrew.cleanup` and for
-    // `git.linked-worktree`.
-    assert_eq!(statuses.len(), 19);
+    // and for `yarn.cache`, one for each other cache rule, 32 for
+    // `project.dependency-directory` (the catalog and `user-configured`),
+    // two for `simulator.devices` and for `container.build-cache`, and one
+    // for `homebrew.cleanup` and for `git.linked-worktree`.
+    assert_eq!(statuses.len(), 48);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);

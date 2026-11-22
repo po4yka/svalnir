@@ -310,7 +310,7 @@ fn selected_rule<'a>(registry: &'a ReviewedRules, name: &str) -> Result<&'a Rule
     let validated: bool = found
         .layouts
         .iter()
-        .any(|layout| layout.lifecycle.permits(&RuleMode::ManualEviction));
+        .any(|layout| layout.permits(&RuleMode::ManualEviction));
     if !validated {
         return Err(ErrorBody::new(
             "rule_mode_not_validated",

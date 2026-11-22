@@ -92,8 +92,38 @@ The `[cleanup.projects]` table holds the settings of the project activity of [CL
 | --- | --- | --- | --- |
 | `quiet_period` | Duration, 1 hour to 90 days | `"24h"` | The time with no project activity after which a project is `quiet` |
 | `paseo_agents` | Boolean | `false` | `true` turns on the Paseo source. A project is then `busy` while Paseo lists a running or starting agent in it, and each project is `busy` when the listing fails |
+| `layouts` | Array of tables, at most 16 | None | The user-configured layouts of `project.dependency-directory` ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 12, "User-configured layouts") |
 
-A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds.
+A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds, and each layout in the list `cleanup.projects.layouts`, with its quiet period in nanoseconds or `null`.
+
+Each `[[cleanup.projects.layouts]]` table (owner decision of 2026-11-22) is a parameter of the reviewed rule, not a rule. It has these keys:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `directory` | String, required | The generated directory, relative to the project directory: one name, or two names with `/` between them |
+| `markers` | Array of 1 to 8 strings, required | The project markers. One of them must be a regular file in the directory that holds the first name of `directory`. A marker can be a pattern with `*` and `?` |
+| `inner_marker` | String | A regular file that the unit must have |
+| `protected` | Array of at most 8 strings | Paths relative to the unit, of at most 4 components, each a name or a pattern with `*` and `?`. A unit with an entry at one of them is refused |
+| `quiet_period` | Duration, 1 hour to 90 days | The quiet period of the projects of this layout, in place of `quiet_period` of the table |
+
+The validation refuses each of these before activation, with the finding code in parentheses:
+
+- A `directory` that is absolute, that starts with `~`, that has more than two names, an empty, `.`, or `..` component, a pattern, `\`, `[`, `]`, or a control character, or a component longer than 255 bytes (`invalid_path`).
+- A `directory` with a component of the skip list of the walk (`.git`, `.hg`, `.jj`, `.svn`, and `.cache`), or with the name of a protected location of the home directory: a personal folder of the default `[protections]` list (section 12), `Library`, or `Applications` (`invalid_path`). The comparisons ignore the case of ASCII letters.
+- A second table with the same `directory`, with the case of ASCII letters ignored (`duplicate_identifier`).
+- An absent `directory` or `markers` (`missing_key`), an empty `markers` list, a marker with `/`, a marker of `*` and `?` only, and a marker of the skip list (`invalid_path`).
+- An `inner_marker` with `/` or a pattern, and a protected path that is absolute or has an empty, `.`, or `..` component (`invalid_path`).
+- More than 16 tables or more than 8 entries in a list (`too_many_entries`), a `quiet_period` outside the range (`out_of_range`), and an unknown key (`unknown_key`).
+
+A user-configured layout has the layout name `user-configured`. It is never used by an automatic operation, in each lifecycle state, and each check of the rule applies to it unchanged. For example:
+
+```toml
+[[cleanup.projects.layouts]]
+directory = "builddir"
+markers = ["meson.build"]
+protected = ["meson-private/install.dat"]
+quiet_period = "3d"
+```
 
 ## 4. Illustrative complete policy values
 

@@ -37,6 +37,7 @@
 
 mod check;
 mod finding;
+mod layout;
 mod path;
 mod reader;
 mod schema;
@@ -51,9 +52,10 @@ pub use path::{ConfigPath, ConfigPathError, ExpandPathError, MAX_PATH_BYTES, Pat
 pub use reader::{MAX_FINDINGS, MAX_LIST_ENTRIES};
 pub use schema::{
     AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, Cleanup, DiskExclusions,
-    DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD, MIN_QUIET_PERIOD,
-    MemoryGuard, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy, SCHEMA_VERSION,
-    ValidatedConfig, VolumeSelector,
+    DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_LAYOUT_ENTRIES, MAX_QUIET_PERIOD,
+    MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, MemoryGuard, PROTECTED_HOME_NAMES, Privacy, Profile,
+    ProjectCleanup, Protections, RestartPolicy, SCHEMA_VERSION, SKIPPED_DIRECTORY_NAMES,
+    UserLayout, ValidatedConfig, VolumeSelector,
 };
 pub use template::{PERSONAL_FOLDERS, TEMPLATE_REVISION};
 pub use validate::{MAX_APP_BUDGETS, MAX_DOCUMENT_BYTES, Validation, parse_and_validate};

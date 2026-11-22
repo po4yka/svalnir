@@ -366,6 +366,68 @@ pub struct ProjectCleanup {
     pub quiet_period: Duration,
     /// True when the Paseo source of the project activity is on.
     pub paseo_agents: bool,
+    /// The `[[cleanup.projects.layouts]]` tables, in the sequence of the
+    /// document. The template has none.
+    pub layouts: Vec<UserLayout>,
+}
+
+/// The largest number of `[[cleanup.projects.layouts]]` tables.
+pub const MAX_USER_LAYOUTS: usize = 16;
+
+/// The largest number of `markers` and of `protected` paths of one layout.
+pub const MAX_LAYOUT_ENTRIES: usize = 8;
+
+/// The names that the walk of `project.dependency-directory` never enters
+/// and that a layout of the configuration cannot name: the directories of
+/// version control and the shared cache directory
+/// (`docs/CLEANUP_RULES.md` section 12).
+pub const SKIPPED_DIRECTORY_NAMES: [&str; 5] = [".git", ".hg", ".jj", ".svn", ".cache"];
+
+/// The names of the protected locations of the home directory that a
+/// layout of the configuration cannot name in a component: the names of
+/// the personal folders of the template of `[protections]`, `Library`, and
+/// `Applications`.
+pub const PROTECTED_HOME_NAMES: [&str; 11] = [
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+    "Library",
+    "Applications",
+    "Mobile Documents",
+    "CloudStorage",
+];
+
+/// One `[[cleanup.projects.layouts]]` table: a layout of
+/// `project.dependency-directory` that the user supplies
+/// (`docs/CLEANUP_RULES.md` section 12, "User-configured layouts").
+///
+/// It is a parameter of the reviewed rule, not a rule: each check of the
+/// rule applies to it unchanged, its layout name is `user-configured`, and
+/// it is never used by an automatic operation. The validation makes sure
+/// of the grammar of each field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UserLayout {
+    /// The generated directory, relative to the project directory: one
+    /// name, or two names with `/` between them.
+    pub directory: String,
+    /// The project markers. One of them must be a regular file in the
+    /// directory that holds the first name of `directory`. A marker can be
+    /// a pattern with `*` and `?`.
+    pub markers: Vec<String>,
+    /// A regular file that the unit must have, when the table gives one.
+    pub inner_marker: Option<String>,
+    /// The protected children: paths relative to the unit, each component
+    /// a name or a pattern with `*` and `?`. A unit with an entry at one of
+    /// them is refused.
+    pub protected: Vec<String>,
+    /// The quiet period of the projects of this layout, when the table
+    /// gives one, in place of `[cleanup.projects].quiet_period`.
+    pub quiet_period: Option<Duration>,
 }
 
 /// The `[cleanup]` table: the settings of the cleanup rules. A setting

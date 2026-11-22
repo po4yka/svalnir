@@ -3,6 +3,7 @@
 //! The two example documents come from the specification files at compile
 //! time, thus a change to an example in a document runs against this module.
 
+use std::fmt::Write as _;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1252,4 +1253,254 @@ fn the_project_cleanup_settings_have_template_values_and_a_bounded_quiet_period(
         FindingCode::UnknownKey,
         "cleanup.projects.quiet",
     );
+}
+
+/// A document with one `[[cleanup.projects.layouts]]` table with `body`.
+fn layout_document(body: &str) -> String {
+    format!("schema_version = 1\n\n[[cleanup.projects.layouts]]\n{body}\n")
+}
+
+#[test]
+fn a_user_layout_is_read_with_each_field() {
+    let config: ValidatedConfig = valid(&format!(
+        "{}\n[[cleanup.projects.layouts]]\ndirectory = \"vendor/cache2\"\nmarkers = [\"Gemfile\"]\n",
+        layout_document(
+            "directory = \"out\"\nmarkers = [\"meson.build\", \"*.meson\"]\ninner_marker = \"meson-info.json\"\nprotected = [\"keep\", \"*/release\"]\nquiet_period = \"2h\""
+        )
+    ));
+    let layouts = &config.cleanup().projects.layouts;
+    assert_eq!(layouts.len(), 2);
+    assert_eq!(layouts[0].directory, "out");
+    assert_eq!(layouts[0].markers, ["meson.build", "*.meson"]);
+    assert_eq!(layouts[0].inner_marker.as_deref(), Some("meson-info.json"));
+    assert_eq!(layouts[0].protected, ["keep", "*/release"]);
+    assert_eq!(layouts[0].quiet_period, Some(Duration::from_hours(2)));
+    assert_eq!(layouts[1].directory, "vendor/cache2");
+    assert_eq!(layouts[1].inner_marker, None);
+    assert_eq!(layouts[1].protected, Vec::<String>::new());
+    assert_eq!(layouts[1].quiet_period, None);
+    assert!(config.is_explicit("cleanup.projects.layouts"));
+    // The template has no layout.
+    assert_eq!(
+        valid(example(POLICY_SPEC)).cleanup().projects.layouts,
+        Vec::new()
+    );
+}
+
+#[test]
+fn each_invalid_directory_of_a_user_layout_has_a_finding() {
+    let directory = "cleanup.projects.layouts[0].directory";
+    let cases: Vec<(&str, FindingCode, String)> = vec![
+        (
+            "directory = \"/abs\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"../up\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"a/../b\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"a/b/c\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"a//b\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"~/x\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \".git\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"x/.GIT\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \".cache\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \".jj\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"Documents\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"library/x\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"out*\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "directory = \"a\\\\b\"\nmarkers = [\"m\"]",
+            FindingCode::InvalidPath,
+            directory.to_owned(),
+        ),
+        (
+            "markers = [\"m\"]",
+            FindingCode::MissingKey,
+            directory.to_owned(),
+        ),
+    ];
+    for (body, code, path) in cases {
+        assert_one(&layout_document(body), code, &path);
+    }
+}
+
+#[test]
+fn each_invalid_key_of_a_user_layout_has_a_finding() {
+    let markers = "cleanup.projects.layouts[0].markers";
+    let first = |key: &str| format!("cleanup.projects.layouts[0].{key}");
+    let cases: Vec<(&str, FindingCode, String)> = vec![
+        (
+            "directory = \"out\"",
+            FindingCode::MissingKey,
+            markers.to_owned(),
+        ),
+        (
+            "directory = \"out\"\nmarkers = []",
+            FindingCode::InvalidPath,
+            markers.to_owned(),
+        ),
+        (
+            "directory = \"out\"\nmarkers = \"m\"",
+            FindingCode::WrongType,
+            markers.to_owned(),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"sub/m\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"*\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\", \"*?\"]",
+            FindingCode::InvalidPath,
+            first("markers[1]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\"]",
+            FindingCode::TooManyEntries,
+            markers.to_owned(),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\ninner_marker = \"a/b\"",
+            FindingCode::InvalidPath,
+            first("inner_marker"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\ninner_marker = \"*.tag\"",
+            FindingCode::InvalidPath,
+            first("inner_marker"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\nprotected = [\"a/../b\"]",
+            FindingCode::InvalidPath,
+            first("protected[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\nprotected = [\"a/b/c/d/e\"]",
+            FindingCode::InvalidPath,
+            first("protected[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\nprotected = [\"/abs\"]",
+            FindingCode::InvalidPath,
+            first("protected[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\nquiet_period = \"30m\"",
+            FindingCode::OutOfRange,
+            first("quiet_period"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"m\"]\nautomatic = true",
+            FindingCode::UnknownKey,
+            first("automatic"),
+        ),
+    ];
+    for (body, code, path) in cases {
+        assert_one(&layout_document(body), code, &path);
+    }
+}
+
+#[test]
+fn the_user_layouts_are_bounded_and_have_distinct_directories() {
+    // A second layout with the same directory, in another case.
+    assert_one(
+        &format!(
+            "{}\n[[cleanup.projects.layouts]]\ndirectory = \"OUT\"\nmarkers = [\"m\"]\n",
+            layout_document("directory = \"out\"\nmarkers = [\"m\"]")
+        ),
+        FindingCode::DuplicateIdentifier,
+        "cleanup.projects.layouts[1].directory",
+    );
+    // At most 16 layouts.
+    let mut many: String = String::from("schema_version = 1\n");
+    for index in 0..=super::MAX_USER_LAYOUTS {
+        write!(
+            many,
+            "\n[[cleanup.projects.layouts]]\ndirectory = \"out{index}\"\nmarkers = [\"m\"]\n"
+        )
+        .unwrap();
+    }
+    assert_one(
+        &many,
+        FindingCode::TooManyEntries,
+        "cleanup.projects.layouts",
+    );
+    // A value that is not an array of tables.
+    assert_one(
+        "schema_version = 1\n[cleanup.projects]\nlayouts = \"out\"\n",
+        FindingCode::WrongType,
+        "cleanup.projects.layouts",
+    );
+}
+
+#[test]
+fn the_user_layout_example_of_the_policy_spec_validates() {
+    let block: &str = POLICY_SPEC
+        .split("```toml\n")
+        .skip(1)
+        .filter_map(|rest| rest.split("\n```").next())
+        .find(|block| block.starts_with("[[cleanup.projects.layouts]]"))
+        .expect("the document has a layout example");
+    let config: ValidatedConfig = valid(&format!("schema_version = 1\n\n{block}\n"));
+    let layout = &config.cleanup().projects.layouts[0];
+    assert_eq!(layout.directory, "builddir");
+    assert_eq!(layout.quiet_period, Some(Duration::from_hours(72)));
 }

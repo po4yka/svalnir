@@ -168,7 +168,7 @@ impl AuthoritySource for SharedAuthority {
                 .filter(|rule| {
                     rule.layouts
                         .iter()
-                        .any(|layout| layout.lifecycle.permits(&RuleMode::ManualEviction))
+                        .any(|layout| layout.permits(&RuleMode::ManualEviction))
                 })
                 .map(|rule| rule.reference.clone())
                 .collect()

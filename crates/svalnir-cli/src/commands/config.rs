@@ -312,6 +312,19 @@ struct HistoryView {
     redact_exported_paths: bool,
 }
 
+/// The `[cleanup.projects]` table.
+#[derive(Debug, Clone, Serialize)]
+struct ProjectCleanupView {
+    quiet_period: Nanoseconds,
+    paseo_agents: bool,
+}
+
+/// The `[cleanup]` table.
+#[derive(Debug, Clone, Serialize)]
+struct CleanupView {
+    projects: ProjectCleanupView,
+}
+
 /// The `[privacy]` table.
 #[derive(Debug, Clone, Serialize)]
 struct PrivacyView {
@@ -334,6 +347,7 @@ pub(crate) struct ShowView {
     /// The guard tables, the `[agent]` timing, and the `[protections]`
     /// table, as `policy show` gives them.
     policies: Vec<PolicyDescription>,
+    cleanup: CleanupView,
     history: HistoryView,
     privacy: PrivacyView,
     /// The keys that the document gives. Each other value comes from the
@@ -346,6 +360,7 @@ impl ShowView {
     pub(crate) fn new(source: SourceView, config: &ValidatedConfig) -> Self {
         let history = config.history();
         let privacy = config.privacy();
+        let projects = &config.cleanup().projects;
         Self {
             source,
             active: false,
@@ -357,6 +372,15 @@ impl ShowView {
                 .iter()
                 .map(|id| policy::show_policy(config, *id))
                 .collect(),
+            cleanup: CleanupView {
+                projects: ProjectCleanupView {
+                    // The validation bounds the period to 90 days, so it
+                    // fits.
+                    quiet_period: Nanoseconds::try_from(projects.quiet_period)
+                        .unwrap_or(Nanoseconds::MAX),
+                    paseo_agents: projects.paseo_agents,
+                },
+            },
             history: HistoryView {
                 // A validated duration fits; a value that does not fit shows
                 // as the largest value.

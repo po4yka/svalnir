@@ -7,7 +7,7 @@
 //! and removes nothing. The inspection reports each generated directory
 //! with its evidence: the project marker, whether Git ignores it and
 //! tracks no file in it, the activity of the build processes of the
-//! project, and its measured size.
+//! project, the project activity, and its measured size.
 //!
 //! # Search roots
 //!
@@ -17,6 +17,15 @@
 //! itself is not a search root. The walk is bounded by depth, by entries,
 //! and by time, follows no symbolic link, and does not cross into another
 //! device.
+//!
+//! # Project activity
+//!
+//! The inspection assesses the project activity of each unit that Git
+//! ignores (`docs/CLEANUP_RULES.md` section 6): the reflog of `HEAD`, the
+//! Claude Code transcripts, and, when the configuration turns it on, the
+//! Paseo agents. A busy project refuses its unit. A quiet or active project
+//! does not: the state is evidence for a later selection, and
+//! [`ProjectRecency::fact`] gives its value for predicate 5.
 //!
 //! # A name is not sufficient
 //!
@@ -31,7 +40,10 @@
 
 mod activity;
 mod inspect;
+mod recency;
 
+#[cfg(test)]
+mod recency_tests;
 #[cfg(test)]
 mod tests;
 
@@ -55,6 +67,13 @@ pub use inspect::{
     GitAvailability, MAX_SEARCH_ROOTS, ProjectActivity, ProjectHost, ProjectInspection,
     ProjectLimits, ProjectUnitOutcome, ProjectUnitReport, SearchCompletion, SearchRootOutcome,
     SearchRootReport, SearchRoots, VersionControl,
+};
+pub use recency::{
+    ActivitySource, AgentListing, AgentReading, AgentStatus, ClaudeTranscripts, GitHeadActivity,
+    HeadActivity, MAX_FOLDER_UNITS, MAX_PASEO_OUTPUT, MAX_TRANSCRIPT_ENTRIES,
+    MAX_TRANSCRIPT_FOLDERS, PASEO_ARGUMENTS, PASEO_CANDIDATES, PASEO_DEADLINE, PaseoAgents,
+    ProjectRecency, RecencyHost, RecencyState, SourceReading, TranscriptActivity, assess,
+    assess_with_head, encode_folder, quiet_period,
 };
 
 use super::caches::ReclaimBasis;

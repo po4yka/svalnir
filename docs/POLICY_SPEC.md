@@ -76,7 +76,24 @@ For an application budget:
 
 The fast sampling interval must fit the maximum qualification gap and decision freshness limit. Ordinary graceful termination requires a positive grace period. Immediate force is a distinct authorized disposable-workload strategy, not an accidental consequence of `grace_period = "0s"`.
 
+For the project rules:
+
+```text
+1h <= quiet_period <= 90d
+```
+
 `plan_ttl` bounds a plan that the agent prepares automatically. It must allow the intended grace interval; it does not guarantee that later escalation will still be valid. `manual_plan_ttl` bounds a plan that a user prepares and reviews before approval, and it must be long enough for that review. Both values are finite and positive. Expiry, permission loss, or a cleared trigger can stop a later step, and an expired plan of either type requires a new plan.
+
+### Cleanup rule settings
+
+The `[cleanup.projects]` table holds the settings of the project activity of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 6 ("Project activity"):
+
+| Key | Type | Template value | Meaning |
+| --- | --- | --- | --- |
+| `quiet_period` | Duration, 1 hour to 90 days | `"24h"` | The time with no project activity after which a project is `quiet` |
+| `paseo_agents` | Boolean | `false` | `true` turns on the Paseo source. A project is then `busy` while Paseo lists a running or starting agent in it, and each project is `busy` when the listing fails |
+
+A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds.
 
 ## 4. Illustrative complete policy values
 
@@ -154,6 +171,10 @@ footprint_recover = "3GiB"
 over_limit_for = "30s"
 cooldown = "10m"
 restart = "never"
+
+[cleanup.projects]
+quiet_period = "24h"
+paseo_agents = false
 
 [history]
 retention = "30d"

@@ -220,8 +220,9 @@ fn is_protected(metadata: &fs::Metadata) -> bool {
 }
 
 /// The resolved path of `path` when it is an executable regular file that
-/// passes the checks of [`GitTool::locate`].
-fn verified(path: &Path) -> Result<PathBuf, GitToolProblem> {
+/// passes the checks of [`GitTool::locate`]. The Paseo source of the
+/// project activity uses the same checks.
+pub(in crate::rules) fn verified(path: &Path) -> Result<PathBuf, GitToolProblem> {
     let resolved: PathBuf = match fs::canonicalize(path) {
         Ok(resolved) => resolved,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -387,52 +388,74 @@ impl GitTool {
             command.arg(prefixed("--work-tree=", work_tree));
         }
         command.args(arguments);
-        // A process group of its own, so that a stop reaches each child of
-        // Git too.
-        command.process_group(0);
-        let deadline: Instant = Instant::now() + limit;
-        let mut child: Child = command.spawn().map_err(|_| GitFailure::NotStarted)?;
-        let Some(stdout) = child.stdout.take() else {
-            stop_group(&mut child);
-            return Err(GitFailure::NotStarted);
-        };
-        let (sender, receiver) = mpsc::channel();
-        let started = thread::Builder::new()
-            .name("svalnir-git-output".to_owned())
-            .spawn(move || {
-                // The receiver can be gone after a timeout; the result is
-                // then not needed.
-                drop(sender.send(read_bounded(stdout, max_output)));
-            });
-        if started.is_err() {
-            stop_group(&mut child);
-            return Err(GitFailure::ReadFailed);
-        }
-        let status: Result<ExitStatus, GitFailure> = wait_until(&mut child, deadline);
-        // A child of Git can hold the output open after Git ended. The wait
-        // for the reader is thus bounded too, and the group is stopped
-        // when the bound passes.
-        let bound: Duration = deadline.saturating_duration_since(Instant::now()) + READER_GRACE;
-        let read: Result<(Vec<u8>, bool), GitFailure> = match receiver.recv_timeout(bound) {
-            Ok(read) => read,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                stop_group(&mut child);
-                Err(GitFailure::Timeout)
-            }
-            // The reader ended with no result: it failed.
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(GitFailure::ReadFailed),
-        };
-        let status: ExitStatus = status?;
-        let (stdout, overflow) = read?;
-        let Some(code) = status.code() else {
-            return Err(GitFailure::Signaled);
-        };
-        Ok(GitOutput {
-            code,
-            stdout,
-            truncated: overflow,
-        })
+        run_bounded(command, max_output, limit)
     }
+}
+
+/// Runs `command` in a process group of its own until the deadline
+/// `limit`, with its output read to `max_output` bytes. The caller sets the
+/// executable, the environment, the working directory, the standard input
+/// and error, and the arguments.
+///
+/// At the deadline, or when a child keeps the output open after it, the
+/// whole group is stopped. A caller uses this only for a command that
+/// reads and writes nothing, so a stop leaves no partial change.
+///
+/// # Errors
+///
+/// Returns a [`GitFailure`] when the process does not start, passes the
+/// deadline, ends with a signal, or its output cannot be read.
+pub(in crate::rules) fn run_bounded(
+    mut command: Command,
+    max_output: usize,
+    limit: Duration,
+) -> Result<GitOutput, GitFailure> {
+    command.stdout(Stdio::piped());
+    // A process group of its own, so that a stop reaches each child of
+    // the command too.
+    command.process_group(0);
+    let deadline: Instant = Instant::now() + limit;
+    let mut child: Child = command.spawn().map_err(|_| GitFailure::NotStarted)?;
+    let Some(stdout) = child.stdout.take() else {
+        stop_group(&mut child);
+        return Err(GitFailure::NotStarted);
+    };
+    let (sender, receiver) = mpsc::channel();
+    let started = thread::Builder::new()
+        .name("svalnir-git-output".to_owned())
+        .spawn(move || {
+            // The receiver can be gone after a timeout; the result is
+            // then not needed.
+            drop(sender.send(read_bounded(stdout, max_output)));
+        });
+    if started.is_err() {
+        stop_group(&mut child);
+        return Err(GitFailure::ReadFailed);
+    }
+    let status: Result<ExitStatus, GitFailure> = wait_until(&mut child, deadline);
+    // A child of Git can hold the output open after Git ended. The wait
+    // for the reader is thus bounded too, and the group is stopped
+    // when the bound passes.
+    let bound: Duration = deadline.saturating_duration_since(Instant::now()) + READER_GRACE;
+    let read: Result<(Vec<u8>, bool), GitFailure> = match receiver.recv_timeout(bound) {
+        Ok(read) => read,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            stop_group(&mut child);
+            Err(GitFailure::Timeout)
+        }
+        // The reader ended with no result: it failed.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GitFailure::ReadFailed),
+    };
+    let status: ExitStatus = status?;
+    let (stdout, overflow) = read?;
+    let Some(code) = status.code() else {
+        return Err(GitFailure::Signaled);
+    };
+    Ok(GitOutput {
+        code,
+        stdout,
+        truncated: overflow,
+    })
 }
 
 /// `prefix` followed by `path`, as one argument.

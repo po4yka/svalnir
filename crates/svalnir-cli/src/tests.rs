@@ -899,6 +899,36 @@ fn the_default_proposal_is_the_file_in_the_state_directory() {
 }
 
 #[test]
+fn config_show_has_the_project_cleanup_table() {
+    let (environment, directory) = environment();
+    let state = directory.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let template = svalnir(&["config", "show", "--format", "json"]);
+    assert_eq!(
+        template.envelope()["result"]["cleanup"],
+        serde_json::json!({
+            "projects": {"quiet_period": "86400000000000", "paseo_agents": false}
+        })
+    );
+    std::fs::write(
+        state.join("config.toml"),
+        "schema_version = 1\n[cleanup.projects]\nquiet_period = \"2d\"\npaseo_agents = true\n",
+    )
+    .unwrap();
+    let shown = run_with(&environment, &["config", "show", "--format", "json"]);
+    assert_eq!(shown.status, ExitStatus::Success, "{}", shown.stdout);
+    assert_eq!(
+        shown.envelope()["result"]["cleanup"]["projects"],
+        serde_json::json!({"quiet_period": "172800000000000", "paseo_agents": true})
+    );
+    let text = run_with(&environment, &["config", "show"]);
+    assert_eq!(text.status, ExitStatus::Success);
+    for line in ["cleanup", "projects", "quiet_period", "paseo_agents"] {
+        assert!(text.stdout.contains(line), "{line}: {}", text.stdout);
+    }
+}
+
+#[test]
 fn without_a_file_the_proposal_is_the_built_in_template() {
     let shown = svalnir(&["config", "show", "--format", "json"]);
     assert_eq!(shown.status, ExitStatus::Success, "{}", shown.stdout);
@@ -928,7 +958,7 @@ fn without_a_file_the_proposal_is_the_built_in_template() {
             "{policy}"
         );
     }
-    assert_eq!(envelope["result"]["template_revision"], 2);
+    assert_eq!(envelope["result"]["template_revision"], 3);
 
     let text = svalnir(&["policy", "show", "memory-guard"]);
     assert_eq!(text.status, ExitStatus::Success);

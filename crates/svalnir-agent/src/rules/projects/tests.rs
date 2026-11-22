@@ -13,21 +13,25 @@ use svalnir_core::time::MonotonicNanos;
 use tempfile::TempDir;
 
 use super::{
-    BuildProcesses, NativeProcessEvidence, ProcessEvidence, ProjectActivity, ProjectHost,
-    ProjectInspection, ProjectLimits, ProjectProcess, ProjectUnitOutcome, ProjectUnitReport,
-    SearchCompletion, SearchRootOutcome, SearchRoots, VersionControl, is_build_process,
+    AgentListing, AgentStatus, BuildProcesses, ClaudeTranscripts, GitHeadActivity, HeadActivity,
+    NativeProcessEvidence, ProcessEvidence, ProjectActivity, ProjectHost, ProjectInspection,
+    ProjectLimits, ProjectProcess, ProjectUnitOutcome, ProjectUnitReport, RecencyHost,
+    SearchCompletion, SearchRootOutcome, SearchRoots, SourceReading, TranscriptActivity,
+    VersionControl, is_build_process,
 };
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
 use crate::rules::caches::ReclaimFigure;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
+use crate::rules::git::Repository;
 use crate::rules::git::{GitTool, GitToolProblem};
 use crate::rules::nested_git::{RefusalReason, RepositoryRefusal};
 use crate::rules::resolve_roots;
-use crate::scan::{CancellationToken, WallScanClock};
+use crate::scan::{CancellationToken, ScanClock, WallScanClock};
+use svalnir_core::quantity::Nanoseconds;
 
 /// Process evidence that the test gives.
-struct Fixed(BuildProcesses);
+pub(super) struct Fixed(BuildProcesses);
 
 impl ProcessEvidence for Fixed {
     fn build_processes(&self, _principal: Uid) -> BuildProcesses {
@@ -61,24 +65,58 @@ fn inventory(processes: Vec<ProjectProcess>) -> Fixed {
 }
 
 /// A complete inventory with one process that is not a build process.
-fn quiet() -> Fixed {
+pub(super) fn quiet() -> Fixed {
     inventory(vec![ProjectProcess {
         executable: PathBuf::from("/usr/bin/login"),
         working_directory: None,
     }])
 }
 
+/// Sources of the project activity with no evidence, and no Paseo source.
+pub(super) struct NoActivity;
+
+impl HeadActivity for NoActivity {
+    fn head_activity(&self, _repository: &Repository) -> SourceReading {
+        SourceReading::NoEvidence
+    }
+}
+
+impl TranscriptActivity for NoActivity {
+    fn transcript_activity(&self, _root: &Path) -> SourceReading {
+        SourceReading::NoEvidence
+    }
+}
+
+impl AgentStatus for NoActivity {
+    fn agent_listing(&self) -> AgentListing {
+        AgentListing::Off
+    }
+}
+
+/// The quiet period of the template, 24 hours.
+pub(super) const DAY: Nanoseconds = Nanoseconds::new(86_400_000_000_000);
+
+/// A project activity with no evidence.
+pub(super) fn no_recency() -> RecencyHost<'static> {
+    RecencyHost {
+        quiet_period: DAY,
+        head: &NoActivity,
+        transcripts: &NoActivity,
+        agents: &NoActivity,
+    }
+}
+
 /// A home directory with the search root `Code` in a temporary directory.
-struct Home {
+pub(super) struct Home {
     _directory: TempDir,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     locations: ProtectedLocations,
     principal: Uid,
-    git: GitTool,
+    pub(super) git: GitTool,
 }
 
 impl Home {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let directory: TempDir = TempDir::new().unwrap();
         let path: PathBuf = fs::canonicalize(directory.path()).unwrap();
         let state: PathBuf = path.join("Library/Application Support/Svalnir");
@@ -94,7 +132,7 @@ impl Home {
         }
     }
 
-    fn write(&self, relative: &str, content: &[u8]) -> PathBuf {
+    pub(super) fn write(&self, relative: &str, content: &[u8]) -> PathBuf {
         let path: PathBuf = self.path.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, content).unwrap();
@@ -103,7 +141,7 @@ impl Home {
 
     /// Runs the Git of the test in `directory`, with no configuration of
     /// the host.
-    fn git(&self, directory: &str, arguments: &[&str]) {
+    pub(super) fn git(&self, directory: &str, arguments: &[&str]) {
         let status = Command::new(self.git.executable())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -130,7 +168,7 @@ impl Home {
     }
 
     /// A repository at `directory` with one commit of its files.
-    fn repository(&self, directory: &str) {
+    pub(super) fn repository(&self, directory: &str) {
         fs::create_dir_all(self.path.join(directory)).unwrap();
         self.git(directory, &["init", "-q"]);
         self.git(directory, &["add", "-A"]);
@@ -139,7 +177,7 @@ impl Home {
 
     /// A Node project at `Code/NAME` with an installed package, which Git
     /// ignores.
-    fn node_project(&self, name: &str) -> PathBuf {
+    pub(super) fn node_project(&self, name: &str) -> PathBuf {
         let project: String = format!("Code/{name}");
         self.write(&format!("{project}/package.json"), b"{}");
         self.write(&format!("{project}/.gitignore"), b"node_modules/\n");
@@ -157,6 +195,41 @@ impl Home {
         git: Result<&GitTool, GitToolProblem>,
         limits: ProjectLimits,
     ) -> ProjectInspection {
+        self.inspect_recency(processes, git, limits, &NoActivity, DAY, &WallScanClock)
+    }
+
+    /// The inspection with the native Git and transcript sources of the
+    /// project activity, the Paseo source `agents`, the quiet period
+    /// `quiet_period`, and the clock `clock`.
+    pub(super) fn inspect_recency(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        agents: &dyn AgentStatus,
+        quiet_period: Nanoseconds,
+        clock: &dyn ScanClock,
+    ) -> ProjectInspection {
+        let head = GitHeadActivity::new(git);
+        let transcripts = ClaudeTranscripts::for_home(Some(&self.path));
+        let recency = RecencyHost {
+            quiet_period,
+            head: &head,
+            transcripts: &transcripts,
+            agents,
+        };
+        self.inspect_sources(processes, git, limits, recency, clock)
+    }
+
+    /// The inspection with the sources of the project activity `recency`.
+    pub(super) fn inspect_sources(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        recency: RecencyHost<'_>,
+        clock: &dyn ScanClock,
+    ) -> ProjectInspection {
         let registry: ReviewedRules = ReviewedRules::new().unwrap();
         let host: ProjectHost<'_> = ProjectHost {
             principal: self.principal,
@@ -164,13 +237,14 @@ impl Home {
             user_exclusions: &[],
             git,
             processes,
+            recency,
         };
         registry.projects().inspect(
             host,
             &SearchRoots::new(vec![PathBuf::from("Code")]).unwrap(),
             limits,
             &CancellationToken::new(),
-            &WallScanClock,
+            clock,
         )
     }
 
@@ -180,7 +254,7 @@ impl Home {
 }
 
 /// The report of the unit at `path`.
-fn unit<'a>(inspection: &'a ProjectInspection, path: &Path) -> &'a ProjectUnitReport {
+pub(super) fn unit<'a>(inspection: &'a ProjectInspection, path: &Path) -> &'a ProjectUnitReport {
     inspection
         .units
         .iter()
@@ -188,7 +262,7 @@ fn unit<'a>(inspection: &'a ProjectInspection, path: &Path) -> &'a ProjectUnitRe
         .unwrap_or_else(|| panic!("no unit {}: {:#?}", path.display(), inspection.units))
 }
 
-fn refusal(report: &ProjectUnitReport) -> &'static str {
+pub(super) fn refusal(report: &ProjectUnitReport) -> &'static str {
     match report.outcome {
         ProjectUnitOutcome::Refused { reason } => reason,
         ref other => panic!("the unit was not refused: {other:?}"),
@@ -278,6 +352,7 @@ fn no_search_root_examines_nothing() {
             user_exclusions: &[],
             git: Ok(&home.git),
             processes: &processes,
+            recency: no_recency(),
         },
         &SearchRoots::new(Vec::new()).unwrap(),
         ProjectLimits::default(),
@@ -300,6 +375,7 @@ fn a_search_root_with_the_state_directory_is_refused() {
             user_exclusions: &[],
             git: Ok(&home.git),
             processes: &processes,
+            recency: no_recency(),
         },
         &SearchRoots::new(vec![PathBuf::from("Library"), PathBuf::from("Absent")]).unwrap(),
         ProjectLimits::default(),
@@ -733,6 +809,7 @@ fn a_search_root_in_another_case_has_the_stored_names() {
             user_exclusions: &[],
             git: Ok(&home.git),
             processes: &NativeProcessEvidence,
+            recency: no_recency(),
         },
         &SearchRoots::new(vec![PathBuf::from("code")]).unwrap(),
         ProjectLimits::default(),

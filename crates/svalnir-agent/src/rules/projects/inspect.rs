@@ -5,7 +5,7 @@
 //! [`crate::rules::git`], reads the process table, and measures each unit
 //! with the scanner. It changes nothing and gives no candidate.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -20,13 +20,16 @@ use svalnir_core::rule::{LayoutSupport, RuleRef};
 use svalnir_core::time::MonotonicNanos;
 
 use super::activity::{BuildProcesses, ProcessEvidence};
+use super::recency::{
+    AgentListing, ProjectRecency, RecencyHost, RecencyState, SourceReading, assess_with_head,
+};
 use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, ProjectRule};
 use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
 use crate::protection::ProtectedLocations;
 use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit_observed};
 use crate::rules::git::{
-    GitFailure, GitOutput, GitTool, GitToolProblem, RepositoryLookup, find_repository,
+    GitFailure, GitOutput, GitTool, GitToolProblem, Repository, RepositoryLookup, find_repository,
 };
 use crate::rules::in_use::{UnitScope, UnitUse, uses_of};
 use crate::rules::nested_git::{MarkerObserver, RepositoryRefusal, Verdict};
@@ -91,6 +94,8 @@ pub struct ProjectHost<'a> {
     pub git: Result<&'a GitTool, GitToolProblem>,
     /// The process evidence.
     pub processes: &'a dyn ProcessEvidence,
+    /// The sources and the quiet period of the project activity.
+    pub recency: RecencyHost<'a>,
 }
 
 /// The bounds of an inspection.
@@ -246,6 +251,9 @@ pub struct ProjectUnitReport {
     /// The use check of `docs/CLEANUP_RULES.md` section 6, when the checks
     /// came to it: whether a process of the user uses the unit.
     pub uses: Option<UnitUse>,
+    /// The project activity of `docs/CLEANUP_RULES.md` section 6, when
+    /// the checks came to it. Only a busy project refuses the unit.
+    pub recency: Option<ProjectRecency>,
     /// The result.
     pub outcome: ProjectUnitOutcome,
     /// The owner workflow, as a text for the user. Svalnir does not run
@@ -300,6 +308,11 @@ struct Inspector<'a> {
     processes: BuildProcesses,
     /// The path-use inventory of the current search root, and its scope.
     uses: Option<(UnitScope, PathInventory)>,
+    /// The Paseo listing, read one time when the first unit needs it.
+    agents: Option<AgentListing>,
+    /// The reading of the Git source of each Git directory, read one time
+    /// for the inspection. The unit bound bounds it.
+    heads: BTreeMap<PathBuf, SourceReading>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
 }
@@ -449,6 +462,8 @@ impl ProjectRule {
                     expiry: self.rule().activity.evidence_expiry,
                     processes: host.processes.build_processes(host.principal),
                     uses: None,
+                    agents: None,
+                    heads: BTreeMap::new(),
                     directories: 0,
                     units: Vec::new(),
                 };
@@ -596,6 +611,7 @@ impl Inspector<'_> {
                 version_control: None,
                 activity: None,
                 uses: None,
+                recency: None,
                 outcome: ProjectUnitOutcome::Refused { reason: "" },
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
@@ -615,6 +631,7 @@ impl Inspector<'_> {
                 version_control: None,
                 activity: None,
                 uses: None,
+                recency: None,
                 outcome: ProjectUnitOutcome::OwnedByOtherRule {
                     rule: CARGO_RULE_ID,
                 },
@@ -678,7 +695,8 @@ impl Inspector<'_> {
         {
             return refused("unsupported_layout");
         }
-        let version_control: VersionControl = self.version_control(project, root, path);
+        let (version_control, repository): (VersionControl, Option<Repository>) =
+            self.version_control(project, root, path);
         report.version_control = Some(version_control.clone());
         match version_control {
             VersionControl::Ignored => {}
@@ -686,6 +704,15 @@ impl Inspector<'_> {
             VersionControl::Tracked => return refused("tracked_files"),
             VersionControl::NoRepository => return refused("no_repository"),
             VersionControl::Unknown { .. } => return refused("version_control_unknown"),
+        }
+        let Some(repository) = repository else {
+            return refused("version_control_unknown");
+        };
+        let recency: ProjectRecency = self.recency(&repository);
+        let busy: bool = recency.state == RecencyState::Busy;
+        report.recency = Some(recency);
+        if busy {
+            return refused("project_busy");
         }
         let activity: ProjectActivity = self.activity(project, root);
         report.activity = Some(activity.clone());
@@ -719,17 +746,30 @@ impl Inspector<'_> {
         }
     }
 
-    /// Whether Git ignores the unit at `path` and tracks no path in it.
-    fn version_control(&self, project: &Path, root: &Path, path: &Path) -> VersionControl {
+    /// Whether Git ignores the unit at `path` and tracks no path in it,
+    /// and the repository when the lookup found one.
+    fn version_control(
+        &self,
+        project: &Path,
+        root: &Path,
+        path: &Path,
+    ) -> (VersionControl, Option<Repository>) {
         let unknown = |reason: &'static str| VersionControl::Unknown { reason };
         let Ok(git) = self.host.git else {
-            return unknown("git_not_available");
+            return (unknown("git_not_available"), None);
         };
         let repository = match find_repository(project, root, self.host.principal, &self.mounts) {
             RepositoryLookup::Found(repository) => repository,
-            RepositoryLookup::NotFound => return VersionControl::NoRepository,
-            RepositoryLookup::Unknown(reason) => return unknown(reason),
+            RepositoryLookup::NotFound => return (VersionControl::NoRepository, None),
+            RepositoryLookup::Unknown(reason) => return (unknown(reason), None),
         };
+        let evidence: VersionControl = Self::ignored(git, &repository, path);
+        (evidence, Some(repository))
+    }
+
+    /// The queries of [`Inspector::version_control`] for `repository`.
+    fn ignored(git: &GitTool, repository: &Repository, path: &Path) -> VersionControl {
+        let unknown = |reason: &'static str| VersionControl::Unknown { reason };
         let Ok(relative) = path.strip_prefix(&repository.work_tree) else {
             return unknown("unit_outside_work_tree");
         };
@@ -776,6 +816,21 @@ impl Inspector<'_> {
             Ok(_) => unknown("git_query_failed"),
             Err(failure) => unknown(failure.as_str()),
         }
+    }
+
+    /// The project activity of `repository`. The Paseo listing is read one
+    /// time for the inspection, and the Git source one time for each Git
+    /// directory.
+    fn recency(&mut self, repository: &Repository) -> ProjectRecency {
+        let host: RecencyHost<'_> = self.host.recency;
+        let git: SourceReading = *self
+            .heads
+            .entry(repository.git_dir.clone())
+            .or_insert_with(|| host.head.head_activity(repository));
+        let listing: &AgentListing = self
+            .agents
+            .get_or_insert_with(|| host.agents.agent_listing());
+        assess_with_head(&host, listing, repository, git, self.clock.now().wall)
     }
 
     /// The use of the unit at `path`, from the inventory of the search root.

@@ -50,9 +50,10 @@ pub use finding::{Finding, FindingCode, Location};
 pub use path::{ConfigPath, ConfigPathError, ExpandPathError, MAX_PATH_BYTES, PathBase};
 pub use reader::{MAX_FINDINGS, MAX_LIST_ENTRIES};
 pub use schema::{
-    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, DiskExclusions, DiskGuard,
-    EligibleGroup, GlobalTrigger, History, MemoryGuard, Privacy, Profile, Protections,
-    RestartPolicy, SCHEMA_VERSION, ValidatedConfig, VolumeSelector,
+    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, Cleanup, DiskExclusions,
+    DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD, MIN_QUIET_PERIOD,
+    MemoryGuard, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy, SCHEMA_VERSION,
+    ValidatedConfig, VolumeSelector,
 };
 pub use template::{PERSONAL_FOLDERS, TEMPLATE_REVISION};
 pub use validate::{MAX_APP_BUDGETS, MAX_DOCUMENT_BYTES, Validation, parse_and_validate};

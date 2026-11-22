@@ -528,6 +528,36 @@ The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules
 
 The procedure makes no automatic operation: a clear rule has none. A root that an environment variable moves is not covered by the rule, and the procedure does not set one. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
 
+### Host procedure for the rules with an owner operation
+
+The rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 9 ("Rules with an owner operation") run the fixed cleanup command of their producer (`RunOwnerOperation`, [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7). Only `uv.cache` has the bound `within_scope`; each other rule is manual only, so its last stage is `manual_action_validated` (record identity `VAL-05/RULE/REVISION/LAYOUT/manual`, one record for each rule). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects. The procedure runs the cleanup commands of the producers of that account, so the account must have no work that needs their caches or their old versions. A rule whose producer is not installed on the host is `not_run`.
+
+**Preparation**
+
+1. Log in as the validation user. Record `sw_vers`, `diskutil info /System/Volumes/Data`, `git rev-parse HEAD`, the path and the version of each producer under test (`mise --version`, `uv --version`, `pnpm --version`, `go version`, `brew --version`, `npm --version`, `yarn --version`, `pip3 --version`), and the first line of each executable that is a script.
+2. On a branch, set the lifecycle state of the layouts under validation in `crates/svalnir-agent/src/rules/producers/mod.rs` to `manual_action_validated`, with the `record_id` as the reference. Run `scripts/check.sh`, record its exit status, and build with `cargo build --release --locked`. Install and start the agent of that build (`svalnir agent install`), because an owner plan from a client needs an agent as the holder of the coordinator lock.
+3. `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`, then `svalnir config apply --config ./config.toml --expected-revision none` with `schema_version = 1`.
+4. For each producer, make a disposable project below `~/Validation` and fill the cache of the producer (for example `uv sync`, `pnpm install`, `go build`, `go mod download`, `brew fetch` of one formula, `npm install`, `yarn install`, `pip3 download`); for `mise.installs`, install two versions of one tool and pin one of them in a tracked configuration. Record the cache root that each producer reports and compare it with the scope root of the rule.
+5. Make the guard fixtures: a copy of the configuration of each producer whose cache location names a directory with no producer marker (for example `cache-dir` of `uv.toml` set to `~/Validation/not-a-cache` with one file in it); a file `brew.env` in `$(brew --prefix)/etc/homebrew` that sets `HOMEBREW_CACHE`; and, for `mise.installs`, a tracked configuration on a disk image that is then detached.
+
+**Inspection and consent**
+
+6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: the executable of step 1, with its interpreter for a script; the scope root of step 4 with a size, marked as the whole cache when the command removes only part of it; the kind; and the exact command and environment.
+7. For a rule of the kind `clear`: `svalnir clean plan --mode owner --rule RULE --format json` with no `--include-clear`. Expected: `clear_not_included`, exit `2`, and no plan.
+8. With each fixture of step 5 in place, in turn: make a plan. Expected: `owner_scope_unmarked` for the root with no marker, and the file in it stays; `owner_guard_refused` with the reason `homebrew_env_overrides` for the `brew.env` file; and `owner_guard_refused` with `tracked_config_volume_absent` for the detached disk image. Remove the fixtures afterwards.
+9. With a process of the producer in progress (a build, an install, or a REPL of its interpreter), make a plan and apply it. Expected: the step is skipped because the producer is active, and the command does not run.
+
+**Manual operation**
+
+10. Make a plan with the options of the rule and apply it with `svalnir clean apply --plan PLAN_ID --digest DIGEST`. Expected: the operation completes with the effect `OperationCompleted`, the history has the `scope_allocation` effect with the sizes before and after the command, and the history names no other target. While the command runs, record its process ID and, if the field is present, the responsible process of `sudo launchctl procinfo PID`, which is expected to be the command itself (the responsibility disclaim of owner decision D1 of 2026-11-22).
+11. Change the executable after the plan: make a plan, then replace the executable of step 1 with a copy of itself (a new inode), and apply. Expected: the step is refused before the command runs, and no process of the producer starts.
+12. Stop the agent while a command runs (`svalnir agent pause` does not stop a manual step, so send the signal to the service: `launchctl kill SIGTERM gui/$(id -u)/dev.po4yka.svalnir.agent`). Expected: the command and its family stop, the step is `UnknownOutcome`, and `svalnir operations acknowledge` is refused while a recorded process lives and accepted when none lives.
+13. Regeneration: run the commands of step 4 again. Expected: each succeeds with a network and no manual step. Record the time and the downloaded bytes, which are the rebuild cost of the rule. For `mise.installs`, the pinned version of step 4 stays installed and the other version is gone.
+
+**Not in this procedure**
+
+The procedure runs no automatic operation: no grant of `RunOwnerOperation` exists in this build, so `uv.cache` stays at `manual_action_validated` until a later record covers the disk guard. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
+
 ## 14. Host validation records
 
 This section has the case records of four runs on one host of the project owner. Runs 1 to 3 were made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. That authorization excluded each grant, each enabled guard, and each other application. Run 4 was made under the owner decisions 21 to 24 of 2026-11-20: fixtures only, no service loaded, no host setting changed, and a guard enabled only on a fixture state directory where no agent ran. In each run, no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.

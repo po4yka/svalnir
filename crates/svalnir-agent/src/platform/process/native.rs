@@ -20,6 +20,10 @@
 //! | Working directory | `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, field `pvi_cdir.vip_path` |
 //! | File descriptors | `proc_pidinfo(PROC_PIDLISTFDS)` |
 //! | Socket of a descriptor | `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` |
+//! | File of a descriptor | `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` |
+//! | Mapped files | `proc_pidinfo(PROC_PIDREGIONPATHINFO2)`, confirmed with `PROC_PIDREGIONPATHINFO`, one region per call |
+//! | Arguments | `sysctl(CTL_KERN, KERN_PROCARGS2)`; the environment is not read |
+//! | Owner of a denied process | `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` |
 //!
 //! `responsibility_get_pid_responsible_for_pid` is not in the public SDK.
 //! The adapter finds it with `dlsym` at run time. When the symbol is absent,
@@ -47,8 +51,8 @@ use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
-    ProcessSource, QueryFailure, RawListeningSocket, RawListeningSockets, RawProcessInfo, RawUsage,
-    RunningApplication, SocketFamily, Timebase,
+    ProcessSource, QueryFailure, RawArguments, RawListeningSocket, RawListeningSockets, RawPaths,
+    RawProcessInfo, RawUsage, RunningApplication, SocketFamily, Timebase,
 };
 
 /// The largest number of process IDs that one list can have. The value is
@@ -500,10 +504,12 @@ fn socket_of_descriptor(
     parse_listening_socket(&info)
 }
 
-fn listening_tcp_sockets(
+/// The open file descriptors of `pid`, at most `max_descriptors` of them,
+/// and whether the process has more.
+fn list_descriptors(
     pid: Pid,
     max_descriptors: usize,
-) -> Result<RawListeningSockets, QueryFailure> {
+) -> Result<(Vec<libc::proc_fdinfo>, bool), QueryFailure> {
     if max_descriptors == 0 {
         return Err(QueryFailure::Inconsistent);
     }
@@ -542,10 +548,7 @@ fn listening_tcp_sockets(
             None | Some(0)
         )
     {
-        return Ok(RawListeningSockets {
-            sockets: Vec::new(),
-            descriptors_truncated: false,
-        });
+        return Ok((Vec::new(), false));
     }
     if written <= 0 {
         return Err(last_failure());
@@ -558,10 +561,17 @@ fn listening_tcp_sockets(
     if count > capacity {
         return Err(QueryFailure::Inconsistent);
     }
-    let descriptors_truncated: bool = count > max_descriptors;
-    let examined: usize = count.min(max_descriptors);
+    descriptors.truncate(count.min(max_descriptors));
+    Ok((descriptors, count > max_descriptors))
+}
+
+fn listening_tcp_sockets(
+    pid: Pid,
+    max_descriptors: usize,
+) -> Result<RawListeningSockets, QueryFailure> {
+    let (descriptors, descriptors_truncated) = list_descriptors(pid, max_descriptors)?;
     let mut sockets: Vec<RawListeningSocket> = Vec::new();
-    for descriptor in descriptors.get(..examined).unwrap_or_default() {
+    for descriptor in &descriptors {
         if descriptor.proc_fdtype != libc::PROX_FDTYPE_SOCKET.cast_unsigned() {
             continue;
         }
@@ -573,6 +583,306 @@ fn listening_tcp_sockets(
         sockets,
         descriptors_truncated,
     })
+}
+
+/// `PROC_PIDFDVNODEPATHINFO` in `<sys/proc_info.h>`.
+const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+/// `PROC_PIDREGIONPATHINFO` in `<sys/proc_info.h>`.
+const PROC_PIDREGIONPATHINFO: c_int = 8;
+/// `PROC_PIDREGIONPATHINFO2` of the kernel source (`bsd/sys/proc_info.h`
+/// of XNU): the next region that maps a vnode. The public SDK header does
+/// not declare it. Its result has the layout of `PROC_PIDREGIONPATHINFO`.
+const PROC_PIDREGIONPATHINFO2: c_int = 22;
+/// `sizeof(struct vnode_fdinfowithpath)` in `<sys/proc_info.h>`.
+const VNODE_FDINFOWITHPATH_SIZE: usize = 1200;
+/// `offsetof(struct vnode_fdinfowithpath, pvip.vip_path)`.
+const VNODE_FDINFOWITHPATH_PATH: usize = 176;
+/// `sizeof(struct proc_regionwithpathinfo)` in `<sys/proc_info.h>`.
+const REGIONWITHPATHINFO_SIZE: usize = 1272;
+/// `offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_address)`, a
+/// `uint64_t`.
+const REGION_ADDRESS: usize = 80;
+/// `offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_size)`, a
+/// `uint64_t`.
+const REGION_SIZE: usize = 88;
+/// `offsetof(struct proc_regionwithpathinfo, prp_vip.vip_path)`.
+const REGIONWITHPATHINFO_PATH: usize = 248;
+
+// The sizes and offsets above were measured with `sizeof` and `offsetof`
+// against `<sys/proc_info.h>` of the macOS SDK. Each path field is a
+// `vip_path` of `MAXPATHLEN` bytes, and each one ends inside its structure.
+const _: () = assert!(VNODE_FDINFOWITHPATH_PATH + VNODE_PATH_CAPACITY <= VNODE_FDINFOWITHPATH_SIZE);
+const _: () = assert!(REGIONWITHPATHINFO_PATH + VNODE_PATH_CAPACITY <= REGIONWITHPATHINFO_SIZE);
+const _: () = assert!(REGION_SIZE + 8 <= REGIONWITHPATHINFO_PATH);
+const _: () = assert!(libc::PROX_FDTYPE_VNODE == 1);
+const _: () = assert!(libc::KERN_PROCARGS2 == 49);
+const _: () = assert!(libc::MAXPATHLEN as usize == VNODE_PATH_CAPACITY);
+
+/// A buffer with the size and the alignment of `struct
+/// vnode_fdinfowithpath`. The fields are read at their offsets.
+#[repr(C, align(8))]
+struct FdVnodeBytes([u8; VNODE_FDINFOWITHPATH_SIZE]);
+
+/// A buffer with the size and the alignment of `struct
+/// proc_regionwithpathinfo`. The fields are read at their offsets.
+#[repr(C, align(8))]
+struct RegionBytes([u8; REGIONWITHPATHINFO_SIZE]);
+
+/// The NUL-terminated absolute path of the `vip_path` field at `offset` of
+/// `bytes`. An empty path is `None`: the kernel gave no path for the vnode.
+pub(super) fn vnode_path_at(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<Option<LosslessPath>, QueryFailure> {
+    let field: &[u8] = bytes
+        .get(offset..offset.saturating_add(VNODE_PATH_CAPACITY))
+        .ok_or(QueryFailure::Inconsistent)?;
+    let end: usize = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(QueryFailure::Inconsistent)?;
+    let path: &[u8] = field.get(..end).ok_or(QueryFailure::Inconsistent)?;
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if path.first() != Some(&b'/') {
+        return Err(QueryFailure::Inconsistent);
+    }
+    LosslessPath::from_bytes(path)
+        .map(Some)
+        .map_err(|_| QueryFailure::Inconsistent)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, QueryFailure> {
+    let field: [u8; 8] = bytes
+        .get(offset..offset.saturating_add(8))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    Ok(u64::from_ne_bytes(field))
+}
+
+/// Adds `path` to `paths` when it is not there.
+fn push_unique(paths: &mut Vec<LosslessPath>, path: LosslessPath) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+/// The path of the vnode of one descriptor, or `None` when the descriptor
+/// closed after the list was read or the kernel gives no path.
+fn vnode_of_descriptor(pid: Pid, descriptor: i32) -> Result<Option<LosslessPath>, QueryFailure> {
+    let mut info: FdVnodeBytes = FdVnodeBytes([0; VNODE_FDINFOWITHPATH_SIZE]);
+    let size: c_int =
+        c_int::try_from(VNODE_FDINFOWITHPATH_SIZE).map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: `info` is a live, writable buffer of `size` bytes with the
+    // alignment of `struct vnode_fdinfowithpath`. The kernel writes at most
+    // `size` bytes for `PROC_PIDFDVNODEPATHINFO`.
+    let written: c_int = unsafe {
+        libc::proc_pidfdinfo(
+            pid.get(),
+            descriptor,
+            PROC_PIDFDVNODEPATHINFO,
+            info.0.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            // The descriptor closed, or it is no longer a vnode.
+            Some(libc::EBADF | libc::ENOTSUP | libc::EINVAL | libc::ENOENT) => Ok(None),
+            _ => Err(last_failure()),
+        };
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    vnode_path_at(&info.0, VNODE_FDINFOWITHPATH_PATH)
+}
+
+fn open_file_paths(pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
+    let (descriptors, truncated) = list_descriptors(pid, max_descriptors)?;
+    let mut paths: Vec<LosslessPath> = Vec::new();
+    for descriptor in &descriptors {
+        if descriptor.proc_fdtype != libc::PROX_FDTYPE_VNODE.cast_unsigned() {
+            continue;
+        }
+        if let Some(path) = vnode_of_descriptor(pid, descriptor.proc_fd)? {
+            push_unique(&mut paths, path);
+        }
+    }
+    Ok(RawPaths { paths, truncated })
+}
+
+fn mapped_file_paths_flavor(
+    pid: Pid,
+    max_regions: usize,
+    flavor: c_int,
+) -> Result<RawPaths, QueryFailure> {
+    let size: c_int =
+        c_int::try_from(REGIONWITHPATHINFO_SIZE).map_err(|_| QueryFailure::Overflow)?;
+    let mut paths: Vec<LosslessPath> = Vec::new();
+    let mut address: u64 = 0;
+    for _ in 0..max_regions {
+        let mut info: RegionBytes = RegionBytes([0; REGIONWITHPATHINFO_SIZE]);
+        // SAFETY: `info` is a live, writable buffer of `size` bytes with the
+        // alignment of `struct proc_regionwithpathinfo`. The kernel writes at
+        // most `size` bytes for `PROC_PIDREGIONPATHINFO`. The argument is the
+        // address from which the kernel looks for the next region.
+        let written: c_int = unsafe {
+            libc::proc_pidinfo(
+                pid.get(),
+                flavor,
+                address,
+                info.0.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+        if written <= 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                // No region is at or after the address: the list is at its
+                // end.
+                Some(libc::EINVAL) => Ok(RawPaths {
+                    paths,
+                    truncated: false,
+                }),
+                _ => Err(last_failure()),
+            };
+        }
+        if written != size {
+            return Err(QueryFailure::Inconsistent);
+        }
+        if let Some(path) = vnode_path_at(&info.0, REGIONWITHPATHINFO_PATH)? {
+            push_unique(&mut paths, path);
+        }
+        let start: u64 = read_u64(&info.0, REGION_ADDRESS)?;
+        let length: u64 = read_u64(&info.0, REGION_SIZE)?;
+        let Some(next) = start.checked_add(length) else {
+            // The region ends at the top of the address space.
+            return Ok(RawPaths {
+                paths,
+                truncated: false,
+            });
+        };
+        if next <= address {
+            return Err(QueryFailure::Inconsistent);
+        }
+        address = next;
+    }
+    Ok(RawPaths {
+        paths,
+        truncated: true,
+    })
+}
+
+/// The arguments in a `KERN_PROCARGS2` buffer: an `int` count, the
+/// executable path, NUL padding, and the count of NUL-terminated arguments.
+/// The environment after the arguments is not read. `complete` is false
+/// when the buffer has fewer arguments than the count.
+pub(super) fn parse_procargs(buffer: &[u8], complete: bool) -> Result<RawArguments, QueryFailure> {
+    let count: [u8; 4] = buffer
+        .get(..4)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    let count: usize =
+        usize::try_from(i32::from_ne_bytes(count)).map_err(|_| QueryFailure::Inconsistent)?;
+    let rest: &[u8] = buffer.get(4..).unwrap_or_default();
+    // The executable path, then the padding.
+    let after_path: usize = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(rest.len());
+    let mut position: usize = after_path;
+    while rest.get(position) == Some(&0) {
+        position += 1;
+    }
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(count.min(4096));
+    while values.len() < count {
+        let Some(tail) = rest.get(position..).filter(|tail| !tail.is_empty()) else {
+            break;
+        };
+        let Some(end) = tail.iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        values.push(tail.get(..end).unwrap_or_default().to_vec());
+        position += end + 1;
+    }
+    let truncated: bool = values.len() < count;
+    if truncated && complete {
+        return Err(QueryFailure::Inconsistent);
+    }
+    Ok(RawArguments { values, truncated })
+}
+
+/// The mapped files of `pid`. The query is first the flavor
+/// [`PROC_PIDREGIONPATHINFO2`], which gives only the regions that map a
+/// vnode; on the hosts that were measured it gave the same paths as the
+/// public flavor in about one thirtieth of the time. A result with no path
+/// can also come from a kernel that does not know the flavor, so it is
+/// confirmed with the public flavor [`PROC_PIDREGIONPATHINFO`].
+fn mapped_file_paths(pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+    match mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO2) {
+        Ok(found) if !found.paths.is_empty() || found.truncated => Ok(found),
+        Ok(_) | Err(QueryFailure::Unsupported) => {
+            mapped_file_paths_flavor(pid, max_regions, PROC_PIDREGIONPATHINFO)
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+fn arguments(pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
+    let mut name: [c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.get()];
+    let mut buffer: Vec<u8> = vec![0; max_bytes.max(8)];
+    let mut length: libc::size_t = buffer.len();
+    // SAFETY: `name` is a live array of 3 integers. `buffer` is a live,
+    // writable allocation and `length` holds its size, so the kernel writes
+    // at most that number of bytes. The call sets no new value.
+    let status: c_int = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(last_failure());
+    }
+    let written: &[u8] = buffer.get(..length).ok_or(QueryFailure::Inconsistent)?;
+    // A full buffer can be the start of a longer argument area.
+    parse_procargs(written, length < buffer.len())
+}
+
+fn process_owner(pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+    let mut info: MaybeUninit<libc::proc_bsdshortinfo> = MaybeUninit::zeroed();
+    let size: c_int = c_int::try_from(size_of::<libc::proc_bsdshortinfo>())
+        .map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: `info` is a live, writable `proc_bsdshortinfo` of `size`
+    // bytes. The kernel writes at most `size` bytes for
+    // `PROC_PIDT_SHORTBSDINFO`.
+    let written: c_int = unsafe {
+        libc::proc_pidinfo(
+            pid.get(),
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(last_failure());
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    // SAFETY: the kernel wrote the full structure. Each field is an integer
+    // or an array of integers, so each bit pattern is a valid value.
+    let info: libc::proc_bsdshortinfo = unsafe { info.assume_init() };
+    if i32::try_from(info.pbsi_pid).ok() != Some(pid.get()) {
+        return Err(QueryFailure::Inconsistent);
+    }
+    Ok((Uid::new(info.pbsi_uid), Uid::new(info.pbsi_ruid)))
 }
 
 fn timebase() -> Result<Timebase, QueryFailure> {
@@ -712,5 +1022,21 @@ impl ProcessSource for DarwinProcessSource {
         max_descriptors: usize,
     ) -> Result<RawListeningSockets, QueryFailure> {
         listening_tcp_sockets(pid, max_descriptors)
+    }
+
+    fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+        process_owner(pid)
+    }
+
+    fn open_file_paths(&self, pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
+        open_file_paths(pid, max_descriptors)
+    }
+
+    fn mapped_file_paths(&self, pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+        mapped_file_paths(pid, max_regions)
+    }
+
+    fn arguments(&self, pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
+        arguments(pid, max_bytes)
     }
 }

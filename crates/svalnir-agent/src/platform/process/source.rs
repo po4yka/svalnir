@@ -173,6 +173,40 @@ pub struct RawListeningSockets {
     pub descriptors_truncated: bool,
 }
 
+/// The file paths of one kind that one process uses, from at most a bounded
+/// number of native objects (file descriptors or memory regions).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawPaths {
+    /// The absolute paths, each one time, in the sequence of the kernel.
+    pub paths: Vec<LosslessPath>,
+    /// The process has more objects than the bound, so the objects after
+    /// the bound were not examined.
+    pub truncated: bool,
+}
+
+/// The arguments of the command line of one process.
+///
+/// The values are sensitive. The type has no `Debug` output of the values,
+/// and no serialization. A caller compares them with paths and drops them.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct RawArguments {
+    /// Each argument, `argv[0]` first, as bytes with no NUL.
+    pub values: Vec<Vec<u8>>,
+    /// The arguments are longer than the bound, so the list is not
+    /// complete.
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for RawArguments {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RawArguments")
+            .field("count", &self.values.len())
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The native queries that the inventory uses.
 ///
 /// Each method addresses a process by its PID, because the native API does.
@@ -305,6 +339,66 @@ pub trait ProcessSource {
         max_descriptors: usize,
     ) -> Result<RawListeningSockets, QueryFailure> {
         let _ = (pid, max_descriptors);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The effective and the real user of the process that has this PID
+    /// now, from a query that the system answers also for many processes
+    /// whose identity query it denies.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`process_info`](Self::process_info)
+    /// does.
+    fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+        let _ = pid;
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The paths of the files that the open file descriptors of the
+    /// process refer to, from at most `max_descriptors` descriptors. A
+    /// descriptor that is not a vnode, or that closed during the query, is
+    /// not in the result.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the process does not exist, the query
+    /// is denied, or the source does not supply the query.
+    fn open_file_paths(&self, pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
+        let _ = (pid, max_descriptors);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The paths of the files that the memory regions of the process map,
+    /// from at most `max_regions` regions.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`open_file_paths`](Self::open_file_paths)
+    /// does.
+    fn mapped_file_paths(&self, pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+        let _ = (pid, max_regions);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The arguments of the command line of the process, from at most
+    /// `max_bytes` bytes of the argument area. The environment of the
+    /// process is not read.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`open_file_paths`](Self::open_file_paths)
+    /// does.
+    fn arguments(&self, pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
+        let _ = (pid, max_bytes);
         Err(QueryFailure::Unsupported)
     }
 }

@@ -376,7 +376,7 @@ An admission deadline stops future steps; it cannot make an already-issued nativ
 
 Manual actions have explicit, finite, immutable plan limits and one-shot authorization for the selected mode. They do not consume, reset, or refund automatic incident counters. Their observed effects can contribute to incident recovery.
 
-`MoveToTrash` is the normal manual removal mode. `DeleteSelectedFiles` is a separately authorized manual permanent-removal class. `EvictRegenerableData` is rule-based and can be admitted automatically. A failed Trash operation never silently becomes permanent deletion.
+`MoveToTrash` is the normal manual removal mode. `DeleteSelectedFiles` is a separately authorized manual permanent-removal class. `EvictRegenerableData` is rule-based and can be admitted automatically. `RunOwnerOperation` runs the fixed cleanup command of a producer for a rule; it is manual, and only a bounded `prune` operation can be admitted automatically ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 9). A failed Trash operation never silently becomes permanent deletion.
 
 Distinguish:
 

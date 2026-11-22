@@ -7,15 +7,16 @@
 //! state machine of `docs/ACTION_CONTRACTS.md` section 6 permits.
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use svalnir_core::action::{
     ActionClass, ActionError, ActionStage, Attribution, CapacityEffect, Checked, Correlation,
     DispatchConsumption, DispatchReceipt, DispatchState, Durability, EffectEvidence,
-    EnvelopeContent, ErrorFamily, Escalation, EvidenceBinding, NativeResult, Operation,
-    OperationState, PLAN_SCHEMA_VERSION, PlanTarget, PlannedStep, RequestEnvelope, Reservation,
-    ResourceEffect, StepLimits, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
-    TargetResultRecord, VolatileJournal, VolatileJournalError, WorkCharge,
+    EnvelopeContent, ErrorFamily, Escalation, EvidenceBinding, FileBinding, NativeResult,
+    Operation, OperationState, OwnerOperationBinding, PLAN_SCHEMA_VERSION, PlanTarget, PlannedStep,
+    RequestEnvelope, Reservation, ResourceEffect, StepLimits, StepState, StopReason, TargetBinding,
+    TargetEffect, TargetResult, TargetResultRecord, VolatileJournal, VolatileJournalError,
+    WorkCharge,
 };
 use svalnir_core::grant::{ActionRequest, RefusalReason};
 use svalnir_core::id::{OperationId, StepId, TargetId, VolumeId};
@@ -32,11 +33,13 @@ use super::ports::{CoordinatorJournal, TimeReading, TriggerStanding};
 use crate::executor::fs::{
     AdmittedStep, ExecutionFault, FsTargetOutcome, ProcessedWork, StepOutcome, Stop,
 };
+use crate::executor::owner::{AdmittedOwnerStep, OwnerFault, OwnerOutcome, OwnerStepOutcome};
 use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
 use crate::rules::ProducerActivity;
 use crate::rules::in_use::UnitUse;
+use svalnir_core::rule::RuleRef;
 
 /// The result of one unit of work on the active operation.
 #[derive(Debug)]
@@ -64,6 +67,18 @@ enum StepEnd {
     Stop(StopReason, Option<ActionError>),
     /// The step waits until a time.
     Wait(MonotonicNanos),
+}
+
+/// A filesystem step that an executor can do.
+enum Admitted<'a> {
+    File(AdmittedStep<'a>),
+    Owner(AdmittedOwnerStep<'a>),
+}
+
+/// The result of the executor call of a filesystem step.
+enum CallOutcome {
+    File(StepOutcome),
+    Owner(OwnerStepOutcome),
 }
 
 /// A change of one step.
@@ -320,6 +335,27 @@ fn add_work(totals: &mut WorkTotals, work: &ProcessedWork) {
     totals.exact &= exact;
 }
 
+/// The charge, the rule, and the path of the use check of a step of a
+/// filesystem class: the entry of a file target, or the scope root of an
+/// owner operation. `None` for a target of a process intervention.
+fn filesystem_scope(binding: &TargetBinding) -> Option<(WorkCharge, Option<RuleRef>, PathBuf)> {
+    match binding {
+        TargetBinding::File(file) => Some((
+            file.charge,
+            file.rule.clone(),
+            file.root_path
+                .to_path_buf()
+                .join(file.relative_entry.to_path_buf()),
+        )),
+        TargetBinding::OwnerOperation(owner) => Some((
+            owner.charge,
+            Some(owner.rule.clone()),
+            owner.root_path.to_path_buf(),
+        )),
+        TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+    }
+}
+
 fn is_force(step: &PlannedStep) -> bool {
     matches!(step.action_class, ActionClass::ForceApplicationExit)
 }
@@ -401,6 +437,12 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 self.config.filesystem_adapter.clone(),
                 Reservation::Work {
                     charge: file.charge,
+                },
+            ),
+            TargetBinding::OwnerOperation(owner) => (
+                self.config.owner_adapter.clone(),
+                Reservation::Work {
+                    charge: owner.charge,
                 },
             ),
             // A process target is manual, so its slot has no incident.
@@ -755,20 +797,114 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         )
     }
 
+    /// The target result of an owner step, with the measurements of its
+    /// scope added to the operation.
+    fn owner_result(
+        active: &mut Active,
+        step: &PlannedStep,
+        outcome: OwnerStepOutcome,
+    ) -> Result<TargetResult, Fault> {
+        match outcome {
+            Ok(OwnerOutcome {
+                result,
+                scope,
+                exit_status,
+                diagnostic_tail,
+            }) => {
+                if let Some(scope) = scope {
+                    active
+                        .scope_effects
+                        .push(ResourceEffect::ScopeAllocation(scope));
+                }
+                // The tail is redacted and bounded, and it goes to the log
+                // only: the journal does not keep it.
+                if let Some(tail) = diagnostic_tail {
+                    tracing::info!(
+                        operation = active.operation.operation_id().as_str(),
+                        step = step.step_id.as_str(),
+                        exit_status,
+                        effect = result.effect.as_str(),
+                        tail = tail.as_str(),
+                        "owner operation ended"
+                    );
+                }
+                Ok(result)
+            }
+            Err(fault) if matches!(fault.dispatch, DispatchState::NotSubmitted) => skipped(
+                &step.target_id,
+                StopReason::TargetSkipped,
+                Some(Self::step_error(
+                    active,
+                    step,
+                    code::EXECUTOR_FAULT,
+                    ErrorFamily::Outcome,
+                    ActionStage::Execution,
+                )),
+            ),
+            Err(fault) => {
+                let OwnerFault { dispatch, scope } = *fault;
+                if let Some(scope) = scope {
+                    active
+                        .scope_effects
+                        .push(ResourceEffect::ScopeAllocation(scope));
+                }
+                unknown_outcome(
+                    &step.target_id,
+                    dispatch.clone(),
+                    action_error_with(
+                        code::EXECUTOR_FAULT,
+                        ErrorFamily::Outcome,
+                        ActionStage::Execution,
+                        dispatch,
+                        Some(&active.plan.plan_id),
+                        Some(active.operation.operation_id()),
+                        Some(&step.step_id),
+                    ),
+                )
+            }
+        }
+    }
+
+    /// The fresh check of a step whose target a rule found: the producer of
+    /// the data must be inactive now, and no process of the user may use
+    /// the target at `path`. A producer that became active after the plan
+    /// was made inhibits the step, and nothing stops the producer or the
+    /// process that uses the target. Each later step has its own check.
+    /// `Some` is the code and the family of the refusal.
+    fn fresh_refusal(&self, rule: &RuleRef, path: &Path) -> Option<(&'static str, ErrorFamily)> {
+        match self.authority.producer_activity(rule) {
+            ProducerActivity::Inactive => {}
+            ProducerActivity::Active => {
+                return Some((code::PRODUCER_ACTIVE, ErrorFamily::Eligibility));
+            }
+            ProducerActivity::Unknown => {
+                return Some((code::PRODUCER_ACTIVITY_UNKNOWN, ErrorFamily::Evidence));
+            }
+        }
+        match self.authority.unit_use(path) {
+            UnitUse::NotInUse => None,
+            UnitUse::InUse { .. } => Some((code::UNIT_IN_USE, ErrorFamily::Eligibility)),
+            UnitUse::Unknown { .. } => Some((code::UNIT_USE_UNKNOWN, ErrorFamily::Evidence)),
+        }
+    }
+
+    /// One step of a filesystem class: a file target, or the scope of an
+    /// owner operation (`docs/ACTION_CONTRACTS.md` section 7).
     fn advance_filesystem(
         &mut self,
         active: &mut Active,
         step: &PlannedStep,
         time: &TimeReading,
     ) -> Result<StepEnd, Fault> {
-        let Some(TargetBinding::File(file)) = active
+        let Some(binding) = active
             .plan
             .target(&step.target_id)
             .map(|t| t.binding.clone())
         else {
             return Err(Fault);
         };
-        let charge: Option<WorkCharge> = Some(file.charge);
+        let (charge, rule, use_path) = filesystem_scope(&binding).ok_or(Fault)?;
+        let charge: Option<WorkCharge> = Some(charge);
         if let Some(reason) = self.boundary(active, step, &ActionStage::Intent, time) {
             return Ok(StepEnd::Stop(reason, None));
         }
@@ -786,7 +922,15 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             self.end_without_call(active, step, charge, charged, reason.clone(), None)?;
             return Ok(StepEnd::Stop(reason, None));
         }
-        let Ok(admitted) = AdmittedStep::new(&envelope, &receipt) else {
+        let admitted: Option<Admitted<'_>> = match &binding {
+            TargetBinding::OwnerOperation(_) => AdmittedOwnerStep::new(&envelope, &receipt)
+                .ok()
+                .map(Admitted::Owner),
+            _ => AdmittedStep::new(&envelope, &receipt)
+                .ok()
+                .map(Admitted::File),
+        };
+        let Some(admitted) = admitted else {
             let error = Self::step_error(
                 active,
                 step,
@@ -804,47 +948,20 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             )?;
             return Ok(StepEnd::Next);
         };
-        // The fresh check of an eviction: the producer of the data must be
-        // inactive now. A producer that became active after the plan was
-        // made inhibits the step, and nothing stops the producer. Each
-        // later step has its own check.
-        if let Some(rule) = &file.rule {
-            let refusal: Option<(&str, ErrorFamily)> = match self.authority.producer_activity(rule)
-            {
-                ProducerActivity::Inactive => None,
-                ProducerActivity::Active => Some((code::PRODUCER_ACTIVE, ErrorFamily::Eligibility)),
-                ProducerActivity::Unknown => {
-                    Some((code::PRODUCER_ACTIVITY_UNKNOWN, ErrorFamily::Evidence))
-                }
-            };
-            // The use check of the target: a process of the user that
-            // started to use the unit after the plan was made inhibits the
-            // step. The process is not signaled.
-            let refusal: Option<(&str, ErrorFamily)> = refusal.or_else(|| {
-                let path: PathBuf = file
-                    .root_path
-                    .to_path_buf()
-                    .join(file.relative_entry.to_path_buf());
-                match self.authority.unit_use(&path) {
-                    UnitUse::NotInUse => None,
-                    UnitUse::InUse { .. } => Some((code::UNIT_IN_USE, ErrorFamily::Eligibility)),
-                    UnitUse::Unknown { .. } => {
-                        Some((code::UNIT_USE_UNKNOWN, ErrorFamily::Evidence))
-                    }
-                }
-            });
-            if let Some((code, family)) = refusal {
-                let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
-                self.end_without_call(
-                    active,
-                    step,
-                    charge,
-                    charged,
-                    StopReason::TargetSkipped,
-                    Some(error),
-                )?;
-                return Ok(StepEnd::Next);
-            }
+        if let Some((code, family)) = rule
+            .as_ref()
+            .and_then(|rule| self.fresh_refusal(rule, &use_path))
+        {
+            let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
+            self.end_without_call(
+                active,
+                step,
+                charge,
+                charged,
+                StopReason::TargetSkipped,
+                Some(error),
+            )?;
+            return Ok(StepEnd::Next);
         }
         // The executor call. The status board is not locked here. The
         // executor reads the signal between the entries of a directory
@@ -852,16 +969,26 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         // request, the deadline, the plan expiry, the leases, the trigger,
         // the authorization, and the durable stop fence.
         let stopped: Cell<Option<StopReason>> = Cell::new(None);
-        let outcome: StepOutcome = {
+        let outcome: CallOutcome = {
             let active: &Active = active;
             let signal = || -> Option<Stop> {
                 let halt: Stop = stop_signal_of(&self.final_check(active, step)?);
                 stopped.set(Some(halt.stop_reason()));
                 Some(halt)
             };
-            self.filesystem.execute(&active.roots, admitted, &signal)
+            match admitted {
+                Admitted::File(admitted) => {
+                    CallOutcome::File(self.filesystem.execute(&active.roots, admitted, &signal))
+                }
+                Admitted::Owner(admitted) => {
+                    CallOutcome::Owner(self.owner.execute(&active.roots, admitted, &signal))
+                }
+            }
         };
-        let result: TargetResult = Self::filesystem_result(active, step, outcome)?;
+        let result: TargetResult = match outcome {
+            CallOutcome::File(outcome) => Self::filesystem_result(active, step, outcome)?,
+            CallOutcome::Owner(outcome) => Self::owner_result(active, step, outcome)?,
+        };
         self.settle_called(active, step, vec![result], charge, charged, false)?;
         // A stop inside a directory target ends the operation: the target
         // has the result that the executor gave (no call, a part removed,
@@ -1316,9 +1443,11 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             self.finish(active, Some(time));
             return Advance::Finished;
         };
+        // A file target and the scope of an owner operation are steps of
+        // a filesystem class.
         let is_file: bool = matches!(
             active.plan.target(&step.target_id).map(|t| &t.binding),
-            Some(TargetBinding::File(_))
+            Some(TargetBinding::File(_) | TargetBinding::OwnerOperation(_))
         );
         let end: Result<StepEnd, Fault> = match active.observing.take() {
             Some(observing) => self.advance_observation(&mut active, &step, observing, time),
@@ -1444,9 +1573,10 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         let mut has_application: bool = false;
         for target in &active.plan.targets {
             match &target.binding {
-                TargetBinding::File(file) => {
-                    if !volumes.contains(&file.volume_id) && volumes.len() < MAX_MEASURED_VOLUMES {
-                        volumes.push(file.volume_id.clone());
+                TargetBinding::File(FileBinding { volume_id, .. })
+                | TargetBinding::OwnerOperation(OwnerOperationBinding { volume_id, .. }) => {
+                    if !volumes.contains(volume_id) && volumes.len() < MAX_MEASURED_VOLUMES {
+                        volumes.push(volume_id.clone());
                     }
                 }
                 TargetBinding::Application(_) | TargetBinding::Process(_) => {
@@ -1485,6 +1615,8 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 after: self.measurements.memory_pressure(),
             });
         }
+        // The measurements of a scope belong to their step and stay.
+        effects.extend(active.scope_effects.iter().cloned());
         active.effects = effects;
     }
 
@@ -1513,7 +1645,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     _ => false,
                 }
             }
-            ResourceEffect::Unrecognized => false,
+            ResourceEffect::ScopeAllocation(_) | ResourceEffect::Unrecognized => false,
         });
         if improved {
             Benefit::Observed

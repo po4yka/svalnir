@@ -8,7 +8,11 @@
 //! grant.
 //!
 //! This module has the declaration types and the interface. The registry
-//! and the rules are in `svalnir-agent` (`rules`).
+//! and the rules are in `svalnir-agent` (`rules`). [`owner`] has the
+//! owner-operation declaration of a rule with the deletion method
+//! `producer_operation`.
+
+pub mod owner;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

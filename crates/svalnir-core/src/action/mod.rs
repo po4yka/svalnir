@@ -26,6 +26,7 @@ pub mod error;
 pub mod journal;
 pub mod operation;
 pub mod outcome;
+pub mod owner;
 pub mod plan;
 pub mod reconciliation;
 pub mod state;
@@ -56,6 +57,12 @@ pub use outcome::{
     Attribution, CapacityEffect, CapacityEffectError, EffectEvidence, NativeResult, OutcomeError,
     ResourceEffect, StopReason, TargetEffect, TargetResult, TargetResultRecord, aggregate,
     aggregate_step,
+};
+pub use owner::{
+    EnvironmentEntry, ExecutableBinding, GROUP_OR_OTHER_WRITE, MAX_OWNER_ARGUMENTS,
+    MAX_OWNER_DEADLINE, MAX_OWNER_ENVIRONMENT, MAX_OWNER_TEXT_BYTES, OwnerOperationBinding,
+    OwnerOperationBound, OwnerOperationKind, ScopeAllocationEffect, ScopeAllocationError,
+    ScopeMeasurement, executable_is_trusted, is_environment_name,
 };
 pub use plan::{
     ApplicationBinding, CandidateBindingError, ClientRole, Escalation, ExecutorRole, FileBinding,

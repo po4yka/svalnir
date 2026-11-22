@@ -159,8 +159,12 @@ impl AuthoritySource for SharedAuthority {
             return RevisionSnapshot::default();
         };
         // The rule revisions that can do the mode now. Only the eviction
-        // mode binds a rule.
-        let rules = if matches!(mode, PlanMode::Cleanup(CleanupMode::Evict)) {
+        // mode and an owner operation, which uses the eviction mode of its
+        // rule, bind a rule.
+        let rules = if matches!(
+            mode,
+            PlanMode::Cleanup(CleanupMode::Evict) | PlanMode::Owner(_)
+        ) {
             records
                 .registry
                 .rules()

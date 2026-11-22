@@ -353,7 +353,9 @@ fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
             .iter()
             .filter_map(|target| match &target.binding {
                 TargetBinding::File(binding) => Some(binding),
-                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+                TargetBinding::Application(_)
+                | TargetBinding::Process(_)
+                | TargetBinding::OwnerOperation(_) => None,
             })
     };
     let bound: BTreeSet<&RootId> = bindings().map(|binding| &binding.root_id).collect();
@@ -395,7 +397,9 @@ pub(crate) fn bound_paths(plan: &Plan) -> BTreeMap<TargetId, LosslessPath> {
         .iter()
         .filter_map(|target| match &target.binding {
             TargetBinding::File(binding) => Some((target.target_id.clone(), bound_path(binding)?)),
-            TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+            TargetBinding::Application(_)
+            | TargetBinding::Process(_)
+            | TargetBinding::OwnerOperation(_) => None,
         })
         .collect()
 }
@@ -871,7 +875,9 @@ impl StoredPlan {
             .iter()
             .filter_map(|target| match &target.binding {
                 TargetBinding::File(binding) => Some((&binding.root_id, &binding.root_path)),
-                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+                TargetBinding::Application(_)
+                | TargetBinding::Process(_)
+                | TargetBinding::OwnerOperation(_) => None,
             })
             .collect();
         roots.into_values().cloned().collect()
@@ -963,7 +969,9 @@ pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> 
                     // The path of a file target is in the sealed plan.
                     path: match &target.binding {
                         TargetBinding::File(binding) => bound_path(binding),
-                        TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+                        TargetBinding::Application(_)
+                        | TargetBinding::Process(_)
+                        | TargetBinding::OwnerOperation(_) => None,
                     },
                     estimate: SizeEstimate::default(),
                 })

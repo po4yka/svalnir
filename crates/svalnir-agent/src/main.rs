@@ -303,6 +303,7 @@ mod agent {
             coordinator: CoordinatorConfig {
                 filesystem_adapter: AdapterId::new("svalnir.filesystem").ok()?,
                 process_adapter: AdapterId::new("macos.process").ok()?,
+                owner_adapter: AdapterId::new("svalnir.owner-operation").ok()?,
                 batch_targets: 8,
                 poll_interval: Nanoseconds::new(500_000_000),
                 volatile_capacity: 16,

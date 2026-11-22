@@ -22,6 +22,7 @@ use thiserror::Error;
 use super::budget::WorkCharge;
 use super::checked::{Check, Checked};
 use super::class::{ActionClass, TriggerClass};
+use super::owner::{OwnerOperationBinding, check_owner_binding};
 use super::state::PlanState;
 use crate::authority::{AuthorityBinding, Generation, required_option};
 use crate::digest::ContentDigest;
@@ -47,8 +48,8 @@ use crate::time::{MonotonicNanos, WallTime};
 /// makes a new plan. A plan is valid for a short time in one boot.
 ///
 /// Version 3 added the budget generation to [`Trigger`] and the target of
-/// one process.
-pub const PLAN_SCHEMA_VERSION: u32 = 3;
+/// one process. Version 4 added the target of an owner operation.
+pub const PLAN_SCHEMA_VERSION: u32 = 4;
 
 /// The largest number of targets and of steps in one plan.
 pub const MAX_PLAN_TARGETS: usize = 4096;
@@ -228,16 +229,6 @@ pub struct FileBinding {
     pub charge: WorkCharge,
 }
 
-impl FileBinding {
-    /// Whether `other` names the same approved root with the same
-    /// evidence: the path and the object. The volume and the mount
-    /// generation are those of the entry, and an entry can be on a
-    /// different volume than a second entry of its root.
-    fn has_same_root(&self, other: &Self) -> bool {
-        self.root_path == other.root_path && self.root_object == other.root_object
-    }
-}
-
 /// True when `path` is absolute, has at least one component, and has no
 /// empty, `.`, or `..` component. This is the rule of the plan builder for a
 /// root path. It is also the rule of the filesystem executor, so a sealed
@@ -383,6 +374,8 @@ pub enum TargetBinding {
     Application(ApplicationBinding),
     /// One process with no verified membership.
     Process(ProcessBinding),
+    /// One fixed command of a producer on one measured scope.
+    OwnerOperation(OwnerOperationBinding),
 }
 
 impl TargetBinding {
@@ -395,9 +388,46 @@ impl TargetBinding {
     /// the protections of an instance with one member.
     pub fn processes(&self) -> Option<&[ProcessIdentity]> {
         match self {
-            Self::File(_) => None,
+            Self::File(_) | Self::OwnerOperation(_) => None,
             Self::Application(application) => Some(&application.members),
             Self::Process(binding) => Some(std::slice::from_ref(&binding.process)),
+        }
+    }
+
+    /// The approved root of a file target or of an owner-operation target:
+    /// its identity, its path, and its object. `None` for a process
+    /// target.
+    pub fn root(&self) -> Option<(&RootId, &LosslessPath, &FileObjectEvidence)> {
+        match self {
+            Self::File(file) => Some((&file.root_id, &file.root_path, &file.root_object)),
+            Self::OwnerOperation(owner) => {
+                Some((&owner.root_id, &owner.root_path, &owner.root_object))
+            }
+            Self::Application(_) | Self::Process(_) => None,
+        }
+    }
+
+    /// The admission charge of a file target or of an owner-operation
+    /// target. `None` for a target of a process intervention, which uses
+    /// one application slot.
+    pub fn charge(&self) -> Option<WorkCharge> {
+        match self {
+            Self::File(file) => Some(file.charge),
+            Self::OwnerOperation(owner) => Some(owner.charge),
+            Self::Application(_) | Self::Process(_) => None,
+        }
+    }
+
+    /// The rule revision and the layout of a target that a rule selected.
+    pub fn rule(&self) -> Option<(&RuleRef, &str)> {
+        match self {
+            Self::File(FileBinding {
+                rule: Some(rule),
+                layout: Some(layout),
+                ..
+            }) => Some((rule, layout.as_str())),
+            Self::OwnerOperation(owner) => Some((&owner.rule, owner.layout.as_str())),
+            _ => None,
         }
     }
 }
@@ -572,12 +602,10 @@ pub(super) fn check_file_binding(
     // An entry is a minimum of one item. A charge of no items would use
     // no part of an item limit, and it fits in an exhausted allowance.
     let charge_agrees: bool = file.charge.items != EntryCount::ZERO;
-    if class.is_filesystem()
-        && rule_agrees
-        && layout_agrees
-        && root_agrees
-        && owner_agrees
-        && charge_agrees
+    // An owner operation has its own binding: a file target is not the
+    // scope of a command.
+    let class_agrees: bool = class.takes_file_target();
+    if class_agrees && rule_agrees && layout_agrees && root_agrees && owner_agrees && charge_agrees
     {
         Ok(())
     } else {
@@ -704,11 +732,12 @@ impl PlanContent {
     /// names it has the same root path and the same root object. With
     /// two, the identity would not say which place the approval is for.
     fn check_roots(&self) -> Result<(), PlanError> {
-        let mut roots: BTreeMap<&RootId, &FileBinding> = BTreeMap::new();
+        type Root<'a> = (&'a LosslessPath, &'a FileObjectEvidence);
+        let mut roots: BTreeMap<&RootId, Root<'_>> = BTreeMap::new();
         for target in &self.targets {
-            if let TargetBinding::File(file) = &target.binding {
-                let first: &FileBinding = roots.entry(&file.root_id).or_insert(file);
-                if !first.has_same_root(file) {
+            if let Some((root_id, path, object)) = target.binding.root() {
+                let first: Root<'_> = *roots.entry(root_id).or_insert((path, object));
+                if first != (path, object) {
                     return Err(PlanError::Binding);
                 }
             }
@@ -747,6 +776,17 @@ impl PlanContent {
                 // A process is one target, as a member or by itself.
                 TargetBinding::Process(binding) => {
                     generations.insert(binding.process.generation_id.as_str())
+                }
+                // An owner operation is for its whole scope root: a second
+                // operation or an entry of the same root is the same data.
+                TargetBinding::OwnerOperation(owner) => {
+                    let new_in_root: bool = entries.insert((&owner.root_id, b""));
+                    let new_in_place: bool = placed.insert((&owner.root_object, b""));
+                    let no_entry: bool = !self.targets.iter().any(|other| {
+                        matches!(&other.binding, TargetBinding::File(file)
+                            if file.root_id == owner.root_id || file.root_object == owner.root_object)
+                    });
+                    new_in_root && new_in_place && no_entry
                 }
             };
             if !is_new {
@@ -797,6 +837,23 @@ impl PlanContent {
                 check_file_binding(class, file, self.principal.uid, &self.executor)?;
                 Ok(file.charge)
             }
+            TargetBinding::OwnerOperation(owner) => {
+                // One command for one scope.
+                let [class] = classes.as_slice() else {
+                    return Err(PlanError::StepTarget);
+                };
+                if !matches!(class, ActionClass::RunOwnerOperation) {
+                    return Err(PlanError::Binding);
+                }
+                check_owner_binding(
+                    owner,
+                    self.principal.uid,
+                    &self.executor,
+                    self.trigger.class.is_automatic(),
+                    self.limits.execution_deadline,
+                )?;
+                Ok(owner.charge)
+            }
             binding @ (TargetBinding::Application(_) | TargetBinding::Process(_)) => {
                 use ActionClass::{ForceApplicationExit, RequestApplicationExit};
                 let steps_agree: bool = match (&self.limits.escalation, classes.as_slice()) {
@@ -821,7 +878,9 @@ impl PlanContent {
                     TargetBinding::Process(process) => {
                         check_process_binding(process, uid, &self.executor, &self.trigger.class)?;
                     }
-                    TargetBinding::File(_) => return Err(PlanError::Binding),
+                    TargetBinding::File(_) | TargetBinding::OwnerOperation(_) => {
+                        return Err(PlanError::Binding);
+                    }
                 }
                 Ok(WorkCharge::ZERO)
             }
@@ -912,7 +971,18 @@ impl Check for PlanContent {
                 step.action_class.is_application_intervention()
             }
         });
-        if !classes_agree {
+        // The owner operations of one plan have one kind, so the plan has
+        // one consequence for its approval.
+        let mut owner_kinds = self
+            .targets
+            .iter()
+            .filter_map(|target| match &target.binding {
+                TargetBinding::OwnerOperation(owner) => Some(owner.operation),
+                _ => None,
+            });
+        let first_kind = owner_kinds.next();
+        let kinds_agree: bool = owner_kinds.all(|kind| Some(kind) == first_kind);
+        if !classes_agree || !kinds_agree {
             return Err(PlanError::Steps);
         }
         self.check_limits(is_filesystem, total)?;

@@ -95,6 +95,7 @@ pub const fn class_phrase(class: &ActionClass) -> &'static str {
         ActionClass::ForceApplicationExit => "force an application to quit",
         ActionClass::MoveToTrash => "move files to the Trash",
         ActionClass::DeleteSelectedFiles => "delete files permanently",
+        ActionClass::RunOwnerOperation => "run the cleanup command of a producer",
         ActionClass::Unrecognized(_) => "act with a different action class",
     }
 }

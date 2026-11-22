@@ -21,6 +21,7 @@ use svalnir_core::state::PressureState;
 use svalnir_core::time::WallTime;
 
 use crate::executor::fs::{AdmittedStep, ApprovedRoots, FsExecutor, StepOutcome, StopSignal};
+use crate::executor::owner::{AdmittedOwnerStep, OwnerExecutor, OwnerStepOutcome};
 use crate::executor::process::{
     ExecutorError, GenerationState, Observation as ExitObservation, ProcessControl,
     ProcessExecutor, StepClock, StepInput, StepRun, StopRequest,
@@ -194,6 +195,35 @@ impl FilesystemExecutor for FsExecutor {
         signal: &dyn StopSignal,
     ) -> StepOutcome {
         self.execute_step_until(roots, step, signal)
+    }
+}
+
+/// The owner executor, as the coordinator calls it.
+pub trait OwnerOperationExecutor: Debug {
+    /// Does one admitted owner step under `roots`. The executor reads
+    /// `signal` while the command runs and stops the process group of the
+    /// command at a stop (`docs/ACTION_CONTRACTS.md` section 7).
+    ///
+    /// # Errors
+    ///
+    /// Returns the fault of the executor: it made no consistent target
+    /// result.
+    fn execute(
+        &self,
+        roots: &ApprovedRoots,
+        step: AdmittedOwnerStep<'_>,
+        signal: &dyn StopSignal,
+    ) -> OwnerStepOutcome;
+}
+
+impl OwnerOperationExecutor for OwnerExecutor {
+    fn execute(
+        &self,
+        roots: &ApprovedRoots,
+        step: AdmittedOwnerStep<'_>,
+        signal: &dyn StopSignal,
+    ) -> OwnerStepOutcome {
+        OwnerExecutor::execute(self, roots, step, signal)
     }
 }
 

@@ -562,7 +562,9 @@ impl<S: ProcessSource, C: ProcessControl, K: StepClock> ProcessExecutor<S, C, K>
             TargetBinding::Process(binding) => {
                 (Subject::Process, std::slice::from_ref(&binding.process))
             }
-            TargetBinding::File(_) => return Err(ExecutorError::NotApplicationStep),
+            TargetBinding::File(_) | TargetBinding::OwnerOperation(_) => {
+                return Err(ExecutorError::NotApplicationStep);
+            }
         };
         if !matches!(envelope.executor, ExecutorRole::User) {
             return Err(ExecutorError::NotApplicationStep);

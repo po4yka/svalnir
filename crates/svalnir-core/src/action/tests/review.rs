@@ -459,6 +459,7 @@ fn only_the_two_application_classes_have_the_critical_memory_exception() {
         ActionClass::MoveToTrash,
         ActionClass::DeleteSelectedFiles,
         ActionClass::EvictRegenerableData,
+        ActionClass::RunOwnerOperation,
     ];
     let application = [
         ActionClass::RequestApplicationExit,
@@ -721,7 +722,7 @@ fn a_file_target_binds_the_path_and_the_object_of_its_root() {
 fn a_plan_of_the_first_schema_version_is_refused_and_no_field_gets_a_default() {
     let plan = seal(file_content(&ActionClass::EvictRegenerableData));
     let value = serde_json::to_value(&plan).unwrap();
-    assert_eq!(value["content"]["schema_version"], json!(3));
+    assert_eq!(value["content"]["schema_version"], json!(4));
     assert_eq!(
         value["content"]["targets"][0]["binding"]["layout"],
         json!("layout-v1")

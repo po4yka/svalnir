@@ -648,7 +648,7 @@ fn trash_moves_a_file_and_does_not_report_a_removal() {
 fn a_file_replaced_by_a_directory_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("data.bin");
@@ -970,7 +970,7 @@ fn a_trash_move_of_a_replaced_entry_is_reported_as_not_established() {
 fn a_directory_replaced_by_a_symbolic_link_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let directory: PathBuf = fixture.root.join("cache");
@@ -994,7 +994,7 @@ fn a_directory_replaced_by_a_symbolic_link_is_skipped() {
 fn a_file_replaced_by_a_symbolic_link_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("data.bin");
@@ -1015,7 +1015,7 @@ fn a_file_replaced_by_a_symbolic_link_is_skipped() {
 fn a_parent_component_replaced_by_a_symbolic_link_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let parent: PathBuf = fixture.root.join("a").join("dir");
@@ -1039,7 +1039,7 @@ fn a_parent_component_replaced_by_a_symbolic_link_is_skipped() {
 fn an_entry_replaced_by_another_inode_with_the_same_name_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("data.bin");
@@ -1290,7 +1290,7 @@ fn a_hard_link_loses_one_name_and_keeps_its_content() {
 fn a_target_on_another_device_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let mount: PathBuf = fixture.root.join("mnt");
@@ -1999,7 +1999,7 @@ fn a_relative_entry_that_is_not_normalized_is_refused() {
     ];
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         for entry in entries {
             let binding = binding_with(&fixture, entry, FileObjectType::RegularFile, object);
@@ -2097,7 +2097,7 @@ fn a_home_directory_that_is_not_an_anchored_path_is_rejected() {
 fn the_home_directory_and_each_directory_that_contains_it_are_refused() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         // The home directory is `root/users/me`.
@@ -2148,7 +2148,7 @@ fn the_home_directory_is_refused_under_another_name() {
 
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         // A name that is not the home path, with the identity of the home
         // directory in the binding.
@@ -2290,7 +2290,7 @@ fn an_approved_root_that_is_not_the_root_of_the_plan_is_refused() {
 fn the_approved_root_itself_is_refused() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         fs::write(fixture.root.join("data.bin"), b"data").unwrap();
@@ -3576,7 +3576,7 @@ fn a_tree_with_a_locked_directory_is_refused_before_the_first_call() {
 fn a_locked_target_gets_no_call_for_each_class() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("locked.bin");

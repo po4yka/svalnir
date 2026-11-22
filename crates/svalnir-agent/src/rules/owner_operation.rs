@@ -1,0 +1,183 @@
+//! The plan binding of an owner operation (`docs/CLEANUP_RULES.md`
+//! section 9).
+//!
+//! [`bind_owner_operation`] makes the [`OwnerOperationBinding`] of one
+//! reviewed declaration for one approved root: it binds the first
+//! executable of the declaration that passes the checks of the owner
+//! executor, resolves the typed parameters of the command, and measures
+//! the scope. No value comes from user input or from configuration text.
+//! The binding goes into a sealed plan of the class `RunOwnerOperation`;
+//! this build has no command that makes such a plan, and only the fixture
+//! tests call this function.
+
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use svalnir_core::action::{
+    ExecutableBinding, OwnerOperationBinding, OwnerOperationKind, ScopeMeasurement,
+};
+use svalnir_core::file::LosslessPath;
+use svalnir_core::process::Uid;
+use svalnir_core::quantity::Nanoseconds;
+use svalnir_core::rule::owner::{ExecutableBase, OwnerCommand, OwnerOperation, ParameterValues};
+use thiserror::Error;
+
+use crate::executor::fs::ApprovedRoot;
+use crate::executor::owner::{ExecutableProblem, ScopeLimits, examine_executable, measure_scope};
+use crate::scan::{CancellationToken, ScanClock};
+
+/// The reason no binding is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum OwnerBindError {
+    /// The declaration has no command of the kind.
+    #[error("the declaration has no command of the kind")]
+    NoCommand,
+    /// A `clear` operation needs the explicit consent of the user.
+    #[error("a clear operation needs the explicit consent of the user")]
+    ClearNotConfirmed,
+    /// No path of the declaration has an executable.
+    #[error("no path of the declaration has an executable")]
+    ExecutableNotFound,
+    /// An executable exists, and it or a directory above it does not pass
+    /// the owner and mode checks.
+    #[error("the executable does not pass the owner and mode checks")]
+    ExecutableNotTrusted,
+    /// The scope root or the home directory is not a UTF-8 path, so a
+    /// typed parameter has no text.
+    #[error("a path of a typed parameter is not UTF-8")]
+    PathNotUtf8,
+    /// The scope root is not a directory of the principal with the object
+    /// of its root record.
+    #[error("the scope root is not the approved root")]
+    ScopeRootChanged,
+    /// The measurement of the scope is not complete.
+    #[error("the measurement of the scope is not complete")]
+    ScopeNotMeasured,
+}
+
+/// One request for a binding.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerBindRequest<'a> {
+    /// The reviewed declaration of the rule.
+    pub declaration: &'a OwnerOperation,
+    /// The kind of the operation.
+    pub kind: OwnerOperationKind,
+    /// The explicit consent of the user to a `clear` operation. A
+    /// `prune` operation has none.
+    pub clear_opt_in: bool,
+    /// The approved root of the scope, bound to its object, its volume,
+    /// and its mount generation.
+    pub scope: &'a ApprovedRoot,
+    /// The layout that the rule found for the scope.
+    pub layout: &'a str,
+    /// The home directory of the account record of the principal.
+    pub home_directory: &'a Path,
+    /// The principal of the plan.
+    pub principal: Uid,
+    /// The largest executable that the builder reads for its digest.
+    pub max_executable_bytes: u64,
+    /// The bounds of the measurement of the scope.
+    pub scope_limits: ScopeLimits,
+}
+
+/// The absolute path of one executable location of a declaration, with
+/// its symbolic links resolved. `None` when nothing is at the path.
+fn resolve_location(base: ExecutableBase, path: &LosslessPath, home: &Path) -> Option<PathBuf> {
+    let path: PathBuf = match base {
+        ExecutableBase::Absolute => path.to_path_buf(),
+        ExecutableBase::UserHome => home.join(path.to_path_buf()),
+    };
+    fs::canonicalize(path).ok()
+}
+
+/// The executable of the declaration: the first path that passes the
+/// checks of the owner executor.
+fn bind_executable(request: &OwnerBindRequest<'_>) -> Result<ExecutableBinding, OwnerBindError> {
+    let mut problem: OwnerBindError = OwnerBindError::ExecutableNotFound;
+    for location in &request.declaration.executables {
+        let Some(path) = resolve_location(location.base, &location.path, request.home_directory)
+        else {
+            continue;
+        };
+        match examine_executable(&path, request.principal, request.max_executable_bytes) {
+            Ok(executable) => return Ok(executable),
+            Err(ExecutableProblem::NotFound) => {}
+            Err(_) => problem = OwnerBindError::ExecutableNotTrusted,
+        }
+    }
+    Err(problem)
+}
+
+/// Makes the binding of `request`.
+///
+/// The scope root must be a directory of the principal with the object of
+/// its root record, and its measurement must be complete. The charge of
+/// the binding is the measured scope.
+///
+/// # Errors
+///
+/// Returns the [`OwnerBindError`] of the first check that fails.
+pub fn bind_owner_operation(
+    request: &OwnerBindRequest<'_>,
+    cancel: &CancellationToken,
+    clock: &dyn ScanClock,
+) -> Result<OwnerOperationBinding, OwnerBindError> {
+    let declaration = request.declaration;
+    let command: &OwnerCommand = declaration
+        .command(request.kind)
+        .ok_or(OwnerBindError::NoCommand)?;
+    let is_clear: bool = matches!(request.kind, OwnerOperationKind::Clear);
+    if is_clear && !request.clear_opt_in {
+        return Err(OwnerBindError::ClearNotConfirmed);
+    }
+    let root: PathBuf = request.scope.path.to_path_buf();
+    let root_agrees: bool = fs::symlink_metadata(&root).is_ok_and(|metadata| {
+        metadata.file_type().is_dir()
+            && metadata.uid() == request.principal.get()
+            && u64::from_ne_bytes(i64::from(request.scope.object.device.get()).to_ne_bytes())
+                == metadata.dev()
+            && request.scope.object.inode.get() == metadata.ino()
+    });
+    if !root_agrees {
+        return Err(OwnerBindError::ScopeRootChanged);
+    }
+    let executable: ExecutableBinding = bind_executable(request)?;
+    let values = ParameterValues {
+        scope_root: request
+            .scope
+            .path
+            .as_utf8()
+            .ok_or(OwnerBindError::PathNotUtf8)?,
+        home_directory: request
+            .home_directory
+            .to_str()
+            .ok_or(OwnerBindError::PathNotUtf8)?,
+    };
+    let measured: ScopeMeasurement = measure_scope(&root, request.scope_limits, cancel, clock)
+        .filter(|measurement| measurement.complete)
+        .ok_or(OwnerBindError::ScopeNotMeasured)?;
+    let deadline: Nanoseconds = declaration.command_deadline;
+    Ok(OwnerOperationBinding {
+        root_id: request.scope.root_id.clone(),
+        root_path: request.scope.path.clone(),
+        root_object: request.scope.object,
+        volume_id: request.scope.volume_id.clone(),
+        mount_id: request.scope.mount_id.clone(),
+        owner: request.principal,
+        rule: declaration.rule.clone(),
+        layout: request.layout.to_owned(),
+        operation: request.kind,
+        clear_opt_in: is_clear,
+        bound: command.bound,
+        executable,
+        arguments: command.resolved_arguments(&values),
+        environment: declaration.resolved_environment(&values),
+        working_directory: LosslessPath::from_path(request.home_directory)
+            .map_err(|_| OwnerBindError::PathNotUtf8)?,
+        command_deadline: deadline,
+        charge: measured.charge().ok_or(OwnerBindError::ScopeNotMeasured)?,
+        measured,
+        expected_effect: command.expected_effect.clone(),
+    })
+}

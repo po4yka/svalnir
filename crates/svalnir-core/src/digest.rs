@@ -30,9 +30,40 @@ pub struct ContentDigest(String);
 impl ContentDigest {
     /// The digest of `bytes`.
     pub fn of_bytes(bytes: &[u8]) -> Self {
+        Self::of_hash(&Sha256::digest(bytes))
+    }
+
+    /// The digest of the bytes that `reader` gives, to its end, with at
+    /// most `limit` bytes. A read that a signal interrupts is read again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the reader, or an error of the kind
+    /// [`std::io::ErrorKind::FileTooLarge`] when the reader gives more than
+    /// `limit` bytes.
+    pub fn of_reader(mut reader: impl std::io::Read, limit: u64) -> std::io::Result<Self> {
+        let mut hasher = Sha256::new();
+        let mut buffer: [u8; 8192] = [0; 8192];
+        let mut total: u64 = 0;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(Self::of_hash(&hasher.finalize())),
+                Ok(count) => {
+                    total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                    if total > limit {
+                        return Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge));
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn of_hash(hash: &[u8]) -> Self {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-        let hash = Sha256::digest(bytes);
         let mut text: String = String::with_capacity(PREFIX.len() + HEX_LENGTH);
         text.push_str(PREFIX);
         for byte in hash {

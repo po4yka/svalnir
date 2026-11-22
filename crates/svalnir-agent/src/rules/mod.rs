@@ -75,6 +75,8 @@ pub mod nested_git;
 #[cfg(unix)]
 mod overlap;
 #[cfg(unix)]
+pub mod owner_operation;
+#[cfg(unix)]
 pub mod owner_tools;
 #[cfg(unix)]
 mod plist;

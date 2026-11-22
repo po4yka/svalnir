@@ -31,7 +31,8 @@ use super::error::{CoordinatorError, StartError, action_error, code};
 use super::ledger::{Hold, IncidentAllowance, JournalUsage, Ledger, LedgerRefusal};
 use super::ports::{
     ApplicationExecutor, AuthoritySource, Clock, CoordinatorJournal, FilesystemExecutor, IdSource,
-    Measurements, RevisionSnapshot, TargetProbe, TimeReading, TriggerStanding,
+    Measurements, OwnerOperationExecutor, RevisionSnapshot, TargetProbe, TimeReading,
+    TriggerStanding,
 };
 use crate::executor::fs::{ApprovedRoot, ApprovedRoots, RootError};
 use crate::executor::process::{NextStep, Observation as ExitObservation};
@@ -60,6 +61,8 @@ pub struct CoordinatorConfig {
     pub filesystem_adapter: AdapterId,
     /// The adapter identity in the envelope of an application step.
     pub process_adapter: AdapterId,
+    /// The adapter identity in the envelope of an owner step.
+    pub owner_adapter: AdapterId,
     /// The number of filesystem targets between two capacity
     /// measurements. A stop request is read before each target.
     pub batch_targets: usize,
@@ -93,6 +96,8 @@ pub struct Dependencies {
     pub roots: ApprovedRoots,
     /// The process executor.
     pub application: Box<dyn ApplicationExecutor + Send>,
+    /// The owner executor of the steps of `RunOwnerOperation`.
+    pub owner: Box<dyn OwnerOperationExecutor + Send>,
     /// The fresh evidence of restart reconciliation.
     pub probe: Box<dyn TargetProbe + Send>,
 }
@@ -226,6 +231,9 @@ pub(super) struct Active {
     pub(super) stop: Option<StopView>,
     pub(super) baseline: Baseline,
     pub(super) effects: Vec<ResourceEffect>,
+    /// The measurements of the scope of each owner step that started a
+    /// command. Each measurement of the operation keeps them.
+    pub(super) scope_effects: Vec<ResourceEffect>,
     pub(super) work: WorkTotals,
     pub(super) unsaved: BTreeSet<StepId>,
     pub(super) degraded: bool,
@@ -299,6 +307,7 @@ pub struct Coordinator<J: CoordinatorJournal> {
     pub(super) filesystem: Box<dyn FilesystemExecutor + Send>,
     pub(super) roots: ApprovedRoots,
     pub(super) application: Box<dyn ApplicationExecutor + Send>,
+    pub(super) owner: Box<dyn OwnerOperationExecutor + Send>,
     pub(super) probe: Box<dyn TargetProbe + Send>,
     pub(super) volatile: VolatileRecord,
     pub(super) ledger: Ledger,
@@ -367,21 +376,21 @@ fn apply_refusal_error(refusal: &ApplyRefusal, plan_id: &PlanId) -> ActionError 
 #[derive(Debug, Clone, Copy)]
 struct NotChargeable;
 
-/// The sum of the charges of the file targets of a plan. `None` for an
-/// application plan, which uses one slot.
+/// The sum of the charges of the file targets and of the owner-operation
+/// targets of a plan. `None` for an application plan, which uses one slot.
 fn total_charge(plan: &Plan) -> Result<Option<WorkCharge>, NotChargeable> {
     let mut total: Option<WorkCharge> = None;
     for step in &plan.steps {
-        match plan.target(&step.target_id).map(|target| &target.binding) {
-            Some(TargetBinding::File(file)) => {
-                let sum: WorkCharge = total
-                    .unwrap_or(WorkCharge::ZERO)
-                    .checked_add(file.charge)
-                    .ok_or(NotChargeable)?;
-                total = Some(sum);
-            }
-            Some(TargetBinding::Application(_) | TargetBinding::Process(_)) => {}
-            None => return Err(NotChargeable),
+        let binding: &TargetBinding = plan
+            .target(&step.target_id)
+            .map(|target| &target.binding)
+            .ok_or(NotChargeable)?;
+        if let Some(charge) = binding.charge() {
+            let sum: WorkCharge = total
+                .unwrap_or(WorkCharge::ZERO)
+                .checked_add(charge)
+                .ok_or(NotChargeable)?;
+            total = Some(sum);
         }
     }
     Ok(total)
@@ -422,19 +431,35 @@ pub fn approved_roots_of(
     }
     let mut roots: BTreeMap<&RootId, ApprovedRoot> = BTreeMap::new();
     for target in &plan.targets {
-        let TargetBinding::File(file) = &target.binding else {
-            continue;
+        // The scope of an owner operation is an approved root of its rule,
+        // with the same record as the root of a file target.
+        let (root_id, path, object, volume_id, mount_id) = match &target.binding {
+            TargetBinding::File(file) => (
+                &file.root_id,
+                &file.root_path,
+                file.root_object,
+                &file.volume_id,
+                &file.mount_id,
+            ),
+            TargetBinding::OwnerOperation(owner) => (
+                &owner.root_id,
+                &owner.root_path,
+                owner.root_object,
+                &owner.volume_id,
+                &owner.mount_id,
+            ),
+            TargetBinding::Application(_) | TargetBinding::Process(_) => continue,
         };
-        roots.entry(&file.root_id).or_insert_with(|| {
+        roots.entry(root_id).or_insert_with(|| {
             configured
-                .root(&file.root_id)
+                .root(root_id)
                 .cloned()
                 .unwrap_or_else(|| ApprovedRoot {
-                    root_id: file.root_id.clone(),
-                    path: file.root_path.clone(),
-                    object: file.root_object,
-                    volume_id: file.volume_id.clone(),
-                    mount_id: file.mount_id.clone(),
+                    root_id: root_id.clone(),
+                    path: path.clone(),
+                    object,
+                    volume_id: volume_id.clone(),
+                    mount_id: mount_id.clone(),
                 })
         });
     }
@@ -471,6 +496,12 @@ pub(super) fn lease_resources_of<'a>(
                 resources.insert(LeaseResource::ProcessGeneration(
                     binding.process.generation_id.clone(),
                 ));
+            }
+            // The cleanup root lease of the scope conflicts with each file
+            // operation on the same root.
+            TargetBinding::OwnerOperation(owner) => {
+                resources.insert(LeaseResource::CleanupRoot(owner.root_id.clone()));
+                resources.insert(LeaseResource::Volume(owner.volume_id.clone()));
             }
         }
     }
@@ -540,6 +571,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             filesystem,
             roots,
             application,
+            owner,
             probe,
         } = dependencies;
         Ok(Start::Coordinating(Box::new(Self {
@@ -556,6 +588,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             filesystem,
             roots,
             application,
+            owner,
             probe,
             board: Arc::new(Board::default()),
             active: None,
@@ -777,10 +810,12 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     /// is not known refuses it with `target_protection_unknown`: an
     /// unknown protection is not "not protected".
     fn check_file_protection(&self, plan: &Plan) -> Result<(), Box<ActionError>> {
-        let has_file: bool = plan
-            .targets
-            .iter()
-            .any(|target| matches!(target.binding, TargetBinding::File(_)));
+        let has_file: bool = plan.targets.iter().any(|target| {
+            matches!(
+                target.binding,
+                TargetBinding::File(_) | TargetBinding::OwnerOperation(_)
+            )
+        });
         if !has_file {
             return Ok(());
         }
@@ -789,19 +824,23 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         // the text of each path is examined.
         let mounts: Option<MountTable> = MountTable::read().ok();
         for target in &plan.targets {
-            let TargetBinding::File(file) = &target.binding else {
-                continue;
+            let fact: ProtectionFact = match &target.binding {
+                TargetBinding::File(file) => locations.of_binding(file, mounts.as_ref()),
+                // The entry of an owner operation is its scope root.
+                TargetBinding::OwnerOperation(owner) => {
+                    locations.of_scope_root(&owner.root_path.to_path_buf(), mounts.as_ref())
+                }
+                TargetBinding::Application(_) | TargetBinding::Process(_) => continue,
             };
-            let refusal: Option<(&str, ErrorFamily)> =
-                match locations.of_binding(file, mounts.as_ref()) {
-                    ProtectionFact::NotProtected => None,
-                    ProtectionFact::Protected => {
-                        Some((code::TARGET_PROTECTED, ErrorFamily::Eligibility))
-                    }
-                    ProtectionFact::Unknown => {
-                        Some((code::TARGET_PROTECTION_UNKNOWN, ErrorFamily::Evidence))
-                    }
-                };
+            let refusal: Option<(&str, ErrorFamily)> = match fact {
+                ProtectionFact::NotProtected => None,
+                ProtectionFact::Protected => {
+                    Some((code::TARGET_PROTECTED, ErrorFamily::Eligibility))
+                }
+                ProtectionFact::Unknown => {
+                    Some((code::TARGET_PROTECTION_UNKNOWN, ErrorFamily::Evidence))
+                }
+            };
             if let Some((code, family)) = refusal {
                 return Err(Box::new(admission_error(code, family, &plan.plan_id)));
             }
@@ -1066,6 +1105,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             stop: None,
             baseline: Baseline::default(),
             effects: Vec::new(),
+            scope_effects: Vec::new(),
             work: WorkTotals {
                 exact: true,
                 ..WorkTotals::default()

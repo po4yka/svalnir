@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use super::checked::{Check, Checked};
 use super::error::ActionError;
+use super::owner::ScopeAllocationEffect;
 use super::state::{DispatchState, Durability, OperationState, StepState};
 use crate::encoding::wire_enum;
 use crate::file::LosslessPath;
@@ -31,6 +32,10 @@ wire_enum! {
         Removed => "Removed",
         /// The exit of the process was observed after the request.
         ExitVerified => "ExitVerified",
+        /// The command of an owner operation exited with status 0, and no
+        /// process of its group runs. This is not a statement about the
+        /// data that the command removed.
+        OperationCompleted => "OperationCompleted",
         /// The entry was absent.
         AlreadyAbsent => "AlreadyAbsent",
         /// The process was not running.
@@ -48,10 +53,11 @@ wire_enum! {
 
 impl TargetEffect {
     /// Each effect that this build knows.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Trashed,
         Self::Removed,
         Self::ExitVerified,
+        Self::OperationCompleted,
         Self::AlreadyAbsent,
         Self::AlreadyExited,
         Self::Skipped,
@@ -62,7 +68,10 @@ impl TargetEffect {
 
     /// Whether the effect is a verified effect of a submitted call.
     pub fn is_verified(&self) -> bool {
-        matches!(self, Self::Trashed | Self::Removed | Self::ExitVerified)
+        matches!(
+            self,
+            Self::Trashed | Self::Removed | Self::ExitVerified | Self::OperationCompleted
+        )
     }
 
     /// Whether the target is in its requested final condition: a verified
@@ -131,6 +140,11 @@ pub enum NativeResult {
     Errno {
         /// The error number.
         errno: i32,
+    },
+    /// The command of an owner operation exited with this status.
+    ExitStatus {
+        /// The exit status.
+        status: i32,
     },
     /// The backend refused the request without an error number.
     Refused,
@@ -255,6 +269,7 @@ impl Check for TargetResultRecord {
             TargetEffect::Trashed
             | TargetEffect::Removed
             | TargetEffect::ExitVerified
+            | TargetEffect::OperationCompleted
             | TargetEffect::Refused
             | TargetEffect::StillRunning => matches!(self.dispatch, Submitted),
             TargetEffect::Skipped => matches!(self.dispatch, NotSubmitted),
@@ -279,7 +294,11 @@ impl Check for TargetResultRecord {
                 NotSubmitted => matches!(self.attribution, Attribution::NotApplicable),
                 _ => matches!(self.attribution, Attribution::Possible),
             },
-            TargetEffect::UnknownOutcome => matches!(self.attribution, Attribution::Possible),
+            // The command of an owner operation selects its own data, so
+            // its effect is never established for a planned object.
+            TargetEffect::UnknownOutcome | TargetEffect::OperationCompleted => {
+                matches!(self.attribution, Attribution::Possible)
+            }
             _ => matches!(self.attribution, Attribution::NotApplicable),
         };
         if !attribution_agrees {
@@ -292,6 +311,7 @@ impl Check for TargetResultRecord {
             TargetEffect::Trashed
             | TargetEffect::Removed
             | TargetEffect::ExitVerified
+            | TargetEffect::OperationCompleted
             | TargetEffect::AlreadyAbsent
             | TargetEffect::AlreadyExited => !matches!(
                 self.stop_reason,
@@ -344,14 +364,17 @@ impl Check for TargetResultRecord {
                 self.effect,
                 TargetEffect::Trashed | TargetEffect::Removed | TargetEffect::AlreadyAbsent
             );
-        if is_covered && !covered_agrees {
-            return Err(OutcomeError::Evidence);
-        }
         // A verified effect is an observation of the target after the
         // call: a native call that succeeded is not a verified effect. A
         // record with no observation source states that no observation
-        // was made, so it cannot have a verified effect.
-        if self.effect.is_verified() && self.evidence.source.is_none() {
+        // was made, so it cannot have a verified effect. A completed owner
+        // operation has the exit status 0 of its command.
+        let completion_differs: bool = matches!(self.effect, TargetEffect::OperationCompleted)
+            && !matches!(self.evidence.native, NativeResult::ExitStatus { status: 0 });
+        if (is_covered && !covered_agrees)
+            || (self.effect.is_verified() && self.evidence.source.is_none())
+            || completion_differs
+        {
             return Err(OutcomeError::Evidence);
         }
         Ok(())
@@ -478,6 +501,9 @@ pub enum ResourceEffect {
         /// The `memory.pressure` observation after the operation.
         after: Observation<PressureState>,
     },
+    /// The size of the scope of an owner operation before and after its
+    /// command. It is not the available capacity of a volume.
+    ScopeAllocation(ScopeAllocationEffect),
     /// A resource kind that this build does not recognize.
     #[serde(other)]
     Unrecognized,

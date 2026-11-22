@@ -265,3 +265,164 @@ pub fn write_project(root: &Path, name: &str, workspace: &Path) -> std::io::Resu
     )?;
     Ok(project)
 }
+
+/// The identity of the fixture rule of an owner operation. No registry
+/// of a build has it: a test gives it to a registry of its own.
+pub const OWNER_FIXTURE_RULE: &str = "fixture.owner-operation";
+
+/// The layout of the fixture rule of an owner operation.
+pub const OWNER_FIXTURE_LAYOUT: &str = "fixture-owner-v1";
+
+/// The fixture rule of an owner operation, with `lifecycle` for its one
+/// layout. Its deletion method is `producer_operation`, and its producer
+/// is a test script ([`write_owner_script`]); no test runs a real
+/// producer tool.
+///
+/// # Errors
+///
+/// Returns the error of the declaration check.
+pub fn owner_fixture_rule(
+    lifecycle: LifecycleState,
+) -> Result<svalnir_core::rule::Rule, svalnir_core::rule::RuleDeclarationError> {
+    use svalnir_core::action::{Checked, ExecutorRole, FileObjectType, WorkCharge};
+    use svalnir_core::file::LosslessPath;
+    use svalnir_core::id::{RuleId, RuleRevisionId};
+    use svalnir_core::policy::RebuildCost;
+    use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
+    use svalnir_core::rule::{
+        ActivityCheck, ActivityProtocol, AgeBasis, ApprovedRoot, DeletionMethod, LayoutSupport,
+        OwnerAttribution, Retention, RootBase, RuleBudget, RuleDeclaration, RuleDeclarationError,
+        RuleExclusions, RuleMode, RuleOwner, RuleRef,
+    };
+    const MINUTE: u64 = 60_000_000_000;
+    Checked::new(RuleDeclaration {
+        reference: RuleRef {
+            id: RuleId::new(OWNER_FIXTURE_RULE).map_err(|_| RuleDeclarationError::Text)?,
+            revision: RuleRevisionId::new("r1").map_err(|_| RuleDeclarationError::Text)?,
+        },
+        owner: RuleOwner {
+            producer: "fixture-producer".to_owned(),
+            attribution: OwnerAttribution::ProducerLayout,
+        },
+        layouts: vec![LayoutSupport {
+            layout: OWNER_FIXTURE_LAYOUT.to_owned(),
+            lifecycle,
+        }],
+        roots: vec![ApprovedRoot {
+            base: RootBase::UserHome,
+            relative: LosslessPath::from_bytes("Library/Caches/fixture-producer")
+                .map_err(|_| RuleDeclarationError::Root)?,
+        }],
+        retention: Retention {
+            age_basis: AgeBasis::FilesystemMetadata,
+            minimum_age: Nanoseconds::new(MINUTE),
+        },
+        activity: ActivityProtocol {
+            checks: vec![ActivityCheck::ProducerProcessAbsent],
+            quiescence: Nanoseconds::new(MINUTE),
+            evidence_expiry: Nanoseconds::new(MINUTE),
+        },
+        exclusions: RuleExclusions {
+            descendants: Vec::new(),
+            supported_object_types: vec![FileObjectType::Directory],
+            skip_hard_linked: false,
+        },
+        modes: vec![
+            RuleMode::Inspection,
+            RuleMode::ManualEviction,
+            RuleMode::AutomaticEviction,
+        ],
+        deletion_method: DeletionMethod::ProducerOperation,
+        executor: ExecutorRole::User,
+        rebuild_cost: RebuildCost::Low,
+        budget: RuleBudget {
+            per_candidate: WorkCharge::new(Bytes::new(1 << 30), EntryCount::new(100_000)),
+            per_pass: WorkCharge::new(Bytes::new(1 << 31), EntryCount::new(200_000)),
+            measurement_expiry: Nanoseconds::new(10 * MINUTE),
+        },
+    })
+}
+
+/// The owner-operation declaration of the fixture rule, with the test
+/// script at the absolute path `executable`. The `prune` command is
+/// `prune ROOT`, bounded to the scope, and the `clear` command is
+/// `clear ROOT`, with no bound. The environment has `HOME` and a fixed
+/// `PATH`.
+///
+/// # Errors
+///
+/// Returns the error of the declaration check.
+pub fn owner_fixture_declaration(
+    executable: &Path,
+    command_deadline: svalnir_core::quantity::Nanoseconds,
+) -> Result<
+    svalnir_core::rule::owner::OwnerOperation,
+    svalnir_core::rule::owner::OwnerDeclarationError,
+> {
+    use svalnir_core::action::{Checked, OwnerOperationBound, OwnerOperationKind};
+    use svalnir_core::file::LosslessPath;
+    use svalnir_core::id::{RuleId, RuleRevisionId};
+    use svalnir_core::rule::RuleRef;
+    use svalnir_core::rule::owner::{
+        EnvironmentDeclaration, ExecutableBase, ExecutableLocation, OwnerCommand,
+        OwnerDeclarationError, OwnerOperationDeclaration, ParameterPart,
+    };
+    let command = |kind: OwnerOperationKind, word: &str, bound: OwnerOperationBound| OwnerCommand {
+        kind,
+        arguments: vec![
+            ParameterPart::Literal(word.to_owned()),
+            ParameterPart::ScopeRoot,
+        ],
+        bound,
+        expected_effect: format!("The fixture producer runs the command {word} on its cache."),
+    };
+    Checked::new(OwnerOperationDeclaration {
+        rule: RuleRef {
+            id: RuleId::new(OWNER_FIXTURE_RULE).map_err(|_| OwnerDeclarationError::Text)?,
+            revision: RuleRevisionId::new("r1").map_err(|_| OwnerDeclarationError::Text)?,
+        },
+        executables: vec![ExecutableLocation {
+            base: ExecutableBase::Absolute,
+            path: LosslessPath::from_path(executable)
+                .map_err(|_| OwnerDeclarationError::Executable)?,
+        }],
+        commands: vec![
+            command(
+                OwnerOperationKind::Prune,
+                "prune",
+                OwnerOperationBound::WithinScope,
+            ),
+            command(
+                OwnerOperationKind::Clear,
+                "clear",
+                OwnerOperationBound::Unbounded,
+            ),
+        ],
+        environment: vec![
+            EnvironmentDeclaration {
+                name: "HOME".to_owned(),
+                value: ParameterPart::HomeDirectory,
+            },
+            EnvironmentDeclaration {
+                name: "PATH".to_owned(),
+                value: ParameterPart::Literal("/usr/bin:/bin".to_owned()),
+            },
+        ],
+        command_deadline,
+    })
+}
+
+/// Writes the test script `name` with `body` below `directory`, with the
+/// mode `0755`, and returns its path. The script runs with `/bin/sh`; its
+/// first argument is the command word and its second the scope root.
+///
+/// # Errors
+///
+/// Returns the error of the write.
+pub fn write_owner_script(directory: &Path, name: &str, body: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path: PathBuf = directory.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}

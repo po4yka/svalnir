@@ -16,7 +16,8 @@ use super::context::{PlanBatch, PlanOutcome, SizeEstimate, TargetPreview};
 use super::mode::{CleanupMode, PlanMode, StopKind, mode_of};
 use super::reason::Omission;
 use crate::action::{
-    ActionClass, FileObjectType, Plan, PlanTarget, TargetBinding, Validity, WorkCharge,
+    ActionClass, FileObjectType, OwnerOperationBound, OwnerOperationKind, Plan, PlanTarget,
+    ScopeMeasurement, TargetBinding, Validity, WorkCharge,
 };
 use crate::digest::ContentDigest;
 use crate::file::LosslessPath;
@@ -53,6 +54,12 @@ pub enum Consequence {
     ForceAfterGrace,
     /// The application is forced to exit with no request first.
     ImmediateForce,
+    /// The producer removes the data that it does not use. There is no
+    /// undo, and the command can remove data that appeared after the plan.
+    OwnerPruneNoUndo,
+    /// The producer removes its cache data, also data that a project can
+    /// use now. There is no undo, and the next build gets the data again.
+    OwnerClearNoUndo,
 }
 
 impl Consequence {
@@ -65,6 +72,8 @@ impl Consequence {
             PlanMode::Stop(StopKind::Graceful) => Self::GracefulExit,
             PlanMode::Stop(StopKind::ForceAfterGrace) => Self::ForceAfterGrace,
             PlanMode::Stop(StopKind::ImmediateForce) => Self::ImmediateForce,
+            PlanMode::Owner(OwnerOperationKind::Prune) => Self::OwnerPruneNoUndo,
+            PlanMode::Owner(OwnerOperationKind::Clear) => Self::OwnerClearNoUndo,
         }
     }
 
@@ -93,6 +102,15 @@ impl Consequence {
             Self::ImmediateForce => {
                 "The application is forced to exit with no request to exit first. Data that is \
                  not saved can be lost."
+            }
+            Self::OwnerPruneNoUndo => {
+                "The producer removes the data that it does not use. Permanent removal has no \
+                 undo. The producer selects the data, so it can remove data that appeared after \
+                 the plan."
+            }
+            Self::OwnerClearNoUndo => {
+                "The producer removes its cache data, also data that a project uses now. \
+                 Permanent removal has no undo. The next build downloads or makes the data again."
             }
         }
     }
@@ -206,6 +224,35 @@ pub enum TargetExplanation {
         /// The process.
         process: MemberView,
     },
+    /// One command of a producer on one measured scope.
+    OwnerOperation {
+        /// The identity of the target.
+        target_id: TargetId,
+        /// The approved root of the scope.
+        root_id: RootId,
+        /// The path of the scope root.
+        root_path: LosslessPath,
+        /// The volume.
+        volume_id: VolumeId,
+        /// The owner of the scope.
+        owner: Uid,
+        /// The rule revision.
+        rule: RuleRef,
+        /// The kind of the operation.
+        operation: OwnerOperationKind,
+        /// The bound of the declaration.
+        bound: OwnerOperationBound,
+        /// The path of the executable.
+        executable: LosslessPath,
+        /// The arguments after the name of the executable.
+        arguments: Vec<String>,
+        /// The expected effect statement of the declaration.
+        expected_effect: String,
+        /// The measurement of the scope by the plan builder.
+        measured: ScopeMeasurement,
+        /// The admission charge. It is not a size.
+        admission_charge: WorkCharge,
+    },
 }
 
 /// The sums of a plan.
@@ -315,6 +362,21 @@ fn target_explanation(
             target_id: target.target_id.clone(),
             process: member_view(&binding.process),
         },
+        TargetBinding::OwnerOperation(owner) => TargetExplanation::OwnerOperation {
+            target_id: target.target_id.clone(),
+            root_id: owner.root_id.clone(),
+            root_path: owner.root_path.clone(),
+            volume_id: owner.volume_id.clone(),
+            owner: owner.owner,
+            rule: owner.rule.clone(),
+            operation: owner.operation,
+            bound: owner.bound,
+            executable: owner.executable.path.clone(),
+            arguments: owner.arguments.clone(),
+            expected_effect: owner.expected_effect.clone(),
+            measured: owner.measured,
+            admission_charge: owner.charge,
+        },
     }
 }
 
@@ -368,7 +430,7 @@ pub fn explain(outcome: &PlanOutcome, clock: &EvaluationClock) -> PlanExplanatio
     let consequence: Consequence = Consequence::of(mode);
     let reclaims: bool = matches!(
         mode,
-        PlanMode::Cleanup(CleanupMode::Permanent | CleanupMode::Evict)
+        PlanMode::Cleanup(CleanupMode::Permanent | CleanupMode::Evict) | PlanMode::Owner(_)
     );
     let preview_of = |target_id: &TargetId| {
         outcome

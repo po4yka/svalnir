@@ -172,6 +172,24 @@ impl ProtectedLocations {
         let resolved: ProtectionFact = fact_of(std::fs::canonicalize(&path));
         strictest(text, strictest(own_location, resolved))
     }
+
+    /// The hard protection of the scope root `root` of an owner operation,
+    /// for the coordinator at admission (`docs/ACTION_CONTRACTS.md`
+    /// section 4). The rules of [`ProtectedLocations::of_binding`] apply,
+    /// with the scope root as the entry.
+    #[must_use]
+    pub fn of_scope_root(&self, root: &Path, mounts: Option<&MountTable>) -> ProtectionFact {
+        if !root.is_absolute() {
+            return ProtectionFact::Unknown;
+        }
+        let text: ProtectionFact = self.of_text(root);
+        let is_local: bool =
+            mounts.is_some_and(|mounts| mounts.path_locality(root) == Locality::Local);
+        if text == ProtectionFact::Protected || !is_local {
+            return text;
+        }
+        strictest(text, self.of_entry(root))
+    }
 }
 
 /// The stricter of two facts: protected, then unknown, then not protected.

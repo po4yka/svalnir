@@ -224,6 +224,10 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 // A different object at the name is a different target.
                 FileProbe::PlannedObject | FileProbe::OtherObject | FileProbe::Unknown => None,
             },
+            // No evidence settles the effect of a command of a producer: the
+            // step stays `UnknownOutcome`, and its leases stay
+            // (`docs/ACTION_CONTRACTS.md` section 7).
+            TargetBinding::OwnerOperation(_) => None,
             // The members of an application target, or the one process
             // of a process target.
             TargetBinding::Application(_) | TargetBinding::Process(_) => {

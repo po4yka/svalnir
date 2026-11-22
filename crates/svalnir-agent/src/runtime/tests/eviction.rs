@@ -254,6 +254,7 @@ impl Bench {
             coordinator: CoordinatorConfig {
                 filesystem_adapter: AdapterId::new("svalnir.filesystem").unwrap(),
                 process_adapter: AdapterId::new("macos.process").unwrap(),
+                owner_adapter: AdapterId::new("svalnir.owner-operation").unwrap(),
                 batch_targets: 8,
                 poll_interval: Nanoseconds::new(SECOND),
                 volatile_capacity: 8,
@@ -300,6 +301,12 @@ impl Bench {
                     executor_epoch: epoch.clone(),
                 },
                 ExecutorConfig::default(),
+            )),
+            owner: Box::new(crate::executor::owner::OwnerExecutor::new(
+                crate::executor::owner::OwnerExecutorConfig::new(
+                    AdapterId::new("svalnir.owner-operation").unwrap(),
+                    svalnir_core::file::LosslessPath::from_path(&self.home).unwrap(),
+                ),
             )),
             probe: Box::new(SystemProbe::new(
                 ApprovedRoots::default(),

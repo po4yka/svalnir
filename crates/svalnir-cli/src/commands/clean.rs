@@ -1011,6 +1011,19 @@ pub(crate) fn show(
     Ok(ExitStatus::Success)
 }
 
+/// The error for a `--digest` that is not the digest of the stored plan.
+fn digest_mismatch(plan_id: &PlanId) -> ErrorBody {
+    ErrorBody::new(
+        "plan_digest_mismatch",
+        ErrorFamily::Evidence,
+        ErrorStage::Admission,
+        "the digest is not the digest of the stored plan; show the plan again with `svalnir clean show` and approve that plan; the command made no change",
+    )
+    .with_fields(&["digest"])
+    .with_plan(plan_id.as_str())
+    .with_next_action(NextAction::PrepareNewPlan)
+}
+
 pub(crate) fn apply(
     arguments: &CleanApplyArgs,
     invocation: &mut Invocation<'_>,
@@ -1019,6 +1032,13 @@ pub(crate) fn apply(
     let environment: &Environment = invocation.environment;
     let journal: Option<OperationJournal> = session::open_existing_journal(environment)?;
     let stored: StoredPlan = load_plan(journal.as_ref(), environment, &plan_id)?;
+    // The digest that was shown for the approval must be that of the
+    // stored plan. The approval then binds the same digest.
+    if let Some(expected) = &arguments.digest
+        && expected.as_str() != stored.plan.digest().as_str()
+    {
+        return Err(digest_mismatch(&plan_id).into());
+    }
     let is_cleanup: bool = matches!(mode_of(&stored.plan), Some(PlanMode::Cleanup(_)));
     if !is_cleanup {
         return Err(ErrorBody::new(

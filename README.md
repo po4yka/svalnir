@@ -329,6 +329,7 @@ The CLI will use **`clap` with its derive API**, plus `clap_complete` for shell 
 | `svalnir status` | Summarize disk, memory, agent, and policy state |
 | `svalnir scan PATH` | Analyze a selected storage scope |
 | `svalnir report --scan ID` | Inspect a recorded scan |
+| `svalnir disk [--warn-below SIZE]` | Show the free and available space of the volume of the home directory; with `--warn-below`, warn only when space is low |
 | `svalnir clean inspect` | Inspect the units of one cleanup rule; read-only |
 | `svalnir clean plan` | Prepare a bounded cleanup plan |
 | `svalnir clean show --plan ID` | Explain targets, estimates, exclusions, and expiry |
@@ -348,6 +349,7 @@ The CLI will use **`clap` with its derive API**, plus `clap_complete` for shell 
 | `svalnir doctor` | Diagnose permissions, service identity, APIs, and degraded state |
 | `svalnir completions SHELL` | Generate shell completions |
 | `svalnir license` | Display the GPLv3 license and applicable notices |
+| `svalnir mcp` | Serve the Model Context Protocol on stdin and stdout for a coding agent |
 
 Future namespaces may include `apps`, `services`, `run`, `volumes`, and `power`. They are not prerequisites for the core guards. The [interfaces](docs/INTERFACES.md) document defines the common options, output encoding, exit status, and the local protocol.
 
@@ -424,6 +426,64 @@ svalnir processes stop --target TARGET_ID --force
 ```
 
 Manual commands use the same identity validation and hard protections as automation. A process budget is a sampled enforcement policy with possible overshoot, not a kernel-enforced allocation ceiling.
+
+### Coding agents
+
+#### Disk space
+
+```sh
+# The free and available space of the volume of the home directory.
+svalnir disk
+svalnir disk --format json
+
+# A check for a script or a hook: one warning line when less than 20 GiB is
+# available, and no output otherwise.
+svalnir disk --warn-below 20GiB
+```
+
+With `--warn-below`, an error goes to stderr and the exit status is `0`, so a hook does not fail. A size has a binary unit: `B`, `KiB`, `MiB`, `GiB`, or `TiB`. A decimal unit such as `GB` is an error.
+
+#### MCP server
+
+`svalnir mcp` is a Model Context Protocol server on stdin and stdout. Add it to Claude Code:
+
+```sh
+claude mcp add svalnir -- svalnir mcp
+```
+
+The tools are `disk`, `scan`, `report`, `inspect`, `plan`, `show`, `apply`, and `operations`. Each tool runs the CLI command of the same name, with the same checks. `apply` is `svalnir clean apply` and needs the digest that `plan` or `show` returned. The descriptions of the tools tell the agent to show each plan to the user and to ask for approval before `apply`. The server cannot verify that approval. The lifecycle gates of the rules, the protections, the digest of the plan, and the journal stay in effect ([THREAT_MODEL.md](docs/THREAT_MODEL.md) section 7). The server has no `permanent` mode, and no tool that enables a guard or stops a process. [INTERFACES.md](docs/INTERFACES.md) section 17 has the contract.
+
+#### Agent skill
+
+[`skills/svalnir/SKILL.md`](skills/svalnir/SKILL.md) tells a coding agent when to use Svalnir and how to apply a plan only after the user approves it. Copy it to the skills directory of Claude Code:
+
+```sh
+mkdir -p ~/.claude/skills/svalnir
+cp skills/svalnir/SKILL.md ~/.claude/skills/svalnir/SKILL.md
+```
+
+#### Hooks
+
+This Claude Code `SessionStart` hook gives the agent a warning when less than 20 GiB is available. Add it to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "svalnir disk --warn-below 20GiB"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook prints nothing when the space is sufficient, and it does not stop the session when Svalnir gives an error.
 
 ### Output contract
 

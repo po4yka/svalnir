@@ -1,6 +1,6 @@
 # Svalnir Threat Model
 
-**Last reviewed:** 2026-11-19
+**Last reviewed:** 2026-11-22
 
 > **Status:** Design specification. Controls described as requirements are not claims that an implementation, security audit, or release validation already exists.
 >
@@ -46,6 +46,7 @@ A path, application name, environment variable, or command argument may contain 
 | --- | --- |
 | Ordinary user or administrator | May enable an overbroad policy, misunderstand an estimate, revoke access, or interrupt an operation |
 | Untrusted application running as the current user | May alter user-writable directories, spawn processes, consume resources, invoke the genuine Svalnir CLI, and modify user-owned configuration |
+| Coding agent connected to `svalnir mcp` | Has the capability of the current user through the tools of [INTERFACES.md](INTERFACES.md) section 17. It can misread a plan, act on text from a file or a web page, and call `apply` with no approval of the user |
 | Other local user | May connect to exposed services, contend for shared capacity, and attempt cross-user observation or action |
 | Malicious or malformed filesystem content | May contain symlinks, mount changes, unusual names, oversized metadata, and adversarial directory structures |
 | Compromised dependency, adapter, or update | May introduce code execution or change eligibility semantics inside a trusted component |
@@ -70,6 +71,7 @@ Code identity is not evidence of human intent. A malicious process can launch a 
 | Agent → user-owned files or applications | Use the requesting user's privileges; enforce action grants, target identity, exclusions, and budgets |
 | Agent → privileged helper (after the initial release) | Authenticate the specific permitted client identity and session; independently enforce helper-owned privilege grants |
 | Agent → catalog and journal | Treat stored plans as stale observations; protect state files and validate decoded records |
+| Coding agent → `svalnir mcp` (stdio) | Treat each message as untrusted input: bound the line and each argument, refuse an unknown method, tool, or argument, and pass no argument to a shell. Each tool call is one invocation of a CLI command with the checks of the CLI; the server has no other path to a file or a process ([INTERFACES.md](INTERFACES.md) section 17) |
 | Helper → its own state and host coordination (after the initial release) | Use root-owned storage and scoped leases; never trust user storage as administrative authority |
 | Release artifacts → installed services | Verify signed artifacts and compatibility before enabling mutation; protect privileged executable locations |
 
@@ -261,6 +263,19 @@ The following changes require updating this model and the applicable release gat
 - Changes to journaling, durability, retention, pause acknowledgement, or replay handling.
 - An updater, remote control, cloud synchronization, third-party plugin, or remote rule distribution.
 - Endpoint Security or Network Extension integration, which are outside the initial trust surface and require their own permissions, boundaries, data-flow analysis, and review.
+
+### Accepted residual risk: approval through a coding agent
+
+Owner decision of 2026-11-22: `svalnir mcp` gives a coding agent the `plan` and `apply` tools of [INTERFACES.md](INTERFACES.md) section 17.
+
+| Field | Value |
+| --- | --- |
+| Scope | `svalnir mcp` and its `apply` tool, which is `clean apply` with `--yes` and `--digest` |
+| Risk | The server cannot verify that the user saw a plan or approved it. The descriptions of the tools tell the agent to show each plan and to ask the user before `apply`, but an agent can ignore them, and text in a file or a web page can tell the agent to call `apply`. This is [T-01](#t-01--confused-deputy-through-local-ipc) for a client that runs as the user |
+| Controls that stay in effect | The lifecycle gates of the rules: in a released build each rule is `proposed`, and the `evict` mode refuses it. The hard protections and the configured protections of each target, at the plan and again at admission. The approval digest: `apply` requires the digest of the plan, and `clean apply --digest` refuses a stored plan with a different digest, so the agent cannot apply a plan that it did not read. The expiry of the plan, and the checks of the coordinator at admission and before each step. No tool enables a guard or starts an automatic operation, and the `plan` tool has no `permanent` mode. The journal records each operation, and `history` shows it. The `HOME` check of each command that changes state |
+| Rationale | The same user can run `svalnir clean apply --yes` from a shell, so the server adds no authority to the session ([section 3](#3-actors-assumptions-and-limits)). The server adds a path that an agent can use without a terminal, and the controls above limit what that path can remove |
+| Owner | The project owner |
+| Verification | The unit tests of `svalnir-cli` exercise a refused wrong digest and a plan and apply round trip with a fixture lifecycle state. They are not evidence for a validation family, and no host run examined the server |
 
 Record accepted residual risks with the affected scope, rationale, owner, and verification evidence. Approval of one disposable namespace or backend does not automatically approve another. Security claims should describe demonstrated boundaries and remaining uncertainty, rather than equating broad OS access with unlimited product authority.
 

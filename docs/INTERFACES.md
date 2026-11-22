@@ -1,6 +1,6 @@
 # Svalnir Interfaces
 
-**Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API. The current build implements the subset that section 4 names in "Milestone 1 in-process build" and "Milestone 2 build without a socket". It has no local protocol: sections 9 to 11 are planned behavior.  
+**Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API. The current build implements the subset that section 4 names in "Milestone 1 in-process build" and "Milestone 2 build without a socket". It has no local protocol: sections 9 to 11 are planned behavior. Section 17 is the MCP server of `svalnir mcp`, which this build has.  
 **Interface baseline:** 1  
 **Last reviewed:** 2026-11-22
 
@@ -85,6 +85,7 @@ The following preserves the README command families and adds operation/configura
 | --- | --- |
 | `status`, `memory status`, `swap status` | Current resource, capability, agent, and policy views |
 | `scan PATH`, `report [--scan ID]` | Bounded analysis, scan inspection, and the capacity report of the startup data volume |
+| `disk [--warn-below SIZE]` | The free and available space of the volume of the home directory, and a check for a hook |
 | `clean inspect/plan/show/apply` | Report what a reviewed rule finds; prepare, inspect, and apply an immutable removal plan |
 | `monitor` | Subscribe to resource and selected operation updates |
 | `processes top/show/stop` | Rank, inspect, and control verified application/process targets |
@@ -94,6 +95,7 @@ The following preserves the README command families and adds operation/configura
 | `config validate/show/apply` | Validate proposals, inspect effective values, and activate a revision |
 | `history`, `doctor` | Bounded historical queries and capability diagnostics |
 | `completions SHELL`, `license` | Local completion generation and license/notices |
+| `mcp` | The MCP server for a coding agent on stdin and stdout (section 17) |
 
 Optional future namespaces do not appear as functional commands until their adapters are implemented.
 
@@ -122,9 +124,9 @@ The read-only commands have no local protocol behind them. The CLI links the age
 
 | Subject | Decision |
 | --- | --- |
-| Commands that run | `status`, `memory status`, `swap status`, `monitor`, `processes top`, `processes show`, `scan`, `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, `completions`, and `license` |
+| Commands that run | `status`, `memory status`, `swap status`, `monitor`, `processes top`, `processes show`, `scan`, `report`, `disk`, `mcp`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, `completions`, and `license` |
 | Commands that change state | See "Milestone 2 build without a socket". On a platform other than macOS, a command whose executor exists only for macOS reports `not_implemented` or `unsupported_platform` (exit `3`, no change) |
-| Response `kind` | `snapshot` for `status`, `memory status`, `swap status`, `processes top`, `processes show`, and `scan`. `report` for `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, and `license` |
+| Response `kind` | `snapshot` for `status`, `memory status`, `swap status`, `processes top`, `processes show`, `disk`, and `scan`. `report` for `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, and `license` |
 | State directory | `~/Library/Application Support/Svalnir/`. The environment variable `SVALNIR_STATE_DIR` replaces it with an absolute path; a value that is not absolute is a request error. Among the read-only commands, only `scan --save` creates the directory, with mode `0700`. "Milestone 2 build without a socket" names the other commands that create it |
 | Catalog store | `catalog.sqlite` in the state directory holds the saved scan records and the metric samples of the agent. `scan --save` applies the `[history]` limits of the configuration template, because no effective revision exists. The `save` field of the result is `not_requested`, `saved`, `not_saved_interrupted`, or `removed_by_retention` |
 | Configuration proposal | The file of `--config PATH`, or `config.toml` in the state directory. `config validate` needs a file. `config show`, `policy list`, `policy show`, and `policy simulate` use the built-in template when the default file does not exist, and the result names that source |
@@ -139,6 +141,9 @@ The read-only commands have no local protocol behind them. The CLI links the age
 | `--timeout` | It bounds the client wait of `clean apply`, `processes stop`, `operations wait`, `operations cancel`, `operations acknowledge`, and `policy rearm`. It has no effect on each other command, whose result has the warning `timeout_not_applied`: in `warnings` of the envelope, or on stderr for the text format and for `monitor`. An error response keeps it: in `warnings` of the error envelope, or on stderr before the error |
 | Target ID | `processes show --target` accepts the form `pg-DIGITS-DIGITS` that `processes top` prints. Other text is an invalid argument (exit `2`) |
 | Configuration file | The path must be a regular file. A directory, a FIFO, or a device is an invalid argument (exit `2`) |
+| `disk` | It reads the volume that has the directory of `HOME`, with the collectors of `status`, one time. The result has `home`, `disk` with the selector `home` and the `total`, `free`, `available`, `important_available`, and `opportunistic_available` observations, `threshold`, `below_threshold`, `warning`, and `coverage`. With no `--warn-below`, `threshold`, `below_threshold`, and `warning` are `null`; an absent or relative `HOME` gives `home_not_set`, exit `3`; an available capacity with no value gives exit `4` |
+| `disk --warn-below SIZE` | A check for a hook. SIZE has the grammar of [POLICY_SPEC.md](POLICY_SPEC.md) section 3 (`B`, `KiB`, `MiB`, `GiB`, `TiB`; no decimal unit). In the text format, stdout has one warning line when the available capacity is below SIZE, and nothing otherwise. In the `json` format, stdout always has the result, with `below_threshold`. Each error of the command, also an invalid SIZE, an absent `HOME`, and an available capacity with no value, goes to stderr as one `error:` line, stdout has nothing, and the exit status is `0`. Only an argument that the parser rejects, for example an unknown option or `--format ndjson`, has exit `2` |
+| `mcp` | The server of section 17. It accepts only the `text` format; `json` and `ndjson` give `unsupported_format`, exit `2`. It ends with exit `0` at the end of stdin, `1` when stdin cannot be read, and `128` plus the number of the signal after `SIGTERM` or `SIGHUP` |
 | Save state | The scan result has `save` with one of `not_requested`, `saved`, `saved_readback_failed`, or `not_saved`. `save_detail` gives the reason for the last two |
 | Interrupt | Ctrl+C ends `monitor` and `scan` with exit `130`, also when the reader of a pipe closes at the same time. An interrupted scan writes its partial result and does not save it. Ctrl+C ends each other command at once |
 
@@ -176,7 +181,7 @@ This build has no socket, and it registers no XPC service. A client and the agen
 | `--scan` | The `trash` and `permanent` modes need it: with none, `scan_required`, exit `2` |
 | File protection of a manual plan | The hard protection of a file entry comes from the catalog of protected file locations of `svalnir-core` (`docs/CLEANUP_RULES.md` section 5): storage of the operating system, swap storage, the state directory of Svalnir, and the home directory with each directory that contains it. The client gives the catalog the home directory and the state directory with their symbolic links resolved, and two forms of the path of the entry: the directory of the entry with its symbolic links resolved plus the name of the entry, and the entry with each symbolic link resolved. The entry is protected when one form is protected, so a symbolic link in a protected location is protected, and so is a symbolic link whose target is a protected location, for example a link at the configured path of the state directory. An entry that does not resolve has an unknown protection. A state directory that does not resolve is not given, and an entry that no other rule protects has an unknown protection; an entry whose protection is not known is left out. The plan builder applies the `[protections]` table, and the filesystem executor refuses the home directory, its ancestors, and the cleanup root again |
 | Plan document | The journal stores the sealed plan. The client keeps the size estimates, the entries that were left out, the record of each cleanup root with its volume, the operation identity, and the measurements of the operation in `plans/plan-PLAN_ID.json` of the state directory, with mode `0600`. A document gives no authority and gives the executor no cleanup root: the coordinator takes the approved roots of a manual operation from the sealed plan. The identity of a cleanup root is a digest of its path, its device and inode, its volume, and its mount generation, and the sealed plan binds that identity, the root path, and the device and inode of the root for each file target. A document is used only when its digest and its plan are those of the stored plan, its roots are exactly the roots that the file targets of the plan bind, each root has the path and the object that the sealed plan binds for it, and each root has the identity that its values give. The display path of a file target, in a plan view and in each result, is the root path and the relative entry that the plan binds, and `cleanup_roots` has the root paths that the plan binds; a client with no document has them also. The estimates, the work totals, and the paths of the entries that were left out are display data of the document with no check. The volumes of the capacity observations of a transient coordinator come from the sealed plan also: the client reads the volume at each root path that the plan binds and uses it only when its volume identity and its mount generation are those of the binding. The result of `clean plan` and `clean show` has `cleanup_roots` and `plan_document` (`used`, `absent`, `not_readable`, or `disagrees_with_plan`). A document that cannot be read or does not agree is not used and is not an error of `clean show`, of `operations show`, of `history`, or of the report of a plan that was applied before. `clean apply` of a plan with no document asks its question with each path and no estimate, and applies the plan. `clean apply` with a document that is present and not used reports `plan_document_not_usable`, exit `5`. A document has `schema_version` (3); `clean show` and `clean apply` refuse a document of a different version with `plan_version_not_supported`, exit `2`, before they read a field of it, and the user makes a new plan. A document is removed after 7 days |
-| Approval | `clean apply` and `processes stop` ask one question on stderr that has the scope and the consequence of the plan: each target, with no limit on the length of the list, and each cleanup root. Only the answers `y` and `yes` approve. A session with no terminal needs `--yes`, else `approval_required`, exit `3`; a refusal gives `approval_declined`, exit `3`. An expired plan is refused before the question, with `plan_expired`, exit `5`. The approval names the plan identity and the digest of the stored plan |
+| Approval | `clean apply` and `processes stop` ask one question on stderr that has the scope and the consequence of the plan: each target, with no limit on the length of the list, and each cleanup root. Only the answers `y` and `yes` approve. A session with no terminal needs `--yes`, else `approval_required`, exit `3`; a refusal gives `approval_declined`, exit `3`. An expired plan is refused before the question, with `plan_expired`, exit `5`. The approval names the plan identity and the digest of the stored plan. With `--digest DIGEST`, a stored plan whose digest is not DIGEST is refused before the question, with `plan_digest_mismatch`, exit `5`, and nothing changes |
 | Duplicate apply | A second `clean apply` of a plan reports its operation with `existing_operation` true and `kind` `operation`, and makes no second operation. The journal has at most one operation for a plan. `wait` is `finished` for an operation that is settled or has an unknown outcome; for each other operation it is `not_waited`, and the command does not wait. The exit status is that of the operation, which is `5` for `not_waited`; with `--no-wait`, an operation in the `Admitted` state gives `0` |
 | `--no-wait` | The response has `kind` `accepted` with `operation_id`, `plan_id`, `state`, `dispatch`, `durability`, `acknowledgement` (`operation_admitted` or `request_queued`), `executor`, and `request_id`. A queued request waits at most 10 seconds, or the `--timeout` value, for its admission; after that the state is `queued` and `operation_id` is null |
 | Waited result | `kind` `operation`. `wait` is `finished`, `timed_out`, `interrupted`, for a transient coordinator `stopped_by_sigterm` or `stopped_by_sighup`, or, for `operations wait`, `no_coordinator`. The exit status is that of section 8 for `finished`, `130` for `interrupted`, `143` for `stopped_by_sigterm`, `129` for `stopped_by_sighup`, and `5` for the others. A result that cannot be written keeps this status: a closed pipe is silent, and each other write error has a diagnostic on stderr. A wait reads a busy journal again. A read that fails after the admission gives `operation_record_unavailable`, exit `5`, with the plan and the operation; a read that fails in `operations wait` gives the journal error with the operation |
@@ -217,7 +222,7 @@ The error codes of this build, in addition to those of the Milestone 1 build and
 | `authority` | `3` | `no_active_policy_revision`, `approval_required`, `approval_declined`, `reviewed_revision_required`, `acceptance_mismatch`, `observe_profile`, `guard_not_requested`, `wrong_principal`, `authority_record_of_a_different_user`, `plan_authority_not_usable`, `disable_refused` |
 | `eligibility` | `3` | `rule_mode_not_validated`, `target_protected`, `target_not_eligible` |
 | `native` | `3` | `agent_program_not_found`, `agent_program_not_trusted`, `state_directory_not_private`, `service_change_failed`, `service_unload_timeout`, `superuser_not_supported`, `home_not_set`, `home_account_unknown`, `home_not_resolvable`, `home_mismatch`, `home_directory_unavailable`, `clock_unavailable`, `rule_registry_unavailable`, `identity_unavailable`, `filesystem_executor_unavailable`, `service_definition_not_renderable` |
-| `evidence` | `5` | `plan_not_found`, `operation_not_found`, `group_not_found`, `scan_stale`, `volume_identity_unavailable`, `plan_document_not_usable`, `revision_conflict`, `authority_record_changed`, `stop_plan_exists`, `target_protection_unknown`, `coordinator_stopped`, `journal_conflict`, `record_not_found`, `agent_not_running`, `incident_not_found`, `generation_conflict`, `incident_record_not_usable` |
+| `evidence` | `5` | `plan_not_found`, `plan_digest_mismatch`, `operation_not_found`, `group_not_found`, `scan_stale`, `volume_identity_unavailable`, `plan_document_not_usable`, `revision_conflict`, `authority_record_changed`, `stop_plan_exists`, `target_protection_unknown`, `coordinator_stopped`, `journal_conflict`, `record_not_found`, `agent_not_running`, `incident_not_found`, `generation_conflict`, `incident_record_not_usable` |
 | `limits` | `5` | `plan_expired`, `queue_full`, `acknowledgment_pending`, `rearm_pending`, `incident_operation_unsettled`, `budget_generations_exhausted`, `selection_too_large`, `plan_limits_not_usable`, `stop_durations_not_usable` |
 | `outcome` | `5` | `operation_record_unavailable`, `incident_outcome_unknown`, `stopped_by_signal` (exit `143` or `129`: the status of the signal) |
 | `recording` | `1` | `journal_unavailable`, `journal_busy`, `journal_full`, `journal_newer_version`, `journal_older_version`, `journal_not_current`, `journal_not_recognized`, `authority_record_not_readable`, `plan_document_unavailable`, `policy_revision_source_not_usable`, `coordinator_unavailable` |
@@ -711,12 +716,56 @@ Test actual artifacts and supported OS combinations. A successful pure serializa
 
 The implementation must publish complete request/response schemas, finite effective limits, compatibility policy, and evidence for the methods it enables.
 
+## 17. MCP server for coding agents
+
+Owner decision of 2026-11-22: Svalnir has an MCP server for a coding agent, with the same authority as the CLI and no new path that changes state. `svalnir mcp` reads JSON-RPC 2.0 messages on stdin and writes the responses on stdout, as the stdio transport of the [Model Context Protocol][mcp] specifies. [THREAT_MODEL.md](THREAT_MODEL.md) section 7 has the residual risk of this server.
+
+### Protocol
+
+| Subject | Decision |
+| --- | --- |
+| Versions | `2026-07-28`, with the protocol version in `_meta` (`io.modelcontextprotocol/protocolVersion`) of each request, and `2025-11-25`, `2025-06-18`, and `2025-03-26` with the `initialize` handshake. `initialize` gives the requested version when the server has it, and else `2025-11-25` |
+| Methods | `initialize`, `server/discover`, `ping`, `tools/list`, and `tools/call`. A different method gives `-32601`. A notification gets no response, also an unknown one. A response of the client is ignored |
+| Version of a request | `tools/list` and `tools/call` need the version `2026-07-28` in `_meta`, or an earlier `initialize`. A different version, or no version and no handshake, gives `-32022` with `data.supported` and `data.requested` |
+| Results | A result of a request with `_meta` has `resultType` `complete`. `tools/list` has all tools in one page |
+| Messages | One message on each line, at most 1 MiB. A longer line is discarded to its end and gets `-32600` with the identity `null`. A line that is not JSON gets `-32700`. A batch, an identity that is not a string or an integer, or a `jsonrpc` value that is not `2.0` gets `-32600` |
+| Streams | Stdout has only the JSON-RPC responses. The log goes to stderr: at most 2 KiB for each line and 256 KiB in total. The log has the exit status and the stderr of each tool call, and the protocol errors |
+| Sequence | The server handles one request at a time, in the sequence of stdin |
+| End | At the end of stdin the server ends. The server records `SIGTERM` and `SIGHUP` from its start, ends after the current request, and gives `128` plus the number of the signal. A transient coordinator of `apply` in the server stops as section 4 specifies |
+
+### Tools
+
+Each tool call is one invocation of a CLI command in the server process, with `--format json`. The command has its own checks: the `HOME` check of a command that changes state, the lifecycle gates, the protections, the plan expiry, and the request queue of the journal or the transient coordinator. Each option value goes to the command in the form `--option=VALUE`, and a path goes after `--`, so a value is never read as an option. No argument goes to a shell.
+
+| Tool | Command | Arguments |
+| --- | --- | --- |
+| `disk` | `disk`, and `disk --warn-below` with `warn_below` | `warn_below` |
+| `scan` | `scan [--save] -- PATH` | `path` (required), `save` |
+| `report` | `report` | `scan`, `window`, `threshold` |
+| `inspect` | `clean inspect --rule` | `rule` (required), `roots`, `no_mise` |
+| `plan` | `clean plan` | `mode` (required, `evict` or `trash`), `rule`, `scan`, `entries`, `profile`, `roots`, `no_mise`, `include_active`, `min_size` |
+| `show` | `clean show --plan` | `plan_id` (required) |
+| `apply` | `clean apply --plan --digest --yes`, with `--no-wait` or `--timeout` | `plan_id` (required), `digest` (required), `no_wait`, `timeout` |
+| `operations` | `operations show` or `operations wait --timeout` | `action` (required, `show` or `wait`), `operation_id` (required), `timeout` |
+
+- The input schema of each tool has `additionalProperties` false. An unknown argument, a value of the wrong type, an empty text, a text longer than 4 KiB or with a NUL character, and a list with more than 64 items give a tool result with `isError` true, and no command runs. An unknown tool gives `-32602`.
+- The `plan` tool has no `permanent` mode. The server has no tool that enables a guard, changes the configuration, or stops a process.
+- `timeout` is a duration of more than zero and at most `30m`. With no `timeout`, `apply` and `operations` with `wait` give `--timeout 5m`. The end of the wait cancels nothing.
+- `apply` requires the `digest` that `plan` or `show` returned. `--yes` takes the place of the question of the terminal, and `--digest` makes the command refuse a stored plan with a different digest (`plan_digest_mismatch`), so the approval binds the plan that the agent read.
+- The description of `plan` and of `apply` tells the agent to show the plan to the user, with the targets, the size estimate, and the warnings, and to call `apply` only after the user approved that plan. The server cannot verify that approval.
+
+### Tool results
+
+A tool result has `content` with one text block, which is the serialized `structuredContent`, and `isError`. `structuredContent` has `exit_status`, the exit status of the command, and `response`, the JSON envelope of section 7. `isError` is true when the envelope has an `error`. The result of `plan` with a plan also has `approval`, with `plan_id`, `digest`, and a note that tells the agent to ask the user for approval. A command that gives no envelope, for example `disk --warn-below` with an error, gives `isError` true and the text of its stderr. A result that is larger than 8 MiB gives `isError` true.
+
 ## References
 
 - [clap: Derive, validation, help, and command APIs][clap]
 - [RFC 8259: JSON interoperability][json]
 - [Apple: NSXPC peer code-signing requirements][xpc]
+- [Model Context Protocol specification, revision 2026-07-28][mcp]
 
 [clap]: https://docs.rs/clap/latest/clap/
 [json]: https://www.rfc-editor.org/rfc/rfc8259
+[mcp]: https://modelcontextprotocol.io/specification/2026-07-28
 [xpc]: https://developer.apple.com/documentation/foundation/nsxpcconnection/setcodesigningrequirement(_:)

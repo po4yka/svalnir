@@ -70,6 +70,19 @@ fn overlaps(path: &[Vec<u8>], location: &[Vec<u8>]) -> bool {
     has_prefix(path, location) || has_prefix(location, path)
 }
 
+/// True when one of two absolute paths is the other one, is inside it, or
+/// contains it, with the fail-closed comparison of this module: it ignores
+/// case, and two components that are not equal count as a match when one
+/// of them has a non-ASCII byte.
+///
+/// A caller that applies an exclusion list outside a plan uses it, so that
+/// an exclusion that differs from the path on disk only in case or in
+/// Unicode normalization still protects the path.
+#[must_use]
+pub fn paths_overlap(first: &[u8], second: &[u8]) -> bool {
+    overlaps(&components(first), &components(second))
+}
+
 /// The hard protection of the file entry at `path`.
 ///
 /// The entry is protected when one of these is true:
@@ -138,12 +151,37 @@ pub fn file_hard_protection(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileProtectionContext, file_hard_protection};
+    use super::{FileProtectionContext, file_hard_protection, paths_overlap};
     use crate::file::LosslessPath;
     use crate::policy::ProtectionFact;
 
     fn path(text: &str) -> LosslessPath {
         LosslessPath::from_bytes(text).unwrap()
+    }
+
+    #[test]
+    fn the_overlap_of_two_paths_fails_closed_for_case_and_normalization() {
+        let derived = b"/Users/a/Library/Developer/Xcode/DerivedData/App-abc".as_slice();
+        // The same path, and a path below it or above it.
+        assert!(paths_overlap(derived, derived));
+        assert!(paths_overlap(
+            b"/Users/a/Library/Developer/Xcode/DerivedData/App-abc/Build",
+            derived
+        ));
+        assert!(paths_overlap(b"/Users/a/Library/Developer", derived));
+        // A different case.
+        assert!(paths_overlap(
+            b"/users/a/library/developer/xcode/deriveddata/app-abc",
+            derived
+        ));
+        // NFC and NFD spellings of one name.
+        assert!(paths_overlap(
+            "/Users/a/Caf\u{e9}".as_bytes(),
+            "/Users/a/Cafe\u{301}/x".as_bytes()
+        ));
+        // Whole components only, and different ASCII names do not match.
+        assert!(!paths_overlap(b"/Users/a/foo", b"/Users/a/foobar"));
+        assert!(!paths_overlap(b"/Users/a/one", b"/Users/a/two"));
     }
 
     /// The protection of `entry` for the user `a` and the usual state

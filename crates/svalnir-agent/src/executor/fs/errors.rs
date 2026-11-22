@@ -114,6 +114,21 @@ pub mod code {
     /// can remove the copy in the cloud. Also `EDEADLK`: the object is
     /// dataless and the thread does not materialize it.
     pub const DATALESS_OBJECT: &str = "dataless_object";
+    /// The target, its parent directory, or an entry of a directory target
+    /// has a flag that prevents its removal or the removal of its entries
+    /// (`uchg`, `uappnd`, `schg`, `sappnd`, or `restricted`). The target
+    /// gets no call, so that the removal does not stop after a part of a
+    /// tree.
+    pub const LOCKED_OBJECT: &str = "locked_object";
+    /// A target of a permanent removal is larger than the work charge of
+    /// its binding: its allocated bytes, or for a directory its number of
+    /// entries. The plan does not authorize the entries or the data that
+    /// appeared after it was made.
+    pub const TARGET_GREW: &str = "target_grew";
+    /// A regular file of an eviction, or a regular file in a directory
+    /// target of an eviction, has more than one name. Its removal frees no
+    /// space while another name keeps the data.
+    pub const TARGET_HARD_LINKED: &str = "target_hard_linked";
     /// `EINTR`.
     pub const INTERRUPTED: &str = "interrupted";
     /// `EIO`.
@@ -141,7 +156,10 @@ pub mod code {
     pub const BATCH_LIMIT: &str = "batch_limit";
 
     /// Each code of the executor.
-    pub const ALL: [&str; 53] = [
+    pub const ALL: [&str; 56] = [
+        LOCKED_OBJECT,
+        TARGET_GREW,
+        TARGET_HARD_LINKED,
         APPROVED_ROOT_MISMATCH,
         TREE_ENTRY_OWNER_MISMATCH,
         BATCH_LIMIT,

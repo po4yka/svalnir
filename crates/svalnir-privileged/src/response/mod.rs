@@ -122,6 +122,11 @@ pub enum Condition {
     /// The object of an entry is larger than the bound of the entry.
     #[error("the object of an entry is larger than its bound")]
     TargetOverBound,
+    /// The object of a directory entry is the home directory of the user
+    /// of the step or a directory that contains it, or the helper could
+    /// not establish the home directory of that user.
+    #[error("the object of an entry is or contains the home directory of the user")]
+    HomeDirectoryProtected,
     /// The removal call returned a definite refusal.
     #[error("the removal call was refused")]
     RemovalRefused,
@@ -135,7 +140,7 @@ pub enum Condition {
 
 impl Condition {
     /// Each condition.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::PeerUnverified,
         Self::PeerUserUnavailable,
         Self::FrameMalformed,
@@ -156,6 +161,7 @@ impl Condition {
         Self::TargetHardLinked,
         Self::TargetDataless,
         Self::TargetOverBound,
+        Self::HomeDirectoryProtected,
         Self::RemovalRefused,
         Self::DirectoryNotEmpty,
         Self::RemovalUnknown,
@@ -177,7 +183,8 @@ impl Condition {
             | Self::MountCrossing
             | Self::TargetNotOwned
             | Self::TargetHardLinked
-            | Self::TargetDataless => ErrorFamily::Eligibility,
+            | Self::TargetDataless
+            | Self::HomeDirectoryProtected => ErrorFamily::Eligibility,
             Self::ResponseTooLarge | Self::TargetOverBound => ErrorFamily::Limits,
             Self::StateUnavailable | Self::RecordNotDurable | Self::ResultNotDurable => {
                 ErrorFamily::Recording
@@ -211,6 +218,7 @@ impl Condition {
             Self::TargetHardLinked => "helper_target_hard_linked",
             Self::TargetDataless => "helper_target_dataless",
             Self::TargetOverBound => "helper_target_over_bound",
+            Self::HomeDirectoryProtected => "helper_home_directory_protected",
             Self::RemovalRefused => "helper_removal_refused",
             Self::DirectoryNotEmpty => "helper_directory_not_empty",
             Self::RemovalUnknown => "helper_removal_unknown",

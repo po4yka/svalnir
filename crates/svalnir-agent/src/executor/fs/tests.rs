@@ -233,7 +233,9 @@ fn binding_with(
             revision: RuleRevisionId::new("rule_rev_1").unwrap(),
         }),
         layout: Some("layout-v1".to_owned()),
-        charge: WorkCharge::new(Bytes::new(1), EntryCount::new(1)),
+        // A charge larger than each fixture tree: a test of the growth
+        // check sets a smaller one.
+        charge: WorkCharge::new(Bytes::new(1 << 30), EntryCount::new(100_000)),
     }
 }
 
@@ -673,7 +675,7 @@ fn a_hard_link_inside_a_tree_loses_one_name_and_keeps_its_content() {
     let kept: PathBuf = fixture.root.join("kept.bin");
     fs::write(&linked, [5_u8; 2048]).unwrap();
     fs::hard_link(&linked, &kept).unwrap();
-    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+    let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "tree");
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
 
@@ -1269,7 +1271,7 @@ fn a_hard_link_loses_one_name_and_keeps_its_content() {
     let second: PathBuf = fixture.root.join("second.bin");
     fs::write(&first, [9_u8; 4096]).unwrap();
     fs::hard_link(&first, &second).unwrap();
-    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "first.bin");
+    let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "first.bin");
 
     let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
 
@@ -3231,4 +3233,270 @@ fn a_tree_with_an_entry_of_another_owner_is_refused_as_a_whole() {
         assert_eq!(listing(&tree), before);
         fixture.assert_outside_unchanged();
     }
+}
+
+// ---------------------------------------------------------------------
+// Bounds of the binding, hard links of an eviction, and locking flags
+// ---------------------------------------------------------------------
+
+/// The envelope of `relative` with the work charge `charge`.
+fn envelope_with_charge(
+    fixture: &Fixture,
+    class: ActionClass,
+    relative: &str,
+    charge: WorkCharge,
+) -> RequestEnvelope {
+    let mut binding: FileBinding = fixture.binding(relative);
+    binding.charge = charge;
+    envelope_of(class, relative, binding)
+}
+
+/// Sets the flags of `path` with `lchflags`, without following a link.
+fn set_flags(path: &Path, flags: u32) {
+    let text = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `text` is a valid NUL-terminated path that lives for the call.
+    let status: libc::c_int = unsafe { libc::lchflags(text.as_ptr(), flags) };
+    assert_eq!(status, 0, "{}", io::Error::last_os_error());
+}
+
+/// Clears the flags of a path at the end of a test, so that the
+/// temporary directory can be removed.
+struct FlagGuard(PathBuf);
+
+impl FlagGuard {
+    fn lock(path: &Path, flags: u32) -> Self {
+        set_flags(path, flags);
+        Self(path.to_path_buf())
+    }
+}
+
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        set_flags(&self.0, 0);
+    }
+}
+
+#[test]
+fn a_directory_target_with_more_entries_than_its_charge_is_refused_as_a_whole() {
+    for class in [
+        ActionClass::DeleteSelectedFiles,
+        ActionClass::EvictRegenerableData,
+    ] {
+        let fixture = Fixture::new();
+        let tree: PathBuf = fixture.root.join("tree");
+        fs::create_dir(&tree).unwrap();
+        for index in 0..10 {
+            fs::write(tree.join(format!("{index}.bin")), b"x").unwrap();
+        }
+        // The plan measured the directory and two entries.
+        let charge = WorkCharge::new(Bytes::new(1 << 20), EntryCount::new(3));
+        let envelope = envelope_with_charge(&fixture, class, "tree", charge);
+
+        let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+        assert_skipped(&outcome, &ErrorFamily::Evidence, code::TARGET_GREW);
+        assert_eq!(fs::read_dir(&tree).unwrap().count(), 10);
+        fixture.assert_outside_unchanged();
+    }
+}
+
+#[test]
+fn a_directory_target_with_more_bytes_than_its_charge_is_refused_as_a_whole() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("grown.bin"), vec![7_u8; 1 << 20]).unwrap();
+    let charge = WorkCharge::new(Bytes::new(4096), EntryCount::new(2));
+    let envelope = envelope_with_charge(&fixture, ActionClass::DeleteSelectedFiles, "tree", charge);
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Evidence, code::TARGET_GREW);
+    assert!(tree.join("grown.bin").exists());
+    fixture.assert_outside_unchanged();
+}
+
+#[test]
+fn a_directory_target_within_its_charge_is_removed() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("a.bin"), vec![1_u8; 8192]).unwrap();
+    let allocated: u64 = fs::metadata(tree.join("a.bin")).unwrap().blocks() * 512;
+    let charge = WorkCharge::new(Bytes::new(allocated), EntryCount::new(2));
+    let envelope = envelope_with_charge(&fixture, ActionClass::DeleteSelectedFiles, "tree", charge);
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_removed(&outcome);
+    assert!(!tree.exists());
+}
+
+#[test]
+fn a_second_name_of_a_file_that_a_scan_counted_elsewhere_does_not_refuse_the_tree() {
+    let fixture = Fixture::new();
+    // A scan read `first/data.bin` first and counted its bytes there; the
+    // charge of `second` has no bytes of the file.
+    let first: PathBuf = fixture.root.join("first");
+    let second: PathBuf = fixture.root.join("second");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    fs::write(first.join("data.bin"), vec![4_u8; 1 << 20]).unwrap();
+    fs::hard_link(first.join("data.bin"), second.join("data.bin")).unwrap();
+    let charge = WorkCharge::new(Bytes::ZERO, EntryCount::new(2));
+    let envelope =
+        envelope_with_charge(&fixture, ActionClass::DeleteSelectedFiles, "second", charge);
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_removed(&outcome);
+    assert!(!second.exists());
+    assert_eq!(fs::read(first.join("data.bin")).unwrap().len(), 1 << 20);
+}
+
+#[test]
+fn a_file_target_larger_than_its_charge_is_refused() {
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("grown.bin");
+    fs::write(&file, vec![3_u8; 1 << 20]).unwrap();
+    let charge = WorkCharge::new(Bytes::new(4096), EntryCount::new(1));
+    let envelope = envelope_with_charge(
+        &fixture,
+        ActionClass::EvictRegenerableData,
+        "grown.bin",
+        charge,
+    );
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Evidence, code::TARGET_GREW);
+    assert!(file.exists());
+}
+
+#[test]
+fn a_trash_move_is_not_bound_by_the_charge() {
+    let fixture = Fixture::new();
+    let file: PathBuf = fixture.root.join("grown.bin");
+    fs::write(&file, vec![3_u8; 1 << 20]).unwrap();
+    let charge = WorkCharge::new(Bytes::new(1), EntryCount::new(1));
+    let envelope = envelope_with_charge(&fixture, ActionClass::MoveToTrash, "grown.bin", charge);
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_eq!(outcome.result.effect, TargetEffect::Trashed);
+}
+
+#[test]
+fn an_eviction_refuses_a_file_with_a_second_name() {
+    let fixture = Fixture::new();
+    let first: PathBuf = fixture.root.join("first.bin");
+    let second: PathBuf = fixture.root.join("second.bin");
+    fs::write(&first, [9_u8; 4096]).unwrap();
+    fs::hard_link(&first, &second).unwrap();
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "first.bin");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(
+        &outcome,
+        &ErrorFamily::Eligibility,
+        code::TARGET_HARD_LINKED,
+    );
+    assert!(first.exists());
+    assert!(second.exists());
+}
+
+#[test]
+fn an_eviction_refuses_a_tree_with_a_file_with_a_second_name() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("plain.bin"), b"plain").unwrap();
+    fs::write(tree.join("linked.bin"), [5_u8; 2048]).unwrap();
+    fs::hard_link(tree.join("linked.bin"), fixture.root.join("kept.bin")).unwrap();
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(
+        &outcome,
+        &ErrorFamily::Eligibility,
+        code::TARGET_HARD_LINKED,
+    );
+    // Nothing was removed: the check is in the measurement.
+    assert!(tree.join("plain.bin").exists());
+    assert!(tree.join("linked.bin").exists());
+}
+
+#[test]
+fn a_tree_with_a_locked_entry_is_refused_before_the_first_call() {
+    for flag in [libc::UF_IMMUTABLE, libc::UF_APPEND] {
+        let fixture = Fixture::new();
+        let tree: PathBuf = fixture.root.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("a.bin"), b"a").unwrap();
+        fs::write(tree.join("b.bin"), b"b").unwrap();
+        fs::write(tree.join("lock"), b"lock").unwrap();
+        let _guard = FlagGuard::lock(&tree.join("lock"), flag);
+        let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "tree");
+
+        let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+        assert_skipped(&outcome, &ErrorFamily::Eligibility, code::LOCKED_OBJECT);
+        assert!(tree.join("a.bin").exists());
+        assert!(tree.join("b.bin").exists());
+    }
+}
+
+#[test]
+fn a_tree_with_a_locked_directory_is_refused_before_the_first_call() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = fixture.root.join("tree");
+    let inner: PathBuf = tree.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(tree.join("a.bin"), b"a").unwrap();
+    fs::write(inner.join("b.bin"), b"b").unwrap();
+    let _guard = FlagGuard::lock(&inner, libc::UF_IMMUTABLE);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::LOCKED_OBJECT);
+    assert!(tree.join("a.bin").exists());
+    assert!(inner.join("b.bin").exists());
+}
+
+#[test]
+fn a_locked_target_gets_no_call_for_each_class() {
+    for class in ActionClass::ALL
+        .into_iter()
+        .filter(ActionClass::is_filesystem)
+    {
+        let fixture = Fixture::new();
+        let file: PathBuf = fixture.root.join("locked.bin");
+        fs::write(&file, b"keep").unwrap();
+        let _guard = FlagGuard::lock(&file, libc::UF_IMMUTABLE);
+        let envelope = fixture.envelope(class, "locked.bin");
+
+        let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+        assert_skipped(&outcome, &ErrorFamily::Eligibility, code::LOCKED_OBJECT);
+        assert!(file.exists());
+    }
+}
+
+#[test]
+fn a_directory_target_in_a_locked_parent_is_refused_before_the_first_call() {
+    let fixture = Fixture::new();
+    let parent: PathBuf = fixture.root.join("parent");
+    let tree: PathBuf = parent.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("a.bin"), b"a").unwrap();
+    let _guard = FlagGuard::lock(&parent, libc::UF_APPEND);
+    let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "parent/tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::LOCKED_OBJECT);
+    assert!(tree.join("a.bin").exists());
 }

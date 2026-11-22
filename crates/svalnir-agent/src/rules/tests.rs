@@ -2266,6 +2266,19 @@ fn a_user_exclusion_and_a_link_in_the_unit_path_stop_a_unit() {
     assert_eq!(discovery.entries_examined, EntryCount::ZERO);
 }
 
+#[test]
+fn a_user_exclusion_in_another_case_still_stops_a_unit() {
+    let (mut fixture, project) = xcode_fixture();
+    // The directory on disk is `Index.noindex`.
+    fixture.excluded = vec![project.join("index.NOINDEX")];
+
+    let discovery = discover_xcode(&fixture);
+    assert_eq!(
+        skip_of(&discovery, &unit("Index.noindex")).reasons,
+        [SkipReason::ExclusionOverlap]
+    );
+}
+
 // ---------------------------------------------------------------------
 // Roots and sources on a filesystem that is not local. No test mounts a
 // volume: each test gives the rule a mount table.

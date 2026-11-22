@@ -407,7 +407,7 @@ After execution, feed independently reported target outcomes and resource observ
 
 A disappearing file does not prove Svalnir removed it; a capacity increase can include unrelated activity. Force-call acceptance is not verified exit. [Apple's termination API][force-terminate] explicitly requires observing the resulting application state.
 
-“No effect” concerns the measured policy objective after its observation window. A disk operation can complete without useful capacity improvement; an application can exit while global pressure remains critical. Preserve both facts, apply relevant backoff, and consider another target only within current authority and remaining budgets.
+“No effect” concerns the measured policy objective after its observation window. A disk operation can complete without useful capacity improvement; an application can exit while global pressure remains critical. Preserve both facts, apply relevant backoff, and consider another target only within current authority and remaining budgets. A disk operation that submitted no call, for example because each of its steps was skipped at the fresh check, has no benefit, and a capacity increase in its window comes from other activity: it ends the pass with the no-effect backoff, so that the guard does not make a new plan in each observation window, and the next pass counts against the pass limit of the incident.
 
 ## 16. Acceptance scenarios
 

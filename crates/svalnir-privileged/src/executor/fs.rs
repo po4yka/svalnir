@@ -138,6 +138,7 @@ impl FsEvictor {
     fn check_object(
         self,
         root: &Root,
+        home: &HomeObjects,
         entry: &BoundedEntry,
         metadata: &Metadata,
     ) -> Result<WorkCharge, Condition> {
@@ -168,6 +169,11 @@ impl FsEvictor {
         if metadata.dataless {
             return Err(Condition::TargetDataless);
         }
+        // The home directory and each directory that contains it, by their
+        // native identifiers, under each name that reaches them.
+        if metadata.kind == Kind::Directory && !home.permits(metadata) {
+            return Err(Condition::HomeDirectoryProtected);
+        }
         if metadata.kind == Kind::File && metadata.link_count > 1 {
             return Err(Condition::TargetHardLinked);
         }
@@ -184,6 +190,7 @@ impl FsEvictor {
     fn evict_entry(
         self,
         root: &Root,
+        home: &HomeObjects,
         entry: &BoundedEntry,
         reports: &Reports<'_>,
         index: u32,
@@ -207,7 +214,7 @@ impl FsEvictor {
             Err(error) if is_absent(&error) => return Reports::absent_before(index),
             Err(_) => return reports.skipped(index, Condition::TargetUnreadable),
         };
-        let work: WorkCharge = match self.check_object(root, entry, &metadata) {
+        let work: WorkCharge = match self.check_object(root, home, entry, &metadata) {
             Ok(work) => work,
             Err(condition) => return reports.skipped(index, condition),
         };
@@ -241,6 +248,7 @@ impl EvictionExecutor for FsEvictor {
         // The root is opened one time, after the gate permitted the first
         // entry. Each entry is then resolved from this handle.
         let mut root: Option<Result<Root, Condition>> = None;
+        let home: HomeObjects = HomeObjects::of(eviction.key.principal.get());
         for (position, entry) in eviction.entries.iter().enumerate() {
             let index: u32 = u32::try_from(position).unwrap_or(u32::MAX);
             if let Some(reason) = stopped {
@@ -257,12 +265,55 @@ impl EvictionExecutor for FsEvictor {
             };
             let report: EntryReport =
                 match root.get_or_insert_with(|| self.open_root(&eviction.root)) {
-                    Ok(root) => self.evict_entry(root, entry, &reports, index, wall),
+                    Ok(root) => self.evict_entry(root, &home, entry, &reports, index, wall),
                     Err(condition) => reports.skipped(index, *condition),
                 };
             entries.push(report);
         }
         Execution { entries, stopped }
+    }
+}
+
+/// The native identifiers of the home directory of the user of a step and
+/// of each directory that contains it. `None` when the helper could not
+/// establish them: then each directory entry is refused.
+struct HomeObjects(Option<Vec<(i32, u64)>>);
+
+impl HomeObjects {
+    /// Reads the home directory of `uid` from its account record, resolves
+    /// its symbolic links, and measures `/` and each directory to the home
+    /// directory.
+    fn of(uid: u32) -> Self {
+        Self(Self::read(uid))
+    }
+
+    fn read(uid: u32) -> Option<Vec<(i32, u64)>> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let text: Vec<u8> = native::home_directory_of(uid)?;
+        let home: std::path::PathBuf =
+            std::fs::canonicalize(std::ffi::OsStr::from_bytes(&text)).ok()?;
+        let mut objects: Vec<(i32, u64)> = Vec::new();
+        for directory in home.ancestors() {
+            let metadata = std::fs::metadata(directory).ok()?;
+            // `dev_t` is a signed 32-bit type on macOS; std widens it with
+            // sign extension.
+            let device: i32 = i32::try_from(metadata.dev().cast_signed()).ok()?;
+            objects.push((device, metadata.ino()));
+        }
+        Some(objects)
+    }
+
+    /// Whether the directory `metadata` may be removed: it is not one of
+    /// the measured directories, and they are known.
+    fn permits(&self, metadata: &Metadata) -> bool {
+        let Some(objects) = &self.0 else {
+            return false;
+        };
+        let Some(device) = metadata.device else {
+            return false;
+        };
+        !objects.contains(&(device, metadata.inode))
     }
 }
 
@@ -443,5 +494,44 @@ impl Reports<'_> {
             )),
             removed: WorkCharge::ZERO,
         }
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use super::HomeObjects;
+    use crate::native::{self, Metadata};
+
+    /// The measurement of the directory at the absolute path `path`.
+    fn directory(path: &std::path::Path) -> Metadata {
+        let open = std::fs::File::open(path).unwrap();
+        native::stat_descriptor(open.as_fd()).unwrap()
+    }
+
+    #[test]
+    fn the_home_directory_and_each_directory_that_contains_it_are_refused() {
+        let home = HomeObjects::of(native::effective_uid());
+        let path: Vec<u8> = native::home_directory_of(native::effective_uid()).unwrap();
+        let canonical = std::fs::canonicalize(std::ffi::OsStr::from_bytes(&path)).unwrap();
+        for ancestor in canonical.ancestors() {
+            assert!(
+                !home.permits(&directory(ancestor)),
+                "{}",
+                ancestor.display()
+            );
+        }
+        let other = tempfile::tempdir().unwrap();
+        assert!(home.permits(&directory(other.path())));
+    }
+
+    #[test]
+    fn an_unknown_home_directory_refuses_each_directory() {
+        // No account record has this user.
+        let home = HomeObjects::of(0xFFFF_FFF0);
+        let other = tempfile::tempdir().unwrap();
+        assert!(!home.permits(&directory(other.path())));
     }
 }

@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use svalnir_core::action::{
     ActionClass, ActionStage, Attribution, Checked, DispatchState, EffectEvidence, NativeResult,
-    StopReason, TargetEffect, TargetResultRecord,
+    StopReason, TargetEffect, TargetResultRecord, WorkCharge,
 };
 use svalnir_core::file::LosslessPath;
 use svalnir_core::quantity::{Bytes, EntryCount};
@@ -21,11 +21,52 @@ use super::model::{
 };
 use super::native::{self, Kind};
 use super::remove::{
-    Attempt, EntryOutcome, Observed, TreeRemoval, count_removed, observe_entry, remove_file,
-    remove_tree,
+    Attempt, BLOCK_BYTES, EntryOutcome, Observed, TreeBounds, TreeRemoval, count_removed,
+    observe_entry, remove_file, remove_tree,
 };
 use super::resolve::{Checkpoint, HomeGuard, Injection, Located, Refusal, Resolution, locate};
 use super::trash::{SystemTrash, TrashBackend, TrashFailure, TrashReply, TrashRequest};
+
+/// The checks of a permanent removal before its first call, after the
+/// revalidation of the target:
+///
+/// - The parent directory has no locking flag. Its entries cannot be
+///   removed, and a directory target would be removed in part.
+/// - A regular file of an eviction has one name. The removal of one name
+///   of several frees no space.
+/// - A regular file or a symbolic link is not larger than the work charge of
+///   the binding. A directory target is compared in [`remove_tree`].
+fn check_removal(
+    located: &Located,
+    charge: WorkCharge,
+    class: &ActionClass,
+) -> Result<(), Refusal> {
+    let parent: native::Metadata = native::stat_descriptor(located.parent.as_fd())
+        .map_err(|error| Refusal::read_failure(&error))?;
+    if parent.locked {
+        return Err(Refusal::skipped(Cause::eligibility(code::LOCKED_OBJECT)));
+    }
+    let metadata: &native::Metadata = &located.metadata;
+    if *class == ActionClass::EvictRegenerableData
+        && metadata.kind == Kind::File
+        && metadata.link_count > 1
+    {
+        return Err(Refusal::skipped(Cause::eligibility(
+            code::TARGET_HARD_LINKED,
+        )));
+    }
+    if matches!(metadata.kind, Kind::File | Kind::Symlink) {
+        // A negative block count is not a valid measurement; it refuses
+        // the target.
+        let allocated: Option<u64> = u64::try_from(metadata.blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(BLOCK_BYTES));
+        if allocated.is_none_or(|bytes| bytes > charge.work_bytes.get()) {
+            return Err(Refusal::skipped(Cause::evidence(code::TARGET_GREW)));
+        }
+    }
+    Ok(())
+}
 
 /// The parts of one target result before the consistency check.
 #[derive(Debug)]
@@ -381,7 +422,8 @@ impl FsExecutor {
         if native::effective_uid() != envelope.principal.uid.get() {
             return Draft::refused(Refusal::skipped(Cause::authority(code::PRINCIPAL_MISMATCH)));
         }
-        let is_trash: bool = match step.action_class() {
+        let class: &ActionClass = step.action_class();
+        let is_trash: bool = match class {
             ActionClass::MoveToTrash => true,
             ActionClass::DeleteSelectedFiles | ActionClass::EvictRegenerableData => false,
             _ => {
@@ -414,8 +456,15 @@ impl FsExecutor {
                 Kind::Symlink | Kind::Other => {}
             }
         }
+        // A locked object cannot be removed or moved. It gets no call.
+        if located.metadata.locked {
+            return Draft::refused(Refusal::skipped(Cause::eligibility(code::LOCKED_OBJECT)));
+        }
         if is_trash {
             return self.move_to_trash(&located);
+        }
+        if let Err(refusal) = check_removal(&located, step.file().charge, class) {
+            return Draft::refused(refusal);
         }
         match located.metadata.kind {
             Kind::File | Kind::Symlink => {
@@ -434,7 +483,18 @@ impl FsExecutor {
                 Draft::of_entry(outcome, work)
             }
             Kind::Directory => {
-                match remove_tree(&located, &self.home, &self.limits, &self.injection, signal) {
+                let tree = TreeBounds {
+                    charge: step.file().charge,
+                    refuse_hard_links: *class == ActionClass::EvictRegenerableData,
+                };
+                match remove_tree(
+                    &located,
+                    tree,
+                    &self.home,
+                    &self.limits,
+                    &self.injection,
+                    signal,
+                ) {
                     Ok(removal) => Self::draft_of_tree(removal),
                     Err(refusal) => Draft::refused(refusal),
                 }

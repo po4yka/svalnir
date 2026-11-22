@@ -483,7 +483,13 @@ impl<'a> Run<'a> {
         let now: MonotonicNanos = self.now();
         // An unavailable measurement is not a benefit.
         let gained: bool = result.capacity_gain.is_some_and(|gain| gain.get() > 0);
-        let low: bool = result.possibly_submitted && !gained;
+        // An operation that submitted no call, for example because each
+        // target was skipped at its step, has no benefit either: a capacity
+        // gain in its window comes from other activity. It ends the pass
+        // with the backoff of a low benefit, so that the guard does not make
+        // a new plan in each observation window, and the next pass counts
+        // against the pass limit of the incident.
+        let low: bool = !(result.possibly_submitted && gained);
         let guard = self.input.config.disk_guard();
         let record: Option<&mut DiskIncidentRecord> = self
             .state

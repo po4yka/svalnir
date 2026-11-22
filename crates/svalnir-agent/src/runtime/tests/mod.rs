@@ -433,13 +433,14 @@ impl CandidateSource for TempCandidates {
             candidates: names
                 .iter()
                 .map(|name| {
+                    let work_bytes: u64 = discovery_charge(&self.root.join(name));
                     let spec = CandidateSpec {
                         name: name.clone(),
                         root_path: LosslessPath::from_path(&self.root).unwrap(),
                         root_object: object_of(&self.root),
                         object: object_of(&self.root.join(name)),
                         object_type: FileObjectType::RegularFile,
-                        work_bytes: 1_000,
+                        work_bytes,
                     };
                     prepared(&rule, &spec)
                 })
@@ -447,6 +448,16 @@ impl CandidateSource for TempCandidates {
             invalidated: false,
         })
     }
+}
+
+/// The charge of a discovery for the file at `path`: the larger of its
+/// logical and its allocated bytes. The executor refuses a target that is
+/// larger than its charge.
+fn discovery_charge(path: &Path) -> u64 {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    std::os::unix::fs::MetadataExt::blocks(&metadata)
+        .saturating_mul(512)
+        .max(metadata.len())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -937,6 +948,7 @@ fn an_automatic_eviction_removes_the_candidates_of_the_test_rule_and_recovers() 
     bench.seed_authority();
     let first: PathBuf = bench.file("a");
     let second: PathBuf = bench.file("b");
+    let charged: u64 = discovery_charge(&first) + discovery_charge(&second);
     let mut driver = bench.start();
 
     // The capacity is below the reclaim threshold for the sustain time.
@@ -970,7 +982,7 @@ fn an_automatic_eviction_removes_the_candidates_of_the_test_rule_and_recovers() 
     let state: &ControllerState = driver.controller_state();
     assert!(state.outstanding.is_none());
     let incident = &state.policy.disk.incidents[0];
-    assert_eq!(incident.usage.consumed_bytes.get(), 2_000);
+    assert_eq!(incident.usage.consumed_bytes.get(), charged);
     assert_eq!(incident.usage.consumed_items.get(), 2);
     assert_eq!(incident.usage.reserved_bytes.get(), 0);
     let finished: Vec<Notification> = bench

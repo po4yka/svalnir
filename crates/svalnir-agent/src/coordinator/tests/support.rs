@@ -1012,9 +1012,30 @@ impl Tree {
             object: Some(object_of(&path)),
             rule: None,
             layout: None,
-            charge: WorkCharge::new(Bytes::new(10), EntryCount::new(1)),
+            charge: measured_charge(&path),
         }
     }
+}
+
+/// The work charge of the entry at `path` as a client measures it: the
+/// larger of the logical and the allocated bytes of the entry and of each
+/// entry below it, and the number of entries, the entry included.
+fn measured_charge(path: &Path) -> WorkCharge {
+    use std::os::unix::fs::MetadataExt as _;
+    fn walk(path: &Path, logical: &mut u64, allocated: &mut u64, entries: &mut u64) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        *logical += metadata.len();
+        *allocated += metadata.blocks() * 512;
+        *entries += 1;
+        if metadata.is_dir() {
+            for child in fs::read_dir(path).unwrap() {
+                walk(&child.unwrap().path(), logical, allocated, entries);
+            }
+        }
+    }
+    let (mut logical, mut allocated, mut entries) = (0, 0, 0);
+    walk(path, &mut logical, &mut allocated, &mut entries);
+    WorkCharge::new(Bytes::new(logical.max(allocated)), EntryCount::new(entries))
 }
 
 // Plans.

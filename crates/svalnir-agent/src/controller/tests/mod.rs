@@ -426,6 +426,46 @@ fn a_low_benefit_ends_the_pass_and_starts_a_backoff() {
 }
 
 #[test]
+fn an_eviction_that_submitted_no_call_ends_the_pass_and_starts_a_backoff() {
+    let mut bench = Bench::new();
+    let all = specs();
+    bench.run(35 * SECOND, disk(5 * GIBIBYTE, &all));
+    let first: PlanId = bench.state.outstanding.as_ref().unwrap().plan_id.clone();
+    let plan_report = ApplyReport::Finished {
+        plan_id: first,
+        result: OperationResult {
+            state: "Skipped".to_owned(),
+            completed: false,
+            // Each target was skipped at its step: no call was submitted.
+            possibly_submitted: false,
+            unknown_outcome: false,
+            // Other activity freed space in the window of the operation.
+            capacity_gain: Some(ByteDelta::new(4_096).unwrap()),
+            pressure_after: None,
+            cooldown_until: None,
+        },
+    };
+    bench.advance(SAMPLE);
+    let output = bench.step(&disk(5 * GIBIBYTE, &all)(bench.now), &[plan_report]);
+    assert!(output.intents.iter().any(|intent| matches!(
+        intent,
+        Intent::Notify(Notification::Finished {
+            low_benefit: true,
+            ..
+        })
+    )));
+    let incident = &bench.state.policy.disk.incidents[0];
+    assert!(incident.current_pass.is_none());
+    assert!(incident.cooldown.is_some());
+
+    // The guard does not make a new plan in each observation window.
+    let output = bench.run(600 * SECOND, disk(5 * GIBIBYTE, &all));
+    assert!(bench.state.outstanding.is_none());
+    assert_eq!(guard(&output, Guard::Disk).phase, GuardPhase::Cooldown);
+    assert_eq!(applies(&output).len(), 0);
+}
+
+#[test]
 fn a_memory_incident_stops_one_application_at_a_time_to_its_ceiling() {
     let mut bench = Bench::new();
     let output = bench.run(10 * SECOND, critical(two_jobs));

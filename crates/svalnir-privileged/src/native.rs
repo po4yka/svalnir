@@ -220,6 +220,52 @@ pub(crate) fn is_on_local_filesystem(_descriptor: BorrowedFd<'_>) -> Option<bool
     Some(true)
 }
 
+/// The largest buffer that [`home_directory_of`] gives `getpwuid_r`.
+const MAX_ACCOUNT_RECORD_BYTES: usize = 64 * 1024;
+
+/// The home directory of the account record of `uid`, from `getpwuid_r`.
+/// `None` when the user has no record, when the record has no home
+/// directory, or when the call fails.
+pub(crate) fn home_directory_of(uid: u32) -> Option<Vec<u8>> {
+    let mut size: usize = 4096;
+    loop {
+        let mut buffer: Vec<libc::c_char> = vec![0; size];
+        let mut record = MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `record` is writable storage for one `passwd`, `buffer` is
+        // a live, writable array of `size` bytes for the strings of the
+        // record, and `result` is a live pointer that the call sets. The
+        // strings that the call writes stay in `buffer`, which lives to the
+        // end of this iteration.
+        let status: libc::c_int = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr(),
+                size,
+                &raw mut result,
+            )
+        };
+        if status == libc::ERANGE && size < MAX_ACCOUNT_RECORD_BYTES {
+            size = size.saturating_mul(2);
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: the call returned 0 and a non-null `result`, so it
+        // initialized `record`.
+        let record: libc::passwd = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is a NUL-terminated string in `buffer`, which is
+        // still alive; the bytes are copied before `buffer` is dropped.
+        let home: &CStr = unsafe { CStr::from_ptr(record.pw_dir) };
+        return Some(home.to_bytes().to_vec());
+    }
+}
+
 /// The effective user of the process.
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: the call has no precondition and cannot fail.

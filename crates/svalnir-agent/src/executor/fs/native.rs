@@ -49,6 +49,31 @@ pub(super) struct Metadata {
     pub(super) owner: u32,
     /// Whether the object is a dataless placeholder (`SF_DATALESS`).
     pub(super) dataless: bool,
+    /// Whether a flag prevents the removal of the object or of the entries
+    /// of a directory: `UF_IMMUTABLE`, `UF_APPEND`, `SF_IMMUTABLE`,
+    /// `SF_APPEND`, or `SF_RESTRICTED`.
+    pub(super) locked: bool,
+}
+
+/// `SF_RESTRICTED` of `<sys/stat.h>` in the macOS SDK. The `libc` crate does
+/// not have this constant.
+#[cfg(target_os = "macos")]
+const SF_RESTRICTED: u32 = 0x0008_0000;
+
+/// The flags that make `unlinkat` or `rename` fail with `EPERM` for the
+/// object, or for the entries of a directory.
+#[cfg(target_os = "macos")]
+const LOCKING_FLAGS: u32 =
+    libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND | SF_RESTRICTED;
+
+#[cfg(target_os = "macos")]
+fn is_locked(stat: &libc::stat) -> bool {
+    stat.st_flags & LOCKING_FLAGS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_locked(_stat: &libc::stat) -> bool {
+    false
 }
 
 /// `SF_DATALESS` of `<sys/stat.h>` in the macOS SDK. The `libc` crate does
@@ -97,6 +122,7 @@ fn metadata_from(stat: &libc::stat) -> Metadata {
         inode: stat.st_ino,
         owner: stat.st_uid,
         dataless: is_dataless(stat),
+        locked: is_locked(stat),
     }
 }
 

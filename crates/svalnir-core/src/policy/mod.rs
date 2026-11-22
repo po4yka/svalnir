@@ -69,7 +69,7 @@ pub use evidence::{
     EvidenceReport,
 };
 pub use file_protection::{
-    FileProtectionContext, VIRTUAL_MEMORY_DIRECTORIES, file_hard_protection,
+    FileProtectionContext, VIRTUAL_MEMORY_DIRECTORIES, file_hard_protection, paths_overlap,
 };
 pub use memory::{
     AdmissionTrigger, ApplicationCandidate, ApplicationCooldown, ApplicationDecision,

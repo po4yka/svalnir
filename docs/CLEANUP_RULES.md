@@ -563,6 +563,8 @@ Use the common operation states from [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md).
 | Some entries removed before failure | Report partial effects; retain remaining work as unexecuted or uncertain |
 | Timeout or crash obscures an effect | Reconcile; preserve unknown outcome; no blind retry |
 | Removal succeeds but capacity stays low | Record the distinction and apply no-effect backoff |
+| Each step skipped, so no call was submitted | Apply no-effect backoff and end the pass; a capacity increase in the window is not a benefit of the operation |
+| Target larger than its planned charge, locked, or (for an eviction) hard-linked at dispatch | Skip the target with no call ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7) |
 | Cache immediately regrows | Apply rule/incident cooldown; do not repeatedly evict without limits |
 
 The executor may refresh read-only evidence within its bounds. Refreshing evidence cannot expand authority, alter the candidate set, or turn a consumed step into a retryable new deletion.

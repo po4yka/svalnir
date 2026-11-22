@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
@@ -221,9 +222,13 @@ pub(super) fn read_record(path: &Path, max_bytes: u64, principal: Uid) -> Record
     }
 }
 
-/// Whether one path is the other path or is below it, by path component.
+/// Whether one path is the other path or is below it, by path component,
+/// with the fail-closed comparison of the exclusion lists
+/// ([`svalnir_core::policy::paths_overlap`]): an exclusion that differs from
+/// the path on disk only in case or in Unicode normalization still matches.
+/// A false match only protects more.
 fn overlaps(first: &Path, second: &Path) -> bool {
-    first.starts_with(second) || second.starts_with(first)
+    svalnir_core::policy::paths_overlap(first.as_os_str().as_bytes(), second.as_os_str().as_bytes())
 }
 
 /// Whether `path` is absolute and has no `.` and no `..` component.
@@ -418,9 +423,12 @@ impl RootView {
             .any(|entry| overlaps(&unit, entry))
     }
 
-    /// Whether `path` is the root, is in it, or contains it.
+    /// Whether `path` is the root, is in it, or contains it, by exact
+    /// path components. This is not an exclusion check, so it does not use
+    /// the fail-closed comparison of [`overlaps`], which would match a
+    /// workspace with non-ASCII names to each root at the same depth.
     pub(super) fn overlaps_path(&self, path: &Path) -> bool {
-        overlaps(&self.path, path)
+        self.path.starts_with(path) || path.starts_with(&self.path)
     }
 
     /// Whether the root is `directory` or is below it.

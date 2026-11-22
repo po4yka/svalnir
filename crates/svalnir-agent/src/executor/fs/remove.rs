@@ -38,6 +38,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
+use svalnir_core::action::WorkCharge;
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
 use svalnir_core::quantity::{Bytes, EntryCount};
 
@@ -50,7 +51,7 @@ use super::resolve::{
 };
 
 /// The size in bytes of one `st_blocks` unit.
-const BLOCK_BYTES: u64 = 512;
+pub(super) const BLOCK_BYTES: u64 = 512;
 
 /// The largest number of entries of a directory target that the removal
 /// starts between two readings of the stop signal.
@@ -258,6 +259,15 @@ impl Snapshot {
     }
 }
 
+/// The bounds of a directory target that the binding of the plan gives.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TreeBounds {
+    /// The work charge of the binding.
+    pub(super) charge: WorkCharge,
+    /// Whether a regular file with more than one name refuses the tree.
+    pub(super) refuse_hard_links: bool,
+}
+
 /// The read-only measurement of a directory target.
 struct Measure<'a> {
     limits: &'a ExecutorLimits,
@@ -266,8 +276,65 @@ struct Measure<'a> {
     device: DeviceNumber,
     /// The owner of the target directory, which is the owner of the plan.
     owner: u32,
+    /// Whether a regular file with more than one name refuses the tree:
+    /// true for an eviction.
+    refuse_hard_links: bool,
     injection: &'a Injection,
     entries: u64,
+    /// The allocated bytes of the measured entries below the target. A
+    /// regular file with more than one name is not counted: a scan counts
+    /// its bytes only at the first name that it reads, which can be
+    /// outside the target, and the removal of one of its names releases no
+    /// storage.
+    allocated: u64,
+}
+
+impl Measure<'_> {
+    /// Adds the allocated bytes of `metadata` to the sum. A negative
+    /// block count is not a valid measurement, and it makes the sum the
+    /// largest value, so that the comparison with the charge refuses the
+    /// tree.
+    fn add_allocated(&mut self, metadata: &Metadata) {
+        if metadata.kind == Kind::File && metadata.link_count > 1 {
+            return;
+        }
+        let bytes: u64 = u64::try_from(metadata.blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(BLOCK_BYTES))
+            .unwrap_or(u64::MAX);
+        self.allocated = self.allocated.saturating_add(bytes);
+    }
+
+    /// Counts one measured entry below the target and checks it: the entry
+    /// bound, the device, the owner, the locking flags, and for an eviction
+    /// the number of names of a regular file. Adds its allocated bytes.
+    fn admit_entry(&mut self, metadata: &Metadata) -> Result<(), Refusal> {
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > self.limits.max_tree_entries() {
+            return Err(Refusal::skipped(Cause::limits(code::TREE_ENTRY_LIMIT)));
+        }
+        if metadata.device != Some(self.device) {
+            return Err(Refusal::skipped(Cause::evidence(code::MOUNT_CROSSED)));
+        }
+        // The plan has the owner of the target only. An entry of another
+        // owner is not data of the owning user: the write permission on its
+        // directory permits the unlink, and the plan does not.
+        if metadata.owner != self.owner {
+            return Err(Refusal::skipped(Cause::eligibility(
+                code::TREE_ENTRY_OWNER_MISMATCH,
+            )));
+        }
+        if metadata.locked {
+            return Err(Refusal::skipped(Cause::eligibility(code::LOCKED_OBJECT)));
+        }
+        if self.refuse_hard_links && metadata.kind == Kind::File && metadata.link_count > 1 {
+            return Err(Refusal::skipped(Cause::eligibility(
+                code::TARGET_HARD_LINKED,
+            )));
+        }
+        self.add_allocated(metadata);
+        Ok(())
+    }
 }
 
 impl Measure<'_> {
@@ -294,6 +361,11 @@ impl Measure<'_> {
             return Err(Refusal::skipped(Cause::eligibility(
                 code::DATALESS_DIRECTORY,
             )));
+        }
+        // An entry of a locked directory cannot be removed, so the removal
+        // would stop after a part of the tree.
+        if expected.locked {
+            return Err(Refusal::skipped(Cause::eligibility(code::LOCKED_OBJECT)));
         }
         let changed = || {
             let code: &'static str = if level == 1 {
@@ -333,22 +405,7 @@ impl Measure<'_> {
                 Err(error) if is_absent(&error) => continue,
                 Err(error) => return Err(Refusal::read_failure(&error)),
             };
-            self.entries = self.entries.saturating_add(1);
-            if self.entries > self.limits.max_tree_entries() {
-                return Err(Refusal::skipped(Cause::limits(code::TREE_ENTRY_LIMIT)));
-            }
-            if metadata.device != Some(self.device) {
-                return Err(Refusal::skipped(Cause::evidence(code::MOUNT_CROSSED)));
-            }
-            // The plan has the owner of the target only. An entry of
-            // another owner is not data of the owning user: the write
-            // permission on its directory permits the unlink, and the plan
-            // does not.
-            if metadata.owner != self.owner {
-                return Err(Refusal::skipped(Cause::eligibility(
-                    code::TREE_ENTRY_OWNER_MISMATCH,
-                )));
-            }
+            self.admit_entry(&metadata)?;
             let children: Vec<Snapshot> = match metadata.kind {
                 Kind::Other => {
                     return Err(Refusal::skipped(Cause::eligibility(
@@ -613,6 +670,14 @@ impl Removal<'_> {
                 None,
             );
         }
+        // An entry that got a locking flag after the measurement gets no
+        // call, as a placeholder does.
+        if current.locked {
+            return (
+                Attempt::NotAttempted(Refusal::skipped(Cause::eligibility(code::LOCKED_OBJECT))),
+                None,
+            );
+        }
         self.injection.reach(Checkpoint::EntryChecked, path);
         let is_directory: bool = snapshot.metadata.kind == Kind::Directory;
         let remaining_before: EntryCount = self.work.remaining_entries;
@@ -681,9 +746,12 @@ impl Removal<'_> {
 /// # Errors
 ///
 /// Returns the [`Refusal`] of the measurement when the tree is not
-/// permitted. No mutation call was issued then.
+/// permitted, or when it is larger than `charge`, the work charge of the
+/// binding: more entries, the target included, or more allocated bytes
+/// below the target. No mutation call was issued then.
 pub(super) fn remove_tree(
     located: &Located,
+    tree: TreeBounds,
     home: &HomeGuard,
     limits: &ExecutorLimits,
     injection: &Injection,
@@ -695,8 +763,10 @@ pub(super) fn remove_tree(
         home,
         device: located.device,
         owner: located.metadata.owner,
+        refuse_hard_links: tree.refuse_hard_links,
         injection,
         entries: 0,
+        allocated: 0,
     };
     let children: Vec<Snapshot> = measure.directory(
         located.parent.as_fd(),
@@ -705,6 +775,11 @@ pub(super) fn remove_tree(
         1,
         &mut path,
     )?;
+    // The measured entries and the target.
+    let entries: u64 = measure.entries.saturating_add(1);
+    if entries > tree.charge.items.get() || measure.allocated > tree.charge.work_bytes.get() {
+        return Err(Refusal::skipped(Cause::evidence(code::TARGET_GREW)));
+    }
     let root = Snapshot {
         name: located.name.clone(),
         metadata: located.metadata,

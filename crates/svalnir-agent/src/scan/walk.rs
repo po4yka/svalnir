@@ -26,7 +26,9 @@ use super::model::{
     ScanResult, ScanTimestamp, ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
 };
 use super::native::{self, DirStream, PrivateAttributes, RawMetadata};
-use super::private::{FilePart, MAX_CLONE_FAMILIES, PrivateTally, file_part};
+use super::private::{
+    FilePart, MAX_CLONE_FAMILIES, PrivateTally, file_part, is_unsupported_request,
+};
 use super::top::TopList;
 
 /// The unit of `st_blocks`, in bytes. This is not `st_blksize` and not the
@@ -41,9 +43,10 @@ pub(super) type MetadataHook = Box<dyn FnMut(&Path, &mut RawMetadata)>;
 
 /// A test changes the private-size attributes of a file before the scan
 /// uses them. This injects a volume that does not report the private size,
-/// or a failed call.
+/// or a failed call. The flag tells whether the call asked for the clone
+/// count.
 #[cfg(test)]
-pub(super) type PrivateHook = Box<dyn FnMut(&Path, &mut io::Result<PrivateAttributes>)>;
+pub(super) type PrivateHook = Box<dyn FnMut(&Path, bool, &mut io::Result<PrivateAttributes>)>;
 
 /// The injection points of a scan. A build that is not a test has none.
 #[derive(Default)]
@@ -221,6 +224,8 @@ struct Walker<'a> {
     hard_links: HashSet<u64>,
     /// The private allocated bytes of the root.
     private: PrivateTally,
+    /// Whether the kernel accepts `ATTR_CMNEXT_CLONE_REFCNT`.
+    clone_count_supported: bool,
     largest_files: TopList<LargeFile>,
     largest_directories: TopList<LargeDirectory>,
     boundaries: Vec<MountBoundary>,
@@ -319,19 +324,35 @@ impl Walker<'_> {
         metadata
     }
 
-    /// Reads the private-size attributes of the current name.
+    /// Reads the private-size attributes of the current name. When the
+    /// kernel refuses `ATTR_CMNEXT_CLONE_REFCNT`, the call is sent again
+    /// without it, and no later call of the scan asks for it.
     fn query_private(&mut self) -> io::Result<PrivateAttributes> {
-        let result: io::Result<PrivateAttributes> = match self.stack.last() {
-            Some(frame) => {
-                native::private_attributes(frame.stream.descriptor(), self.current_name()?)
+        let first: io::Result<PrivateAttributes> =
+            self.query_private_once(self.clone_count_supported);
+        match first {
+            Err(error) if self.clone_count_supported && is_unsupported_request(&error) => {
+                self.clone_count_supported = false;
+                self.query_private_once(false)
             }
+            result => result,
+        }
+    }
+
+    fn query_private_once(&mut self, with_clone_count: bool) -> io::Result<PrivateAttributes> {
+        let result: io::Result<PrivateAttributes> = match self.stack.last() {
+            Some(frame) => native::private_attributes(
+                frame.stream.descriptor(),
+                self.current_name()?,
+                with_clone_count,
+            ),
             None => Err(io::Error::from(io::ErrorKind::NotFound)),
         };
         #[cfg(test)]
         let result: io::Result<PrivateAttributes> = {
             let mut result: io::Result<PrivateAttributes> = result;
             if let Some(hook) = self.injection.private.as_mut() {
-                hook(as_path(&self.path), &mut result);
+                hook(as_path(&self.path), with_clone_count, &mut result);
             }
             result
         };
@@ -347,7 +368,12 @@ impl Walker<'_> {
         hard_link: HardLink,
         allocated: Option<Bytes>,
     ) {
+        if hard_link == HardLink::NotTracked {
+            return;
+        }
         let Some(allocated) = allocated else {
+            // A device, a socket, or a FIFO.
+            self.private.add_without_size();
             return;
         };
         match (metadata.kind, hard_link) {
@@ -358,15 +384,14 @@ impl Walker<'_> {
             (EntryKind::File, HardLink::LaterName) => self.private.add_later_link(metadata.inode),
             (EntryKind::Directory | EntryKind::Symlink, _) => self.private.add_allocated(allocated),
             (EntryKind::File, HardLink::Single | HardLink::FirstName) => {
-                let part: FilePart = if metadata.compressed || metadata.dataless {
-                    // APFS does not count compressed data in the private
-                    // size, and a dataless file has no local data to read.
+                let part: FilePart = if metadata.dataless {
+                    // A dataless file has no local data to read.
                     FilePart::Allocated(allocated)
                 } else if !self.private.is_available() {
                     return;
                 } else {
                     let attributes: io::Result<PrivateAttributes> = self.query_private();
-                    match file_part(attributes, metadata.inode, allocated) {
+                    match file_part(attributes, metadata.inode, allocated, metadata.compressed) {
                         Ok(part) => part,
                         Err(cause) => {
                             self.private.fail(cause);
@@ -841,6 +866,7 @@ pub(super) fn scan_with(
         shared: SharedStorageEvidence::default(),
         hard_links: HashSet::new(),
         private: PrivateTally::new(family_limit),
+        clone_count_supported: true,
         largest_files: TopList::new(request.limits.max_largest_files),
         largest_directories: TopList::new(request.limits.max_largest_directories),
         boundaries: Vec::new(),

@@ -444,10 +444,9 @@ pub enum SizeMeasure {
     /// are unavailable.
     AllocatedBytes,
     /// The private allocated bytes of the unit that the APFS backend of the
-    /// scanner reported (`docs/RESOURCE_MODEL.md` section 8): the blocks
-    /// that only the unit uses, with the shared blocks of each clone family
-    /// whose members are all in the unit. A snapshot, a name outside the
-    /// unit, or an open file can still keep these blocks.
+    /// scanner reported (`docs/RESOURCE_MODEL.md` section 8): the sum of
+    /// the private parts, with no block that a clone shares. A snapshot, a
+    /// name outside the unit, or an open file can still keep these blocks.
     PrivateAllocatedBytes,
 }
 
@@ -493,8 +492,13 @@ pub struct UnitMeasurement {
     /// it.
     pub allocated_bytes: Bytes,
     /// The private allocated bytes of the unit, or the cause that they are
-    /// unavailable. An unavailable value is not zero.
+    /// unavailable. They count no block that a clone shares. An unavailable
+    /// value is not zero.
     pub private_allocated_bytes: PrivateBytes,
+    /// The shared parts of the clone families whose members are all in the
+    /// unit. Not a reclaim figure: a modified clone outside the unit or a
+    /// snapshot can hold them. The estimate never uses them.
+    pub complete_family_shared_bytes: PrivateBytes,
     /// The number of names below the unit that are regular files.
     pub files: EntryCount,
     /// The number of names below the unit that are directories.

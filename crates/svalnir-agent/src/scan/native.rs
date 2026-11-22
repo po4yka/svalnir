@@ -525,10 +525,20 @@ mod attributes {
 /// Reads the private-size attributes of the regular file `name` of the
 /// open directory `parent`. The call does not follow a symbolic link.
 #[cfg(target_os = "macos")]
+///
+/// With `with_clone_count` false, the request has no
+/// `ATTR_CMNEXT_CLONE_REFCNT`, which an older kernel can refuse with
+/// `EINVAL`, and the result has no clone count.
 pub(super) fn private_attributes(
     parent: BorrowedFd<'_>,
     name: &CStr,
+    with_clone_count: bool,
 ) -> io::Result<PrivateAttributes> {
+    let fork: libc::attrgroup_t = if with_clone_count {
+        attributes::FORK
+    } else {
+        attributes::FORK & !attributes::ATTR_CMNEXT_CLONE_REFCNT
+    };
     let mut request = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -536,7 +546,7 @@ pub(super) fn private_attributes(
         volattr: 0,
         dirattr: 0,
         fileattr: 0,
-        forkattr: attributes::FORK,
+        forkattr: fork,
     };
     let mut buffer: MaybeUninit<attributes::Buffer> = MaybeUninit::zeroed();
     // SAFETY: `parent` is open for the call, `name` is a NUL-terminated
@@ -562,7 +572,13 @@ pub(super) fn private_attributes(
     // size of the buffer.
     let buffer: attributes::Buffer = unsafe { buffer.assume_init() };
     let length: u32 = buffer.length;
-    if usize::try_from(length).ok() != Some(size_of::<attributes::Buffer>()) {
+    // Without the clone count, the layout ends before its field.
+    let expected: usize = if with_clone_count {
+        size_of::<attributes::Buffer>()
+    } else {
+        std::mem::offset_of!(attributes::Buffer, clone_count)
+    };
+    if usize::try_from(length).ok() != Some(expected) {
         // With `FSOPT_PACK_INVAL_ATTRS`, the length is the full layout.
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
@@ -573,8 +589,9 @@ pub(super) fn private_attributes(
         private_size: valid(returned.forkattr, libc::ATTR_CMNEXT_PRIVATESIZE)
             .then_some(buffer.private_size),
         clone_id: valid(returned.forkattr, libc::ATTR_CMNEXT_CLONEID).then_some(buffer.clone_id),
-        clone_count: valid(returned.forkattr, attributes::ATTR_CMNEXT_CLONE_REFCNT)
-            .then_some(buffer.clone_count),
+        clone_count: (with_clone_count
+            && valid(returned.forkattr, attributes::ATTR_CMNEXT_CLONE_REFCNT))
+        .then_some(buffer.clone_count),
     })
 }
 
@@ -583,6 +600,7 @@ pub(super) fn private_attributes(
 pub(super) fn private_attributes(
     _parent: BorrowedFd<'_>,
     _name: &CStr,
+    _with_clone_count: bool,
 ) -> io::Result<PrivateAttributes> {
     Ok(PrivateAttributes::default())
 }

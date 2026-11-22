@@ -185,6 +185,12 @@ fn render_summary(result: &ScanResult, out: &mut String) {
         14,
         &private_size_text(&result.private_allocation),
     );
+    field(
+        out,
+        "Clone-shared",
+        14,
+        &shared_size_text(&result.private_allocation),
+    );
     let shared = &result.shared_storage;
     field(
         out,
@@ -207,13 +213,26 @@ fn render_summary(result: &ScanResult, out: &mut String) {
 fn private_size_text(private: &PrivateAllocation) -> String {
     match private.bytes {
         PrivateBytes::Available { bytes } => format!(
-            "{} ({} files by private size, {} by allocated size; {} of {} clone families inside; {} hard-linked objects with a name outside)",
+            "{} lower figure, no shared block ({} files by private size, {} by allocated size, {} compressed with unknown sharing; {} hard-linked objects with a name outside; {} entries with no size)",
             human_bytes(bytes.get()),
             private.files_by_private_size,
             private.files_by_allocated_size,
+            private.compressed_files_with_unknown_sharing,
+            private.hard_linked_objects_with_names_outside,
+            private.entries_without_allocated_size
+        ),
+        PrivateBytes::Unavailable { cause } => format!("unavailable ({})", cause.as_str()),
+    }
+}
+
+/// The complete-family shared bytes, which are not a reclaim figure.
+fn shared_size_text(private: &PrivateAllocation) -> String {
+    match private.complete_family_shared_bytes {
+        PrivateBytes::Available { bytes } => format!(
+            "{} in {} of {} clone families with each member inside; not a reclaim figure, because a modified clone outside or a snapshot can hold these blocks",
+            human_bytes(bytes.get()),
             private.clone_families_complete,
-            private.clone_families,
-            private.hard_linked_objects_with_names_outside
+            private.clone_families
         ),
         PrivateBytes::Unavailable { cause } => format!("unavailable ({})", cause.as_str()),
     }
@@ -832,13 +851,18 @@ mod tests {
             text.contains("Private size    unavailable (not_reported)"),
             "{text}"
         );
+        assert!(
+            text.contains("Clone-shared    unavailable (not_reported)"),
+            "{text}"
+        );
         let mut measured = result.clone();
         measured.private_allocation.bytes = super::PrivateBytes::Available {
             bytes: svalnir_core::quantity::Bytes::new(2 * 1024 * 1024),
         };
         let measured_text = render_result(&measured);
         assert!(
-            measured_text.contains("Private size    2.0 MiB (0 files by private size"),
+            measured_text
+                .contains("Private size    2.0 MiB lower figure, no shared block (0 files"),
             "{measured_text}"
         );
         assert!(text.contains("/data/project/big.bin"), "{text}");

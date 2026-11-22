@@ -885,6 +885,7 @@ impl FinishedScan<'_> {
             logical_bytes: totals.logical_bytes,
             allocated_bytes: totals.allocated_bytes,
             private_allocated_bytes: private,
+            complete_family_shared_bytes: result.private_allocation.complete_family_shared_bytes,
             files: totals.files,
             directories: totals.directories,
             symlinks: totals.symlinks,

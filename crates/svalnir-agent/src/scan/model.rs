@@ -544,35 +544,51 @@ impl PrivateBytes {
     }
 }
 
-/// The private allocated bytes of the scan root and the evidence of their
-/// calculation.
+/// The private allocated bytes of the scan root, the complete-family shared
+/// bytes, and the evidence of their calculation.
 ///
-/// `docs/RESOURCE_MODEL.md` section 8 defines the quantity: the private
-/// size of each counted object, plus the shared part of each clone family
-/// whose members the scan found. The quantity is not the logical size and
-/// not the allocated size. It does not prove reclamation: a snapshot, a
-/// name outside the root, an open file, or a later change can keep blocks.
+/// `docs/RESOURCE_MODEL.md` section 8 defines the two quantities. The
+/// private allocated bytes are the sum of the private parts of the counted
+/// objects; they count no block that a clone shares, and the reclaim
+/// estimate uses only them. The complete-family shared bytes are the shared
+/// parts of the clone families whose members the scan found. They are not a
+/// reclaim figure: a modified clone outside the root, or a snapshot, can
+/// hold each of those blocks. Neither quantity is the logical size or the
+/// allocated size, and neither proves reclamation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrivateAllocation {
-    /// The quantity, or the cause that it is unavailable.
+    /// The private allocated bytes, or the cause that they are unavailable.
     pub bytes: PrivateBytes,
-    /// The number of counted files whose private size the volume reported.
+    /// The shared parts of the complete clone families, or the cause that
+    /// they are unavailable. Not a reclaim figure.
+    pub complete_family_shared_bytes: PrivateBytes,
+    /// The number of counted files with a private part from the reported
+    /// private size, and the compressed members of a clone family.
     pub files_by_private_size: EntryCount,
     /// The number of counted files that add their allocated size: a
-    /// compressed file, a dataless file, or a file whose private size is
-    /// above its allocated size.
+    /// dataless file, a file whose private size is above its allocated
+    /// size, or a compressed file with a clone count of 1.
     pub files_by_allocated_size: EntryCount,
+    /// The number of compressed files whose clone count the volume did not
+    /// report. Each adds zero.
+    pub compressed_files_with_unknown_sharing: EntryCount,
     /// The number of clone families that the scan found a member of.
     pub clone_families: EntryCount,
     /// The number of those families whose members the scan found. Each adds
-    /// its shared part one time.
+    /// its shared part one time to the complete-family shared bytes.
     pub clone_families_complete: EntryCount,
-    /// The number of family members that add only their private part
-    /// because the scan tracked its largest number of families.
+    /// The number of family members with a shared part of zero.
+    pub clone_members_without_shared_part: EntryCount,
+    /// The number of family members that add nothing to the
+    /// complete-family shared bytes because the scan tracked its largest
+    /// number of families.
     pub clone_families_not_tracked: EntryCount,
     /// The number of hard-linked objects with a name that the scan did not
     /// find. Each adds zero bytes.
     pub hard_linked_objects_with_names_outside: EntryCount,
+    /// The number of counted entries with no allocated size: a device, a
+    /// socket, or a FIFO. Each adds zero bytes.
+    pub entries_without_allocated_size: EntryCount,
 }
 
 impl PrivateAllocation {
@@ -580,12 +596,16 @@ impl PrivateAllocation {
     pub fn unavailable(cause: PrivateSizeUnavailable) -> Self {
         Self {
             bytes: PrivateBytes::Unavailable { cause },
+            complete_family_shared_bytes: PrivateBytes::Unavailable { cause },
             files_by_private_size: EntryCount::ZERO,
             files_by_allocated_size: EntryCount::ZERO,
+            compressed_files_with_unknown_sharing: EntryCount::ZERO,
             clone_families: EntryCount::ZERO,
             clone_families_complete: EntryCount::ZERO,
+            clone_members_without_shared_part: EntryCount::ZERO,
             clone_families_not_tracked: EntryCount::ZERO,
             hard_linked_objects_with_names_outside: EntryCount::ZERO,
+            entries_without_allocated_size: EntryCount::ZERO,
         }
     }
 }

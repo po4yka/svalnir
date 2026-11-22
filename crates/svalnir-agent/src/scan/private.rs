@@ -1,10 +1,14 @@
 //! The private allocated bytes of the root of a scan.
 //!
-//! `docs/RESOURCE_MODEL.md` section 8 defines the quantity. The traversal
-//! gives each counted object to a [`PrivateTally`]; the tally adds the
-//! private part of each object, keeps the hard-linked objects until the
-//! scan ends, and adds the shared part of each clone family whose members
-//! the scan found. The tally does no native call.
+//! `docs/RESOURCE_MODEL.md` section 8 defines the two quantities. The
+//! traversal gives each counted object to a [`PrivateTally`]; the tally adds
+//! the private part of each object to the private allocated bytes, keeps the
+//! hard-linked objects until the scan ends, and adds the shared part of each
+//! clone family whose members the scan found to the complete-family shared
+//! bytes. The private allocated bytes count no shared block, so they are the
+//! lower figure. The complete-family shared bytes are not a reclaim figure:
+//! a modified clone outside the root or a snapshot can hold them. The tally
+//! does no native call.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -16,8 +20,8 @@ use super::model::{PrivateAllocation, PrivateBytes, PrivateSizeUnavailable};
 use super::native::PrivateAttributes;
 
 /// The largest number of clone families that one scan tracks. A member of
-/// a family above this number adds only its private part, which can only
-/// make the quantity smaller.
+/// a family above this number adds nothing to the complete-family shared
+/// bytes.
 pub(super) const MAX_CLONE_FAMILIES: usize = 1_000_000;
 
 /// The membership of one file in a clone family.
@@ -27,42 +31,61 @@ pub(super) struct CloneShare {
     pub(super) family: u64,
     /// `ATTR_CMNEXT_CLONE_REFCNT`: the number of files of the family.
     pub(super) members: u32,
-    /// The allocated size minus the private size of the file.
+    /// The allocated size minus the private size of the file, or the
+    /// allocated size of a compressed file. It can be zero.
     pub(super) shared: Bytes,
 }
 
 /// What one counted regular file adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FilePart {
-    /// The volume reported the private size.
+    /// The private part, and the clone family when the file is a member.
     Private {
-        /// `ATTR_CMNEXT_PRIVATESIZE`.
+        /// The bytes that only this file uses.
         private: Bytes,
-        /// The clone family, when the file shares blocks with clones.
+        /// The clone family, when the clone count is above 1.
         clone: Option<CloneShare>,
     },
-    /// The file adds its allocated size: it is compressed or dataless, or
-    /// its private size is above its allocated size.
+    /// The file adds its allocated size: it is dataless, its private size
+    /// is above its allocated size, or it is compressed with a clone count
+    /// of 1.
     Allocated(Bytes),
+    /// A compressed file whose clone count the volume did not report. It
+    /// adds zero, because its blocks can be shared.
+    UnknownSharing,
+}
+
+/// The cause of a failed private-size call.
+pub(super) fn cause_of_error(error: &io::Error) -> PrivateSizeUnavailable {
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM) => PrivateSizeUnavailable::PermissionDenied,
+        Some(libc::ENOENT) => PrivateSizeUnavailable::IdentityChanged,
+        // The kernel does not support an attribute of the request.
+        Some(libc::EINVAL | libc::ENOTSUP) => PrivateSizeUnavailable::NotReported,
+        _ => PrivateSizeUnavailable::QueryFailed,
+    }
+}
+
+/// Whether the kernel refused an attribute of the request.
+pub(super) fn is_unsupported_request(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP))
 }
 
 /// Classifies the attributes of one regular file.
 ///
-/// `inode` and `allocated` are from the `fstatat` measurement of the file.
+/// `inode`, `allocated`, and `compressed` are from the `fstatat`
+/// measurement of the file.
 ///
 /// # Errors
 ///
-/// Returns the cause that makes the quantity of the scan unavailable.
+/// Returns the cause that makes the quantities of the scan unavailable.
 pub(super) fn file_part(
     attributes: io::Result<PrivateAttributes>,
     inode: u64,
     allocated: Bytes,
+    compressed: bool,
 ) -> Result<FilePart, PrivateSizeUnavailable> {
-    let attributes: PrivateAttributes = attributes.map_err(|error| match error.raw_os_error() {
-        Some(libc::EACCES | libc::EPERM) => PrivateSizeUnavailable::PermissionDenied,
-        Some(libc::ENOENT) => PrivateSizeUnavailable::IdentityChanged,
-        _ => PrivateSizeUnavailable::QueryFailed,
-    })?;
+    let attributes: PrivateAttributes = attributes.map_err(|error| cause_of_error(&error))?;
     let file_id: u64 = attributes
         .file_id
         .ok_or(PrivateSizeUnavailable::NotReported)?;
@@ -75,19 +98,36 @@ pub(super) fn file_part(
     let private: Bytes = u64::try_from(private_size)
         .map(Bytes::new)
         .map_err(|_| PrivateSizeUnavailable::InconsistentValue)?;
-    if private > allocated {
-        return Ok(FilePart::Allocated(allocated));
-    }
-    let shared: Bytes = Bytes::new(allocated.get() - private.get());
-    let clone: Option<CloneShare> = match (attributes.clone_id, attributes.clone_count) {
-        (Some(family), Some(members)) if members > 1 && shared > Bytes::ZERO => Some(CloneShare {
+    let family = |shared: Bytes| match (attributes.clone_id, attributes.clone_count) {
+        (Some(family), Some(members)) if members > 1 => Some(CloneShare {
             family,
             members,
             shared,
         }),
         _ => None,
     };
-    Ok(FilePart::Private { private, clone })
+    if compressed {
+        // APFS does not count compressed data in the private size.
+        return Ok(match attributes.clone_count {
+            None => FilePart::UnknownSharing,
+            Some(0 | 1) => FilePart::Allocated(allocated),
+            Some(_) => match family(allocated) {
+                Some(clone) => FilePart::Private {
+                    private: Bytes::ZERO,
+                    clone: Some(clone),
+                },
+                None => FilePart::UnknownSharing,
+            },
+        });
+    }
+    if private > allocated {
+        return Ok(FilePart::Allocated(allocated));
+    }
+    let shared: Bytes = Bytes::new(allocated.get() - private.get());
+    Ok(FilePart::Private {
+        private,
+        clone: family(shared),
+    })
 }
 
 /// A hard-linked object that the scan counted one time.
@@ -110,6 +150,28 @@ struct Family {
     shared: Bytes,
 }
 
+/// Adds `bytes` to a running sum. The first cause stays.
+fn add_to(sum: &mut Result<Bytes, PrivateSizeUnavailable>, bytes: Bytes) {
+    if let Ok(value) = *sum {
+        *sum = value
+            .checked_add(bytes)
+            .ok_or(PrivateSizeUnavailable::Overflow);
+    }
+}
+
+fn reading(sum: Result<Bytes, PrivateSizeUnavailable>) -> PrivateBytes {
+    match sum {
+        Ok(bytes) => PrivateBytes::Available { bytes },
+        Err(cause) => PrivateBytes::Unavailable { cause },
+    }
+}
+
+fn bump(count: &mut EntryCount) {
+    if let Some(next) = count.checked_add(EntryCount::new(1)) {
+        *count = next;
+    }
+}
+
 /// The running calculation of the private allocated bytes of one scan.
 #[derive(Debug)]
 pub(super) struct PrivateTally {
@@ -120,14 +182,11 @@ pub(super) struct PrivateTally {
     family_limit: usize,
     files_by_private_size: EntryCount,
     files_by_allocated_size: EntryCount,
+    compressed_files_with_unknown_sharing: EntryCount,
+    clone_members_without_shared_part: EntryCount,
     clone_families_not_tracked: EntryCount,
     hard_linked_objects_with_names_outside: EntryCount,
-}
-
-fn bump(count: &mut EntryCount) {
-    if let Some(next) = count.checked_add(EntryCount::new(1)) {
-        *count = next;
-    }
+    entries_without_allocated_size: EntryCount,
 }
 
 impl PrivateTally {
@@ -139,36 +198,36 @@ impl PrivateTally {
             family_limit,
             files_by_private_size: EntryCount::ZERO,
             files_by_allocated_size: EntryCount::ZERO,
+            compressed_files_with_unknown_sharing: EntryCount::ZERO,
+            clone_members_without_shared_part: EntryCount::ZERO,
             clone_families_not_tracked: EntryCount::ZERO,
             hard_linked_objects_with_names_outside: EntryCount::ZERO,
+            entries_without_allocated_size: EntryCount::ZERO,
         }
     }
 
-    /// Whether the quantity can still be available. When it cannot, the
-    /// traversal does not read the attributes of a later file.
+    /// Whether the quantities can still be available. When they cannot,
+    /// the traversal does not read the attributes of a later file.
     pub(super) fn is_available(&self) -> bool {
         self.sum.is_ok()
     }
 
-    /// Makes the quantity unavailable. The first cause stays.
+    /// Makes the quantities unavailable. The first cause stays.
     pub(super) fn fail(&mut self, cause: PrivateSizeUnavailable) {
         if self.sum.is_ok() {
             self.sum = Err(cause);
         }
     }
 
-    fn add(&mut self, bytes: Bytes) {
-        if let Ok(sum) = self.sum {
-            self.sum = sum
-                .checked_add(bytes)
-                .ok_or(PrivateSizeUnavailable::Overflow);
-        }
-    }
-
     /// Adds an object that is not a regular file and adds its allocated
     /// size: the root, a directory, or a symbolic link.
     pub(super) fn add_allocated(&mut self, allocated: Bytes) {
-        self.add(allocated);
+        add_to(&mut self.sum, allocated);
+    }
+
+    /// Records a counted entry that has no allocated size and adds zero.
+    pub(super) fn add_without_size(&mut self) {
+        bump(&mut self.entries_without_allocated_size);
     }
 
     /// Adds a regular file with one name.
@@ -200,11 +259,12 @@ impl PrivateTally {
         match part {
             FilePart::Allocated(allocated) => {
                 bump(&mut self.files_by_allocated_size);
-                self.add(allocated);
+                add_to(&mut self.sum, allocated);
             }
+            FilePart::UnknownSharing => bump(&mut self.compressed_files_with_unknown_sharing),
             FilePart::Private { private, clone } => {
                 bump(&mut self.files_by_private_size);
-                self.add(private);
+                add_to(&mut self.sum, private);
                 if let Some(clone) = clone {
                     self.join(clone);
                 }
@@ -213,6 +273,9 @@ impl PrivateTally {
     }
 
     fn join(&mut self, clone: CloneShare) {
+        if clone.shared == Bytes::ZERO {
+            bump(&mut self.clone_members_without_shared_part);
+        }
         let tracked: usize = self.families.len();
         match self.families.entry(clone.family) {
             Entry::Occupied(mut occupied) => {
@@ -243,27 +306,25 @@ impl PrivateTally {
             }
         }
         let mut complete: EntryCount = EntryCount::ZERO;
-        let shared: Vec<Bytes> = self
-            .families
-            .values()
-            .filter(|family| family.found >= family.members)
-            .map(|family| family.shared)
-            .collect();
-        for bytes in shared {
-            bump(&mut complete);
-            self.add(bytes);
+        let mut shared: Result<Bytes, PrivateSizeUnavailable> = self.sum.map(|_| Bytes::ZERO);
+        for family in self.families.values() {
+            if family.found >= family.members {
+                bump(&mut complete);
+                add_to(&mut shared, family.shared);
+            }
         }
         PrivateAllocation {
-            bytes: match self.sum {
-                Ok(bytes) => PrivateBytes::Available { bytes },
-                Err(cause) => PrivateBytes::Unavailable { cause },
-            },
+            bytes: reading(self.sum),
+            complete_family_shared_bytes: reading(shared),
             files_by_private_size: self.files_by_private_size,
             files_by_allocated_size: self.files_by_allocated_size,
+            compressed_files_with_unknown_sharing: self.compressed_files_with_unknown_sharing,
             clone_families: EntryCount::new(u64::try_from(self.families.len()).unwrap_or(u64::MAX)),
             clone_families_complete: complete,
+            clone_members_without_shared_part: self.clone_members_without_shared_part,
             clone_families_not_tracked: self.clone_families_not_tracked,
             hard_linked_objects_with_names_outside: self.hard_linked_objects_with_names_outside,
+            entries_without_allocated_size: self.entries_without_allocated_size,
         }
     }
 }

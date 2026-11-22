@@ -752,27 +752,35 @@ impl AppModel {
     /// confirmation. Returns `false` and does nothing while a plan dialog
     /// is open.
     pub fn prepare_cleanup(&mut self, rule: &str, kind: PlanKind, cx: &mut Context<Self>) -> bool {
-        let Some(request) = self.cleanup_book.open(rule) else {
+        let Some((request, cancel)) = self.cleanup_book.open(rule) else {
             return false;
         };
-        self.make_cleanup_plan(request, rule, kind, cx);
+        self.make_cleanup_plan(request, cancel, rule, kind, cx);
         true
     }
 
     /// Makes a new plan in the open plan dialog of `rule`.
     pub fn renew_cleanup(&mut self, rule: &str, kind: PlanKind, cx: &mut Context<Self>) {
-        if let Some(request) = self.cleanup_book.renew(rule) {
-            self.make_cleanup_plan(request, rule, kind, cx);
+        if let Some((request, cancel)) = self.cleanup_book.renew(rule) {
+            self.make_cleanup_plan(request, cancel, rule, kind, cx);
         }
     }
 
-    fn make_cleanup_plan(&self, request: u64, rule: &str, kind: PlanKind, cx: &mut Context<Self>) {
+    fn make_cleanup_plan(
+        &self,
+        request: u64,
+        cancel: CancellationToken,
+        rule: &str,
+        kind: PlanKind,
+        cx: &mut Context<Self>,
+    ) {
         cx.notify();
         let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
         let plan_request = CleanupRequest {
             rule: rule.to_owned(),
             kind,
             options: self.cleanup_book.options(rule),
+            cancel,
         };
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = cx

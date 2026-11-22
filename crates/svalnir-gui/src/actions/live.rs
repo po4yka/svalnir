@@ -69,6 +69,8 @@ const ADMISSION_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub struct LivePort {
     state_directory: Option<PathBuf>,
+    /// The home directory and the process evidence of the cleanup rules.
+    environment: live_cleanup::LiveEnvironment,
     admission_wait: Duration,
     /// The rule registry of a test. `None`: the registry of this build, in
     /// which each layout has the lifecycle state of its declaration.
@@ -78,9 +80,10 @@ pub struct LivePort {
 impl LivePort {
     /// Creates the port for the journal of `state_directory`.
     #[must_use]
-    pub const fn new(state_directory: Option<PathBuf>) -> Self {
+    pub fn new(state_directory: Option<PathBuf>) -> Self {
         Self {
             state_directory,
+            environment: live_cleanup::LiveEnvironment::host(),
             admission_wait: ADMISSION_WAIT,
             registry: None,
         }
@@ -561,7 +564,11 @@ impl ActionPort for LivePort {
         let registry: ReviewedRules = self
             .registry()
             .map_err(|_| "The rule registry of this build is not usable.".to_owned())?;
-        live_cleanup::inspect_rules(&registry, self.state_directory.as_deref())
+        live_cleanup::inspect_rules(
+            &registry,
+            self.state_directory.as_deref(),
+            &self.environment,
+        )
     }
 
     fn prepare_cleanup(&self, request: &CleanupRequest) -> Result<CleanupProposal, ActionState> {
@@ -597,6 +604,8 @@ impl ActionPort for LivePort {
                 clock: &clock,
                 wall,
                 state_directory: self.state_directory.as_deref(),
+                environment: &self.environment,
+                cancel: &request.cancel,
             },
         )
     }
@@ -1493,6 +1502,7 @@ mod tests {
         CleanupRequest {
             rule: rule.to_owned(),
             kind,
+            cancel: svalnir_agent::scan::CancellationToken::new(),
             options: CleanupOptions {
                 include_clear,
                 ..CleanupOptions::default()
@@ -1613,6 +1623,31 @@ mod tests {
             proposal: Arc::new(proposal),
         });
         assert_eq!(state, ActionState::refused("plan_not_buildable"));
+        assert_eq!(
+            std::fs::metadata(&path).map(|metadata| metadata.len()).ok(),
+            before
+        );
+    }
+
+    #[test]
+    fn with_the_agent_a_plan_reads_the_revision_in_effect_and_records_nothing() {
+        let (directory, path) = state_directory();
+        let _lock = CoordinatorLock::try_acquire(&path, CoordinatorRole::Agent)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let port =
+            LivePort::new(Some(directory.path().to_owned())).with_registry(fixture_registry());
+        let before = std::fs::metadata(&path).map(|metadata| metadata.len()).ok();
+        // The agent holds the lock, so the gate passes; the journal has no
+        // revision in effect, so no plan is made.
+        let result = port.prepare_cleanup(&cleanup_request(
+            "cargo.registry-cache",
+            PlanKind::Evict,
+            true,
+        ));
+        assert!(
+            matches!(&result, Err(ActionState::Refused { code, .. }) if code == "no_active_policy_revision"),
+            "{result:?}"
+        );
         assert_eq!(
             std::fs::metadata(&path).map(|metadata| metadata.len()).ok(),
             before

@@ -42,7 +42,8 @@ pub struct Tokens {
     /// Dividers and empty cells only.
     pub border: Rgba,
     /// The edge of an unchecked checkbox, a radio, and a text field: 3:1 or
-    /// more against `surface`, `surface-inset`, and `inset-tint`.
+    /// more against `surface`, `surface-inset`, `inset-tint`, and
+    /// `surface-raised`.
     pub control_border: Rgba,
     /// Activity in progress, selection, focus ring.
     pub brand: Rgba,
@@ -97,7 +98,7 @@ impl Tokens {
         foreground: hex(0x16_1618),
         muted_foreground: hex(0x63_6368),
         border: hex_alpha(0x16_1618, 0.07),
-        control_border: hex(0x8e_8e93),
+        control_border: hex(0x7c_7c81),
         brand: hex(0x00_71e3),
         positive: hex(0x24_8a3d),
         negative: hex(0xd7_0015),

@@ -17,7 +17,9 @@ use crate::{
     },
     data::{model::Loadable, store::AppModel},
     screens::{
-        common::{ago, body_line, caption, failed_body, inset, skeleton_rows, until},
+        common::{
+            ago, body_line, caption, failed_body, inset, problem_lines, skeleton_rows, until,
+        },
         controls::{TARGET_LIST_HEIGHT, focus_ring, footer, list_scroll, open_state_detail},
     },
     theme::tokens::{self, Tokens, to_hsla},
@@ -487,7 +489,15 @@ fn rule_block(
         .children(
             rule.problem
                 .as_ref()
-                .map(|problem| caption(format!("cleanup-problem-{id}"), problem.clone(), tokens)),
+                .map(|problem| {
+                    problem_lines(
+                        &format!("cleanup-{id}"),
+                        std::slice::from_ref(problem),
+                        tokens,
+                    )
+                })
+                .into_iter()
+                .flatten(),
         )
         .children(plan_options(rule, options, model_entity, tokens))
         .children(plan_controls(rule, model_entity, model, tokens))
@@ -719,6 +729,43 @@ fn owner_lines(
     ]
 }
 
+/// The entries that a plan leaves out, with their reasons (`DESIGN.md`
+/// §7): at most eight lines, and the count of all of them.
+fn omitted_lines(
+    proposal: &CleanupProposal,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> Vec<AnyElement> {
+    if proposal.omitted_count == 0 {
+        return Vec::new();
+    }
+    let mut omitted = v_flex().gap(tokens::SPACE_1);
+    for (index, (path, reason)) in proposal.omitted.iter().take(8).enumerate() {
+        let text: String = format!("{path}  {reason}");
+        omitted = omitted.child(
+            div()
+                .id(SharedString::from(format!("confirm-omitted-{index}")))
+                .test_support()
+                .aria_label(text.clone())
+                .font_family(mono.clone())
+                .text_size(px(11.0))
+                .text_color(to_hsla(tokens.muted_foreground))
+                .child(text),
+        );
+    }
+    vec![
+        caption(
+            "confirm-omitted",
+            format!(
+                "Left out of the plan: {} entries. The agent does not touch them.",
+                proposal.omitted_count
+            ),
+            tokens,
+        ),
+        omitted.into_any_element(),
+    ]
+}
+
 fn plan_body(
     proposal: &CleanupProposal,
     now: SystemTime,
@@ -757,28 +804,7 @@ fn plan_body(
                 .child(format!("Warning: {warning}")),
         );
     }
-    if proposal.omitted_count > 0 {
-        let mut omitted = v_flex().gap(tokens::SPACE_1);
-        for (path, reason) in proposal.omitted.iter().take(8) {
-            omitted = omitted.child(
-                div()
-                    .font_family(mono.clone())
-                    .text_size(px(11.0))
-                    .text_color(to_hsla(tokens.muted_foreground))
-                    .child(format!("{path}  {reason}")),
-            );
-        }
-        body = body
-            .child(caption(
-                "confirm-omitted",
-                format!(
-                    "Left out of the plan: {} entries. The agent does not touch them.",
-                    proposal.omitted_count
-                ),
-                tokens,
-            ))
-            .child(omitted);
-    }
+    body = body.children(omitted_lines(proposal, mono, tokens));
     body.child(body_line(
         "confirm-consequence",
         if proposal.permanent {
@@ -870,12 +896,17 @@ pub fn open_cleanup(
                 .child(action_status("confirm-failed", &state, tokens))
                 .footer(footer(vec![cancel_button(model.clone())])),
             Some(CleanupDraft::Ready(proposal)) if !proposal.has_targets() => dialog
-                .child(body_line(
-                    "confirm-empty",
-                    "No entry of this rule is a candidate now, so there is no plan to apply. Nothing was recorded.",
-                    false,
-                    tokens,
-                ))
+                .child(
+                    v_flex()
+                        .gap(tokens::SPACE_2)
+                        .child(body_line(
+                            "confirm-empty",
+                            "No entry of this rule is a candidate now, so there is no plan to apply. Nothing was recorded.",
+                            false,
+                            tokens,
+                        ))
+                        .children(omitted_lines(&proposal, &mono, tokens)),
+                )
                 .footer(footer(vec![cancel_button(model.clone())])),
             Some(CleanupDraft::Ready(proposal)) if proposal.expired(now) => {
                 let again: Entity<AppModel> = model.clone();

@@ -147,7 +147,7 @@ impl Action {
             Self::Stop { force: false, .. } => "Quit",
             Self::Stop { force: true, .. } => "Force quit",
             Self::Clean { proposal } => match proposal.kind {
-                cleanup::PlanKind::Evict => "Clear",
+                cleanup::PlanKind::Evict => "Remove",
                 cleanup::PlanKind::Owner => "Run",
             },
         }
@@ -615,7 +615,7 @@ pub fn reason_of(code: &str) -> &'static str {
             "This rule is in the lifecycle state proposed. No validation is recorded for a manual plan under it, so this build makes no plan, and the agent admits none"
         }
         "clear_not_included" => {
-            "The command of this rule removes the whole cache. Check the consent to plan it"
+            "This plan clears cache data of the producer, also data that a project uses now. Check the consent to plan it"
         }
         "unknown_rule" => "This build has no rule with this identity",
         "owner_operation_not_available" => "The rule has no owner command in this build",

@@ -16,6 +16,10 @@ use super::{
     },
 };
 use std::time::{Duration, SystemTime};
+use svalnir_agent::rules::{
+    XCODE_DERIVED_DATA_REVISION, clear::CLEAR_RULE_REVISION, producers::EXTENDED_RULE_REVISION,
+    projects::PROJECT_RULE_REVISION, worktrees::WORKTREE_RULE_REVISION,
+};
 
 /// The lifetime of a fixture plan.
 const PLAN_LIFETIME: Duration = Duration::from_secs(300);
@@ -42,6 +46,19 @@ fn root(path: &str, state: &str) -> RootRow {
     }
 }
 
+/// The revision of the rule `rule` in the registry of this build. The
+/// producer rules that extend a cache rule or an owner tool have the
+/// revision of [`EXTENDED_RULE_REVISION`].
+fn revision_of(rule: &str) -> &'static str {
+    match rule {
+        "project.dependency-directory" => PROJECT_RULE_REVISION,
+        "git.linked-worktree" => WORKTREE_RULE_REVISION,
+        "cargo.registry-cache" => CLEAR_RULE_REVISION,
+        "xcode.inactive-derived-data" => XCODE_DERIVED_DATA_REVISION,
+        _ => EXTENDED_RULE_REVISION,
+    }
+}
+
 /// A rule with no root, no unit, and one layout in its lifecycle state.
 fn base(
     rule: &str,
@@ -57,7 +74,7 @@ fn base(
     };
     RuleInspection {
         rule: rule.to_owned(),
-        revision: "r1".to_owned(),
+        revision: revision_of(rule).to_owned(),
         family,
         producer: producer.to_owned(),
         lifecycle: lifecycle.to_owned(),
@@ -243,7 +260,6 @@ fn worktree_rule() -> RuleInspection {
 
 fn xcode_rule() -> RuleInspection {
     RuleInspection {
-        revision: "r2".to_owned(),
         layouts: vec![
             ("derived-data-project-v1".to_owned(), "proposed".to_owned()),
             ("derived-data-orphan-v1".to_owned(), "proposed".to_owned()),
@@ -372,6 +388,7 @@ mod tests {
             rule: rule.to_owned(),
             kind,
             options,
+            cancel: svalnir_agent::scan::CancellationToken::new(),
         }
     }
 
@@ -484,5 +501,25 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("/api/")));
         assert!(!paths.iter().any(|p| p.contains("notes-app")));
         assert!(!paths.iter().any(|p| p.contains("cli-tool")));
+    }
+
+    #[test]
+    fn each_fixture_rule_has_the_revision_of_the_registry() {
+        use svalnir_core::rule::RuleRegistry as _;
+        let registry =
+            svalnir_agent::rules::ReviewedRules::new().unwrap_or_else(|error| panic!("{error}"));
+        for rule in inspections() {
+            let known = registry
+                .rules()
+                .into_iter()
+                .find(|known| known.reference.id.as_str() == rule.rule)
+                .unwrap_or_else(|| panic!("{} is not a rule of this build", rule.rule));
+            assert_eq!(
+                known.reference.revision.as_str(),
+                rule.revision,
+                "{}",
+                rule.rule
+            );
+        }
     }
 }

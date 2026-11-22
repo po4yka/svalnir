@@ -10,6 +10,7 @@
 
 use super::ActionState;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use svalnir_agent::scan::CancellationToken;
 use svalnir_core::action::Plan;
 
 /// The most units of one rule that an inspection keeps for the view.
@@ -219,7 +220,7 @@ pub struct CleanupOptions {
 }
 
 /// The request of a plan for one rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CleanupRequest {
     /// The rule.
     pub rule: String,
@@ -227,6 +228,9 @@ pub struct CleanupRequest {
     pub kind: PlanKind,
     /// The options.
     pub options: CleanupOptions,
+    /// Stops the discovery and the measurement of the plan: the window
+    /// cancels it when the dialog closes or a newer request replaces it.
+    pub cancel: CancellationToken,
 }
 
 /// Why the control that makes a plan is off, as one sentence. `None`: the
@@ -331,6 +335,8 @@ pub struct CleanupBook {
     /// The number of the latest preparation. A result of an earlier
     /// preparation is not kept.
     request: u64,
+    /// The cancellation of the latest preparation.
+    cancel: Option<CancellationToken>,
 }
 
 impl CleanupBook {
@@ -345,27 +351,38 @@ impl CleanupBook {
         self.options.insert(rule.to_owned(), options);
     }
 
+    /// Starts a new preparation: cancels the one before it and gives the
+    /// number and the cancellation of the new one.
+    fn next(&mut self) -> (u64, CancellationToken) {
+        if let Some(earlier) = self.cancel.take() {
+            earlier.cancel();
+        }
+        let cancel: CancellationToken = CancellationToken::new();
+        self.cancel = Some(cancel.clone());
+        self.request = self.request.wrapping_add(1);
+        (self.request, cancel)
+    }
+
     /// Opens the plan dialog of `rule` with a plan that is being made, and
-    /// gives the number of this preparation. Gives `None` and changes
-    /// nothing while a plan dialog is open: the window has at most one
-    /// plan confirmation.
-    pub fn open(&mut self, rule: &str) -> Option<u64> {
+    /// gives the number and the cancellation of this preparation. Gives
+    /// `None` and changes nothing while a plan dialog is open: the window
+    /// has at most one plan confirmation.
+    pub fn open(&mut self, rule: &str) -> Option<(u64, CancellationToken)> {
         if self.dialog.is_some() {
             return None;
         }
-        self.request = self.request.wrapping_add(1);
         self.dialog = Some((rule.to_owned(), CleanupDraft::Preparing));
-        Some(self.request)
+        Some(self.next())
     }
 
-    /// Makes a new plan in the open dialog of `rule`. Gives `None` when no
-    /// dialog of `rule` is open.
-    pub fn renew(&mut self, rule: &str) -> Option<u64> {
+    /// Makes a new plan in the open dialog of `rule`, and cancels the
+    /// preparation before it. Gives `None` when no dialog of `rule` is
+    /// open.
+    pub fn renew(&mut self, rule: &str) -> Option<(u64, CancellationToken)> {
         match &mut self.dialog {
             Some((open, draft)) if open == rule => {
                 *draft = CleanupDraft::Preparing;
-                self.request = self.request.wrapping_add(1);
-                Some(self.request)
+                Some(self.next())
             }
             _ => None,
         }
@@ -392,8 +409,12 @@ impl CleanupBook {
         }
     }
 
-    /// Closes the plan dialog. A preparation that runs keeps no result.
+    /// Closes the plan dialog. A preparation that runs is cancelled and
+    /// keeps no result.
     pub fn close(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
         self.request = self.request.wrapping_add(1);
         self.dialog = None;
     }
@@ -418,24 +439,6 @@ pub fn bytes_label(bytes: u64) -> String {
     // than it is.
     let tenth: u64 = rest * 10 / 1024;
     format!("{value}.{tenth} {}", UNITS[unit])
-}
-
-/// The snake-case name of a `Debug` name such as `ActiveProducer`.
-#[must_use]
-pub fn snake_name(debug: &str) -> String {
-    let head: &str = debug.split([' ', '{', '(']).next().unwrap_or(debug);
-    let mut out: String = String::with_capacity(head.len() + 4);
-    for (index, character) in head.chars().enumerate() {
-        if character.is_ascii_uppercase() {
-            if index > 0 {
-                out.push('_');
-            }
-            out.push(character.to_ascii_lowercase());
-        } else {
-            out.push(character);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -489,13 +492,18 @@ mod tests {
     #[test]
     fn the_window_has_at_most_one_plan_dialog() {
         let mut book = CleanupBook::default();
-        let first = book.open("a").expect("opens");
-        assert_eq!(book.open("b"), None);
+        let (first, first_cancel) = book.open("a").expect("opens");
+        assert!(book.open("b").is_none());
         assert_eq!(book.open_rule(), Some("a"));
-        let second = book.renew("a").expect("renews");
+        let (second, second_cancel) = book.renew("a").expect("renews");
+        // A newer request cancels the discovery of the one before it.
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
         assert!(!book.finish(first, CleanupDraft::Preparing));
         assert!(book.finish(second, CleanupDraft::Preparing));
         book.close();
+        // Closing the dialog cancels the discovery that runs.
+        assert!(second_cancel.is_cancelled());
         assert!(!book.finish(second, CleanupDraft::Preparing));
         assert_eq!(book.open_rule(), None);
     }
@@ -519,14 +527,5 @@ mod tests {
         assert_eq!(bytes_label(1536), "1.5 KiB");
         assert_eq!(bytes_label(1024 * 1024 - 1), "1023.9 KiB");
         assert_eq!(bytes_label(3 * 1024 * 1024 * 1024), "3.0 GiB");
-    }
-
-    #[test]
-    fn a_debug_name_becomes_the_stable_name() {
-        assert_eq!(snake_name("ActiveProducer"), "active_producer");
-        assert_eq!(
-            snake_name("EligibilityNotSatisfied { predicate: X }"),
-            "eligibility_not_satisfied"
-        );
     }
 }

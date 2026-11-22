@@ -22,9 +22,9 @@ use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::id::{PlanId, PolicyRevisionId, RuleId, StepId, TargetId};
 use svalnir_core::plan::{
-    CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, OwnerPlanRequest, PlanBuildError,
-    PlanContext, PlanOutcome, SelectionPreset, build_cleanup_plan, build_owner_plan,
-    manual_plan_lifetime,
+    CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, OmissionReason, OwnerPlanRequest,
+    PlanBuildError, PlanContext, PlanOutcome, SelectionPreset, build_cleanup_plan,
+    build_owner_plan, manual_plan_lifetime,
 };
 use svalnir_core::policy::EvaluationClock;
 use svalnir_core::process::Uid;
@@ -48,7 +48,7 @@ use crate::rules::projects::{
 use crate::rules::worktrees::{WorktreeHost, WorktreeInspection, WorktreeLimits};
 use crate::rules::{
     DiscoveryEnvironment, DiscoveryHost, DiscoveryLimits, EvictionCandidate, EvictionDiscovery,
-    EvictionRequest, ReviewedRules,
+    EvictionRequest, ReviewedRules, SkipReason,
 };
 use crate::scan::CancellationToken;
 
@@ -57,6 +57,33 @@ pub const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000
 
 /// The time in which the executor verifies the effect of one step.
 pub const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
+
+/// The stable name of a reason that a unit is not a candidate now, as
+/// `docs/CLEANUP_RULES.md` section 13 and the JSON output name it, for
+/// example `active_producer`.
+#[must_use]
+pub fn skip_reason_name(reason: SkipReason) -> String {
+    match serde_json::to_value(reason) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// The stable name of a reason that the plan builder left an entry out,
+/// as the JSON output names it (its `reason` field), for example
+/// `hard_protected`.
+#[must_use]
+pub fn omission_reason_name(reason: OmissionReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
 
 /// Why a rule cannot have the manual plan that a request names. Each value
 /// has the stable code of `docs/INTERFACES.md` section 4.

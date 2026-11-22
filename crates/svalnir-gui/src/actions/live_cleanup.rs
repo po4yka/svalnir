@@ -16,7 +16,6 @@ use super::{
     cleanup::{
         CleanupProposal, CleanupRequest, CleanupSnapshot, CleanupTarget, OwnerFacts, PlanKind,
         RootRow, RuleFamily, RuleInspection, SizeKind, TARGET_LIMIT, UNIT_LIMIT, UnitRow,
-        snake_name,
     },
 };
 use std::{
@@ -66,6 +65,35 @@ use svalnir_core::{
 /// than the schema version, so each value comes from the template.
 const TEMPLATE_DOCUMENT: &str = "schema_version = 1\n";
 
+/// The home directory and the process evidence of the inspections and the
+/// plans of this window. A test gives a temporary home directory and a
+/// fixture environment.
+#[derive(Clone)]
+pub(super) struct LiveEnvironment {
+    /// The home directory of the user.
+    pub(super) home: Option<PathBuf>,
+    /// The clock and the process evidence of a discovery.
+    pub(super) evidence: SharedEnvironment,
+}
+
+impl std::fmt::Debug for LiveEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveEnvironment")
+            .field("home", &self.home)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LiveEnvironment {
+    /// `HOME` and the process table of the host.
+    pub(super) fn host() -> Self {
+        Self {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            evidence: Arc::new(SourceEnvironment(DarwinProcessSource::new())),
+        }
+    }
+}
+
 /// The inputs that each inspection and each plan read.
 struct Host {
     config: ValidatedConfig,
@@ -75,13 +103,16 @@ struct Host {
 }
 
 impl Host {
-    fn new(config: ValidatedConfig, state_directory: Option<&Path>) -> Self {
-        let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
+    fn new(
+        config: ValidatedConfig,
+        state_directory: Option<&Path>,
+        environment: &LiveEnvironment,
+    ) -> Self {
         Self {
             config,
-            locations: ProtectedLocations::resolve(home.as_deref(), state_directory),
+            locations: ProtectedLocations::resolve(environment.home.as_deref(), state_directory),
             principal: svalnir_agent::observe::current_uid(),
-            evidence: Arc::new(SourceEnvironment(DarwinProcessSource::new())),
+            evidence: Arc::clone(&environment.evidence),
         }
     }
 
@@ -369,7 +400,7 @@ fn blocker_names(candidate: &EvictionCandidate) -> Option<String> {
         .discovered
         .blockers
         .iter()
-        .map(|reason| snake_name(&format!("{reason:?}")))
+        .map(|reason| cleanup::skip_reason_name(*reason))
         .collect();
     (!reasons.is_empty()).then(|| reasons.join(", "))
 }
@@ -514,10 +545,11 @@ fn inspect_clear(
 pub(super) fn inspect_rules(
     registry: &ReviewedRules,
     state_directory: Option<&Path>,
+    environment: &LiveEnvironment,
 ) -> Result<CleanupSnapshot, String> {
     let config: ValidatedConfig = inspection_config(state_directory)
         .ok_or_else(|| "No valid configuration is available for the inspection.".to_owned())?;
-    let host: Host = Host::new(config, state_directory);
+    let host: Host = Host::new(config, state_directory, environment);
     let cancel: CancellationToken = CancellationToken::new();
     let mut rules: Vec<RuleInspection> = Vec::new();
     // The rules that search the projects of the user.
@@ -657,6 +689,11 @@ pub(super) struct PlanInputs<'a> {
     pub(super) clock: &'a EvaluationClock,
     pub(super) wall: WallTime,
     pub(super) state_directory: Option<&'a Path>,
+    /// The home directory and the process evidence.
+    pub(super) environment: &'a LiveEnvironment,
+    /// Stops the discovery and the measurement when the dialog closes or a
+    /// newer request replaces this one.
+    pub(super) cancel: &'a CancellationToken,
 }
 
 fn plan_refusal(error: &ManualPlanError) -> ActionState {
@@ -685,7 +722,11 @@ pub(super) fn build(
     request: &CleanupRequest,
     inputs: &PlanInputs<'_>,
 ) -> Result<CleanupProposal, ActionState> {
-    let host: Host = Host::new(inputs.config.clone(), inputs.state_directory);
+    let host: Host = Host::new(
+        inputs.config.clone(),
+        inputs.state_directory,
+        inputs.environment,
+    );
     let home: Option<LosslessPath> = host
         .locations
         .home_directory()
@@ -702,8 +743,8 @@ pub(super) fn build(
         home_directory: home.as_ref(),
     };
     let mut proposal: CleanupProposal = match request.kind {
-        PlanKind::Evict => build_evict(registry, request, &host, &plan_inputs)?,
-        PlanKind::Owner => build_owner(registry, request, &host, &plan_inputs)?,
+        PlanKind::Evict => build_evict(registry, request, &host, &plan_inputs, inputs.cancel)?,
+        PlanKind::Owner => build_owner(registry, request, &host, &plan_inputs, inputs.cancel)?,
     };
     proposal.clear = cleanup::needs_clear_consent(registry, &request.rule);
     Ok(proposal)
@@ -714,6 +755,7 @@ fn build_evict(
     request: &CleanupRequest,
     host: &Host,
     inputs: &ManualPlanInputs<'_>,
+    cancel: &CancellationToken,
 ) -> Result<CleanupProposal, ActionState> {
     let rule: &Rule = cleanup::evict_rule(registry, &request.rule, request.options.include_clear)
         .map_err(|error| ActionState::refused(error.code()))?;
@@ -732,8 +774,13 @@ fn build_evict(
             roots: roots.as_ref().map(|roots| &roots.roots),
             include_active: request.options.include_active,
         },
-        &CancellationToken::new(),
+        cancel,
     );
+    // A cancelled discovery has a part of the candidates: no plan is made
+    // from a part.
+    if cancel.is_cancelled() {
+        return Err(ActionState::refused("discovery_not_complete"));
+    }
     let (selected, below): (Vec<EvictionCandidate>, Vec<EvictionCandidate>) =
         cleanup::split_min_size(
             &discovery.candidates,
@@ -749,31 +796,44 @@ fn build_evict(
     Ok(proposal)
 }
 
-/// Adds to `proposal` the candidates that the minimum size leaves out, the
-/// candidates whose eligibility the rule did not establish, and the
-/// warnings of the discovery.
+/// Adds to `proposal` the candidates that the minimum size leaves out and
+/// the warnings of the discovery. A candidate that a check refused is in
+/// the explanation of the plan builder already; a path is listed once.
 fn add_discovery_notes(
     proposal: &mut CleanupProposal,
     discovery: &EvictionDiscovery,
     below: &[EvictionCandidate],
 ) {
-    for candidate in below.iter().take(TARGET_LIMIT) {
-        proposal.omitted.push((
-            candidate.candidate.candidate.path.display_label(),
-            "below_minimum_size".to_owned(),
-        ));
-    }
-    proposal.omitted_count = proposal.omitted_count.saturating_add(below.len());
+    // The plan builder names a candidate that a check of the rule refused
+    // `eligibility_not_satisfied`; the discovery has the reasons of the
+    // rule, which say more, so they replace it in place.
     for candidate in discovery
         .candidates
         .iter()
         .filter(|candidate| !candidate.discovered.blockers.is_empty())
-        .take(TARGET_LIMIT)
     {
-        proposal.omitted.push((
-            candidate.candidate.candidate.path.display_label(),
-            blocker_names(candidate).unwrap_or_default(),
-        ));
+        let path: String = candidate.candidate.candidate.path.display_label();
+        if let (Some(listed), Some(reasons)) = (
+            proposal
+                .omitted
+                .iter_mut()
+                .find(|(listed, _)| *listed == path),
+            blocker_names(candidate),
+        ) {
+            listed.1 = reasons;
+        }
+    }
+    for candidate in below {
+        let path: String = candidate.candidate.candidate.path.display_label();
+        if proposal.omitted.iter().any(|(listed, _)| *listed == path) {
+            continue;
+        }
+        proposal.omitted_count = proposal.omitted_count.saturating_add(1);
+        if proposal.omitted.len() < TARGET_LIMIT {
+            proposal
+                .omitted
+                .push((path, "below_minimum_size".to_owned()));
+        }
     }
     if !discovery.complete {
         proposal.warnings.push(
@@ -813,6 +873,7 @@ fn build_owner(
     request: &CleanupRequest,
     host: &Host,
     inputs: &ManualPlanInputs<'_>,
+    cancel: &CancellationToken,
 ) -> Result<CleanupProposal, ActionState> {
     let producer: &ProducerRule =
         cleanup::owner_rule(registry, &request.rule, request.options.include_clear)
@@ -825,7 +886,7 @@ fn build_owner(
         request.options.include_clear,
     );
     let bound: ProducerBinding = producer
-        .bind(&bind_request, &CancellationToken::new(), &WallScanClock)
+        .bind(&bind_request, cancel, &WallScanClock)
         .map_err(|error| owner_bind_refusal(&error))?;
     let outcome: PlanOutcome =
         cleanup::build_owner_operation_plan(registry, &bound, &host.locations, inputs)
@@ -919,7 +980,7 @@ fn proposal_of(
                 omission
                     .reasons
                     .iter()
-                    .map(|reason| snake_name(&format!("{reason:?}")))
+                    .map(|reason| cleanup::omission_reason_name(*reason))
                     .collect::<Vec<String>>()
                     .join(", "),
             )
@@ -948,5 +1009,247 @@ fn proposal_of(
             .map_or_else(SystemTime::now, super::live::expiry_wall),
         plan,
         targets,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::cleanup::CleanupOptions;
+    use svalnir_agent::rules::{
+        ProducerProcesses,
+        fixture::{FixtureEnvironment, manual_action_validated},
+    };
+    use tempfile::TempDir;
+
+    const CARGO: &str = "cargo.registry-cache";
+
+    /// A home directory and a state directory in a temporary directory.
+    struct Home {
+        _directory: TempDir,
+        path: PathBuf,
+        state: PathBuf,
+    }
+
+    impl Home {
+        /// A home with the cache of Cargo: two units of the clear rule and
+        /// the index, which the rule keeps.
+        fn with_cargo_cache() -> Self {
+            let directory: TempDir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+            // The temporary directory of macOS is below a symbolic link.
+            let base: PathBuf =
+                std::fs::canonicalize(directory.path()).unwrap_or_else(|error| panic!("{error}"));
+            let path: PathBuf = base.join("home");
+            let state: PathBuf = path.join("Library/Application Support/Svalnir");
+            std::fs::create_dir_all(&state).unwrap_or_else(|error| panic!("{error}"));
+            let home = Self {
+                _directory: directory,
+                path,
+                state,
+            };
+            home.write(
+                ".cargo/registry/cache/index.crates.io-1/foo-1.0.0.crate",
+                b"crate",
+            );
+            home.write(
+                ".cargo/registry/src/index.crates.io-1/foo-1.0.0/src/lib.rs",
+                b"//",
+            );
+            home.write(".cargo/registry/index/index.crates.io-1/config.json", b"{}");
+            home
+        }
+
+        fn write(&self, relative: &str, content: &[u8]) {
+            let path: PathBuf = self.path.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap_or_else(|error| panic!("{error}"));
+            }
+            std::fs::write(&path, content).unwrap_or_else(|error| panic!("{error}"));
+        }
+
+        /// The environment of the home, 30 days later, so each unit is
+        /// older than the quiet time of the rule.
+        fn environment(&self, producer: ProducerProcesses) -> LiveEnvironment {
+            let fixture: FixtureEnvironment = FixtureEnvironment::days_later(30);
+            fixture.set_producer(producer);
+            LiveEnvironment {
+                home: Some(self.path.clone()),
+                evidence: Arc::new(fixture),
+            }
+        }
+    }
+
+    fn registry() -> ReviewedRules {
+        ReviewedRules::with_fixture_lifecycle(&manual_action_validated())
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn request(options: CleanupOptions) -> CleanupRequest {
+        CleanupRequest {
+            rule: CARGO.to_owned(),
+            kind: PlanKind::Evict,
+            options,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn consent() -> CleanupOptions {
+        CleanupOptions {
+            include_clear: true,
+            ..CleanupOptions::default()
+        }
+    }
+
+    fn plan(
+        home: &Home,
+        environment: &LiveEnvironment,
+        request: &CleanupRequest,
+    ) -> Result<CleanupProposal, ActionState> {
+        let config: ValidatedConfig = svalnir_core::config::parse_and_validate(TEMPLATE_DOCUMENT)
+            .result
+            .unwrap_or_else(|_| panic!("the template validates"));
+        let host = svalnir_agent::observe::Host::open().unwrap_or_else(|error| panic!("{error}"));
+        let (clock, wall) = svalnir_agent::client::control_time(host.context())
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        build(
+            &registry(),
+            request,
+            &PlanInputs {
+                policy_revision: PolicyRevisionId::new("revision-test")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                config,
+                clock: &clock,
+                wall,
+                state_directory: Some(&home.state),
+                environment,
+                cancel: &request.cancel,
+            },
+        )
+    }
+
+    #[test]
+    fn a_clear_rule_plan_binds_its_units_and_states_the_clear() {
+        let home = Home::with_cargo_cache();
+        let environment = home.environment(ProducerProcesses::NotRunning);
+        let proposal = plan(&home, &environment, &request(consent()))
+            .unwrap_or_else(|state| panic!("{state:?}"));
+        assert_eq!(proposal.target_count, 2, "{proposal:?}");
+        assert!(proposal.plan.is_some());
+        assert!(proposal.clear);
+        assert_eq!(proposal.omitted_count, 0, "{proposal:?}");
+        assert!(
+            proposal
+                .targets
+                .iter()
+                .all(|target| !target.path.contains("index/"))
+        );
+    }
+
+    #[test]
+    fn a_candidate_below_the_minimum_size_is_left_out_once() {
+        let home = Home::with_cargo_cache();
+        let environment = home.environment(ProducerProcesses::NotRunning);
+        let proposal = plan(
+            &home,
+            &environment,
+            &request(CleanupOptions {
+                min_size: Some(u64::MAX),
+                ..consent()
+            }),
+        )
+        .unwrap_or_else(|state| panic!("{state:?}"));
+        assert_eq!(proposal.target_count, 0);
+        assert_eq!(proposal.omitted_count, 2, "{proposal:?}");
+        assert_eq!(proposal.omitted.len(), 2);
+        assert!(
+            proposal
+                .omitted
+                .iter()
+                .all(|(_, reason)| reason == "below_minimum_size")
+        );
+    }
+
+    #[test]
+    fn a_blocked_candidate_is_left_out_once_with_its_stable_reason() {
+        let home = Home::with_cargo_cache();
+        let environment = home.environment(ProducerProcesses::Running);
+        let proposal = plan(&home, &environment, &request(consent()))
+            .unwrap_or_else(|state| panic!("{state:?}"));
+        assert_eq!(proposal.target_count, 0, "{proposal:?}");
+        let mut paths: Vec<&str> = proposal
+            .omitted
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let listed: usize = paths.len();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), listed, "a path is listed once: {proposal:?}");
+        assert_eq!(proposal.omitted_count, listed, "{proposal:?}");
+        assert!(listed > 0, "{proposal:?}");
+        assert!(
+            proposal
+                .omitted
+                .iter()
+                .all(|(_, reason)| reason.contains("active_producer")
+                    && !reason.contains("ActiveProducer")),
+            "{proposal:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_discovery_makes_no_plan() {
+        let home = Home::with_cargo_cache();
+        let environment = home.environment(ProducerProcesses::NotRunning);
+        let request = request(consent());
+        request.cancel.cancel();
+        let result = plan(&home, &environment, &request);
+        assert!(
+            matches!(&result, Err(ActionState::Refused { code, .. }) if code == "discovery_not_complete"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn the_inspection_lists_the_units_of_a_clear_rule_and_the_problem_of_a_rule_with_no_root() {
+        let home = Home::with_cargo_cache();
+        let environment = home.environment(ProducerProcesses::NotRunning);
+        let snapshot = inspect_rules(&registry(), Some(&home.state), &environment)
+            .unwrap_or_else(|reason| panic!("{reason}"));
+        let cargo = snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.rule == CARGO)
+            .unwrap_or_else(|| panic!("no clear rule"));
+        assert_eq!(cargo.family, RuleFamily::Clear);
+        assert!(cargo.needs_clear && cargo.permits_plan);
+        assert_eq!(cargo.units.len(), 2, "{cargo:?}");
+        assert!(
+            cargo.units.iter().all(|unit| unit.reason.is_none()),
+            "{cargo:?}"
+        );
+        let project = snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.rule == PROJECT_RULE_ID)
+            .unwrap_or_else(|| panic!("no project rule"));
+        assert!(
+            project
+                .problem
+                .as_deref()
+                .is_some_and(|problem| problem.contains("no_search_roots")),
+            "{project:?}"
+        );
+        let xcode = snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.family == RuleFamily::Xcode)
+            .unwrap_or_else(|| panic!("no xcode rule"));
+        assert!(
+            xcode
+                .layouts
+                .iter()
+                .any(|(layout, _)| layout == XCODE_ORPHAN_LAYOUT)
+        );
     }
 }

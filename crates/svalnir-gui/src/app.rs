@@ -456,6 +456,7 @@ fn send_fixture_plan(
         rule: rule.to_owned(),
         kind,
         options: crate::actions::cleanup::CleanupOptions::default(),
+        cancel: svalnir_agent::scan::CancellationToken::new(),
     };
     let proposal = match source.actions().prepare_cleanup(&request) {
         Ok(proposal) => proposal,

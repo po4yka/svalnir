@@ -6,9 +6,11 @@
 //! project dependency directories ([`super::projects`]), and the three
 //! rules of the data that only its owner tool removes
 //! ([`super::owner_tools`]), and the rule of the linked Git worktrees
-//! ([`super::worktrees`]). Of the last eleven, the project rule has the
-//! inspection mode and the manual eviction, and the other ten have the
-//! inspection mode only. Each layout of each rule is
+//! ([`super::worktrees`]), and the rules with an owner operation
+//! ([`super::producers`]). Of the eleven rules after the first two, the
+//! project rule has the inspection mode and the manual eviction, and the
+//! other ten have the inspection mode only, except that five of them have
+//! a new revision with an owner operation. Each layout of each rule is
 //! `proposed`, because no validation record under `docs/VALIDATION.md`
 //! exists for a rule. The registry has no function that changes a
 //! lifecycle state: a promotion is a new declaration with a reference to
@@ -18,6 +20,7 @@
 //! the inspection mode and the manual eviction, and no automatic mode.
 
 use svalnir_core::policy::MAX_CLEANUP_CANDIDATES;
+use svalnir_core::rule::owner::OwnerOperation;
 use svalnir_core::rule::{
     LifecycleState, Rule, RuleDeclarationError, RuleMode, RuleRef, RuleRefusal, RuleRegistry,
 };
@@ -29,6 +32,7 @@ use super::expired_temporary::ExpiredTemporaryRule;
 use super::model::DiscoveredCandidate;
 use super::overlap::{OverlapResolution, resolve_overlaps};
 use super::owner_tools::OwnerToolRules;
+use super::producers::{ProducerRule, producer_rules};
 use super::projects::ProjectRule;
 use super::worktrees::WorktreeRule;
 use super::xcode::XcodeDerivedDataRule;
@@ -100,6 +104,7 @@ pub struct ReviewedRules {
     owner_tools: OwnerToolRules,
     worktrees: WorktreeRule,
     clear: ClearRules,
+    producers: Vec<ProducerRule>,
 }
 
 impl ReviewedRules {
@@ -111,15 +116,48 @@ impl ReviewedRules {
     /// not complete. A test makes the registry, so a released build does
     /// not return this error.
     pub fn new() -> Result<Self, RegistryError> {
+        let caches: Vec<CacheRule> = cache_rules()?;
+        let owner_tools: OwnerToolRules = OwnerToolRules::new()?;
+        let producers: Vec<ProducerRule> = producer_rules(|id| {
+            caches
+                .iter()
+                .map(CacheRule::rule)
+                .chain(owner_tools.rules())
+                .find(|rule| rule.reference.id.as_str() == id)
+        })?;
         Ok(Self {
             expired_temporary: ExpiredTemporaryRule::new()?,
             xcode_derived_data: XcodeDerivedDataRule::new()?,
-            caches: cache_rules()?,
+            caches,
             projects: ProjectRule::new()?,
-            owner_tools: OwnerToolRules::new()?,
+            owner_tools,
             worktrees: WorktreeRule::new()?,
+            producers,
             clear: ClearRules::new()?,
-        })
+        }
+        .with_producer_revisions())
+    }
+
+    /// The registry in which each rule of another module that has an
+    /// owner operation has the revision of [`super::producers`] in place of
+    /// its own declaration, so one identity has one revision.
+    fn with_producer_revisions(self) -> Self {
+        let mut registry: Self = self;
+        for producer in &registry.producers {
+            if !producer.extends() {
+                continue;
+            }
+            let id: &str = producer.rule().reference.id.as_str();
+            for cache in &mut registry.caches {
+                if cache.rule().reference.id.as_str() == id {
+                    *cache = cache.with_rule(producer.rule().clone());
+                }
+            }
+            if registry.owner_tools.homebrew().reference.id.as_str() == id {
+                registry.owner_tools = registry.owner_tools.with_homebrew(producer.rule().clone());
+            }
+        }
+        registry
     }
 
     /// The registry with `lifecycle` for each layout of each rule, for a
@@ -135,7 +173,11 @@ impl ReviewedRules {
     /// The cache rules, the rules of [`super::owner_tools`], and
     /// `git.linked-worktree` keep the state of their declarations: their
     /// implementation has the inspection mode only, so no state permits a
-    /// removal under one of them, also in a test build.
+    /// removal under one of them, also in a test build. The exception is
+    /// the layout of the scope root of a rule with an owner operation
+    /// ([`super::producers`]), which gets at most
+    /// [`LifecycleState::ManualActionValidated`]: this build has no
+    /// automatic plan of an owner operation.
     /// `project.dependency-directory` gets at most
     /// [`LifecycleState::ManualActionValidated`]: it has no automatic mode.
     /// Each clear rule of [`super::clear`] has the same limit.
@@ -155,7 +197,36 @@ impl ReviewedRules {
             owner_tools: registry.owner_tools,
             worktrees: registry.worktrees,
             clear: registry.clear.with_lifecycle(lifecycle)?,
-        })
+            producers: registry
+                .producers
+                .iter()
+                .map(|producer| producer.with_lifecycle(lifecycle))
+                .collect::<Result<Vec<ProducerRule>, RegistryError>>()?,
+        }
+        .with_producer_revisions())
+    }
+
+    /// The registry whose rules with an owner operation each have one
+    /// executable: the file of the same name in `directory`, a script of
+    /// `/bin/sh`, for a fixture test that never runs a producer tool. Only
+    /// a test build has this function, as
+    /// [`ReviewedRules::with_fixture_lifecycle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RegistryError`] when a declaration with the path is not
+    /// complete.
+    #[cfg(any(test, all(feature = "test-support", debug_assertions)))]
+    pub fn with_owner_fixture_executables(
+        self,
+        directory: &std::path::Path,
+    ) -> Result<Self, RegistryError> {
+        let producers: Vec<ProducerRule> = self
+            .producers
+            .iter()
+            .map(|producer| producer.with_fixture_executable(directory))
+            .collect::<Result<Vec<ProducerRule>, RegistryError>>()?;
+        Ok(Self { producers, ..self })
     }
 
     /// The rule `svalnir.expired-temporary`.
@@ -208,6 +279,19 @@ impl ReviewedRules {
     /// The clear rule with the identity `id`.
     pub fn clear_rule(&self, id: &str) -> Option<&ClearRule> {
         self.clear.get(id)
+    }
+
+    /// The rules with an owner operation, in the sequence of
+    /// [`super::producers::PRODUCER_SPECS`].
+    pub fn producers(&self) -> &[ProducerRule] {
+        &self.producers
+    }
+
+    /// The rule with an owner operation with the identity `id`.
+    pub fn producer(&self, id: &str) -> Option<&ProducerRule> {
+        self.producers
+            .iter()
+            .find(|producer| producer.rule().reference.id.as_str() == id)
     }
 
     /// The exact revision `reference`.
@@ -313,7 +397,20 @@ impl RuleRegistry for ReviewedRules {
         rules.push(self.projects.rule());
         rules.extend(self.owner_tools.rules());
         rules.push(self.worktrees.rule());
+        rules.extend(
+            self.producers
+                .iter()
+                .filter(|producer| !producer.extends())
+                .map(ProducerRule::rule),
+        );
         rules.extend(self.clear.rules());
         rules
+    }
+
+    fn owner_operation(&self, reference: &RuleRef) -> Option<&OwnerOperation> {
+        self.producers
+            .iter()
+            .find(|producer| &producer.rule().reference == reference)
+            .map(ProducerRule::operation)
     }
 }

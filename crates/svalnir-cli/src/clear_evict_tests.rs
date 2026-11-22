@@ -196,7 +196,7 @@ fn a_clear_rule_needs_the_consent_and_the_flag_needs_a_clear_rule() {
     // No consent: no plan, and nothing is read or changed.
     let outcome = world.plan("gradle.caches", &[]);
     assert_eq!(outcome.status, ExitStatus::Usage, "{}", outcome.stdout);
-    assert_eq!(outcome.error_code(), "clear_consent_required");
+    assert_eq!(outcome.error_code(), "clear_not_included");
     assert!(world.exists(".gradle/caches/modules-2/a.jar"));
     // The flag with a rule that is not a clear rule, or with another mode.
     for arguments in [
@@ -213,7 +213,7 @@ fn a_clear_rule_needs_the_consent_and_the_flag_needs_a_clear_rule() {
     ] {
         let outcome = json(&world.environment, arguments);
         assert_eq!(outcome.status, ExitStatus::Usage, "{}", outcome.stdout);
-        assert_eq!(outcome.error_code(), "option_not_accepted");
+        assert_eq!(outcome.error_code(), "unsupported_rule_selection");
     }
 }
 

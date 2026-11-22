@@ -510,7 +510,7 @@ The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules
 
 **Consent and activity**
 
-7. `svalnir clean plan --mode evict --rule RULE --format json` with no `--include-clear`. Expected: `clear_consent_required`, exit `2`, and no plan.
+7. `svalnir clean plan --mode evict --rule RULE --format json` with no `--include-clear`. Expected: `clear_not_included`, exit `2`, and no plan.
 8. With a build of the producer in progress, make a plan with `--include-clear`. Expected: each unit is blocked with `active_producer`.
 
 **Manual eviction**

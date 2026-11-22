@@ -95,6 +95,8 @@ pub mod owner_tools;
 #[cfg(unix)]
 mod plist;
 #[cfg(unix)]
+pub mod producers;
+#[cfg(unix)]
 pub mod projects;
 #[cfg(unix)]
 mod registry;

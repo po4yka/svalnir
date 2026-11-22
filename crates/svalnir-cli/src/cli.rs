@@ -298,8 +298,8 @@ pub enum CleanCommand {
 #[derive(Debug, Args)]
 pub struct CleanPlanArgs {
     /// Identifier of the scan that supplies the candidates. The `trash` and
-    /// `permanent` modes require it. The `evict` mode reads no scan: its
-    /// candidates come from the rule.
+    /// `permanent` modes require it. The `evict` and `owner` modes read no
+    /// scan: their candidates come from the rule.
     #[arg(long, value_name = "SCAN_ID")]
     pub scan: Option<String>,
     /// Selection preset that filters candidates. It grants no authority.
@@ -308,13 +308,19 @@ pub struct CleanPlanArgs {
     /// Removal mode.
     #[arg(long, value_enum, default_value_t = CleanMode::Trash)]
     pub mode: CleanMode,
-    /// Reviewed cleanup rule. Only the `evict` mode accepts it, and requires it.
-    #[arg(long, value_name = "RULE_ID", required_if_eq("mode", "evict"))]
+    /// Reviewed cleanup rule. Only the `evict` and `owner` modes accept it,
+    /// and they require it.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        required_if_eq_any([("mode", "evict"), ("mode", "owner")])
+    )]
     pub rule: Option<String>,
-    /// Consent to a clear rule: the plan removes the contents of a cache
-    /// directory of the producer, also data that a project uses now. Only
-    /// the `evict` mode with a clear rule accepts it, and a clear rule
-    /// requires it.
+    /// Consent to a clear rule: the plan removes cache data of the
+    /// producer, also data that a project uses now. The `owner` mode
+    /// accepts it for a rule whose owner command has the kind `clear`, and
+    /// the `evict` mode for a clear rule of the registry, which requires
+    /// it.
     #[arg(long)]
     pub include_clear: bool,
     /// An entry of the saved scan to select, by its exact path. Repeat it
@@ -369,6 +375,9 @@ pub enum CleanMode {
     Permanent,
     /// Permanently remove the candidates of one reviewed rule.
     Evict,
+    /// Run the fixed command of the producer of one reviewed rule on its
+    /// measured scope.
+    Owner,
 }
 
 #[derive(Debug, Args)]

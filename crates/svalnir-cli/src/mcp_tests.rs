@@ -406,6 +406,32 @@ fn a_message_that_is_not_a_valid_request_gets_the_error_of_the_specification() {
 }
 
 #[test]
+fn the_plan_tool_cannot_give_the_consent_to_a_clear_rule() {
+    let (environment, _directory) = environment();
+    let session = serve(
+        &environment,
+        &[
+            initialize(),
+            initialized(),
+            call(
+                2,
+                "plan",
+                &json!({"mode": "evict", "rule": "cargo.registry-cache", "include_clear": true}),
+            ),
+        ],
+    );
+    let result = &response(&session, 2)["result"];
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("has no argument `include_clear`"),
+        "{result}"
+    );
+}
+
+#[test]
 fn the_disk_tool_has_the_result_of_the_command() {
     let (environment, _directory) = environment();
     let session = serve(
@@ -758,6 +784,56 @@ fn the_apply_tool_refuses_a_permanent_plan_and_needs_an_agent() {
         "{refused}"
     );
     assert!(tree.join("build/b.bin").exists());
+}
+
+#[test]
+fn the_apply_tool_refuses_an_owner_operation() {
+    // `--only-modes evict,trash` of the server permits no owner operation,
+    // also a `clear` command whose plan the user made.
+    let world = crate::owner_tests::World::manual();
+    let root: PathBuf = world.cache("Library/Caches/go-build");
+    let (plan, result) = world.planned("go.build-cache", &["--include-clear"]);
+    let digest: String = result["explanation"]["plan"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session = serve(
+        &world.environment,
+        &[
+            initialize(),
+            call(1, "apply", &json!({"plan_id": plan, "digest": digest})),
+        ],
+    );
+    let refused = &response(&session, 1)["result"];
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["response"]["error"]["code"],
+        "mode_not_permitted"
+    );
+    assert_eq!(world.runs(), Vec::<String>::new());
+    assert!(root.join("stale-a").exists());
+    // In a terminal, `--only-modes trash` refuses it too.
+    let applied = run(
+        &world.environment,
+        &[
+            "clean",
+            "apply",
+            "--plan",
+            &plan,
+            "--yes",
+            "--only-modes",
+            "trash",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        applied.status,
+        ExitStatus::Unavailable,
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(world.runs(), Vec::<String>::new());
 }
 
 #[test]

@@ -510,6 +510,9 @@ pub trait DiscoveryEnvironment: ScanClock {
     /// - A clear rule ([`super::clear`]): the process inventory, for the
     ///   executable names of the producer of the rule
     ///   ([`DiscoveryEnvironment::producer_processes`]).
+    /// - A rule with an owner operation ([`super::producers`]): the
+    ///   process inventory, for the executable names of the producer of the
+    ///   rule ([`DiscoveryEnvironment::producer_processes`]).
     /// - `svalnir.expired-temporary`: the use leases, which this build
     ///   does not record, so the activity is not known.
     /// - A rule that this build does not know: not known.
@@ -523,7 +526,9 @@ pub trait DiscoveryEnvironment: ScanClock {
         if rule.as_str() == PROJECT_RULE_ID {
             return ProducerActivity::Inactive;
         }
-        if let Some(names) = clear::process_names(rule.as_str()) {
+        let names = clear::process_names(rule.as_str())
+            .or_else(|| super::producers::producer_process_names(rule.as_str()));
+        if let Some(names) = names {
             return match self.producer_processes(principal, names) {
                 ProducerProcesses::NotRunning => ProducerActivity::Inactive,
                 ProducerProcesses::Running => ProducerActivity::Active,

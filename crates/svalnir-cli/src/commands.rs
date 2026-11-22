@@ -53,6 +53,8 @@ pub(crate) mod inspect;
 pub(crate) mod monitor;
 pub(crate) mod operation_view;
 pub(crate) mod operations;
+#[cfg(unix)]
+pub(crate) mod owner;
 pub(crate) mod plan_store;
 pub(crate) mod plan_view;
 pub(crate) mod policy;
@@ -448,7 +450,10 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
     })
 }
 
-/// A rule selects the candidates of the `evict` mode only.
+/// A rule selects the candidates of the `evict` mode and the command of the
+/// `owner` mode only, and `--include-clear` is an option of the `owner`
+/// mode and of the `evict` mode with a clear rule
+/// (`docs/CLEANUP_RULES.md` section 12, "Clear rules") only.
 fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
     let Command::Clean {
         command: CleanCommand::Plan(plan),
@@ -456,14 +461,31 @@ fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
     else {
         return Ok(());
     };
-    if plan.rule.is_none() || plan.mode == CleanMode::Evict {
+    let clear_evict: bool = plan.mode == CleanMode::Evict
+        && plan
+            .rule
+            .as_deref()
+            .is_some_and(svalnir_agent::rules::clear::is_clear_rule);
+    if plan.include_clear && plan.mode != CleanMode::Owner && !clear_evict {
+        return Err(ErrorBody {
+            code: "unsupported_rule_selection".into(),
+            family: ErrorFamily::Request,
+            stage: ErrorStage::Arguments,
+            message: "`--include-clear` applies only to `--mode owner` and to `--mode evict` with a clear rule".to_owned(),
+            fields: &["include_clear", "mode"],
+            operation_id: None,
+            plan_id: None,
+            next_action: NextAction::CorrectRequest,
+        });
+    }
+    if plan.rule.is_none() || matches!(plan.mode, CleanMode::Evict | CleanMode::Owner) {
         return Ok(());
     }
     Err(ErrorBody {
         code: "unsupported_rule_selection".into(),
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
-        message: "`--rule` applies only to `--mode evict`".to_owned(),
+        message: "`--rule` applies only to `--mode evict` and `--mode owner`".to_owned(),
         fields: &["rule", "mode"],
         operation_id: None,
         plan_id: None,

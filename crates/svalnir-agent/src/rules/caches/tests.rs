@@ -114,7 +114,13 @@ fn each_cache_rule_is_registered_proposed_with_the_inspection_mode_only() {
     );
     for cache in registry.caches() {
         let rule = cache.rule();
-        assert_eq!(rule.modes, [RuleMode::Inspection]);
+        // A rule with an owner operation has a new revision with the mode
+        // of that operation (`rules::producers`).
+        if registry.producer(rule.reference.id.as_str()).is_some() {
+            assert_eq!(rule.modes, [RuleMode::Inspection, RuleMode::ManualEviction]);
+        } else {
+            assert_eq!(rule.modes, [RuleMode::Inspection]);
+        }
         assert!(registry.lookup(&rule.reference).is_ok());
         for layout in &rule.layouts {
             assert_eq!(layout.lifecycle, LifecycleState::Proposed);
@@ -135,7 +141,16 @@ fn a_fixture_lifecycle_does_not_change_a_cache_rule() {
     for state in [manual_action_validated(), automatic_eviction_validated()] {
         let registry: ReviewedRules = ReviewedRules::with_fixture_lifecycle(&state).unwrap();
         for cache in registry.caches() {
+            // The layout of the scope root of an owner operation has the
+            // fixture state (`rules::producers`); the layouts of the units
+            // keep their own.
+            let owner_layout: Option<&str> = registry
+                .producer(cache.rule().reference.id.as_str())
+                .map(|producer| producer.spec().layout);
             for layout in &cache.rule().layouts {
+                if Some(layout.layout.as_str()) == owner_layout {
+                    continue;
+                }
                 assert_eq!(layout.lifecycle, LifecycleState::Proposed);
                 for mode in [RuleMode::ManualEviction, RuleMode::AutomaticEviction] {
                     assert!(!layout.lifecycle.permits(&mode));

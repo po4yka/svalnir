@@ -52,7 +52,9 @@ pub use inspect::{
     CacheInspection, CacheMeasurement, CacheRootReport, CacheUnitReport, InspectionHost,
     InspectionLimits, ReclaimFigure, RootOutcome, RootResolution, UnitOutcome, resolve,
 };
-pub(in crate::rules) use inspect::{check_scope_root, measure_unit, measure_unit_observed};
+pub(in crate::rules) use inspect::{
+    check_scope_root, has_marker, measure_unit, measure_unit_observed,
+};
 
 use super::registry::RegistryError;
 
@@ -108,6 +110,8 @@ pub enum Marker {
     ChildDirectory(&'static str),
     /// The unit is a directory.
     Directory,
+    /// The unit has a regular file with this name, of each size.
+    File(&'static str),
     /// The unit has this regular file, and the file starts with these
     /// bytes.
     FilePrefix {

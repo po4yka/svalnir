@@ -84,6 +84,13 @@ fn json(environment: &Environment, arguments: &[&str]) -> Outcome {
 /// names.
 const PRODUCER: &str = "echo \"$*\" >> \"$HOME/runs\"\nfor last; do :; done\nroot=\"${GOCACHE:-$last}\"\nrm -f \"$root\"/stale-*";
 
+/// The marker of a uv cache.
+const UV_TAG: &[u8] =
+    b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n";
+
+/// The marker of a Go build cache: the start of the text that Go writes.
+const GO_README: &[u8] = b"This directory holds cached build artifacts from the Go build system.\nRun \"go clean -cache\" if the directory is getting too large.\n";
+
 /// One temporary world with a home directory and a directory of scripts.
 pub(crate) struct World {
     pub(crate) environment: Environment,
@@ -141,9 +148,23 @@ impl World {
         assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
     }
 
-    /// A cache below the home directory with two stale files and one file
-    /// that the producer keeps.
+    /// A cache below the home directory with two stale files, one file
+    /// that the producer keeps, and the marker of the producer of its
+    /// default location (`docs/CLEANUP_RULES.md` section 9).
     pub(crate) fn cache(&self, relative: &str) -> PathBuf {
+        let root: PathBuf = self.unmarked(relative);
+        match relative {
+            ".cache/uv" => std::fs::write(root.join("CACHEDIR.TAG"), UV_TAG).unwrap(),
+            "Library/Caches/go-build" => std::fs::write(root.join("README"), GO_README).unwrap(),
+            "Library/pnpm/store" => std::fs::create_dir_all(root.join("v10/files")).unwrap(),
+            _ => {}
+        }
+        root
+    }
+
+    /// A directory below the home directory with the files of
+    /// [`World::cache`] and no marker.
+    fn unmarked(&self, relative: &str) -> PathBuf {
         let root: PathBuf = self.home.join(relative);
         std::fs::create_dir_all(&root).unwrap();
         for name in ["stale-a", "stale-b", "kept"] {
@@ -401,4 +422,42 @@ fn the_inspection_shows_the_owner_operation_and_runs_nothing() {
     assert_eq!(mise.status, ExitStatus::Success, "{}", mise.stdout);
     assert_eq!(mise.result()["kind"], "owner");
     assert_eq!(world.runs(), Vec::<String>::new());
+}
+
+#[test]
+fn a_root_with_a_typing_error_gives_no_plan_and_keeps_its_files() {
+    let world = World::manual();
+    std::fs::create_dir_all(world.home.join(".config/uv")).unwrap();
+    std::fs::write(
+        world.home.join(".config/uv/uv.toml"),
+        "cache-dir = \"~/code\"\n",
+    )
+    .unwrap();
+    let code: PathBuf = world.unmarked("code");
+    let outcome = world.plan("uv.cache", &[]);
+    assert_eq!(
+        outcome.status,
+        ExitStatus::Unavailable,
+        "{}",
+        outcome.stdout
+    );
+    assert_eq!(outcome.error_code(), "owner_scope_unmarked");
+    assert!(!world.state_has_plans());
+    assert_eq!(stale(&code), 2);
+}
+
+#[test]
+fn a_marker_that_is_gone_at_admission_refuses_the_plan() {
+    let world = World::manual();
+    let root: PathBuf = world.cache(".cache/uv");
+    let (plan, _) = world.planned("uv.cache", &[]);
+    std::fs::remove_file(root.join("CACHEDIR.TAG")).unwrap();
+    let applied = world.apply(&plan);
+    assert!(
+        applied.stdout.contains("owner_scope_unmarked"),
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(world.runs(), Vec::<String>::new());
+    assert_eq!(stale(&root), 2);
 }

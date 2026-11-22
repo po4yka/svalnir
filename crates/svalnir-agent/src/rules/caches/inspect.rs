@@ -381,9 +381,11 @@ fn is_in_project(root: &Path, home: &Path) -> bool {
 }
 
 /// Whether the unit at `path` has the marker of its layout.
-fn has_marker(path: &Path, marker: Marker, principal: Uid) -> bool {
+pub(in crate::rules) fn has_marker(path: &Path, marker: Marker, principal: Uid) -> bool {
     match marker {
         Marker::Directory => true,
+        Marker::File(name) => lstat(&path.join(name))
+            .is_ok_and(|child| child.kind == ObjectKind::RegularFile && child.owner == principal),
         Marker::ChildDirectory(name) => {
             lstat(&path.join(name)).is_ok_and(|child| child.kind == ObjectKind::Directory)
         }

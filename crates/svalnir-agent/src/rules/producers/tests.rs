@@ -14,8 +14,9 @@ use svalnir_core::rule::{LifecycleState, RuleMode, RuleRegistry};
 use tempfile::TempDir;
 
 use super::{
-    EXTENDED_RULE_REVISION, GuardOutcome, OWN_RULE_REVISION, PRODUCER_SPECS, Part,
-    ProducerBindError, ProducerBindRequest, ProducerRule, mise_tracked_configs,
+    EXTENDED_RULE_REVISION, GuardOutcome, HOMEBREW_ENV_OVERRIDES, OWN_RULE_REVISION,
+    OWNER_SCOPE_UNMARKED, PRODUCER_SPECS, Part, ProducerBindError, ProducerBindRequest,
+    ProducerRule, homebrew_system_env, mise_tracked_configs, scope_evidence,
 };
 use crate::executor::owner::ScopeLimits;
 use crate::protection::ProtectedLocations;
@@ -253,6 +254,15 @@ fn the_scope_root_comes_from_the_configuration_of_the_producer() {
     // The configuration names another location.
     home.write(".config/uv/uv.toml", b"cache-dir = \"~/uv-cache\"\n");
     fs::create_dir(home.path.join("uv-cache")).unwrap();
+    // With no marker of uv, the directory is not a scope.
+    assert_eq!(
+        uv.scope(&home.host()).outcome,
+        RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
+    );
+    home.write(
+        "uv-cache/CACHEDIR.TAG",
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
     let report = uv.scope(&home.host());
     assert!(matches!(
         report.resolution,
@@ -262,7 +272,7 @@ fn the_scope_root_comes_from_the_configuration_of_the_producer() {
     assert_eq!(report.outcome, RootOutcome::Examined);
     assert!(report.bound.is_some());
     // A root that is a symbolic link is refused.
-    fs::remove_dir(home.path.join("uv-cache")).unwrap();
+    fs::remove_dir_all(home.path.join("uv-cache")).unwrap();
     fs::create_dir(home.path.join("elsewhere")).unwrap();
     symlink(home.path.join("elsewhere"), home.path.join("uv-cache")).unwrap();
     assert!(matches!(
@@ -304,12 +314,26 @@ fn the_guard_of_mise_reads_each_tracked_configuration() {
     let versions: PathBuf = home.write("work/b/.tool-versions", b"node 22\n");
     symlink(&good, tracked.join("a")).unwrap();
     symlink(&versions, tracked.join("b")).unwrap();
-    // A link to a file that is absent: mise leaves it out.
+    // A link to a file that is absent in a directory that exists: mise
+    // leaves the file of a removed project out.
+    fs::create_dir_all(home.path.join("work/gone")).unwrap();
     symlink(home.path.join("work/gone/mise.toml"), tracked.join("c")).unwrap();
     assert_eq!(
         mise_tracked_configs(&home.path, home.principal),
         GuardOutcome::Passed { files: 2 }
     );
+    // A file whose directory is absent can be on a volume that is not
+    // mounted, so mise cannot load it: the guard refuses.
+    let unmounted: PathBuf = PathBuf::from("/Volumes/svalnir-test-absent/app/mise.toml");
+    symlink(&unmounted, tracked.join("v")).unwrap();
+    assert_eq!(
+        mise_tracked_configs(&home.path, home.principal),
+        GuardOutcome::Refused {
+            reason: "tracked_config_volume_absent",
+            path: unmounted,
+        }
+    );
+    fs::remove_file(tracked.join("v")).unwrap();
     // A file that does not parse protects no version, so the guard
     // refuses.
     let broken: PathBuf = home.write("work/d/mise.toml", b"[tools\nnode = 22\n");
@@ -329,6 +353,10 @@ fn a_guard_that_refuses_gives_no_binding() {
     let registry: ReviewedRules = home.registry();
     write_owner_script(&home.tools, "mise", "exit 0").unwrap();
     fs::create_dir_all(home.path.join(".local/share/mise/installs/node/22")).unwrap();
+    home.write(
+        ".local/share/mise/installs/.mise-installs.toml",
+        b"[node]\nshort = \"node\"\n",
+    );
     let tracked: PathBuf = home.path.join(".local/state/mise/tracked-configs");
     fs::create_dir_all(&tracked).unwrap();
     let broken: PathBuf = home.write("work/mise.toml", b"tools = [\n");
@@ -350,6 +378,11 @@ fn a_binding_names_the_measured_root_and_admission_makes_it_again() {
     let script: PathBuf = write_owner_script(&home.tools, "uv", "exit 0").unwrap();
     let root: PathBuf = home.path.join(".cache/uv");
     fs::create_dir_all(root.join("wheels-v5")).unwrap();
+    fs::write(
+        root.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     fs::write(root.join("wheels-v5/pkg"), vec![1_u8; 4096]).unwrap();
     let uv = registry.producer("uv.cache").unwrap();
     let bound = bind(uv, &home, false).unwrap();
@@ -515,5 +548,151 @@ fn the_owner_of_a_home_is_the_principal_of_the_fixture() {
     assert_eq!(
         fs::metadata(&home.path).unwrap().uid(),
         home.principal.get()
+    );
+}
+
+#[test]
+fn a_root_with_a_typing_error_is_never_a_scope() {
+    // A configuration value names a directory of the user: the producer
+    // command would empty it. With no marker of uv, no plan binds it.
+    let home = Home::new();
+    let registry: ReviewedRules = home.registry();
+    write_owner_script(&home.tools, "uv", "exit 0").unwrap();
+    home.write(".config/uv/uv.toml", b"cache-dir = \"~/code\"\n");
+    let work: PathBuf = home.write("code/app/main.rs", b"fn main() {}\n");
+    let uv = registry.producer("uv.cache").unwrap();
+    assert!(matches!(
+        bind(uv, &home, false),
+        Err(ProducerBindError::NoScope(report))
+            if report.outcome == RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
+    ));
+    // The same for each other rule whose root is a plain directory.
+    let go = registry.producer("go.module-cache").unwrap();
+    fs::create_dir_all(home.path.join("go/pkg/mod/github.com")).unwrap();
+    write_owner_script(&home.tools, "go", "exit 0").unwrap();
+    assert!(matches!(
+        bind(go, &home, true),
+        Err(ProducerBindError::NoScope(report))
+            if report.outcome == RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
+    ));
+    assert!(work.exists());
+    // The rule `mise.cache` has no marker, so it binds no scope.
+    fs::create_dir_all(home.path.join("Library/Caches/mise/node")).unwrap();
+    assert_eq!(
+        registry
+            .producer("mise.cache")
+            .unwrap()
+            .scope(&home.host())
+            .outcome,
+        RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
+    );
+}
+
+#[test]
+fn the_checks_at_admission_read_the_marker_and_the_guards_again() {
+    let home = Home::new();
+    let registry: ReviewedRules = home.registry();
+    let root: PathBuf = home.path.join(".cache/uv");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    let rule = registry
+        .producer("uv.cache")
+        .unwrap()
+        .rule()
+        .reference
+        .clone();
+    assert_eq!(
+        scope_evidence(&rule, &root, &home.path, home.principal),
+        Ok(())
+    );
+    fs::remove_file(root.join("CACHEDIR.TAG")).unwrap();
+    assert_eq!(
+        scope_evidence(&rule, &root, &home.path, home.principal),
+        Err(OWNER_SCOPE_UNMARKED)
+    );
+    // A rule that is not of this module, as the fixture rule, passes.
+    let other = registry
+        .cache("cocoapods.cache")
+        .unwrap()
+        .rule()
+        .reference
+        .clone();
+    assert_eq!(
+        scope_evidence(&other, &root, &home.path, home.principal),
+        Ok(())
+    );
+}
+
+#[test]
+fn the_module_cache_is_below_the_first_path_of_gopath() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let go = registry.producer("go.module-cache").unwrap();
+    assert_eq!(
+        go.scope(&home.host()).path,
+        Some(home.path.join("go/pkg/mod"))
+    );
+    let first: PathBuf = home.path.join("work/gopath");
+    let text: String = format!(
+        "GOPATH={}:{}\n",
+        first.display(),
+        home.path.join("other").display()
+    );
+    home.write("Library/Application Support/go/env", text.as_bytes());
+    let report = go.scope(&home.host());
+    assert_eq!(report.path, Some(first.join("pkg/mod")));
+    assert!(matches!(
+        report.resolution,
+        RootResolution::Configured { .. }
+    ));
+    // `GOMODCACHE` takes priority over `GOPATH`.
+    let named: PathBuf = home.path.join("mods");
+    home.write(
+        "Library/Application Support/go/env",
+        format!("{text}GOMODCACHE={}\n", named.display()).as_bytes(),
+    );
+    assert_eq!(go.scope(&home.host()).path, Some(named));
+}
+
+#[test]
+fn a_system_brew_env_that_changes_the_effect_refuses_homebrew() {
+    let home = Home::new();
+    let absent: PathBuf = home.path.join("etc/absent/brew.env");
+    assert_eq!(
+        homebrew_system_env(std::slice::from_ref(&absent)),
+        GuardOutcome::Passed { files: 0 }
+    );
+    let quiet: PathBuf = home.write("etc/quiet/brew.env", b"HOMEBREW_NO_EMOJI=1\n");
+    assert_eq!(
+        homebrew_system_env(&[absent.clone(), quiet.clone()]),
+        GuardOutcome::Passed { files: 1 }
+    );
+    for line in [
+        "HOMEBREW_CACHE=/tmp/elsewhere",
+        "HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1",
+        "HOMEBREW_NO_INSTALL_CLEANUP=",
+        "HOMEBREW_AUTOREMOVE=1",
+    ] {
+        let file: PathBuf = home.write("etc/loud/brew.env", format!("{line}\n").as_bytes());
+        assert_eq!(
+            homebrew_system_env(&[quiet.clone(), file.clone()]),
+            GuardOutcome::Refused {
+                reason: HOMEBREW_ENV_OVERRIDES,
+                path: file,
+            },
+            "{line}"
+        );
+    }
+    // The declaration has the fixed value that stops the autoremove.
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let brew = registry.producer("homebrew.cleanup").unwrap().operation();
+    assert!(
+        brew.environment
+            .iter()
+            .any(|entry| entry.name == "HOMEBREW_NO_AUTOREMOVE")
     );
 }

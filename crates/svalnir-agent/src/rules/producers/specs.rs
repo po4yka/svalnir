@@ -13,7 +13,8 @@ use svalnir_core::policy::RebuildCost;
 
 use super::{Guard, Part, ProducerBase, ProducerSpec};
 use crate::rules::caches::{
-    ConfigFormat, ConfigSource, ExclusionSpec, GO, HOMEBREW, Location, PNPM, RootSpec, UV, YARN,
+    ConfigFormat, ConfigSource, ExclusionSpec, GO, HOMEBREW, Location, Marker, PNPM, RootSpec, UV,
+    YARN,
 };
 
 /// The search path of each command: the system directories only.
@@ -94,16 +95,19 @@ const GO_MODULE_ROOT: RootSpec = RootSpec {
     units: &[],
 };
 
+/// The `GOPATH` list of the `env` file of Go.
+const GO_PATH_SOURCE: ConfigSource = ConfigSource {
+    file: GO_ENV,
+    format: ConfigFormat::Assignment,
+    key: "GOPATH",
+    tilde: false,
+    list: true,
+};
+
 /// The source code and the installed commands of `GOPATH`, which the
 /// module cache never contains.
 const GO_PATH_EXCLUSION: ExclusionSpec = ExclusionSpec {
-    sources: &[ConfigSource {
-        file: GO_ENV,
-        format: ConfigFormat::Assignment,
-        key: "GOPATH",
-        tilde: false,
-        list: true,
-    }],
+    sources: &[GO_PATH_SOURCE],
     default: Location::Home("go"),
     children: &["src", "bin"],
 };
@@ -153,8 +157,10 @@ pub const MISE_CACHE: ProducerSpec = ProducerSpec {
     effect: "mise removes the files of its cache that it has not used for its age limit. The environment names the measured root as the cache directory.",
     regeneration: "mise downloads or makes a removed file again when a later command needs it.",
     whole_cache: true,
+    default_below: None,
     guard: Guard::None,
     processes: &["mise"],
+    markers: &[],
     lookup: "The root is the default of macOS. Plonge runs `mise cache path`; Svalnir runs no query and gives the root to mise in `MISE_CACHE_DIR`.",
 };
 
@@ -183,8 +189,10 @@ pub const MISE_INSTALLS: ProducerSpec = ProducerSpec {
     effect: "mise removes each installed tool version that no tracked configuration file names.",
     regeneration: "`mise install` downloads and installs a removed version again. A project that needs the version fails until then.",
     whole_cache: true,
+    default_below: None,
     guard: Guard::MiseTrackedConfigs,
     processes: &["mise"],
+    markers: &[Marker::File(".mise-installs.toml")],
     lookup: "The root is the default of the data directory of mise, which mise uses with the fixed environment of the command. Plonge reads `mise doctor --json`; Svalnir runs no query.",
 };
 
@@ -215,11 +223,16 @@ pub const UV_CACHE: ProducerSpec = ProducerSpec {
     ],
     environment: &[HOME, SYSTEM_PATH, ("UV_NO_PROGRESS", Part::Literal("1"))],
     deadline_seconds: 300,
-    effect: "uv removes the entries of its cache that no environment can use.",
+    effect: "uv removes the entries of its cache that no environment can use, also the cached environments of uv (for example of `uvx` and `uv run --with`) that a `.venv` link of a project can refer to.",
     regeneration: "A later install downloads and builds each removed package again and needs an index that is still available.",
     whole_cache: true,
+    default_below: None,
     guard: Guard::None,
     processes: &["uv", "uvx"],
+    markers: &[Marker::FilePrefix {
+        file: "CACHEDIR.TAG",
+        prefix: b"Signature: 8a477f597d28d172789f06886806bc55",
+    }],
     lookup: FROM_FILES,
 };
 
@@ -257,8 +270,13 @@ pub const PNPM_STORE: ProducerSpec = ProducerSpec {
     effect: "pnpm removes the packages of the store that no project refers to.",
     regeneration: "A later install downloads each removed package again and needs a registry that is still available.",
     whole_cache: true,
+    default_below: None,
     guard: Guard::None,
     processes: &["pnpm", "node"],
+    markers: &[
+        Marker::ChildDirectory("v10/files"),
+        Marker::ChildDirectory("v3/files"),
+    ],
     lookup: FROM_FILES,
 };
 
@@ -287,8 +305,13 @@ pub const GO_BUILD: ProducerSpec = ProducerSpec {
     effect: "Go removes the whole build cache. The environment names the measured root as `GOCACHE`.",
     regeneration: "The next build compiles each package again, and the next test run runs each test again.",
     whole_cache: false,
+    default_below: None,
     guard: Guard::None,
     processes: &["go"],
+    markers: &[Marker::FilePrefix {
+        file: "README",
+        prefix: b"This directory holds cached build artifacts from the Go build system.",
+    }],
     lookup: FROM_FILES,
 };
 
@@ -320,7 +343,9 @@ pub const GO_MODULES: ProducerSpec = ProducerSpec {
     regeneration: "The next build downloads each module again and needs a module proxy or a source that is still available.",
     whole_cache: false,
     guard: Guard::None,
+    default_below: Some((GO_PATH_SOURCE, "pkg/mod")),
     processes: &["go"],
+    markers: &[Marker::ChildDirectory("cache/download")],
     lookup: FROM_FILES,
 };
 
@@ -347,15 +372,18 @@ pub const HOMEBREW_CLEANUP: ProducerSpec = ProducerSpec {
         ("HOMEBREW_CACHE", Part::ScopeRoot),
         ("HOMEBREW_NO_AUTO_UPDATE", Part::Literal("1")),
         ("HOMEBREW_NO_INSTALL_CLEANUP", Part::Literal("1")),
+        ("HOMEBREW_NO_AUTOREMOVE", Part::Literal("1")),
         ("HOMEBREW_NO_ANALYTICS", Part::Literal("1")),
         ("HOMEBREW_NO_ENV_HINTS", Part::Literal("1")),
     ],
     deadline_seconds: 300,
-    effect: "Homebrew removes each file of its cache and the old versions of each formula and cask that is not pinned. The environment names the measured root as `HOMEBREW_CACHE`.",
+    effect: "Homebrew removes each file of its cache. Outside the measured cache it also removes the old versions of each formula of the Cellar and of each cask that is not pinned, old versions of its portable Ruby, the compiled Python files of the prefix, old logs and lock files, and the broken symbolic links and empty directories of the prefix. The environment names the measured root as `HOMEBREW_CACHE` and stops the removal of unused dependencies.",
     regeneration: "A later install or reinstall downloads the bottle or the source again, and an old version is not available again unless the user installs it.",
     whole_cache: true,
-    guard: Guard::None,
+    default_below: None,
+    guard: Guard::HomebrewSystemEnv,
     processes: &["brew", "ruby"],
+    markers: &[Marker::ChildDirectory("downloads")],
     lookup: FROM_FILES,
 };
 
@@ -375,7 +403,6 @@ pub const NPM_CACHE: ProducerSpec = ProducerSpec {
     executables: &[
         Location::Absolute("/opt/homebrew/bin/npm"),
         Location::Absolute("/usr/local/bin/npm"),
-        Location::Home(".local/share/mise/installs/node/latest/bin/npm"),
     ],
     interpreters: &NODE,
     arguments: &[
@@ -395,8 +422,10 @@ pub const NPM_CACHE: ProducerSpec = ProducerSpec {
     effect: "npm removes its content cache (`_cacache`) below the measured root. The logs and the `npx` directory stay.",
     regeneration: "A later install downloads each removed package again and needs a registry that is still available.",
     whole_cache: true,
+    default_below: None,
     guard: Guard::None,
     processes: &["npm", "npx", "node"],
+    markers: &[Marker::ChildDirectory("_cacache")],
     lookup: FROM_FILES,
 };
 
@@ -433,8 +462,10 @@ pub const YARN_CACHE: ProducerSpec = ProducerSpec {
     effect: "Yarn 1 removes the content of the measured cache folder. Yarn 2 and later refuse the option `--cache-folder`, so the command then ends with an error and removes nothing.",
     regeneration: "A later install downloads each removed package again and needs a registry that is still available.",
     whole_cache: false,
+    default_below: None,
     guard: Guard::None,
     processes: &["yarn", "node"],
+    markers: &[Marker::ChildDirectory("v6")],
     lookup: FROM_FILES,
 };
 
@@ -454,15 +485,10 @@ pub const PIP_CACHE: ProducerSpec = ProducerSpec {
     executables: &[
         Location::Absolute("/opt/homebrew/bin/pip3"),
         Location::Absolute("/usr/local/bin/pip3"),
-        Location::Home(".local/share/mise/installs/python/latest/bin/pip3"),
     ],
     interpreters: &[
         (Location::Absolute("/opt/homebrew/bin/python3"), None),
         (Location::Absolute("/usr/local/bin/python3"), None),
-        (
-            Location::Home(".local/share/mise/installs/python/latest/bin/python3"),
-            None,
-        ),
     ],
     arguments: &[
         Part::Literal("cache"),
@@ -478,8 +504,14 @@ pub const PIP_CACHE: ProducerSpec = ProducerSpec {
     effect: "pip removes the wheels and the HTTP responses of its cache. With `--isolated`, pip reads no configuration file and no `PIP_` variable.",
     regeneration: "A later install downloads each removed package again and needs an index that is still available.",
     whole_cache: true,
+    default_below: None,
     guard: Guard::None,
     processes: &["pip*", "python*", "Python"],
+    markers: &[
+        Marker::ChildDirectory("http-v2"),
+        Marker::ChildDirectory("http"),
+        Marker::ChildDirectory("wheels"),
+    ],
     lookup: "The root is the default of macOS: the keys of `pip.conf` are in sections, which Svalnir does not read, and the command gives `--isolated`. Plonge runs `pip cache dir`; Svalnir runs no query.",
 };
 

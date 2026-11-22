@@ -20,8 +20,8 @@ use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::protection::ProtectedLocations;
 use svalnir_agent::rules::caches::{InspectionHost, RootOutcome};
 use svalnir_agent::rules::producers::{
-    GuardOutcome, MAX_PRODUCER_EXECUTABLE_BYTES, ProducerBindError, ProducerBindRequest,
-    ProducerBinding, ProducerRule,
+    GuardOutcome, MAX_PRODUCER_EXECUTABLE_BYTES, OWNER_SCOPE_UNMARKED, ProducerBindError,
+    ProducerBindRequest, ProducerBinding, ProducerRule, guard_code,
 };
 use svalnir_agent::rules::{DiscoveryHost, ReviewedRules};
 use svalnir_agent::scan::{CancellationToken, WallScanClock};
@@ -196,8 +196,13 @@ fn bind_error(error: &ProducerBindError) -> ErrorBody {
                 RootOutcome::Refused(reason) => reason,
                 RootOutcome::Examined => "the scope root is not known",
             };
+            let code: &'static str = if report.outcome == RootOutcome::Refused(OWNER_SCOPE_UNMARKED) {
+                OWNER_SCOPE_UNMARKED
+            } else {
+                "owner_scope_unavailable"
+            };
             ErrorBody::new(
-                "owner_scope_unavailable",
+                code,
                 ErrorFamily::Eligibility,
                 ErrorStage::Admission,
                 format!(
@@ -207,12 +212,12 @@ fn bind_error(error: &ProducerBindError) -> ErrorBody {
             .with_fields(&["rule"])
         }
         ProducerBindError::Guard(outcome) => {
-            let reason: &str = match outcome {
+            let reason: &'static str = match outcome {
                 GuardOutcome::Refused { reason, .. } => reason,
                 GuardOutcome::None | GuardOutcome::Passed { .. } => "the guard refused",
             };
             ErrorBody::new(
-                "owner_guard_refused",
+                guard_code(reason),
                 ErrorFamily::Eligibility,
                 ErrorStage::Admission,
                 format!(

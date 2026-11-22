@@ -50,12 +50,51 @@ impl GuardOutcome {
     }
 }
 
+/// Whether the absent target `target` is the file of a removed project,
+/// which mise leaves out: its directory exists, and it is not below a
+/// directory of `/Volumes` that is not a mount point. A project on a
+/// volume that is not mounted is not removed, and mise cannot load its
+/// file.
+fn absent_is_removed(target: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent_exists: bool = target
+        .parent()
+        .is_some_and(|parent| fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()));
+    if !parent_exists {
+        return false;
+    }
+    let mut components = target.components();
+    let volume: Option<PathBuf> = match (components.next(), components.next(), components.next()) {
+        (
+            Some(std::path::Component::RootDir),
+            Some(std::path::Component::Normal(first)),
+            Some(std::path::Component::Normal(name)),
+        ) if first == "Volumes" => Some(Path::new("/Volumes").join(name)),
+        _ => None,
+    };
+    let Some(volume) = volume else {
+        return true;
+    };
+    // A mount point has another device than the directory above it.
+    match (fs::metadata(&volume), fs::metadata("/Volumes")) {
+        (Ok(mounted), Ok(above)) => mounted.dev() != above.dev(),
+        _ => false,
+    }
+}
+
 /// Reads one tracked file. `Ok(false)` when the target of the link is
-/// absent.
+/// absent and is the file of a removed project ([`absent_is_removed`]).
 fn read_tracked(target: &Path) -> Result<bool, &'static str> {
     let metadata = match fs::metadata(target) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return if absent_is_removed(target) {
+                Ok(false)
+            } else {
+                Err("tracked_config_volume_absent")
+            };
+        }
         Err(_) => return Err("tracked_config_not_readable"),
     };
     if !metadata.is_file() {
@@ -141,4 +180,69 @@ pub fn mise_tracked_configs(home: &Path, principal: Uid) -> GuardOutcome {
         }
     }
     GuardOutcome::Passed { files }
+}
+
+/// The system `brew.env` files of Homebrew: the file of the system and the
+/// file of each documented prefix.
+pub const HOMEBREW_SYSTEM_ENV_FILES: [&str; 3] = [
+    "/etc/homebrew/brew.env",
+    "/opt/homebrew/etc/homebrew/brew.env",
+    "/usr/local/etc/homebrew/brew.env",
+];
+
+/// The keys of a system `brew.env` file that change the effect of
+/// `brew cleanup --prune=all` with the fixed environment of the command.
+pub const HOMEBREW_OVERRIDING_KEYS: [&str; 7] = [
+    "HOMEBREW_CACHE",
+    "HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY",
+    "HOMEBREW_NO_INSTALL_CLEANUP",
+    "HOMEBREW_NO_AUTOREMOVE",
+    "HOMEBREW_AUTOREMOVE",
+    "HOMEBREW_NO_AUTO_UPDATE",
+    "HOMEBREW_CLEANUP_MAX_AGE_DAYS",
+];
+
+/// The largest system `brew.env` file that the guard reads, in bytes.
+const MAX_BREW_ENV_BYTES: u64 = 64 * 1024;
+
+/// The guard of `homebrew.cleanup`: no file of `files` sets a key of
+/// [`HOMEBREW_OVERRIDING_KEYS`]. Homebrew reads these files, and a value
+/// there can take priority over the fixed environment of the command. A
+/// file that exists and cannot be read, or that is larger than 64 KiB,
+/// also refuses: its keys are not known.
+#[must_use]
+pub fn homebrew_system_env<P: AsRef<Path>>(files: &[P]) -> GuardOutcome {
+    use crate::rules::caches::ConfigFormat;
+    use crate::rules::caches::config::find_values;
+
+    let refused = |path: &Path| GuardOutcome::Refused {
+        reason: super::HOMEBREW_ENV_OVERRIDES,
+        path: path.to_path_buf(),
+    };
+    let mut read: usize = 0;
+    for file in files {
+        let path: &Path = file.as_ref();
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return refused(path),
+        };
+        if !metadata.is_file() || metadata.len() > MAX_BREW_ENV_BYTES {
+            return refused(path);
+        }
+        let mut text: String = String::new();
+        let opened = fs::File::open(path)
+            .and_then(|file| file.take(MAX_BREW_ENV_BYTES).read_to_string(&mut text));
+        if opened.is_err() {
+            return refused(path);
+        }
+        read += 1;
+        let sets_key: bool = HOMEBREW_OVERRIDING_KEYS
+            .iter()
+            .any(|key| !find_values(&text, ConfigFormat::Assignment, key).is_empty());
+        if sets_key {
+            return refused(path);
+        }
+    }
+    GuardOutcome::Passed { files: read }
 }

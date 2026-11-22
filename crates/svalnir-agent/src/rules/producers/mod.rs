@@ -60,15 +60,19 @@ use svalnir_core::rule::{
     RuleExclusions, RuleMode, RuleOwner, RuleRef,
 };
 
-pub use guard::{GuardOutcome, MAX_TRACKED_CONFIG_BYTES, mise_tracked_configs};
+pub use guard::{
+    GuardOutcome, HOMEBREW_OVERRIDING_KEYS, HOMEBREW_SYSTEM_ENV_FILES, MAX_TRACKED_CONFIG_BYTES,
+    homebrew_system_env, mise_tracked_configs,
+};
 pub use specs::{
     GO_BUILD, GO_MODULES, HOMEBREW_CLEANUP, MISE_CACHE, MISE_INSTALLS, NPM_CACHE, PIP_CACHE,
     PNPM_STORE, PRODUCER_SPECS, UV_CACHE, YARN_CACHE,
 };
 
+use super::caches::config::{ConfigValue, paths_of, read_source};
 use super::caches::{
-    ExclusionSpec, InspectionHost, Location, RootOutcome, RootResolution, RootSpec,
-    check_scope_root, resolve,
+    ConfigSource, ExclusionSpec, InspectionHost, Location, Marker, RootOutcome, RootResolution,
+    RootSpec, check_scope_root, has_marker, resolve,
 };
 use super::eviction::BoundRoot;
 use super::owner_operation::{
@@ -136,7 +140,20 @@ pub enum Guard {
     /// Each tracked configuration file of mise loads
     /// ([`mise_tracked_configs`]).
     MiseTrackedConfigs,
+    /// No system `brew.env` file of Homebrew changes the effect of the
+    /// command ([`homebrew_system_env`]).
+    HomebrewSystemEnv,
 }
+
+/// The stable code of a scope root with no marker of its producer.
+pub const OWNER_SCOPE_UNMARKED: &str = "owner_scope_unmarked";
+
+/// The stable code of a guard that refuses the operation.
+pub const OWNER_GUARD_REFUSED: &str = "owner_guard_refused";
+
+/// The stable code of a system `brew.env` file that changes the effect of
+/// the command of `homebrew.cleanup`.
+pub const HOMEBREW_ENV_OVERRIDES: &str = "homebrew_env_overrides";
 
 /// The reviewed facts of one rule with an owner operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +193,10 @@ pub struct ProducerSpec {
     /// Whether the measurement is of the whole cache while the producer
     /// removes only a part of it.
     pub whole_cache: bool,
+    /// The root when the configuration names no location and this source
+    /// names a list of paths: the child path below the first path, as Go
+    /// makes `GOMODCACHE` from `GOPATH`. `None`: the default of the root.
+    pub default_below: Option<(ConfigSource, &'static str)>,
     /// The guard.
     pub guard: Guard,
     /// The executable file names of the processes of the producer: a
@@ -185,6 +206,10 @@ pub struct ProducerSpec {
     /// include the interpreter, and each process of that interpreter
     /// inhibits the command.
     pub processes: &'static [&'static str],
+    /// The markers of the producer: the scope root must have one of them
+    /// at the plan, at admission, and before the step. An empty list binds
+    /// no scope.
+    pub markers: &'static [Marker],
     /// The lookup decision: how the root is found, and why no query of
     /// the producer runs.
     pub lookup: &'static str,
@@ -598,6 +623,40 @@ impl ProducerRule {
             };
         };
         let (resolution, path) = resolve(self.spec.root, home, host.principal, &mounts);
+        let (resolution, path) = match (&resolution, self.spec.default_below) {
+            (RootResolution::Default, Some((source, child))) => {
+                match read_source(&source, home, host.principal, &mounts) {
+                    ConfigValue::NotSet => (resolution, path),
+                    ConfigValue::Problem(problem) => (
+                        RootResolution::NotResolved {
+                            file: home.join(source.file),
+                            key: source.key,
+                            problem,
+                        },
+                        None,
+                    ),
+                    ConfigValue::Set(raw) => match paths_of(&raw, &source, home) {
+                        Ok(paths) if !paths.is_empty() => (
+                            RootResolution::Configured {
+                                file: home.join(source.file),
+                                key: source.key,
+                            },
+                            paths.first().map(|first| first.join(child)),
+                        ),
+                        Ok(_) => (resolution, path),
+                        Err(problem) => (
+                            RootResolution::NotResolved {
+                                file: home.join(source.file),
+                                key: source.key,
+                                problem,
+                            },
+                            None,
+                        ),
+                    },
+                }
+            }
+            _ => (resolution, path),
+        };
         let Some(path) = path else {
             return ScopeReport {
                 resolution,
@@ -608,6 +667,9 @@ impl ProducerRule {
         };
         let (outcome, bound) =
             match check_scope_root(self.spec.exclusions, &path, host, home, &mounts) {
+                Ok(_) if !self.has_marker(&path, host.principal) => {
+                    (RootOutcome::Refused(OWNER_SCOPE_UNMARKED), None)
+                }
                 Ok(bound) => (RootOutcome::Examined, Some(bound)),
                 Err(outcome) => (outcome, None),
             };
@@ -622,10 +684,13 @@ impl ProducerRule {
     /// The result of the guard of the rule.
     #[must_use]
     pub fn guard(&self, home: &Path, principal: Uid) -> GuardOutcome {
-        match self.spec.guard {
-            Guard::None => GuardOutcome::None,
-            Guard::MiseTrackedConfigs => mise_tracked_configs(home, principal),
-        }
+        guard_of(self.spec, home, principal)
+    }
+
+    /// Whether the scope root at `root` has a marker of the producer.
+    #[must_use]
+    pub fn has_marker(&self, root: &Path, principal: Uid) -> bool {
+        marked(self.spec, root, principal)
     }
 
     /// The read-only inspection of the rule: the scope root, the
@@ -779,6 +844,64 @@ fn declaration_for(
     interpreters: Vec<InterpreterLocation>,
 ) -> Result<OwnerOperation, RegistryError> {
     declaration(spec, rule.reference.clone(), executables, interpreters)
+}
+
+/// The result of the guard of `spec`.
+fn guard_of(spec: &ProducerSpec, home: &Path, principal: Uid) -> GuardOutcome {
+    match spec.guard {
+        Guard::None => GuardOutcome::None,
+        Guard::MiseTrackedConfigs => mise_tracked_configs(home, principal),
+        Guard::HomebrewSystemEnv => homebrew_system_env(&HOMEBREW_SYSTEM_ENV_FILES),
+    }
+}
+
+/// Whether the scope root at `root` has a marker of the producer of
+/// `spec`. A spec with no marker binds no scope.
+fn marked(spec: &ProducerSpec, root: &Path, principal: Uid) -> bool {
+    spec.markers
+        .iter()
+        .any(|marker| has_marker(root, *marker, principal))
+}
+
+/// The checks of the scope root of an owner operation of the rule `rule`
+/// at admission and immediately before its step
+/// (`docs/CLEANUP_RULES.md` section 9): the marker of the producer and the
+/// guards. A rule that is not of this module passes.
+///
+/// # Errors
+///
+/// Returns the stable code of the first check that fails:
+/// [`OWNER_SCOPE_UNMARKED`], [`OWNER_GUARD_REFUSED`], or
+/// [`HOMEBREW_ENV_OVERRIDES`].
+pub fn scope_evidence(
+    rule: &RuleRef,
+    root: &Path,
+    home: &Path,
+    principal: Uid,
+) -> Result<(), &'static str> {
+    let Some(spec) = PRODUCER_SPECS
+        .iter()
+        .find(|spec| spec.id == rule.id.as_str())
+    else {
+        return Ok(());
+    };
+    if !marked(spec, root, principal) {
+        return Err(OWNER_SCOPE_UNMARKED);
+    }
+    match guard_of(spec, home, principal) {
+        GuardOutcome::None | GuardOutcome::Passed { .. } => Ok(()),
+        GuardOutcome::Refused { reason, .. } => Err(guard_code(reason)),
+    }
+}
+
+/// The stable code of a guard that refused with `reason`.
+#[must_use]
+pub fn guard_code(reason: &'static str) -> &'static str {
+    if reason == HOMEBREW_ENV_OVERRIDES {
+        HOMEBREW_ENV_OVERRIDES
+    } else {
+        OWNER_GUARD_REFUSED
+    }
 }
 
 /// The executable names of the producer of the rule `id`, when `id` is a

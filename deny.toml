@@ -10,7 +10,12 @@ all-features = true
 # RustSec advisories for vulnerable, unmaintained, unsound, and yanked crates.
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # url 2.5.8 comes only through gpui-kit -> gpui-pre, and no version that
+    # gpui-kit accepts has the fix. Svalnir parses no `blob:` URL. Remove this
+    # entry when gpui-kit takes a fixed url (owner decision of 2026-11-22).
+    { id = "RUSTSEC-2026-0592", reason = "transitive through gpui-kit; no blob: URL is parsed; no compatible fixed version" },
+]
 
 [licenses]
 # Each license must be compatible with distribution under GPL-3.0-only.

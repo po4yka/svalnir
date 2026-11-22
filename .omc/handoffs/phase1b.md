@@ -1,13 +1,9 @@
 # Phase 1b handoff (branch phase1b-process-use, worktree .claude/worktrees/phase1b-process-use)
 
-Done:
-- d2f41b8 spec (CLEANUP_RULES s6 "Use by a running process", ACTION_CONTRACTS s7, INTERFACES codes, THREAT_MODEL).
-- 0f3b7f9 platform inventory (platform/process/uses.rs, native.rs queries) + rules/in_use.rs matching, tests.
-- next commit: discovery use check (rules/eviction.rs use_check), SkipReason UnitInUse/UnitUseUnknown,
-  DiscoveryEnvironment::path_uses/unit_use, AuthoritySource::unit_use, dispatch refusal unit_in_use/unit_use_unknown.
+Status: implementation complete; checks pass (fmt, clippy agent/cli/gui, tests agent/cli/gui).
+rustdoc -D warnings fails only on the two pre-existing links in rules/caches/config.rs.
 
-Remaining:
-- run cargo test -p svalnir-agent / -p svalnir-cli; fix fallout.
-- tests: discovery skip with injected inventory (eviction_tests), coordinator step refusal (coordinator tests).
-- project.dependency-directory inspection: add uses to ProjectUnitReport (ProcessEvidence::path_uses).
-- spec: align "not_visible" (identity-denied) and unknown-process semantics in CLEANUP_RULES s6.
+Open owner decision: on the development host, 8 hardened system agents of the user
+(dmd, routined, ScreenTimeAgent, progressd, ThumbnailsAgent, ...) deny the descriptor
+query, so each unit is unit_use_unknown (process_not_readable) with native evidence.
+No host run of the eviction path was made.

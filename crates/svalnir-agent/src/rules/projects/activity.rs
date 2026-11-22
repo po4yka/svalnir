@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use svalnir_core::process::{Pid, Uid};
 use svalnir_core::time::MonotonicNanos;
 
-use crate::platform::process::{DarwinProcessSource, ProcessSource, QueryFailure};
+use crate::platform::process::{DarwinProcessSource, PathInventory, ProcessSource, QueryFailure};
+use crate::rules::in_use::{UnitScope, inventory_of};
 
 /// The executable names of the build and package-manager processes of the
 /// layouts: the JavaScript runtimes and package managers, Python and its
@@ -148,6 +149,10 @@ pub trait ProcessEvidence {
     /// The monotonic time now, on the timeline of
     /// [`BuildProcesses::observed_at`].
     fn monotonic_now(&self) -> Option<MonotonicNanos>;
+
+    /// The path-use inventory of the processes of `principal`, read now,
+    /// with the paths in `scopes` only (`docs/CLEANUP_RULES.md` section 6).
+    fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory;
 }
 
 /// The inventory of the processes of `principal` from `source`, with the
@@ -259,6 +264,10 @@ impl ProcessEvidence for NativeProcessEvidence {
 
     fn monotonic_now(&self) -> Option<MonotonicNanos> {
         DarwinProcessSource::new().monotonic_now().ok()
+    }
+
+    fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory {
+        inventory_of(&DarwinProcessSource::new(), principal, scopes)
     }
 }
 

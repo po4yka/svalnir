@@ -21,12 +21,14 @@ use svalnir_core::time::MonotonicNanos;
 
 use super::activity::{BuildProcesses, ProcessEvidence};
 use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, ProjectRule};
+use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
 use crate::protection::ProtectedLocations;
 use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit};
 use crate::rules::git::{
     GitFailure, GitOutput, GitTool, GitToolProblem, RepositoryLookup, find_repository,
 };
+use crate::rules::in_use::{UnitScope, UnitUse, uses_of};
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
 };
@@ -236,6 +238,9 @@ pub struct ProjectUnitReport {
     pub version_control: Option<VersionControl>,
     /// The process evidence, when the checks came to it.
     pub activity: Option<ProjectActivity>,
+    /// The use check of `docs/CLEANUP_RULES.md` section 6, when the checks
+    /// came to it: whether a process of the user uses the unit.
+    pub uses: Option<UnitUse>,
     /// The result.
     pub outcome: ProjectUnitOutcome,
     /// The owner workflow, as a text for the user. Svalnir does not run
@@ -288,6 +293,8 @@ struct Inspector<'a> {
     deadline: Instant,
     expiry: Nanoseconds,
     processes: BuildProcesses,
+    /// The path-use inventory of the current search root, and its scope.
+    uses: Option<(UnitScope, PathInventory)>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
 }
@@ -436,6 +443,7 @@ impl ProjectRule {
                     deadline: Instant::now() + limits.max_duration,
                     expiry: self.rule().activity.evidence_expiry,
                     processes: host.processes.build_processes(host.principal),
+                    uses: None,
                     directories: 0,
                     units: Vec::new(),
                 };
@@ -478,6 +486,13 @@ impl Inspector<'_> {
             }
         };
         report.path = Some(path.clone());
+        // One inventory for each search root, with the root as its scope.
+        let scope: UnitScope = UnitScope::new(&path);
+        let inventory: PathInventory = self
+            .host
+            .processes
+            .path_uses(self.host.principal, std::slice::from_ref(&scope));
+        self.uses = Some((scope, inventory));
         let completion: SearchCompletion = self.walk(&path, snapshot, &mut report);
         report.outcome = SearchRootOutcome::Examined(completion);
         report
@@ -575,6 +590,7 @@ impl Inspector<'_> {
                 layout: layout.layout,
                 version_control: None,
                 activity: None,
+                uses: None,
                 outcome: ProjectUnitOutcome::Refused { reason: "" },
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
@@ -593,6 +609,7 @@ impl Inspector<'_> {
                 layout: "",
                 version_control: None,
                 activity: None,
+                uses: None,
                 outcome: ProjectUnitOutcome::OwnedByOtherRule {
                     rule: CARGO_RULE_ID,
                 },
@@ -672,6 +689,11 @@ impl Inspector<'_> {
             ProjectActivity::Active { .. } => return refused("producer_active"),
             ProjectActivity::Unknown { .. } => return refused("activity_unknown"),
         }
+        let uses: UnitUse = self.unit_use(path);
+        report.uses = Some(uses.clone());
+        if let Some(reason) = uses.refusal() {
+            return refused(reason);
+        }
         match measure_unit(
             path,
             self.limits.measure,
@@ -741,6 +763,32 @@ impl Inspector<'_> {
             Ok(_) => unknown("git_query_failed"),
             Err(failure) => unknown(failure.as_str()),
         }
+    }
+
+    /// The use of the unit at `path`, from the inventory of the search root.
+    /// An inventory that is older than the expiry of the rule is read again.
+    fn unit_use(&mut self, path: &Path) -> UnitUse {
+        let expiry: Nanoseconds = self.expiry;
+        let now: Option<MonotonicNanos> = self.host.processes.monotonic_now();
+        let Some((scope, inventory)) = &mut self.uses else {
+            return UnitUse::Unknown {
+                reason: "no_inventory",
+                processes: Vec::new(),
+                omitted: 0,
+            };
+        };
+        let current: bool = inventory
+            .observed_at
+            .zip(now)
+            .and_then(|(observed, now)| now.checked_duration_since(observed))
+            .is_some_and(|age| age <= expiry);
+        if !current {
+            *inventory = self
+                .host
+                .processes
+                .path_uses(self.host.principal, std::slice::from_ref(scope));
+        }
+        uses_of(inventory, &UnitScope::new(path))
     }
 
     /// The process evidence for the project at `project`. Evidence that is

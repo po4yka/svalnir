@@ -761,6 +761,56 @@ fn the_apply_tool_refuses_a_permanent_plan_and_needs_an_agent() {
 }
 
 #[test]
+fn the_apply_tool_refuses_an_owner_operation() {
+    // `--only-modes evict,trash` of the server permits no owner operation,
+    // also a `clear` command whose plan the user made.
+    let world = crate::owner_tests::World::manual();
+    let root: PathBuf = world.cache("Library/Caches/go-build");
+    let (plan, result) = world.planned("go.build-cache", &["--include-clear"]);
+    let digest: String = result["explanation"]["plan"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session = serve(
+        &world.environment,
+        &[
+            initialize(),
+            call(1, "apply", &json!({"plan_id": plan, "digest": digest})),
+        ],
+    );
+    let refused = &response(&session, 1)["result"];
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["response"]["error"]["code"],
+        "mode_not_permitted"
+    );
+    assert_eq!(world.runs(), Vec::<String>::new());
+    assert!(root.join("stale-a").exists());
+    // In a terminal, `--only-modes trash` refuses it too.
+    let applied = run(
+        &world.environment,
+        &[
+            "clean",
+            "apply",
+            "--plan",
+            &plan,
+            "--yes",
+            "--only-modes",
+            "trash",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        applied.status,
+        ExitStatus::Unavailable,
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(world.runs(), Vec::<String>::new());
+}
+
+#[test]
 fn a_stop_signal_ends_the_wait_of_a_queued_request() {
     use svalnir_agent::journal::{CoordinatorLock, CoordinatorRole};
 

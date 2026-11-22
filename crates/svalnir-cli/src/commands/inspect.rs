@@ -15,6 +15,7 @@ use svalnir_agent::rules::caches::{
     CacheInspection, InspectionHost, InspectionLimits, RootOutcome, UnitOutcome,
 };
 use svalnir_agent::rules::git::{GitTool, GitToolProblem};
+use svalnir_agent::rules::producers::{MAX_PRODUCER_EXECUTABLE_BYTES, OwnerInspection};
 use svalnir_agent::rules::projects::{
     ArgumentRootError, ClaudeTranscripts, EnvironmentEvidence, GitHeadActivity, MiseDiscovery,
     MiseLocations, MiseState, PROJECT_RULE_ID, PaseoAgents, ProjectHost, ProjectInspection,
@@ -215,13 +216,18 @@ impl ProjectSources {
 struct InspectView {
     /// The rule that the command inspected.
     rule: String,
-    /// `project`, `cache`, or `worktree`.
+    /// `project`, `cache`, `worktree`, or `owner`. A cache rule with an
+    /// owner operation is `cache` and has `owner` too.
     kind: &'static str,
     /// The read of mise, for a rule that searches projects.
     mise: Option<MiseDiscovery>,
     projects: Option<ProjectInspection>,
     cache: Option<CacheInspection>,
     worktrees: Option<WorktreeInspection>,
+    /// The owner operation of a rule that has one: the resolved
+    /// executable, the scope root, the measured size, the kind, and the
+    /// exact command. The inspection runs no command.
+    owner: Option<OwnerInspection>,
     note: &'static str,
 }
 
@@ -344,6 +350,9 @@ impl InspectView {
             }
             put_line!(out, "  Owner workflow: {}", inspection.owner_workflow);
         }
+        if let Some(inspection) = &self.owner {
+            render_owner(&mut out, inspection);
+        }
         if let Some(inspection) = &self.worktrees {
             render_roots(&mut out, &inspection.roots);
             for repository in &inspection.repositories {
@@ -357,6 +366,95 @@ impl InspectView {
         }
         put_line!(out, "{}", self.note);
         out
+    }
+}
+
+/// The text lines of the owner operation of a rule.
+fn render_owner(out: &mut String, inspection: &OwnerInspection) {
+    put_line!(
+        out,
+        "  Owner operation: {} ({}), layout {} {}",
+        inspection.kind.as_str(),
+        label(&inspection.bound),
+        inspection.layout.layout,
+        label(&inspection.layout.lifecycle)
+    );
+    let root: String = inspection.scope.path.as_ref().map_or_else(
+        || "(not resolved)".to_owned(),
+        |path| path.display().to_string(),
+    );
+    put_line!(
+        out,
+        "  Scope root: {root}   {}",
+        label(&inspection.scope.outcome)
+    );
+    match &inspection.measured {
+        Some(measured) => put_line!(
+            out,
+            "  Measured: {} allocated, {} entries{}{}",
+            human_bytes(measured.allocated_bytes.get()),
+            measured.entries.get(),
+            if measured.complete {
+                ""
+            } else {
+                ", not complete"
+            },
+            if inspection.whole_cache {
+                "; the size is of the whole cache, and the producer removes only a part of it"
+            } else {
+                ""
+            }
+        ),
+        None => out.push_str("  Measured: no measurement\n"),
+    }
+    match (&inspection.program.executable, inspection.program.problem) {
+        (Some(executable), _) => {
+            put_line!(out, "  Executable: {}", executable.display_label());
+            if let Some(interpreter) = &inspection.program.interpreter {
+                put_line!(
+                    out,
+                    "  Interpreter: {} {}",
+                    interpreter.display_label(),
+                    inspection.program.interpreter_arguments.join(" ")
+                );
+            }
+        }
+        (None, problem) => put_line!(
+            out,
+            "  Executable: none ({})",
+            problem.unwrap_or("executable_not_found")
+        ),
+    }
+    put_line!(out, "  Command: {}", inspection.arguments.join(" "));
+    for entry in &inspection.environment {
+        put_line!(out, "  Env: {}={}", entry.name, entry.value);
+    }
+    put_line!(out, "  Guard: {}", label(&inspection.guard));
+    put_line!(out, "  Effect: {}", inspection.effect);
+    put_line!(out, "  Consequence: {}", inspection.regeneration);
+    put_line!(out, "  Bound: {}", inspection.bound_reason);
+    put_line!(out, "  Root lookup: {}", inspection.lookup);
+    if inspection.needs_include_clear {
+        out.push_str("  A plan of this rule needs `--include-clear`.\n");
+    }
+}
+
+/// The short label of a serialized value: its text, or the text of its
+/// `kind` field with its `reason` field.
+fn label<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        Ok(serde_json::Value::Object(map)) => {
+            let kind: &str = map
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match map.get("reason").and_then(serde_json::Value::as_str) {
+                Some(reason) => format!("{kind}: {reason}"),
+                None => kind.to_owned(),
+            }
+        }
+        _ => String::new(),
     }
 }
 
@@ -490,8 +588,22 @@ pub(crate) fn inspect(
         projects: None,
         cache: None,
         worktrees: None,
+        owner: None,
         note: NOTE,
     };
+    let owner_host: InspectionHost<'_> = InspectionHost {
+        principal,
+        locations: &locations,
+        user_exclusions: &host.user_exclusions,
+    };
+    let owner: Option<OwnerInspection> = registry.producer(rule).map(|producer| {
+        producer.inspect(
+            &owner_host,
+            MAX_PRODUCER_EXECUTABLE_BYTES,
+            &cancel,
+            evidence.as_ref(),
+        )
+    });
     if rule == PROJECT_RULE_ID {
         let (inspection, mise) = context.projects(&arguments.projects)?;
         view.projects = Some(inspection);
@@ -514,6 +626,13 @@ pub(crate) fn inspect(
             &cancel,
             evidence.as_ref(),
         ));
+        view.owner = owner;
+    } else if let Some(owner) = owner {
+        if !arguments.projects.roots.is_empty() || arguments.projects.no_mise {
+            return Err(option_not_accepted().into());
+        }
+        view.kind = "owner";
+        view.owner = Some(owner);
     } else if registry
         .rules()
         .iter()
@@ -521,7 +640,7 @@ pub(crate) fn inspect(
     {
         return Err(rule_error(
             "inspection_not_available",
-            "this build has no `clean inspect` for this rule: it inspects `project.dependency-directory`, `git.linked-worktree`, and the six cache rules; the command made no change",
+            "this build has no `clean inspect` for this rule: it inspects `project.dependency-directory`, `git.linked-worktree`, the six cache rules, and each rule with an owner operation; the command made no change",
         )
         .into());
     } else {

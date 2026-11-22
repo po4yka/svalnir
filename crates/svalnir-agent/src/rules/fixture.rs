@@ -153,6 +153,12 @@ impl ScanClock for FixtureEnvironment {
 }
 
 impl DiscoveryEnvironment for FixtureEnvironment {
+    /// The producer state that the test set
+    /// ([`FixtureEnvironment::set_producer`]), for each producer.
+    fn producer_processes(&self, principal: Uid, _names: &[&str]) -> ProducerProcesses {
+        self.xcode_evidence(principal).producer_processes
+    }
+
     fn xcode_evidence(&self, _principal: Uid) -> XcodeEvidence {
         XcodeEvidence {
             producer_processes: match self.producer.load(Ordering::SeqCst) {

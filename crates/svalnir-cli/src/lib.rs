@@ -53,6 +53,9 @@ mod intervention_tests;
 mod mcp_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
+mod owner_tests;
+#[cfg(test)]
+#[cfg(target_os = "macos")]
 mod parity_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]

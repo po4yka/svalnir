@@ -249,7 +249,7 @@ impl OwnerToolRules {
             rule: rule.reference.clone(),
             layouts: rule.layouts.clone(),
             prefixes: reports,
-            owner_workflow: "Run `brew cleanup --dry-run` to see what `brew cleanup` removes, then `brew cleanup FORMULA` for one formula or `brew cleanup` for each one. It keeps the current version and the formulae that `brew pin` pinned. Svalnir does not run them.",
+            owner_workflow: "Run `brew cleanup --dry-run` to see what `brew cleanup` removes, then `brew cleanup FORMULA` for one formula or `brew cleanup` for each one. It keeps the current version and the formulae that `brew pin` pinned. Svalnir does not run them; it runs `brew cleanup --prune=all` only in a plan of `svalnir clean plan --mode owner --include-clear` that you approve.",
         }
     }
 }

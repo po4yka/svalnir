@@ -39,8 +39,8 @@ use svalnir_core::rule::{Rule, RuleMode, RuleRef, RuleRefusal, RuleRegistry as _
 
 use super::clean::{self, PlanView};
 use super::inspect::{self, ProjectRoots, ProjectSources};
-use super::plan_store::{self, PlanDocument, RootRecord};
-use super::session::{self, ActiveConfig, Now, journal_error};
+use super::plan_store::RootRecord;
+use super::session::{self, ActiveConfig, Now};
 use super::{CommandFailure, Invocation};
 use crate::cli::CleanPlanArgs;
 use crate::environment::Environment;
@@ -348,10 +348,14 @@ fn selected_rule<'a>(registry: &'a ReviewedRules, name: &str) -> Result<&'a Rule
         )
         .with_fields(&["rule"]));
     };
-    let validated: bool = found
-        .layouts
-        .iter()
-        .any(|layout| layout.permits(&RuleMode::ManualEviction));
+    // The layout of the scope root of an owner operation is for the
+    // `owner` mode: an eviction removes no scope root as a whole.
+    let owner_layout: Option<&str> = registry
+        .producer(name)
+        .map(|producer| producer.spec().layout);
+    let validated: bool = found.layouts.iter().any(|layout| {
+        Some(layout.layout.as_str()) != owner_layout && layout.permits(&RuleMode::ManualEviction)
+    });
     if !validated {
         return Err(ErrorBody::new(
             "rule_mode_not_validated",
@@ -657,17 +661,7 @@ pub(crate) fn plan(
     )?;
     let roots: Vec<RootRecord> = root_records(&discovery, &outcome);
     let has_plan: bool = outcome.plan.is_some();
-    if let Some(plan) = &outcome.plan {
-        // The journal has the sealed plan before the document names it.
-        journal
-            .try_record_plan(plan)
-            .map_err(|error| journal_error(&error))?;
-        let mut document =
-            PlanDocument::new(plan_id.clone(), plan.digest().clone(), outcome.clone());
-        document.roots.clone_from(&roots);
-        plan_store::save_plan(environment, &document)?;
-        plan_store::prune(environment);
-    }
+    clean::store_plan(&mut journal, environment, &outcome, roots.clone())?;
     let view = PlanView {
         scan_id: None,
         explanation: explain(&outcome, &now.clock),
@@ -683,6 +677,7 @@ pub(crate) fn plan(
                 &below_minimum,
             ),
         ),
+        owner: None,
         repository_warnings: Vec::new(),
         note: if interrupted {
             INTERRUPTED_NOTE

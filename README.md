@@ -371,6 +371,14 @@ svalnir clean plan --scan SCAN_ID --mode trash --entry ~/Library/Caches/com.exam
 svalnir clean show --plan PLAN_ID
 svalnir clean apply --plan PLAN_ID
 
+# Show the owner command of a producer rule: the executable, the scope
+# root, the measured size, and the exact command. Then plan it. A rule of
+# the kind `clear` needs --include-clear. Each rule is `proposed` in this
+# build, so the plan is refused until a rule has a promotion record.
+svalnir clean inspect --rule uv.cache
+svalnir clean plan --mode owner --rule uv.cache
+svalnir clean plan --mode owner --rule go.build-cache --include-clear
+
 # Inspect memory and stream machine-readable observations.
 svalnir memory status
 svalnir swap status

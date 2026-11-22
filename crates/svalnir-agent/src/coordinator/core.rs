@@ -893,8 +893,9 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     /// reviewed declaration of its rule with the scope root of the binding
     /// and the home directory of this process (`docs/ACTION_CONTRACTS.md`
     /// section 7). A plan whose binding differs, whose rule has no
-    /// declaration, or whose command deadline does not fit in the time
-    /// that the plan has left, is refused.
+    /// declaration, whose scope root has no marker of the producer or
+    /// fails a guard of the rule, or whose command deadline does not fit
+    /// in the time that the plan has left, is refused.
     fn check_owner_bindings(
         &self,
         plan: &Plan,
@@ -931,6 +932,21 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                 .ok_or_else(mismatch)?;
             if !crate::rules::owner_operation::binding_agrees(owner, &declaration, home) {
                 return Err(mismatch());
+            }
+            // The marker of the producer and the guards of the rule, read
+            // again: the plan can be up to its lifetime old
+            // (`docs/CLEANUP_RULES.md` section 9).
+            if let Err(code) = crate::rules::producers::scope_evidence(
+                &owner.rule,
+                &owner.root_path.to_path_buf(),
+                home,
+                owner.owner,
+            ) {
+                return Err(Box::new(admission_error(
+                    code,
+                    ErrorFamily::Eligibility,
+                    &plan.plan_id,
+                )));
             }
             if left.is_none_or(|left| owner.command_deadline > left) {
                 return Err(Box::new(admission_error(

@@ -6,9 +6,9 @@
 //! executable of the declaration that passes the checks of the owner
 //! executor, resolves the typed parameters of the command, and measures
 //! the scope. No value comes from user input or from configuration text.
-//! The binding goes into a sealed plan of the class `RunOwnerOperation`;
-//! this build has no command that makes such a plan, and only the fixture
-//! tests call this function.
+//! The binding goes into a sealed plan of the class `RunOwnerOperation`,
+//! which `clean plan --mode owner` makes for a rule of
+//! [`super::producers`].
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -64,6 +64,23 @@ pub enum OwnerBindError {
     /// The measurement of the scope is not complete.
     #[error("the measurement of the scope is not complete")]
     ScopeNotMeasured,
+}
+
+impl OwnerBindError {
+    /// The stable name of the reason.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCommand => "owner_command_absent",
+            Self::ClearNotConfirmed => "clear_not_confirmed",
+            Self::ExecutableNotFound => "executable_not_found",
+            Self::InterpreterNotDeclared => "interpreter_not_declared",
+            Self::ExecutableNotTrusted => "executable_not_trusted",
+            Self::PathNotUtf8 => "path_not_utf8",
+            Self::ScopeRootChanged => "scope_root_changed",
+            Self::ScopeNotMeasured => "scope_not_measured",
+        }
+    }
 }
 
 /// One request for a binding.
@@ -125,21 +142,28 @@ pub fn canonical_interpreters(
         .collect()
 }
 
-/// The executable of the declaration, with the interpreter of a script:
-/// the first path that passes the checks of the owner executor.
-fn bind_executable(
-    request: &OwnerBindRequest<'_>,
+/// The executable of `declaration` below the home directory `home`, with
+/// the interpreter of a script: the first path that passes the checks of
+/// the owner executor for `principal`. The read for the digest of a file
+/// stops at `max_executable_bytes`.
+///
+/// # Errors
+///
+/// Returns [`OwnerBindError::ExecutableNotFound`] when no path has a file,
+/// [`OwnerBindError::InterpreterNotDeclared`] when the `#!` line of a script
+/// names an interpreter that is not declared, and
+/// [`OwnerBindError::ExecutableNotTrusted`] when a file fails another check.
+pub fn resolve_program(
+    declaration: &OwnerOperation,
+    home: &Path,
+    principal: Uid,
+    max_executable_bytes: u64,
 ) -> Result<(ExecutableBinding, Option<InterpreterBinding>), OwnerBindError> {
     let interpreters: Vec<(PathBuf, Vec<String>)> =
-        canonical_interpreters(&request.declaration.interpreters, request.home_directory);
+        canonical_interpreters(&declaration.interpreters, home);
     let mut problem: OwnerBindError = OwnerBindError::ExecutableNotFound;
-    for path in canonical_locations(&request.declaration.executables, request.home_directory) {
-        match examine_program(
-            &path,
-            &interpreters,
-            request.principal,
-            request.max_executable_bytes,
-        ) {
+    for path in canonical_locations(&declaration.executables, home) {
+        match examine_program(&path, &interpreters, principal, max_executable_bytes) {
             Ok(program) => return Ok(program),
             Err(ExecutableProblem::NotFound) => {}
             Err(ExecutableProblem::InterpreterNotDeclared) => {
@@ -217,7 +241,12 @@ pub fn bind_owner_operation(
     if !root_agrees {
         return Err(OwnerBindError::ScopeRootChanged);
     }
-    let (executable, interpreter) = bind_executable(request)?;
+    let (executable, interpreter) = resolve_program(
+        declaration,
+        request.home_directory,
+        request.principal,
+        request.max_executable_bytes,
+    )?;
     let values = ParameterValues {
         scope_root: request
             .scope

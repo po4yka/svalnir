@@ -84,6 +84,8 @@ pub mod owner_tools;
 #[cfg(unix)]
 mod plist;
 #[cfg(unix)]
+pub mod producers;
+#[cfg(unix)]
 pub mod projects;
 #[cfg(unix)]
 mod registry;
@@ -105,7 +107,8 @@ mod tests;
 pub use eviction::{
     BoundRoot, DiscoveryEnvironment, DiscoveryHost, EvictionCandidate, EvictionDiscovery,
     EvictionRequest, ProducerActivity, RootProblem, RootReport, RootResult, SharedEnvironment,
-    SourceEnvironment, automatic_roots, bind_root, resolve_roots, root_id_of, xcode_evidence,
+    SourceEnvironment, automatic_roots, bind_root, producer_processes, resolve_roots, root_id_of,
+    xcode_evidence,
 };
 #[cfg(unix)]
 pub use expired_temporary::{

@@ -840,6 +840,28 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
     }
 
+    /// The checks of the scope root of an owner step immediately before
+    /// its start: the marker of the producer and the guards of the rule
+    /// ([`crate::rules::producers::scope_evidence`]). `Some` is the code
+    /// and the family of the refusal.
+    fn owner_recheck(
+        &self,
+        owner: &svalnir_core::action::OwnerOperationBinding,
+    ) -> Option<(&'static str, ErrorFamily)> {
+        let locations = self.authority.protected_locations();
+        let Some(home) = locations.home_directory() else {
+            return Some((code::OWNER_BINDING_MISMATCH, ErrorFamily::Evidence));
+        };
+        crate::rules::producers::scope_evidence(
+            &owner.rule,
+            &owner.root_path.to_path_buf(),
+            home,
+            owner.owner,
+        )
+        .err()
+        .map(|code| (code, ErrorFamily::Eligibility))
+    }
+
     /// The fresh checks of a step with a rule, immediately before its call:
     /// the producer activity and the use check ([`Self::fresh_refusal`]),
     /// then, for a file target, the checks of the rule ([`Self::rule_recheck`]),
@@ -858,6 +880,21 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             return Ok(false);
         };
         if let Some((code, family)) = self.fresh_refusal(rule, use_path) {
+            let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
+            self.end_without_call(
+                active,
+                step,
+                charge,
+                charged,
+                StopReason::TargetSkipped,
+                Some(error),
+            )?;
+            return Ok(true);
+        }
+        if let TargetBinding::OwnerOperation(owner) = binding {
+            let Some((code, family)) = self.owner_recheck(owner) else {
+                return Ok(false);
+            };
             let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
             self.end_without_call(
                 active,

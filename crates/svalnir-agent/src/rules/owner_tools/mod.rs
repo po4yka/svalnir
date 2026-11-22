@@ -241,6 +241,17 @@ impl OwnerToolRules {
         })
     }
 
+    /// The rules with the declaration `rule` of `homebrew.cleanup` in place
+    /// of its own: the new revision with the owner operation
+    /// ([`super::producers`]).
+    pub(super) fn with_homebrew(&self, rule: Rule) -> Self {
+        Self {
+            simulator: self.simulator.clone(),
+            container: self.container.clone(),
+            homebrew: rule,
+        }
+    }
+
     /// The declaration of `simulator.devices`.
     pub fn simulator(&self) -> &Rule {
         &self.simulator

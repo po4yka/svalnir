@@ -1,9 +1,9 @@
 //! The request, the limits, and the serializable result of a scan.
 //!
 //! `docs/RESOURCE_MODEL.md` section 8 owns the size definitions and the
-//! aggregation convention. Each size in this file is a logical size or an
-//! allocated size. No value in this file is a reclaimable size or an
-//! exclusive size.
+//! aggregation convention. Each size in this file is a logical size, an
+//! allocated size, or the private allocated size of the APFS backend. No
+//! value in this file is a reclaimable size.
 
 use std::path::Path;
 
@@ -21,14 +21,14 @@ use svalnir_core::volume::VolumeIdentity;
 use thiserror::Error;
 
 /// The version of the serialized [`ScanResult`].
-pub const SCAN_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const SCAN_RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// The metric name of the logical-size total of a scan.
 pub const METRIC_SCAN_LOGICAL_BYTES: &str = "scan.logical_bytes";
 /// The metric name of the allocated-size total of a scan.
 pub const METRIC_SCAN_ALLOCATED_BYTES: &str = "scan.allocated_bytes";
-/// The metric name of the exclusive-size total of a scan. A metadata scan
-/// cannot measure this quantity, so the observation is always unavailable.
+/// The metric name of the exclusive-size total of a scan: the private
+/// allocated bytes of [`PrivateAllocation`], or unavailable.
 pub const METRIC_SCAN_EXCLUSIVE_BYTES: &str = "scan.exclusive_bytes";
 /// The metric name of the entry total of a scan.
 pub const METRIC_SCAN_ENTRIES: &str = "scan.entries";
@@ -471,6 +471,125 @@ impl SharedStorageEvidence {
     }
 }
 
+/// Why the private allocated bytes of a scan are unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateSizeUnavailable {
+    /// The volume did not return `ATTR_CMNEXT_PRIVATESIZE` for a file, for
+    /// example because it is not an APFS volume.
+    NotReported,
+    /// The attribute call failed for a file.
+    QueryFailed,
+    /// The attribute call failed with a permission error for a file.
+    PermissionDenied,
+    /// The file identity of the attribute call is not the identity of the
+    /// `fstatat` measurement.
+    IdentityChanged,
+    /// The volume returned a negative private size.
+    InconsistentValue,
+    /// A sum overflowed.
+    Overflow,
+}
+
+impl PrivateSizeUnavailable {
+    /// The stable name of the cause.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotReported => "not_reported",
+            Self::QueryFailed => "query_failed",
+            Self::PermissionDenied => "permission_denied",
+            Self::IdentityChanged => "identity_changed",
+            Self::InconsistentValue => "inconsistent_value",
+            Self::Overflow => "overflow",
+        }
+    }
+
+    /// The reason of the observation.
+    pub fn reason(self) -> UnavailableReason {
+        match self {
+            Self::NotReported => UnavailableReason::Unsupported,
+            Self::QueryFailed => UnavailableReason::TransientFailure,
+            Self::PermissionDenied => UnavailableReason::PermissionDenied,
+            Self::IdentityChanged => UnavailableReason::IdentityChanged,
+            Self::InconsistentValue => UnavailableReason::InconsistentData,
+            Self::Overflow => UnavailableReason::Overflow,
+        }
+    }
+}
+
+/// The private allocated bytes of the scan root, or why they are not
+/// known. An unavailable value is not zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum PrivateBytes {
+    /// The volume reported the private size of each counted file.
+    Available {
+        /// The private allocated bytes.
+        bytes: Bytes,
+    },
+    /// The quantity is not known.
+    Unavailable {
+        /// The first cause that the scan found.
+        cause: PrivateSizeUnavailable,
+    },
+}
+
+impl PrivateBytes {
+    /// The bytes of an available value.
+    pub fn value(&self) -> Option<Bytes> {
+        match self {
+            Self::Available { bytes } => Some(*bytes),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// The private allocated bytes of the scan root and the evidence of their
+/// calculation.
+///
+/// `docs/RESOURCE_MODEL.md` section 8 defines the quantity: the private
+/// size of each counted object, plus the shared part of each clone family
+/// whose members the scan found. The quantity is not the logical size and
+/// not the allocated size. It does not prove reclamation: a snapshot, a
+/// name outside the root, an open file, or a later change can keep blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PrivateAllocation {
+    /// The quantity, or the cause that it is unavailable.
+    pub bytes: PrivateBytes,
+    /// The number of counted files whose private size the volume reported.
+    pub files_by_private_size: EntryCount,
+    /// The number of counted files that add their allocated size: a
+    /// compressed file, a dataless file, or a file whose private size is
+    /// above its allocated size.
+    pub files_by_allocated_size: EntryCount,
+    /// The number of clone families that the scan found a member of.
+    pub clone_families: EntryCount,
+    /// The number of those families whose members the scan found. Each adds
+    /// its shared part one time.
+    pub clone_families_complete: EntryCount,
+    /// The number of family members that add only their private part
+    /// because the scan tracked its largest number of families.
+    pub clone_families_not_tracked: EntryCount,
+    /// The number of hard-linked objects with a name that the scan did not
+    /// find. Each adds zero bytes.
+    pub hard_linked_objects_with_names_outside: EntryCount,
+}
+
+impl PrivateAllocation {
+    /// A value with no measurement, for a test or a fixture.
+    pub fn unavailable(cause: PrivateSizeUnavailable) -> Self {
+        Self {
+            bytes: PrivateBytes::Unavailable { cause },
+            files_by_private_size: EntryCount::ZERO,
+            files_by_allocated_size: EntryCount::ZERO,
+            clone_families: EntryCount::ZERO,
+            clone_families_complete: EntryCount::ZERO,
+            clone_families_not_tracked: EntryCount::ZERO,
+            hard_linked_objects_with_names_outside: EntryCount::ZERO,
+        }
+    }
+}
+
 /// How a scan ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -547,6 +666,8 @@ pub struct ScanResult {
     pub totals: ScanTotals,
     /// Evidence that the allocated total is not exclusive storage.
     pub shared_storage: SharedStorageEvidence,
+    /// The private allocated bytes of the root.
+    pub private_allocation: PrivateAllocation,
     /// The largest files by allocated size, largest first.
     pub largest_files: Vec<LargeFile>,
     /// The largest directories by allocated size, largest first. A
@@ -570,8 +691,8 @@ pub struct ScanObservations {
     pub logical_bytes: Observation<Bytes>,
     /// [`METRIC_SCAN_ALLOCATED_BYTES`].
     pub allocated_bytes: Observation<Bytes>,
-    /// [`METRIC_SCAN_EXCLUSIVE_BYTES`]. Always unavailable with the reason
-    /// `unsupported`.
+    /// [`METRIC_SCAN_EXCLUSIVE_BYTES`], kind `estimate`: the private
+    /// allocated bytes, or unavailable with the reason of their cause.
     pub exclusive_bytes: Observation<Bytes>,
     /// [`METRIC_SCAN_ENTRIES`].
     pub entries: Observation<EntryCount>,
@@ -619,8 +740,11 @@ impl ScanResult {
             )?,
             exclusive_bytes: bytes(
                 METRIC_SCAN_EXCLUSIVE_BYTES,
-                Reading::Unavailable(UnavailableReason::Unsupported),
-                MetricKind::Gauge,
+                match self.private_allocation.bytes {
+                    PrivateBytes::Available { bytes } => Reading::Available(bytes),
+                    PrivateBytes::Unavailable { cause } => Reading::Unavailable(cause.reason()),
+                },
+                MetricKind::Estimate,
             )?,
             entries: Observation {
                 metric_id: MetricId::new(METRIC_SCAN_ENTRIES)?,

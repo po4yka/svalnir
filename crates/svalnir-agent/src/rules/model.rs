@@ -22,7 +22,7 @@ use svalnir_core::rule::{
 use svalnir_core::time::WallTime;
 use thiserror::Error;
 
-use crate::scan::{CancellationToken, MAX_DEPTH_LIMIT, ScanClock};
+use crate::scan::{CancellationToken, MAX_DEPTH_LIMIT, PrivateBytes, ScanClock};
 
 /// The largest permitted [`DiscoveryLimits::max_units`].
 pub const MAX_UNITS_LIMIT: u32 = 100_000;
@@ -440,8 +440,15 @@ pub enum SizeMeasure {
     /// The sum of `st_blocks * 512` of the unit and of each object below
     /// it. This is allocated storage. It is not exclusive storage: APFS
     /// clones and snapshots can share it, and a metadata read cannot
-    /// measure that.
+    /// measure that. The estimate uses it when the private allocated bytes
+    /// are unavailable.
     AllocatedBytes,
+    /// The private allocated bytes of the unit that the APFS backend of the
+    /// scanner reported (`docs/RESOURCE_MODEL.md` section 8): the blocks
+    /// that only the unit uses, with the shared blocks of each clone family
+    /// whose members are all in the unit. A snapshot, a name outside the
+    /// unit, or an open file can still keep these blocks.
+    PrivateAllocatedBytes,
 }
 
 /// A prediction of the bytes that the removal of a unit can make
@@ -453,7 +460,8 @@ pub struct ReclaimEstimate {
     pub bytes: Bytes,
     /// The size that the estimate derives from.
     pub measure: SizeMeasure,
-    /// Always `false`: a metadata read cannot measure exclusive storage.
+    /// Always `false`: no measure of this build proves exclusive storage,
+    /// because a local snapshot can keep each block of the unit.
     pub exclusive_storage_known: bool,
     /// The number of files of the unit whose allocated size is less than
     /// their logical size: sparse, compressed, or dataless files.
@@ -484,6 +492,9 @@ pub struct UnitMeasurement {
     /// The sum of `st_blocks * 512` of the unit and of each object below
     /// it.
     pub allocated_bytes: Bytes,
+    /// The private allocated bytes of the unit, or the cause that they are
+    /// unavailable. An unavailable value is not zero.
+    pub private_allocated_bytes: PrivateBytes,
     /// The number of names below the unit that are regular files.
     pub files: EntryCount,
     /// The number of names below the unit that are directories.

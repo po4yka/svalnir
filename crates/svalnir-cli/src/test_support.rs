@@ -602,6 +602,9 @@ pub(crate) fn scan_result(partial: bool) -> ScanResult {
             compressed_files: EntryCount::new(0),
             files_allocated_below_logical: EntryCount::new(0),
         },
+        private_allocation: svalnir_agent::scan::PrivateAllocation::unavailable(
+            svalnir_agent::scan::PrivateSizeUnavailable::NotReported,
+        ),
         largest_files,
         largest_directories: vec![LargeDirectory {
             path: path(b"/data/project/build"),

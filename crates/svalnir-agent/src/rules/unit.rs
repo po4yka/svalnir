@@ -37,8 +37,8 @@ use super::model::{
 };
 use crate::platform::volume::{Locality, MountTable};
 use crate::scan::{
-    CancellationToken, EntryKind, EntryRecord, RegionCause, ScanCompletion, ScanError, ScanLimits,
-    ScanObserver, ScanRequest, ScanResult, run_scan,
+    CancellationToken, EntryKind, EntryRecord, PrivateBytes, RegionCause, ScanCompletion,
+    ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, run_scan,
 };
 
 /// The number of bytes of one block of `st_blocks`.
@@ -850,6 +850,21 @@ impl FinishedScan<'_> {
         }
 
         let totals = result.totals;
+        let private: PrivateBytes = result.private_allocation.bytes;
+        let estimate: ReclaimEstimate = match private.value() {
+            Some(bytes) => ReclaimEstimate {
+                bytes,
+                measure: SizeMeasure::PrivateAllocatedBytes,
+                exclusive_storage_known: false,
+                files_allocated_below_logical: result.shared_storage.files_allocated_below_logical,
+            },
+            None => ReclaimEstimate {
+                bytes: totals.allocated_bytes,
+                measure: SizeMeasure::AllocatedBytes,
+                exclusive_storage_known: false,
+                files_allocated_below_logical: result.shared_storage.files_allocated_below_logical,
+            },
+        };
         let charge: Option<WorkCharge> = work_bytes
             .zip(unit.allocated)
             .and_then(|(below, own)| below.checked_add(own))
@@ -869,16 +884,12 @@ impl FinishedScan<'_> {
             source: MeasurementSource::Scanned,
             logical_bytes: totals.logical_bytes,
             allocated_bytes: totals.allocated_bytes,
+            private_allocated_bytes: private,
             files: totals.files,
             directories: totals.directories,
             symlinks: totals.symlinks,
             charge,
-            estimate: ReclaimEstimate {
-                bytes: totals.allocated_bytes,
-                measure: SizeMeasure::AllocatedBytes,
-                exclusive_storage_known: false,
-                files_allocated_below_logical: result.shared_storage.files_allocated_below_logical,
-            },
+            estimate,
             measured_at: result.finished.wall,
         })
     }

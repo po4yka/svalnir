@@ -687,10 +687,13 @@ fn scan_and_report_work_end_to_end_on_a_temporary_directory() {
         assert_eq!(observation["metric_id"], "scan.allocated_bytes");
         assert_eq!(observation["scope"]["kind"], "scan");
         assert_eq!(observation["scope"]["identity_id"], scan_id.as_str());
-        assert_eq!(
-            envelope["result"]["observations"]["exclusive_bytes"]["reason"],
-            "unsupported"
-        );
+        // The temporary directory is on APFS, which reports the private
+        // size, so the exclusive size is the private allocated size.
+        let exclusive = &envelope["result"]["observations"]["exclusive_bytes"];
+        let private = &envelope["result"]["scan"]["private_allocation"]["bytes"];
+        assert_eq!(exclusive["kind"], "estimate");
+        assert_eq!(private["availability"], "available");
+        assert_eq!(exclusive["value"], private["bytes"]);
     }
 
     let report = run_with(

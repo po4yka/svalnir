@@ -446,3 +446,143 @@ pub(super) fn materialization_policy_of_this_thread() -> libc::c_int {
         )
     }
 }
+
+/// The private-size attributes of one regular file, from `getattrlistat`.
+///
+/// Each field is `None` when the volume did not return the attribute.
+/// `docs/RESOURCE_MODEL.md` section 8 defines how the scan uses them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct PrivateAttributes {
+    /// `ATTR_CMN_FILEID`, which is `st_ino` on APFS.
+    pub(super) file_id: Option<u64>,
+    /// `ATTR_CMNEXT_PRIVATESIZE`: the bytes that only this file uses. The
+    /// value can be negative; the caller validates it.
+    pub(super) private_size: Option<i64>,
+    /// `ATTR_CMNEXT_CLONEID`: the identity of the clone family.
+    pub(super) clone_id: Option<u64>,
+    /// `ATTR_CMNEXT_CLONE_REFCNT`: the number of files in the clone family.
+    pub(super) clone_count: Option<u32>,
+}
+
+/// The layout of the attribute buffer and the request constants of
+/// `<sys/attr.h>` in the macOS 27.2 SDK.
+#[cfg(target_os = "macos")]
+mod attributes {
+    use std::mem::{offset_of, size_of};
+
+    /// `ATTR_CMNEXT_CLONE_REFCNT`. The `libc` crate does not have this
+    /// constant.
+    pub(super) const ATTR_CMNEXT_CLONE_REFCNT: libc::attrgroup_t = 0x0000_1000;
+
+    pub(super) const COMMON: libc::attrgroup_t =
+        libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FILEID;
+    pub(super) const FORK: libc::attrgroup_t =
+        libc::ATTR_CMNEXT_PRIVATESIZE | libc::ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT;
+    /// `FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS | FSOPT_ATTR_CMN_EXTENDED`.
+    /// With `FSOPT_PACK_INVAL_ATTRS`, each requested attribute has its
+    /// place in the buffer, and the returned set tells which ones are valid.
+    /// `FSOPT_ATTR_CMN_EXTENDED` makes the fork group carry the `CMNEXT`
+    /// attributes.
+    pub(super) const OPTIONS: libc::c_ulong =
+        (libc::FSOPT_NOFOLLOW | libc::FSOPT_PACK_INVAL_ATTRS | libc::FSOPT_ATTR_CMN_EXTENDED)
+            as libc::c_ulong;
+
+    /// The buffer that the call writes: the length, the returned attribute
+    /// set, then the values in the order of their bits, common group before
+    /// fork group. The kernel aligns each value to 4 bytes, so a 64-bit
+    /// value can be at an offset that is not a multiple of 8.
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    pub(super) struct Buffer {
+        pub(super) length: u32,
+        pub(super) returned: libc::attribute_set_t,
+        pub(super) file_id: u64,
+        pub(super) private_size: libc::off_t,
+        pub(super) clone_id: u64,
+        pub(super) clone_count: u32,
+    }
+
+    // The values of `<sys/attr.h>` and of `getattrlist(2)` in the SDK.
+    const _: () = assert!(libc::ATTR_BIT_MAP_COUNT == 5);
+    const _: () = assert!(libc::ATTR_CMN_RETURNED_ATTRS == 0x8000_0000);
+    const _: () = assert!(libc::ATTR_CMN_FILEID == 0x0200_0000);
+    const _: () = assert!(libc::ATTR_CMNEXT_PRIVATESIZE == 0x0000_0008);
+    const _: () = assert!(libc::ATTR_CMNEXT_CLONEID == 0x0000_0100);
+    const _: () = assert!(libc::FSOPT_NOFOLLOW == 0x0000_0001);
+    const _: () = assert!(libc::FSOPT_PACK_INVAL_ATTRS == 0x0000_0008);
+    const _: () = assert!(libc::FSOPT_ATTR_CMN_EXTENDED == 0x0000_0020);
+    const _: () = assert!(size_of::<libc::attrlist>() == 24);
+    const _: () = assert!(size_of::<libc::attribute_set_t>() == 20);
+    const _: () = assert!(size_of::<libc::off_t>() == 8);
+    const _: () = assert!(offset_of!(Buffer, returned) == 4);
+    const _: () = assert!(offset_of!(Buffer, file_id) == 24);
+    const _: () = assert!(offset_of!(Buffer, private_size) == 32);
+    const _: () = assert!(offset_of!(Buffer, clone_id) == 40);
+    const _: () = assert!(offset_of!(Buffer, clone_count) == 48);
+    const _: () = assert!(size_of::<Buffer>() == 52);
+}
+
+/// Reads the private-size attributes of the regular file `name` of the
+/// open directory `parent`. The call does not follow a symbolic link.
+#[cfg(target_os = "macos")]
+pub(super) fn private_attributes(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+) -> io::Result<PrivateAttributes> {
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: attributes::COMMON,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: attributes::FORK,
+    };
+    let mut buffer: MaybeUninit<attributes::Buffer> = MaybeUninit::zeroed();
+    // SAFETY: `parent` is open for the call, `name` is a NUL-terminated
+    // string that lives for the call, `request` is a valid `attrlist` for
+    // the call, and `buffer` is valid for a write of its full size, which
+    // is the size that the call gets. The call keeps no pointer after it
+    // returns.
+    let status: libc::c_int = unsafe {
+        libc::getattrlistat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            (&raw mut request).cast(),
+            buffer.as_mut_ptr().cast(),
+            size_of::<attributes::Buffer>(),
+            attributes::OPTIONS,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the buffer was made with `zeroed`, and each field is an
+    // integer, for which zero is a valid value. The call wrote at most the
+    // size of the buffer.
+    let buffer: attributes::Buffer = unsafe { buffer.assume_init() };
+    let length: u32 = buffer.length;
+    if usize::try_from(length).ok() != Some(size_of::<attributes::Buffer>()) {
+        // With `FSOPT_PACK_INVAL_ATTRS`, the length is the full layout.
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    let returned: libc::attribute_set_t = buffer.returned;
+    let valid = |group: libc::attrgroup_t, bit: libc::attrgroup_t| group & bit == bit;
+    Ok(PrivateAttributes {
+        file_id: valid(returned.commonattr, libc::ATTR_CMN_FILEID).then_some(buffer.file_id),
+        private_size: valid(returned.forkattr, libc::ATTR_CMNEXT_PRIVATESIZE)
+            .then_some(buffer.private_size),
+        clone_id: valid(returned.forkattr, libc::ATTR_CMNEXT_CLONEID).then_some(buffer.clone_id),
+        clone_count: valid(returned.forkattr, attributes::ATTR_CMNEXT_CLONE_REFCNT)
+            .then_some(buffer.clone_count),
+    })
+}
+
+/// A system that is not macOS reports no private size.
+#[cfg(not(target_os = "macos"))]
+pub(super) fn private_attributes(
+    _parent: BorrowedFd<'_>,
+    _name: &CStr,
+) -> io::Result<PrivateAttributes> {
+    Ok(PrivateAttributes::default())
+}

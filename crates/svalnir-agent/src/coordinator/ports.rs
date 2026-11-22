@@ -162,7 +162,9 @@ pub trait AuthoritySource: Debug {
         _root: &Path,
         _path: &Path,
     ) -> UnitRecheck {
-        if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID {
+        if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID
+            || crate::rules::clear::is_clear_rule(rule.id.as_str())
+        {
             UnitRecheck::Unknown("unit_recheck_unavailable")
         } else {
             UnitRecheck::Passed

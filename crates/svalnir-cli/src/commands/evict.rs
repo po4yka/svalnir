@@ -11,7 +11,10 @@
 //! A rule permits this mode only for a layout whose lifecycle state is
 //! validated for manual action (`docs/CLEANUP_RULES.md` section 2). Each
 //! reviewed rule of this build is `proposed`, so the command refuses each
-//! rule with `rule_mode_not_validated` before it reads a directory.
+//! rule with `rule_mode_not_validated` before it reads a directory. A clear
+//! rule (`docs/CLEANUP_RULES.md` section 12, "Clear rules") also needs the
+//! consent `--include-clear`; with none, the command refuses it with
+//! `clear_consent_required` before that check.
 
 use serde::Serialize;
 use svalnir_agent::journal::OperationJournal;
@@ -163,7 +166,7 @@ pub(crate) struct DiscoveryView {
 }
 
 impl DiscoveryView {
-    fn new(rule: RuleRef, discovery: &EvictionDiscovery) -> Self {
+    pub(crate) fn new(rule: RuleRef, discovery: &EvictionDiscovery) -> Self {
         let lossless = |path: &std::path::PathBuf| LosslessPath::from_path(path).ok();
         let blocked = || {
             discovery
@@ -332,9 +335,14 @@ fn registry_unavailable() -> ErrorBody {
     )
 }
 
-/// The rule revision `name` of the registry, when one of its layouts is
-/// validated for manual eviction.
-fn selected_rule<'a>(registry: &'a ReviewedRules, name: &str) -> Result<&'a Rule, ErrorBody> {
+/// The rule revision of `--rule` of the registry, when one of its layouts
+/// is validated for manual eviction. A clear rule also needs the consent of
+/// `--include-clear`.
+fn selected_rule<'a>(
+    registry: &'a ReviewedRules,
+    arguments: &CleanPlanArgs,
+) -> Result<&'a Rule, ErrorBody> {
+    let name: &str = arguments.rule.as_deref().unwrap_or_default();
     let Some(found) = registry
         .rules()
         .into_iter()
@@ -348,6 +356,17 @@ fn selected_rule<'a>(registry: &'a ReviewedRules, name: &str) -> Result<&'a Rule
         )
         .with_fields(&["rule"]));
     };
+    // A clear rule removes data that a project can use now: the user
+    // consents to it with the flag, before a directory is read.
+    if registry.clear_rule(name).is_some() && !arguments.include_clear {
+        return Err(ErrorBody::new(
+            "clear_consent_required",
+            ErrorFamily::Request,
+            ErrorStage::Arguments,
+            "the rule is a clear rule: it removes the contents of a cache directory of the producer, also data that a project uses now, so the next build downloads it again; give `--include-clear` to consent; the command made no change",
+        )
+        .with_fields(&["rule", "include_clear"]));
+    }
     let validated: bool = found
         .layouts
         .iter()
@@ -595,7 +614,7 @@ pub(crate) fn plan(
         .seams
         .rule_registry()
         .map_err(|_| registry_unavailable())?;
-    let rule: &Rule = selected_rule(&registry, arguments.rule.as_deref().unwrap_or_default())?;
+    let rule: &Rule = selected_rule(&registry, arguments)?;
     let preset: Option<SelectionPreset> = arguments.profile.as_deref().map(preset).transpose()?;
 
     let host: Host = Host::open()?;

@@ -463,8 +463,24 @@ Every entry is currently **proposed**. The first two entries have a discovery in
 | `container.build-cache` | The build cache that the container engine reports, through the owner tool | Inspection and manual owner workflow |
 | `homebrew.cleanup` | The old kegs of the formulae of one Homebrew prefix, through the owner tool | Inspection and manual owner workflow |
 | `git.linked-worktree` | One linked worktree of one identified repository below a directory that the user names | Inspection; a later removal is manual only, never automatic, and needs the preservation of its work |
+| `cargo.registry-cache` | Clear rule: one registry directory of `~/.cargo/registry/cache` or `src` | Inspection and manual eviction with consent; never automatic |
+| `gradle.caches` | Clear rule: one child of `~/.gradle/caches` | Inspection and manual eviction with consent; never automatic |
+| `maven.repository` | Clear rule: one top-level group directory of the local repository with no local install | Inspection and manual eviction with consent; never automatic |
+| `rubygems.cache` | Clear rule: one `.gem` file of the cache of one gem directory | Inspection and manual eviction with consent; never automatic |
+| `deno.remote` | Clear rule: one child of the remote-module cache of Deno | Inspection and manual eviction with consent; never automatic |
+| `deno.npm` | Clear rule: one registry directory of the npm cache of Deno | Inspection and manual eviction with consent; never automatic |
+| `deno.gen` | Clear rule: one child of the emitted-code cache of Deno | Inspection and manual eviction with consent; never automatic |
+| `nuget.packages` | Clear rule: one package directory of the global packages of NuGet | Inspection and manual eviction with consent; never automatic |
+| `nuget.http-cache` | Clear rule: one child of the HTTP cache of NuGet | Inspection and manual eviction with consent; never automatic |
+| `swiftpm.cache` | Clear rule: one child of the shared cache of Swift Package Manager | Inspection and manual eviction with consent; never automatic |
+| `zig.global-cache` | Clear rule: one child of the global cache of Zig | Inspection and manual eviction with consent; never automatic |
+| `hex.packages` | Clear rule: one repository directory of the package cache of Hex | Inspection and manual eviction with consent; never automatic |
+| `rebar3.hex` | Clear rule: one child of the Hex cache of rebar3 | Inspection and manual eviction with consent; never automatic |
+| `bun.cache` | Clear rule: one package directory of the install cache of Bun | Inspection and manual eviction with consent; never automatic |
 
 The six entries from `pnpm.content-store` to `cocoapods.cache` are package and build caches of the same class as `npm.content-cache` (owner decision of 2026-11-20). They widen the developer coverage of the first release. Each one stays `proposed` until it has its own promotion evidence (section 15).
+
+The fourteen entries from `cargo.registry-cache` to `bun.cache` are the clear rules of section 12 (owner decision of 2026-11-22). Each one has a declaration with the inspection mode and the manual eviction, and no automatic mode, with an inspection and a discovery for a manual eviction in `svalnir-agent` (`rules::clear`). A clear rule removes data that a project can use now, so a plan of it needs the explicit consent `--include-clear`. Its layout is `proposed`, so the `evict` mode refuses it in a released build; a test build with a fixture lifecycle state gives it at most `manual_action_validated`.
 
 The registry deliberately omits a universal “all application caches” rule. More adapters can be added when their ownership, lifecycle, and concurrency contracts are known.
 
@@ -798,6 +814,50 @@ CocoaPods documents `pod cache list` and `pod cache clean` for its download cach
 Discovery must resolve the cache of the specific CocoaPods installation. The `Pods` directory of a project, `Podfile`, `Podfile.lock`, the spec repositories, and credentials are outside this rule.
 
 Initial support explains and previews the owner workflow. A running `pod` process blocks admission. Eviction may require future downloads and sources that are still available.
+
+### Clear rules
+
+A clear rule is for a producer that has no cleanup command that is safe to run. The rule removes the contents of one cache directory of the producer, also data that a project uses now, so that the next build downloads or makes that data again. The rules are a port of the built-in clear rules of the Plonge project (MIT license) to the eviction path of this specification (owner decision of 2026-11-22). The code is in `svalnir-agent` (`rules::clear`).
+
+**Mode.** A clear rule is manual only. Its declaration has the modes `inspection` and `manual_eviction`, and no automatic mode. These items enforce it:
+
+- The discovery for an eviction examines a clear rule only for a manual eviction, and never for known candidates, which only an automatic operation gives.
+- `automatic_roots` approves no root of a clear rule.
+- A fixture lifecycle state of a test build gives a clear rule at most `manual_action_validated`.
+- The registry refuses the mode `automatic_eviction` for each layout of the rule, because the declaration does not have the mode, so the controller of the agent treats each candidate of the rule as not ready.
+
+The user gives an explicit consent: `clean plan --mode evict --rule RULE --include-clear` ([INTERFACES.md](INTERFACES.md) section 4). With no `--include-clear`, the command refuses the rule before it reads a directory. The MCP server gives no `--include-clear`, so it cannot plan a clear rule. Each layout is `proposed`, so a released build refuses the `evict` mode for each clear rule. A layout leaves `proposed` only with a promotion record (section 15, [VALIDATION.md](VALIDATION.md) section 13, "Host procedure for the clear rules").
+
+**Roots.** The root of a rule is the cache directory whose contents the rule removes. The root comes from the documented default location of the producer below the home directory. For `maven.repository`, the one element `localRepository` of `~/.m2/settings.xml` replaces the default. The rule reads that file as text, to 256 KiB, with no XML comment. It replaces `${user.home}` with the home directory. The rule refuses a value with another property or with an entity, a relative value, a value with a `.` or `..` component, a value that is not below the home directory, and a file with two elements. A refused value gives no root, with a stable reason, for example `configuration_outside_home`. The rule runs no producer tool (`zig env`, `gem env`, `deno info --json`, `dotnet nuget locals`), and it reads no environment variable, because the environment of the agent or of a client is not the shell of the user. Thus a location that only an environment variable or a command-line option moves is not covered: `CARGO_HOME`, `GRADLE_USER_HOME`, `MAVEN_OPTS` and `.mvn/maven.config`, `DENO_DIR`, `NUGET_PACKAGES` and `globalPackagesFolder` of `NuGet.Config`, `ZIG_GLOBAL_CACHE_DIR`, `HEX_HOME` and `MIX_XDG`, `REBAR_CACHE_DIR`, and `BUN_INSTALL_CACHE_DIR` and `bunfig.toml`. A component `*` of a default location stands for each directory at that place, in name order, to 32 roots. A directory whose name starts with `.` and a symbolic link are not expanded. A discovery that stops at the bound is not complete.
+
+**Units.** A unit is one child of a root. The root itself is never a unit, so the directory stays and only its contents go. This gives each unit its own charge and its own step, and the budget of a candidate (50 GiB and 2 000 000 entries) bounds each removal. A child that the rule keeps is a skipped unit with `protected_data`. A symbolic link at the place of a unit is skipped with `symbolic_link`. Below a directory unit, the executor removes a symbolic link and does not follow it. A file unit with more than one link is skipped with `hard_linked`. The measurement and the executor refuse a unit that holds a Git repository at any depth (section 6, "Repositories in a unit"). A unit that has a file of a refused name at any depth is skipped with `protected_data`.
+
+**Checks.** The use check of section 6 applies to each unit. A process of the user whose executable has a name of the rule blocks each unit (`active_producer`) and each step. A unit with a change in the last hour (the minimum age; the quiescence is 10 minutes) is blocked with `retention_not_elapsed`: a download can be in progress. Before each step, the coordinator makes the use check again, reads the producer processes again, and makes the check of the unit again: the unit must still be a child of its root that the rule does not keep, with the form of the rule and the owner of the user, and no file of a refused name may be below it (`protected_child`). The walk of that check follows no symbolic link, does not enter another device, and reads at most 2 000 000 entries; a walk that stops gives `protected_child_unknown`. A unit that is gone is already absent.
+
+| Rule ID | Default root (below the home directory) | Unit | Kept, refused, or not covered | Producer executables |
+| --- | --- | --- | --- | --- |
+| `cargo.registry-cache` | `.cargo/registry/cache`, `.cargo/registry/src` | One registry directory | `registry/index`, `~/.cargo/git` (its checkouts can hold work), `~/.cargo/bin`, the configuration and the credentials stay | `cargo`, `rustc` |
+| `gradle.caches` | `.gradle/caches` | One child (a cache family, a version directory, or `user-id.txt`) | `gradle.properties` (it can hold credentials), `init.d`, `wrapper/dists`, `jdks`, `daemon`, and `native` stay | `java` |
+| `maven.repository` | `.m2/repository`, or `localRepository` of `.m2/settings.xml` | One top-level group directory | A group with `maven-metadata-local.xml` at any depth is refused; `settings.xml`, `settings-security.xml`, `toolchains.xml`, and `extensions.xml` stay | `java` |
+| `rubygems.cache` | `.gem/ruby/*/cache`, `.local/share/gem/ruby/*/cache`, `.rbenv/versions/*/lib/ruby/gems/*/cache`, `.asdf/installs/ruby/*/lib/ruby/gems/*/cache`, `.local/share/mise/installs/ruby/*/lib/ruby/gems/*/cache` | One `.gem` file | `bundler` (the bare clones of the Git sources of Bundler) and each child that is not a `.gem` file stay; the installed gems are outside the root | `ruby` |
+| `deno.remote` | `Library/Caches/deno/remote`, `Library/Caches/deno/deps` | One child | `location_data` (localStorage and the Cache API data), `deno_history.txt` (the REPL history), and each other entry of the Deno directory are outside the root | `deno` |
+| `deno.npm` | `Library/Caches/deno/npm` | One registry directory | As `deno.remote` | `deno` |
+| `deno.gen` | `Library/Caches/deno/gen` | One child | As `deno.remote` | `deno` |
+| `nuget.packages` | `.nuget/packages` | One package directory | `NuGet.Config` and the other folders of `~/.nuget` are outside the root | `dotnet` |
+| `nuget.http-cache` | `.local/share/NuGet/http-cache`, `.local/share/NuGet/v3-cache` | One child | The global packages are outside the root | `dotnet` |
+| `swiftpm.cache` | `Library/Caches/org.swift.swiftpm` | One child | `artifacts` and `prebuilts` stay; `repositories` holds bare Git mirrors, which the repository check refuses | `swift-build`, `swift-package`, `swift-frontend`, `xcodebuild`, `Xcode` |
+| `zig.global-cache` | `.cache/zig` | One child (`h`, `o`, `p`, `z`, `tmp`) | The project-local `.zig-cache` directories are outside the root | `zig` |
+| `hex.packages` | `.hex/packages` | One repository directory | `hex.config` (the API key of the user) and the registry cache of `~/.hex` are outside the root | `beam.smp`, `beam` |
+| `rebar3.hex` | `.cache/rebar3/hex` | One child | `bin`, `vsns`, and the global plugins of `~/.cache/rebar3` are outside the root | `beam.smp`, `beam` |
+| `bun.cache` | `.bun/install/cache` | One package directory | `links` (the global link store) stays; `~/.bun/install/global` is outside the root | `bun` |
+
+`java` is the executable of the Gradle daemon and of Maven. The rule cannot tell them from another Java process, so each Java process of the user blocks `gradle.caches` and `maven.repository`. `gradle.caches` is a separate identity from `gradle.cache-inventory`, which stays the inspection and owner-retention family. A unit of `bun.cache` or `deno.npm` that a project links with hard links is refused (`hard_linked`); a unit that a project shares with APFS clones gives an allocated size that is not exclusive storage.
+
+**Regeneration.** Each rule has the rebuild cost of its declaration (`low` for `rubygems.cache`, the three Deno rules, `nuget.http-cache`, `hex.packages`, `rebar3.hex`, and `bun.cache`; `medium` for the others). After a removal, the next build or install downloads each removed item again and needs a registry, a feed, or a server that still has it. An offline build (`cargo build --offline`, `mvn -o`, `deno --cached-only`, `HEX_OFFLINE`) fails for an item that is gone. `bundle cache` without `--all-platforms` fails for a gem whose `.gem` copy is gone. `gradle.caches` also empties the local build cache, so the next build runs each task. `deno.gen` and `zig.global-cache` make their output again with no download for the content of a project.
+
+**Not confirmed.** The default locations come from the documentation of each producer and from the Plonge rules. No host run confirmed them. The macOS default of the HTTP cache of NuGet (`http-cache` or `v3-cache`) and the macOS default of the global cache of Zig (`~/.cache/zig`) are the least certain. A promotion record must confirm each root and each layout on a host (section 15).
+
+**Required evidence:** The record of the host procedure of [VALIDATION.md](VALIDATION.md) section 13 for each rule: the default root and the configured root of each version of each producer under test, the regeneration of each removed item with that version, and each guard of this section.
 
 ## 13. Preview and explainability
 

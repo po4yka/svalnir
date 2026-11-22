@@ -174,15 +174,17 @@ fn the_registry_has_thirteen_rules_and_each_layout_is_proposed() {
     let rules = registry.rules();
     // The two rules of Milestone 2, the six cache rules,
     // `project.dependency-directory`, and the three rules of the owner
-    // tools, and `git.linked-worktree`.
-    assert_eq!(rules.len(), 13);
+    // tools, and `git.linked-worktree`, and the clear rules.
+    let clear: usize = super::clear::CLEAR_SPECS.len();
+    assert_eq!(rules.len(), 13 + clear);
     let statuses = registry.statuses();
     // One layout for each of the two rules, two for `pnpm.content-store`
     // and for `yarn.cache`, one for each other cache rule, 32 for
     // `project.dependency-directory` (the catalog and `user-configured`),
     // two for `simulator.devices` and for `container.build-cache`, and one
     // for `homebrew.cleanup` and for `git.linked-worktree`.
-    assert_eq!(statuses.len(), 48);
+    // A clear rule has one layout.
+    assert_eq!(statuses.len(), 48 + clear);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);

@@ -14,6 +14,7 @@ use svalnir_agent::protection::ProtectedLocations;
 use svalnir_agent::rules::caches::{
     CacheInspection, InspectionHost, InspectionLimits, RootOutcome, UnitOutcome,
 };
+use svalnir_agent::rules::clear::{ClearRootEntry, RootSource as ClearRootSource};
 use svalnir_agent::rules::git::{GitTool, GitToolProblem};
 use svalnir_agent::rules::projects::{
     ArgumentRootError, ClaudeTranscripts, EnvironmentEvidence, GitHeadActivity, MiseDiscovery,
@@ -23,13 +24,18 @@ use svalnir_agent::rules::projects::{
     tracked_projects,
 };
 use svalnir_agent::rules::worktrees::{WorktreeHost, WorktreeInspection, WorktreeLimits};
-use svalnir_agent::rules::{DiscoveryHost, ReviewedRules, SharedEnvironment};
+use svalnir_agent::rules::{
+    DiscoveryHost, DiscoveryLimits, EvictionDiscovery, EvictionRequest, ReviewedRules,
+    SharedEnvironment, SkipReason,
+};
 use svalnir_agent::scan::CancellationToken;
 use svalnir_core::config::ValidatedConfig;
+use svalnir_core::file::LosslessPath;
 use svalnir_core::process::Uid;
-use svalnir_core::rule::RuleRegistry as _;
+use svalnir_core::rule::{RuleMode, RuleRegistry as _};
 
 use super::config::{self, Proposal};
+use super::evict::DiscoveryView;
 use super::session;
 use super::{CommandFailure, Invocation};
 use crate::cli::{CleanInspectArgs, ProjectRootArgs, ProposalOption};
@@ -68,7 +74,27 @@ pub(crate) fn check_plan_options(arguments: &crate::cli::CleanPlanArgs) -> Resul
     if project_options && !project_rule {
         return Err(option_not_accepted());
     }
+    let clear_rule: bool = arguments.mode == crate::cli::CleanMode::Evict
+        && arguments
+            .rule
+            .as_deref()
+            .is_some_and(svalnir_agent::rules::clear::is_clear_rule);
+    if arguments.include_clear && !clear_rule {
+        return Err(clear_option_not_accepted());
+    }
     Ok(())
+}
+
+/// The error of `--include-clear` with a mode or a rule that does not take
+/// it.
+pub(crate) fn clear_option_not_accepted() -> ErrorBody {
+    ErrorBody::new(
+        "option_not_accepted",
+        ErrorFamily::Request,
+        ErrorStage::Arguments,
+        "`--include-clear` is an option of `--mode evict` with a clear rule only; the command made no change",
+    )
+    .with_fields(&["include_clear"])
 }
 
 fn search_root_error(error: ArgumentRootError, path: &Path) -> ErrorBody {
@@ -222,10 +248,137 @@ struct InspectView {
     projects: Option<ProjectInspection>,
     cache: Option<CacheInspection>,
     worktrees: Option<WorktreeInspection>,
+    /// The inspection of a clear rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear: Option<ClearInspectView>,
     note: &'static str,
 }
 
+/// The largest number of units that the inspection of a clear rule lists.
+const CLEAR_UNIT_LIMIT: usize = 64;
+
+/// One unit of a clear rule that the discovery found.
+#[derive(Debug, Clone, Serialize)]
+struct ClearUnitView {
+    path: LosslessPath,
+    allocated_bytes: u64,
+    /// The reasons that the unit is not eligible now. Empty for a unit
+    /// that each check accepts.
+    blockers: Vec<SkipReason>,
+}
+
+/// The inspection of a clear rule (`docs/CLEANUP_RULES.md` section 12,
+/// "Clear rules").
+#[derive(Debug, Clone, Serialize)]
+struct ClearInspectView {
+    /// Each root of the rule on this host, with its source.
+    resolved_roots: Vec<ClearRootEntry>,
+    /// The units that the discovery found, to 64.
+    units: Vec<ClearUnitView>,
+    /// The number of units that are not in `units`.
+    units_omitted: usize,
+    /// The sum of the allocated bytes of the units with no blocker. It is
+    /// not exclusive storage.
+    eligible_allocated_bytes: u64,
+    /// The discovery of the roots, as `clean plan --mode evict` reports it.
+    discovery: DiscoveryView,
+    /// The data that the rule keeps.
+    kept: &'static str,
+    /// The consequence of a removal.
+    regeneration: &'static str,
+}
+
+impl ClearInspectView {
+    fn new(
+        rule: &svalnir_agent::rules::clear::ClearRule,
+        discovery: &EvictionDiscovery,
+        resolved_roots: Vec<ClearRootEntry>,
+    ) -> Self {
+        let units: Vec<ClearUnitView> = discovery
+            .candidates
+            .iter()
+            .map(|candidate| ClearUnitView {
+                path: candidate.candidate.candidate.path.clone(),
+                allocated_bytes: candidate.discovered.measurement.allocated_bytes.get(),
+                blockers: candidate.discovered.blockers.clone(),
+            })
+            .collect();
+        let eligible_allocated_bytes: u64 = units
+            .iter()
+            .filter(|unit| unit.blockers.is_empty())
+            .fold(0_u64, |sum, unit| sum.saturating_add(unit.allocated_bytes));
+        let units_omitted: usize = units.len().saturating_sub(CLEAR_UNIT_LIMIT);
+        Self {
+            resolved_roots,
+            units: units.into_iter().take(CLEAR_UNIT_LIMIT).collect(),
+            units_omitted,
+            eligible_allocated_bytes,
+            discovery: DiscoveryView::new(rule.rule().reference.clone(), discovery),
+            kept: rule.spec().kept,
+            regeneration: rule.spec().regeneration,
+        }
+    }
+
+    fn render(&self, out: &mut String) {
+        for root in &self.resolved_roots {
+            let source: String = match &root.source {
+                ClearRootSource::Default { pattern } => format!("default {pattern}"),
+                ClearRootSource::Configuration { file } => format!("configuration {file}"),
+            };
+            match (&root.path, root.problem) {
+                (Some(path), _) => {
+                    put_line!(out, "  Root: {}   from {source}", path.display());
+                }
+                (None, problem) => put_line!(
+                    out,
+                    "  Root: (not resolved)   from {source}: {}",
+                    problem.unwrap_or("root_not_resolved")
+                ),
+            }
+        }
+        for unit in &self.units {
+            if unit.blockers.is_empty() {
+                put_line!(
+                    out,
+                    "  Unit: {}   {} allocated",
+                    unit.path.display_label(),
+                    human_bytes(unit.allocated_bytes)
+                );
+            } else {
+                let reasons: Vec<String> = unit
+                    .blockers
+                    .iter()
+                    .filter_map(|reason| {
+                        serde_json::to_value(reason)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                    })
+                    .collect();
+                put_line!(
+                    out,
+                    "  Unit: {}   not eligible now: {}",
+                    unit.path.display_label(),
+                    reasons.join(", ")
+                );
+            }
+        }
+        if self.units_omitted > 0 {
+            put_line!(out, "  ... and {} more units", self.units_omitted);
+        }
+        put_line!(
+            out,
+            "  Eligible now: {} allocated (not exclusive storage)",
+            human_bytes(self.eligible_allocated_bytes)
+        );
+        put_line!(out, "  Kept: {}", self.kept);
+        put_line!(out, "  After a removal: {}", self.regeneration);
+        self.discovery.render(out);
+    }
+}
+
 const NOTE: &str = "An inspection gives no candidate and removes nothing. Each layout of this build is `proposed`.";
+
+const CLEAR_NOTE: &str = "An inspection gives no authority and removes nothing. A clear rule is manual only: `clean plan --mode evict --include-clear` plans its units when its layout is validated. Each layout of this build is `proposed`.";
 
 fn source_label(source: &RootSource) -> String {
     match source {
@@ -344,6 +497,9 @@ impl InspectView {
             }
             put_line!(out, "  Owner workflow: {}", inspection.owner_workflow);
         }
+        if let Some(inspection) = &self.clear {
+            inspection.render(&mut out);
+        }
         if let Some(inspection) = &self.worktrees {
             render_roots(&mut out, &inspection.roots);
             for repository in &inspection.repositories {
@@ -418,6 +574,35 @@ impl InspectContext<'_> {
         Ok((inspection, roots.mise))
     }
 
+    /// The inspection of the clear rule `rule`: the discovery of its roots,
+    /// whatever its lifecycle state, with no consent and no plan.
+    fn clear(&self, rule: &str) -> Result<ClearInspectView, ErrorBody> {
+        let request: EvictionRequest<'_> = EvictionRequest {
+            host: self.host,
+            purpose: &RuleMode::Inspection,
+            rules: None,
+            volumes: None,
+            known: None,
+            limits: DiscoveryLimits::default(),
+            cancel: self.cancel,
+            projects: None,
+        };
+        let found = self
+            .registry
+            .clear_rule(rule)
+            .zip(
+                self.registry
+                    .inspect_clear(rule, &request, self.evidence.as_ref()),
+            );
+        let Some((clear, (discovery, roots))) = found else {
+            return Err(rule_error(
+                "inspection_not_available",
+                "this build has no inspection for this clear rule; the command made no change",
+            ));
+        };
+        Ok(ClearInspectView::new(clear, &discovery, roots))
+    }
+
     /// The inspection of `git.linked-worktree`. The rule has search roots
     /// only: a project root of mise is not walked for it.
     fn worktrees(&self, arguments: &ProjectRootArgs) -> Result<WorktreeInspection, ErrorBody> {
@@ -490,6 +675,7 @@ pub(crate) fn inspect(
         projects: None,
         cache: None,
         worktrees: None,
+        clear: None,
         note: NOTE,
     };
     if rule == PROJECT_RULE_ID {
@@ -514,6 +700,13 @@ pub(crate) fn inspect(
             &cancel,
             evidence.as_ref(),
         ));
+    } else if registry.clear_rule(rule).is_some() {
+        if !arguments.projects.roots.is_empty() || arguments.projects.no_mise {
+            return Err(option_not_accepted().into());
+        }
+        view.kind = "clear";
+        view.clear = Some(context.clear(rule)?);
+        view.note = CLEAR_NOTE;
     } else if registry
         .rules()
         .iter()
@@ -521,7 +714,7 @@ pub(crate) fn inspect(
     {
         return Err(rule_error(
             "inspection_not_available",
-            "this build has no `clean inspect` for this rule: it inspects `project.dependency-directory`, `git.linked-worktree`, and the six cache rules; the command made no change",
+            "this build has no `clean inspect` for this rule: it inspects `project.dependency-directory`, `git.linked-worktree`, the six cache rules, and the clear rules; the command made no change",
         )
         .into());
     } else {

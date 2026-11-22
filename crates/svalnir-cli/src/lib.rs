@@ -44,6 +44,9 @@ mod text;
 
 #[cfg(test)]
 #[cfg(target_os = "macos")]
+mod clear_evict_tests;
+#[cfg(test)]
+#[cfg(target_os = "macos")]
 mod evict_tests;
 #[cfg(test)]
 #[cfg(target_os = "macos")]

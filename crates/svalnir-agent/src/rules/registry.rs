@@ -13,6 +13,9 @@
 //! exists for a rule. The registry has no function that changes a
 //! lifecycle state: a promotion is a new declaration with a reference to
 //! its recorded evidence, in a new build.
+//!
+//! The registry also has the clear rules of [`super::clear`]: each one has
+//! the inspection mode and the manual eviction, and no automatic mode.
 
 use svalnir_core::policy::MAX_CLEANUP_CANDIDATES;
 use svalnir_core::rule::{
@@ -21,6 +24,7 @@ use svalnir_core::rule::{
 use thiserror::Error;
 
 use super::caches::{CacheRule, cache_rules};
+use super::clear::{ClearRule, ClearRules};
 use super::expired_temporary::ExpiredTemporaryRule;
 use super::model::DiscoveredCandidate;
 use super::overlap::{OverlapResolution, resolve_overlaps};
@@ -95,6 +99,7 @@ pub struct ReviewedRules {
     projects: ProjectRule,
     owner_tools: OwnerToolRules,
     worktrees: WorktreeRule,
+    clear: ClearRules,
 }
 
 impl ReviewedRules {
@@ -113,6 +118,7 @@ impl ReviewedRules {
             projects: ProjectRule::new()?,
             owner_tools: OwnerToolRules::new()?,
             worktrees: WorktreeRule::new()?,
+            clear: ClearRules::new()?,
         })
     }
 
@@ -132,6 +138,7 @@ impl ReviewedRules {
     /// removal under one of them, also in a test build.
     /// `project.dependency-directory` gets at most
     /// [`LifecycleState::ManualActionValidated`]: it has no automatic mode.
+    /// Each clear rule of [`super::clear`] has the same limit.
     ///
     /// # Errors
     ///
@@ -147,6 +154,7 @@ impl ReviewedRules {
             projects: registry.projects.with_lifecycle(lifecycle)?,
             owner_tools: registry.owner_tools,
             worktrees: registry.worktrees,
+            clear: registry.clear.with_lifecycle(lifecycle)?,
         })
     }
 
@@ -189,6 +197,17 @@ impl ReviewedRules {
     /// The rule `git.linked-worktree`. It has the inspection mode only.
     pub fn worktrees(&self) -> &WorktreeRule {
         &self.worktrees
+    }
+
+    /// The clear rules ([`super::clear`]). Each one has the inspection mode
+    /// and the manual eviction, and no automatic mode.
+    pub fn clear(&self) -> &ClearRules {
+        &self.clear
+    }
+
+    /// The clear rule with the identity `id`.
+    pub fn clear_rule(&self, id: &str) -> Option<&ClearRule> {
+        self.clear.get(id)
     }
 
     /// The exact revision `reference`.
@@ -294,6 +313,7 @@ impl RuleRegistry for ReviewedRules {
         rules.push(self.projects.rule());
         rules.extend(self.owner_tools.rules());
         rules.push(self.worktrees.rule());
+        rules.extend(self.clear.rules());
         rules
     }
 }

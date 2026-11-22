@@ -33,6 +33,15 @@
 //! They give no candidate, and the discovery for an eviction does not
 //! examine them.
 //!
+//! # Clear rules
+//!
+//! The rules of [`clear`] remove the contents of one cache directory of a
+//! producer that has no safe cleanup command, also data that a project
+//! uses now. Each one has the inspection mode and the manual eviction
+//! only: the discovery for an eviction examines it for a manual eviction
+//! and never for an automatic one, and a client plans it only with the
+//! explicit consent of the user.
+//!
 //! # Discovery for an eviction
 //!
 //! [`ReviewedRules::discover_for_eviction`] does steps 2 to 4 for the
@@ -59,6 +68,8 @@
 
 #[cfg(unix)]
 pub mod caches;
+#[cfg(unix)]
+pub mod clear;
 #[cfg(unix)]
 mod eviction;
 #[cfg(unix)]
@@ -105,7 +116,8 @@ mod tests;
 pub use eviction::{
     BoundRoot, DiscoveryEnvironment, DiscoveryHost, EvictionCandidate, EvictionDiscovery,
     EvictionRequest, ProducerActivity, RootProblem, RootReport, RootResult, SharedEnvironment,
-    SourceEnvironment, automatic_roots, bind_root, resolve_roots, root_id_of, xcode_evidence,
+    SourceEnvironment, automatic_roots, bind_root, producer_processes, resolve_roots, root_id_of,
+    xcode_evidence,
 };
 #[cfg(unix)]
 pub use expired_temporary::{

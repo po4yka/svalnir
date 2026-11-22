@@ -311,6 +311,12 @@ pub struct CleanPlanArgs {
     /// Reviewed cleanup rule. Only the `evict` mode accepts it, and requires it.
     #[arg(long, value_name = "RULE_ID", required_if_eq("mode", "evict"))]
     pub rule: Option<String>,
+    /// Consent to a clear rule: the plan removes the contents of a cache
+    /// directory of the producer, also data that a project uses now. Only
+    /// the `evict` mode with a clear rule accepts it, and a clear rule
+    /// requires it.
+    #[arg(long)]
+    pub include_clear: bool,
     /// An entry of the saved scan to select, by its exact path. Repeat it
     /// for each entry. With none, the `trash` and `permanent` modes list the
     /// candidates of the scan and make no plan. The `evict` mode takes no

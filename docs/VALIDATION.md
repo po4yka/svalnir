@@ -492,6 +492,38 @@ The rule has no automatic mode, so the last stage of a record is `manual_action_
 
 The procedure makes no automatic operation: the rule has none. A layout, a tool version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
 
+### Host procedure for the clear rules
+
+The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules") have no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/RULE/r1/LAYOUT/manual`, one record for each rule). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects. The procedure removes the caches of that account, so the account must have no work that needs them offline. A rule whose producer is not installed on the host is `not_run`.
+
+**Preparation**
+
+1. Log in as the validation user. Record `sw_vers`, `diskutil info /System/Volumes/Data`, `git rev-parse HEAD`, and the version of each producer under test (`cargo --version`, `gradle --version`, `mvn --version`, `ruby --version` and `gem --version`, `deno --version`, `dotnet --version`, `swift --version`, `zig version`, `mix hex.info`, `rebar3 version`, `bun --version`).
+2. On a branch, set the lifecycle state of the layouts under validation in `crates/svalnir-agent/src/rules/clear/mod.rs` to `manual_action_validated`, with the `record_id` as the reference. Run `scripts/check.sh`, record its exit status, and build with `cargo build --release --locked`.
+3. `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`, then `svalnir config apply --config ./config.toml --expected-revision none` with `schema_version = 1`.
+4. For each producer, make a disposable project below `~/Validation` and run its fetch or build command (for example `cargo fetch`, `gradle build`, `mvn package`, `bundle install`, `deno cache`, `dotnet restore`, `swift package resolve`, `zig build`, `mix deps.get`, `rebar3 get-deps`, `bun install`) so that the producer fills its cache. Record each cache root that the producer reports (`gem env gemdir`, `deno info --json`, `dotnet nuget locals all --list`, `zig env`) and compare it with the root of the rule.
+5. Make the guard fixtures: a Git checkout in `~/.cargo/git/checkouts` with an edit; `mvn install` of one project, so that `maven-metadata-local.xml` is in the local repository; a Gemfile with a Git source, so that `cache/bundler/git` has a clone; a script that writes localStorage, so that the Deno directory has `location_data`; and, for `maven.repository`, a second run with `localRepository` in `~/.m2/settings.xml`.
+
+**Inspection**
+
+6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: `resolved_roots` has the root of step 4; each unit has a size; the units of step 5 are not eligible (`protected_data` for `bundler` and for the group of the local install, `nested_repository` for `repositories` of SwiftPM). Keep the output.
+
+**Consent and activity**
+
+7. `svalnir clean plan --mode evict --rule RULE --format json` with no `--include-clear`. Expected: `clear_consent_required`, exit `2`, and no plan.
+8. With a build of the producer in progress, make a plan with `--include-clear`. Expected: each unit is blocked with `active_producer`.
+
+**Manual eviction**
+
+9. Make a plan with `--include-clear`. Expected: one target for each unit that each check accepts, the cleanup root of step 4, `discovery.complete` true, and no target for a unit of step 5.
+10. Check before a step: make a plan of `maven.repository`, then run `mvn install` of a project whose group is a target; `svalnir clean apply --plan PLAN_ID`. Expected: that target is skipped with `protected_child`, and its files stay; each other target is removed.
+11. `svalnir history --format json`. Expected: `permanently_removed` has the count. The root directory of each rule, `~/.cargo/git`, `~/.cargo/bin`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `location_data`, and `deno_history.txt` stay.
+12. Regeneration: run the fetch or build command of each project of step 4 again. Expected: each succeeds with a network and no manual step. Record the time and the downloaded bytes: this is the rebuild cost of the rule. Record the result of an offline build (`cargo build --offline`, `mvn -o package`), which is expected to fail for a removed item.
+
+**Not in this procedure**
+
+The procedure makes no automatic operation: a clear rule has none. A root that an environment variable moves is not covered by the rule, and the procedure does not set one. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
+
 ## 14. Host validation records
 
 This section has the case records of four runs on one host of the project owner. Runs 1 to 3 were made under the owner authorization of 2026-11-19: fixtures only, the `LaunchAgent` of the build installed and removed, and only files that the run made moved to the Trash. That authorization excluded each grant, each enabled guard, and each other application. Run 4 was made under the owner decisions 21 to 24 of 2026-11-20: fixtures only, no service loaded, no host setting changed, and a guard enabled only on a fixture state directory where no agent ran. In each run, no automatic action was possible. The records follow section 12. The fields that each record of a run has are in the block of that run; a record of the table gives the fields that differ. A table also records each case of the run that did not run.

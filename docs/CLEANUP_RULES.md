@@ -162,7 +162,7 @@ A rule establishes predicates 1, 2, 4, 5, 6, 7, and 8. The discovery for an evic
 | --- | --- |
 | 3 | `satisfied` when the catalog of protected file locations (section 5) gives `not_protected` for the unit. The discovery examines only a rule that the request selects (the approved rules of the disk guard, or the rule that the user names), under a root of its declaration. A protected unit gives `not_satisfied`; an unknown protection gives `unknown` |
 | 9 | `satisfied`: the discovery read the root and the mount table. The coordinator reserves the budget, takes the leases, and records the admission before a step, and refuses the plan when one of them is not available |
-| 10 | `satisfied`: the discovery examined the identity, the records, and the activity of the unit in this call. The coordinator reads the activity of the producer again before each step ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7), and the executor compares the object with the plan before its call |
+| 10 | `satisfied`: the discovery examined the identity, the records, and the activity of the unit in this call. The coordinator reads the activity of the producer and makes the use check of section 6 again before each step ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7), and the executor compares the object with the plan before its call |
 
 With no state directory, the hard exclusion of the control-plane state has no path: the discovery examines no rule, and its result is not complete.
 
@@ -181,6 +181,38 @@ Descriptor-relative traversal, no-follow checks, identity comparison, and constr
 Before automatic mutation, the rule must document and test confinement. A deliberately disposable namespace may accept a documented residual race within that confinement; authorization alone does not establish it. An active or adversarial writable namespace without that evidence remains ineligible.
 
 New entries discovered during execution are not silently added to a fixed plan. Unexpected replacement or growth invalidates the affected unit. Any protocol that can select the wrong entry despite its checks must state that residual risk in its promotion evidence.
+
+### Use by a running process
+
+The use check is a part of predicate 6 for each file rule. It is in addition to the producer evidence of the rule; it does not replace that evidence. A unit is in use when a process of the user does one of these:
+
+| Kind of use | Evidence | Serialized value |
+| --- | --- | --- |
+| Open file | A file descriptor of the process refers to a vnode at or below the unit (`proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`) | `open_file` |
+| Mapped file | A memory region of the process maps a file at or below the unit (`proc_pidinfo(PROC_PIDREGIONPATHINFO)`) | `mapped_file` |
+| Working directory | The working directory of the process is at or below the unit (`proc_pidinfo(PROC_PIDVNODEPATHINFO)`) | `working_directory` |
+| Executable | The executable of the process is at or below the unit (`proc_pidpath`) | `executable` |
+| Argument | An argument of the command line names a path at or below the unit (`sysctl` `KERN_PROCARGS2`) | `argument` |
+
+A process of the user is a process whose effective or real user is the user of the discovery. The process that makes the check is not examined. An argument names a path when it is an absolute path, when it has the form `NAME=PATH` with an absolute `PATH`, or when it is a relative path and the working directory of the process is known; a relative path is joined to that working directory. The check does not follow a symbolic link in an argument. The check compares paths by component and ignores the case of ASCII letters, so a difference of case gives a use and not a miss. It compares each path from the kernel with the unit path as the discovery found it, with the unit path with its symbolic links resolved, and with the form of each of them below `/System/Volumes/Data`.
+
+The check reads the arguments in memory only to compare them with the unit paths. It keeps no argument that does not name a path in a scope of the check, and it never stores, logs, or prints a command line. A use record has the PID, the executable name, the kind of use, and the path relative to the unit. It has no other part of the command line.
+
+The check has three results. A unit is `in_use` when the inventory has one use of it, also when the inventory is not complete. A unit is `not_in_use` only when the inventory is complete and has no use of it. In all other cases the use of the unit is unknown, and the unit is not a candidate. The inventory is not complete, and the check fails closed, when one of these is true:
+
+- The process list cannot be read, the list has no process, or the clock gives no time.
+- A query of a process of the user is denied or fails for a cause other than the exit of the process. A process whose identity query is denied and whose owner is a different user is out of the scope.
+- A bound is reached: the number of processes, the file descriptors or the memory regions of one process, the size of the arguments, or the time of the inventory.
+
+The inventory is read one time for each discovery, after the walk of the roots and before the facts of admission, with the bound roots as its scope. The coordinator makes the check again for the unit of each step of an eviction, immediately before the call ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7). A unit that is in use is skipped with the reason `unit_in_use`, and a unit whose use is unknown is skipped with the reason `unit_use_unknown`.
+
+The check has these known blind spots. Each one is a residual risk of each rule that uses the check, and a rule needs other evidence for it:
+
+- A process that starts to use the unit after the check. The check before each step makes the window short; it does not close it.
+- A service that is stopped now and uses the unit when it starts again, and a job that `launchd`, `cron`, or a different scheduler starts at a later time.
+- A process of a different user, and a process whose queries the system denies to the user. The check does not see them.
+- A use with no open descriptor, no mapping, no working directory, no executable, and no argument at the time of the check: for example a tool that opens a file only for a short time, or a path in a configuration file or in an environment variable.
+- An argument that names the unit through a symbolic link, or a path that the kernel cannot give for a vnode.
 
 ## 7. Accounting and budgets
 

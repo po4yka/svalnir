@@ -732,6 +732,10 @@ struct Table {
     list_fails: bool,
     clock_fails: bool,
     processes: BTreeMap<i32, Answers>,
+    /// The answer of the owner query of each PID; no entry is a failure.
+    owners: BTreeMap<i32, Uid>,
+    /// The PIDs whose code is Apple platform code.
+    platform: Vec<i32>,
 }
 
 impl Table {
@@ -783,6 +787,15 @@ impl ProcessSource for Table {
     fn executable_path(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
         let (_, path) = self.processes.get(&pid.get()).ok_or(QueryFailure::Gone)?;
         Ok(LosslessPath::from_bytes((*path)?).unwrap())
+    }
+
+    fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+        let owner: Uid = *self.owners.get(&pid.get()).ok_or(QueryFailure::Failed(5))?;
+        Ok((owner, owner))
+    }
+
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        Ok(self.platform.contains(&pid.get()))
     }
 
     fn file_evidence(&self, _path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
@@ -911,6 +924,44 @@ fn an_inventory_that_is_not_complete_does_not_show_inactivity() {
 }
 
 #[test]
+fn a_denied_process_of_the_user_is_out_of_the_inventory_only_through_the_platform_gate() {
+    let denied = |failure: QueryFailure, path: &'static str, platform: bool| Table {
+        owners: BTreeMap::from([(202, USER)]),
+        platform: if platform { vec![202] } else { Vec::new() },
+        ..shell_and(Table::default()).with_answers(202, Err(failure), Ok(path))
+    };
+    // `login`: Apple platform code on the sealed system volume.
+    assert_eq!(
+        xcode_evidence(
+            &denied(QueryFailure::PermissionDenied, "/usr/bin/login", true),
+            USER
+        )
+        .producer_processes,
+        ProducerProcesses::NotRunning
+    );
+    // With no owner answer, the gate still decides.
+    let no_owner: Table = Table {
+        owners: BTreeMap::new(),
+        ..denied(QueryFailure::PermissionDenied, "/usr/bin/login", true)
+    };
+    assert_eq!(
+        xcode_evidence(&no_owner, USER).producer_processes,
+        ProducerProcesses::NotRunning
+    );
+    // Each other denied process of the user can be the producer.
+    for table in [
+        denied(QueryFailure::PermissionDenied, "/usr/bin/login", false),
+        denied(QueryFailure::PermissionDenied, "/Users/u/bin/tool", true),
+        denied(QueryFailure::AccessDenied, "/usr/bin/login", true),
+    ] {
+        assert_eq!(
+            xcode_evidence(&table, USER).producer_processes,
+            ProducerProcesses::Unknown
+        );
+    }
+}
+
+#[test]
 fn a_process_that_exited_and_a_process_of_a_different_user_keep_the_inventory_complete() {
     let table = shell_and(Table::default())
         .with_answers(200, Err(QueryFailure::Gone), Ok("/usr/bin/true"))
@@ -921,6 +972,11 @@ fn a_process_that_exited_and_a_process_of_a_different_user_keep_the_inventory_co
             Ok("/usr/bin/true"),
         )
         .with_answers(203, Ok(OTHER_USER), Err(QueryFailure::Failed(5)));
+    // The owner query of the denied process gives a different user.
+    let table = Table {
+        owners: BTreeMap::from([(202, OTHER_USER)]),
+        ..table
+    };
     assert_eq!(
         xcode_evidence(&table, USER).producer_processes,
         ProducerProcesses::NotRunning

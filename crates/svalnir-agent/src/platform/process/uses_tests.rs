@@ -101,6 +101,8 @@ struct Table {
     queries: Cell<usize>,
     /// The number of identity queries of each PID.
     identity_queries: RefCell<HashMap<i32, usize>>,
+    /// Whether the entries of `/` can be read.
+    root_readable: bool,
 }
 
 impl Table {
@@ -111,6 +113,7 @@ impl Table {
             clock: true,
             queries: Cell::new(0),
             identity_queries: RefCell::new(HashMap::new()),
+            root_readable: true,
         }
     }
 
@@ -189,6 +192,17 @@ impl ProcessSource for Table {
 
     fn file_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
         Ok(object_of(path.as_bytes()))
+    }
+
+    fn root_entries(&self, _max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+        if self.root_readable {
+            Ok(["Users", "Applications", "private", "System"]
+                .iter()
+                .map(|name| name.as_bytes().to_vec())
+                .collect())
+        } else {
+            Err(QueryFailure::Failed(5))
+        }
     }
 
     /// The synthetic link identity: a different object than the target.
@@ -522,6 +536,46 @@ fn a_path_from_the_kernel_is_evidence_only_when_its_identity_matches() {
     let inventory = collect(&Table::new(vec![agent]));
     assert_eq!(inventory.platform_refused, 0);
     assert_eq!(inventory.unknown.len(), 1);
+}
+
+#[test]
+fn a_path_of_the_cut_length_is_verified_by_its_first_component_and_its_identity() {
+    let with_open = |vnode: RawVnode, root_readable: bool| {
+        let mut entry: Entry = Entry::plain(10);
+        entry.open = Ok(RawPaths {
+            paths: vec![vnode],
+            truncated: false,
+        });
+        let mut table: Table = Table::new(vec![entry]);
+        table.root_readable = root_readable;
+        collect(&table)
+    };
+    // The cut path of the measured host: 266 bytes that start with a
+    // component from the middle. The synthetic file at the text has the
+    // identity of the vnode, so only the first component shows the cut.
+    let cut: String = format!("/{}/node_modules/f", "a".repeat(250));
+    assert!(cut.len() >= super::uses::MIN_CUT_PATH_BYTES && cut.len() < 512);
+    let inventory = with_open(vn(&cut), true);
+    assert_eq!(
+        unknown_reason(&inventory),
+        Some(InventoryGap::PathNotVerified)
+    );
+    // A path of that length below an entry of `/` whose file matches.
+    let complete: String = format!("/Users/u/{}/f", "b".repeat(250));
+    let inventory = with_open(vn(&complete), true);
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
+    // With no list of `/`, no long path is verified.
+    let inventory = with_open(vn(&complete), false);
+    assert_eq!(
+        unknown_reason(&inventory),
+        Some(InventoryGap::PathNotVerified)
+    );
+    // A path shorter than the bound is complete text.
+    let short: String = format!("/{}", "c".repeat(super::uses::MIN_CUT_PATH_BYTES - 2));
+    let mut other: RawVnode = vn(&short);
+    other.vnode.object = object_of(b"different");
+    let inventory = with_open(other, false);
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
 }
 
 #[test]
@@ -915,6 +969,58 @@ mod native {
             .iter()
             .any(|process| u32::try_from(process.pid.get()).is_ok_and(|value| value == pid));
         assert!(used || unknown, "the child is not seen: {inventory:?}");
+    }
+
+    #[test]
+    fn a_child_below_a_longest_name_gives_a_short_cut_path_and_is_never_not_in_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let root: PathBuf = resolved(&directory);
+        // A component of 255 three-byte characters (765 bytes), one of
+        // 250 bytes, and the unit. The shell makes them with relative
+        // steps, holds a file open, and works in the unit.
+        let wide: String = "\u{20ac}".repeat(255);
+        let narrow: String = "a".repeat(250);
+        let script: String = format!(
+            "mkdir {wide} && cd {wide} && mkdir {narrow} && cd {narrow} && mkdir unit && cd unit \
+             && echo x > held && : > \"$0/ready\" && exec /bin/sleep 30 < held"
+        );
+        let child = spawn(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .arg(&root)
+                .current_dir(&root),
+        );
+        let deadline: Instant = Instant::now() + Duration::from_secs(5);
+        while !root.join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(root.join("ready").exists(), "the child made no tree");
+        std::thread::sleep(Duration::from_millis(200));
+        let source: DarwinProcessSource = DarwinProcessSource::new();
+        let pid: svalnir_core::process::Pid =
+            svalnir_core::process::Pid::new(i32::try_from(child.0.id()).unwrap()).unwrap();
+        // The kernel gives a cut path shorter than 512 bytes for the held
+        // file: the case that a bound of 512 bytes trusted.
+        let open = source.open_file_paths(pid, 64).unwrap();
+        let cut: Vec<usize> = open
+            .paths
+            .iter()
+            .filter_map(|vnode| vnode.path.as_ref())
+            .filter(|path| path.as_bytes().ends_with(b"/unit/held"))
+            .map(|path| path.as_bytes().len())
+            .collect();
+        assert!(cut.iter().any(|length| *length < 512), "{cut:?}");
+        let keep = |path: &Path| path.starts_with(&root);
+        let inventory =
+            collect_path_uses(&source, source.effective_uid(), &keep, UseLimits::default());
+        let seen =
+            |list: &[super::super::ProcessUses]| list.iter().any(|process| process.pid == pid);
+        let unknown: bool = inventory.unknown.iter().any(|process| process.pid == pid);
+        assert!(
+            seen(&inventory.processes) || unknown,
+            "the child is not seen: {inventory:?}"
+        );
     }
 
     #[test]

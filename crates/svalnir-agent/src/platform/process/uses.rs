@@ -394,12 +394,37 @@ const MAX_VERIFIED_PATHS: usize = 65_536;
 struct Verifier<'a, S: ProcessSource + ?Sized> {
     source: &'a S,
     known: HashMap<LosslessPath, Vec<FileObjectEvidence>>,
+    /// The entries of `/`, read at the first long path.
+    root_entries: RootEntries,
 }
 
-/// The shortest path from the kernel that is verified. A cut path fills
-/// the buffer of `MAXPATHLEN` (1024) bytes, so a shorter path than half of
-/// it is complete (`docs/CLEANUP_RULES.md` section 6).
-pub(super) const MIN_VERIFIED_PATH_BYTES: usize = 512;
+/// The entries of `/` of one inventory.
+enum RootEntries {
+    /// Not read yet.
+    NotRead,
+    /// The directory cannot be read, so no long path is verified.
+    Unavailable,
+    /// The names of the entries.
+    Read(std::collections::HashSet<Vec<u8>>),
+}
+
+/// `MAXPATHLEN` of `<sys/param.h>`: the buffer of a kernel path.
+const MAXPATHLEN: usize = 1024;
+
+/// The longest name of one component in UTF-8 bytes: 255 UTF-16 units of
+/// three bytes each, the longest that APFS accepted on the measured host.
+const MAX_NAME_BYTES_UTF8: usize = 3 * 255;
+
+/// The shortest path from the kernel that can be cut. The kernel builds a
+/// path from its last component to the root and stops at the first
+/// component that does not fit into the buffer (with its `/` and the final
+/// NUL), so a cut path has at least this length (`docs/CLEANUP_RULES.md`
+/// section 6).
+pub(super) const MIN_CUT_PATH_BYTES: usize = MAXPATHLEN - 1 - (MAX_NAME_BYTES_UTF8 + 1);
+const _: () = assert!(MIN_CUT_PATH_BYTES == 257);
+
+/// The largest number of entries of `/` that an inventory reads.
+const MAX_ROOT_ENTRIES: usize = 4_096;
 
 impl<S: ProcessSource + ?Sized> Verifier<'_, S> {
     /// Whether the path from the kernel is evidence for the vnode
@@ -407,8 +432,27 @@ impl<S: ProcessSource + ?Sized> Verifier<'_, S> {
     /// has that identity, with or without the resolution of a symbolic link
     /// at its end.
     fn matches(&mut self, path: &LosslessPath, object: FileObjectEvidence) -> bool {
-        if path.as_bytes().len() < MIN_VERIFIED_PATH_BYTES {
+        if path.as_bytes().len() < MIN_CUT_PATH_BYTES {
             return true;
+        }
+        // A cut path starts with a component from the middle of the path,
+        // which is not an entry of `/`; such a path is not verified.
+        let first: &[u8] = path
+            .as_bytes()
+            .strip_prefix(b"/")
+            .and_then(|rest| rest.split(|byte| *byte == b'/').next())
+            .unwrap_or_default();
+        if matches!(self.root_entries, RootEntries::NotRead) {
+            self.root_entries = match self.source.root_entries(MAX_ROOT_ENTRIES) {
+                Ok(entries) => RootEntries::Read(entries.into_iter().collect()),
+                Err(_) => RootEntries::Unavailable,
+            };
+        }
+        let RootEntries::Read(entries) = &self.root_entries else {
+            return false;
+        };
+        if !entries.contains(first) {
+            return false;
         }
         if let Some(found) = self.known.get(path) {
             return found.contains(&object);
@@ -464,6 +508,7 @@ pub fn collect_path_uses<S: ProcessSource + ?Sized>(
     let mut verifier: Verifier<'_, S> = Verifier {
         source,
         known: HashMap::new(),
+        root_entries: RootEntries::NotRead,
     };
     let own: u32 = std::process::id();
     let mut seen: usize = 0;
@@ -504,6 +549,21 @@ pub fn collect_path_uses<S: ProcessSource + ?Sized>(
 /// Whether the owner `(effective, real)` is the user.
 fn is_user((effective, real): (Uid, Uid), principal: Uid) -> bool {
     effective == principal || real == principal
+}
+
+/// Whether the process `pid`, whose identity query was refused with
+/// `EPERM`, passes the platform gate of `docs/CLEANUP_RULES.md` section 6:
+/// its executable is on the sealed system volume, and its running code is
+/// an Apple platform binary.
+pub fn refused_process_passes_platform_gate<S: ProcessSource + ?Sized>(
+    source: &S,
+    pid: Pid,
+) -> bool {
+    let executable: Option<PathBuf> = source
+        .executable_path(pid)
+        .ok()
+        .map(|path| path.to_path_buf());
+    passes_platform_gate(source, pid, executable.as_deref())
 }
 
 /// Whether the process passes the platform gate: its executable is on the

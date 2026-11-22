@@ -56,7 +56,9 @@ use super::overlap::{OverlapConflict, OverlapResolution};
 use super::registry::ReviewedRules;
 use super::xcode::{ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XcodeEvidence};
 use crate::executor::fs::{ApprovedRoot, ApprovedRoots};
-use crate::platform::process::{PathInventory, ProcessSource, QueryFailure};
+use crate::platform::process::{
+    PathInventory, ProcessSource, QueryFailure, refused_process_passes_platform_gate,
+};
 use crate::platform::volume::volume_at;
 use crate::protection::ProtectedLocations;
 use crate::scan::{CancellationToken, ScanClock};
@@ -358,12 +360,11 @@ pub fn automatic_roots(
 /// The observation time is the time before the first query, so the
 /// evidence is never newer than its time says.
 ///
-/// A denied identity query gives no owner. The inventory reads it as a
-/// process of a different user, as the process inventory of the memory
-/// guard does: the system denies the query for a process of a different
-/// user. A process of this user whose identity query is denied is thus
-/// not seen. This is a residual risk of the evidence; the lock check of
-/// the build database is the second check of the rule.
+/// For a denied identity query, the owner query decides: a process of a
+/// different user is out of the scope, and a process of the user is out
+/// of the inventory only when it passes the platform gate of
+/// `docs/CLEANUP_RULES.md` section 6. Each other such process makes the
+/// evidence [`ProducerProcesses::Unknown`].
 pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvidence {
     let unknown = |observed_at: MonotonicNanos| XcodeEvidence {
         producer_processes: ProducerProcesses::Unknown,
@@ -382,9 +383,21 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
             Ok(info) => info,
             // A process that exited is not a process of the inventory. A
             // denied identity query is a process of a different user.
-            Err(
-                QueryFailure::Gone | QueryFailure::PermissionDenied | QueryFailure::AccessDenied,
-            ) => continue,
+            Err(QueryFailure::Gone) => continue,
+            // A denied identity query: the owner query decides. A process
+            // of a different user is out of the scope; a process of the
+            // user is out of the inventory only through the platform gate
+            // (`docs/CLEANUP_RULES.md` sections 6 and 11).
+            Err(failure @ (QueryFailure::PermissionDenied | QueryFailure::AccessDenied)) => {
+                match source.process_owner(pid) {
+                    Ok((effective, real)) if effective != principal && real != principal => {}
+                    Err(QueryFailure::Gone) => {}
+                    _ if failure == QueryFailure::PermissionDenied
+                        && refused_process_passes_platform_gate(source, pid) => {}
+                    _ => return unknown(observed_at),
+                }
+                continue;
+            }
             Err(_) => return unknown(observed_at),
         };
         if info.zombie || (info.effective_uid != principal && info.real_uid != principal) {

@@ -101,6 +101,7 @@ pub use source::{
 pub use uses::{
     InventoryGap, MAX_NAME_BYTES, MAX_UNKNOWN_PROCESSES, PathInventory, PathUseKind,
     ProcessPathUse, ProcessUses, UnknownProcess, UseLimits, collect_path_uses,
+    refused_process_passes_platform_gate,
 };
 
 #[cfg(target_os = "macos")]

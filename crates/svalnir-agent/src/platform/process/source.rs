@@ -289,6 +289,19 @@ pub trait ProcessSource {
         Err(QueryFailure::Unsupported)
     }
 
+    /// The names of the entries of `/`, at most `max` of them.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the directory cannot be read or has
+    /// more entries than `max`.
+    fn root_entries(&self, max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+        let _ = max;
+        Err(QueryFailure::Unsupported)
+    }
+
     /// The resource use of the process that has this PID now.
     ///
     /// # Errors

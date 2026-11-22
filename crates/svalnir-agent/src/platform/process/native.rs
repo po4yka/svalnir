@@ -205,6 +205,22 @@ fn link_evidence(path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure
     object_of(std::fs::symlink_metadata(path.to_path_buf()))
 }
 
+fn root_entries(max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let entries = std::fs::read_dir("/")
+        .map_err(|error| QueryFailure::Failed(error.raw_os_error().unwrap_or(0)))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| QueryFailure::Failed(error.raw_os_error().unwrap_or(0)))?;
+        if names.len() >= max {
+            return Err(QueryFailure::Overflow);
+        }
+        names.push(entry.file_name().as_bytes().to_vec());
+    }
+    Ok(names)
+}
+
 fn object_of(
     metadata: std::io::Result<std::fs::Metadata>,
 ) -> Result<FileObjectEvidence, QueryFailure> {
@@ -1257,6 +1273,10 @@ impl ProcessSource for DarwinProcessSource {
 
     fn link_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
         link_evidence(path)
+    }
+
+    fn root_entries(&self, max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+        root_entries(max)
     }
 
     fn usage(&self, pid: Pid) -> Result<RawUsage, QueryFailure> {

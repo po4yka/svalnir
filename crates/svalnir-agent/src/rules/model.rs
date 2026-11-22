@@ -349,6 +349,14 @@ pub enum SkipReason {
     OverCandidateCeiling,
     /// The operating system denied access to the unit or to a part of it.
     AccessDenied,
+    /// A process of the user uses the unit: it has a file open in it, maps
+    /// a file from it, has its working directory in it, runs an executable
+    /// from it, or names it in an argument (`docs/CLEANUP_RULES.md` section
+    /// 6). Serialized as `unit_in_use`.
+    UnitInUse,
+    /// The use check does not show that no process of the user uses the
+    /// unit. Serialized as `unit_use_unknown`.
+    UnitUseUnknown,
 }
 
 impl SkipReason {
@@ -362,8 +370,9 @@ impl SkipReason {
             | Self::SourceNotLocal
             | Self::ExclusionOverlap => SkipCategory::ProtectedData,
             Self::WrongOwner | Self::SharedOwnership => SkipCategory::UnknownOwnership,
-            Self::ActiveProducer => SkipCategory::ActiveProducer,
+            Self::ActiveProducer | Self::UnitInUse => SkipCategory::ActiveProducer,
             Self::ActivityUnknown
+            | Self::UnitUseUnknown
             | Self::NotSealed
             | Self::ModifiedAfterSeal
             | Self::RetentionNotElapsed

@@ -7,6 +7,7 @@
 //! state machine of `docs/ACTION_CONTRACTS.md` section 6 permits.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 
 use svalnir_core::action::{
     ActionClass, ActionError, ActionStage, Attribution, CapacityEffect, Checked, Correlation,
@@ -35,6 +36,7 @@ use crate::executor::process::{
     ExecutorError, GracefulRecord, NextStep, StepInput, StepReport, StepRun, StopRequest,
 };
 use crate::rules::ProducerActivity;
+use crate::rules::in_use::UnitUse;
 
 /// The result of one unit of work on the active operation.
 #[derive(Debug)]
@@ -815,6 +817,22 @@ impl<J: CoordinatorJournal> Coordinator<J> {
                     Some((code::PRODUCER_ACTIVITY_UNKNOWN, ErrorFamily::Evidence))
                 }
             };
+            // The use check of the target: a process of the user that
+            // started to use the unit after the plan was made inhibits the
+            // step. The process is not signaled.
+            let refusal: Option<(&str, ErrorFamily)> = refusal.or_else(|| {
+                let path: PathBuf = file
+                    .root_path
+                    .to_path_buf()
+                    .join(file.relative_entry.to_path_buf());
+                match self.authority.unit_use(&path) {
+                    UnitUse::NotInUse => None,
+                    UnitUse::InUse { .. } => Some((code::UNIT_IN_USE, ErrorFamily::Eligibility)),
+                    UnitUse::Unknown { .. } => {
+                        Some((code::UNIT_USE_UNKNOWN, ErrorFamily::Evidence))
+                    }
+                }
+            });
             if let Some((code, family)) = refusal {
                 let error = Self::step_error(active, step, code, family, ActionStage::Dispatch);
                 self.end_without_call(

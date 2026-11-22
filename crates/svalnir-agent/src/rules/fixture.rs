@@ -124,6 +124,20 @@ impl DiscoveryEnvironment for FixtureEnvironment {
             observed_at: self.monotonic(),
         }
     }
+
+    /// A fixture has no process that uses its units: the inventory is
+    /// complete and empty. A test of the use check gives its own
+    /// environment.
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        crate::platform::process::PathInventory {
+            observed_at: Some(self.monotonic()),
+            ..crate::platform::process::PathInventory::default()
+        }
+    }
 }
 
 /// The path of the `DerivedData` root below the home directory `home`,

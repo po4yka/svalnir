@@ -379,6 +379,14 @@ impl crate::rules::DiscoveryEnvironment for TestRuleEnvironment {
         self.0.xcode_evidence(principal)
     }
 
+    fn path_uses(
+        &self,
+        principal: svalnir_core::process::Uid,
+        scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        self.0.path_uses(principal, scopes)
+    }
+
     fn producer_activity(
         &self,
         _rule: &svalnir_core::id::RuleId,

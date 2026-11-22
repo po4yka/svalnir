@@ -253,6 +253,23 @@ impl AuthoritySource for SharedAuthority {
             environment.producer_activity(&rule.id, principal)
         })
     }
+
+    fn unit_use(&self, path: &std::path::Path) -> crate::rules::in_use::UnitUse {
+        // The reading of the process table is outside the critical
+        // section.
+        let (environment, principal) = {
+            let records = self.records();
+            (records.environment.clone(), records.principal)
+        };
+        environment.map_or(
+            crate::rules::in_use::UnitUse::Unknown {
+                reason: "no_process_evidence",
+                processes: Vec::new(),
+                omitted: 0,
+            },
+            |environment| environment.unit_use(principal, path),
+        )
+    }
 }
 
 #[cfg(test)]

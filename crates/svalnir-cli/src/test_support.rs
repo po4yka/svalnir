@@ -743,4 +743,15 @@ impl svalnir_agent::rules::DiscoveryEnvironment for NoEvidence {
             observed_at: MonotonicNanos::new(0),
         }
     }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[svalnir_agent::rules::in_use::UnitScope],
+    ) -> svalnir_agent::platform::process::PathInventory {
+        svalnir_agent::platform::process::PathInventory::incomplete(
+            svalnir_agent::platform::process::InventoryGap::ProcessListUnavailable,
+            None,
+        )
+    }
 }

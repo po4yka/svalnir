@@ -966,3 +966,133 @@ fn the_fixture_lifecycle_names_no_validation_record() {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
     }
 }
+
+// ---------------------------------------------------------------------
+// The use check of a running process (`docs/CLEANUP_RULES.md` section 6).
+// ---------------------------------------------------------------------
+
+/// A fixture environment whose path-use inventory the test gives.
+struct WithUses {
+    inner: FixtureEnvironment,
+    inventory: crate::platform::process::PathInventory,
+    scopes: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+impl crate::scan::ScanClock for WithUses {
+    fn now(&self) -> crate::scan::ScanTimestamp {
+        self.inner.now()
+    }
+}
+
+impl super::eviction::DiscoveryEnvironment for WithUses {
+    fn xcode_evidence(&self, principal: Uid) -> super::xcode::XcodeEvidence {
+        self.inner.xcode_evidence(principal)
+    }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        scopes: &[super::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        self.scopes
+            .lock()
+            .unwrap()
+            .extend(scopes.iter().map(|scope| scope.path().to_path_buf()));
+        self.inventory.clone()
+    }
+}
+
+fn discover_with(
+    home: &UserTree,
+    inventory: crate::platform::process::PathInventory,
+) -> (EvictionDiscovery, Vec<PathBuf>) {
+    let environment = WithUses {
+        inner: month_later(),
+        inventory,
+        scopes: std::sync::Mutex::default(),
+    };
+    let cancel = CancellationToken::new();
+    let discovery = automatic_registry().discover_for_eviction(
+        &EvictionRequest {
+            host: &home.host(),
+            purpose: &RuleMode::AutomaticEviction,
+            rules: Some(&[xcode_rule()]),
+            volumes: None,
+            known: None,
+            limits: DiscoveryLimits::default(),
+            cancel: &cancel,
+        },
+        &environment,
+    );
+    let scopes = environment.scopes.into_inner().unwrap();
+    (discovery, scopes)
+}
+
+#[test]
+fn a_unit_that_a_process_uses_is_skipped_and_the_others_stay_candidates() {
+    use crate::platform::process::{PathInventory, PathUseKind, ProcessPathUse, ProcessUses};
+
+    let home = UserTree::with_project();
+    let used: PathBuf = home.root.join(PROJECT).join("Build/Products/Debug");
+    let inventory = PathInventory {
+        processes: vec![ProcessUses {
+            pid: Pid::new(77).unwrap(),
+            name: "lldb".to_owned(),
+            uses: vec![ProcessPathUse {
+                kind: PathUseKind::WorkingDirectory,
+                path: used,
+            }],
+        }],
+        ..PathInventory::default()
+    };
+    let (discovery, scopes) = discover_with(&home, inventory);
+    // The scope of the inventory is the bound root.
+    assert_eq!(scopes, vec![home.root.clone()]);
+    let mut expected: Vec<String> = units(PROJECT);
+    expected.retain(|unit| !unit.ends_with("Build/Products"));
+    assert_eq!(relative_entries(&discovery), expected);
+    assert_eq!(skip_reasons(&discovery), vec![SkipReason::UnitInUse]);
+    let RootResult::Examined { skipped, .. } = &discovery.roots[0].result else {
+        panic!("{:?}", discovery.roots);
+    };
+    assert_eq!(
+        skipped[0].relative_entry.as_utf8().unwrap(),
+        format!("{PROJECT}/Build/Products")
+    );
+    assert_eq!(
+        skipped[0].eligibility.protocols_valid,
+        svalnir_core::rule::Fact::NotSatisfied
+    );
+    assert!(discovery.complete);
+}
+
+#[test]
+fn an_unknown_process_or_an_incomplete_inventory_gives_no_candidate() {
+    use crate::platform::process::{InventoryGap, PathInventory, UnknownProcess};
+
+    let home = UserTree::with_project();
+    let unknown = PathInventory {
+        unknown: vec![UnknownProcess {
+            pid: Pid::new(9).unwrap(),
+            name: "dmd".to_owned(),
+            reason: InventoryGap::ProcessQueryDenied,
+        }],
+        ..PathInventory::default()
+    };
+    let gap = PathInventory::incomplete(InventoryGap::ProcessListUnavailable, None);
+    for inventory in [unknown, gap] {
+        let (discovery, _) = discover_with(&home, inventory);
+        assert_eq!(discovery.candidates.len(), 0);
+        assert_eq!(
+            skip_reasons(&discovery),
+            vec![SkipReason::UnitUseUnknown; 3]
+        );
+        let RootResult::Examined { skipped, .. } = &discovery.roots[0].result else {
+            panic!("{:?}", discovery.roots);
+        };
+        assert_eq!(
+            skipped[0].eligibility.protocols_valid,
+            svalnir_core::rule::Fact::Unknown
+        );
+    }
+}

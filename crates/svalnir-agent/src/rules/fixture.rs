@@ -59,6 +59,19 @@ pub struct FixtureEnvironment {
     started: Instant,
     days_later: i64,
     producer: Arc<AtomicU8>,
+    in_use: Arc<AtomicU8>,
+}
+
+/// The use state of the units of a fixture test, for the use check of
+/// `docs/CLEANUP_RULES.md` section 6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureUse {
+    /// No process uses a unit: the inventory is complete and empty.
+    NotInUse,
+    /// A synthetic process has its working directory in each scope.
+    InUse,
+    /// A synthetic process of the user cannot be read.
+    Unknown,
 }
 
 const NOT_RUNNING: u8 = 0;
@@ -74,6 +87,7 @@ impl FixtureEnvironment {
             started: Instant::now(),
             days_later,
             producer: Arc::new(AtomicU8::new(NOT_RUNNING)),
+            in_use: Arc::new(AtomicU8::new(NOT_RUNNING)),
         }
     }
 
@@ -85,6 +99,19 @@ impl FixtureEnvironment {
                 ProducerProcesses::NotRunning => NOT_RUNNING,
                 ProducerProcesses::Running => RUNNING,
                 ProducerProcesses::Unknown => UNKNOWN,
+            },
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Sets the use state that each later use check gives. Each copy of
+    /// the environment has the same state.
+    pub fn set_use(&self, state: FixtureUse) {
+        self.in_use.store(
+            match state {
+                FixtureUse::NotInUse => NOT_RUNNING,
+                FixtureUse::InUse => RUNNING,
+                FixtureUse::Unknown => UNKNOWN,
             },
             Ordering::SeqCst,
         );
@@ -125,18 +152,46 @@ impl DiscoveryEnvironment for FixtureEnvironment {
         }
     }
 
-    /// A fixture has no process that uses its units: the inventory is
-    /// complete and empty. A test of the use check gives its own
-    /// environment.
+    /// The inventory of the use state that the test set
+    /// ([`FixtureEnvironment::set_use`]); no process table is read.
     fn path_uses(
         &self,
         _principal: Uid,
-        _scopes: &[crate::rules::in_use::UnitScope],
+        scopes: &[crate::rules::in_use::UnitScope],
     ) -> crate::platform::process::PathInventory {
-        crate::platform::process::PathInventory {
+        use crate::platform::process::{
+            InventoryGap, PathInventory, PathUseKind, ProcessPathUse, ProcessUses, UnknownProcess,
+        };
+        use svalnir_core::process::Pid;
+
+        let mut inventory: PathInventory = PathInventory {
             observed_at: Some(self.monotonic()),
-            ..crate::platform::process::PathInventory::default()
+            ..PathInventory::default()
+        };
+        // PID 1 is a synthetic process here; no query names it.
+        let Ok(pid) = Pid::new(1) else {
+            return inventory;
+        };
+        match self.in_use.load(Ordering::SeqCst) {
+            NOT_RUNNING => {}
+            RUNNING => inventory.processes.push(ProcessUses {
+                pid,
+                name: "fixture".to_owned(),
+                uses: scopes
+                    .iter()
+                    .map(|scope| ProcessPathUse {
+                        kind: PathUseKind::WorkingDirectory,
+                        path: scope.path().to_path_buf(),
+                    })
+                    .collect(),
+            }),
+            _ => inventory.unknown.push(UnknownProcess {
+                pid,
+                name: "fixture".to_owned(),
+                reason: InventoryGap::ProcessQueryDenied,
+            }),
         }
+        inventory
     }
 }
 

@@ -174,7 +174,9 @@ pub use self::coordination::{
 pub use self::effects::MAX_RESOURCE_EFFECTS_BYTES;
 pub use self::error::{AdmissionStop, OperationJournalError, SequenceViolation};
 pub use self::incident::IncidentUsage;
-pub use self::owner_process::{MAX_OWNER_DESCENDANTS, OwnerProcess, ProcessRecord};
+pub use self::owner_process::{
+    DescendantChange, MAX_OWNER_DESCENDANTS, OwnerProcess, ProcessRecord,
+};
 pub use self::record::{AgentRecord, MAX_AGENT_RECORD_BYTES, StoredAgentRecord};
 pub use self::recovery::{ConsumedDispatch, RecoveryPosition, RecoveryRecord, StepRecovery};
 pub use self::request::{

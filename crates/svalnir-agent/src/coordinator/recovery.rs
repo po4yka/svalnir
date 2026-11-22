@@ -258,8 +258,6 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
     }
 
-    /// Settles what the evidence establishes for one operation. Returns
-    /// false when a write of the journal failed.
     /// Stops each recorded owner command of `operation` that still lives
     /// after a restart: the command, the members of its group, and each
     /// recorded descendant, by their start times (`docs/ACTION_CONTRACTS.md`
@@ -275,6 +273,8 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         }
     }
 
+    /// Settles what the evidence establishes for one operation. Returns
+    /// false when a write of the journal failed.
     fn reconcile_record(&mut self, record: RecoveryRecord) -> bool {
         let RecoveryRecord {
             mut operation,

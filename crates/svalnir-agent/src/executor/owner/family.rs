@@ -9,6 +9,13 @@
 //! the process ID of the group runs with a different start time, the group
 //! identity was given again after the command, and its members are not the
 //! command.
+//!
+//! A truncated record (the worker could not keep or the journal could not
+//! write each descendant) counts as a live process until the system started
+//! again after the command. After the exit of the command, a descendant
+//! that it did not record has the launch process as its parent and is its
+//! own responsible process, so no reading of the host can find it; only a
+//! new start of the system shows that it ended.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -59,9 +66,17 @@ fn live(process: &OwnerProcess) -> Vec<(libc::pid_t, ProcessStartTime)> {
     found
 }
 
-/// Whether a process of the recorded command `process` lives.
+/// Whether a process of the recorded command `process` lives, or can
+/// live: a truncated record counts as live until the system started again
+/// after the command.
 pub fn process_lives(process: &OwnerProcess) -> bool {
-    !live(process).is_empty()
+    !live(process).is_empty() || (process.truncated && !booted_after(process))
+}
+
+/// Whether the system started after the start of the command `process`.
+/// False when the system does not give its start time.
+fn booted_after(process: &OwnerProcess) -> bool {
+    native::boot_time().is_some_and(|booted| booted > process.started)
 }
 
 /// Sends `signal` to each process of `targets` that still has its start
@@ -78,11 +93,12 @@ fn signal_each(targets: &[(libc::pid_t, ProcessStartTime)], signal: libc::c_int)
 /// once to a process that is still suspended (it ran no instruction of the
 /// command), `SIGTERM` to each other one, a wait of at most `grace`, a new
 /// reading, and `SIGKILL` to each process that is left. Returns whether a
-/// process of the command lives after the stop.
+/// process of the command lives after the stop, as [`process_lives`]
+/// reads it: a truncated record keeps it true.
 pub fn stop_recorded(process: &OwnerProcess, grace: Duration) -> bool {
     let targets = live(process);
     if targets.is_empty() {
-        return false;
+        return process_lives(process);
     }
     let (suspended, running): (Vec<_>, Vec<_>) = targets
         .into_iter()
@@ -92,7 +108,7 @@ pub fn stop_recorded(process: &OwnerProcess, grace: Duration) -> bool {
     let until: Instant = Instant::now() + grace;
     while Instant::now() < until {
         if live(process).is_empty() {
-            return false;
+            return process_lives(process);
         }
         thread::sleep(POLL);
     }
@@ -100,7 +116,7 @@ pub fn stop_recorded(process: &OwnerProcess, grace: Duration) -> bool {
     let until: Instant = Instant::now() + grace;
     while Instant::now() < until {
         if live(process).is_empty() {
-            return false;
+            return process_lives(process);
         }
         thread::sleep(POLL);
     }

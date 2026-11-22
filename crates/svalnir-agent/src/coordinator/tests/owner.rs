@@ -1163,3 +1163,112 @@ fn a_restart_stops_a_suspended_command_that_never_ran() {
         .acknowledge(&operation_id, &super::support::principal())
         .unwrap();
 }
+
+#[test]
+fn a_set_of_descendants_that_overflows_is_unknown_and_refuses_the_acknowledgment() {
+    let (mut bench, script) = owner_bench(
+        "echo \"$1\" >> \"$HOME/runs\"\nsleep 1 &\nsleep 1 &\nsleep 1 &\nsleep 1 &\nwait\nexit 0",
+    );
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_overflow", owner);
+    let home: PathBuf = bench.tree.home().to_path_buf();
+    let start = bench.start_with(|dependencies, _| {
+        let mut config = crate::executor::owner::OwnerExecutorConfig::new(
+            svalnir_core::id::AdapterId::new("svalnir.owner-operation").unwrap(),
+            svalnir_core::file::LosslessPath::from_path(&home).unwrap(),
+        );
+        config.max_descendants = 2;
+        dependencies.owner = Box::new(crate::executor::owner::OwnerExecutor::new(config));
+    });
+    let super::super::Start::Coordinating(mut coordinator) = start else {
+        panic!("the lock is held");
+    };
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run_owner(&mut coordinator, &bench, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+    assert_eq!(effect(&view), TargetEffect::UnknownOutcome);
+    assert_eq!(
+        failure_code(&view).as_deref(),
+        Some(owner_code::OWNER_DESCENDANTS_TRUNCATED)
+    );
+    let processes = open_journal(&bench.tree.database)
+        .owner_processes(&operation_id)
+        .unwrap();
+    assert_eq!(processes.len(), 1);
+    assert!(processes[0].truncated);
+    // Each process of the command ended, but the record is truncated.
+    let error = coordinator
+        .acknowledge(&operation_id, &super::support::principal())
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), code::OWNER_PROCESS_ALIVE);
+}
+
+#[test]
+fn a_descendant_record_that_fails_is_unknown_and_refuses_the_acknowledgment() {
+    let (mut bench, script) = owner_bench("echo \"$1\" >> \"$HOME/runs\"\nsleep 1 &\nwait\nexit 0");
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_lost", owner);
+    bench.fail(FailPoint::RecordOwnerDescendants);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run_owner(&mut coordinator, &bench, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+    assert_eq!(effect(&view), TargetEffect::UnknownOutcome);
+    assert_eq!(
+        failure_code(&view).as_deref(),
+        Some(owner_code::OWNER_DESCENDANTS_NOT_RECORDED)
+    );
+    let processes = open_journal(&bench.tree.database)
+        .owner_processes(&operation_id)
+        .unwrap();
+    assert!(processes[0].truncated);
+    let error = coordinator
+        .acknowledge(&operation_id, &super::support::principal())
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), code::OWNER_PROCESS_ALIVE);
+}
+
+#[test]
+fn a_truncated_record_refuses_the_acknowledgment_with_no_live_process() {
+    let (mut bench, script) = owner_bench("echo \"$1\" >> \"$HOME/runs\"\nexit 3");
+    let owner = binding(
+        &bench,
+        &declaration(&script, 30 * SECOND),
+        OwnerOperationKind::Prune,
+    )
+    .unwrap();
+    let plan: Plan = owner_plan(&bench, "plan_truncated", owner);
+    let mut coordinator = bench.start();
+    let operation_id = admitted(&mut coordinator, stored_request(&plan));
+    let view = run_owner(&mut coordinator, &bench, &operation_id);
+    assert_eq!(view.operation.state(), &OperationState::UnknownOutcome);
+    let step_id = StepId::new("plan_truncated_step").unwrap();
+    let mut journal = open_journal(&bench.tree.database);
+    let mut record = journal.owner_processes(&operation_id).unwrap().remove(0);
+    record.truncated = true;
+    journal
+        .record_owner_process(&operation_id, &step_id, &record)
+        .unwrap();
+    let error = coordinator
+        .acknowledge(&operation_id, &super::support::principal())
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), code::OWNER_PROCESS_ALIVE);
+    // The same record with a complete set permits the acknowledgment.
+    record.truncated = false;
+    journal
+        .record_owner_process(&operation_id, &step_id, &record)
+        .unwrap();
+    coordinator
+        .acknowledge(&operation_id, &super::support::principal())
+        .unwrap();
+}

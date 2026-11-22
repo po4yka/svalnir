@@ -559,7 +559,7 @@ pub struct DiscoveredCandidate {
 impl DiscoveredCandidate {
     /// Whether the lifecycle state of the layout permits `mode`.
     pub fn permits(&self, mode: &RuleMode) -> bool {
-        self.lifecycle.permits(mode)
+        svalnir_core::rule::layout_permits(&self.candidate.layout, &self.lifecycle, mode)
     }
 
     /// The binding of the unit for a plan target.

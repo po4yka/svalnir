@@ -189,7 +189,7 @@ impl Home {
         self.path.join(project)
     }
 
-    fn inspect_with(
+    pub(super) fn inspect_with(
         &self,
         processes: &dyn ProcessEvidence,
         git: Result<&GitTool, GitToolProblem>,
@@ -230,6 +230,19 @@ impl Home {
         recency: RecencyHost<'_>,
         clock: &dyn ScanClock,
     ) -> ProjectInspection {
+        self.inspect_layouts(processes, git, limits, recency, clock, &[])
+    }
+
+    /// The inspection with the layouts of the configuration `layouts`.
+    pub(super) fn inspect_layouts(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        recency: RecencyHost<'_>,
+        clock: &dyn ScanClock,
+        layouts: &[svalnir_core::config::UserLayout],
+    ) -> ProjectInspection {
         let registry: ReviewedRules = ReviewedRules::new().unwrap();
         let host: ProjectHost<'_> = ProjectHost {
             principal: self.principal,
@@ -238,6 +251,7 @@ impl Home {
             git,
             processes,
             recency,
+            layouts,
         };
         registry.projects().inspect(
             host,
@@ -248,7 +262,7 @@ impl Home {
         )
     }
 
-    fn inspect(&self, processes: &dyn ProcessEvidence) -> ProjectInspection {
+    pub(super) fn inspect(&self, processes: &dyn ProcessEvidence) -> ProjectInspection {
         self.inspect_with(processes, Ok(&self.git), ProjectLimits::default())
     }
 }
@@ -284,7 +298,22 @@ fn the_rule_is_registered_proposed_with_the_inspection_mode_only() {
         .iter()
         .map(|layout| layout.layout.as_str())
         .collect();
-    assert_eq!(layouts, ["node-modules", "python-venv", "cocoapods-pods"]);
+    let mut expected: Vec<&str> = super::PROJECT_LAYOUTS
+        .iter()
+        .map(|layout| layout.layout)
+        .collect();
+    expected.push("user-configured");
+    assert_eq!(layouts, expected);
+    assert_eq!(
+        &layouts[..5],
+        [
+            "node-modules",
+            "python-venv",
+            "python-venv-plain",
+            "cocoapods-pods",
+            "cargo-target"
+        ]
+    );
     for layout in &rule.layouts {
         assert_eq!(layout.lifecycle, LifecycleState::Proposed);
         for mode in RuleMode::ALL {
@@ -353,6 +382,7 @@ fn no_search_root_examines_nothing() {
             git: Ok(&home.git),
             processes: &processes,
             recency: no_recency(),
+            layouts: &[],
         },
         &SearchRoots::new(Vec::new()).unwrap(),
         ProjectLimits::default(),
@@ -376,6 +406,7 @@ fn a_search_root_with_the_state_directory_is_refused() {
             git: Ok(&home.git),
             processes: &processes,
             recency: no_recency(),
+            layouts: &[],
         },
         &SearchRoots::new(vec![PathBuf::from("Library"), PathBuf::from("Absent")]).unwrap(),
         ProjectLimits::default(),
@@ -670,21 +701,36 @@ fn a_virtual_environment_needs_its_marker_and_cocoapods_needs_its_manifest() {
 }
 
 #[test]
-fn a_cargo_target_directory_belongs_to_the_cargo_rule() {
+fn a_cargo_target_directory_is_the_cargo_target_layout() {
     let home = Home::new();
     home.write("Code/crate/Cargo.toml", b"[package]\n");
+    home.write("Code/crate/.gitignore", b"/target\n");
+    home.repository("Code/crate");
     home.write("Code/crate/target/debug/app", b"");
+    // A target directory with no tag of Cargo is not a unit.
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let report = unit(&inspection, &home.path.join("Code/crate/target"));
+    assert_eq!(report.layout, "cargo-target");
+    assert_eq!(refusal(report), "unsupported_layout");
+    home.write(
+        "Code/crate/target/CACHEDIR.TAG",
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    assert!(matches!(
+        unit(&inspection, &home.path.join("Code/crate/target")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
     // A directory named `target` with no manifest is an ordinary
-    // directory, which the walk enters.
+    // directory, which the walk enters and the report does not list.
     home.write("Code/web/target/package.json", b"{}");
     home.write("Code/web/target/node_modules/a/index.js", b"1;\n");
     let inspection: ProjectInspection = home.inspect(&quiet());
-    let report = unit(&inspection, &home.path.join("Code/crate/target"));
-    assert_eq!(
-        report.outcome,
-        ProjectUnitOutcome::OwnedByOtherRule {
-            rule: "cargo.build-output"
-        }
+    assert!(
+        inspection
+            .units
+            .iter()
+            .all(|unit| unit.path != home.path.join("Code/web/target"))
     );
     assert_eq!(
         refusal(unit(
@@ -736,7 +782,20 @@ fn a_linked_worktree_of_the_project_has_git_evidence() {
 
 #[test]
 fn the_build_process_names() {
-    for name in ["node", "pnpm", "python3", "python3.13", "pod", "xcodebuild"] {
+    for name in [
+        "node",
+        "pnpm",
+        "python3",
+        "python3.13",
+        "pod",
+        "xcodebuild",
+        "cargo",
+        "java",
+        "beam.smp",
+        "dotnet",
+        "zig",
+        "swift-build",
+    ] {
         assert!(is_build_process(name), "{name}");
     }
     for name in ["zsh", "Finder", "nodejs-helper", "login"] {
@@ -810,6 +869,7 @@ fn a_search_root_in_another_case_has_the_stored_names() {
             git: Ok(&home.git),
             processes: &NativeProcessEvidence,
             recency: no_recency(),
+            layouts: &[],
         },
         &SearchRoots::new(vec![PathBuf::from("code")]).unwrap(),
         ProjectLimits::default(),

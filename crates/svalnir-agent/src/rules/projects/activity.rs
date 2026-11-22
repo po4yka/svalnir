@@ -16,10 +16,13 @@ use crate::platform::process::{DarwinProcessSource, PathInventory, ProcessSource
 use crate::rules::in_use::{UnitScope, inventory_of};
 
 /// The executable names of the build and package-manager processes of the
-/// layouts: the JavaScript runtimes and package managers, Python and its
-/// installers, `CocoaPods` and Ruby, and the build tools of Xcode. A name
-/// that starts with `python3.` or `pip3.` is also one.
-pub const BUILD_PROCESS_NAMES: [&str; 25] = [
+/// layouts: the JavaScript runtimes, package managers, and build tools,
+/// Python, its installers, and its tools, `CocoaPods`, Ruby, and Bundler,
+/// the build tools of Xcode and of Swift Package Manager, Cargo, Maven and
+/// Gradle (and the Java runtime that runs them), Mix and the Erlang
+/// runtime, .NET, and Zig. A name that starts with `python3.` or `pip3.` is
+/// also one.
+pub const BUILD_PROCESS_NAMES: [&str; 44] = [
     "node",
     "npm",
     "npx",
@@ -45,6 +48,25 @@ pub const BUILD_PROCESS_NAMES: [&str; 25] = [
     "XCBBuildService",
     "SWBBuildService",
     "make",
+    "turbo",
+    "tox",
+    "nox",
+    "ruff",
+    "bundle",
+    "swift",
+    "swift-build",
+    "swift-frontend",
+    "cargo",
+    "rustc",
+    "mvn",
+    "gradle",
+    "java",
+    "mix",
+    "elixir",
+    "erl",
+    "beam.smp",
+    "dotnet",
+    "zig",
 ];
 
 /// Whether `name` is the executable name of a build or package-manager

@@ -328,7 +328,7 @@ pub fn automatic_roots(
             && rule
                 .layouts
                 .iter()
-                .any(|layout| layout.lifecycle.permits(&RuleMode::AutomaticEviction));
+                .any(|layout| layout.permits(&RuleMode::AutomaticEviction));
         if !permits {
             continue;
         }
@@ -848,7 +848,7 @@ impl ReviewedRules {
                 && rule
                     .layouts
                     .iter()
-                    .any(|layout| layout.lifecycle.permits(request.purpose));
+                    .any(|layout| layout.permits(request.purpose));
             if !selected {
                 continue;
             }

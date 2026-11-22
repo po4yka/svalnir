@@ -914,7 +914,8 @@ fn read_memory_guard(
 }
 
 /// Reads `[cleanup]`. A quiet period outside [`MIN_QUIET_PERIOD`] to
-/// [`MAX_QUIET_PERIOD`] has a finding.
+/// [`MAX_QUIET_PERIOD`] has a finding. The template has no layout, so the
+/// layouts are the tables of the document only.
 fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cleanup) -> Cleanup {
     let mut projects_table: TableReader<'_> = table.table(context, "projects");
     let path: String = projects_table.key_path("quiet_period");
@@ -931,6 +932,7 @@ fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cl
             projects_table.boolean(context, "paseo_agents"),
             defaults.projects.paseo_agents,
         ),
+        layouts: super::layout::read_layouts(context, &mut projects_table),
     };
     projects_table.finish(context);
     table.finish(context);

@@ -24,7 +24,7 @@ use crate::digest::ContentDigest;
 use crate::id::PolicyRevisionId;
 use crate::policy::PolicyId;
 use crate::process::Uid;
-use crate::rule::{LifecycleState, RuleRef, RuleRegistry};
+use crate::rule::{RuleMode, RuleRef, RuleRegistry};
 use crate::time::WallTime;
 
 /// A request to activate a validated configuration.
@@ -127,12 +127,9 @@ fn rules_not_validated(scope: &PolicyScope, registry: &dyn RuleRegistry) -> Vec<
         .into_iter()
         .filter(|reference| {
             !registry.rule(reference).is_some_and(|rule| {
-                rule.layouts.iter().any(|support| {
-                    matches!(
-                        support.lifecycle,
-                        LifecycleState::AutomaticEvictionValidated { .. }
-                    )
-                })
+                rule.layouts
+                    .iter()
+                    .any(|support| support.permits(&RuleMode::AutomaticEviction))
             })
         })
         .collect()

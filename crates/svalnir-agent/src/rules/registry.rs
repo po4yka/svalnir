@@ -243,7 +243,7 @@ impl ReviewedRules {
                     permitted_modes: rule
                         .modes
                         .iter()
-                        .filter(|mode| support.lifecycle.permits(mode))
+                        .filter(|mode| support.permits(mode))
                         .cloned()
                         .collect(),
                 })

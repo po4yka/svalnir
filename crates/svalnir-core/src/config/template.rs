@@ -22,7 +22,7 @@ use super::schema::{
 use crate::quantity::{Bytes, EntryCount};
 
 /// The revision of the template. Increase it when a value changes.
-pub const TEMPLATE_REVISION: u32 = 3;
+pub const TEMPLATE_REVISION: u32 = 4;
 
 /// The personal folders of the home directory: the default of
 /// `[protections].excluded_paths` (`docs/POLICY_SPEC.md` section 12). Each
@@ -130,6 +130,7 @@ impl Template {
                 projects: ProjectCleanup {
                     quiet_period: Duration::from_hours(24),
                     paseo_agents: false,
+                    layouts: Vec::new(),
                 },
             },
             history: History {

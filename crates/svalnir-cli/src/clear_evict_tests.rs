@@ -147,6 +147,15 @@ impl World {
         )
     }
 
+    /// A file of a Maven version directory with the record of its download.
+    fn downloaded(&self, relative: &str) {
+        self.write(relative, b"content");
+        let path: PathBuf = PathBuf::from(relative);
+        let name: &str = path.file_name().unwrap().to_str().unwrap();
+        let record: String = format!("{}/_remote.repositories", path.parent().unwrap().display());
+        self.write(&record, format!("{name}>central=\n").as_bytes());
+    }
+
     fn exists(&self, relative: &str) -> bool {
         std::fs::symlink_metadata(self.home.join(relative)).is_ok()
     }
@@ -220,8 +229,13 @@ fn a_clear_rule_needs_the_consent_and_the_flag_needs_a_clear_rule() {
 #[test]
 fn a_maven_plan_removes_only_the_eligible_artifacts_and_keeps_the_settings() {
     let world = World::manual();
-    world.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
-    world.write(".m2/repository/io/x/1/x-1.pom", b"<project/>");
+    world.downloaded(".m2/repository/org/lib/1.0/lib-1.0.jar");
+    world.downloaded(".m2/repository/io/x/1/x-1.pom");
+    // A hand-copied driver with no record.
+    world.write(
+        ".m2/repository/com/oracle/ojdbc8/19.3/ojdbc8-19.3.jar",
+        b"jar",
+    );
     // One artifact of the group `com.me` is a local install; the other is
     // not.
     world.write(".m2/repository/com/me/app/1.0/app-1.0.pom", b"<project/>");
@@ -229,7 +243,7 @@ fn a_maven_plan_removes_only_the_eligible_artifacts_and_keeps_the_settings() {
         ".m2/repository/com/me/app/maven-metadata-local.xml",
         b"<metadata/>",
     );
-    world.write(".m2/repository/com/me/tool/2.0/tool-2.0.jar", b"jar");
+    world.downloaded(".m2/repository/com/me/tool/2.0/tool-2.0.jar");
     world.write(".m2/settings.xml", b"<settings/>");
     let (plan_id, result) = world.planned("maven.repository");
     assert_eq!(
@@ -259,6 +273,7 @@ fn a_maven_plan_removes_only_the_eligible_artifacts_and_keeps_the_settings() {
     // stay.
     assert!(world.exists(".m2/repository/org"));
     assert!(world.exists(".m2/repository/com/me/app/1.0/app-1.0.pom"));
+    assert!(world.exists(".m2/repository/com/oracle/ojdbc8/19.3/ojdbc8-19.3.jar"));
     assert!(world.exists(".m2/settings.xml"));
 }
 
@@ -300,6 +315,7 @@ fn a_rubygems_plan_removes_the_gem_files_and_keeps_bundler() {
     world.write(".gem/ruby/3.3.0/cache/rake-13.0.gem", b"gem");
     world.write(".gem/ruby/3.3.0/cache/bundler/git/tool-1/HEAD", b"ref: x");
     world.write(".gem/ruby/3.3.0/gems/rake-13.0/lib/rake.rb", b"#");
+    world.write(".gem/ruby/3.3.0/specifications/rake-13.0.gemspec", b"#");
     let (plan_id, result) = world.planned("rubygems.cache");
     assert_eq!(
         targets(&world, &result),
@@ -333,8 +349,8 @@ fn a_deno_plan_keeps_the_local_storage_and_the_history() {
 #[test]
 fn the_step_checks_a_local_install_and_a_repository_again() {
     let world = World::manual();
-    world.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
-    world.write(".m2/repository/io/x/1/x-1.pom", b"<project/>");
+    world.downloaded(".m2/repository/org/lib/1.0/lib-1.0.jar");
+    world.downloaded(".m2/repository/io/x/1/x-1.pom");
     let (plan_id, result) = world.planned("maven.repository");
     assert_eq!(targets(&world, &result).len(), 2, "{result}");
     // After the plan: a local install in one unit, and a Git repository in

@@ -295,35 +295,53 @@ fn cargo_clears_the_archives_and_the_sources_and_keeps_git_bin_and_index() {
 }
 
 #[test]
-fn maven_refuses_an_artifact_with_a_local_install_and_reads_settings() {
+fn maven_clears_only_the_artifacts_that_a_record_attributes_to_a_remote() {
     let home = Home::new();
     home.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
+    home.write(".m2/repository/org/lib/1.0/lib-1.0.pom", b"<project/>");
     home.write(
         ".m2/repository/org/lib/1.0/_remote.repositories",
         b"#NOTE: internal\nlib-1.0.jar>central=\nlib-1.0.pom>central=\n",
     );
-    // Two artifacts of one group: only the installed one is refused.
+    // A local install: the metadata of the install, and a record with no
+    // repository.
     home.write(".m2/repository/com/me/app/1.0/app-1.0.pom", b"<project/>");
+    home.write(
+        ".m2/repository/com/me/app/1.0/_remote.repositories",
+        b"app-1.0.pom>central=\n",
+    );
     home.write(
         ".m2/repository/com/me/app/maven-metadata-local.xml",
         b"<metadata/>",
     );
-    home.write(".m2/repository/com/me/tool/2.0/tool-2.0.jar", b"jar");
     home.write(".m2/repository/com/me/cli/3.0/cli-3.0.jar", b"jar");
     home.write(
         ".m2/repository/com/me/cli/3.0/_remote.repositories",
         b"cli-3.0.jar>=\n",
+    );
+    // A hand-copied driver: a `.jar` and a `.pom` with no record.
+    home.write(
+        ".m2/repository/com/oracle/ojdbc8/19.3/ojdbc8-19.3.jar",
+        b"jar",
+    );
+    home.write(
+        ".m2/repository/com/oracle/ojdbc8/19.3/ojdbc8-19.3.pom",
+        b"<project/>",
+    );
+    // A record that names the `.jar` and not the `.pom`.
+    home.write(".m2/repository/io/half/1/half-1.jar", b"jar");
+    home.write(".m2/repository/io/half/1/half-1.pom", b"<project/>");
+    home.write(
+        ".m2/repository/io/half/1/_remote.repositories",
+        b"half-1.jar>central=\n",
     );
     // An entry in no artifact directory is not a unit.
     home.write(".m2/repository/org/stray.lastUpdated", b"x");
     home.write(".m2/settings.xml", b"<settings/>");
     let root: PathBuf = home.path.join(".m2/repository");
     let discovery: EvictionDiscovery = manual(&home, MAVEN_REPOSITORY.id);
-    assert_eq!(
-        candidates(&home, &discovery),
-        [".m2/repository/com/me/tool", ".m2/repository/org/lib"]
-    );
-    for refused in ["com/me/app", "com/me/cli"] {
+    assert_eq!(candidates(&home, &discovery), [".m2/repository/org/lib"]);
+    for refused in ["com/me/app", "com/me/cli", "com/oracle/ojdbc8", "io/half"] {
         assert_eq!(
             skip_reasons(&discovery, &root, refused),
             [SkipReason::ProtectedData],
@@ -331,13 +349,24 @@ fn maven_refuses_an_artifact_with_a_local_install_and_reads_settings() {
         );
     }
     assert!(discovery.complete, "{discovery:?}");
+}
 
+#[test]
+fn maven_reads_the_settings_and_refuses_a_root_in_a_work_tree() {
+    let home = Home::new();
+    let downloaded = |relative: &str| {
+        home.write(&format!("{relative}/x/1/x-1.pom"), b"<project/>");
+        home.write(
+            &format!("{relative}/x/1/_remote.repositories"),
+            b"x-1.pom>central=\n",
+        );
+    };
     // A `localRepository` of the settings replaces the default root.
     home.write(
         ".m2/settings.xml",
         b"<settings><!-- <localRepository>/nowhere</localRepository> -->\n  <localRepository>${user.home}/maven-repo</localRepository>\n</settings>",
     );
-    home.write("maven-repo/io/x/1/x-1.pom", b"<project/>");
+    downloaded("maven-repo/io");
     let discovery: EvictionDiscovery = manual(&home, MAVEN_REPOSITORY.id);
     assert_eq!(candidates(&home, &discovery), ["maven-repo/io/x"]);
 
@@ -353,8 +382,126 @@ fn maven_refuses_an_artifact_with_a_local_install_and_reads_settings() {
         discovery.roots[0].result,
         RootResult::Refused("configuration_outside_home")
     );
+
+    // A root in a Git work tree, for example a folder of a project.
+    home.write(
+        ".m2/settings.xml",
+        b"<settings><localRepository>${user.home}/Code/app/repo</localRepository></settings>",
+    );
+    home.write("Code/app/.git/HEAD", b"ref: refs/heads/main");
+    downloaded("Code/app/repo/io");
+    let discovery: EvictionDiscovery = manual(&home, MAVEN_REPOSITORY.id);
+    assert_eq!(discovery.candidates.len(), 0);
+    assert_eq!(
+        discovery.roots[0].result,
+        RootResult::Refused("configuration_in_work_tree")
+    );
+
+    // With no user settings, the global settings of a Maven of SDKMAN!.
+    fs::remove_file(home.path.join(".m2/settings.xml")).unwrap();
+    home.write(
+        ".sdkman/candidates/maven/current/conf/settings.xml",
+        b"<settings><localRepository>${user.home}/sdk-repo</localRepository></settings>",
+    );
+    downloaded("sdk-repo/io");
+    let (roots, _) = resolve(&MAVEN_REPOSITORY, &home.path);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(
+        roots[0].path.as_deref(),
+        Some(home.path.join("sdk-repo").as_path())
+    );
+    assert_eq!(
+        roots[0].source,
+        super::RootSource::Configuration {
+            file: ".sdkman/candidates/maven/current/conf/settings.xml"
+        }
+    );
 }
 
+#[test]
+fn nuget_refuses_a_package_with_a_local_or_unknown_source() {
+    let home = Home::new();
+    let metadata = |relative: &str, source: &str| {
+        home.write(
+            &format!(".nuget/packages/{relative}/.nupkg.metadata"),
+            format!("{{\"version\": 2, \"contentHash\": \"x\", \"source\": \"{source}\"}}")
+                .as_bytes(),
+        );
+    };
+    metadata(
+        "newtonsoft.json/13.0.1",
+        "https://api.nuget.org/v3/index.json",
+    );
+    metadata("local.tool/1.0.0", "/Users/me/feed");
+    // One version from the registry and one with no record.
+    metadata("mixed/1.0.0", "https://api.nuget.org/v3/index.json");
+    home.write(".nuget/packages/mixed/2.0.0/mixed.nuspec", b"<package/>");
+    home.write(".nuget/packages/broken/1.0.0/.nupkg.metadata", b"not json");
+    let root: PathBuf = home.path.join(".nuget/packages");
+    let discovery: EvictionDiscovery = manual(&home, super::NUGET_PACKAGES.id);
+    assert_eq!(
+        candidates(&home, &discovery),
+        [".nuget/packages/newtonsoft.json"]
+    );
+    for refused in ["local.tool", "mixed", "broken"] {
+        assert_eq!(
+            skip_reasons(&discovery, &root, refused),
+            [SkipReason::ProtectedData],
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn a_root_with_no_marker_of_its_producer_is_not_bound() {
+    let home = Home::new();
+    // `registry/cache` with no `registry/index` beside it.
+    home.write(
+        ".cargo/registry/cache/index.crates.io-1/a-1.0.0.crate",
+        b"crate",
+    );
+    // A Zig cache with none of `h`, `o`, and `z`.
+    home.write(".cache/zig/notes.txt", b"x");
+    for (rule, root) in [
+        (super::CARGO_REGISTRY.id, ".cargo/registry/cache"),
+        (super::ZIG_GLOBAL_CACHE.id, ".cache/zig"),
+    ] {
+        let discovery: EvictionDiscovery = manual(&home, rule);
+        assert_eq!(discovery.candidates.len(), 0, "{rule}");
+        let report = discovery
+            .roots
+            .iter()
+            .find(|report| report.path.as_deref() == Some(home.path.join(root).as_path()))
+            .unwrap();
+        assert_eq!(
+            report.result,
+            RootResult::Refused("clear_root_unmarked"),
+            "{rule}"
+        );
+        assert!(!discovery.complete);
+    }
+}
+
+#[test]
+fn the_markers_of_each_rule_are_checked() {
+    use super::{RootMarker, has_marker};
+    let home = Home::new();
+    let root: PathBuf = home.path.join("root");
+    fs::create_dir_all(&root).unwrap();
+    assert!(has_marker(RootMarker::None, &root));
+    assert!(!has_marker(RootMarker::Sibling("index"), &root));
+    fs::create_dir_all(home.path.join("index")).unwrap();
+    assert!(has_marker(RootMarker::Sibling("index"), &root));
+    assert!(!has_marker(RootMarker::AnyChild(&["h", "o"]), &root));
+    home.write("root/o/a", b"x");
+    assert!(has_marker(RootMarker::AnyChild(&["h", "o"]), &root));
+    assert!(!has_marker(RootMarker::ChildNameContains("@"), &root));
+    home.write("root/left-pad@1.3.0/index.js", b"x");
+    assert!(has_marker(RootMarker::ChildNameContains("@"), &root));
+    assert!(!has_marker(RootMarker::NuGetPackage, &root));
+    home.write("root/pkg/1.0.0/.nupkg.metadata", b"{}");
+    assert!(has_marker(RootMarker::NuGetPackage, &root));
+}
 #[test]
 fn the_settings_reader_takes_one_plain_value_below_the_home_directory() {
     let home: &Path = Path::new("/Users/test");
@@ -453,9 +600,14 @@ fn rubygems_clears_gem_files_and_keeps_bundler_and_other_children() {
     home.write(".gem/ruby/3.3.0/cache/notes.txt", b"note");
     home.write(".gem/ruby/3.3.0/cache/bundler/git/tool-1/HEAD", b"ref: x");
     home.write(".gem/ruby/3.3.0/gems/rake-13.0/lib/rake.rb", b"#");
+    home.write(".gem/ruby/3.3.0/specifications/rake-13.0.gemspec", b"#");
     home.write(
         ".rbenv/versions/3.2.2/lib/ruby/gems/3.2.0/cache/json-2.gem",
         b"gem",
+    );
+    home.write(
+        ".rbenv/versions/3.2.2/lib/ruby/gems/3.2.0/specifications/json-2.gemspec",
+        b"#",
     );
     let root: PathBuf = home.path.join(".gem/ruby/3.3.0/cache");
     let discovery: EvictionDiscovery = manual(&home, RUBYGEMS_CACHE.id);
@@ -491,6 +643,12 @@ fn the_expansion_of_a_root_pattern_is_bounded_and_skips_links() {
     let (roots, complete) = resolve(&RUBYGEMS_CACHE, &home.path);
     assert!(!complete);
     assert_eq!(roots.len(), super::MAX_EXPANDED_ROOTS);
+    // The cut keeps the first versions in name order.
+    let expected: Vec<PathBuf> = (0..super::MAX_EXPANDED_ROOTS)
+        .map(|index| home.path.join(format!(".gem/ruby/{index:02}/cache")))
+        .collect();
+    let found: Vec<PathBuf> = roots.iter().filter_map(|root| root.path.clone()).collect();
+    assert_eq!(found, expected);
     assert!(roots.iter().all(|root| {
         root.path
             .as_ref()
@@ -601,10 +759,15 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
     let home = Home::new();
     let root: PathBuf = home.path.join(".m2/repository");
     home.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
+    home.write(
+        ".m2/repository/org/lib/1.0/_remote.repositories",
+        b"lib-1.0.jar>central=\n",
+    );
     let unit: PathBuf = root.join("org/lib");
     let check = |path: &Path| recheck_unit(&MAVEN_REPOSITORY, home.principal, &root, path);
     assert_eq!(check(&unit), UnitRecheck::Passed);
     // A local install in the unit after the plan.
+    home.write(".m2/repository/org/lib/2.0/lib-2.0.jar", b"jar");
     home.write(
         ".m2/repository/org/lib/2.0/_remote.repositories",
         b"lib-2.0.jar>=\n",
@@ -658,6 +821,10 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
 fn the_inspection_reports_the_roots_and_the_units_of_a_proposed_rule() {
     let home = Home::new();
     home.write(".nuget/packages/newtonsoft.json/13.0.1/lib.dll", b"dll");
+    home.write(
+        ".nuget/packages/newtonsoft.json/13.0.1/.nupkg.metadata",
+        b"{\"version\": 2, \"source\": \"https://api.nuget.org/v3/index.json\"}",
+    );
     let registry: ReviewedRules = ReviewedRules::new().unwrap();
     let host: DiscoveryHost = home.host();
     let cancel = CancellationToken::new();

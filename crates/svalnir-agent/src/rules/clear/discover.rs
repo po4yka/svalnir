@@ -178,12 +178,18 @@ impl ClearRule {
             assessment.reasons.insert(SkipReason::ExclusionOverlap);
             return Ok((assessment, None));
         }
+        // The origin of the content: a unit whose evidence does not show a
+        // download from a remote source is data that no download gives
+        // again.
+        if super::guard_refuses(spec.guard, &path) {
+            assessment.eligibility.no_exclusion_overlap = Fact::NotSatisfied;
+            assessment.reasons.insert(SkipReason::ProtectedData);
+            return Ok((assessment, None));
+        }
         assessment.eligibility.no_exclusion_overlap = Fact::Satisfied;
         // Predicate 8: the complete unit and its charge.
         if before.kind == ObjectKind::Directory {
             let refuse: &'static [&'static str] = spec.refuse_names;
-            let records: bool = spec.units == UnitForm::MavenArtifact;
-            let unit_path: PathBuf = path.clone();
             let stopped: Option<DiscoveryCompletion> = establish_charge(
                 &mut assessment,
                 None,
@@ -195,10 +201,8 @@ impl ClearRule {
                 self.rule(),
                 &mut collector.bounds,
                 &mut |relative: &Path, kind: EntryKind| {
-                    let refused: bool = kind != EntryKind::Directory
-                        && (has_refused_name(refuse, relative)
-                            || (records && is_local_record(&unit_path.join(relative), relative)));
-                    refused.then_some(SkipReason::ProtectedData)
+                    (kind != EntryKind::Directory && has_refused_name(refuse, relative))
+                        .then_some(SkipReason::ProtectedData)
                 },
             )?;
             if stopped.is_some() {
@@ -360,15 +364,6 @@ fn has_refused_name(names: &[&str], relative: &Path) -> bool {
     })
 }
 
-/// Whether the file `relative` at `path` is a `_remote.repositories`
-/// record of a local install.
-fn is_local_record(path: &Path, relative: &Path) -> bool {
-    relative
-        .file_name()
-        .is_some_and(|name| name == std::ffi::OsStr::new(super::REMOTE_RECORD))
-        && super::has_local_install_record(path)
-}
-
 /// The reason that the child `relative` with the snapshot `snapshot` is not
 /// a unit of `spec`, or `None`.
 fn form_refusal(
@@ -406,9 +401,11 @@ const MAX_RECHECK_ENTRIES: u64 = 2_000_000;
 /// - The unit is a child of the root `root` that the rule does not keep,
 ///   with the form of the rule, and the user `principal` owns it. A unit
 ///   that is gone gives [`UnitRecheck::Absent`].
-/// - For `maven.repository`, the unit is still an artifact directory, and
-///   no entry below it is `maven-metadata-local.xml` or a
-///   `_remote.repositories` record of a local install. The walk follows no symbolic link and reads at
+/// - The guard of the rule ([`super::guard_refuses`]) accepts the unit
+///   again: for `maven.repository`, the unit is still an artifact directory
+///   whose `.jar` and `.pom` files a `_remote.repositories` record
+///   attributes to a remote repository, with no `maven-metadata-local.xml`
+///   below it; for `nuget.packages`, each version has a remote source. The walk follows no symbolic link and reads at
 ///   most 2 000 000 entries; a walk that stops or cannot read a directory
 ///   gives [`UnitRecheck::Unknown`].
 ///
@@ -443,16 +440,16 @@ pub fn recheck_unit(spec: &ClearSpec, principal: Uid, root: &Path, path: &Path) 
     if snapshot.owner != principal {
         return UnitRecheck::Refused("unit_owner");
     }
-    let records: bool = spec.units == UnitForm::MavenArtifact;
-    if records && !super::is_artifact_directory(path) {
+    if spec.units == UnitForm::MavenArtifact && !super::is_artifact_directory(path) {
         return UnitRecheck::Refused("unit_layout_changed");
     }
-    if (spec.refuse_names.is_empty() && !records) || snapshot.kind != ObjectKind::Directory {
+    if snapshot.kind == ObjectKind::Directory && super::guard_refuses(spec.guard, path) {
+        return UnitRecheck::Refused("protected_child");
+    }
+    if spec.refuse_names.is_empty() || snapshot.kind != ObjectKind::Directory {
         return UnitRecheck::Passed;
     }
-    let refuses = |file: &Path, name: &Path| -> bool {
-        has_refused_name(spec.refuse_names, name) || (records && is_local_record(file, name))
-    };
+    let refuses = |_file: &Path, name: &Path| -> bool { has_refused_name(spec.refuse_names, name) };
     match find_refused(path, snapshot.object.device.get(), &refuses) {
         Ok(false) => UnitRecheck::Passed,
         Ok(true) => UnitRecheck::Refused("protected_child"),

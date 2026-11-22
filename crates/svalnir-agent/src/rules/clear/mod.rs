@@ -104,6 +104,10 @@ pub const BUN_CACHE_RULE_ID: &str = "bun.cache";
 /// that it is not complete.
 pub const MAX_EXPANDED_ROOTS: usize = 32;
 
+/// The largest number of names of one directory that the expansion of a
+/// component `*` reads.
+pub const MAX_EXPANSION_ENTRIES: usize = 4_096;
+
 /// The largest size of `~/.m2/settings.xml` that the rule reads.
 pub const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
 
@@ -120,10 +124,200 @@ pub enum UnitForm {
     /// `VERSION` that holds a file `ARTIFACT-*.pom` or `ARTIFACT-*.jar`
     /// ([`is_artifact_directory`]). The walk to the artifact directories is
     /// bounded; a group directory, and an entry that is in no artifact
-    /// directory, is never a unit. A unit with a `_remote.repositories`
-    /// record that names no remote repository is refused, as a local
-    /// install ([`has_local_install_record`]).
+    /// directory, is never a unit.
     MavenArtifact,
+}
+
+/// The check of the origin of the content of a unit. A unit that the check
+/// refuses, or whose evidence is missing or cannot be read, is skipped with
+/// `protected_data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitGuard {
+    /// No check of the origin.
+    None,
+    /// Each `.jar` and `.pom` of each version directory of the artifact is
+    /// attributed to a remote repository ([`version_is_downloaded`]).
+    MavenDownloaded,
+    /// The `.nupkg.metadata` of each version directory of the package
+    /// names an `http` or `https` source ([`version_has_remote_source`]).
+    NuGetRemoteSource,
+}
+
+/// The marker of a bound root: a cheap check that the directory is the
+/// cache of the producer. A root with no marker is refused with
+/// `clear_root_unmarked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootMarker {
+    /// No marker: the guard of each unit attributes its content.
+    None,
+    /// A directory of this name beside the root.
+    Sibling(&'static str),
+    /// A child directory of the root with one of these names.
+    AnyChild(&'static [&'static str]),
+    /// A child of the root whose name has this text.
+    ChildNameContains(&'static str),
+    /// A file `ID/VERSION/.nupkg.metadata` below the root.
+    NuGetPackage,
+}
+
+/// The largest number of children of a root that the marker check reads.
+const MAX_MARKER_ENTRIES: usize = 256;
+
+/// Whether the root `root` has the marker `marker`.
+#[must_use]
+pub fn has_marker(marker: RootMarker, root: &Path) -> bool {
+    let is_directory =
+        |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    let children = |path: &Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(path).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .take(MAX_MARKER_ENTRIES)
+                    .collect()
+            },
+        )
+    };
+    match marker {
+        RootMarker::None => true,
+        RootMarker::Sibling(name) => root
+            .parent()
+            .is_some_and(|parent| is_directory(&parent.join(name))),
+        RootMarker::AnyChild(names) => names.iter().any(|name| is_directory(&root.join(name))),
+        RootMarker::ChildNameContains(text) => children(root).iter().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.contains(text))
+        }),
+        RootMarker::NuGetPackage => children(root).iter().any(|package| {
+            is_directory(&package.path())
+                && children(&package.path()).iter().any(|version| {
+                    std::fs::symlink_metadata(version.path().join(NUGET_METADATA))
+                        .is_ok_and(|metadata| metadata.is_file())
+                })
+        }),
+    }
+}
+
+/// The record of the package cache of `NuGet` in each version directory.
+pub const NUGET_METADATA: &str = ".nupkg.metadata";
+
+/// Whether the guard `guard` refuses the unit at `unit`. Missing or
+/// unreadable evidence refuses it.
+#[must_use]
+pub fn guard_refuses(guard: UnitGuard, unit: &Path) -> bool {
+    let check: fn(&Path) -> bool = match guard {
+        UnitGuard::None => return false,
+        UnitGuard::MavenDownloaded => version_is_downloaded,
+        UnitGuard::NuGetRemoteSource => version_has_remote_source,
+    };
+    let Ok(entries) = std::fs::read_dir(unit) else {
+        return true;
+    };
+    let mut count: usize = 0;
+    for entry in entries {
+        count = count.saturating_add(1);
+        let Ok(entry) = entry else {
+            return true;
+        };
+        if count > MAX_ARTIFACT_PROBE_ENTRIES {
+            return true;
+        }
+        let path: PathBuf = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return true;
+        };
+        if metadata.is_dir() && !check(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the text of a small regular file at `path`, to
+/// [`MAX_REMOTE_RECORD_BYTES`]. `None` when it is absent, is not a regular
+/// file, is larger, or is not text.
+fn small_text(path: &Path) -> Option<String> {
+    let readable: bool = std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_REMOTE_RECORD_BYTES);
+    if !readable {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Whether each `.jar` and each `.pom` of the Maven version directory
+/// `version` is attributed to a remote repository. Maven Resolver writes
+/// `_remote.repositories` with a line `FILE>REPOSITORY=` for each file that
+/// it downloaded, and `FILE>=` for a file that `mvn install` put there. A
+/// file with no line, a line with no repository, and a record that is
+/// absent or cannot be read give `false`: a hand-copied file has no record,
+/// and no download can give it again. A version directory with no `.jar`
+/// and no `.pom` gives `true`.
+#[must_use]
+pub fn version_is_downloaded(version: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(version) else {
+        return false;
+    };
+    let mut files: Vec<String> = Vec::new();
+    for entry in entries.take(MAX_ARTIFACT_PROBE_ENTRIES.saturating_add(1)) {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let is_artifact: bool = Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension == "jar" || extension == "pom");
+        if is_artifact {
+            files.push(name.to_owned());
+        }
+        if files.len() > MAX_ARTIFACT_PROBE_ENTRIES {
+            return false;
+        }
+    }
+    if files.is_empty() {
+        return true;
+    }
+    let Some(record) = small_text(&version.join(REMOTE_RECORD)) else {
+        return false;
+    };
+    let remote: Vec<&str> = record
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (file, rest) = line.split_once('>')?;
+            let (repository, _) = rest.split_once('=')?;
+            (!repository.trim().is_empty()).then_some(file.trim())
+        })
+        .collect();
+    files.iter().all(|file| remote.contains(&file.as_str()))
+}
+
+/// Whether the `.nupkg.metadata` of the `NuGet` version directory `version`
+/// names a `source` that is an `http` or `https` URL. A record that is
+/// absent, cannot be read, or names a local folder feed gives `false`: a
+/// package of a local feed can exist nowhere else.
+#[must_use]
+pub fn version_has_remote_source(version: &Path) -> bool {
+    let Some(text) = small_text(&version.join(NUGET_METADATA)) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|source| {
+            let lower: String = source.to_ascii_lowercase();
+            lower.starts_with("https://") || lower.starts_with("http://")
+        })
 }
 
 /// A configuration file of the producer that can name the root.
@@ -154,6 +348,10 @@ pub struct ClearSpec {
     pub refuse_names: &'static [&'static str],
     /// What a child must be to be a unit.
     pub units: UnitForm,
+    /// The check of the origin of the content of a unit.
+    pub guard: UnitGuard,
+    /// The marker that a bound root must have ([`has_marker`]).
+    pub marker: RootMarker,
     /// The file names of the executables of the producer. A process of the
     /// user with one of them blocks the discovery and each step.
     pub processes: &'static [&'static str],
@@ -184,7 +382,9 @@ pub const CARGO_REGISTRY: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
-    processes: &["cargo", "rustc"],
+    guard: UnitGuard::None,
+    marker: RootMarker::Sibling("index"),
+    processes: &["cargo", "rustc", "rust-analyzer"],
     rebuild_cost: RebuildCost::Medium,
     kept: "`~/.cargo/registry/index`, `~/.cargo/git` (its checkouts can hold work), `~/.cargo/bin`, and the configuration and credentials of the Cargo home stay.",
     regeneration: "The next build downloads each removed crate archive again and extracts its source; it needs a registry that is still available, and `cargo build --offline` fails for a crate whose archive is gone.",
@@ -200,6 +400,8 @@ pub const GRADLE_CACHES: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["modules-2"]),
     processes: JAVA,
     rebuild_cost: RebuildCost::Medium,
     kept: "`gradle.properties` (it can hold credentials), `init.d`, `wrapper/dists`, `jdks`, `daemon`, and `native` of `~/.gradle` stay.",
@@ -216,9 +418,11 @@ pub const MAVEN_REPOSITORY: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &["maven-metadata-local.xml"],
     units: UnitForm::MavenArtifact,
+    guard: UnitGuard::MavenDownloaded,
+    marker: RootMarker::None,
     processes: JAVA,
     rebuild_cost: RebuildCost::Medium,
-    kept: "`settings.xml`, `settings-security.xml`, `toolchains.xml`, and `extensions.xml` of `~/.m2` stay, and so does each artifact directory with a local install (`maven-metadata-local.xml`, or a `_remote.repositories` record with no remote repository).",
+    kept: "`settings.xml`, `settings-security.xml`, `toolchains.xml`, and `extensions.xml` of `~/.m2` stay, and so does each artifact directory with a `.jar` or a `.pom` that no `_remote.repositories` record attributes to a remote repository, for example a local install or a hand-copied file.",
     regeneration: "The next build downloads each removed artifact again and needs a remote repository that still has it; an offline build fails for an artifact that is gone.",
 };
 
@@ -238,10 +442,12 @@ pub const RUBYGEMS_CACHE: ClearSpec = ClearSpec {
     keep: &["bundler"],
     refuse_names: &[],
     units: UnitForm::GemFile,
+    guard: UnitGuard::None,
+    marker: RootMarker::Sibling("specifications"),
     processes: &["ruby"],
     rebuild_cost: RebuildCost::Low,
     kept: "The installed gems, `cache/bundler` (Bundler keeps a bare clone of each Git source there, which can hold commits that the remote no longer has), and each child of the cache that is not a `.gem` file stay.",
-    regeneration: "`gem pristine` and `gem install` download a removed `.gem` file again; `bundle cache` without `--all-platforms` fails for a gem whose copy is gone.",
+    regeneration: "`gem pristine` and `gem install` download a removed `.gem` file again; `bundle cache` without `--all-platforms` fails for a gem whose copy is gone. A gem that was installed from a local `.gem` file loses its only cached copy: `gem pristine` and `bundle cache` then fail for it.",
 };
 
 /// The rule `deno.remote`.
@@ -254,6 +460,8 @@ pub const DENO_REMOTE: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["https", "http"]),
     processes: &["deno"],
     rebuild_cost: RebuildCost::Low,
     kept: "`location_data` (the localStorage and Cache API data of each script), `deno_history.txt` (the REPL history), and each other entry of the Deno directory stay.",
@@ -270,6 +478,8 @@ pub const DENO_NPM: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["registry.npmjs.org"]),
     processes: &["deno"],
     rebuild_cost: RebuildCost::Low,
     kept: "`location_data`, `deno_history.txt`, and each other entry of the Deno directory stay.",
@@ -286,6 +496,8 @@ pub const DENO_GEN: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["file", "https", "http"]),
     processes: &["deno"],
     rebuild_cost: RebuildCost::Low,
     kept: "`location_data`, `deno_history.txt`, and each other entry of the Deno directory stay.",
@@ -302,9 +514,11 @@ pub const NUGET_PACKAGES: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::NuGetRemoteSource,
+    marker: RootMarker::NuGetPackage,
     processes: &["dotnet"],
     rebuild_cost: RebuildCost::Medium,
-    kept: "`NuGet.Config` and the other folders of `~/.nuget` stay.",
+    kept: "`NuGet.Config` and the other folders of `~/.nuget` stay, and so does each package with a version whose `.nupkg.metadata` names no `http` or `https` source, for example a package from a local folder feed.",
     regeneration: "The next `dotnet restore` downloads each removed package again and needs a feed that still has it.",
 };
 
@@ -321,6 +535,8 @@ pub const NUGET_HTTP_CACHE: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::ChildNameContains("$"),
     processes: &["dotnet"],
     rebuild_cost: RebuildCost::Low,
     kept: "The global packages and the other folders of `~/.local/share/NuGet` stay.",
@@ -337,6 +553,8 @@ pub const SWIFTPM_CACHE: ClearSpec = ClearSpec {
     keep: &["artifacts", "prebuilts"],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["repositories", "manifests"]),
     processes: &[
         "swift-build",
         "swift-package",
@@ -359,7 +577,9 @@ pub const ZIG_GLOBAL_CACHE: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
-    processes: &["zig"],
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["h", "o", "z"]),
+    processes: &["zig", "zls"],
     rebuild_cost: RebuildCost::Medium,
     kept: "The Zig installation and each project-local `.zig-cache` stay.",
     regeneration: "The next build compiles each removed artifact again and downloads each removed package again from the URL of its `build.zig.zon`.",
@@ -375,6 +595,8 @@ pub const HEX_PACKAGES: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["hexpm"]),
     processes: BEAM,
     rebuild_cost: RebuildCost::Low,
     kept: "`hex.config` (it holds the API key of the user) and the registry cache of `~/.hex` stay.",
@@ -391,6 +613,8 @@ pub const REBAR3_HEX: ClearSpec = ClearSpec {
     keep: &[],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::AnyChild(&["hexpm"]),
     processes: BEAM,
     rebuild_cost: RebuildCost::Low,
     kept: "`bin` and `vsns` (the rebar3 of `rebar3 local install`) and the global plugins of `~/.cache/rebar3` stay.",
@@ -407,6 +631,8 @@ pub const BUN_CACHE: ClearSpec = ClearSpec {
     keep: &["links"],
     refuse_names: &[],
     units: UnitForm::Any,
+    guard: UnitGuard::None,
+    marker: RootMarker::ChildNameContains("@"),
     processes: &["bun"],
     rebuild_cost: RebuildCost::Low,
     kept: "`links` (the global link store), the global packages of `~/.bun/install/global`, and the Bun executable stay.",
@@ -669,14 +895,13 @@ pub struct ClearRootEntry {
 #[must_use]
 pub fn resolve(spec: &ClearSpec, home: &Path) -> (Vec<ClearRootEntry>, bool) {
     if spec.configuration == Some(RootConfiguration::MavenSettings) {
-        match maven_local_repository(home) {
+        let (configured, file) = maven_local_repository(home);
+        match configured {
             Configured::Unset => {}
             Configured::Path(path) => {
                 return (
                     vec![ClearRootEntry {
-                        source: RootSource::Configuration {
-                            file: MAVEN_SETTINGS,
-                        },
+                        source: RootSource::Configuration { file },
                         path: Some(path),
                         problem: None,
                     }],
@@ -686,9 +911,7 @@ pub fn resolve(spec: &ClearSpec, home: &Path) -> (Vec<ClearRootEntry>, bool) {
             Configured::Problem(problem) => {
                 return (
                     vec![ClearRootEntry {
-                        source: RootSource::Configuration {
-                            file: MAVEN_SETTINGS,
-                        },
+                        source: RootSource::Configuration { file },
                         path: None,
                         problem: Some(problem),
                     }],
@@ -736,16 +959,24 @@ fn expand(home: &Path, pattern: &str, room: usize) -> (Vec<PathBuf>, bool) {
             let Ok(entries) = std::fs::read_dir(&base) else {
                 continue;
             };
-            let mut names: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|entry| PathBuf::from(entry.file_name()))
-                .filter(|name| {
-                    !name.as_os_str().as_encoded_bytes().starts_with(b".")
-                        && std::fs::symlink_metadata(base.join(name))
-                            .is_ok_and(|metadata| metadata.is_dir())
-                })
-                .take(MAX_EXPANDED_ROOTS.saturating_add(1))
-                .collect();
+            // The names are sorted before the cut, so the roots that the
+            // bound keeps are the first ones in name order.
+            let mut listed: usize = 0;
+            let mut names: Vec<PathBuf> = Vec::new();
+            for entry in entries.filter_map(Result::ok) {
+                listed = listed.saturating_add(1);
+                if listed > MAX_EXPANSION_ENTRIES {
+                    complete = false;
+                    break;
+                }
+                let name: PathBuf = PathBuf::from(entry.file_name());
+                let is_directory: bool = !name.as_os_str().as_encoded_bytes().starts_with(b".")
+                    && std::fs::symlink_metadata(base.join(&name))
+                        .is_ok_and(|metadata| metadata.is_dir());
+                if is_directory {
+                    names.push(name);
+                }
+            }
             names.sort();
             next.extend(names.into_iter().map(|name| base.join(name)));
         }
@@ -833,34 +1064,6 @@ pub fn is_artifact_directory(directory: &Path) -> bool {
     false
 }
 
-/// Whether the `_remote.repositories` record at `path` shows a local
-/// install, or cannot be read: Maven Resolver writes `FILE>REPOSITORY=` for
-/// a file that it downloaded from the repository `REPOSITORY`, and
-/// `FILE>=` with no repository for a file that `mvn install` put there. A
-/// record that is not a regular file, that is larger than
-/// [`MAX_REMOTE_RECORD_BYTES`], or that is not text is treated as a local
-/// install.
-#[must_use]
-pub fn has_local_install_record(path: &Path) -> bool {
-    let readable: bool = std::fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_REMOTE_RECORD_BYTES);
-    if !readable {
-        return true;
-    }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return true;
-    };
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .any(|line| match line.split_once('>') {
-            Some((_, rest)) => rest
-                .split_once('=')
-                .is_none_or(|(id, _)| id.trim().is_empty()),
-            None => true,
-        })
-}
-
 /// The artifact directories below `root`, relative to it, in name order, at
 /// most `limit`. The walk reads only directories that are not symbolic
 /// links and that are on the device `device`, to [`MAX_ARTIFACT_DEPTH`]
@@ -944,9 +1147,59 @@ pub(in crate::rules) enum Configured {
 /// with another property or an entity, a relative value, a value with a
 /// `.` or `..` component, and a value that is not below the home directory
 /// give a problem. Two elements give a problem.
-pub(in crate::rules) fn maven_local_repository(home: &Path) -> Configured {
-    let file: PathBuf = home.join(MAVEN_SETTINGS);
-    let metadata = match std::fs::symlink_metadata(&file) {
+pub(in crate::rules) fn maven_local_repository(home: &Path) -> (Configured, &'static str) {
+    let user: Configured = read_settings(&home.join(MAVEN_SETTINGS), home);
+    if user != Configured::Unset {
+        return (in_work_tree(user, home), MAVEN_SETTINGS);
+    }
+    for file in MAVEN_GLOBAL_SETTINGS {
+        let path: PathBuf = if file.starts_with('/') {
+            PathBuf::from(file)
+        } else {
+            home.join(file)
+        };
+        let global: Configured = read_settings(&path, home);
+        if global != Configured::Unset {
+            return (in_work_tree(global, home), file);
+        }
+    }
+    (Configured::Unset, MAVEN_SETTINGS)
+}
+
+/// The global settings files of the Maven installations that the rule can
+/// locate with no tool run: Homebrew on Apple silicon and on Intel, and
+/// the current version of SDKMAN! (relative to the home directory). The
+/// first file that names a location is used, after the settings of the
+/// user. Another installation (`MAVEN_HOME`, a Maven of an IDE, a
+/// distribution of the Maven Wrapper) is not read.
+pub const MAVEN_GLOBAL_SETTINGS: [&str; 3] = [
+    "/opt/homebrew/opt/maven/libexec/conf/settings.xml",
+    "/usr/local/opt/maven/libexec/conf/settings.xml",
+    ".sdkman/candidates/maven/current/conf/settings.xml",
+];
+
+/// `configured`, or a problem when its path is in a Git work tree: a
+/// directory from the path up to the home directory (not included) has a
+/// `.git` entry. A local repository in a project folder can be the work of
+/// the user.
+fn in_work_tree(configured: Configured, home: &Path) -> Configured {
+    let Configured::Path(path) = &configured else {
+        return configured;
+    };
+    let in_tree: bool = path
+        .ancestors()
+        .take_while(|ancestor| *ancestor != home)
+        .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
+    if in_tree {
+        Configured::Problem("configuration_in_work_tree")
+    } else {
+        configured
+    }
+}
+
+/// The value of `localRepository` of the settings file `file`.
+fn read_settings(file: &Path, home: &Path) -> Configured {
+    let metadata = match std::fs::symlink_metadata(file) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Configured::Unset;
@@ -959,7 +1212,7 @@ pub(in crate::rules) fn maven_local_repository(home: &Path) -> Configured {
     if metadata.len() > MAX_SETTINGS_BYTES {
         return Configured::Problem("configuration_too_large");
     }
-    let Ok(bytes) = std::fs::read(&file) else {
+    let Ok(bytes) = std::fs::read(file) else {
         return Configured::Problem("configuration_not_readable");
     };
     let Ok(text) = String::from_utf8(bytes) else {

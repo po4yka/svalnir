@@ -830,6 +830,25 @@ pub struct EvictionDiscovery {
     pub project_roots: Vec<SearchRootReport>,
 }
 
+/// The result of a bound root of the clear rule `clear` that the discovery
+/// does not examine: a root on a volume that the request does not name, or
+/// a root with no marker of its producer, which is not bound as its cache
+/// (`clear_root_unmarked`).
+fn clear_root_refusal(
+    clear: &ClearRule,
+    request: &EvictionRequest<'_>,
+    bound: &BoundRoot,
+) -> Option<RootResult> {
+    if request
+        .volumes
+        .is_some_and(|volumes| !volumes.contains(&bound.binding.volume_id))
+    {
+        return Some(RootResult::OtherVolume);
+    }
+    (!clear::has_marker(clear.spec().marker, &bound.binding.path))
+        .then_some(RootResult::Refused("clear_root_unmarked"))
+}
+
 /// A stable name of a discovery refusal, with no path.
 pub(super) const fn refusal_name(error: &DiscoveryError) -> &'static str {
     match error {
@@ -1220,14 +1239,14 @@ impl ReviewedRules {
                     continue;
                 }
             };
-            if request
-                .volumes
-                .is_some_and(|volumes| !volumes.contains(&bound.binding.volume_id))
-            {
+            if let Some(refused) = clear_root_refusal(clear, request, &bound) {
+                if refused != RootResult::OtherVolume {
+                    result.complete = false;
+                }
                 result.roots.push(RootReport {
                     rule: rule.reference.clone(),
                     path: Some(path),
-                    result: RootResult::OtherVolume,
+                    result: refused,
                 });
                 continue;
             }

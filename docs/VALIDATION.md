@@ -363,7 +363,7 @@ A promotion record is a case record of section 12 with `validation_id: VAL-05` a
 
 ```yaml
 rule_id: xcode.inactive-derived-data
-rule_revision: r1
+rule_revision: r2
 layout: derived-data-project-v1
 lifecycle_target: automatic_eviction_validated
 record_id: VAL-05/xcode.inactive-derived-data/r2/derived-data-project-v1/automatic
@@ -506,11 +506,11 @@ The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules
 2. On a branch, set the lifecycle state of the layouts under validation in `crates/svalnir-agent/src/rules/clear/mod.rs` to `manual_action_validated`, with the `record_id` as the reference. Run `scripts/check.sh`, record its exit status, and build with `cargo build --release --locked`.
 3. `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`, then `svalnir config apply --config ./config.toml --expected-revision none` with `schema_version = 1`.
 4. For each producer, make a disposable project below `~/Validation` and run its fetch or build command (for example `cargo fetch`, `gradle build`, `mvn package`, `bundle install`, `deno cache`, `dotnet restore`, `swift package resolve`, `zig build`, `mix deps.get`, `rebar3 get-deps`, `bun install`) so that the producer fills its cache. Record each cache root that the producer reports (`gem env gemdir`, `deno info --json`, `dotnet nuget locals all --list`, `zig env`) and compare it with the root of the rule.
-5. Make the guard fixtures: a Git checkout in `~/.cargo/git/checkouts` with an edit; `mvn install` of one project, so that `maven-metadata-local.xml` is in the local repository; a Gemfile with a Git source, so that `cache/bundler/git` has a clone; a script that writes localStorage, so that the Deno directory has `location_data`; and, for `maven.repository`, a second run with `localRepository` in `~/.m2/settings.xml`.
+5. Make the guard fixtures: a Git checkout in `~/.cargo/git/checkouts` with an edit; `mvn install` of one project, so that `maven-metadata-local.xml` is in the local repository; a Gemfile with a Git source, so that `cache/bundler/git` has a clone; a script that writes localStorage, so that the Deno directory has `location_data`; a driver `.jar` and `.pom` copied by hand into `~/.m2/repository`; a package restored from a local folder feed of NuGet; and, for `maven.repository`, a second run with `localRepository` in `~/.m2/settings.xml`.
 
 **Inspection**
 
-6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: `resolved_roots` has the root of step 4; each unit has a size; the units of step 5 are not eligible (`protected_data` for `bundler` and for the artifact directory of the local install, `nested_repository` for `repositories` of SwiftPM); the other artifacts of the group of the local install are units. Keep the output.
+6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: `resolved_roots` has the root of step 4; each unit has a size; the units of step 5 are not eligible (`protected_data` for `bundler`, for the artifact directory of the local install and of the hand-copied driver, and for the package of the local feed, `nested_repository` for `repositories` of SwiftPM); the other artifacts of the group of the local install are units. Keep the output.
 
 **Consent and activity**
 

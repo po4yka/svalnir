@@ -43,8 +43,12 @@ readonly NOTARIZE="${SVALNIR_NOTARIZE:-0}"
 
 # Paths that only a build host has. A release executable must not name them.
 # The home directory and the checkout of this host are checked as literals.
-# `/Users/NAME/` is not in the pattern: the fixtures of the GUI have such paths.
-readonly HOST_PATHS='/Users/runner/|/home/runner|/var/folders/|/private/tmp/|\.cargo/(registry|git)/|\.rustup/toolchains/|/mise/installs/'
+# A path below a home directory is a host path only with a directory of the
+# toolchain after it: the rules of the product name relative paths such as
+# `.cargo/registry/cache`, which can stand next to another string in the
+# file. The fixture home of the GUI (`FIXTURE_HOME`) is not a host path.
+readonly HOST_PATHS='/Users/runner/|/home/runner|/var/folders/|/private/tmp/|/(Users|home)/[^/]+/\.cargo/(registry|git)/|/(Users|home)/[^/]+/\.rustup/toolchains/|/(Users|home)/[^/]+/\.local/share/mise/installs/'
+readonly FIXTURE_HOME='/(Users|home)/fixture/'
 # The prefix of each environment variable that only a test build reads.
 readonly TEST_SWITCH='SVALNIR_TEST_'
 # Formats of well-known credentials. This is a search for an accident, not
@@ -109,7 +113,8 @@ no_match() {
 
 check_hygiene() {
     local file="$1" found literal
-    no_match "$file" "a path of a build host" "$HOST_PATHS"
+    found="$(file_strings "$file" | grep -E -o -- "$HOST_PATHS" | grep -E -v -- "^$FIXTURE_HOME" | head -n 3 || true)"
+    [ -z "$found" ] || fail "$(basename "$file") has a path of a build host: $(head -c 300 <<<"$found")"
     no_match "$file" "a test-only switch" "$TEST_SWITCH"
     no_match "$file" "a known secret format" "$SECRET_FORMATS"
     for literal in "$ROOT" "$HOME"; do

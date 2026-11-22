@@ -21,15 +21,15 @@ use super::rearm::IncidentBudget;
 use super::state::{ActiveRevision, AuthorityState, InstanceInhibition, policy_id};
 use crate::action::{
     ActionClass, ActionError, ActionStage, DispatchState, ErrorCode, ErrorCodeError, ErrorFamily,
-    Escalation, FileBinding, Plan, PlanApproval, PlannedStep, RecordingMode, TargetBinding,
-    TriggerClass, critical_exception_applies,
+    Escalation, FileBinding, OwnerOperationBound, OwnerOperationKind, Plan, PlanApproval,
+    PlannedStep, RecordingMode, TargetBinding, TriggerClass, critical_exception_applies,
 };
 use crate::authority::{ActionGrant, ActionGrantRef};
 use crate::digest::ContentDigest;
 use crate::id::{BootId, ClockDomainId, PlanId, PolicyRevisionId, StepId};
 use crate::policy::PolicyId;
 use crate::process::Uid;
-use crate::rule::{RuleMode, RuleRef, RuleRefusal, RuleRegistry};
+use crate::rule::{DeletionMethod, Rule, RuleMode, RuleRef, RuleRefusal, RuleRegistry};
 use crate::time::MonotonicNanos;
 
 /// The records that the authorization reads.
@@ -429,19 +429,28 @@ fn rule_refusal(refusal: RuleRefusal) -> RefusalReason {
 impl StepCheck<'_> {
     /// Checks that the lifecycle state of `rule` permits `mode` for the
     /// layout that the sealed plan binds for the target.
+    ///
+    /// An owner operation is the removal method of a rule whose deletion
+    /// method is `producer_operation`; a rule with a different method has
+    /// no owner operation, so no lifecycle state permits one.
     fn check_rule_mode(&self, rule: &RuleRef, mode: &RuleMode) -> Result<(), RefusalReason> {
-        let TargetBinding::File(FileBinding {
-            layout: Some(layout),
-            ..
-        }) = self.binding
-        else {
-            return Err(RefusalReason::LayoutMissing);
+        let (layout, is_owner): (&str, bool) = match self.binding {
+            TargetBinding::File(FileBinding {
+                layout: Some(layout),
+                ..
+            }) => (layout.as_str(), false),
+            TargetBinding::OwnerOperation(owner) => (owner.layout.as_str(), true),
+            _ => return Err(RefusalReason::LayoutMissing),
         };
-        self.context
+        let resolved: &Rule = self
+            .context
             .registry
             .resolve(rule, layout, mode)
-            .map(|_| ())
-            .map_err(rule_refusal)
+            .map_err(rule_refusal)?;
+        if is_owner && resolved.deletion_method != DeletionMethod::ProducerOperation {
+            return Err(RefusalReason::RuleModeNotValidated);
+        }
+        Ok(())
     }
 
     /// A manual step: the approval that is bound to the plan is the
@@ -479,6 +488,14 @@ impl StepCheck<'_> {
                 (Some(_), None) => return Err(RefusalReason::RuleNotGranted),
                 (None, _) => {}
             }
+        }
+        // An owner operation uses the manual eviction mode of its rule,
+        // for the layout that the sealed plan binds.
+        if let TargetBinding::OwnerOperation(owner) = self.binding {
+            if self.step.action_class != ActionClass::RunOwnerOperation {
+                return Err(RefusalReason::RuleNotGranted);
+            }
+            self.check_rule_mode(&owner.rule, &RuleMode::ManualEviction)?;
         }
         Ok(AuthorizationBasis::PlanApproval {
             plan_id: plan.plan_id.clone(),
@@ -521,8 +538,25 @@ impl StepCheck<'_> {
             TargetBinding::File(file) => {
                 let rule: &RuleRef = file.rule.as_ref().ok_or(RefusalReason::RuleNotGranted)?;
                 let approved: bool = self.active.scope.rules(PolicyId::DiskGuard).contains(rule);
-                if !approved || !grant.covers_rule(rule, now) {
+                if !approved || !grant.covers_rule(&self.step.action_class, rule, now) {
                     return Err(RefusalReason::RuleNotGranted);
+                }
+                self.check_rule_mode(rule, &RuleMode::AutomaticEviction)
+            }
+            // An automatic owner operation is a bounded `prune`; the seal
+            // of the plan refuses each other one, and this check fails
+            // closed for it again.
+            TargetBinding::OwnerOperation(owner) => {
+                let rule: &RuleRef = &owner.rule;
+                let approved: bool = self.active.scope.rules(PolicyId::DiskGuard).contains(rule);
+                if !approved || !grant.covers_rule(&self.step.action_class, rule, now) {
+                    return Err(RefusalReason::RuleNotGranted);
+                }
+                let bounded: bool = matches!(owner.operation, OwnerOperationKind::Prune)
+                    && matches!(owner.bound, OwnerOperationBound::WithinScope)
+                    && !owner.clear_opt_in;
+                if !bounded {
+                    return Err(RefusalReason::UnsupportedValue);
                 }
                 self.check_rule_mode(rule, &RuleMode::AutomaticEviction)
             }
@@ -626,7 +660,11 @@ impl StepCheck<'_> {
         }
         let grant: &ActionGrant = self.standing_grant(policy)?;
         self.check_scope(grant)?;
-        self.check_evidence()?;
+        // The trigger evidence is a condition of the start of a step and not
+        // of a command that runs (the stage `execution`).
+        if !matches!(self.request.stage, ActionStage::Execution) {
+            self.check_evidence()?;
+        }
         if matches!(
             self.request.recording,
             RecordingMode::VolatileCriticalException
@@ -676,7 +714,11 @@ fn decide(
     if plan.authority.policy_revision != active.revision.revision_id {
         return Err(RefusalReason::PolicyRevisionMismatch);
     }
-    if plan.is_expired(context.clock.clock) {
+    // The stage `execution` is the check while a command of an owner
+    // operation runs: the expiry of the plan does not stop a call that was
+    // issued (`docs/ACTION_CONTRACTS.md` section 7).
+    let running: bool = matches!(request.stage, ActionStage::Execution);
+    if !running && plan.is_expired(context.clock.clock) {
         return Err(RefusalReason::PlanExpired);
     }
     if !class.accepts_trigger(trigger) {

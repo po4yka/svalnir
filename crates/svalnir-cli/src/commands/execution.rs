@@ -23,6 +23,7 @@ use svalnir_agent::coordinator::{
     Progress, Start, SystemProbe, code,
 };
 use svalnir_agent::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
+use svalnir_agent::executor::owner::{OwnerExecutor, OwnerExecutorConfig};
 use svalnir_agent::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
@@ -158,6 +159,7 @@ fn coordinator_config() -> Result<CoordinatorConfig, ErrorBody> {
     Ok(CoordinatorConfig {
         filesystem_adapter: adapter("svalnir.filesystem")?,
         process_adapter: adapter("macos.process")?,
+        owner_adapter: adapter("svalnir.owner-operation")?,
         batch_targets: 8,
         poll_interval: Nanoseconds::new(250_000_000),
         volatile_capacity: 16,
@@ -310,6 +312,10 @@ fn coordinator_dependencies(
             filesystem: Box::new(filesystem),
             roots: roots.clone(),
             application: Box::new(application),
+            owner: Box::new(OwnerExecutor::new(OwnerExecutorConfig::new(
+                AdapterId::new("svalnir.owner-operation").map_err(|_| session::identity_error())?,
+                home_directory(environment)?,
+            ))),
             probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
         },
         clock,

@@ -224,13 +224,29 @@ impl Idle for TestClock {
 }
 
 /// The registry of a test: no rule, or the reviewed rules of the agent,
-/// each of which is in the proposed lifecycle state.
+/// each of which is in the proposed lifecycle state, and the fixture rules
+/// of the second field.
 #[derive(Debug, Default)]
-pub(super) struct NoRules(pub(super) Option<ReviewedRules>);
+pub(super) struct NoRules(
+    pub(super) Option<ReviewedRules>,
+    pub(super) Vec<Rule>,
+    pub(super) Vec<svalnir_core::rule::owner::OwnerOperation>,
+);
 
 impl RuleRegistry for NoRules {
     fn rules(&self) -> Vec<&Rule> {
-        self.0.as_ref().map_or_else(Vec::new, RuleRegistry::rules)
+        let mut rules: Vec<&Rule> = self.0.as_ref().map_or_else(Vec::new, RuleRegistry::rules);
+        rules.extend(self.1.iter());
+        rules
+    }
+
+    fn owner_operation(
+        &self,
+        reference: &svalnir_core::rule::RuleRef,
+    ) -> Option<&svalnir_core::rule::owner::OwnerOperation> {
+        self.2
+            .iter()
+            .find(|declaration| &declaration.rule == reference)
     }
 }
 
@@ -457,6 +473,13 @@ impl AuthoritySource for TestAuthority {
 
     fn producer_activity(&self, _rule: &svalnir_core::rule::RuleRef) -> ProducerActivity {
         self.records().activity
+    }
+
+    fn owner_operation(
+        &self,
+        rule: &svalnir_core::rule::RuleRef,
+    ) -> Option<svalnir_core::rule::owner::OwnerOperation> {
+        self.records().registry.owner_operation(rule).cloned()
     }
 
     fn unit_use(&self, path: &Path) -> crate::rules::in_use::UnitUse {
@@ -966,6 +989,11 @@ impl Tree {
         }
     }
 
+    /// The home directory of the tree.
+    pub(super) fn home(&self) -> &Path {
+        &self.home
+    }
+
     /// The directory of the tree.
     pub(super) fn base(&self) -> &Path {
         self.database.parent().unwrap()
@@ -1060,7 +1088,7 @@ pub(super) fn principal() -> Principal {
     }
 }
 
-fn base_content(plan: &str, now: u64) -> PlanContent {
+pub(super) fn base_content(plan: &str, now: u64) -> PlanContent {
     PlanContent {
         schema_version: PLAN_SCHEMA_VERSION,
         plan_id: PlanId::new(plan).unwrap(),
@@ -1277,6 +1305,8 @@ pub(super) enum FailPoint {
     IncidentUsageBusy,
     /// The storage of the journal fails in `incident_usage`.
     IncidentUsageFailed,
+    /// The record of the process of an owner command fails.
+    RecordOwnerProcess,
 }
 
 /// A function that a test runs inside a journal call.
@@ -1584,6 +1614,41 @@ impl CoordinatorJournal for FailingJournal {
         }
         record.persist_into(&mut self.inner)
     }
+
+    fn record_owner_process(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        process: &crate::journal::OwnerProcess,
+    ) -> Result<(), OperationJournalError> {
+        if self
+            .failing
+            .lock()
+            .unwrap()
+            .contains(&FailPoint::RecordOwnerProcess)
+        {
+            return Err(OperationJournalError::NotFound);
+        }
+        self.inner
+            .record_owner_process(operation_id, step_id, process)
+    }
+
+    fn owner_processes(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Vec<crate::journal::OwnerProcess>, OperationJournalError> {
+        self.inner.owner_processes(operation_id)
+    }
+
+    fn record_owner_descendants(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        descendants: &[crate::journal::ProcessRecord],
+    ) -> Result<(), OperationJournalError> {
+        self.inner
+            .record_owner_descendants(operation_id, step_id, descendants)
+    }
 }
 
 // The assembled coordinator.
@@ -1701,6 +1766,12 @@ impl Bench {
                     Box::new(executor)
                 }
             },
+            owner: Box::new(crate::executor::owner::OwnerExecutor::new(
+                crate::executor::owner::OwnerExecutorConfig::new(
+                    AdapterId::new("svalnir.owner-operation").unwrap(),
+                    LosslessPath::from_path(&self.tree.home).unwrap(),
+                ),
+            )),
             probe: Box::new(self.host.clone()),
         }
     }
@@ -1709,6 +1780,7 @@ impl Bench {
         CoordinatorConfig {
             filesystem_adapter: AdapterId::new("svalnir.filesystem").unwrap(),
             process_adapter: AdapterId::new("macos.process").unwrap(),
+            owner_adapter: AdapterId::new("svalnir.owner-operation").unwrap(),
             batch_targets: 2,
             poll_interval: Nanoseconds::new(SECOND),
             volatile_capacity: 8,

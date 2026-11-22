@@ -39,8 +39,8 @@ use crate::controller::{
 };
 use crate::coordinator::{
     ApplicationExecutor, ApplyOutcome, ApplyRequest, Coordinator, CoordinatorConfig, Dependencies,
-    FilesystemExecutor, IdSource, Idle, Measurements, OperationView, Phase, Start, StartError,
-    TargetProbe, TimeReading, code, rearm_rejection,
+    FilesystemExecutor, IdSource, Idle, Measurements, OperationView, OwnerOperationExecutor, Phase,
+    Start, StartError, TargetProbe, TimeReading, code, rearm_rejection,
 };
 use crate::executor::fs::ApprovedRoots;
 use crate::journal::{
@@ -112,6 +112,8 @@ pub struct DriverParts {
     pub roots: ApprovedRoots,
     /// The process executor.
     pub application: Box<dyn ApplicationExecutor + Send>,
+    /// The owner executor.
+    pub owner: Box<dyn OwnerOperationExecutor + Send>,
     /// The probe of restart reconciliation.
     pub probe: Box<dyn TargetProbe + Send>,
     /// The source of the cleanup candidates.
@@ -475,10 +477,11 @@ impl Driver {
         parts: DriverParts,
     ) -> Result<DriverStart, DriverError> {
         let database: PathBuf = journal_path(state_directory);
-        let journal: OperationJournal =
-            OperationJournal::open(&database, &settings.journal).map_err(DriverError::Journal)?;
-        let mut records: OperationJournal =
-            OperationJournal::open(&database, &settings.journal).map_err(DriverError::Journal)?;
+        // The connection of the coordinator, and one for the records of the
+        // driver.
+        let open = || OperationJournal::open(&database, &settings.journal);
+        let journal: OperationJournal = open().map_err(DriverError::Journal)?;
+        let mut records: OperationJournal = open().map_err(DriverError::Journal)?;
         let time: TimeReading = parts.clock.now().ok_or(DriverError::Clock)?;
 
         let authority: SharedAuthority = SharedAuthority::new(authority_records(
@@ -495,6 +498,7 @@ impl Driver {
             filesystem: parts.filesystem,
             roots: parts.roots,
             application: parts.application,
+            owner: parts.owner,
             probe: parts.probe,
         };
         let mut coordinator: Box<Coordinator<OperationJournal>> = match Coordinator::start(
@@ -766,7 +770,7 @@ impl Driver {
                         ResourceEffect::MemoryPressure { after, .. } => {
                             pressure_after = after.value().cloned();
                         }
-                        ResourceEffect::Unrecognized => {}
+                        ResourceEffect::ScopeAllocation(_) | ResourceEffect::Unrecognized => {}
                     }
                 }
                 OperationResult {

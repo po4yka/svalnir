@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{ActionClass, Escalation, PlanContent};
+use crate::action::{ActionClass, Escalation, OwnerOperationKind, PlanContent, TargetBinding};
 use crate::rule::RuleMode;
 
 /// A manual cleanup mode of the CLI (`docs/INTERFACES.md` section 4).
@@ -94,6 +94,8 @@ pub enum PlanMode {
     Cleanup(CleanupMode),
     /// An application stop plan.
     Stop(StopKind),
+    /// A plan of owner operations of one kind (`RunOwnerOperation`).
+    Owner(OwnerOperationKind),
 }
 
 /// The mode of a plan content.
@@ -112,6 +114,7 @@ pub fn mode_of(plan: &PlanContent) -> Option<PlanMode> {
             ActionClass::MoveToTrash => CleanupMode::Trash,
             ActionClass::DeleteSelectedFiles => CleanupMode::Permanent,
             ActionClass::EvictRegenerableData => CleanupMode::Evict,
+            ActionClass::RunOwnerOperation => return owner_mode(plan),
             _ => return None,
         };
         return Some(PlanMode::Cleanup(mode));
@@ -141,4 +144,21 @@ pub fn mode_of(plan: &PlanContent) -> Option<PlanMode> {
         StopKind::ImmediateForce => !has_graceful && has_force,
     };
     steps_agree.then_some(PlanMode::Stop(kind))
+}
+
+/// The mode of a plan of owner operations: the one kind of its targets.
+/// `None` when a target is not an owner operation or when two targets
+/// have different kinds.
+fn owner_mode(plan: &PlanContent) -> Option<PlanMode> {
+    let mut kind: Option<OwnerOperationKind> = None;
+    for target in &plan.targets {
+        let TargetBinding::OwnerOperation(owner) = &target.binding else {
+            return None;
+        };
+        if kind.is_some_and(|first| first != owner.operation) {
+            return None;
+        }
+        kind = Some(owner.operation);
+    }
+    kind.map(PlanMode::Owner)
 }

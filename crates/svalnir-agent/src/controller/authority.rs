@@ -167,8 +167,12 @@ impl AuthoritySource for SharedAuthority {
             return RevisionSnapshot::default();
         };
         // The rule revisions that can do the mode now. Only the eviction
-        // mode binds a rule.
-        let rules = if matches!(mode, PlanMode::Cleanup(CleanupMode::Evict)) {
+        // mode and an owner operation, which uses the eviction mode of its
+        // rule, bind a rule.
+        let rules = if matches!(
+            mode,
+            PlanMode::Cleanup(CleanupMode::Evict) | PlanMode::Owner(_)
+        ) {
             records
                 .registry
                 .rules()
@@ -260,6 +264,10 @@ impl AuthoritySource for SharedAuthority {
         environment.map_or(ProducerActivity::Unknown, |environment| {
             environment.producer_activity(&rule.id, principal)
         })
+    }
+
+    fn owner_operation(&self, rule: &RuleRef) -> Option<svalnir_core::rule::owner::OwnerOperation> {
+        self.records().registry.owner_operation(rule).cloned()
     }
 
     fn unit_use(&self, path: &std::path::Path) -> crate::rules::in_use::UnitUse {

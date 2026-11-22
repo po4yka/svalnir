@@ -38,6 +38,10 @@ use super::record::CapabilitySummary;
 use crate::capability::{CapabilityReport, WorkerRole, diagnose_in};
 use crate::coordinator::{IdSource, Measurements, SystemProbe, TimeReading};
 use crate::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
+use crate::executor::owner::{OwnerExecutor, OwnerExecutorConfig};
+
+/// The adapter identity of the owner executor.
+const OWNER_ADAPTER: &str = "svalnir.owner-operation";
 use crate::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
@@ -612,6 +616,11 @@ pub fn system_parts(
         limits: ExecutorLimits::default(),
     })
     .map_err(|error| HostError::Executor(error.to_string()))?;
+    let owner: OwnerExecutor = OwnerExecutor::new(OwnerExecutorConfig::new(
+        svalnir_core::id::AdapterId::new(OWNER_ADAPTER)
+            .map_err(|error| HostError::Executor(error.to_string()))?,
+        home_directory.clone(),
+    ));
     let identity = context.identity();
     let application = ProcessExecutor::new(
         DarwinProcessSource::new(),
@@ -643,6 +652,7 @@ pub fn system_parts(
         filesystem: Box::new(filesystem),
         roots: roots.clone(),
         application: Box::new(application),
+        owner: Box::new(owner),
         probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
         candidates: Box::new(candidates),
         environment,

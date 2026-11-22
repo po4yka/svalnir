@@ -14,6 +14,7 @@ use super::budget::{LeaseResource, ResourceLease, WorkCharge};
 use super::checked::{Check, Checked};
 use super::class::ActionClass;
 use super::journal::critical_exception_applies;
+use super::owner::check_owner_binding;
 use super::plan::{
     ClientRole, Escalation, ExecutorRole, PLAN_SCHEMA_VERSION, PlanError, PlanTarget, Principal,
     TargetBinding, Trigger, check_application_binding, check_file_binding, check_process_binding,
@@ -290,6 +291,21 @@ impl EnvelopeContent {
                 self.action_class.is_application_intervention()
                     && incident_id == &self.trigger.incident_id
             }
+            (TargetBinding::OwnerOperation(owner), Reservation::Work { charge }) => {
+                check_owner_binding(
+                    owner,
+                    uid,
+                    &self.executor,
+                    self.trigger.class.is_automatic(),
+                    owner.command_deadline,
+                )
+                .map_err(|error| match error {
+                    PlanError::Trigger => EnvelopeError::Trigger,
+                    other => binding_error(other),
+                })?;
+                matches!(self.action_class, ActionClass::RunOwnerOperation)
+                    && charge == &owner.charge
+            }
             _ => false,
         };
         if !target_agrees {
@@ -311,6 +327,9 @@ impl EnvelopeContent {
             |resource: &LeaseResource| self.leases.iter().any(|lease| &lease.resource == resource);
         match &self.target.binding {
             TargetBinding::File(file) => holds(&LeaseResource::CleanupRoot(file.root_id.clone())),
+            TargetBinding::OwnerOperation(owner) => {
+                holds(&LeaseResource::CleanupRoot(owner.root_id.clone()))
+            }
             TargetBinding::Application(application) => application.members.iter().all(|member| {
                 holds(&LeaseResource::ProcessGeneration(
                     member.generation_id.clone(),

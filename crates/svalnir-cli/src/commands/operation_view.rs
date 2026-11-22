@@ -51,6 +51,9 @@ pub(crate) struct EffectCounts {
     pub(crate) permanently_removed: u64,
     /// Processes whose exit was observed after the request.
     pub(crate) exit_verified: u64,
+    /// Commands of an owner operation that exited with status 0. This is
+    /// not a statement about the data that a command removed.
+    pub(crate) operations_completed: u64,
     pub(crate) already_absent: u64,
     pub(crate) already_exited: u64,
     pub(crate) skipped: u64,
@@ -68,6 +71,7 @@ impl EffectCounts {
                 TargetEffect::Trashed => &mut counts.moved_to_trash,
                 TargetEffect::Removed => &mut counts.permanently_removed,
                 TargetEffect::ExitVerified => &mut counts.exit_verified,
+                TargetEffect::OperationCompleted => &mut counts.operations_completed,
                 TargetEffect::AlreadyAbsent => &mut counts.already_absent,
                 TargetEffect::AlreadyExited => &mut counts.already_exited,
                 TargetEffect::Skipped => &mut counts.skipped,
@@ -88,6 +92,7 @@ impl EffectCounts {
             (self.permanently_removed, "permanently removed"),
             (self.moved_to_trash, "moved to Trash"),
             (self.exit_verified, "exit observed"),
+            (self.operations_completed, "owner operation completed"),
             (self.already_absent, "already absent"),
             (self.already_exited, "already exited"),
             (self.skipped, "skipped"),
@@ -489,6 +494,21 @@ fn render_effect(effect: &ResourceEffect, out: &mut String) {
                 state(before),
                 state(after)
             );
+        }
+        ResourceEffect::ScopeAllocation(scope) => {
+            let target: String = escape(scope.target_id().as_str());
+            if let Some(delta) = scope.delta() {
+                put_line!(
+                    out,
+                    "  Observed change of the private size of the scope of {target}: {} (other writers contribute to this value)",
+                    human_byte_delta(delta.get())
+                );
+            } else {
+                put_line!(
+                    out,
+                    "  Observed change of the private size of the scope of {target}: no value (a complete measurement was not available)"
+                );
+            }
         }
         ResourceEffect::Unrecognized => {
             out.push_str("  A resource observation of a kind that this build does not recognize\n");

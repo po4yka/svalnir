@@ -145,6 +145,26 @@ fn render_target(target: &TargetExplanation, out: &mut String) {
                 LosslessPath::display_label
             ),
         ),
+        TargetExplanation::OwnerOperation {
+            root_path,
+            operation,
+            executable,
+            arguments,
+            expected_effect,
+            ..
+        } => {
+            put_line!(
+                out,
+                "  owner operation {}  {}  {}",
+                operation.as_str(),
+                root_path.display_label(),
+                executable.display_label(),
+            );
+            let arguments: Vec<String> =
+                arguments.iter().map(|argument| escape(argument)).collect();
+            put_line!(out, "    arguments: {}", arguments.join(" "));
+            put_line!(out, "    {}", escape(expected_effect));
+        }
     }
 }
 

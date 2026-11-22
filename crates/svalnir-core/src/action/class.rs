@@ -21,6 +21,9 @@ wire_enum! {
         /// Permanently remove candidates that a reviewed cleanup rule
         /// selected.
         EvictRegenerableData => "EvictRegenerableData",
+        /// Run the fixed cleanup operation of a producer on one measured
+        /// scope of a reviewed rule.
+        RunOwnerOperation => "RunOwnerOperation",
         /// Ask a verified application or managed job to exit gracefully.
         RequestApplicationExit => "RequestApplicationExit",
         /// Force a verified application or managed job to exit.
@@ -31,10 +34,11 @@ wire_enum! {
 impl ActionClass {
     /// Each class that this build knows, in the sequence of the
     /// specification.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::MoveToTrash,
         Self::DeleteSelectedFiles,
         Self::EvictRegenerableData,
+        Self::RunOwnerOperation,
         Self::RequestApplicationExit,
         Self::ForceApplicationExit,
     ];
@@ -44,13 +48,29 @@ impl ActionClass {
     pub fn is_filesystem(&self) -> bool {
         matches!(
             self,
+            Self::MoveToTrash
+                | Self::DeleteSelectedFiles
+                | Self::EvictRegenerableData
+                | Self::RunOwnerOperation
+        )
+    }
+
+    /// Whether a step of the class acts on a file target: a filesystem
+    /// class other than `RunOwnerOperation`, whose target is the scope of
+    /// a command.
+    pub fn takes_file_target(&self) -> bool {
+        matches!(
+            self,
             Self::MoveToTrash | Self::DeleteSelectedFiles | Self::EvictRegenerableData
         )
     }
 
     /// Whether the class removes data permanently.
     pub fn is_permanent_removal(&self) -> bool {
-        matches!(self, Self::DeleteSelectedFiles | Self::EvictRegenerableData)
+        matches!(
+            self,
+            Self::DeleteSelectedFiles | Self::EvictRegenerableData | Self::RunOwnerOperation
+        )
     }
 
     /// Whether the class is a step of an application intervention.
@@ -64,13 +84,16 @@ impl ActionClass {
     /// Whether a trigger of class `trigger` can select this action class.
     ///
     /// `MoveToTrash` and `DeleteSelectedFiles` are manual only. An automatic
-    /// disk incident selects only `EvictRegenerableData`, and an automatic
+    /// disk incident selects only `EvictRegenerableData` and
+    /// `RunOwnerOperation`, and an automatic
     /// memory trigger selects only an application intervention. A value that
     /// this build does not recognize gives `false`.
     pub fn accepts_trigger(&self, trigger: &TriggerClass) -> bool {
         match trigger {
             TriggerClass::Manual => self.is_recognized(),
-            TriggerClass::DiskPressure => matches!(self, Self::EvictRegenerableData),
+            TriggerClass::DiskPressure => {
+                matches!(self, Self::EvictRegenerableData | Self::RunOwnerOperation)
+            }
             TriggerClass::GlobalCriticalMemory | TriggerClass::ApplicationBudget => {
                 self.is_application_intervention()
             }
@@ -116,6 +139,7 @@ mod tests {
             "MoveToTrash",
             "DeleteSelectedFiles",
             "EvictRegenerableData",
+            "RunOwnerOperation",
             "RequestApplicationExit",
             "ForceApplicationExit",
         ];
@@ -146,19 +170,22 @@ mod tests {
         assert!(!ActionClass::MoveToTrash.is_permanent_removal());
         assert!(ActionClass::DeleteSelectedFiles.is_permanent_removal());
         assert!(ActionClass::EvictRegenerableData.is_permanent_removal());
+        assert!(ActionClass::RunOwnerOperation.is_permanent_removal());
+        assert!(ActionClass::RunOwnerOperation.is_filesystem());
     }
 
     #[test]
     fn a_trigger_selects_only_its_classes() {
         use ActionClass::{
             DeleteSelectedFiles, EvictRegenerableData, ForceApplicationExit, MoveToTrash,
-            RequestApplicationExit,
+            RequestApplicationExit, RunOwnerOperation,
         };
         for class in &ActionClass::ALL {
             assert!(class.accepts_trigger(&TriggerClass::Manual));
         }
         let disk = TriggerClass::DiskPressure;
         assert!(EvictRegenerableData.accepts_trigger(&disk));
+        assert!(RunOwnerOperation.accepts_trigger(&disk));
         for class in [
             MoveToTrash,
             DeleteSelectedFiles,
@@ -173,7 +200,12 @@ mod tests {
         ] {
             assert!(RequestApplicationExit.accepts_trigger(&trigger));
             assert!(ForceApplicationExit.accepts_trigger(&trigger));
-            for class in [MoveToTrash, DeleteSelectedFiles, EvictRegenerableData] {
+            for class in [
+                MoveToTrash,
+                DeleteSelectedFiles,
+                EvictRegenerableData,
+                RunOwnerOperation,
+            ] {
                 assert!(!class.accepts_trigger(&trigger), "{class}");
             }
         }

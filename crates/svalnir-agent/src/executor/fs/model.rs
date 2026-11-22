@@ -340,7 +340,7 @@ impl<'a> AdmittedStep<'a> {
         envelope: &'a RequestEnvelope,
         receipt: &'a DispatchReceipt,
     ) -> Result<Self, AdmissionRefusal> {
-        if !envelope.action_class.is_filesystem() {
+        if !envelope.action_class.takes_file_target() {
             return Err(AdmissionRefusal::ActionClass);
         }
         let TargetBinding::File(file) = &envelope.target.binding else {

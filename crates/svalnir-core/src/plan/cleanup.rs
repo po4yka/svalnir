@@ -820,6 +820,7 @@ pub fn split_batches(plan: &PlanContent, batch: &WorkCharge) -> Result<Vec<PlanB
         let target: &PlanTarget = plan.target(&step.target_id).ok_or(BatchError::Content)?;
         let charge: WorkCharge = match &target.binding {
             TargetBinding::File(file) => file.charge,
+            TargetBinding::OwnerOperation(owner) => owner.charge,
             TargetBinding::Application(_) | TargetBinding::Process(_) => {
                 return Err(BatchError::Content);
             }

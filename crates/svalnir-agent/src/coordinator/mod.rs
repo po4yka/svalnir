@@ -119,8 +119,8 @@ pub use self::error::{CoordinatorError, StartError, code, rearm_rejection};
 pub use self::ledger::{IncidentAllowance, MAX_INCIDENTS, MAX_LEASES, Pacing};
 pub use self::ports::{
     ApplicationExecutor, AuthoritySource, Clock, CoordinatorJournal, FileProbe, FilesystemExecutor,
-    IdSource, Measurements, RevisionSnapshot, SystemProbe, TargetProbe, TimeReading,
-    TriggerStanding,
+    IdSource, Measurements, OwnerOperationExecutor, RevisionSnapshot, SystemProbe, TargetProbe,
+    TimeReading, TriggerStanding,
 };
 pub use self::rearm::PendingRearm;
 pub use self::recovery::{HELD_RECONCILIATION_INTERVAL, MAX_RECONCILED_OPERATIONS};

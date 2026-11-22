@@ -35,6 +35,8 @@ use crate::quantity::{ByteDelta, Bytes, EntryCount, Nanoseconds};
 use crate::rule::RuleRef;
 use crate::time::{MonotonicNanos, WallTime};
 
+mod owner;
+
 // Fixtures.
 
 /// A change of a plan content in a table of rejected plans.
@@ -278,6 +280,13 @@ fn record(target: &str, effect: TargetEffect) -> TargetResultRecord {
             StopReason::Completed,
             None,
         ),
+        TargetEffect::OperationCompleted => (
+            Submitted,
+            NativeResult::ExitStatus { status: 0 },
+            Attribution::Possible,
+            StopReason::Completed,
+            None,
+        ),
         TargetEffect::AlreadyAbsent | TargetEffect::AlreadyExited => (
             NotSubmitted,
             NativeResult::NotCalled,
@@ -510,7 +519,7 @@ fn a_plan_round_trips_and_a_changed_plan_is_rejected() {
         let plan = seal(content);
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["digest"], json!(plan.digest().as_str()));
-        assert_eq!(value["content"]["schema_version"], json!(3));
+        assert_eq!(value["content"]["schema_version"], json!(4));
         assert_eq!(serde_json::from_value::<Plan>(value).unwrap(), plan);
     }
 
@@ -575,7 +584,8 @@ fn a_filesystem_plan_that_does_not_agree_with_itself_is_rejected() {
     let cases: Vec<(PlanError, PlanChange)> = vec![
         (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 1)),
         (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 2)),
-        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 4)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 3)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 5)),
         (PlanError::Count, Box::new(|c| c.targets.clear())),
         (PlanError::Count, Box::new(|c| c.steps.clear())),
         (
@@ -1306,7 +1316,10 @@ fn an_unknown_effect_stays_unknown() {
             effect.is_verified(),
             matches!(
                 effect,
-                TargetEffect::Trashed | TargetEffect::Removed | TargetEffect::ExitVerified
+                TargetEffect::Trashed
+                    | TargetEffect::Removed
+                    | TargetEffect::ExitVerified
+                    | TargetEffect::OperationCompleted
             )
         );
         assert_eq!(

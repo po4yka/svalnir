@@ -12,8 +12,10 @@
 //! | --- | --- |
 //! | [`fs`] | Trash move and permanent removal |
 //! | [`process`] | Graceful termination and force escalation |
+//! | [`owner`] | The fixed command of a producer on one measured scope |
 //!
 //! Owning specification: `docs/ACTION_CONTRACTS.md` sections 7 and 8.
 
 pub mod fs;
+pub mod owner;
 pub mod process;

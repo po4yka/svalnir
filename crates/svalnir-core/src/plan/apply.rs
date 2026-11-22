@@ -131,6 +131,7 @@ pub fn bound_revisions(plan: &PlanContent) -> BoundRevisions {
         .iter()
         .filter_map(|target| match &target.binding {
             TargetBinding::File(file) => file.rule.clone(),
+            TargetBinding::OwnerOperation(owner) => Some(owner.rule.clone()),
             TargetBinding::Application(_) | TargetBinding::Process(_) => None,
         })
         .collect();

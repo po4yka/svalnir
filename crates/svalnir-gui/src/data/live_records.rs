@@ -824,7 +824,11 @@ fn effect_row(effect: &ResourceEffect) -> EffectRow {
             before: pressure_text(before),
             after: pressure_text(after),
         },
-        ResourceEffect::Unrecognized => EffectRow::Unrecognized,
+        // The window has no view of the scope measurement of an owner
+        // operation yet; no command of this build makes such an operation.
+        ResourceEffect::ScopeAllocation(_) | ResourceEffect::Unrecognized => {
+            EffectRow::Unrecognized
+        }
     }
 }
 

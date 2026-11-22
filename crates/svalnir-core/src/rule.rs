@@ -8,7 +8,11 @@
 //! grant.
 //!
 //! This module has the declaration types and the interface. The registry
-//! and the rules are in `svalnir-agent` (`rules`).
+//! and the rules are in `svalnir-agent` (`rules`). [`owner`] has the
+//! owner-operation declaration of a rule with the deletion method
+//! `producer_operation`.
+
+pub mod owner;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -586,6 +590,13 @@ pub trait RuleRegistry {
         self.rules()
             .into_iter()
             .find(|rule| &rule.reference == reference)
+    }
+
+    /// The reviewed owner-operation declaration of the exact revision
+    /// `reference` (`docs/CLEANUP_RULES.md` section 9). `None` for a rule
+    /// with no owner operation; the default has none.
+    fn owner_operation(&self, _reference: &RuleRef) -> Option<&owner::OwnerOperation> {
+        None
     }
 
     /// The exact revision `reference`, when it can do `mode` for

@@ -521,6 +521,7 @@ pub(crate) fn plan(
         has_plan_document: has_plan,
         plan_document: if has_plan { "used" } else { "absent" },
         discovery: Some(DiscoveryView::new(rule.reference.clone(), &discovery)),
+        repository_warnings: Vec::new(),
         note: if interrupted {
             INTERRUPTED_NOTE
         } else if has_plan {

@@ -71,6 +71,8 @@ mod model;
 #[cfg(unix)]
 mod native;
 #[cfg(unix)]
+pub mod nested_git;
+#[cfg(unix)]
 mod overlap;
 #[cfg(unix)]
 pub mod owner_tools;

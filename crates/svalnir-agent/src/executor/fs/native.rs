@@ -6,6 +6,10 @@
 //! `AT_SYMLINK_NOFOLLOW`, and `unlinkat`. The only path that the operating
 //! system resolves is `/`, which has one component. A replaced path
 //! component thus cannot redirect a call to another directory.
+//!
+//! The read-only walk of `rules::nested_git` uses the calls that read
+//! (`openat`, `fstatat`, `fstat`, and the directory stream); no other
+//! module of the crate uses the call that removes.
 
 use std::ffi::CStr;
 use std::io;
@@ -17,7 +21,7 @@ use svalnir_core::file::DeviceNumber;
 
 /// The kind of a file object, from `st_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     /// A regular file.
     File,
     /// A directory.
@@ -30,29 +34,29 @@ pub(super) enum Kind {
 
 /// The `stat` fields that the executor uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Metadata {
+pub(crate) struct Metadata {
     /// The kind, from `st_mode`.
-    pub(super) kind: Kind,
+    pub(crate) kind: Kind,
     /// `st_size`. The value can be negative; the caller validates it.
-    pub(super) size: i64,
+    pub(crate) size: i64,
     /// `st_blocks`, in units of 512 bytes. The value can be negative; the
     /// caller validates it.
-    pub(super) blocks: i64,
+    pub(crate) blocks: i64,
     /// `st_nlink`.
-    pub(super) link_count: u64,
+    pub(crate) link_count: u64,
     /// `st_dev`. `None` when the number does not fit the device-number
     /// type.
-    pub(super) device: Option<DeviceNumber>,
+    pub(crate) device: Option<DeviceNumber>,
     /// `st_ino`.
-    pub(super) inode: u64,
+    pub(crate) inode: u64,
     /// `st_uid`.
-    pub(super) owner: u32,
+    pub(crate) owner: u32,
     /// Whether the object is a dataless placeholder (`SF_DATALESS`).
-    pub(super) dataless: bool,
+    pub(crate) dataless: bool,
     /// Whether a flag prevents the removal of the object or of the entries
     /// of a directory: `UF_IMMUTABLE`, `UF_APPEND`, `SF_IMMUTABLE`,
     /// `SF_APPEND`, or `SF_RESTRICTED`.
-    pub(super) locked: bool,
+    pub(crate) locked: bool,
 }
 
 /// `SF_RESTRICTED` of `<sys/stat.h>` in the macOS SDK. The `libc` crate does
@@ -140,7 +144,7 @@ fn owned_descriptor(descriptor: libc::c_int) -> io::Result<OwnedFd> {
 
 /// Opens the directory `/`. The path has one component, so the operating
 /// system resolves no symbolic link.
-pub(super) fn open_filesystem_root() -> io::Result<OwnedFd> {
+pub(crate) fn open_filesystem_root() -> io::Result<OwnedFd> {
     // SAFETY: the path is a NUL-terminated literal. The flags have no
     // `O_CREAT`, so the call needs no mode argument.
     let descriptor: libc::c_int = unsafe { libc::open(c"/".as_ptr(), DIRECTORY_FLAGS) };
@@ -150,7 +154,7 @@ pub(super) fn open_filesystem_root() -> io::Result<OwnedFd> {
 /// Opens the directory `name` in the open directory `parent`. The call
 /// fails when `name` is a symbolic link or is not a directory. `name` is
 /// one path component.
-pub(super) fn open_directory_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
+pub(crate) fn open_directory_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
     // SAFETY: `parent` is an open descriptor for the call, and `name` is a
     // NUL-terminated string that lives for the call. The flags have no
     // `O_CREAT`, so the call needs no mode argument.
@@ -176,7 +180,7 @@ fn metadata_after(status: libc::c_int, buffer: MaybeUninit<libc::stat>) -> io::R
 }
 
 /// Measures the open object `descriptor` with `fstat`.
-pub(super) fn stat_descriptor(descriptor: BorrowedFd<'_>) -> io::Result<Metadata> {
+pub(crate) fn stat_descriptor(descriptor: BorrowedFd<'_>) -> io::Result<Metadata> {
     let mut buffer: MaybeUninit<libc::stat> = MaybeUninit::zeroed();
     // SAFETY: `descriptor` is open for the call, and `buffer` is valid for
     // a write of one `stat` structure.
@@ -186,7 +190,7 @@ pub(super) fn stat_descriptor(descriptor: BorrowedFd<'_>) -> io::Result<Metadata
 
 /// Measures the entry `name` of the open directory `parent`. The call does
 /// not follow a symbolic link. `name` is one path component.
-pub(super) fn stat_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<Metadata> {
+pub(crate) fn stat_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<Metadata> {
     let mut buffer: MaybeUninit<libc::stat> = MaybeUninit::zeroed();
     // SAFETY: `parent` is open for the call, `name` is a NUL-terminated
     // string that lives for the call, and `buffer` is valid for a write of
@@ -243,7 +247,7 @@ fn clear_errno() {
 
 /// An open directory stream. The stream owns its file descriptor.
 #[derive(Debug)]
-pub(super) struct DirStream {
+pub(crate) struct DirStream {
     /// The stream from `fdopendir`. `closedir` in `Drop` releases it.
     stream: NonNull<libc::DIR>,
     /// The descriptor that `fdopendir` received. The stream owns it.
@@ -253,7 +257,7 @@ pub(super) struct DirStream {
 impl DirStream {
     /// Makes a stream from an open directory. The stream takes the
     /// descriptor.
-    pub(super) fn from_descriptor(descriptor: OwnedFd) -> io::Result<Self> {
+    pub(crate) fn from_descriptor(descriptor: OwnedFd) -> io::Result<Self> {
         let raw: RawFd = descriptor.into_raw_fd();
         // SAFETY: `raw` is an open descriptor that this function owns. On
         // success the stream owns it.
@@ -273,7 +277,7 @@ impl DirStream {
 
     /// The descriptor of the directory, for `openat`, `fstatat`, and
     /// `unlinkat`.
-    pub(super) fn descriptor(&self) -> BorrowedFd<'_> {
+    pub(crate) fn descriptor(&self) -> BorrowedFd<'_> {
         // SAFETY: the stream owns `descriptor` and closes it only in
         // `Drop`. The borrow cannot outlive `self`.
         unsafe { BorrowedFd::borrow_raw(self.descriptor) }
@@ -282,7 +286,7 @@ impl DirStream {
     /// Reads the next name into `name`, with its NUL terminator. The names
     /// `.` and `..` are not given. Returns `false` at the end of the
     /// directory.
-    pub(super) fn next_name(&mut self, name: &mut Vec<u8>) -> io::Result<bool> {
+    pub(crate) fn next_name(&mut self, name: &mut Vec<u8>) -> io::Result<bool> {
         loop {
             // `readdir` returns a null pointer at the end and on an error.
             // Only `errno` tells the two apart.

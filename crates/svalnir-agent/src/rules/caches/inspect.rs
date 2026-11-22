@@ -32,8 +32,8 @@ use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, RecordRead, RootView, WalkStop, lstat, read_record, walk_local,
 };
 use crate::scan::{
-    CancellationToken, NoObserver, ScanClock, ScanCompletion, ScanLimits, ScanRequest, ScanResult,
-    run_scan,
+    CancellationToken, NoObserver, ScanClock, ScanCompletion, ScanLimits, ScanObserver,
+    ScanRequest, ScanResult, run_scan,
 };
 
 /// The scan identity of a unit measurement. The result is not saved.
@@ -644,6 +644,20 @@ pub(in crate::rules) fn measure_unit(
     clock: &dyn ScanClock,
     reclaim: ReclaimBasis,
 ) -> Option<CacheMeasurement> {
+    measure_unit_observed(path, limits, cancel, clock, reclaim, &mut NoObserver)
+        .map(|(measurement, _)| measurement)
+}
+
+/// [`measure_unit`] with `observer`, which sees each entry of the scan. The
+/// result has the scan result too.
+pub(in crate::rules) fn measure_unit_observed(
+    path: &Path,
+    limits: InspectionLimits,
+    cancel: &CancellationToken,
+    clock: &dyn ScanClock,
+    reclaim: ReclaimBasis,
+    observer: &mut dyn ScanObserver,
+) -> Option<(CacheMeasurement, ScanResult)> {
     let request: ScanRequest = ScanRequest {
         scan_id: ScanId::new(INSPECTION_SCAN_ID).ok()?,
         root: LosslessPath::from_path(path).ok()?,
@@ -658,9 +672,9 @@ pub(in crate::rules) fn measure_unit(
         },
         volume: None,
     };
-    let result: ScanResult = run_scan(&request, cancel, clock, &mut NoObserver).ok()?;
+    let result: ScanResult = run_scan(&request, cancel, clock, observer).ok()?;
     let totals = &result.totals;
-    Some(CacheMeasurement {
+    let measurement: CacheMeasurement = CacheMeasurement {
         logical_bytes: totals.logical_bytes,
         allocated_bytes: totals.allocated_bytes,
         files: totals.files,
@@ -675,5 +689,6 @@ pub(in crate::rules) fn measure_unit(
             ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
             ReclaimBasis::ClonedStorage => ReclaimFigure::NotKnownClonedStorage,
         },
-    })
+    };
+    Some((measurement, result))
 }

@@ -24,11 +24,12 @@ use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, Project
 use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
 use crate::protection::ProtectedLocations;
-use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit};
+use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit_observed};
 use crate::rules::git::{
     GitFailure, GitOutput, GitTool, GitToolProblem, RepositoryLookup, find_repository,
 };
 use crate::rules::in_use::{UnitScope, UnitUse, uses_of};
+use crate::rules::nested_git::{MarkerObserver, RepositoryRefusal, Verdict};
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
 };
@@ -217,6 +218,10 @@ pub enum ProjectUnitOutcome {
         /// The reason.
         reason: &'static str,
     },
+    /// The unit holds a Git repository, or the walk that looks for one did
+    /// not examine each entry (`docs/CLEANUP_RULES.md` section 6,
+    /// "Repositories in a unit"). It is not measured.
+    RepositoryRefused(RepositoryRefusal),
     /// Another rule owns the directory (`docs/CLEANUP_RULES.md` section
     /// 8). It is not measured.
     OwnedByOtherRule {
@@ -694,14 +699,22 @@ impl Inspector<'_> {
         if let Some(reason) = uses.refusal() {
             return refused(reason);
         }
-        match measure_unit(
+        // The measurement also looks for a clone with commits or changes
+        // that exist nowhere else. The layouts of this rule have no
+        // checkouts of Swift Package Manager, so no exception applies.
+        let mut repositories: MarkerObserver<'_> = MarkerObserver::new(path);
+        match measure_unit_observed(
             path,
             self.limits.measure,
             self.cancel,
             self.clock,
             layout.reclaim,
+            &mut repositories,
         ) {
-            Some(measurement) => ProjectUnitOutcome::Measured(measurement),
+            Some((measurement, result)) => match repositories.verdict(&result) {
+                Verdict::Clear => ProjectUnitOutcome::Measured(measurement),
+                Verdict::Refused(refusal) => ProjectUnitOutcome::RepositoryRefused(refusal),
+            },
             None => refused("unit_not_readable"),
         }
     }

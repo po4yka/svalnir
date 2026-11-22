@@ -22,6 +22,7 @@ use crate::rules::ReviewedRules;
 use crate::rules::caches::ReclaimFigure;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
 use crate::rules::git::{GitTool, GitToolProblem};
+use crate::rules::nested_git::{RefusalReason, RepositoryRefusal};
 use crate::rules::resolve_roots;
 use crate::scan::{CancellationToken, WallScanClock};
 
@@ -854,4 +855,27 @@ fn a_unit_with_an_unknown_process_is_refused_with_its_name() {
         panic!("{:?}", report.uses);
     };
     assert_eq!(processes[0].name, "routined");
+}
+
+// ---------------------------------------------------------------------
+// Repositories in a unit.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_unit_that_holds_a_repository_is_refused_and_not_measured() {
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    // A dependency that a person cloned into the ignored directory.
+    home.repository("Code/app/node_modules/forked-lib");
+
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let report = unit(&inspection, &project.join("node_modules"));
+    assert_eq!(report.version_control, Some(VersionControl::Ignored));
+    assert_eq!(
+        report.outcome,
+        ProjectUnitOutcome::RepositoryRefused(RepositoryRefusal {
+            reason: RefusalReason::NestedRepository,
+            path: Some(PathBuf::from("forked-lib")),
+        })
+    );
 }

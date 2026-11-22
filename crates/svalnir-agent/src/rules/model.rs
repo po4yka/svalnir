@@ -357,6 +357,10 @@ pub enum SkipReason {
     /// The use check does not show that no process of the user uses the
     /// unit. Serialized as `unit_use_unknown`.
     UnitUseUnknown,
+    /// The unit holds a Git repository: an object with the name `.git`,
+    /// or a Git directory (`HEAD`, `objects`, and `refs`), at some depth
+    /// (`docs/CLEANUP_RULES.md` section 6, "Repositories in a unit").
+    NestedRepository,
 }
 
 impl SkipReason {
@@ -368,7 +372,8 @@ impl SkipReason {
             | Self::NotRegenerable
             | Self::RegenerabilityUnknown
             | Self::SourceNotLocal
-            | Self::ExclusionOverlap => SkipCategory::ProtectedData,
+            | Self::ExclusionOverlap
+            | Self::NestedRepository => SkipCategory::ProtectedData,
             Self::WrongOwner | Self::SharedOwnership => SkipCategory::UnknownOwnership,
             Self::ActiveProducer | Self::UnitInUse => SkipCategory::ActiveProducer,
             Self::ActivityUnknown
@@ -615,6 +620,10 @@ pub struct SkippedUnit {
     pub eligibility: CandidateEligibility,
     /// The identity evidence of the unit, when the rule got it.
     pub evidence: Option<TargetEvidence>,
+    /// The first Git marker (`.git`) or Git directory of the unit,
+    /// relative to the unit, when the list has
+    /// [`SkipReason::NestedRepository`].
+    pub repository_marker: Option<LosslessPath>,
 }
 
 /// The result of one discovery of one rule.

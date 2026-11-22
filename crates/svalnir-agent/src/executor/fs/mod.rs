@@ -86,7 +86,7 @@
 mod errors;
 mod executor;
 mod model;
-mod native;
+pub(crate) mod native;
 mod remove;
 mod resolve;
 mod trash;

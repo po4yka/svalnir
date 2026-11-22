@@ -760,6 +760,7 @@ fn skip_in_report(
             ..record.eligibility.clone()
         },
         evidence: Some(discovered.evidence.clone()),
+        repository_marker: None,
     });
     true
 }

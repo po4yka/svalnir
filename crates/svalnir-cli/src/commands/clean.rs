@@ -31,7 +31,7 @@ use svalnir_core::id::{OperationId, PlanId, RootId, ScanId, StepId, TargetId};
 use svalnir_core::plan::{
     CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, PlanBuildError, PlanContext,
     PlanExplanation, PlanMode, PlanOutcome, PlanPreview, SelectionPreset, SizeEstimate,
-    TargetPreview, build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
+    TargetExplanation, TargetPreview, build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
 };
 use svalnir_core::policy::ProtectionFact;
 use svalnir_core::process::Uid;
@@ -77,6 +77,77 @@ pub(crate) struct StaleEntry {
     pub(crate) reason: &'static str,
 }
 
+/// A selected entry of a manual plan that holds a Git repository, or that
+/// the check for one could not examine completely. The plan does not
+/// refuse it: the user selected the entry
+/// (`docs/CLEANUP_RULES.md` section 6, "Repositories in a unit").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RepositoryWarning {
+    /// The selected entry.
+    pub(crate) entry: LosslessPath,
+    /// `nested_repository`, or the reason that the check is not complete.
+    pub(crate) code: &'static str,
+    /// The repository, or the directory that the check could not read,
+    /// relative to the entry, when the code has one.
+    pub(crate) path: Option<LosslessPath>,
+}
+
+/// The largest number of selected entries that `clean plan` examines for
+/// a repository.
+const MAX_REPOSITORY_CHECKS: usize = 256;
+
+/// The repository warnings of the directory targets of a manual plan. The
+/// check is a read-only walk of each selected directory.
+fn repository_warnings(explanation: &PlanExplanation) -> Vec<RepositoryWarning> {
+    use svalnir_agent::rules::git::GitToolProblem;
+    use svalnir_agent::rules::nested_git::{self, DetectionLimits, Verdict};
+    let limits: DetectionLimits = DetectionLimits {
+        max_duration: std::time::Duration::from_secs(10),
+        ..DetectionLimits::default()
+    };
+    let mut warnings: Vec<RepositoryWarning> = Vec::new();
+    let entries = explanation
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            TargetExplanation::File {
+                path: Some(path), ..
+            } => Some(path),
+            _ => None,
+        });
+    for entry in entries.take(MAX_REPOSITORY_CHECKS) {
+        let path: PathBuf = entry.to_path_buf();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        // The walk opens a path with no symbolic link; the warning is
+        // advice, so the resolved path of the entry is walked.
+        let verdict: Verdict = match std::fs::canonicalize(&path) {
+            Ok(resolved) => nested_git::check_unit(
+                &resolved,
+                None,
+                Err(GitToolProblem::NotInstalled),
+                &limits,
+                None,
+            ),
+            Err(_) => Verdict::Refused(nested_git::RepositoryRefusal {
+                reason: nested_git::RefusalReason::UnitUnavailable,
+                path: None,
+            }),
+        };
+        if let Verdict::Refused(refusal) = verdict {
+            warnings.push(RepositoryWarning {
+                entry: entry.clone(),
+                code: refusal.reason.as_str(),
+                path: refusal
+                    .path
+                    .and_then(|path| LosslessPath::from_path(&path).ok()),
+            });
+        }
+    }
+    warnings
+}
+
 /// The result of `clean plan` and `clean show`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PlanView {
@@ -103,6 +174,10 @@ pub(crate) struct PlanView {
     /// that this invocation made. A plan of a scan has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) discovery: Option<super::evict::DiscoveryView>,
+    /// The selected directories of a `trash` or `permanent` plan that hold
+    /// a Git repository, for `clean plan`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) repository_warnings: Vec<RepositoryWarning>,
     pub(crate) note: &'static str,
 }
 
@@ -110,6 +185,31 @@ impl PlanView {
     pub(crate) fn render(&self) -> String {
         let mut out = String::new();
         plan_view::render(&self.explanation, &self.cleanup_roots, &mut out);
+        if !self.repository_warnings.is_empty() {
+            put_line!(
+                out,
+                "\nWarning: {} selected entries hold a Git repository, or could not be checked for one. A repository can hold commits and changes that exist nowhere else. The plan does not refuse these entries:",
+                self.repository_warnings.len()
+            );
+            for warning in self
+                .repository_warnings
+                .iter()
+                .take(plan_view::TEXT_LIST_LIMIT)
+            {
+                let at: String = warning.path.as_ref().map_or_else(String::new, |path| {
+                    format!("  (at {})", path.display_label())
+                });
+                put_line!(
+                    out,
+                    "  {}  {}{at}",
+                    warning.code,
+                    warning.entry.display_label()
+                );
+            }
+            if self.repository_warnings.len() > plan_view::TEXT_LIST_LIMIT {
+                out.push_str("  ...\n");
+            }
+        }
         if !self.stale_entries.is_empty() {
             put_line!(
                 out,
@@ -705,9 +805,11 @@ pub(crate) fn plan(
         plan_store::save_plan(environment, &document)?;
         plan_store::prune(environment);
     }
+    let explanation: PlanExplanation = explain(&outcome, &now.clock);
+    let repository_warnings: Vec<RepositoryWarning> = repository_warnings(&explanation);
     let view = PlanView {
         scan_id: Some(scan.scan_id),
-        explanation: explain(&outcome, &now.clock),
+        explanation,
         stale_entries: chosen.stale,
         operation_id: None,
         cleanup_roots: if has_plan {
@@ -718,6 +820,7 @@ pub(crate) fn plan(
         has_plan_document: has_plan,
         plan_document: if has_plan { "used" } else { "absent" },
         discovery: None,
+        repository_warnings,
         note: if has_plan { PLAN_NOTE } else { EMPTY_PLAN_NOTE },
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
@@ -900,6 +1003,7 @@ pub(crate) fn show(
         has_plan_document: stored.document.is_some(),
         plan_document: stored.document_state.as_str(),
         discovery: None,
+        repository_warnings: Vec::new(),
         note: "This command changed nothing.",
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;

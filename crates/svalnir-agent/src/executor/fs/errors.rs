@@ -129,6 +129,10 @@ pub mod code {
     /// target of an eviction, has more than one name. Its removal frees no
     /// space while another name keeps the data.
     pub const TARGET_HARD_LINKED: &str = "target_hard_linked";
+    /// A directory target of an eviction has a Git marker (`.git`) at some
+    /// depth. A repository can hold commits and changes that exist nowhere
+    /// else, so no build makes it again.
+    pub const NESTED_REPOSITORY: &str = "nested_repository";
     /// `EINTR`.
     pub const INTERRUPTED: &str = "interrupted";
     /// `EIO`.
@@ -156,10 +160,11 @@ pub mod code {
     pub const BATCH_LIMIT: &str = "batch_limit";
 
     /// Each code of the executor.
-    pub const ALL: [&str; 56] = [
+    pub const ALL: [&str; 57] = [
         LOCKED_OBJECT,
         TARGET_GREW,
         TARGET_HARD_LINKED,
+        NESTED_REPOSITORY,
         APPROVED_ROOT_MISMATCH,
         TREE_ENTRY_OWNER_MISMATCH,
         BATCH_LIMIT,

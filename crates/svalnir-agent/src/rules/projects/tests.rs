@@ -209,21 +209,34 @@ impl Home {
         quiet_period: Nanoseconds,
         clock: &dyn ScanClock,
     ) -> ProjectInspection {
-        let registry: ReviewedRules = ReviewedRules::new().unwrap();
         let head = GitHeadActivity::new(git);
         let transcripts = ClaudeTranscripts::for_home(Some(&self.path));
+        let recency = RecencyHost {
+            quiet_period,
+            head: &head,
+            transcripts: &transcripts,
+            agents,
+        };
+        self.inspect_sources(processes, git, limits, recency, clock)
+    }
+
+    /// The inspection with the sources of the project activity `recency`.
+    pub(super) fn inspect_sources(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        recency: RecencyHost<'_>,
+        clock: &dyn ScanClock,
+    ) -> ProjectInspection {
+        let registry: ReviewedRules = ReviewedRules::new().unwrap();
         let host: ProjectHost<'_> = ProjectHost {
             principal: self.principal,
             locations: &self.locations,
             user_exclusions: &[],
             git,
             processes,
-            recency: RecencyHost {
-                quiet_period,
-                head: &head,
-                transcripts: &transcripts,
-                agents,
-            },
+            recency,
         };
         registry.projects().inspect(
             host,

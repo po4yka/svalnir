@@ -93,7 +93,7 @@ The `[cleanup.projects]` table holds the settings of the project activity of [CL
 | `quiet_period` | Duration, 1 hour to 90 days | `"24h"` | The time with no project activity after which a project is `quiet` |
 | `paseo_agents` | Boolean | `false` | `true` turns on the Paseo source. A project is then `busy` while Paseo lists a running or starting agent in it, and each project is `busy` when the listing fails |
 
-A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`.
+A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds.
 
 ## 4. Illustrative complete policy values
 

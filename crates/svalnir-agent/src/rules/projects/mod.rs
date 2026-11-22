@@ -70,9 +70,10 @@ pub use inspect::{
 };
 pub use recency::{
     ActivitySource, AgentListing, AgentReading, AgentStatus, ClaudeTranscripts, GitHeadActivity,
-    HeadActivity, MAX_PASEO_OUTPUT, MAX_TRANSCRIPT_ENTRIES, MAX_TRANSCRIPT_FOLDERS,
-    PASEO_ARGUMENTS, PASEO_CANDIDATES, PASEO_DEADLINE, PaseoAgents, ProjectRecency, RecencyHost,
-    RecencyState, SourceReading, TranscriptActivity, assess, encode_folder, quiet_period,
+    HeadActivity, MAX_FOLDER_UNITS, MAX_PASEO_OUTPUT, MAX_TRANSCRIPT_ENTRIES,
+    MAX_TRANSCRIPT_FOLDERS, PASEO_ARGUMENTS, PASEO_CANDIDATES, PASEO_DEADLINE, PaseoAgents,
+    ProjectRecency, RecencyHost, RecencyState, SourceReading, TranscriptActivity, assess,
+    assess_with_head, encode_folder, quiet_period,
 };
 
 use super::caches::ReclaimBasis;

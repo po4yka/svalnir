@@ -5,7 +5,7 @@
 //! [`crate::rules::git`], reads the process table, and measures each unit
 //! with the scanner. It changes nothing and gives no candidate.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -20,7 +20,9 @@ use svalnir_core::rule::{LayoutSupport, RuleRef};
 use svalnir_core::time::MonotonicNanos;
 
 use super::activity::{BuildProcesses, ProcessEvidence};
-use super::recency::{AgentListing, ProjectRecency, RecencyHost, RecencyState, assess};
+use super::recency::{
+    AgentListing, ProjectRecency, RecencyHost, RecencyState, SourceReading, assess_with_head,
+};
 use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, ProjectRule};
 use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
@@ -303,6 +305,9 @@ struct Inspector<'a> {
     uses: Option<(UnitScope, PathInventory)>,
     /// The Paseo listing, read one time when the first unit needs it.
     agents: Option<AgentListing>,
+    /// The reading of the Git source of each Git directory, read one time
+    /// for the inspection. The unit bound bounds it.
+    heads: BTreeMap<PathBuf, SourceReading>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
 }
@@ -453,6 +458,7 @@ impl ProjectRule {
                     processes: host.processes.build_processes(host.principal),
                     uses: None,
                     agents: None,
+                    heads: BTreeMap::new(),
                     directories: 0,
                     units: Vec::new(),
                 };
@@ -800,13 +806,18 @@ impl Inspector<'_> {
     }
 
     /// The project activity of `repository`. The Paseo listing is read one
-    /// time for the inspection.
+    /// time for the inspection, and the Git source one time for each Git
+    /// directory.
     fn recency(&mut self, repository: &Repository) -> ProjectRecency {
         let host: RecencyHost<'_> = self.host.recency;
+        let git: SourceReading = *self
+            .heads
+            .entry(repository.git_dir.clone())
+            .or_insert_with(|| host.head.head_activity(repository));
         let listing: &AgentListing = self
             .agents
             .get_or_insert_with(|| host.agents.agent_listing());
-        assess(&host, listing, repository, self.clock.now().wall)
+        assess_with_head(&host, listing, repository, git, self.clock.now().wall)
     }
 
     /// The use of the unit at `path`, from the inventory of the search root.

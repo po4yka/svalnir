@@ -12,7 +12,8 @@ use svalnir_core::rule::Fact;
 use svalnir_core::time::WallTime;
 use tempfile::TempDir;
 
-use super::recency::{newest_transcript, parse_listing};
+use super::MAX_FOLDER_UNITS;
+use super::recency::{folder_keys, head_reading, matches_folder, newest_transcript, parse_listing};
 use super::tests::{DAY, Home, NoActivity, quiet, refusal, unit};
 use super::{
     ActivitySource, AgentListing, AgentReading, AgentStatus, ClaudeTranscripts, GitHeadActivity,
@@ -260,7 +261,8 @@ fn a_failed_paseo_listing_makes_each_project_busy() {
         Some(at(BASE + 30 * DAY_SECONDS)),
     );
     assert_eq!(recency.state, RecencyState::Busy);
-    assert_eq!(recency.reason, "agent_status_failed");
+    // The reason of the failure shows why each project is busy.
+    assert_eq!(recency.reason, "paseo_timeout");
     assert_eq!(
         recency.agents,
         AgentReading::Failed {
@@ -469,7 +471,10 @@ fn the_git_source_reads_the_reflog_of_head_then_head() {
     // A write of the index does not count.
     set_modified(&work_tree.join(".git/index"), at(BASE + 200));
     let source = GitHeadActivity::new(Ok(&home.git));
-    assert_eq!(source.head_activity(&repository), observed(at(BASE)));
+    // The newest of the two files applies.
+    assert_eq!(source.head_activity(&repository), observed(at(BASE + 100)));
+    set_modified(&reflog, at(BASE + 150));
+    assert_eq!(source.head_activity(&repository), observed(at(BASE + 150)));
     fs::remove_file(&reflog).unwrap();
     assert_eq!(source.head_activity(&repository), observed(at(BASE + 100)));
     fs::remove_file(&head).unwrap();
@@ -500,7 +505,100 @@ fn the_folder_name_replaces_each_character_that_is_not_a_letter_or_digit() {
         encode_folder(Path::new("/Users/a/GitHub/svalnir/.claude/worktrees/w_1")),
         "-Users-a-GitHub-svalnir--claude-worktrees-w-1"
     );
-    assert_eq!(encode_folder(Path::new("/tmp/é x")), "-tmp---x");
+    assert_eq!(encode_folder(Path::new("/tmp/\u{e9} x")), "-tmp---x");
+    // A character outside the Basic Multilingual Plane has two UTF-16 code
+    // units, so it gives `--`.
+    assert_eq!(encode_folder(Path::new("/tmp/\u{1F600}a")), "-tmp---a");
+}
+
+#[test]
+fn neither_head_file_is_a_failure_and_not_a_quiet_project() {
+    let directory: TempDir = TempDir::new().unwrap();
+    let paths: Vec<PathBuf> = vec![
+        directory.path().join("logs/HEAD"),
+        directory.path().join("HEAD"),
+    ];
+    assert_eq!(
+        head_reading(&paths),
+        SourceReading::Failed {
+            reason: "git_head_missing"
+        }
+    );
+    fs::write(&paths[1], b"ref: refs/heads/main\n").unwrap();
+    set_modified(&paths[1], at(BASE));
+    assert_eq!(head_reading(&paths), observed(at(BASE)));
+    let recency = assess_with(
+        SourceReading::Failed {
+            reason: "git_head_missing",
+        },
+        SourceReading::NoEvidence,
+        &AgentListing::Off,
+        Some(at(BASE)),
+    );
+    assert_eq!(recency.reason, "activity_source_failed");
+    assert_eq!(recency.fact(), Fact::Unknown);
+}
+
+#[test]
+fn a_root_in_nfc_or_nfd_matches_the_folders_of_both_forms() {
+    let nfc: &str = "/tmp/x\u{e9}y";
+    let nfd: &str = "/tmp/xe\u{301}y";
+    for root in [nfc, nfd] {
+        let keys: Vec<String> = folder_keys(Path::new(root));
+        assert!(keys.contains(&"-tmp-x-y".to_owned()), "{root}: {keys:?}");
+        assert!(keys.contains(&"-tmp-xe-y".to_owned()), "{root}: {keys:?}");
+    }
+    // A name with no character that normalization changes has one key.
+    assert_eq!(
+        folder_keys(Path::new("/tmp/absent/app")),
+        ["-tmp-absent-app"]
+    );
+}
+
+#[test]
+fn a_folder_that_claude_code_cut_matches_its_long_root() {
+    let short: String = "-a".repeat(50);
+    assert!(matches_folder(short.as_bytes(), short.as_bytes()));
+    assert!(matches_folder(
+        format!("{short}-x").as_bytes(),
+        short.as_bytes()
+    ));
+    assert!(!matches_folder(
+        format!("{short}x").as_bytes(),
+        short.as_bytes()
+    ));
+    // A key of more than 200 code units: Claude Code keeps 200 and adds `-`
+    // and a hash of the path.
+    let long: String = format!("-{}", "b".repeat(300));
+    let cut: String = format!("{}-1x9z0q", &long[..MAX_FOLDER_UNITS]);
+    assert!(matches_folder(cut.as_bytes(), long.as_bytes()));
+    // A descendant of a long root has the same first 200 code units.
+    let below: String = format!("{}-k2", &format!("{long}-src")[..MAX_FOLDER_UNITS]);
+    assert!(matches_folder(below.as_bytes(), long.as_bytes()));
+    // A key of exactly 200 code units is not cut.
+    let exact: String = long[..MAX_FOLDER_UNITS].to_owned();
+    assert!(matches_folder(exact.as_bytes(), exact.as_bytes()));
+    assert!(matches_folder(
+        format!("{exact}-h").as_bytes(),
+        exact.as_bytes()
+    ));
+    assert!(!matches_folder(&exact.as_bytes()[..199], exact.as_bytes()));
+}
+
+#[test]
+fn the_transcript_source_finds_the_cut_folder_of_a_long_root() {
+    let home = Home::new();
+    let mut relative: String = "Code".to_owned();
+    while encode_folder(&home.path.join(&relative)).len() <= MAX_FOLDER_UNITS {
+        relative.push_str("/directory-of-a-long-path");
+    }
+    let root: PathBuf = home.path.join(&relative);
+    let key: String = encode_folder(&root);
+    let folder: String = format!("{}-3k2l9a", &key[..MAX_FOLDER_UNITS]);
+    let transcript: PathBuf = home.write(&format!(".claude/projects/{folder}/a.jsonl"), b"");
+    set_modified(&transcript, at(BASE));
+    let source = ClaudeTranscripts::for_home(Some(&home.path));
+    assert_eq!(source.transcript_activity(&root), observed(at(BASE)));
 }
 
 #[test]
@@ -669,7 +767,7 @@ fn a_busy_project_refuses_its_unit() {
         assert_eq!(refusal(report), "project_busy");
         assert_eq!(
             report.recency.as_ref().unwrap().reason,
-            "agent_status_failed"
+            "paseo_output_not_array"
         );
     }
 }
@@ -684,4 +782,56 @@ fn the_quiet_period_of_the_settings_is_its_duration() {
         super::quiet_period(&config.cleanup().projects),
         Nanoseconds::new(2 * 86_400_000_000_000)
     );
+}
+
+/// A Git source that counts its reads.
+struct Counted<'a> {
+    inner: GitHeadActivity<'a>,
+    reads: std::cell::Cell<u32>,
+}
+
+impl HeadActivity for Counted<'_> {
+    fn head_activity(&self, repository: &Repository) -> SourceReading {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.head_activity(repository)
+    }
+}
+
+#[test]
+fn the_inspection_reads_the_git_source_one_time_for_each_git_directory() {
+    let home = Home::new();
+    home.write("Code/mono/.gitignore", b"node_modules/\n");
+    for name in ["one", "two"] {
+        home.write(&format!("Code/mono/{name}/package.json"), b"{}");
+    }
+    home.repository("Code/mono");
+    for name in ["one", "two"] {
+        home.write(&format!("Code/mono/{name}/node_modules/p/index.js"), b"1\n");
+    }
+    old_project(&home, "solo", at(BASE));
+    let head = Counted {
+        inner: GitHeadActivity::new(Ok(&home.git)),
+        reads: std::cell::Cell::new(0),
+    };
+    let transcripts = ClaudeTranscripts::for_home(Some(&home.path));
+    let inspection = home.inspect_sources(
+        &quiet(),
+        Ok(&home.git),
+        ProjectLimits::default(),
+        RecencyHost {
+            quiet_period: DAY,
+            head: &head,
+            transcripts: &transcripts,
+            agents: &NoActivity,
+        },
+        &At(Some(at(BASE + 2 * DAY_SECONDS))),
+    );
+    let measured: usize = inspection
+        .units
+        .iter()
+        .filter(|unit| unit.recency.is_some())
+        .count();
+    assert_eq!(measured, 3, "{:#?}", inspection.units);
+    // Two units in `mono` share one Git directory.
+    assert_eq!(head.reads.get(), 2);
 }

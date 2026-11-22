@@ -7,8 +7,9 @@
 //! Three sources give the evidence, each behind a small trait, so a test
 //! can give its own evidence:
 //!
-//! - [`HeadActivity`]: the modification time of the reflog of `HEAD`, or of
-//!   `HEAD`, that `git rev-parse --git-path` names. The native source
+//! - [`HeadActivity`]: the newest modification time of the reflog of `HEAD`
+//!   and of `HEAD`, which `git rev-parse --git-path` names. Neither file is a
+//!   failure, not an absence of evidence. The native source
 //!   ([`GitHeadActivity`]) runs the query through the constrained runner of
 //!   [`crate::rules::git`], so it runs no program from the configuration of
 //!   the repository.
@@ -129,7 +130,7 @@ pub enum AgentListing {
 
 /// The evidence of the reflog of `HEAD` for one repository.
 pub trait HeadActivity {
-    /// The modification time of the reflog of `HEAD`, or of `HEAD`.
+    /// The newest modification time of the reflog of `HEAD` and of `HEAD`.
     fn head_activity(&self, repository: &Repository) -> SourceReading;
 }
 
@@ -290,8 +291,21 @@ pub fn assess(
     repository: &Repository,
     now: Option<WallTime>,
 ) -> ProjectRecency {
-    let root: &Path = &repository.work_tree;
     let git: SourceReading = host.head.head_activity(repository);
+    assess_with_head(host, listing, repository, git, now)
+}
+
+/// [`assess`] with the reading `git` of the Git source, which the caller
+/// read, for example from a cache of one inspection.
+#[must_use]
+pub fn assess_with_head(
+    host: &RecencyHost<'_>,
+    listing: &AgentListing,
+    repository: &Repository,
+    git: SourceReading,
+    now: Option<WallTime>,
+) -> ProjectRecency {
+    let root: &Path = &repository.work_tree;
     let transcripts: SourceReading = host.transcripts.transcript_activity(root);
     let agents: AgentReading = agent_reading(listing, root);
     let newest: Option<(WallTime, ActivitySource)> = [
@@ -309,7 +323,9 @@ pub fn assess(
         .any(|reading| matches!(reading, SourceReading::Failed { .. }));
     let (state, reason): (RecencyState, &'static str) = match (agents, newest, now) {
         (AgentReading::Busy, _, _) => (RecencyState::Busy, "agent_running"),
-        (AgentReading::Failed { .. }, _, _) => (RecencyState::Busy, "agent_status_failed"),
+        // The reason of the failure, so that each report shows why each
+        // project is busy.
+        (AgentReading::Failed { reason }, _, _) => (RecencyState::Busy, reason),
         (_, _, None) => (RecencyState::Active, "clock_unknown"),
         (_, Some((at, _)), Some(now))
             if nanos(now) - nanos(at) < i128::from(host.quiet_period.get()) =>
@@ -400,43 +416,124 @@ impl HeadActivity for GitHeadActivity<'_> {
         if lines.len() != 2 {
             return failed("git_output_not_supported");
         }
-        for line in lines {
-            let named: &Path = Path::new(OsStr::from_bytes(line));
-            let path: PathBuf = if named.is_absolute() {
-                named.to_path_buf()
-            } else {
-                repository.work_tree.join(named)
-            };
-            match modified(&path) {
-                Ok(Some(at)) => return SourceReading::Observed { at },
-                Ok(None) => {}
-                Err(_) => return failed("git_head_not_readable"),
-            }
-        }
-        SourceReading::NoEvidence
+        let paths: Vec<PathBuf> = lines
+            .into_iter()
+            .map(|line| {
+                let named: &Path = Path::new(OsStr::from_bytes(line));
+                if named.is_absolute() {
+                    named.to_path_buf()
+                } else {
+                    repository.work_tree.join(named)
+                }
+            })
+            .collect();
+        head_reading(&paths)
     }
 }
 
+/// The newest modification time of the files `paths`. A file that does not
+/// exist is skipped; when none exists, the reading fails with
+/// `git_head_missing`, because a repository with no `HEAD` gives no
+/// evidence of quiet.
+pub(super) fn head_reading(paths: &[PathBuf]) -> SourceReading {
+    let mut newest: Option<WallTime> = None;
+    for path in paths {
+        match modified(path) {
+            Ok(time) => newest = newest.max(time),
+            Err(_) => {
+                return SourceReading::Failed {
+                    reason: "git_head_not_readable",
+                };
+            }
+        }
+    }
+    newest.map_or(
+        SourceReading::Failed {
+            reason: "git_head_missing",
+        },
+        |at| SourceReading::Observed { at },
+    )
+}
+
+/// The longest folder name that Claude Code keeps, in UTF-16 code units.
+/// Claude Code 2.1.330 cuts a longer encoded name to this length and adds
+/// `-` and a hash of the path.
+pub const MAX_FOLDER_UNITS: usize = 200;
+
+/// The encoded name of `text` that Claude Code gives its folder: each
+/// UTF-16 code unit that is not an ASCII letter or digit is `-`, so a
+/// character outside the Basic Multilingual Plane gives `--`.
+fn encode_text(text: &str) -> String {
+    let mut encoded: String = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() {
+            encoded.push(character);
+        } else {
+            for _ in 0..character.len_utf16() {
+                encoded.push('-');
+            }
+        }
+    }
+    encoded
+}
+
 /// The encoded name of the directory `path` that Claude Code gives its
-/// folder: each character that is not an ASCII letter or digit is `-`.
+/// folder, before Claude Code cuts a long name. The result is ASCII, so
+/// each byte is one UTF-16 code unit.
 #[must_use]
 pub fn encode_folder(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
+    encode_text(&path.to_string_lossy())
+}
+
+/// The Unicode NFC and NFD forms of `text`, when the platform gives them.
+#[cfg(target_os = "macos")]
+fn normal_forms(text: &str) -> [Option<String>; 2] {
+    use objc2_foundation::NSString;
+    objc2::rc::autoreleasepool(|_| {
+        let string = NSString::from_str(text);
+        [
+            Some(string.precomposedStringWithCanonicalMapping().to_string()),
+            Some(string.decomposedStringWithCanonicalMapping().to_string()),
+        ]
+    })
+}
+
+/// The Unicode NFC and NFD forms of `text`, when the platform gives them.
+#[cfg(not(target_os = "macos"))]
+fn normal_forms(_text: &str) -> [Option<String>; 2] {
+    [None, None]
+}
+
+/// The encoded keys of the root `root`: of the path as the walk found it
+/// and of its resolved form, each also in its NFC and NFD forms when they
+/// differ. More keys can only match more folders.
+pub(super) fn folder_keys(root: &Path) -> Vec<String> {
+    let mut paths: Vec<PathBuf> = vec![root.to_path_buf()];
+    if let Ok(resolved) = fs::canonicalize(root)
+        && resolved != root
+    {
+        paths.push(resolved);
+    }
+    let mut keys: Vec<String> = Vec::new();
+    for path in &paths {
+        let text: String = path.to_string_lossy().into_owned();
+        let [nfc, nfd] = normal_forms(&text);
+        for form in [Some(text), nfc, nfd].into_iter().flatten() {
+            let key: String = encode_text(&form);
+            if !keys.contains(&key) {
+                keys.push(key);
             }
-        })
-        .collect()
+        }
+    }
+    keys
 }
 
 /// Whether the folder `name` is of the encoded root `key` or of a directory
-/// below it. The case of ASCII letters is ignored, which can only match
-/// more folders.
-fn matches_folder(name: &[u8], key: &[u8]) -> bool {
+/// below it. A key that is longer than [`MAX_FOLDER_UNITS`] is cut to that
+/// length, so a folder that Claude Code cut matches. The case of ASCII
+/// letters is ignored. Each of these rules can only match more folders.
+pub(super) fn matches_folder(name: &[u8], key: &[u8]) -> bool {
+    let key: &[u8] = &key[..key.len().min(MAX_FOLDER_UNITS)];
     name.len() >= key.len()
         && name[..key.len()].eq_ignore_ascii_case(key)
         && (name.len() == key.len() || name[key.len()] == b'-')
@@ -500,10 +597,7 @@ impl TranscriptActivity for ClaudeTranscripts {
         let Some(projects) = &self.projects else {
             return failed("home_unknown");
         };
-        let mut keys: Vec<String> = vec![encode_folder(root)];
-        if let Ok(resolved) = fs::canonicalize(root) {
-            keys.push(encode_folder(&resolved));
-        }
+        let keys: Vec<String> = folder_keys(root);
         let mut newest: Option<WallTime> = None;
         let mut budget: usize = MAX_TRANSCRIPT_ENTRIES;
         for name in folders {

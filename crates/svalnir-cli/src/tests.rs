@@ -907,12 +907,17 @@ fn config_show_has_the_project_cleanup_table() {
     assert_eq!(
         template.envelope()["result"]["cleanup"],
         serde_json::json!({
-            "projects": {"quiet_period": "86400000000000", "paseo_agents": false, "layouts": []}
+            "projects": {
+                "quiet_period": "86400000000000",
+                "paseo_agents": false,
+                "search_roots": [],
+                "layouts": []
+            }
         })
     );
     std::fs::write(
         state.join("config.toml"),
-        "schema_version = 1\n[cleanup.projects]\nquiet_period = \"2d\"\npaseo_agents = true\n\n[[cleanup.projects.layouts]]\ndirectory = \"out\"\nmarkers = [\"meson.build\", \"*.meson\"]\nprotected = [\"keep\"]\nquiet_period = \"2h\"\n",
+        "schema_version = 1\n[cleanup.projects]\nquiet_period = \"2d\"\npaseo_agents = true\nsearch_roots = [\"Developer\", \"GitHub/work\"]\n\n[[cleanup.projects.layouts]]\ndirectory = \"out\"\nmarkers = [\"meson.build\", \"*.meson\"]\nprotected = [\"keep\"]\nquiet_period = \"2h\"\n",
     )
     .unwrap();
     let shown = run_with(&environment, &["config", "show", "--format", "json"]);
@@ -922,6 +927,7 @@ fn config_show_has_the_project_cleanup_table() {
         serde_json::json!({
             "quiet_period": "172800000000000",
             "paseo_agents": true,
+            "search_roots": ["Developer", "GitHub/work"],
             "layouts": [{
                 "directory": "out",
                 "markers": ["meson.build", "*.meson"],

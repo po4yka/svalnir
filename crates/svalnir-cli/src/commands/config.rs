@@ -317,6 +317,9 @@ struct HistoryView {
 struct ProjectCleanupView {
     quiet_period: Nanoseconds,
     paseo_agents: bool,
+    /// The search roots of `project.dependency-directory`, relative to the
+    /// home directory.
+    search_roots: Vec<String>,
     /// The `[[cleanup.projects.layouts]]` tables. Each one has the layout
     /// name `user-configured`, which never permits an automatic action.
     layouts: Vec<UserLayoutView>,
@@ -394,6 +397,7 @@ impl ShowView {
                     quiet_period: Nanoseconds::try_from(projects.quiet_period)
                         .unwrap_or(Nanoseconds::MAX),
                     paseo_agents: projects.paseo_agents,
+                    search_roots: projects.search_roots.clone(),
                     layouts: projects
                         .layouts
                         .iter()

@@ -290,6 +290,16 @@ fn coordinator_dependencies(
         environment.state_directory().ok().as_deref(),
     );
     records.environment = Some(environment.seams.discovery_environment());
+    // The layouts of the configuration in effect, for the check of a unit
+    // of `project.dependency-directory` with the layout `user-configured`
+    // before its step. A configuration that cannot be read gives none, and
+    // such a unit is then skipped.
+    records.project_layouts = open_journal(environment)
+        .ok()
+        .and_then(|journal| session::active_config(&journal, authority).ok())
+        .map_or_else(Vec::new, |active| {
+            active.config.cleanup().projects.layouts.clone()
+        });
     let authority: SharedAuthority = SharedAuthority::new(records);
     Ok((
         Dependencies {

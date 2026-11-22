@@ -1255,6 +1255,52 @@ fn the_project_cleanup_settings_have_template_values_and_a_bounded_quiet_period(
     );
 }
 
+#[test]
+fn the_search_roots_are_plain_relative_paths_below_the_home_directory() {
+    let document =
+        |value: &str| format!("schema_version = 1\n[cleanup.projects]\nsearch_roots = {value}\n");
+    let template: ValidatedConfig = valid(example(README));
+    assert_eq!(
+        template.cleanup().projects.search_roots,
+        Vec::<String>::new()
+    );
+    let config: ValidatedConfig = valid(&document("[\"Developer\", \"GitHub/work\"]"));
+    assert_eq!(
+        config.cleanup().projects.search_roots,
+        ["Developer", "GitHub/work"]
+    );
+    assert!(config.is_explicit("cleanup.projects.search_roots"));
+    for bad in [
+        "/Users/me/Code",
+        "../other",
+        "Code/../..",
+        "./Code",
+        "~/Code",
+        "",
+        "Code//app",
+    ] {
+        assert_one(
+            &document(&format!("[\"{bad}\"]")),
+            FindingCode::InvalidPath,
+            "cleanup.projects.search_roots[0]",
+        );
+    }
+    assert_one(
+        &document("[\"Code\", \"code\"]"),
+        FindingCode::DuplicateIdentifier,
+        "cleanup.projects.search_roots[1]",
+    );
+    let many: String = (0..17)
+        .map(|index| format!("\"r{index}\""))
+        .collect::<Vec<String>>()
+        .join(", ");
+    assert_one(
+        &document(&format!("[{many}]")),
+        FindingCode::TooManyEntries,
+        "cleanup.projects.search_roots",
+    );
+}
+
 /// A document with one `[[cleanup.projects.layouts]]` table with `body`.
 fn layout_document(body: &str) -> String {
     format!("schema_version = 1\n\n[[cleanup.projects.layouts]]\n{body}\n")

@@ -546,19 +546,29 @@ fn a_layout_of_the_configuration_permits_no_automatic_mode() {
             Some(RuleRefusal::ModeNotValidated)
         );
     }
-    // A fixture lifecycle does not change the layout, and no state of it
-    // can permit an automatic mode.
+    // A fixture lifecycle gives the layout at most a manual state, and no
+    // state of it can permit an automatic mode.
     for state in [manual_action_validated(), automatic_eviction_validated()] {
         let registry: ReviewedRules = ReviewedRules::with_fixture_lifecycle(&state).unwrap();
-        let support = registry
-            .projects()
-            .rule()
+        let rule = registry.projects().rule();
+        let support = rule
             .layouts
             .iter()
             .find(|layout| layout.layout == "user-configured")
             .unwrap();
-        assert_eq!(support.lifecycle, LifecycleState::Proposed);
+        assert_eq!(support.lifecycle, manual_action_validated());
+        assert!(support.permits(&RuleMode::ManualEviction));
         assert!(!support.permits(&RuleMode::AutomaticEviction));
+        assert_eq!(
+            registry
+                .resolve(
+                    &rule.reference,
+                    "user-configured",
+                    &RuleMode::AutomaticEviction
+                )
+                .err(),
+            Some(RuleRefusal::ModeNotValidated)
+        );
     }
     let promoted = svalnir_core::rule::LayoutSupport {
         layout: "user-configured".to_owned(),

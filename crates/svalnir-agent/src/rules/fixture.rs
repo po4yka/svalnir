@@ -8,8 +8,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use svalnir_core::process::Uid;
@@ -17,6 +17,7 @@ use svalnir_core::rule::{LifecycleState, PromotionEvidence};
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::eviction::DiscoveryEnvironment;
+use super::projects::{BuildProcesses, ProjectProcess};
 use super::xcode::{ProducerProcesses, XcodeEvidence};
 use crate::scan::{ScanClock, ScanTimestamp};
 
@@ -60,6 +61,9 @@ pub struct FixtureEnvironment {
     days_later: i64,
     producer: Arc<AtomicU8>,
     in_use: Arc<AtomicU8>,
+    /// The working directory of a synthetic build process, for
+    /// `project.dependency-directory`.
+    build: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// The use state of the units of a fixture test, for the use check of
@@ -88,7 +92,15 @@ impl FixtureEnvironment {
             days_later,
             producer: Arc::new(AtomicU8::new(NOT_RUNNING)),
             in_use: Arc::new(AtomicU8::new(NOT_RUNNING)),
+            build: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Sets the working directory of a synthetic build process (`cargo`)
+    /// that each later inventory of the build processes has, or no such
+    /// process. Each copy of the environment has the same state.
+    pub fn set_build_process(&self, working_directory: Option<PathBuf>) {
+        *self.build.lock().unwrap_or_else(PoisonError::into_inner) = working_directory;
     }
 
     /// Sets the producer state that each later reading gives. Each copy of
@@ -192,6 +204,32 @@ impl DiscoveryEnvironment for FixtureEnvironment {
             }),
         }
         inventory
+    }
+
+    /// A complete inventory with the synthetic build process that the test
+    /// set ([`FixtureEnvironment::set_build_process`]), and a process that
+    /// is not a build process; no process table is read.
+    fn build_processes(&self, _principal: Uid) -> BuildProcesses {
+        let mut processes: Vec<ProjectProcess> = vec![ProjectProcess {
+            executable: PathBuf::from("/usr/bin/login"),
+            working_directory: None,
+        }];
+        if let Some(directory) = self
+            .build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            processes.push(ProjectProcess {
+                executable: PathBuf::from("/usr/local/bin/cargo"),
+                working_directory: Some(directory),
+            });
+        }
+        BuildProcesses {
+            processes,
+            incomplete: None,
+            observed_at: Some(self.monotonic()),
+        }
     }
 }
 

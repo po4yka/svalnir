@@ -126,6 +126,7 @@ fn discover(
             known,
             limits: DiscoveryLimits::default(),
             cancel: &cancel,
+            projects: None,
         },
         environment,
     )
@@ -651,6 +652,7 @@ fn a_cancelled_discovery_is_not_complete() {
             known: None,
             limits: DiscoveryLimits::default(),
             cancel: &cancel,
+            projects: None,
         },
         &month_later(),
     );
@@ -673,6 +675,7 @@ fn a_root_on_a_volume_that_the_request_does_not_name_is_not_examined() {
             known: None,
             limits: DiscoveryLimits::default(),
             cancel: &cancel,
+            projects: None,
         },
         &month_later(),
     );
@@ -699,6 +702,7 @@ fn the_expired_temporary_rule_gives_no_eligible_candidate_without_a_lease_record
             known: None,
             limits: DiscoveryLimits::default(),
             cancel: &cancel,
+            projects: None,
         },
         &month_later(),
     );
@@ -1077,6 +1081,7 @@ fn discover_with(
             known: None,
             limits: DiscoveryLimits::default(),
             cancel: &cancel,
+            projects: None,
         },
         &environment,
     );

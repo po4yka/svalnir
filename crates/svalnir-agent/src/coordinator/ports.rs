@@ -34,6 +34,7 @@ use crate::platform::process::ProcessSource;
 use crate::protection::ProtectedLocations;
 use crate::rules::ProducerActivity;
 use crate::rules::in_use::UnitUse;
+use crate::rules::projects::UnitRecheck;
 use std::path::Path;
 use svalnir_core::rule::RuleRef;
 
@@ -139,6 +140,30 @@ pub trait AuthoritySource: Debug {
     /// eviction, after [`producer_activity`](Self::producer_activity). Only
     /// [`UnitUse::NotInUse`] permits the step.
     fn unit_use(&self, path: &Path) -> UnitUse;
+
+    /// The checks of the rule for the file target at `path` below its
+    /// approved root `root`, from evidence that this call reads: for
+    /// `project.dependency-directory`, the layout `layout` of the sealed
+    /// plan with its markers, the protected children, and the build
+    /// processes of the project. The coordinator asks immediately before
+    /// each step of an eviction, after [`unit_use`](Self::unit_use). Only
+    /// [`UnitRecheck::Passed`] permits the step.
+    ///
+    /// The default has no evidence for that rule, so it refuses its steps;
+    /// a rule with no such check passes.
+    fn unit_recheck(
+        &self,
+        rule: &RuleRef,
+        _layout: Option<&str>,
+        _root: &Path,
+        _path: &Path,
+    ) -> UnitRecheck {
+        if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID {
+            UnitRecheck::Unknown("unit_recheck_unavailable")
+        } else {
+            UnitRecheck::Passed
+        }
+    }
 }
 
 /// The measurements of outcome verification.

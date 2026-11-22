@@ -41,6 +41,10 @@ pub(crate) struct Environment {
     /// The directory in which the user started the command. A relative path
     /// argument is resolved against it.
     pub(crate) current_directory: Option<PathBuf>,
+    /// The values of `XDG_STATE_HOME` and `XDG_CONFIG_HOME`, which locate
+    /// the files of mise. A value that is not an absolute path is not used.
+    pub(crate) xdg_state_home: Option<OsString>,
+    pub(crate) xdg_config_home: Option<OsString>,
     /// The interrupt request of the user.
     pub(crate) interrupt: Interrupt,
     /// The host effects that a test replaces.
@@ -56,6 +60,8 @@ impl Environment {
                 .filter(|home| !home.is_empty())
                 .map(PathBuf::from),
             current_directory: std::env::current_dir().ok(),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             interrupt: Interrupt::for_process(),
             seams: Seams::default(),
         }

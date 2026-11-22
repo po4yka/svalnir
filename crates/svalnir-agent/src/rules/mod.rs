@@ -42,7 +42,10 @@
 //! ([`xcode_evidence`]), runs each discovery, resolves the overlaps,
 //! applies the catalog of protected file locations, and sets predicates 3,
 //! 9, and 10. [`automatic_roots`] gives the approved roots of an automatic
-//! operation.
+//! operation. `project.dependency-directory` has no root in its
+//! declaration: a manual request gives its roots
+//! ([`projects::ProjectRequest`]), and the discovery never examines it for
+//! an automatic operation.
 //!
 //! # What a discovery establishes
 //!

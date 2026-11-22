@@ -725,6 +725,7 @@ pub(crate) fn plan(
     arguments: &CleanPlanArgs,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
+    super::inspect::check_plan_options(arguments)?;
     if arguments.mode == CleanMode::Evict {
         if !arguments.entries.is_empty() {
             return Err(selection::entry_not_accepted().into());

@@ -366,10 +366,20 @@ pub struct ProjectCleanup {
     pub quiet_period: Duration,
     /// True when the Paseo source of the project activity is on.
     pub paseo_agents: bool,
+    /// The search roots of the rule, each a plain relative path below the
+    /// home directory, in the sequence of the document. The template has
+    /// none. The validation makes sure that each one has no empty, `.`,
+    /// `..`, or `~` component, that no two are the same with the case of
+    /// ASCII letters ignored, and that the list has at most
+    /// [`MAX_SEARCH_ROOTS`] paths.
+    pub search_roots: Vec<String>,
     /// The `[[cleanup.projects.layouts]]` tables, in the sequence of the
     /// document. The template has none.
     pub layouts: Vec<UserLayout>,
 }
+
+/// The largest number of `[cleanup.projects].search_roots`.
+pub const MAX_SEARCH_ROOTS: usize = 16;
 
 /// The largest number of `[[cleanup.projects.layouts]]` tables.
 pub const MAX_USER_LAYOUTS: usize = 16;

@@ -245,9 +245,6 @@ fn the_evict_mode_refuses_each_inspection_rule_also_with_a_fixture_lifecycle() {
         "uv.cache",
         "homebrew.download-cache",
         "cocoapods.cache",
-        // The rule of the project dependency directories has the
-        // inspection mode only too.
-        "project.dependency-directory",
         // The rules of the owner tools.
         "simulator.devices",
         "container.build-cache",

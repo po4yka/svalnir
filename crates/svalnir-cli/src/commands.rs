@@ -47,6 +47,8 @@ pub(crate) mod evict;
 pub(crate) mod execution;
 pub(crate) mod history;
 mod home;
+#[cfg(unix)]
+pub(crate) mod inspect;
 pub(crate) mod monitor;
 pub(crate) mod operation_view;
 pub(crate) mod operations;
@@ -288,6 +290,10 @@ fn dispatch(cli: &Cli, invocation: &mut Invocation<'_>) -> Result<ExitStatus, Co
             })?;
             Ok(ExitStatus::Success)
         }
+        #[cfg(unix)]
+        Command::Clean {
+            command: CleanCommand::Inspect(arguments),
+        } => inspect::inspect(arguments, invocation),
         #[cfg(unix)]
         Command::Clean {
             command: CleanCommand::Plan(arguments),

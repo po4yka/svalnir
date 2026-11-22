@@ -68,7 +68,35 @@ pub(crate) struct DiskView {
 }
 
 impl DiskView {
+    /// The view of the startup data volume.
     pub(crate) fn new(reading: &DiskReading, coverage: &mut ScopeCoverage) -> Self {
+        Self::of_selector(reading, "startup-data", coverage)
+    }
+
+    /// The view of the volume of the home directory, for `disk`.
+    pub(crate) fn of_home(reading: &DiskReading, coverage: &mut ScopeCoverage) -> Self {
+        Self::of_selector(reading, "home", coverage)
+    }
+
+    /// The available capacity, when the volume was measured.
+    pub(crate) fn available(&self) -> Option<&Observation<Bytes>> {
+        self.available.as_ref()
+    }
+
+    /// The name of the volume in the text form.
+    fn label(&self) -> &'static str {
+        if self.selector == "home" {
+            "volume of the home directory"
+        } else {
+            "startup data volume"
+        }
+    }
+
+    fn of_selector(
+        reading: &DiskReading,
+        selector: &'static str,
+        coverage: &mut ScopeCoverage,
+    ) -> Self {
         match reading {
             DiskReading::Measured {
                 identity,
@@ -78,7 +106,7 @@ impl DiskView {
                 coverage.require(&capacity.total);
                 coverage.require(&capacity.available);
                 Self {
-                    selector: "startup-data",
+                    selector,
                     volume: Some(identity.clone()),
                     unresolved_reason: None,
                     total: Some(capacity.total.clone()),
@@ -91,7 +119,7 @@ impl DiskView {
             DiskReading::CapacityUnavailable { identity, reason } => {
                 coverage.missing("disk.available_bytes");
                 Self {
-                    selector: "startup-data",
+                    selector,
                     volume: Some(identity.clone()),
                     unresolved_reason: Some(reason.clone()),
                     total: None,
@@ -104,7 +132,7 @@ impl DiskView {
             DiskReading::Unresolved(reason) => {
                 coverage.missing("disk.available_bytes");
                 Self {
-                    selector: "startup-data",
+                    selector,
                     volume: None,
                     unresolved_reason: Some(reason.clone()),
                     total: None,
@@ -117,11 +145,12 @@ impl DiskView {
         }
     }
 
-    fn render(&self, out: &mut String) {
+    pub(crate) fn render(&self, out: &mut String) {
         if let (Some(volume), Some(reason)) = (&self.volume, &self.unresolved_reason) {
             put_line!(
                 out,
-                "Disk (startup data volume, {})",
+                "Disk ({}, {})",
+                self.label(),
                 volume.mount_point.display_label()
             );
             field(
@@ -134,7 +163,7 @@ impl DiskView {
         }
         let Some(volume) = &self.volume else {
             let reason: &str = self.unresolved_reason.as_deref().unwrap_or("unknown");
-            put_line!(out, "Disk (startup data volume)");
+            put_line!(out, "Disk ({})", self.label());
             field(
                 out,
                 "Volume",
@@ -145,7 +174,8 @@ impl DiskView {
         };
         put_line!(
             out,
-            "Disk (startup data volume, {})",
+            "Disk ({}, {})",
+            self.label(),
             volume.mount_point.display_label()
         );
         let rows: [(&str, &Option<Observation<Bytes>>); 5] = [

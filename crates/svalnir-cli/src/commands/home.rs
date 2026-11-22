@@ -61,11 +61,15 @@ fn changes_state(command: &Command) -> bool {
         Command::Status
         | Command::Scan { .. }
         | Command::Report { .. }
+        | Command::Disk { .. }
         | Command::Monitor { .. }
         | Command::History { .. }
         | Command::Doctor
         | Command::Completions { .. }
-        | Command::License => false,
+        | Command::License
+        // The server changes nothing itself. Each tool call is one
+        // invocation of a command, which has its own check.
+        | Command::Mcp => false,
     }
 }
 

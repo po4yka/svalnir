@@ -77,6 +77,8 @@ pub enum Command {
     Scan(ScanArgs),
     /// Inspect a recorded scan and the capacity of the startup data volume.
     Report(ReportArgs),
+    /// Show the free and available space of the volume of the home directory.
+    Disk(DiskArgs),
     /// Prepare, inspect, and apply a cleanup plan.
     Clean {
         #[command(subcommand)]
@@ -127,6 +129,9 @@ pub enum Command {
     Completions(CompletionsArgs),
     /// Display the license of Svalnir.
     License,
+    /// Serve the Model Context Protocol on stdin and stdout for a coding
+    /// agent. A plan is applied only through the path of `clean apply`.
+    Mcp,
 }
 
 impl Command {
@@ -136,6 +141,7 @@ impl Command {
             Self::Status => "status",
             Self::Scan(_) => "scan",
             Self::Report(_) => "report",
+            Self::Disk(_) => "disk",
             Self::Clean { command } => match command {
                 CleanCommand::Inspect(_) => "clean inspect",
                 CleanCommand::Plan(_) => "clean plan",
@@ -184,6 +190,7 @@ impl Command {
             Self::Doctor => "doctor",
             Self::Completions(_) => "completions",
             Self::License => "license",
+            Self::Mcp => "mcp",
         }
     }
 
@@ -263,6 +270,16 @@ pub struct ReportArgs {
     /// of the configuration template.
     #[arg(long, value_name = "SIZE", value_parser = byte_size)]
     pub threshold: Option<Bytes>,
+}
+
+#[derive(Debug, Args)]
+pub struct DiskArgs {
+    /// Print a warning only when the available capacity is below SIZE, for
+    /// example `20GiB`, and print nothing otherwise. In this mode each
+    /// error goes to stderr and the exit status is 0, so a hook never
+    /// fails.
+    #[arg(long, value_name = "SIZE")]
+    pub warn_below: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -359,6 +376,19 @@ pub struct PlanRef {
 pub struct CleanApplyArgs {
     #[command(flatten)]
     pub plan: PlanRef,
+    /// The digest of the plan that was shown for the approval. A stored
+    /// plan with a different digest is refused, and nothing changes.
+    #[arg(long, value_name = "DIGEST")]
+    pub digest: Option<String>,
+    /// The modes that this request permits, for example `evict,trash`. A
+    /// stored plan of a different mode is refused, and nothing changes.
+    #[arg(long, value_enum, value_name = "MODE", value_delimiter = ',')]
+    pub only_modes: Vec<CleanMode>,
+    /// Permit only an agent as the executor. With no agent that holds the
+    /// coordinator lock, the request is refused, and this process does
+    /// not execute the plan.
+    #[arg(long)]
+    pub require_agent: bool,
     #[command(flatten)]
     pub apply: ApplyOptions,
 }

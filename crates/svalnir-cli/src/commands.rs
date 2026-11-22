@@ -6,7 +6,7 @@
 //!
 //! | Module | Commands |
 //! | --- | --- |
-//! | `resources`, `monitor`, `processes`, `scan`, `doctor`, `policy` | The read-only commands, which read the host in this process |
+//! | `resources`, `disk`, `monitor`, `processes`, `scan`, `doctor`, `policy` | The read-only commands, which read the host in this process |
 //! | `config` | `config validate` and `config show`, with `--effective` |
 //! | `authority` | `config apply`, `policy enable`, `policy disable`, `policy rearm`, `agent pause`, and `agent resume` |
 //! | `clean`, `stop` | `clean plan`, `clean show`, `clean apply`, and `processes stop` |
@@ -41,6 +41,7 @@ pub(crate) mod capacity;
 #[cfg(unix)]
 pub(crate) mod clean;
 pub(crate) mod config;
+pub(crate) mod disk;
 pub(crate) mod doctor;
 pub(crate) mod evict;
 #[cfg(target_os = "macos")]
@@ -253,6 +254,8 @@ fn dispatch_read_only(
         } => processes::show(arguments, invocation),
         Command::Scan(arguments) => scan::scan(arguments, invocation),
         Command::Report(arguments) => scan::report(arguments, invocation),
+        Command::Disk(arguments) => disk::run(arguments, invocation),
+        Command::Mcp => crate::mcp::serve_process(invocation),
         Command::Doctor => doctor::run(invocation),
         Command::Config {
             command: ConfigCommand::Validate(arguments),
@@ -419,6 +422,9 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
     let message: String = match (command, format) {
         (Command::Completions(_), Format::Json | Format::Ndjson) => {
             "`svalnir completions` writes a shell script; use `--format text`".to_owned()
+        }
+        (Command::Mcp, Format::Json | Format::Ndjson) => {
+            "`svalnir mcp` writes JSON-RPC messages and takes no `--format`".to_owned()
         }
         (command, Format::Ndjson) if !command.is_streaming() => format!(
             "`svalnir {}` is not a streaming command; use `--format json`",

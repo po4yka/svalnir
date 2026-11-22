@@ -27,6 +27,7 @@ use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit};
 use crate::rules::git::{
     GitFailure, GitOutput, GitTool, GitToolProblem, RepositoryLookup, find_repository,
 };
+use crate::rules::nested_git::{self, DetectionLimits, RepositoryRefusal, Verdict};
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
 };
@@ -215,6 +216,10 @@ pub enum ProjectUnitOutcome {
         /// The reason.
         reason: &'static str,
     },
+    /// The unit holds a Git repository, or the walk that looks for one did
+    /// not examine each entry (`docs/CLEANUP_RULES.md` section 6,
+    /// "Repositories in a unit"). It is not measured.
+    RepositoryRefused(RepositoryRefusal),
     /// Another rule owns the directory (`docs/CLEANUP_RULES.md` section
     /// 8). It is not measured.
     OwnedByOtherRule {
@@ -671,6 +676,21 @@ impl Inspector<'_> {
             ProjectActivity::Inactive => {}
             ProjectActivity::Active { .. } => return refused("producer_active"),
             ProjectActivity::Unknown { .. } => return refused("activity_unknown"),
+        }
+        // A clone with commits or changes that exist nowhere else. The
+        // layouts of this rule have no checkouts of Swift Package Manager.
+        if let Verdict::Refused(refusal) = nested_git::check_unit(
+            path,
+            None,
+            self.host.git,
+            &DetectionLimits {
+                max_depth: self.limits.measure.max_depth,
+                max_entries: self.limits.measure.max_entries_per_unit.get(),
+                ..DetectionLimits::default()
+            },
+            Some(self.cancel),
+        ) {
+            return ProjectUnitOutcome::RepositoryRefused(refusal);
         }
         match measure_unit(
             path,

@@ -52,7 +52,10 @@
 //!
 //! No query of this module compares the content of a work tree with the
 //! index (`git status`, `git diff-files`): such a comparison can run a
-//! clean filter that the configuration of the repository names.
+//! clean filter that the configuration of the repository names. The one
+//! caller that runs `git status`, the check of a checkout of Swift Package
+//! Manager (`rules::nested_git::swiftpm`), first refuses a repository whose
+//! configuration names a filter driver.
 //!
 //! # Bounds
 //!

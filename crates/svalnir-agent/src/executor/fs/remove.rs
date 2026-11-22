@@ -8,7 +8,8 @@
 //!    mutation. A tree that does not fit the depth, entry, or descriptor
 //!    bound, that has a mount point, a dataless directory or file, an entry of
 //!    another owner than the target, or a type that is not supported, is
-//!    refused as a whole: nothing is removed.
+//!    refused as a whole: nothing is removed. A tree of an eviction with a
+//!    Git marker (`.git`) at any depth is refused in the same way.
 //! 2. The removal goes bottom-up through the measured entries only. It
 //!    compares each entry with its measurement immediately before the
 //!    call, never follows a symbolic link, and never reads a directory
@@ -49,6 +50,7 @@ use super::resolve::{
     Checkpoint, HomeGuard, Injection, Located, Refusal, identity_of, is_absent, is_not_directory,
     push_name,
 };
+use crate::rules::nested_git;
 
 /// The size in bytes of one `st_blocks` unit.
 pub(super) const BLOCK_BYTES: u64 = 512;
@@ -266,6 +268,8 @@ pub(super) struct TreeBounds {
     pub(super) charge: WorkCharge,
     /// Whether a regular file with more than one name refuses the tree.
     pub(super) refuse_hard_links: bool,
+    /// Whether a Git marker (`.git`) at any depth refuses the tree.
+    pub(super) refuse_repositories: bool,
 }
 
 /// The read-only measurement of a directory target.
@@ -279,6 +283,8 @@ struct Measure<'a> {
     /// Whether a regular file with more than one name refuses the tree:
     /// true for an eviction.
     refuse_hard_links: bool,
+    /// Whether a Git marker refuses the tree: true for an eviction.
+    refuse_repositories: bool,
     injection: &'a Injection,
     entries: u64,
     /// The allocated bytes of the measured entries below the target. A
@@ -406,6 +412,15 @@ impl Measure<'_> {
                 Err(error) => return Err(Refusal::read_failure(&error)),
             };
             self.admit_entry(&metadata)?;
+            // A Git repository in the tree of an eviction: its commits and
+            // changes can exist nowhere else. The check is in the
+            // measurement, so the whole tree is refused before the first
+            // call (`docs/CLEANUP_RULES.md` section 6).
+            if self.refuse_repositories && nested_git::is_marker(entry_name.to_bytes()) {
+                return Err(Refusal::skipped(Cause::eligibility(
+                    code::NESTED_REPOSITORY,
+                )));
+            }
             let children: Vec<Snapshot> = match metadata.kind {
                 Kind::Other => {
                     return Err(Refusal::skipped(Cause::eligibility(
@@ -764,6 +779,7 @@ pub(super) fn remove_tree(
         device: located.device,
         owner: located.metadata.owner,
         refuse_hard_links: tree.refuse_hard_links,
+        refuse_repositories: tree.refuse_repositories,
         injection,
         entries: 0,
         allocated: 0,

@@ -22,6 +22,7 @@ use crate::rules::ReviewedRules;
 use crate::rules::caches::ReclaimFigure;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
 use crate::rules::git::{GitTool, GitToolProblem};
+use crate::rules::nested_git::{RefusalReason, RepositoryRefusal};
 use crate::rules::resolve_roots;
 use crate::scan::{CancellationToken, WallScanClock};
 
@@ -731,4 +732,27 @@ fn a_search_root_in_another_case_has_the_stored_names() {
     assert_eq!(inspection.roots[0].path, Some(home.path.join("Code")));
     let report = unit(&inspection, &project.join("node_modules"));
     assert_eq!(refusal(report), "producer_active");
+}
+
+// ---------------------------------------------------------------------
+// Repositories in a unit.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_unit_that_holds_a_repository_is_refused_and_not_measured() {
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    // A dependency that a person cloned into the ignored directory.
+    home.repository("Code/app/node_modules/forked-lib");
+
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let report = unit(&inspection, &project.join("node_modules"));
+    assert_eq!(report.version_control, Some(VersionControl::Ignored));
+    assert_eq!(
+        report.outcome,
+        ProjectUnitOutcome::RepositoryRefused(RepositoryRefusal {
+            reason: RefusalReason::NestedRepository,
+            path: Some(PathBuf::from("forked-lib")),
+        })
+    );
 }

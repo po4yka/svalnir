@@ -2,7 +2,7 @@
 
 **Status:** Design specification. Commands, message shapes, limits, and version numbers below define the proposed first implementation; they are not a shipped API. The current build implements the subset that section 4 names in "Milestone 1 in-process build" and "Milestone 2 build without a socket". It has no local protocol: sections 9 to 11 are planned behavior.  
 **Interface baseline:** 1  
-**Last reviewed:** 2026-11-19
+**Last reviewed:** 2026-11-22
 
 This document connects CLI and GPUI requests to the shared agent and privileged helper. Metric semantics belong to [RESOURCE_MODEL.md](RESOURCE_MODEL.md), decisions to [POLICY_SPEC.md](POLICY_SPEC.md), and execution to [ACTION_CONTRACTS.md](ACTION_CONTRACTS.md). Rule modes belong to [CLEANUP_RULES.md](CLEANUP_RULES.md). [ARCHITECTURE.md](ARCHITECTURE.md), [THREAT_MODEL.md](THREAT_MODEL.md), and [VALIDATION.md](VALIDATION.md) define boundaries and required evidence.
 
@@ -244,6 +244,7 @@ A refusal of the coordinator or of the authorization keeps its own code and fami
 | `locked_object` | `eligibility` | From the filesystem executor: a cleanup target, the parent directory of a target of a permanent removal, or an entry of a directory target has a flag that prevents its removal (`uchg`, `uappnd`, `schg`, `sappnd`, or `restricted`). The target is skipped with no call, for each action class; a directory target with such an entry is refused whole at its measurement ([ACTION_CONTRACTS.md](ACTION_CONTRACTS.md) section 7) |
 | `target_grew` | `evidence` | From the filesystem executor: a target of a permanent removal is larger than the work charge of its binding, in allocated bytes or, for a directory, in entries. The target is skipped with no call, and nothing of a directory target is removed |
 | `target_hard_linked` | `eligibility` | From the filesystem executor: a regular file of an eviction, or a regular file in a directory target of an eviction, has more than one name. The target is skipped with no call |
+| `nested_repository` | `eligibility` | From the filesystem executor: a directory target of an eviction has an object with the name `.git` at some depth, so it holds a Git repository ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 6). The whole tree is skipped with no call |
 
 A plan explanation gives the reason `link_count_unknown` (family `evidence`) for an entry of a rule that skips hard-linked objects when the link count of the entry is not known. The `next_action` values of this build are `none`, `correct_request`, `refresh_observation`, `resolve_authority`, `respect_limits`, `prepare_new_plan`, `query_operation`, and `reconcile`.
 

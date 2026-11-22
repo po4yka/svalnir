@@ -3429,6 +3429,48 @@ fn an_eviction_refuses_a_tree_with_a_file_with_a_second_name() {
 }
 
 #[test]
+fn an_eviction_refuses_a_tree_with_a_repository_that_appeared_after_the_plan() {
+    for marker in ["directory", "file"] {
+        let fixture = Fixture::new();
+        let tree: PathBuf = make_tree(&fixture);
+        // The plan binds the tree with no repository in it.
+        let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+        let work_tree: PathBuf = tree.join("a").join("b");
+        if marker == "directory" {
+            fs::create_dir_all(work_tree.join(".git").join("objects")).unwrap();
+            fs::write(
+                work_tree.join(".git").join("HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(work_tree.join(".git"), b"gitdir: ../../../elsewhere\n").unwrap();
+        }
+
+        let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+        assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+        // Nothing was removed: the check is in the measurement.
+        assert!(tree.join("top.bin").exists(), "{marker}");
+        assert!(work_tree.join("two.bin").exists(), "{marker}");
+        assert!(work_tree.join(".git").exists(), "{marker}");
+    }
+}
+
+#[test]
+fn a_manual_deletion_of_a_tree_with_a_repository_is_not_refused() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    fs::create_dir(tree.join("a").join(".git")).unwrap();
+    let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_removed(&outcome);
+    assert!(!tree.exists());
+}
+
+#[test]
 fn a_tree_with_a_locked_entry_is_refused_before_the_first_call() {
     for flag in [libc::UF_IMMUTABLE, libc::UF_APPEND] {
         let fixture = Fixture::new();

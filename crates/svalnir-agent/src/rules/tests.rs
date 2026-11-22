@@ -799,6 +799,44 @@ fn an_item_with_content_that_the_rule_preserves_is_skipped() {
     }
 }
 
+#[test]
+fn an_item_that_holds_a_repository_is_skipped() {
+    let fixture = temporary_fixture();
+    let clone: PathBuf = fixture.root().join("clone");
+    add_item(&fixture, "clone", |_| {
+        fs::create_dir_all(clone.join("nested/dep/.git/objects")).unwrap();
+        fs::write(
+            clone.join("nested/dep/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+    });
+    let gitlink: PathBuf = fixture.root().join("gitlink");
+    add_item(&fixture, "gitlink", |_| {
+        fs::write(gitlink.join(".git"), b"gitdir: ../elsewhere\n").unwrap();
+    });
+    add_item(&fixture, "plain", |_| {});
+
+    let discovery = discover_temporary(&fixture);
+    candidate_of(&discovery, "plain");
+    for (name, marker) in [("clone", "nested/dep/.git"), ("gitlink", ".git")] {
+        let skipped = skip_of(&discovery, name);
+        assert!(
+            skipped.reasons.contains(&SkipReason::NestedRepository),
+            "{name}: {:?}",
+            skipped.reasons
+        );
+        assert_eq!(skipped.eligibility.regenerable, Fact::NotSatisfied);
+        assert_eq!(
+            skipped
+                .repository_marker
+                .as_ref()
+                .and_then(svalnir_core::file::LosslessPath::as_utf8),
+            Some(marker)
+        );
+    }
+}
+
 /// The time that a discovery on a FIFO can take. A discovery that opens the
 /// FIFO for reading never ends.
 const FIFO_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);

@@ -349,6 +349,10 @@ pub enum SkipReason {
     OverCandidateCeiling,
     /// The operating system denied access to the unit or to a part of it.
     AccessDenied,
+    /// The unit holds a Git repository: an object with the name `.git`
+    /// at some depth (`docs/CLEANUP_RULES.md` section 6, "Repositories in
+    /// a unit").
+    NestedRepository,
 }
 
 impl SkipReason {
@@ -360,7 +364,8 @@ impl SkipReason {
             | Self::NotRegenerable
             | Self::RegenerabilityUnknown
             | Self::SourceNotLocal
-            | Self::ExclusionOverlap => SkipCategory::ProtectedData,
+            | Self::ExclusionOverlap
+            | Self::NestedRepository => SkipCategory::ProtectedData,
             Self::WrongOwner | Self::SharedOwnership => SkipCategory::UnknownOwnership,
             Self::ActiveProducer => SkipCategory::ActiveProducer,
             Self::ActivityUnknown
@@ -606,6 +611,9 @@ pub struct SkippedUnit {
     pub eligibility: CandidateEligibility,
     /// The identity evidence of the unit, when the rule got it.
     pub evidence: Option<TargetEvidence>,
+    /// The first Git marker (`.git`) of the unit, relative to the unit,
+    /// when the list has [`SkipReason::NestedRepository`].
+    pub repository_marker: Option<LosslessPath>,
 }
 
 /// The result of one discovery of one rule.

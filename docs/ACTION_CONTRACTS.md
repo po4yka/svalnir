@@ -2,7 +2,7 @@
 
 **Status:** Design specification. This document defines required behavior for the first implementation; the examples are conceptual, and the types are not a shipped API or evidence of runtime validation. The `action` module of `svalnir-core` has the types of this contract and the serialized spellings that this document fixes. No executor, journal, or coordinator is implemented.
 
-**Last reviewed:** 2026-11-19
+**Last reviewed:** 2026-11-22
 
 These contracts connect [policy decisions](POLICY_SPEC.md) and [cleanup rules](CLEANUP_RULES.md) to observable effects. They refine the component boundaries in [ARCHITECTURE.md](ARCHITECTURE.md) and address the threats in [THREAT_MODEL.md](THREAT_MODEL.md). [RESOURCE_MODEL.md](RESOURCE_MODEL.md) defines the identities and resource observations used here, [INTERFACES.md](INTERFACES.md) defines how clients see these states, and [VALIDATION.md](VALIDATION.md) owns the release evidence. A contract applies equally to CLI, GPUI, and background requests.
 
@@ -206,6 +206,8 @@ A locked object gets no call. An object is locked when it has a flag that makes 
 The binding of a target has its work charge (`work_bytes` and items, section 5): the plan does not authorize data or entries that appeared after it was made. Before the first call of a permanent removal (`DeleteSelectedFiles` or `EvictRegenerableData`), the filesystem executor compares the target with that charge. A regular file or a symbolic link whose allocated bytes are larger than the work bytes of the charge is refused with `target_grew` (family `evidence`) and the result `Skipped`. For a directory target, the measurement counts the entries, the target included, and the allocated bytes of the entries below the target, with no bytes for a regular file of more than one name (a scan counts such a file only at the first name it reads, which can be outside the target, and the removal of one name releases no storage); a tree with more entries than the items of the charge or more bytes than its work bytes is refused as a whole in the same way, and nothing is removed. A move to Trash removes no data and is not compared with the charge.
 
 For `EvictRegenerableData`, a regular file with more than one name is refused with `target_hard_linked` (family `eligibility`): the removal of one name frees no space while another name keeps the data. The measurement of a directory target of this class refuses the whole tree when it has such a file. A manual `DeleteSelectedFiles` target with more than one name is not refused; its removal releases no storage of the object, and the executor counts it apart from the removed bytes.
+
+For `EvictRegenerableData`, a directory target with an object of the name `.git` at any depth is refused with `nested_repository` (family `eligibility`): a Git repository can hold commits and changes that exist nowhere else, so no build makes it again ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 6, "Repositories in a unit"). The check is in the measurement of the tree, so the whole tree is refused before the first call, also for a repository that a process made after the plan. The comparison of the name ignores the case of ASCII letters. A target of `DeleteSelectedFiles` or `MoveToTrash` is not refused for a repository.
 
 Ordinary user-cache mutation runs as its owner. Initial root deletion is limited to helper-owned data or reviewed administrator-controlled disposable namespaces. A denied user-scope action must not be retried automatically as root.
 

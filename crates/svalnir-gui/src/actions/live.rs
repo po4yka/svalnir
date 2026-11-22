@@ -1534,6 +1534,16 @@ mod tests {
         let directory = private_tempdir();
         let state: PathBuf = directory.path().join("state");
         let port = LivePort::new(Some(state.clone())).with_registry(fixture_registry());
+        // A clear rule of the `evict` mode needs the same consent.
+        let evict = port.prepare_cleanup(&cleanup_request(
+            "cargo.registry-cache",
+            PlanKind::Evict,
+            false,
+        ));
+        assert!(
+            matches!(&evict, Err(ActionState::Refused { code, .. }) if code == "clear_not_included"),
+            "{evict:?}"
+        );
         let result =
             port.prepare_cleanup(&cleanup_request("go.build-cache", PlanKind::Owner, false));
         assert!(

@@ -116,7 +116,7 @@ fn a_plan_is_sent_only_after_its_confirmation(cx: &mut TestAppContext) {
     click(handle, &format!("cleanup-plan-{PROJECT}"), cx);
     let object = label(handle, "confirm-object", cx).expect("object");
     assert!(
-        object.starts_with(&format!("The plan of {PROJECT} binds 3 entries")),
+        object.starts_with(&format!("The plan of {PROJECT} binds 2 entries")),
         "{object}"
     );
     let consequence = label(handle, "confirm-consequence", cx).expect("consequence");
@@ -124,8 +124,20 @@ fn a_plan_is_sent_only_after_its_confirmation(cx: &mut TestAppContext) {
         consequence.starts_with("Permanent deletion."),
         "{consequence}"
     );
+    // A unit that holds a repository is left out, as the discovery leaves
+    // it out; an eviction plan has no repository warning.
+    assert_eq!(label(handle, "confirm-warning-0", cx), None);
+    let omitted = label(handle, "confirm-omitted", cx).expect("omitted");
     assert!(
-        label(handle, "confirm-warning-0", cx).is_some_and(|w| w.contains("nested_repository"))
+        omitted.starts_with("Left out of the plan: 3 entries"),
+        "{omitted}"
+    );
+    // An eviction is not a clear: no clear line, and the button names the
+    // removal.
+    assert_eq!(label(handle, "confirm-clear", cx), None);
+    assert_eq!(
+        label(handle, "confirm-ok", cx).as_deref(),
+        Some("Remove 2 entries")
     );
     let estimate = label(handle, "confirm-estimate", cx).expect("estimate");
     assert!(estimate.starts_with("Estimated: about "), "{estimate}");
@@ -266,4 +278,35 @@ fn the_storage_screen_has_a_cleanup_section(cx: &mut TestAppContext) {
     assert!(
         label(handle, "cleanup-intro", cx).is_some_and(|text| text.contains("changes nothing"))
     );
+}
+
+#[gpui_kit::test]
+fn a_clear_rule_is_listed_and_its_plan_states_the_clear(cx: &mut TestAppContext) {
+    const CARGO: &str = "cargo.registry-cache";
+    let (handle, view) = open(FixtureSource::new(FixtureScenario::Healthy), cx);
+    let rule = label(handle, &format!("cleanup-rule-{CARGO}"), cx).expect("rule");
+    assert!(rule.contains("Clear cache"), "{rule}");
+    assert!(
+        label(handle, &format!("cleanup-note-{CARGO}-0"), cx)
+            .is_some_and(|note| note.starts_with("Kept:"))
+    );
+    let gate = label(handle, &format!("cleanup-gate-{CARGO}"), cx).expect("gate");
+    assert!(gate.contains("consent"), "{gate}");
+    click(handle, &format!("cleanup-clear-{CARGO}"), cx);
+    click(handle, &format!("cleanup-plan-{CARGO}"), cx);
+    let clear = label(handle, "confirm-clear", cx).expect("clear line");
+    assert!(clear.starts_with("This plan clears a cache"), "{clear}");
+    assert_eq!(
+        label(handle, "confirm-ok", cx).as_deref(),
+        Some("Remove 1 entry")
+    );
+    assert_eq!(state_of(&view, CARGO, cx), None);
+}
+
+#[gpui_kit::test]
+fn the_orphan_layout_of_xcode_is_listed(cx: &mut TestAppContext) {
+    const XCODE: &str = "xcode.inactive-derived-data";
+    let (handle, _view) = open(FixtureSource::new(FixtureScenario::Healthy), cx);
+    let layout = label(handle, &format!("cleanup-layout-{XCODE}-1"), cx).expect("layout");
+    assert_eq!(layout, "Layout derived-data-orphan-v1: proposed");
 }

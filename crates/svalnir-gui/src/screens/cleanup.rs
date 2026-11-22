@@ -45,7 +45,10 @@ use std::{sync::Arc, time::SystemTime};
 const TARGET_ROW_STEP: f32 = 24.0;
 
 /// The consent sentence of a rule whose command removes the whole cache.
-pub const CLEAR_CONSENT: &str = "I understand that the command removes the whole cache, also data that a project uses now. The next build downloads or compiles it again.";
+pub const CLEAR_CONSENT: &str = "I understand that this plan clears the cache of the producer, also data that a project uses now. The next build downloads or compiles it again.";
+
+/// The line above the apply button of a plan that clears a cache.
+pub const CLEAR_LINE: &str = "This plan clears a cache: it also removes data that a project uses now, and the next build downloads or compiles it again.";
 
 /// The sentence at the top of the section.
 const INTRO: &str = "An inspection reads the roots of each rule and changes nothing. A plan is made only when you ask for it, and nothing is removed until you confirm the plan and the agent admits it.";
@@ -327,6 +330,17 @@ fn rule_heading(rule: &RuleInspection, tokens: &Tokens) -> AnyElement {
 fn rule_findings(rule: &RuleInspection, mono: &SharedString, tokens: &Tokens) -> Vec<AnyElement> {
     let id: &str = rule.rule.as_str();
     let mut out: Vec<AnyElement> = Vec::new();
+    // A rule with more than one layout shows the state of each, for example
+    // the orphan layout of the derived data of Xcode.
+    if rule.layouts.len() > 1 {
+        for (index, (layout, state)) in rule.layouts.iter().enumerate() {
+            out.push(caption(
+                format!("cleanup-layout-{id}-{index}"),
+                format!("Layout {layout}: {state}"),
+                tokens,
+            ));
+        }
+    }
     for (index, root) in rule.roots.iter().enumerate() {
         out.push(
             div()
@@ -467,6 +481,9 @@ fn rule_block(
         .child(rule_heading(rule, tokens))
         .children(rule_findings(rule, mono, tokens))
         .children(owner_inset(rule, mono, tokens))
+        .children(rule.notes.iter().enumerate().map(|(index, note)| {
+            caption(format!("cleanup-note-{id}-{index}"), note.clone(), tokens)
+        }))
         .children(
             rule.problem
                 .as_ref()
@@ -652,13 +669,54 @@ pub fn plan_object(proposal: &CleanupProposal) -> String {
     }
 }
 
-/// The label of the apply button of a plan.
+/// The label of the apply button of a plan (`DESIGN.md` §4): "Remove" and
+/// the count of entries for an eviction, and "Run the command of" and the
+/// rule for an owner command.
 #[must_use]
 pub fn apply_label(proposal: &CleanupProposal) -> String {
     match proposal.kind {
-        PlanKind::Evict => format!("Clear {}", proposal.rule),
+        PlanKind::Evict if proposal.target_count == 1 => "Remove 1 entry".to_owned(),
+        PlanKind::Evict => format!("Remove {} entries", proposal.target_count),
         PlanKind::Owner => format!("Run the command of {}", proposal.rule),
     }
+}
+
+/// The exact command, its environment, and its effect, for an owner plan.
+fn owner_lines(
+    proposal: &CleanupProposal,
+    mono: &SharedString,
+    tokens: &Tokens,
+) -> Vec<AnyElement> {
+    let Some(owner) = &proposal.owner else {
+        return Vec::new();
+    };
+    let mut lines = v_flex().gap(tokens::SPACE_1).child(
+        div()
+            .id("confirm-command")
+            .test_support()
+            .aria_label(format!("Exact command ({}): {}", owner.kind, owner.command))
+            .font_family(mono.clone())
+            .text_size(px(12.0))
+            .child(owner.command.clone()),
+    );
+    for entry in &owner.environment {
+        lines = lines.child(
+            div()
+                .font_family(mono.clone())
+                .text_size(px(11.0))
+                .text_color(to_hsla(tokens.muted_foreground))
+                .child(entry.clone()),
+        );
+    }
+    vec![
+        inset(lines, tokens),
+        body_line(
+            "confirm-effect",
+            format!("Effect: {} {}", owner.effect, owner.consequence),
+            false,
+            tokens,
+        ),
+    ]
 }
 
 fn plan_body(
@@ -686,33 +744,8 @@ fn plan_body(
             tokens,
         ))
         .child(target_list(proposal, scroll, focus, mono, tokens))
-        .child(caption("confirm-estimate", estimate, tokens));
-    if let Some(owner) = &proposal.owner {
-        let mut lines = v_flex().gap(tokens::SPACE_1).child(
-            div()
-                .id("confirm-command")
-                .test_support()
-                .aria_label(format!("Exact command ({}): {}", owner.kind, owner.command))
-                .font_family(mono.clone())
-                .text_size(px(12.0))
-                .child(owner.command.clone()),
-        );
-        for entry in &owner.environment {
-            lines = lines.child(
-                div()
-                    .font_family(mono.clone())
-                    .text_size(px(11.0))
-                    .text_color(to_hsla(tokens.muted_foreground))
-                    .child(entry.clone()),
-            );
-        }
-        body = body.child(inset(lines, tokens)).child(body_line(
-            "confirm-effect",
-            format!("Effect: {} {}", owner.effect, owner.consequence),
-            false,
-            tokens,
-        ));
-    }
+        .child(caption("confirm-estimate", estimate, tokens))
+        .children(owner_lines(proposal, mono, tokens));
     for (index, warning) in proposal.warnings.iter().enumerate() {
         body = body.child(
             div()
@@ -756,6 +789,15 @@ fn plan_body(
         false,
         tokens,
     ))
+    .children(proposal.clear.then(|| {
+        div()
+            .id("confirm-clear")
+            .test_support()
+            .aria_label(CLEAR_LINE)
+            .text_size(px(13.0))
+            .text_color(to_hsla(tokens.warning))
+            .child(CLEAR_LINE)
+    }))
     .child(caption(
         "confirm-expiry",
         until(proposal.expires_at, now).map_or_else(

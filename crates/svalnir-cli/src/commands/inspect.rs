@@ -10,30 +10,27 @@
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use svalnir_agent::client::cleanup::{self, MiseRequest, ProjectRoots};
 use svalnir_agent::protection::ProtectedLocations;
 use svalnir_agent::rules::caches::{
     CacheInspection, InspectionHost, InspectionLimits, RootOutcome, UnitOutcome,
 };
 use svalnir_agent::rules::clear::{ClearRootEntry, RootSource as ClearRootSource};
-use svalnir_agent::rules::git::{GitTool, GitToolProblem};
 use svalnir_agent::rules::producers::{MAX_PRODUCER_EXECUTABLE_BYTES, OwnerInspection};
 use svalnir_agent::rules::projects::{
-    ArgumentRootError, ClaudeTranscripts, EnvironmentEvidence, GitHeadActivity, MiseDiscovery,
-    MiseLocations, MiseState, PROJECT_RULE_ID, PaseoAgents, ProjectHost, ProjectInspection,
-    ProjectLimits, ProjectUnitOutcome, RecencyHost, RootKind, RootSource, SearchRootEntry,
-    SearchRootOutcome, SearchRootReport, SearchRoots, argument_root, quiet_period,
-    tracked_projects,
+    ArgumentRootError, MiseDiscovery, MiseState, PROJECT_RULE_ID, ProjectInspection,
+    ProjectUnitOutcome, RootKind, RootSource, SearchRootEntry, SearchRootOutcome, SearchRootReport,
+    argument_root,
 };
-use svalnir_agent::rules::worktrees::{WorktreeHost, WorktreeInspection, WorktreeLimits};
+use svalnir_agent::rules::worktrees::WorktreeInspection;
 use svalnir_agent::rules::{
-    DiscoveryHost, DiscoveryLimits, EvictionDiscovery, EvictionRequest, ReviewedRules,
-    SharedEnvironment, SkipReason,
+    DiscoveryHost, EvictionDiscovery, ReviewedRules, SharedEnvironment, SkipReason,
 };
 use svalnir_agent::scan::CancellationToken;
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::process::Uid;
-use svalnir_core::rule::{RuleMode, RuleRegistry as _};
+use svalnir_core::rule::RuleRegistry as _;
 
 use super::config::{self, Proposal};
 use super::evict::DiscoveryView;
@@ -115,17 +112,9 @@ fn home_unknown() -> ErrorBody {
     )
 }
 
-/// The roots of one request of a rule that searches projects, and the
-/// result of the read of mise.
-#[derive(Debug, Clone)]
-pub(crate) struct ProjectRoots {
-    pub(crate) roots: SearchRoots,
-    pub(crate) mise: MiseDiscovery,
-}
-
 /// The roots of a request: `[cleanup.projects].search_roots`, each
 /// `--root`, and, when `with_mise` is true and `--no-mise` is not given,
-/// the project roots that mise records.
+/// the project roots that mise records ([`cleanup::project_roots`]).
 ///
 /// # Errors
 ///
@@ -140,17 +129,7 @@ pub(crate) fn project_roots(
     with_mise: bool,
 ) -> Result<ProjectRoots, ErrorBody> {
     let home: &Path = locations.home_directory().ok_or_else(home_unknown)?;
-    let mut entries: Vec<SearchRootEntry> = config
-        .cleanup()
-        .projects
-        .search_roots
-        .iter()
-        .map(|relative| SearchRootEntry {
-            relative: PathBuf::from(relative),
-            kind: RootKind::Search,
-            source: RootSource::Configuration,
-        })
-        .collect();
+    let mut entries: Vec<SearchRootEntry> = Vec::with_capacity(arguments.roots.len());
     for root in &arguments.roots {
         let absolute: PathBuf = environment.resolve(root, &["root"])?;
         let relative: PathBuf =
@@ -161,18 +140,18 @@ pub(crate) fn project_roots(
             source: RootSource::Argument,
         });
     }
-    let mise_locations: MiseLocations = MiseLocations::resolve(
+    cleanup::project_roots(
+        config,
         home,
-        environment.xdg_state_home.as_deref(),
-        environment.xdg_config_home.as_deref(),
-    );
-    let mise: MiseDiscovery = if with_mise && !arguments.no_mise {
-        tracked_projects(home, &mise_locations, session::current_uid())
-    } else {
-        MiseDiscovery::off(&mise_locations)
-    };
-    entries.extend(mise.entries());
-    let roots: SearchRoots = SearchRoots::with_entries(entries).map_err(|_| {
+        entries,
+        MiseRequest {
+            read: with_mise && !arguments.no_mise,
+            state_home: environment.xdg_state_home.as_deref(),
+            config_home: environment.xdg_config_home.as_deref(),
+        },
+        session::current_uid(),
+    )
+    .map_err(|_| {
         ErrorBody::new(
             "too_many_search_roots",
             ErrorFamily::Request,
@@ -180,41 +159,7 @@ pub(crate) fn project_roots(
             "the request has more than 16 search roots or more than 256 project roots; name fewer roots or give `--no-mise`; the command made no change",
         )
         .with_fields(&["root"])
-    })?;
-    Ok(ProjectRoots { roots, mise })
-}
-
-/// The sources of the project activity of one command.
-pub(crate) struct ProjectSources {
-    pub(crate) git: Result<GitTool, GitToolProblem>,
-    transcripts: ClaudeTranscripts,
-    agents: PaseoAgents,
-    quiet_period: svalnir_core::quantity::Nanoseconds,
-}
-
-impl ProjectSources {
-    pub(crate) fn new(config: &ValidatedConfig, home: Option<&Path>) -> Self {
-        let projects = &config.cleanup().projects;
-        Self {
-            git: GitTool::locate(),
-            transcripts: ClaudeTranscripts::for_home(home),
-            agents: PaseoAgents::new(projects.paseo_agents, home),
-            quiet_period: quiet_period(projects),
-        }
-    }
-
-    pub(crate) fn git(&self) -> Result<&GitTool, GitToolProblem> {
-        self.git.as_ref().map_err(|problem| *problem)
-    }
-
-    pub(crate) fn recency<'a>(&'a self, head: &'a GitHeadActivity<'a>) -> RecencyHost<'a> {
-        RecencyHost {
-            quiet_period: self.quiet_period,
-            head,
-            transcripts: &self.transcripts,
-            agents: &self.agents,
-        }
-    }
+    })
 }
 
 /// The result of `clean inspect`.
@@ -647,25 +592,13 @@ impl InspectContext<'_> {
         if roots.roots.is_empty() {
             return Err(no_search_roots());
         }
-        let sources: ProjectSources =
-            ProjectSources::new(self.config, self.locations.home_directory());
-        let head: GitHeadActivity<'_> = GitHeadActivity::new(sources.git());
-        let processes: EnvironmentEvidence<'_> = EnvironmentEvidence(self.evidence.as_ref());
-        let host: ProjectHost<'_> = ProjectHost {
-            principal: self.host.principal,
-            locations: self.locations,
-            user_exclusions: &self.host.user_exclusions,
-            git: sources.git(),
-            processes: &processes,
-            recency: sources.recency(&head),
-            layouts: &self.config.cleanup().projects.layouts,
-        };
-        let inspection: ProjectInspection = self.registry.projects().inspect(
-            host,
+        let inspection: ProjectInspection = cleanup::inspect_projects(
+            self.registry,
+            self.host,
+            self.config,
             &roots.roots,
-            ProjectLimits::default(),
-            self.cancel,
             self.evidence.as_ref(),
+            self.cancel,
         );
         Ok((inspection, roots.mise))
     }
@@ -673,23 +606,13 @@ impl InspectContext<'_> {
     /// The inspection of the clear rule `rule`: the discovery of its roots,
     /// whatever its lifecycle state, with no consent and no plan.
     fn clear(&self, rule: &str) -> Result<ClearInspectView, ErrorBody> {
-        let request: EvictionRequest<'_> = EvictionRequest {
-            host: self.host,
-            purpose: &RuleMode::Inspection,
-            rules: None,
-            volumes: None,
-            known: None,
-            limits: DiscoveryLimits::default(),
-            cancel: self.cancel,
-            projects: None,
-        };
-        let found = self
-            .registry
-            .clear_rule(rule)
-            .zip(
-                self.registry
-                    .inspect_clear(rule, &request, self.evidence.as_ref()),
-            );
+        let found = self.registry.clear_rule(rule).zip(cleanup::inspect_clear(
+            self.registry,
+            rule,
+            self.host,
+            self.evidence.as_ref(),
+            self.cancel,
+        ));
         let Some((clear, (discovery, roots))) = found else {
             return Err(rule_error(
                 "inspection_not_available",
@@ -712,16 +635,10 @@ impl InspectContext<'_> {
         if roots.roots.is_empty() {
             return Err(no_search_roots());
         }
-        let git: Result<GitTool, GitToolProblem> = GitTool::locate();
-        Ok(self.registry.worktrees().inspect(
-            WorktreeHost {
-                principal: self.host.principal,
-                locations: self.locations,
-                user_exclusions: &self.host.user_exclusions,
-                git: git.as_ref().map_err(|problem| *problem),
-            },
+        Ok(cleanup::inspect_worktrees(
+            self.registry,
+            self.host,
             &roots.roots,
-            WorktreeLimits::default(),
             self.cancel,
         ))
     }

@@ -1,15 +1,15 @@
-//! The live path of the cleanup rules: the inspection of each rule and the
-//! sealed plan of one rule, from the functions of `svalnir_agent::rules`
-//! and `svalnir_core::plan` that `svalnir clean inspect` and `svalnir clean
-//! plan --mode evict|owner` call.
+//! The live path of the cleanup rules: the view of the inspection of each
+//! rule and of the sealed plan of one rule.
+//!
+//! The rule checks, the discoveries, the inspections, and the plan builder
+//! calls are the shared ones of `svalnir_agent::client::cleanup`, which
+//! `svalnir clean inspect` and `svalnir clean plan --mode evict|owner` also
+//! call; this module only turns their results into the rows of the window.
 //!
 //! The inspection is read-only. The plan is made in this process and is
 //! not recorded: the window records it and writes its apply request to the
 //! queue only after the confirmation ([`super::live::LivePort`]). The
-//! lifecycle state of the rule is checked first, as the CLI checks it, so a
-//! `proposed` rule is refused with `rule_mode_not_validated` before a
-//! directory is read. Each read has the bounds of the agent library, and
-//! the model calls these functions on a background thread only.
+//! model calls these functions on a background thread only.
 
 use super::{
     ActionState,
@@ -25,55 +25,42 @@ use std::{
     time::SystemTime,
 };
 use svalnir_agent::{
-    executor::owner::ScopeLimits,
+    client::cleanup::{
+        self, EvictDiscovery, ManualPlanError, ManualPlanInputs, MiseRequest, ProjectRoots,
+        RuleSelectionError,
+    },
     platform::process::DarwinProcessSource,
     protection::ProtectedLocations,
     rules::{
-        DiscoveryHost, DiscoveryLimits, EvictionCandidate, EvictionDiscovery, EvictionRequest,
-        ReviewedRules, RootResult, SharedEnvironment, SourceEnvironment,
+        DiscoveryHost, EvictionCandidate, EvictionDiscovery, ReviewedRules, RootResult,
+        SharedEnvironment, SourceEnvironment, XCODE_ORPHAN_LAYOUT,
         caches::{
-            CacheInspection, CacheMeasurement, InspectionHost, InspectionLimits, ReclaimFigure,
-            RootOutcome, UnitOutcome,
+            CacheInspection, CacheMeasurement, InspectionLimits, ReclaimFigure, RootOutcome,
+            UnitOutcome,
         },
-        git::{GitTool, GitToolProblem},
+        clear::{ClearRootEntry, ClearRule, RootSource as ClearRootSource},
         producers::{
             GuardOutcome, MAX_PRODUCER_EXECUTABLE_BYTES, OWNER_SCOPE_UNMARKED, OwnerInspection,
-            ProducerBindError, ProducerBindRequest, ProducerBinding, ProducerRule, guard_code,
+            ProducerBindError, ProducerBinding, ProducerRule, guard_code,
         },
-        projects::{
-            ClaudeTranscripts, EnvironmentEvidence, GitHeadActivity, MiseLocations,
-            PROJECT_RULE_ID, PaseoAgents, ProjectHost, ProjectLimits, ProjectRequest,
-            ProjectUnitOutcome, RecencyHost, RootKind, RootSource, SearchRootEntry,
-            SearchRootOutcome, SearchRootReport, SearchRoots, quiet_period, tracked_projects,
-        },
-        worktrees::{WorktreeHost, WorktreeLimits},
+        projects::{PROJECT_RULE_ID, ProjectUnitOutcome, SearchRootOutcome, SearchRootReport},
     },
     scan::{CancellationToken, WallScanClock},
 };
 use svalnir_core::{
-    action::{ClientRole, OwnerOperationKind, Plan, WorkCharge},
-    authority::AuthorityBinding,
+    action::{ClientRole, Plan},
     config::ValidatedConfig,
     file::LosslessPath,
-    id::{PlanId, PolicyRevisionId, StepId, TargetId},
+    id::PolicyRevisionId,
     plan::{
-        CleanupEntry, CleanupLimits, CleanupRequest as PlanRequest, ModeSelection,
-        OwnerPlanRequest, PlanBuildError, PlanContext, PlanExplanation, PlanOutcome,
-        TargetExplanation, build_cleanup_plan, build_owner_plan, explain, manual_plan_lifetime,
+        CleanupEntry, PlanBuildError, PlanExplanation, PlanOutcome, TargetExplanation, explain,
     },
     policy::EvaluationClock,
     process::Uid,
-    quantity::{Bytes, EntryCount, Nanoseconds},
-    rule::{LifecycleState, Rule, RuleMode, RuleRegistry as _},
+    quantity::Bytes,
+    rule::{LifecycleState, Rule},
     time::WallTime,
 };
-
-/// The time that the execution of a manual cleanup plan can use, as the
-/// CLI gives it.
-const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000_000);
-
-/// The time in which the executor verifies the effect of one step.
-const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
 
 /// The text of the configuration template: a document with no key other
 /// than the schema version, so each value comes from the template.
@@ -83,7 +70,6 @@ const TEMPLATE_DOCUMENT: &str = "schema_version = 1\n";
 struct Host {
     config: ValidatedConfig,
     locations: ProtectedLocations,
-    discovery: DiscoveryHost,
     principal: Uid,
     evidence: SharedEnvironment,
 }
@@ -91,25 +77,49 @@ struct Host {
 impl Host {
     fn new(config: ValidatedConfig, state_directory: Option<&Path>) -> Self {
         let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
-        let locations: ProtectedLocations =
-            ProtectedLocations::resolve(home.as_deref(), state_directory);
-        let principal: Uid = svalnir_agent::observe::current_uid();
-        let discovery: DiscoveryHost = DiscoveryHost::manual(principal, locations.clone(), &config);
         Self {
             config,
-            locations,
-            discovery,
-            principal,
+            locations: ProtectedLocations::resolve(home.as_deref(), state_directory),
+            principal: svalnir_agent::observe::current_uid(),
             evidence: Arc::new(SourceEnvironment(DarwinProcessSource::new())),
         }
     }
 
-    fn inspection_host(&self) -> InspectionHost<'_> {
-        InspectionHost {
-            principal: self.principal,
-            locations: &self.locations,
-            user_exclusions: &self.discovery.user_exclusions,
+    /// The host of an inspection, as `clean inspect` makes it.
+    fn inspection(&self) -> DiscoveryHost {
+        DiscoveryHost::automatic(self.principal, self.locations.clone(), &self.config)
+    }
+
+    /// The host of a manual plan, as `clean plan` makes it.
+    fn manual(&self) -> DiscoveryHost {
+        DiscoveryHost::manual(self.principal, self.locations.clone(), &self.config)
+    }
+
+    /// The roots of a rule that searches projects: the configuration and,
+    /// with `with_mise`, the project roots that mise records.
+    fn project_roots(&self, with_mise: bool) -> Result<ProjectRoots, &'static str> {
+        let home: &Path = self
+            .locations
+            .home_directory()
+            .ok_or("home_directory_unavailable")?;
+        let state_home = std::env::var_os("XDG_STATE_HOME");
+        let config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let roots: ProjectRoots = cleanup::project_roots(
+            &self.config,
+            home,
+            Vec::new(),
+            MiseRequest {
+                read: with_mise,
+                state_home: state_home.as_deref(),
+                config_home: config_home.as_deref(),
+            },
+            self.principal,
+        )
+        .map_err(|_| "too_many_search_roots")?;
+        if roots.roots.is_empty() {
+            return Err("no_search_roots");
         }
+        Ok(roots)
     }
 }
 
@@ -134,6 +144,18 @@ fn inspection_config(state_directory: Option<&Path>) -> Option<ValidatedConfig> 
     })
 }
 
+const fn lifecycle_name(state: &LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Proposed => "proposed",
+        LifecycleState::InspectionValidated { .. } => "inspection_validated",
+        LifecycleState::ManualActionValidated { .. } => "manual_action_validated",
+        LifecycleState::AutomaticEvictionValidated { .. } => "automatic_eviction_validated",
+        LifecycleState::Disabled { .. } => "disabled",
+        LifecycleState::Retired => "retired",
+        LifecycleState::Unrecognized => "unrecognized",
+    }
+}
+
 /// The lifecycle state of the layouts of `rule`, as one text: the state of
 /// each layout when they differ.
 fn lifecycle_text(rule: &Rule) -> String {
@@ -148,40 +170,6 @@ fn lifecycle_text(rule: &Rule) -> String {
     } else {
         states.join(", ")
     }
-}
-
-const fn lifecycle_name(state: &LifecycleState) -> &'static str {
-    match state {
-        LifecycleState::Proposed => "proposed",
-        LifecycleState::InspectionValidated { .. } => "inspection_validated",
-        LifecycleState::ManualActionValidated { .. } => "manual_action_validated",
-        LifecycleState::AutomaticEvictionValidated { .. } => "automatic_eviction_validated",
-        LifecycleState::Disabled { .. } => "disabled",
-        LifecycleState::Retired => "retired",
-        LifecycleState::Unrecognized => "unrecognized",
-    }
-}
-
-/// Whether a layout of `rule` that an eviction removes is validated for a
-/// manual eviction. The layout of the scope root of an owner operation is
-/// for the `owner` mode: an eviction removes no scope root as a whole.
-fn permits_evict(registry: &ReviewedRules, rule: &Rule) -> bool {
-    let owner_layout: Option<&str> = registry
-        .producer(rule.reference.id.as_str())
-        .map(|producer| producer.spec().layout);
-    rule.modes.contains(&RuleMode::ManualEviction)
-        && rule.layouts.iter().any(|layout| {
-            Some(layout.layout.as_str()) != owner_layout
-                && layout.permits(&RuleMode::ManualEviction)
-        })
-}
-
-/// Whether the layout of the scope root of `producer` is validated for a
-/// manual action.
-fn permits_owner(producer: &ProducerRule) -> bool {
-    producer
-        .layout()
-        .is_some_and(|layout| layout.permits(&RuleMode::ManualEviction))
 }
 
 fn path_text(path: Option<&Path>) -> String {
@@ -203,6 +191,16 @@ fn cache_unit(path: &Path, measurement: &CacheMeasurement) -> UnitRow {
         },
         partial: measurement.partial,
         reason: None,
+    }
+}
+
+fn refused_unit(path: &Path, reason: &str) -> UnitRow {
+    UnitRow {
+        path: path.display().to_string(),
+        size: None,
+        size_kind: SizeKind::AllocatedUpperBound,
+        partial: false,
+        reason: Some(reason.to_owned()),
     }
 }
 
@@ -228,6 +226,16 @@ fn empty_inspection(
         family,
         producer: rule.owner.producer.clone(),
         lifecycle: lifecycle_text(rule),
+        layouts: rule
+            .layouts
+            .iter()
+            .map(|layout| {
+                (
+                    layout.layout.clone(),
+                    lifecycle_name(&layout.lifecycle).to_owned(),
+                )
+            })
+            .collect(),
         plan,
         permits_plan,
         needs_clear: false,
@@ -236,6 +244,7 @@ fn empty_inspection(
         units: Vec::new(),
         units_omitted: 0,
         owner: None,
+        notes: Vec::new(),
         problem: None,
     }
 }
@@ -258,20 +267,8 @@ fn add_cache(inspection: &mut RuleInspection, cache: &CacheInspection) {
             let row: UnitRow = match &unit.outcome {
                 UnitOutcome::Measured(measurement) => cache_unit(&unit.path, measurement),
                 UnitOutcome::Absent => continue,
-                UnitOutcome::UnsupportedLayout => UnitRow {
-                    path: unit.path.display().to_string(),
-                    size: None,
-                    size_kind: SizeKind::AllocatedUpperBound,
-                    partial: false,
-                    reason: Some("unsupported_layout".to_owned()),
-                },
-                UnitOutcome::Refused { reason } => UnitRow {
-                    path: unit.path.display().to_string(),
-                    size: None,
-                    size_kind: SizeKind::AllocatedUpperBound,
-                    partial: false,
-                    reason: Some((*reason).to_owned()),
-                },
+                UnitOutcome::UnsupportedLayout => refused_unit(&unit.path, "unsupported_layout"),
+                UnitOutcome::Refused { reason } => refused_unit(&unit.path, reason),
             };
             push_unit(inspection, row);
         }
@@ -319,7 +316,9 @@ fn add_owner(inspection: &mut RuleInspection, owner: &OwnerInspection) {
             state: root_outcome(owner.scope.outcome),
         });
     }
-    if let Some(measured) = &owner.measured {
+    if let Some(measured) = &owner.measured
+        && inspection.units.is_empty()
+    {
         let (size, kind): (u64, SizeKind) =
             match (owner.whole_cache, measured.private_allocated_bytes) {
                 (true, _) => (measured.allocated_bytes.get(), SizeKind::WholeCache),
@@ -329,59 +328,22 @@ fn add_owner(inspection: &mut RuleInspection, owner: &OwnerInspection) {
                     SizeKind::AllocatedUpperBound,
                 ),
             };
-        if inspection.units.is_empty() {
-            push_unit(
-                inspection,
-                UnitRow {
-                    path: path_text(owner.scope.path.as_deref()),
-                    size: Some(size),
-                    size_kind: kind,
-                    partial: !measured.complete,
-                    reason: None,
-                },
-            );
-        }
+        push_unit(
+            inspection,
+            UnitRow {
+                path: path_text(owner.scope.path.as_deref()),
+                size: Some(size),
+                size_kind: kind,
+                partial: !measured.complete,
+                reason: None,
+            },
+        );
     }
     if let GuardOutcome::Refused { reason, .. } = &owner.guard {
         inspection.problem = Some(format!(
             "The guard of the rule refuses the command now ({reason})."
         ));
     }
-}
-
-/// The search roots of a rule that searches the projects of the user:
-/// `[cleanup.projects].search_roots` and, with `with_mise`, the project
-/// roots that mise records.
-fn search_roots(host: &Host, with_mise: bool) -> Result<SearchRoots, &'static str> {
-    let home: &Path = host
-        .locations
-        .home_directory()
-        .ok_or("home_directory_unavailable")?;
-    let mut entries: Vec<SearchRootEntry> = host
-        .config
-        .cleanup()
-        .projects
-        .search_roots
-        .iter()
-        .map(|relative| SearchRootEntry {
-            relative: PathBuf::from(relative),
-            kind: RootKind::Search,
-            source: RootSource::Configuration,
-        })
-        .collect();
-    if with_mise {
-        let state_home = std::env::var_os("XDG_STATE_HOME");
-        let config_home = std::env::var_os("XDG_CONFIG_HOME");
-        let mise: MiseLocations =
-            MiseLocations::resolve(home, state_home.as_deref(), config_home.as_deref());
-        entries.extend(tracked_projects(home, &mise, host.principal).entries());
-    }
-    let roots: SearchRoots =
-        SearchRoots::with_entries(entries).map_err(|_| "too_many_search_roots")?;
-    if roots.is_empty() {
-        return Err("no_search_roots");
-    }
-    Ok(roots)
 }
 
 fn search_root_rows(reports: &[SearchRootReport]) -> Vec<RootRow> {
@@ -402,37 +364,14 @@ fn search_root_rows(reports: &[SearchRootReport]) -> Vec<RootRow> {
         .collect()
 }
 
-/// The sources of the project activity of one request.
-struct ProjectSources {
-    git: Result<GitTool, GitToolProblem>,
-    transcripts: ClaudeTranscripts,
-    agents: PaseoAgents,
-    quiet_period: Nanoseconds,
-}
-
-impl ProjectSources {
-    fn new(config: &ValidatedConfig, home: Option<&Path>) -> Self {
-        let projects = &config.cleanup().projects;
-        Self {
-            git: GitTool::locate(),
-            transcripts: ClaudeTranscripts::for_home(home),
-            agents: PaseoAgents::new(projects.paseo_agents, home),
-            quiet_period: quiet_period(projects),
-        }
-    }
-
-    fn git(&self) -> Result<&GitTool, GitToolProblem> {
-        self.git.as_ref().map_err(|problem| *problem)
-    }
-
-    fn recency<'a>(&'a self, head: &'a GitHeadActivity<'a>) -> RecencyHost<'a> {
-        RecencyHost {
-            quiet_period: self.quiet_period,
-            head,
-            transcripts: &self.transcripts,
-            agents: &self.agents,
-        }
-    }
+fn blocker_names(candidate: &EvictionCandidate) -> Option<String> {
+    let reasons: Vec<String> = candidate
+        .discovered
+        .blockers
+        .iter()
+        .map(|reason| snake_name(&format!("{reason:?}")))
+        .collect();
+    (!reasons.is_empty()).then(|| reasons.join(", "))
 }
 
 fn inspect_projects(
@@ -441,51 +380,29 @@ fn inspect_projects(
     cancel: &CancellationToken,
     inspection: &mut RuleInspection,
 ) {
-    let roots: SearchRoots = match search_roots(host, true) {
+    let roots: ProjectRoots = match host.project_roots(true) {
         Ok(roots) => roots,
         Err(code) => {
             inspection.problem = Some(format!("{} ({code}).", super::reason_of(code)));
             return;
         }
     };
-    let sources: ProjectSources =
-        ProjectSources::new(&host.config, host.locations.home_directory());
-    let head: GitHeadActivity<'_> = GitHeadActivity::new(sources.git());
-    let processes: EnvironmentEvidence<'_> = EnvironmentEvidence(host.evidence.as_ref());
-    let project_host: ProjectHost<'_> = ProjectHost {
-        principal: host.principal,
-        locations: &host.locations,
-        user_exclusions: &host.discovery.user_exclusions,
-        git: sources.git(),
-        processes: &processes,
-        recency: sources.recency(&head),
-        layouts: &host.config.cleanup().projects.layouts,
-    };
-    let result = registry.projects().inspect(
-        project_host,
-        &roots,
-        ProjectLimits::default(),
-        cancel,
+    let result = cleanup::inspect_projects(
+        registry,
+        &host.inspection(),
+        &host.config,
+        &roots.roots,
         host.evidence.as_ref(),
+        cancel,
     );
     inspection.roots = search_root_rows(&result.roots);
     for unit in &result.units {
         let row: UnitRow = match &unit.outcome {
             ProjectUnitOutcome::Measured(measurement) => cache_unit(&unit.path, measurement),
-            ProjectUnitOutcome::Refused { reason } => UnitRow {
-                path: unit.path.display().to_string(),
-                size: None,
-                size_kind: SizeKind::AllocatedUpperBound,
-                partial: false,
-                reason: Some((*reason).to_owned()),
-            },
-            ProjectUnitOutcome::RepositoryRefused(refusal) => UnitRow {
-                path: unit.path.display().to_string(),
-                size: None,
-                size_kind: SizeKind::AllocatedUpperBound,
-                partial: false,
-                reason: Some(refusal.reason.as_str().to_owned()),
-            },
+            ProjectUnitOutcome::Refused { reason } => refused_unit(&unit.path, reason),
+            ProjectUnitOutcome::RepositoryRefused(refusal) => {
+                refused_unit(&unit.path, refusal.reason.as_str())
+            }
             ProjectUnitOutcome::Checked => continue,
         };
         push_unit(inspection, row);
@@ -498,25 +415,14 @@ fn inspect_worktrees(
     cancel: &CancellationToken,
     inspection: &mut RuleInspection,
 ) {
-    let roots: SearchRoots = match search_roots(host, false) {
+    let roots: ProjectRoots = match host.project_roots(false) {
         Ok(roots) => roots,
         Err(code) => {
             inspection.problem = Some(format!("{} ({code}).", super::reason_of(code)));
             return;
         }
     };
-    let git: Result<GitTool, GitToolProblem> = GitTool::locate();
-    let result = registry.worktrees().inspect(
-        WorktreeHost {
-            principal: host.principal,
-            locations: &host.locations,
-            user_exclusions: &host.discovery.user_exclusions,
-            git: git.as_ref().map_err(|problem| *problem),
-        },
-        &roots,
-        WorktreeLimits::default(),
-        cancel,
-    );
+    let result = cleanup::inspect_worktrees(registry, &host.inspection(), &roots.roots, cancel);
     inspection.roots = search_root_rows(&result.roots);
     for repository in &result.repositories {
         for worktree in &repository.worktrees {
@@ -534,7 +440,77 @@ fn inspect_worktrees(
     }
 }
 
+fn clear_root_row(root: &ClearRootEntry) -> RootRow {
+    let source: String = match &root.source {
+        ClearRootSource::Default { pattern } => format!("default {pattern}"),
+        ClearRootSource::Configuration { file } => format!("configuration {file}"),
+    };
+    match (&root.path, root.problem) {
+        (Some(path), _) => RootRow {
+            path: path.display().to_string(),
+            state: format!("from {source}"),
+        },
+        (None, problem) => RootRow {
+            path: "(not resolved)".to_owned(),
+            state: format!("from {source}: {}", problem.unwrap_or("root_not_resolved")),
+        },
+    }
+}
+
+fn inspect_clear(
+    host: &Host,
+    registry: &ReviewedRules,
+    clear: &ClearRule,
+    cancel: &CancellationToken,
+) -> RuleInspection {
+    let rule: &Rule = clear.rule();
+    let mut inspection: RuleInspection = empty_inspection(
+        rule,
+        RuleFamily::Clear,
+        Some(PlanKind::Evict),
+        cleanup::permits_evict(registry, rule),
+    );
+    inspection.needs_clear = true;
+    inspection.notes = vec![
+        format!("Kept: {}", clear.spec().kept),
+        format!("After a removal: {}", clear.spec().regeneration),
+    ];
+    let id: &str = rule.reference.id.as_str();
+    let Some((discovery, roots)) = cleanup::inspect_clear(
+        registry,
+        id,
+        &host.inspection(),
+        host.evidence.as_ref(),
+        cancel,
+    ) else {
+        inspection.problem = Some("This build has no inspection for this clear rule.".to_owned());
+        return inspection;
+    };
+    inspection.roots = roots.iter().map(clear_root_row).collect();
+    for candidate in &discovery.candidates {
+        push_unit(
+            &mut inspection,
+            UnitRow {
+                path: candidate.candidate.candidate.path.display_label(),
+                size: Some(candidate.discovered.measurement.allocated_bytes.get()),
+                size_kind: SizeKind::AllocatedUpperBound,
+                partial: false,
+                reason: blocker_names(candidate),
+            },
+        );
+    }
+    if !discovery.complete {
+        inspection.problem =
+            Some("The discovery stopped at a bound, so the list is not complete.".to_owned());
+    }
+    inspection
+}
+
 /// Inspects each rule of `registry`. Read-only.
+///
+/// # Errors
+///
+/// Returns the reason when no configuration is available.
 pub(super) fn inspect_rules(
     registry: &ReviewedRules,
     state_directory: Option<&Path>,
@@ -550,7 +526,7 @@ pub(super) fn inspect_rules(
         projects,
         RuleFamily::Project,
         Some(PlanKind::Evict),
-        permits_evict(registry, projects),
+        cleanup::permits_evict(registry, projects),
     );
     project.project_options = true;
     inspect_projects(&host, registry, &cancel, &mut project);
@@ -563,51 +539,50 @@ pub(super) fn inspect_rules(
             Some(producer) => (
                 RuleFamily::Owner,
                 Some(PlanKind::Owner),
-                permits_owner(producer),
+                cleanup::permits_owner(producer),
             ),
             None => (RuleFamily::Cache, None, false),
         };
         let mut inspection: RuleInspection = empty_inspection(rule, family, plan, permits);
+        let inspection_host = host.inspection();
         add_cache(
             &mut inspection,
             &cache.inspect(
-                host.inspection_host(),
+                svalnir_agent::rules::caches::InspectionHost {
+                    principal: host.principal,
+                    locations: &host.locations,
+                    user_exclusions: &inspection_host.user_exclusions,
+                },
                 InspectionLimits::default(),
                 &cancel,
                 host.evidence.as_ref(),
             ),
         );
         if let Some(producer) = producer {
-            let owner: OwnerInspection = producer.inspect(
-                &host.inspection_host(),
-                MAX_PRODUCER_EXECUTABLE_BYTES,
-                &cancel,
-                host.evidence.as_ref(),
-            );
-            add_owner(&mut inspection, &owner);
+            add_owner(&mut inspection, &owner_inspection(&host, producer, &cancel));
         }
         rules.push(inspection);
     }
     // The producers with an owner command that are not a cache rule.
     for producer in registry.producers() {
-        let id: &str = producer.rule().reference.id.as_str();
-        if registry.cache(id).is_some() {
+        if registry
+            .cache(producer.rule().reference.id.as_str())
+            .is_some()
+        {
             continue;
         }
         let mut inspection: RuleInspection = empty_inspection(
             producer.rule(),
             RuleFamily::Owner,
             Some(PlanKind::Owner),
-            permits_owner(producer),
+            cleanup::permits_owner(producer),
         );
-        let owner: OwnerInspection = producer.inspect(
-            &host.inspection_host(),
-            MAX_PRODUCER_EXECUTABLE_BYTES,
-            &cancel,
-            host.evidence.as_ref(),
-        );
-        add_owner(&mut inspection, &owner);
+        add_owner(&mut inspection, &owner_inspection(&host, producer, &cancel));
         rules.push(inspection);
+    }
+    // The clear rules: manual only, and each plan needs the consent.
+    for clear in registry.clear().all() {
+        rules.push(inspect_clear(&host, registry, clear, &cancel));
     }
     // The linked Git worktrees.
     let worktrees: &Rule = registry.worktrees().rule();
@@ -615,14 +590,18 @@ pub(super) fn inspect_rules(
         empty_inspection(worktrees, RuleFamily::Worktree, None, false);
     inspect_worktrees(&host, registry, &cancel, &mut worktree);
     rules.push(worktree);
-    // The derived data of Xcode: this build has no inspection of it.
+    // The derived data of Xcode: this build has no inspection of it. Its
+    // orphan layout is for a manual eviction only.
     let xcode: &Rule = registry.xcode_derived_data().rule();
     let mut derived: RuleInspection = empty_inspection(
         xcode,
         RuleFamily::Xcode,
         Some(PlanKind::Evict),
-        permits_evict(registry, xcode),
+        cleanup::permits_evict(registry, xcode),
     );
+    derived.notes = vec![format!(
+        "The layout {XCODE_ORPHAN_LAYOUT} is the project directory whose project is gone; it is for a manual eviction only."
+    )];
     derived.problem = Some(
         "This build has no inspection for this rule. A plan of the evict mode finds its units."
             .to_owned(),
@@ -634,46 +613,41 @@ pub(super) fn inspect_rules(
     })
 }
 
+fn owner_inspection(
+    host: &Host,
+    producer: &ProducerRule,
+    cancel: &CancellationToken,
+) -> OwnerInspection {
+    let inspection_host = host.inspection();
+    producer.inspect(
+        &svalnir_agent::rules::caches::InspectionHost {
+            principal: host.principal,
+            locations: &host.locations,
+            user_exclusions: &inspection_host.user_exclusions,
+        },
+        MAX_PRODUCER_EXECUTABLE_BYTES,
+        cancel,
+        host.evidence.as_ref(),
+    )
+}
+
 /// The checks of `request` that read nothing: the rule, its lifecycle
-/// state, and the consent to a `clear` command. They have the order and
-/// the codes of the CLI.
+/// state, and the consent to a clear, with the shared checks and the codes
+/// of the CLI.
+///
+/// # Errors
+///
+/// Returns the refusal with its code.
 pub(super) fn check_request(
     registry: &ReviewedRules,
     request: &CleanupRequest,
 ) -> Result<(), ActionState> {
-    let known: bool = registry
-        .rules()
-        .iter()
-        .any(|rule| rule.reference.id.as_str() == request.rule);
-    if !known {
-        return Err(ActionState::refused("unknown_rule"));
-    }
-    match request.kind {
-        PlanKind::Evict => {
-            let rule: &Rule = registry
-                .rules()
-                .into_iter()
-                .find(|rule| rule.reference.id.as_str() == request.rule)
-                .ok_or_else(|| ActionState::refused("unknown_rule"))?;
-            if !permits_evict(registry, rule) {
-                return Err(ActionState::refused("rule_mode_not_validated"));
-            }
-        }
-        PlanKind::Owner => {
-            let producer: &ProducerRule = registry
-                .producer(&request.rule)
-                .ok_or_else(|| ActionState::refused("owner_operation_not_available"))?;
-            if !permits_owner(producer) {
-                return Err(ActionState::refused("rule_mode_not_validated"));
-            }
-            if matches!(producer.spec().kind, OwnerOperationKind::Clear)
-                && !request.options.include_clear
-            {
-                return Err(ActionState::refused("clear_not_included"));
-            }
-        }
-    }
-    Ok(())
+    let include_clear: bool = request.options.include_clear;
+    let checked: Result<(), RuleSelectionError> = match request.kind {
+        PlanKind::Evict => cleanup::evict_rule(registry, &request.rule, include_clear).map(drop),
+        PlanKind::Owner => cleanup::owner_rule(registry, &request.rule, include_clear).map(drop),
+    };
+    checked.map_err(|error| ActionState::refused(error.code()))
 }
 
 /// The inputs of the plan builder of one request.
@@ -685,44 +659,27 @@ pub(super) struct PlanInputs<'a> {
     pub(super) state_directory: Option<&'a Path>,
 }
 
-fn plan_refusal(error: &PlanBuildError) -> ActionState {
+fn plan_refusal(error: &ManualPlanError) -> ActionState {
     ActionState::refused(match error {
-        PlanBuildError::Rule(_) => "rule_mode_not_validated",
-        PlanBuildError::UnsupportedExecutor => "helper_not_available",
-        PlanBuildError::Authority | PlanBuildError::Principal => "plan_authority_not_usable",
-        PlanBuildError::Lifetime | PlanBuildError::Limits => "plan_limits_not_usable",
-        _ => "plan_not_buildable",
-    })
-}
-
-fn context<'a>(
-    plan_text: &str,
-    inputs: &'a PlanInputs<'a>,
-    home: Option<&'a LosslessPath>,
-) -> Result<PlanContext<'a>, ActionState> {
-    let lifetime: Nanoseconds = manual_plan_lifetime(&inputs.config)
-        .ok_or_else(|| plan_refusal(&PlanBuildError::Lifetime))?;
-    Ok(PlanContext {
-        plan_id: PlanId::new(plan_text.to_owned())
-            .map_err(|_| ActionState::refused("identity_unavailable"))?,
-        principal: svalnir_agent::client::principal(ClientRole::Gui),
-        // A manual plan has no action grant: its authority is the approval
-        // that is bound to the plan.
-        authority: AuthorityBinding {
-            policy_revision: inputs.policy_revision.clone(),
-            action_grants: Vec::new(),
-            privilege_grant: None,
-        },
-        clock: inputs.clock,
-        created_wall: inputs.wall,
-        lifetime,
-        protections: inputs.config.protections(),
-        home_directory: home,
+        ManualPlanError::Identity => "identity_unavailable",
+        ManualPlanError::Build(PlanBuildError::Rule(_)) => "rule_mode_not_validated",
+        ManualPlanError::Build(PlanBuildError::UnsupportedExecutor) => "helper_not_available",
+        ManualPlanError::Build(PlanBuildError::Authority | PlanBuildError::Principal) => {
+            "plan_authority_not_usable"
+        }
+        ManualPlanError::Build(PlanBuildError::Lifetime | PlanBuildError::Limits) => {
+            "plan_limits_not_usable"
+        }
+        ManualPlanError::Build(_) => "plan_not_buildable",
     })
 }
 
 /// Makes the sealed plan of `request`, after [`check_request`] and the gate
 /// of the agent. Nothing is recorded.
+///
+/// # Errors
+///
+/// Returns the refusal with its code.
 pub(super) fn build(
     registry: &ReviewedRules,
     request: &CleanupRequest,
@@ -734,101 +691,58 @@ pub(super) fn build(
         .home_directory()
         .and_then(|home| LosslessPath::from_path(home).ok());
     let plan_text: String = svalnir_agent::client::new_id("plan");
-    let context: PlanContext<'_> = context(&plan_text, inputs, home.as_ref())?;
-    match request.kind {
-        PlanKind::Evict => build_evict(registry, request, &host, &context, &plan_text, inputs),
-        PlanKind::Owner => build_owner(registry, request, &host, &context, &plan_text, inputs),
-    }
-}
-
-fn identity(plan_text: &str, kind: char, index: usize) -> String {
-    format!("{plan_text}-{kind}{index:04}")
+    let principal = svalnir_agent::client::principal(ClientRole::Gui);
+    let plan_inputs = ManualPlanInputs {
+        plan_text: &plan_text,
+        principal: &principal,
+        policy_revision: &inputs.policy_revision,
+        config: &inputs.config,
+        clock: inputs.clock,
+        created_wall: inputs.wall,
+        home_directory: home.as_ref(),
+    };
+    let mut proposal: CleanupProposal = match request.kind {
+        PlanKind::Evict => build_evict(registry, request, &host, &plan_inputs)?,
+        PlanKind::Owner => build_owner(registry, request, &host, &plan_inputs)?,
+    };
+    proposal.clear = cleanup::needs_clear_consent(registry, &request.rule);
+    Ok(proposal)
 }
 
 fn build_evict(
     registry: &ReviewedRules,
     request: &CleanupRequest,
     host: &Host,
-    context: &PlanContext<'_>,
-    plan_text: &str,
-    inputs: &PlanInputs<'_>,
+    inputs: &ManualPlanInputs<'_>,
 ) -> Result<CleanupProposal, ActionState> {
-    let rule: &Rule = registry
-        .rules()
-        .into_iter()
-        .find(|rule| rule.reference.id.as_str() == request.rule)
-        .ok_or_else(|| ActionState::refused("unknown_rule"))?;
-    let cancel: CancellationToken = CancellationToken::new();
-    let rules = [rule.reference.id.clone()];
-    let sources: ProjectSources =
-        ProjectSources::new(&host.config, host.locations.home_directory());
-    let head: GitHeadActivity<'_> = GitHeadActivity::new(sources.git());
-    let roots: Option<SearchRoots> = if request.rule == PROJECT_RULE_ID {
-        Some(search_roots(host, true).map_err(ActionState::refused)?)
+    let rule: &Rule = cleanup::evict_rule(registry, &request.rule, request.options.include_clear)
+        .map_err(|error| ActionState::refused(error.code()))?;
+    let roots: Option<ProjectRoots> = if request.rule == PROJECT_RULE_ID {
+        Some(host.project_roots(true).map_err(ActionState::refused)?)
     } else {
         None
     };
-    let projects: Option<ProjectRequest<'_>> = roots.as_ref().map(|roots| ProjectRequest {
-        roots,
-        git: sources.git(),
-        recency: sources.recency(&head),
-        layouts: &host.config.cleanup().projects.layouts,
-        include_active: request.options.include_active,
-        limits: ProjectLimits::default(),
-    });
-    let discovery: EvictionDiscovery = registry.discover_for_eviction(
-        &EvictionRequest {
-            host: &host.discovery,
-            purpose: &RuleMode::ManualEviction,
-            rules: Some(&rules),
-            volumes: None,
-            known: None,
-            limits: DiscoveryLimits::default(),
-            cancel: &cancel,
-            projects: projects.as_ref(),
-        },
+    let discovery: EvictionDiscovery = cleanup::discover_for_manual_eviction(
+        registry,
+        rule,
+        &host.manual(),
         host.evidence.as_ref(),
-    );
-    // The minimum size only filters: a smaller candidate is not given to
-    // the plan builder, and the confirmation names it.
-    let (selected, below): (Vec<EvictionCandidate>, Vec<EvictionCandidate>) =
-        discovery.candidates.iter().cloned().partition(|candidate| {
-            request.options.min_size.is_none_or(|minimum| {
-                candidate.discovered.measurement.estimate.bytes >= Bytes::new(minimum)
-            })
-        });
-    let entries: Vec<CleanupEntry> = selected
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            Ok(candidate.cleanup_entry(
-                TargetId::new(identity(plan_text, 't', index))
-                    .map_err(|_| ActionState::refused("identity_unavailable"))?,
-                StepId::new(identity(plan_text, 's', index))
-                    .map_err(|_| ActionState::refused("identity_unavailable"))?,
-            ))
-        })
-        .collect::<Result<Vec<CleanupEntry>, ActionState>>()?;
-    let outcome: PlanOutcome = build_cleanup_plan(
-        context,
-        &PlanRequest {
-            mode: ModeSelection::Evict {
-                rule: registry.lookup(&rule.reference),
-            },
-            entries: &entries,
-            preset: None,
-            limits: CleanupLimits {
-                plan: rule.budget.per_pass,
-                batch: WorkCharge::new(
-                    rule.budget.per_pass.work_bytes.max(Bytes::new(1)),
-                    rule.budget.per_pass.items.max(EntryCount::new(1)),
-                ),
-                execution_deadline: EXECUTION_DEADLINE,
-                verification_window: VERIFICATION_WINDOW,
-            },
+        &EvictDiscovery {
+            config: &host.config,
+            roots: roots.as_ref().map(|roots| &roots.roots),
+            include_active: request.options.include_active,
         },
-    )
-    .map_err(|error| plan_refusal(&error))?;
+        &CancellationToken::new(),
+    );
+    let (selected, below): (Vec<EvictionCandidate>, Vec<EvictionCandidate>) =
+        cleanup::split_min_size(
+            &discovery.candidates,
+            request.options.min_size.map(Bytes::new),
+        );
+    let entries: Vec<CleanupEntry> =
+        cleanup::eviction_entries(&selected, inputs).map_err(|error| plan_refusal(&error))?;
+    let outcome: PlanOutcome = cleanup::build_eviction_plan(registry, rule, &entries, None, inputs)
+        .map_err(|error| plan_refusal(&error))?;
     let mut proposal: CleanupProposal =
         proposal_of(request, &outcome, &explain(&outcome, inputs.clock));
     add_discovery_notes(&mut proposal, &discovery, &below);
@@ -856,15 +770,9 @@ fn add_discovery_notes(
         .filter(|candidate| !candidate.discovered.blockers.is_empty())
         .take(TARGET_LIMIT)
     {
-        let reasons: Vec<String> = candidate
-            .discovered
-            .blockers
-            .iter()
-            .map(|reason| snake_name(&format!("{reason:?}")))
-            .collect();
         proposal.omitted.push((
             candidate.candidate.candidate.path.display_label(),
-            reasons.join(", "),
+            blocker_names(candidate).unwrap_or_default(),
         ));
     }
     if !discovery.complete {
@@ -904,36 +812,24 @@ fn build_owner(
     registry: &ReviewedRules,
     request: &CleanupRequest,
     host: &Host,
-    context: &PlanContext<'_>,
-    plan_text: &str,
-    inputs: &PlanInputs<'_>,
+    inputs: &ManualPlanInputs<'_>,
 ) -> Result<CleanupProposal, ActionState> {
-    let producer: &ProducerRule = registry
-        .producer(&request.rule)
-        .ok_or_else(|| ActionState::refused("owner_operation_not_available"))?;
-    let bind_request = ProducerBindRequest {
-        host: host.inspection_host(),
-        include_clear: request.options.include_clear,
-        max_executable_bytes: MAX_PRODUCER_EXECUTABLE_BYTES,
-        scope_limits: ScopeLimits::default(),
-    };
+    let producer: &ProducerRule =
+        cleanup::owner_rule(registry, &request.rule, request.options.include_clear)
+            .map_err(|error| ActionState::refused(error.code()))?;
+    let manual: DiscoveryHost = host.manual();
+    let bind_request = cleanup::owner_bind_request(
+        host.principal,
+        &host.locations,
+        &manual.user_exclusions,
+        request.options.include_clear,
+    );
     let bound: ProducerBinding = producer
         .bind(&bind_request, &CancellationToken::new(), &WallScanClock)
         .map_err(|error| owner_bind_refusal(&error))?;
-    let outcome: PlanOutcome = build_owner_plan(
-        context,
-        &OwnerPlanRequest {
-            target_id: TargetId::new(identity(plan_text, 't', 0))
-                .map_err(|_| ActionState::refused("identity_unavailable"))?,
-            step_id: StepId::new(identity(plan_text, 's', 0))
-                .map_err(|_| ActionState::refused("identity_unavailable"))?,
-            binding: &bound.binding,
-            rule: registry.lookup(&bound.binding.rule),
-            protection: host.locations.of_text(&bound.root.binding.path),
-            verification_window: VERIFICATION_WINDOW,
-        },
-    )
-    .map_err(|error| plan_refusal(&error))?;
+    let outcome: PlanOutcome =
+        cleanup::build_owner_operation_plan(registry, &bound, &host.locations, inputs)
+            .map_err(|error| plan_refusal(&error))?;
     let explanation: PlanExplanation = explain(&outcome, inputs.clock);
     let mut proposal: CleanupProposal = proposal_of(request, &outcome, &explanation);
     let binding = &bound.binding;
@@ -1046,6 +942,7 @@ fn proposal_of(
         consequence: explanation.consequence_statement.to_owned(),
         // An eviction and an owner command both remove data with no undo.
         permanent: true,
+        clear: false,
         expires_at: plan
             .as_deref()
             .map_or_else(SystemTime::now, super::live::expiry_wall),

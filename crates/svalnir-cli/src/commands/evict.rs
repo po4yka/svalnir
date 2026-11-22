@@ -17,31 +17,25 @@
 //! `clear_not_included` after that check.
 
 use serde::Serialize;
+use svalnir_agent::client::cleanup::{
+    self, EvictDiscovery, ManualPlanError, ManualPlanInputs, ProjectRoots, RuleSelectionError,
+};
 use svalnir_agent::journal::OperationJournal;
 use svalnir_agent::protection::ProtectedLocations;
-use svalnir_agent::rules::projects::{
-    GitHeadActivity, MiseDiscovery, PROJECT_RULE_ID, ProjectLimits, ProjectRequest,
-    SearchRootReport,
-};
+use svalnir_agent::rules::projects::{MiseDiscovery, PROJECT_RULE_ID, SearchRootReport};
 use svalnir_agent::rules::{
-    DiscoveryCompletion, DiscoveryHost, DiscoveryLimits, EvictionCandidate, EvictionDiscovery,
-    EvictionRequest, ReviewedRules, RootResult, SkipReason,
+    DiscoveryCompletion, DiscoveryHost, EvictionCandidate, EvictionDiscovery, ReviewedRules,
+    RootResult, SkipReason,
 };
 use svalnir_agent::scan::CancellationToken;
-use svalnir_core::action::WorkCharge;
-use svalnir_core::authority::AuthorityBinding;
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
-use svalnir_core::id::{PlanId, RuleId, StepId, TargetId};
-use svalnir_core::plan::{
-    CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, PlanBuildError, PlanContext,
-    PlanOutcome, SelectionPreset, build_cleanup_plan, explain, manual_plan_lifetime,
-};
-use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
-use svalnir_core::rule::{Rule, RuleMode, RuleRef, RuleRefusal, RuleRegistry as _};
+use svalnir_core::id::RuleId;
+use svalnir_core::plan::{CleanupEntry, PlanOutcome, SelectionPreset, explain};
+use svalnir_core::rule::{Rule, RuleRef};
 
 use super::clean::{self, PlanView};
-use super::inspect::{self, ProjectRoots, ProjectSources};
+use super::inspect;
 use super::plan_store::RootRecord;
 use super::session::{self, ActiveConfig, Now};
 use super::{CommandFailure, Invocation};
@@ -337,55 +331,41 @@ fn registry_unavailable() -> ErrorBody {
 
 /// The rule revision of `--rule` of the registry, when one of its layouts
 /// is validated for manual eviction. A clear rule also needs the consent of
-/// `--include-clear`.
+/// `--include-clear`. The checks are the shared ones of
+/// [`cleanup::evict_rule`]; this function gives their messages.
 fn selected_rule<'a>(
     registry: &'a ReviewedRules,
     arguments: &CleanPlanArgs,
 ) -> Result<&'a Rule, ErrorBody> {
     let name: &str = arguments.rule.as_deref().unwrap_or_default();
-    let Some(found) = registry
-        .rules()
-        .into_iter()
-        .find(|candidate| candidate.reference.id.as_str() == name)
-    else {
-        return Err(ErrorBody::new(
-            "unknown_rule",
-            ErrorFamily::Request,
-            ErrorStage::Arguments,
-            "the rule registry of this build has no rule with this ID; the command made no change",
-        )
-        .with_fields(&["rule"]));
-    };
-    // The layout of the scope root of an owner operation is for the
-    // `owner` mode: an eviction removes no scope root as a whole.
-    let owner_layout: Option<&str> = registry
-        .producer(name)
-        .map(|producer| producer.spec().layout);
-    let validated: bool = found.layouts.iter().any(|layout| {
-        Some(layout.layout.as_str()) != owner_layout && layout.permits(&RuleMode::ManualEviction)
-    });
-    if !validated {
-        return Err(ErrorBody::new(
+    cleanup::evict_rule(registry, name, arguments.include_clear).map_err(|error| match error {
+        RuleSelectionError::UnknownRule | RuleSelectionError::OwnerOperationNotAvailable => {
+            ErrorBody::new(
+                "unknown_rule",
+                ErrorFamily::Request,
+                ErrorStage::Arguments,
+                "the rule registry of this build has no rule with this ID; the command made no change",
+            )
+            .with_fields(&["rule"])
+        }
+        RuleSelectionError::ModeNotValidated => ErrorBody::new(
             "rule_mode_not_validated",
             ErrorFamily::Eligibility,
             ErrorStage::Admission,
             "the rule has no recorded validation for manual eviction, so the `evict` mode is not permitted for it; the command made no change",
         )
-        .with_fields(&["rule", "mode"]));
-    }
-    // A clear rule removes data that a project can use now: the user
-    // consents to it with the flag, before a directory is read. The code is
-    // the one of a clear owner command of the `owner` mode.
-    if registry.clear_rule(name).is_some() && !arguments.include_clear {
-        return Err(ErrorBody::new(
+        .with_fields(&["rule", "mode"]),
+        // A clear rule removes data that a project can use now: the user
+        // consents to it with the flag, before a directory is read. The
+        // code is the one of a clear owner command of the `owner` mode.
+        RuleSelectionError::ClearNotIncluded => ErrorBody::new(
             "clear_not_included",
             ErrorFamily::Request,
             ErrorStage::Arguments,
             "the rule is a clear rule: it removes the contents of a cache directory of the producer, also data that a project uses now, so the next build downloads it again; add `--include-clear` to plan it; the command made no change",
         )
-        .with_fields(&["rule", "include_clear"]));
-    }
-    Ok(found)
+        .with_fields(&["rule", "include_clear"]),
+    })
 }
 
 /// Sets `finished` when it is dropped, so that the interrupt thread ends
@@ -398,13 +378,14 @@ impl Drop for Finish<'_> {
     }
 }
 
-/// Runs the discovery of `rule` and stops it when the user interrupts.
+/// Runs the shared discovery of `rule` ([`cleanup::discover_for_manual_eviction`])
+/// and stops it when the user interrupts.
 fn discover(
     registry: &ReviewedRules,
     rule: &Rule,
     host: &DiscoveryHost,
     environment: &Environment,
-    projects: Option<&ProjectRequest<'_>>,
+    options: &EvictDiscovery<'_>,
 ) -> EvictionDiscovery {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -413,7 +394,6 @@ fn discover(
     let cancel = CancellationToken::new();
     let finished = AtomicBool::new(false);
     let evidence = environment.seams.discovery_environment();
-    let rules: [RuleId; 1] = [rule.reference.id.clone()];
     std::thread::scope(|scope| {
         // With no thread for the interrupt, the discovery still runs to
         // its bounds; it then does not stop at an interrupt.
@@ -431,18 +411,13 @@ fn discover(
                 }),
         );
         let _finish = Finish(&finished);
-        registry.discover_for_eviction(
-            &EvictionRequest {
-                host,
-                purpose: &RuleMode::ManualEviction,
-                rules: Some(&rules),
-                volumes: None,
-                known: None,
-                limits: DiscoveryLimits::default(),
-                cancel: &cancel,
-                projects,
-            },
+        cleanup::discover_for_manual_eviction(
+            registry,
+            rule,
+            host,
             evidence.as_ref(),
+            options,
+            &cancel,
         )
     })
 }
@@ -472,115 +447,12 @@ fn request_roots(
     Ok(Some(roots))
 }
 
-/// The inputs of the discovery of `project.dependency-directory`.
-struct DiscoveryOptions<'a> {
-    config: &'a ValidatedConfig,
-    roots: Option<&'a ProjectRoots>,
-    include_active: bool,
-}
-
-/// [`discover`] with the request of `project.dependency-directory` when
-/// `options` has its roots.
-fn discover_with_roots(
-    registry: &ReviewedRules,
-    rule: &Rule,
-    host: &DiscoveryHost,
-    environment: &Environment,
-    options: &DiscoveryOptions<'_>,
-) -> EvictionDiscovery {
-    let sources: ProjectSources =
-        ProjectSources::new(options.config, host.locations.home_directory());
-    let head: GitHeadActivity<'_> = GitHeadActivity::new(sources.git());
-    let request: Option<ProjectRequest<'_>> = options.roots.map(|roots| ProjectRequest {
-        roots: &roots.roots,
-        git: sources.git(),
-        recency: sources.recency(&head),
-        layouts: &options.config.cleanup().projects.layouts,
-        include_active: options.include_active,
-        limits: ProjectLimits::default(),
-    });
-    discover(registry, rule, host, environment, request.as_ref())
-}
-
-/// The inputs of the plan builder beside the entries.
-struct PlanInputs<'a> {
-    plan_id: PlanId,
-    policy_revision: svalnir_core::id::PolicyRevisionId,
-    config: &'a ValidatedConfig,
-    now: &'a Now,
-    locations: &'a ProtectedLocations,
-}
-
-/// The plan of `entries` for a manual eviction under `rule`.
-///
-/// # Errors
-///
-/// Returns the error of the plan builder.
-fn build_outcome(
-    registry: &ReviewedRules,
-    rule: &Rule,
-    entries: &[CleanupEntry],
-    preset: Option<&SelectionPreset>,
-    inputs: &PlanInputs<'_>,
-) -> Result<PlanOutcome, ErrorBody> {
-    let home: Option<LosslessPath> = inputs
-        .locations
-        .home_directory()
-        .and_then(|home| LosslessPath::from_path(home).ok());
-    let lifetime: Nanoseconds = manual_plan_lifetime(inputs.config)
-        .ok_or_else(|| clean::plan_error(&PlanBuildError::Lifetime))?;
-    let context = PlanContext {
-        plan_id: inputs.plan_id.clone(),
-        principal: session::principal(),
-        // A manual plan has no action grant: its authority is the approval
-        // that is bound to the plan.
-        authority: AuthorityBinding {
-            policy_revision: inputs.policy_revision.clone(),
-            action_grants: Vec::new(),
-            privilege_grant: None,
-        },
-        clock: &inputs.now.clock,
-        created_wall: inputs.now.wall,
-        lifetime,
-        protections: inputs.config.protections(),
-        home_directory: home.as_ref(),
-    };
-    let selected: Result<&Rule, RuleRefusal> = registry.lookup(&rule.reference);
-    let request = CleanupRequest {
-        mode: ModeSelection::Evict { rule: selected },
-        entries,
-        preset,
-        // The builder charges no more than one pass of the rule, and the
-        // rule gives the ceiling of one candidate.
-        limits: CleanupLimits {
-            plan: rule.budget.per_pass,
-            batch: WorkCharge::new(
-                rule.budget.per_pass.work_bytes.max(Bytes::new(1)),
-                rule.budget.per_pass.items.max(EntryCount::new(1)),
-            ),
-            execution_deadline: clean::EXECUTION_DEADLINE,
-            verification_window: clean::VERIFICATION_WINDOW,
-        },
-    };
-    build_cleanup_plan(&context, &request).map_err(|error| clean::plan_error(&error))
-}
-
-/// The entries of the plan builder for the candidates of a discovery.
-fn entries(
-    candidates: &[EvictionCandidate],
-    plan_text: &str,
-) -> Result<Vec<CleanupEntry>, ErrorBody> {
-    candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let identity = |kind: char| format!("{plan_text}-{kind}{index:04}");
-            Ok(candidate.cleanup_entry(
-                TargetId::new(identity('t')).map_err(|_| session::identity_error())?,
-                StepId::new(identity('s')).map_err(|_| session::identity_error())?,
-            ))
-        })
-        .collect()
+/// The error of a manual plan that the shared builder did not make.
+pub(crate) fn manual_plan_error(error: &ManualPlanError) -> ErrorBody {
+    match error {
+        ManualPlanError::Identity => session::identity_error(),
+        ManualPlanError::Build(error) => clean::plan_error(error),
+    }
 }
 
 /// The cleanup roots of the plan document: the binding of each root that
@@ -636,14 +508,14 @@ pub(crate) fn plan(
         DiscoveryHost::manual(session::current_uid(), locations.clone(), &config);
     let project_roots: Option<ProjectRoots> =
         request_roots(arguments, environment, rule, &config, &locations)?;
-    let discovery: EvictionDiscovery = discover_with_roots(
+    let discovery: EvictionDiscovery = discover(
         &registry,
         rule,
         &discovery_host,
         environment,
-        &DiscoveryOptions {
+        &EvictDiscovery {
             config: &config,
-            roots: project_roots.as_ref(),
+            roots: project_roots.as_ref().map(|roots| &roots.roots),
             include_active: arguments.include_active,
         },
     );
@@ -654,31 +526,29 @@ pub(crate) fn plan(
     // `--min-size` only filters: a candidate whose estimate is smaller is
     // not given to the plan builder, and the result names it.
     let (selected, below_minimum): (Vec<EvictionCandidate>, Vec<EvictionCandidate>) =
-        discovery.candidates.iter().cloned().partition(|candidate| {
-            arguments
-                .min_size
-                .is_none_or(|minimum| candidate.discovered.measurement.estimate.bytes >= minimum)
-        });
+        cleanup::split_min_size(&discovery.candidates, arguments.min_size);
     let plan_text: String = session::new_id("plan");
-    let plan_id: PlanId = PlanId::new(plan_text.clone()).map_err(|_| session::identity_error())?;
+    let home: Option<LosslessPath> = locations
+        .home_directory()
+        .and_then(|home| LosslessPath::from_path(home).ok());
+    let principal = session::principal();
+    let inputs = ManualPlanInputs {
+        plan_text: &plan_text,
+        principal: &principal,
+        policy_revision: &active.revision.revision_id,
+        config: &config,
+        clock: &now.clock,
+        created_wall: now.wall,
+        home_directory: home.as_ref(),
+    };
     let entries: Vec<CleanupEntry> = if interrupted {
         Vec::new()
     } else {
-        entries(&selected, &plan_text)?
+        cleanup::eviction_entries(&selected, &inputs).map_err(|error| manual_plan_error(&error))?
     };
-    let outcome: PlanOutcome = build_outcome(
-        &registry,
-        rule,
-        &entries,
-        preset.as_ref(),
-        &PlanInputs {
-            plan_id: plan_id.clone(),
-            policy_revision: active.revision.revision_id.clone(),
-            config: &config,
-            now: &now,
-            locations: &locations,
-        },
-    )?;
+    let outcome: PlanOutcome =
+        cleanup::build_eviction_plan(&registry, rule, &entries, preset.as_ref(), &inputs)
+            .map_err(|error| manual_plan_error(&error))?;
     let roots: Vec<RootRecord> = root_records(&discovery, &outcome);
     let has_plan: bool = outcome.plan.is_some();
     clean::store_plan(&mut journal, environment, &outcome, roots.clone())?;

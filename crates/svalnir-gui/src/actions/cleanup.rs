@@ -37,6 +37,9 @@ pub enum RuleFamily {
     Cache,
     /// The owner operation of a producer: its own cleanup command.
     Owner,
+    /// A clear rule: the contents of a cache directory of a producer that
+    /// has no safe cleanup command.
+    Clear,
     /// A linked Git worktree.
     Worktree,
     /// The derived data of Xcode.
@@ -51,6 +54,7 @@ impl RuleFamily {
             Self::Project => "Project",
             Self::Cache => "Cache",
             Self::Owner => "Owner command",
+            Self::Clear => "Clear cache",
             Self::Worktree => "Worktree",
             Self::Xcode => "Xcode",
         }
@@ -167,6 +171,8 @@ pub struct RuleInspection {
     /// The lifecycle state of the layouts of the rule, for example
     /// `proposed`.
     pub lifecycle: String,
+    /// Each layout of the rule with its lifecycle state.
+    pub layouts: Vec<(String, String)>,
     /// The plan that the rule offers. `None`: inspection only.
     pub plan: Option<PlanKind>,
     /// Whether the lifecycle state permits the manual plan of the rule.
@@ -184,6 +190,9 @@ pub struct RuleInspection {
     pub units_omitted: usize,
     /// The owner command, for a rule that has one.
     pub owner: Option<OwnerFacts>,
+    /// Facts of the rule for the user, for example what a clear rule
+    /// keeps.
+    pub notes: Vec<String>,
     /// Why the inspection is not complete or did not run.
     pub problem: Option<String>,
 }
@@ -232,7 +241,7 @@ pub fn plan_gate(inspection: &RuleInspection, options: &CleanupOptions) -> Optio
     }
     if inspection.needs_clear && !options.include_clear {
         return Some(
-            "The command of this rule removes the whole cache. Check the consent above to make a plan.",
+            "This rule clears a cache, also data that a project uses now. Check the consent above to make a plan.",
         );
     }
     None
@@ -278,6 +287,9 @@ pub struct CleanupProposal {
     pub consequence: String,
     /// Whether the plan removes data permanently.
     pub permanent: bool,
+    /// Whether the plan clears a cache: it also removes data that a
+    /// project uses now, with the consent of the user.
+    pub clear: bool,
     /// The wall-clock time at which the plan expires.
     pub expires_at: SystemTime,
     /// The sealed plan. `None` for a fixture, and for a plan with no
@@ -437,6 +449,7 @@ mod tests {
             family: RuleFamily::Owner,
             producer: "go".to_owned(),
             lifecycle: "proposed".to_owned(),
+            layouts: Vec::new(),
             plan,
             permits_plan: false,
             needs_clear,
@@ -445,6 +458,7 @@ mod tests {
             units: Vec::new(),
             units_omitted: 0,
             owner: None,
+            notes: Vec::new(),
             problem: None,
         }
     }

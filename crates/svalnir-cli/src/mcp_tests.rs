@@ -7,6 +7,7 @@
 //! A removal is only below the temporary directory.
 
 use std::io::Cursor;
+use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
@@ -273,9 +274,17 @@ fn the_handshake_lists_each_tool_with_a_closed_schema() {
         json!(["plan_id", "digest"])
     );
     assert_eq!(apply["annotations"]["destructiveHint"], true);
+    assert_eq!(apply["annotations"]["idempotentHint"], false);
+    let annotation = |name: &str, hint: &str| {
+        tools.iter().find(|tool| tool["name"] == name).unwrap()["annotations"][hint].clone()
+    };
+    assert_eq!(annotation("scan", "readOnlyHint"), false);
+    assert_eq!(annotation("plan", "idempotentHint"), false);
+    assert_eq!(annotation("disk", "readOnlyHint"), true);
     let description = apply["description"].as_str().unwrap();
     assert!(description.contains("the user approved this plan"));
     assert!(description.contains("cannot verify that approval"));
+    assert!(description.contains("agent_not_running"));
     let plan = tools.iter().find(|tool| tool["name"] == "plan").unwrap();
     assert_eq!(
         plan["inputSchema"]["properties"]["mode"]["enum"],
@@ -314,8 +323,13 @@ fn a_modern_request_has_its_version_in_meta() {
             json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {"_meta": meta("1900-01-01")}}),
             // No version and no handshake.
             json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
+            // No client capabilities, and `ping`, which the revision does not have.
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "ping", "params": {"_meta": meta("2026-07-28")}}),
         ],
     );
+    assert_eq!(response(&session, 5)["error"]["code"], -32_602);
+    assert_eq!(response(&session, 6)["error"]["code"], -32_601);
     let discover = &response(&session, 1)["result"];
     assert_eq!(discover["resultType"], "complete");
     assert_eq!(discover["supportedVersions"], json!(["2026-07-28"]));
@@ -402,6 +416,7 @@ fn the_disk_tool_has_the_result_of_the_command() {
             call(2, "disk", &json!({"warn_below": "1B"})),
             call(3, "disk", &json!({"warn_below": "20GB"})),
             call(4, "plan", &json!({"mode": "permanent"})),
+            call(5, "scan", &json!({"path": "relative/dir"})),
         ],
     );
     let plain = &response(&session, 1)["result"];
@@ -413,7 +428,7 @@ fn the_disk_tool_has_the_result_of_the_command() {
     assert_eq!(&text, structured);
     let threshold = &response(&session, 2)["result"]["structuredContent"];
     assert_eq!(threshold["response"]["result"]["below_threshold"], false);
-    for id in [3, 4] {
+    for id in [3, 4, 5] {
         assert_eq!(response(&session, id)["result"]["isError"], true);
     }
 }
@@ -424,6 +439,7 @@ mod round_trip {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
+    use svalnir_agent::journal::{CoordinatorLock, CoordinatorRole};
     use svalnir_agent::rules::fixture::{
         FixtureEnvironment, derived_data_root, manual_action_validated, write_project,
         write_workspace,
@@ -484,9 +500,62 @@ mod round_trip {
             .count()
     }
 
+    /// The apply tool with no agent, and with a holder of the lock that
+    /// serves no request.
+    fn queue_only(
+        environment: &Environment,
+        base: &Path,
+        plan_id: &str,
+        digest: &str,
+        project: &Path,
+    ) {
+        // With no agent, the server is not a transient coordinator.
+        let alone = serve(
+            environment,
+            &[
+                initialize(),
+                call(1, "apply", &json!({"plan_id": plan_id, "digest": digest})),
+            ],
+        );
+        let refused = &response(&alone, 1)["result"];
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            refused["structuredContent"]["response"]["error"]["code"],
+            "agent_not_running"
+        );
+        assert_eq!(remaining(project), 3);
+
+        // A holder of the lock in place of an agent, which serves no
+        // request: the request goes to the queue, and the wait ends.
+        let journal: PathBuf = base.join("state/operations.sqlite");
+        let lock = CoordinatorLock::try_acquire(&journal, CoordinatorRole::Agent).unwrap();
+        let queued = serve(
+            environment,
+            &[
+                initialize(),
+                call(
+                    1,
+                    "apply",
+                    &json!({"plan_id": plan_id, "digest": digest, "timeout": "1s"}),
+                ),
+            ],
+        );
+        let waited = &response(&queued, 1)["result"]["structuredContent"];
+        assert_eq!(
+            waited["response"]["result"]["wait"], "timed_out",
+            "{waited}"
+        );
+        assert_eq!(
+            waited["response"]["result"]["executor"],
+            "queued_for_coordinator"
+        );
+        assert_eq!(remaining(project), 3);
+        drop(lock);
+    }
+
     #[test]
     fn a_plan_is_applied_only_with_its_digest() {
-        let (environment, _directory, project) = world();
+        let (environment, directory, project) = world();
         let planned = serve(
             &environment,
             &[
@@ -541,26 +610,22 @@ mod round_trip {
         assert_eq!(response(&applied, 3)["result"]["isError"], true);
         assert_eq!(remaining(&project), 3);
 
-        let session = serve(
+        queue_only(&environment, directory.path(), plan_id, digest, &project);
+
+        // The next coordinator, here a terminal client, executes the plan.
+        let done = run(
             &environment,
             &[
-                initialize(),
-                call(
-                    1,
-                    "apply",
-                    &json!({"plan_id": plan_id, "digest": digest, "timeout": "1m"}),
-                ),
+                "clean", "apply", "--plan", plan_id, "--yes", "--format", "json",
             ],
         );
-        let done = &response(&session, 1)["result"];
-        assert_eq!(done["isError"], false, "{done}");
-        assert_eq!(done["structuredContent"]["exit_status"], 0, "{done}");
+        assert_eq!(done.status, ExitStatus::Success, "{}", done.stdout);
         assert_eq!(remaining(&project), 0);
-        let operation_id: String =
-            done["structuredContent"]["response"]["result"]["operation"]["operation_id"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+        let envelope: Value = serde_json::from_str(&done.stdout).unwrap();
+        let operation_id: String = envelope["result"]["operation"]["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         // The operation, and a second apply that makes no second one.
         let after = serve(
             &environment,
@@ -618,4 +683,123 @@ fn a_stop_signal_ends_the_server_between_two_requests() {
         "{}",
         session.stderr
     );
+}
+
+/// A stored plan of `mode` with its digest, from a scan of a fixture tree.
+fn stored_plan(mode: &str) -> (crate::intervention_tests::World, PathBuf, String, String) {
+    let (world, tree, plan) = crate::intervention_tests::World::with_plan(mode);
+    let shown = run(
+        &world.environment,
+        &["clean", "show", "--plan", &plan, "--format", "json"],
+    );
+    let envelope: Value = serde_json::from_str(&shown.stdout).unwrap();
+    let digest: String = envelope["result"]["explanation"]["plan"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (world, tree, plan, digest)
+}
+
+#[test]
+fn the_apply_tool_refuses_a_permanent_plan_and_needs_an_agent() {
+    let (world, tree, plan, digest) = stored_plan("permanent");
+    let session = serve(
+        &world.environment,
+        &[
+            initialize(),
+            call(1, "apply", &json!({"plan_id": plan, "digest": digest})),
+        ],
+    );
+    let refused = &response(&session, 1)["result"];
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["response"]["error"]["code"],
+        "mode_not_permitted"
+    );
+    assert!(tree.join("build/b.bin").exists());
+    // The same plan in a terminal is not limited by the option.
+    let limited = run(
+        &world.environment,
+        &[
+            "clean",
+            "apply",
+            "--plan",
+            &plan,
+            "--yes",
+            "--only-modes",
+            "trash",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        limited.status,
+        ExitStatus::Unavailable,
+        "{}",
+        limited.stdout
+    );
+
+    // A trash plan with no agent is refused before the question.
+    let (world, tree, plan, digest) = stored_plan("trash");
+    let session = serve(
+        &world.environment,
+        &[
+            initialize(),
+            call(
+                1,
+                "apply",
+                &json!({"plan_id": plan, "digest": digest, "no_wait": true}),
+            ),
+        ],
+    );
+    let refused = &response(&session, 1)["result"];
+    assert_eq!(
+        refused["structuredContent"]["response"]["error"]["code"], "agent_not_running",
+        "{refused}"
+    );
+    assert!(tree.join("build/b.bin").exists());
+}
+
+#[test]
+fn a_stop_signal_ends_the_wait_of_a_queued_request() {
+    use svalnir_agent::journal::{CoordinatorLock, CoordinatorRole};
+
+    let (mut world, tree, plan, digest) = stored_plan("trash");
+    let journal: PathBuf = world.path("state").join("operations.sqlite");
+    let _lock = CoordinatorLock::try_acquire(&journal, CoordinatorRole::Agent).unwrap();
+    let (interrupt, _flag, signal) = crate::interrupt::Interrupt::manual_with_stop_signal();
+    world.environment.interrupt = interrupt;
+    signal.store(15, std::sync::atomic::Ordering::SeqCst);
+    let waited = run(
+        &world.environment,
+        &[
+            "clean",
+            "apply",
+            "--plan",
+            &plan,
+            "--digest",
+            &digest,
+            "--yes",
+            "--require-agent",
+            "--timeout",
+            "30s",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(waited.status, ExitStatus::Terminated, "{}", waited.stdout);
+    let envelope: Value = serde_json::from_str(&waited.stdout).unwrap();
+    assert_eq!(envelope["result"]["wait"], "stopped_by_sigterm");
+    assert!(
+        envelope["result"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note
+                .as_str()
+                .unwrap()
+                .starts_with("A stop signal ended the client wait")),
+        "{envelope}"
+    );
+    assert!(tree.join("build/b.bin").exists());
 }

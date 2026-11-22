@@ -8,11 +8,13 @@
 //! Each tool call is one invocation of a CLI command through
 //! [`crate::run_in`], with `--format json`, in this process. A tool has no
 //! other path to the host: `apply` is `clean apply`, so the request queue
-//! of the journal, the transient coordinator, the lifecycle gates, the
-//! protections, and the `HOME` check are those of the CLI. The server
-//! cannot verify that the user approved a plan (`docs/THREAT_MODEL.md`
-//! section 7). `apply` requires the digest that `plan` or `show` returned,
-//! and `clean apply --digest` refuses a different stored plan.
+//! of the journal, the lifecycle gates, the protections, and the `HOME`
+//! check are those of the CLI. `apply` adds `--require-agent`, so the
+//! server is never a transient coordinator, and `--only-modes evict,trash`.
+//! The server cannot verify that the user approved a plan
+//! (`docs/THREAT_MODEL.md` section 7). `apply` requires the digest that
+//! `plan` or `show` returned, and `clean apply --digest` refuses a
+//! different stored plan.
 //!
 //! The server supports the protocol revision `2026-07-28`, with the
 //! protocol version in the `_meta` of each request, and the revisions
@@ -41,6 +43,12 @@ pub(crate) const LEGACY_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025
 /// The `_meta` key of the protocol version of a request.
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 
+/// The `_meta` key of the client capabilities of a request.
+const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// The code, the message, and the data of an error response.
+type ProtocolError = (i64, String, Option<Value>);
+
 /// The longest line of stdin. A longer line is refused and not parsed.
 pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 
@@ -52,6 +60,49 @@ const MAX_LIST_ITEMS: usize = 64;
 
 /// The largest tool result. A larger result is an error of the tool.
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The largest response line. A response of a tool call is at most
+/// [`MAX_RESULT_BYTES`] and a summary, so this bound is a last guard.
+const MAX_RESPONSE_BYTES: usize = MAX_RESULT_BYTES + 64 * 1024;
+
+/// The largest result that the text block of a tool result repeats.
+const MAX_INLINE_TEXT_BYTES: usize = 64 * 1024;
+
+/// The part of the stderr of a command that the server keeps.
+const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+
+/// A sink that keeps at most `limit` bytes and records the overflow. A
+/// write never fails, so the command runs as it does with a terminal.
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl BoundedBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for BoundedBuffer {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let room: usize = self.limit.saturating_sub(self.bytes.len());
+        if data.len() > room {
+            self.overflowed = true;
+        }
+        self.bytes.extend_from_slice(&data[..data.len().min(room)]);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// The client wait of `apply` and of `operations` with `wait`, when the
 /// call gives no `timeout`.
@@ -75,6 +126,7 @@ const PARSE_ERROR: i64 = -32_700;
 const INVALID_REQUEST: i64 = -32_600;
 const METHOD_NOT_FOUND: i64 = -32_601;
 const INVALID_PARAMS: i64 = -32_602;
+const INTERNAL_ERROR: i64 = -32_603;
 const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32_022;
 
 const INSTRUCTIONS: &str = "Svalnir reads the disk capacity of this Mac and prepares bounded cleanup plans for regenerable data. Run `disk`, `inspect`, and `plan` first. Show each plan to the user: the targets, the size estimate, and the warnings. Call `apply` only after the user approved that plan. This server cannot verify the approval of the user.";
@@ -220,8 +272,8 @@ pub(crate) fn serve(
     stderr: &mut dyn Write,
 ) -> io::Result<ExitStatus> {
     // `SIGTERM` and `SIGHUP` set a flag from now on, so the server can
-    // end between two requests, and a transient coordinator of `apply`
-    // stops at its next safe point.
+    // end between two requests, and the client wait of `apply` and of
+    // `operations` ends at once.
     environment.interrupt.arm_stop_signals();
     let input: Receiver<Input> = spawn_reader(reader);
     let mut server = Server {
@@ -264,7 +316,19 @@ pub(crate) fn serve(
             Err(RecvTimeoutError::Timeout) => None,
         };
         if let Some(response) = response {
-            write_interruptible(stdout, &json_line(&response)?, &environment.interrupt)?;
+            let mut line: Vec<u8> = json_line(&response)?;
+            if line.len() > MAX_RESPONSE_BYTES {
+                server
+                    .log
+                    .write(stderr, "a response is too large and was not written");
+                line = json_line(&error_response(
+                    response.get("id").cloned().unwrap_or(Value::Null),
+                    INTERNAL_ERROR,
+                    "the response is too large",
+                    None,
+                ))?;
+            }
+            write_interruptible(stdout, &line, &environment.interrupt)?;
             stdout.flush()?;
         }
     }
@@ -430,21 +494,14 @@ impl Server<'_> {
                     "instructions": INSTRUCTIONS,
                 })),
             ),
-            "ping" => result_response(
-                id,
-                requested.map(|_| Era::Modern).or(Some(Era::Legacy)),
-                Map::new(),
-            ),
+            // The revision 2026-07-28 has no `ping`; the revisions with the
+            // handshake have it.
+            "ping" if requested.is_none() => result_response(id, Some(Era::Legacy), Map::new()),
             "tools/list" | "tools/call" => {
-                let era: Era = match self.era(requested) {
+                let era: Era = match self.era(params) {
                     Ok(era) => era,
-                    Err(data) => {
-                        return error_response(
-                            id,
-                            UNSUPPORTED_PROTOCOL_VERSION,
-                            "Unsupported protocol version",
-                            Some(data),
-                        );
+                    Err((code, message, data)) => {
+                        return error_response(id, code, &message, data);
                     }
                 };
                 if method == "tools/list" {
@@ -463,15 +520,37 @@ impl Server<'_> {
         }
     }
 
-    /// The era of a request: modern with a supported version in `_meta`,
-    /// legacy after `initialize`. The error has the `data` of an
-    /// `UnsupportedProtocolVersion` error.
-    fn era(&self, requested: Option<&Value>) -> Result<Era, Value> {
-        match requested {
-            Some(Value::String(version)) if version == MODERN_VERSION => Ok(Era::Modern),
-            Some(other) => Err(json!({"supported": supported_versions(), "requested": other})),
+    /// The era of a request: modern with a supported version and the
+    /// client capabilities in `_meta`, legacy after `initialize`. The
+    /// error is the code, the message, and the data of the response.
+    fn era(&self, params: &Map<String, Value>) -> Result<Era, ProtocolError> {
+        let meta: Option<&Value> = params.get("_meta");
+        let unsupported = |requested: Value| {
+            (
+                UNSUPPORTED_PROTOCOL_VERSION,
+                "Unsupported protocol version".to_owned(),
+                Some(json!({"supported": supported_versions(), "requested": requested})),
+            )
+        };
+        match meta.and_then(|meta| meta.get(VERSION_KEY)) {
+            Some(Value::String(version)) if version == MODERN_VERSION => {
+                if meta
+                    .and_then(|meta| meta.get(CAPABILITIES_KEY))
+                    .is_none_or(|value| !value.is_object())
+                {
+                    return Err((
+                        INVALID_PARAMS,
+                        format!(
+                            "a request of the revision {MODERN_VERSION} needs `{CAPABILITIES_KEY}` in `_meta`"
+                        ),
+                        None,
+                    ));
+                }
+                Ok(Era::Modern)
+            }
+            Some(other) => Err(unsupported(other.clone())),
             None if self.legacy.is_some() => Ok(Era::Legacy),
-            None => Err(json!({"supported": supported_versions(), "requested": Value::Null})),
+            None => Err(unsupported(Value::Null)),
         }
     }
 
@@ -541,8 +620,8 @@ impl Server<'_> {
     ) -> Map<String, Value> {
         let mut arguments: Vec<OsString> = vec!["svalnir".into(), "--format".into(), "json".into()];
         arguments.extend(command.into_iter().map(OsString::from));
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
+        let mut out = BoundedBuffer::new(MAX_RESULT_BYTES);
+        let mut err = BoundedBuffer::new(MAX_DIAGNOSTIC_BYTES);
         let status: ExitStatus = crate::run_in(
             arguments,
             generate_request_id(),
@@ -550,6 +629,21 @@ impl Server<'_> {
             &mut out,
             &mut err,
         );
+        if out.overflowed {
+            self.log.write(
+                stderr,
+                &format!(
+                    "tool `{}`: exit status {}; the result is too large",
+                    tool.name,
+                    status.code()
+                ),
+            );
+            return tool_error(&format!(
+                "the result is larger than {MAX_RESULT_BYTES} bytes; select a smaller scope (exit status {})",
+                status.code()
+            ));
+        }
+        let (out, err): (Vec<u8>, Vec<u8>) = (out.bytes, err.bytes);
         self.log.write(
             stderr,
             &format!("tool `{}`: exit status {}", tool.name, status.code()),
@@ -587,12 +681,24 @@ impl Server<'_> {
             }
         }
         structured.insert("response".to_owned(), envelope);
+        let summary: Option<Value> = structured.get("approval").cloned();
         let structured = Value::Object(structured);
-        let text: String = structured.to_string();
+        let mut text: String = structured.to_string();
         if text.len() > MAX_RESULT_BYTES {
             return tool_error(&format!(
                 "the result is larger than {MAX_RESULT_BYTES} bytes; select a smaller scope"
             ));
+        }
+        // A large result is in `structuredContent` only, so the response
+        // has it one time; the text has a summary.
+        if text.len() > MAX_INLINE_TEXT_BYTES {
+            text = json!({
+                "exit_status": status.code(),
+                "approval": summary,
+                "error": structured["response"]["error"],
+                "note": "The result is large; the full result is in `structuredContent`.",
+            })
+            .to_string();
         }
         object(json!({
             "content": [{"type": "text", "text": text}],
@@ -706,6 +812,9 @@ struct Tool {
     required: &'static [&'static str],
     read_only: bool,
     destructive: bool,
+    /// Whether a repeated call with the same arguments has no further
+    /// effect.
+    idempotent: bool,
     build: fn(&Arguments<'_>) -> Result<Vec<String>, String>,
 }
 
@@ -725,9 +834,7 @@ impl Tool {
                 "title": self.title,
                 "readOnlyHint": self.read_only,
                 "destructiveHint": self.destructive,
-                // A second `apply` of a plan reports its operation and
-                // makes no second one.
-                "idempotentHint": true,
+                "idempotentHint": self.idempotent,
                 "openWorldHint": false,
             },
         })
@@ -788,8 +895,12 @@ fn build_scan(arguments: &Arguments<'_>) -> Result<Vec<String>, String> {
     let mut command: Vec<String> = vec!["scan".to_owned()];
     switch(&mut command, "save", arguments.flag("save")?);
     // `--` ends the options, so a path that starts with `-` is a path.
+    let path: &str = arguments.required_text("path")?;
+    if !std::path::Path::new(path).is_absolute() {
+        return Err("`path` must be an absolute path".to_owned());
+    }
     command.push("--".to_owned());
-    command.push(arguments.required_text("path")?.to_owned());
+    command.push(path.to_owned());
     Ok(command)
 }
 
@@ -865,6 +976,10 @@ fn build_apply(arguments: &Arguments<'_>) -> Result<Vec<String>, String> {
         Some(arguments.required_text("digest")?),
     );
     command.push("--yes".to_owned());
+    // The server applies no `permanent` plan, also one that a terminal
+    // prepared, and it is never a transient coordinator.
+    command.push("--only-modes=evict,trash".to_owned());
+    command.push("--require-agent".to_owned());
     if arguments.flag("no_wait")? {
         command.push("--no-wait".to_owned());
         if arguments.text("timeout")?.is_some() {
@@ -906,6 +1021,7 @@ static TOOLS: [Tool; 8] = [
         required: &[],
         read_only: true,
         destructive: false,
+        idempotent: true,
         build: build_disk,
     },
     Tool {
@@ -919,8 +1035,10 @@ static TOOLS: [Tool; 8] = [
             })
         },
         required: &["path"],
-        read_only: true,
+        // `save` writes a scan record of Svalnir.
+        read_only: false,
         destructive: false,
+        idempotent: false,
         build: build_scan,
     },
     Tool {
@@ -937,6 +1055,7 @@ static TOOLS: [Tool; 8] = [
         required: &[],
         read_only: true,
         destructive: false,
+        idempotent: true,
         build: build_report,
     },
     Tool {
@@ -953,6 +1072,7 @@ static TOOLS: [Tool; 8] = [
         required: &["rule"],
         read_only: true,
         destructive: false,
+        idempotent: true,
         build: build_inspect,
     },
     Tool {
@@ -975,6 +1095,7 @@ static TOOLS: [Tool; 8] = [
         required: &["mode"],
         read_only: false,
         destructive: false,
+        idempotent: false,
         build: build_plan,
     },
     Tool {
@@ -985,12 +1106,13 @@ static TOOLS: [Tool; 8] = [
         required: &["plan_id"],
         read_only: true,
         destructive: false,
+        idempotent: true,
         build: build_show,
     },
     Tool {
         name: "apply",
         title: "Apply a cleanup plan",
-        description: "Apply a prepared cleanup plan. A plan of mode `evict` deletes files permanently; a plan of mode `trash` moves them to Trash. Call this tool only after you showed the plan to the user and the user approved this plan. This server cannot verify that approval. Give the `digest` that `plan` or `show` returned: a stored plan with a different digest is refused. The checks of `svalnir clean apply` stay in effect: the lifecycle state of the rule, the protections, the expiry of the plan, and the HOME check.",
+        description: "Apply a prepared cleanup plan. A plan of mode `evict` deletes files permanently; a plan of mode `trash` moves them to Trash. Call this tool only after you showed the plan to the user and the user approved this plan. This server cannot verify that approval. Give the `digest` that `plan` or `show` returned: a stored plan with a different digest is refused. The checks of `svalnir clean apply` stay in effect: the lifecycle state of the rule, the protections, the expiry of the plan, and the HOME check. This tool applies only `evict` and `trash` plans, and only a running Svalnir agent executes them: with no agent, the call is refused with `agent_not_running`.",
         properties: || {
             json!({
                 "plan_id": text_property("The ID of the approved plan."),
@@ -1002,6 +1124,7 @@ static TOOLS: [Tool; 8] = [
         required: &["plan_id", "digest"],
         read_only: false,
         destructive: true,
+        idempotent: false,
         build: build_apply,
     },
     Tool {
@@ -1018,6 +1141,7 @@ static TOOLS: [Tool; 8] = [
         required: &["action", "operation_id"],
         read_only: true,
         destructive: false,
+        idempotent: true,
         build: build_operations,
     },
 ];

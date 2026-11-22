@@ -380,6 +380,15 @@ pub struct CleanApplyArgs {
     /// plan with a different digest is refused, and nothing changes.
     #[arg(long, value_name = "DIGEST")]
     pub digest: Option<String>,
+    /// The modes that this request permits, for example `evict,trash`. A
+    /// stored plan of a different mode is refused, and nothing changes.
+    #[arg(long, value_enum, value_name = "MODE", value_delimiter = ',')]
+    pub only_modes: Vec<CleanMode>,
+    /// Permit only an agent as the executor. With no agent that holds the
+    /// coordinator lock, the request is refused, and this process does
+    /// not execute the plan.
+    #[arg(long)]
+    pub require_agent: bool,
     #[command(flatten)]
     pub apply: ApplyOptions,
 }

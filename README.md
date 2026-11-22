@@ -441,7 +441,7 @@ svalnir disk --format json
 svalnir disk --warn-below 20GiB
 ```
 
-With `--warn-below`, an error goes to stderr and the exit status is `0`, so a hook does not fail. A size has a binary unit: `B`, `KiB`, `MiB`, `GiB`, or `TiB`. A decimal unit such as `GB` is an error.
+With `--warn-below`, an error goes to stderr and the exit status is `0`, so a hook does not fail. A size has a binary unit only: `B`, `KiB`, `MiB`, `GiB`, or `TiB`. A decimal unit such as `20GB` is an error: the command then prints nothing on stdout and one `error:` line on stderr.
 
 #### MCP server
 
@@ -451,7 +451,7 @@ With `--warn-below`, an error goes to stderr and the exit status is `0`, so a ho
 claude mcp add svalnir -- svalnir mcp
 ```
 
-The tools are `disk`, `scan`, `report`, `inspect`, `plan`, `show`, `apply`, and `operations`. Each tool runs the CLI command of the same name, with the same checks. `apply` is `svalnir clean apply` and needs the digest that `plan` or `show` returned. The descriptions of the tools tell the agent to show each plan to the user and to ask for approval before `apply`. The server cannot verify that approval. The lifecycle gates of the rules, the protections, the digest of the plan, and the journal stay in effect ([THREAT_MODEL.md](docs/THREAT_MODEL.md) section 7). The server has no `permanent` mode, and no tool that enables a guard or stops a process. [INTERFACES.md](docs/INTERFACES.md) section 17 has the contract.
+The tools are `disk`, `scan`, `report`, `inspect`, `plan`, `show`, `apply`, and `operations`. Each tool runs the CLI command of the same name, with the same checks. `apply` is `svalnir clean apply` and needs the digest that `plan` or `show` returned. It applies only `evict` and `trash` plans, and only a running agent executes them: with no agent, `apply` is refused with `agent_not_running`, and the server never executes a step itself. The descriptions of the tools tell the agent to show each plan to the user and to ask for approval before `apply`. The server cannot verify that approval. The lifecycle gates of the rules, the protections, the digest of the plan, and the journal stay in effect ([THREAT_MODEL.md](docs/THREAT_MODEL.md) section 7). The server has no `permanent` mode, and no tool that enables a guard or stops a process. [INTERFACES.md](docs/INTERFACES.md) section 17 has the contract.
 
 #### Agent skill
 
@@ -483,7 +483,7 @@ This Claude Code `SessionStart` hook gives the agent a warning when less than 20
 }
 ```
 
-The hook prints nothing when the space is sufficient, and it does not stop the session when Svalnir gives an error.
+The hook prints nothing when the space is sufficient, and it does not stop the session when Svalnir gives an error. Give the size with a binary unit (`20GiB`): with `20GB` the hook prints nothing, and the error goes to stderr.
 
 ### Output contract
 

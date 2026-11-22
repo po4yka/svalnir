@@ -1011,6 +1011,27 @@ pub(crate) fn show(
     Ok(ExitStatus::Success)
 }
 
+/// The core mode of a CLI mode.
+fn cleanup_mode(mode: CleanMode) -> svalnir_core::plan::CleanupMode {
+    match mode {
+        CleanMode::Trash => svalnir_core::plan::CleanupMode::Trash,
+        CleanMode::Permanent => svalnir_core::plan::CleanupMode::Permanent,
+        CleanMode::Evict => svalnir_core::plan::CleanupMode::Evict,
+    }
+}
+
+/// The error for a stored plan whose mode `--only-modes` does not permit.
+fn mode_not_permitted(plan_id: &PlanId) -> ErrorBody {
+    ErrorBody::new(
+        "mode_not_permitted",
+        ErrorFamily::Authority,
+        ErrorStage::Admission,
+        "the mode of the stored plan is not one of the modes that `--only-modes` permits; the command made no change",
+    )
+    .with_fields(&["only_modes"])
+    .with_plan(plan_id.as_str())
+}
+
 /// The error for a `--digest` that is not the digest of the stored plan.
 fn digest_mismatch(plan_id: &PlanId) -> ErrorBody {
     ErrorBody::new(
@@ -1040,6 +1061,16 @@ pub(crate) fn apply(
         return Err(digest_mismatch(&plan_id).into());
     }
     let is_cleanup: bool = matches!(mode_of(&stored.plan), Some(PlanMode::Cleanup(_)));
+    // The modes that the caller permits, for example `svalnir mcp`.
+    if let Some(PlanMode::Cleanup(mode)) = mode_of(&stored.plan)
+        && !arguments.only_modes.is_empty()
+        && !arguments
+            .only_modes
+            .iter()
+            .any(|permitted| cleanup_mode(*permitted) == mode)
+    {
+        return Err(mode_not_permitted(&plan_id).into());
+    }
     if !is_cleanup {
         return Err(ErrorBody::new(
             "not_a_cleanup_plan",
@@ -1107,6 +1138,7 @@ pub(crate) fn apply(
             yes: arguments.apply.yes,
             summary,
             what: "the apply of the plan",
+            require_agent: arguments.require_agent,
         },
         invocation,
     )

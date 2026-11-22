@@ -82,7 +82,11 @@ impl Screen {
                 Section::Policies,
                 Section::LatestIntervention,
             ],
-            Self::Storage => &[Section::StorageStartupVolume, Section::FolderSizes],
+            Self::Storage => &[
+                Section::StorageStartupVolume,
+                Section::FolderSizes,
+                Section::Cleanup,
+            ],
             _ => &[],
         }
     }
@@ -159,6 +163,8 @@ pub enum Section {
     StorageStartupVolume,
     /// Storage: the folder sizes.
     FolderSizes,
+    /// Storage: the cleanup rules and their manual plans.
+    Cleanup,
 }
 
 impl Section {
@@ -172,6 +178,7 @@ impl Section {
             Self::Policies => "Policies",
             Self::LatestIntervention => "Latest intervention",
             Self::FolderSizes => "Folder sizes",
+            Self::Cleanup => "Cleanup",
         }
     }
 
@@ -184,7 +191,7 @@ impl Section {
             | Self::Agent
             | Self::Policies
             | Self::LatestIntervention => Screen::Overview,
-            Self::StorageStartupVolume | Self::FolderSizes => Screen::Storage,
+            Self::StorageStartupVolume | Self::FolderSizes | Self::Cleanup => Screen::Storage,
         }
     }
 
@@ -201,6 +208,7 @@ impl Section {
             Self::LatestIntervention => "nav-overview-latest-intervention",
             Self::StorageStartupVolume => "nav-storage-startup-volume",
             Self::FolderSizes => "nav-storage-folder-sizes",
+            Self::Cleanup => "nav-storage-cleanup",
         }
     }
 }
@@ -427,10 +435,10 @@ mod tests {
                 ids.push(section.id());
             }
         }
-        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.len(), 9);
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.len(), 9);
         let titles: Vec<&str> = Screen::Overview
             .sections()
             .iter()

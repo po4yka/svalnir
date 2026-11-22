@@ -13,6 +13,8 @@
 use super::{
     ADMISSION_GRACE, Action, ActionPort, ActionState, AuthorityPath, StopProposal, StopTarget,
     UNEXPECTED_COMPLETION, Unavailable,
+    cleanup::{CleanupProposal, CleanupRequest, CleanupSnapshot},
+    live_cleanup,
 };
 use crate::data::{live_records::collect_processes, model::OperationPhase};
 use std::{
@@ -34,6 +36,7 @@ use svalnir_agent::{
         account::verify_process_home,
         process::{ProcessRecord, ProcessSnapshot, control_plane_of_this_process},
     },
+    rules::ReviewedRules,
     runtime::journal_path,
 };
 use svalnir_core::{
@@ -67,6 +70,9 @@ const ADMISSION_WAIT: Duration = Duration::from_secs(10);
 pub struct LivePort {
     state_directory: Option<PathBuf>,
     admission_wait: Duration,
+    /// The rule registry of a test. `None`: the registry of this build, in
+    /// which each layout has the lifecycle state of its declaration.
+    registry: Option<ReviewedRules>,
 }
 
 impl LivePort {
@@ -76,6 +82,73 @@ impl LivePort {
         Self {
             state_directory,
             admission_wait: ADMISSION_WAIT,
+            registry: None,
+        }
+    }
+
+    /// The port with the rule registry `registry`, for a test that gives a
+    /// rule a fixture lifecycle state.
+    #[cfg(test)]
+    fn with_registry(mut self, registry: ReviewedRules) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// The rule registry: the registry of the test, else the registry of
+    /// this build.
+    fn registry(&self) -> Result<ReviewedRules, ActionState> {
+        match &self.registry {
+            Some(registry) => Ok(registry.clone()),
+            None => {
+                ReviewedRules::new().map_err(|_| ActionState::refused("rule_registry_unavailable"))
+            }
+        }
+    }
+
+    /// Records the confirmed cleanup plan and sends it to the agent, as a
+    /// stop is sent.
+    fn clean(&self, proposal: &CleanupProposal) -> Result<ActionState, ActionState> {
+        let plan: &Plan = proposal
+            .plan
+            .as_deref()
+            .ok_or_else(|| ActionState::refused("plan_not_buildable"))?;
+        let path: PathBuf = self.gate()?;
+        let (clock, _) = clocks()?;
+        if check_expiry(plan, &clock).is_err() {
+            return Err(ActionState::refused("plan_expired"));
+        }
+        let remaining: Duration = Duration::from_nanos(
+            plan.validity
+                .expires_at
+                .get()
+                .saturating_sub(clock.now.get()),
+        );
+        let mut journal: OperationJournal = open_for_writes(&path)?;
+        journal
+            .try_record_plan(plan)
+            .map_err(|error| journal_refusal(&error))?;
+        let approval = PlanApproval {
+            plan_id: plan.plan_id.clone(),
+            digest: plan.digest().clone(),
+        };
+        let request_id: RequestId = enqueue(&mut journal, RequestBody::Apply { approval })?;
+        let since: Instant = Instant::now();
+        match client::wait_for_completion(&journal, &path, &request_id, self.admission_wait) {
+            Ok(completion) => Ok(match admission_of(completion, Instant::now()) {
+                ActionState::WaitingForExit { operation, since } => {
+                    ActionState::Running { operation, since }
+                }
+                other => other,
+            }),
+            Err(WaitError::Pending | WaitError::CoordinatorStopped | WaitError::Journal(_)) => {
+                Ok(ActionState::AwaitingAdmission {
+                    request: request_id.to_string(),
+                    since,
+                    until: since
+                        .checked_add(remaining.saturating_add(ADMISSION_GRACE))
+                        .unwrap_or(since),
+                })
+            }
         }
     }
 
@@ -292,6 +365,7 @@ impl LivePort {
                 })
             }
             Action::Stop { proposal, force } => self.stop(proposal, *force),
+            Action::Clean { proposal } => self.clean(proposal),
             _ => Err(ActionState::refused(UNEXPECTED_COMPLETION)),
         }
     }
@@ -481,6 +555,50 @@ impl ActionPort for LivePort {
             .try_operation(&OperationId::new(operation).ok()?)
             .ok()??;
         Some(OperationPhase::of(operation.state()))
+    }
+
+    fn inspect_rules(&self) -> Result<CleanupSnapshot, String> {
+        let registry: ReviewedRules = self
+            .registry()
+            .map_err(|_| "The rule registry of this build is not usable.".to_owned())?;
+        live_cleanup::inspect_rules(&registry, self.state_directory.as_deref())
+    }
+
+    fn prepare_cleanup(&self, request: &CleanupRequest) -> Result<CleanupProposal, ActionState> {
+        // The checks that read nothing come first, as in the CLI: a
+        // `proposed` rule is refused before a directory is read.
+        let registry: ReviewedRules = self.registry()?;
+        live_cleanup::check_request(&registry, request)?;
+        let path: PathBuf = self.gate()?;
+        let journal: OperationJournal = match observe::open_existing_journal_read_only(&path) {
+            Ok(Some(journal)) => journal,
+            Ok(None) => return Err(ActionState::Unavailable(Unavailable::NoJournal)),
+            Err(_) => return Err(ActionState::refused("journal_unavailable")),
+        };
+        let stored: StoredAuthority = read_authority(&journal)?;
+        let ActiveConfig { active, config } = client::active_config(&journal, &stored.state)
+            .map_err(|error| match error {
+                ActiveConfigError::NoActiveRevision => {
+                    ActionState::refused("no_active_policy_revision")
+                }
+                ActiveConfigError::Journal(error) => journal_refusal(&error),
+                ActiveConfigError::SourceNotUsable => {
+                    ActionState::refused("policy_revision_source_not_usable")
+                }
+            })?;
+        drop(journal);
+        let (clock, wall) = clocks()?;
+        live_cleanup::build(
+            &registry,
+            request,
+            &live_cleanup::PlanInputs {
+                policy_revision: active.revision.revision_id.clone(),
+                config,
+                clock: &clock,
+                wall,
+                state_directory: self.state_directory.as_deref(),
+            },
+        )
     }
 }
 
@@ -721,7 +839,7 @@ fn stop_target(process: &ProcessIdentity, snapshot: &ProcessSnapshot) -> StopTar
 
 /// The wall-clock time at which `plan` expires: its creation time plus its
 /// monotonic lifetime.
-fn expiry_wall(plan: &Plan) -> SystemTime {
+pub(super) fn expiry_wall(plan: &Plan) -> SystemTime {
     let validity = &plan.validity;
     let lifetime: u64 = validity
         .expires_at
@@ -1367,5 +1485,127 @@ mod tests {
         );
         assert_eq!(capitalized("`HOME` is not set"), "`HOME` is not set");
         assert_eq!(capitalized("home"), "Home");
+    }
+
+    use crate::actions::cleanup::{CleanupOptions, PlanKind};
+
+    fn cleanup_request(rule: &str, kind: PlanKind, include_clear: bool) -> CleanupRequest {
+        CleanupRequest {
+            rule: rule.to_owned(),
+            kind,
+            options: CleanupOptions {
+                include_clear,
+                ..CleanupOptions::default()
+            },
+        }
+    }
+
+    fn fixture_registry() -> ReviewedRules {
+        ReviewedRules::with_fixture_lifecycle(
+            &svalnir_agent::rules::fixture::manual_action_validated(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn a_proposed_rule_is_refused_before_anything_is_read_or_written() {
+        // No state directory exists: the lifecycle check comes first, so the
+        // refusal does not depend on the agent or the journal.
+        let directory = private_tempdir();
+        let state: PathBuf = directory.path().join("state");
+        let port = LivePort::new(Some(state.clone()));
+        for (rule, kind) in [
+            ("project.dependency-directory", PlanKind::Evict),
+            ("xcode.inactive-derived-data", PlanKind::Evict),
+            ("go.build-cache", PlanKind::Owner),
+            ("homebrew.cleanup", PlanKind::Owner),
+        ] {
+            let result = port.prepare_cleanup(&cleanup_request(rule, kind, true));
+            assert!(
+                matches!(&result, Err(ActionState::Refused { code, .. }) if code == "rule_mode_not_validated"),
+                "{rule}: {result:?}"
+            );
+        }
+        assert!(!state.exists(), "nothing was made");
+    }
+
+    #[test]
+    fn a_clear_command_needs_the_consent_before_anything_is_read() {
+        let directory = private_tempdir();
+        let state: PathBuf = directory.path().join("state");
+        let port = LivePort::new(Some(state.clone())).with_registry(fixture_registry());
+        let result =
+            port.prepare_cleanup(&cleanup_request("go.build-cache", PlanKind::Owner, false));
+        assert!(
+            matches!(&result, Err(ActionState::Refused { code, .. }) if code == "clear_not_included"),
+            "{result:?}"
+        );
+        assert!(!state.exists(), "nothing was made");
+    }
+
+    #[test]
+    fn with_no_agent_a_validated_rule_makes_no_plan_and_writes_nothing() {
+        let (directory, path) = state_directory();
+        let port =
+            LivePort::new(Some(directory.path().to_owned())).with_registry(fixture_registry());
+        let before = std::fs::metadata(&path).map(|metadata| metadata.len()).ok();
+        let evict = port.prepare_cleanup(&cleanup_request(
+            "project.dependency-directory",
+            PlanKind::Evict,
+            false,
+        ));
+        assert_eq!(
+            evict.err(),
+            Some(ActionState::Unavailable(Unavailable::NoAgent))
+        );
+        let owner = port.prepare_cleanup(&cleanup_request("go.build-cache", PlanKind::Owner, true));
+        assert_eq!(
+            owner.err(),
+            Some(ActionState::Unavailable(Unavailable::NoAgent))
+        );
+        assert_eq!(
+            std::fs::metadata(&path).map(|metadata| metadata.len()).ok(),
+            before
+        );
+    }
+
+    #[test]
+    fn an_owner_plan_of_a_rule_with_no_owner_command_is_refused() {
+        let port = LivePort::new(None).with_registry(fixture_registry());
+        let result = port.prepare_cleanup(&cleanup_request(
+            "project.dependency-directory",
+            PlanKind::Owner,
+            false,
+        ));
+        assert!(
+            matches!(&result, Err(ActionState::Refused { code, .. }) if code == "owner_operation_not_available"),
+            "{result:?}"
+        );
+        let unknown =
+            port.prepare_cleanup(&cleanup_request("no.such-rule", PlanKind::Evict, false));
+        assert!(
+            matches!(&unknown, Err(ActionState::Refused { code, .. }) if code == "unknown_rule"),
+            "{unknown:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_with_no_sealed_plan_sends_nothing() {
+        let (directory, path) = state_directory();
+        let port = LivePort::new(Some(directory.path().to_owned()));
+        let before = std::fs::metadata(&path).map(|metadata| metadata.len()).ok();
+        let proposal = crate::actions::fixture_cleanup::proposal(
+            &cleanup_request("project.dependency-directory", PlanKind::Evict, false),
+            true,
+        )
+        .unwrap_or_else(|state| panic!("{state:?}"));
+        let state = port.submit(&Action::Clean {
+            proposal: Arc::new(proposal),
+        });
+        assert_eq!(state, ActionState::refused("plan_not_buildable"));
+        assert_eq!(
+            std::fs::metadata(&path).map(|metadata| metadata.len()).ok(),
+            before
+        );
     }
 }

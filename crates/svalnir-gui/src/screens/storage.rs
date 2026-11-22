@@ -224,6 +224,9 @@ impl StorageScreen {
     /// Marks a new activation of the screen: the cards enter again.
     pub fn activate(&mut self, cx: &mut Context<Self>) {
         self.activation += 1;
+        // The first view of the screen inspects the cleanup rules once, on a
+        // background thread; "Inspect again" reads them again.
+        self.model.update(cx, AppModel::ensure_cleanup);
         cx.notify();
     }
 
@@ -1403,6 +1406,13 @@ impl Render for StorageScreen {
         let metric_caption: Option<AnyElement> = (!matches!(scan, ScanState::Done(_)))
             .then(|| caption("scan-metric", self.metric.caption(), tokens));
         let reduce: bool = cx.reduce_motion();
+        let cleanup: AnyElement = crate::screens::cleanup::cleanup_card(
+            &self.model,
+            self.model.read(cx),
+            &mono,
+            SystemTime::now(),
+            tokens,
+        );
         let title: &'static str = "Storage";
         div()
             .flex()
@@ -1446,6 +1456,10 @@ impl Render for StorageScreen {
                     ),
                 ),
             )
+            .child(self.anchored(
+                Section::Cleanup,
+                card_entry(cleanup, 2, self.activation, reduce),
+            ))
     }
 }
 

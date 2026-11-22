@@ -92,9 +92,10 @@ The `[cleanup.projects]` table holds the settings of the project activity of [CL
 | --- | --- | --- | --- |
 | `quiet_period` | Duration, 1 hour to 90 days | `"24h"` | The time with no project activity after which a project is `quiet` |
 | `paseo_agents` | Boolean | `false` | `true` turns on the Paseo source. A project is then `busy` while Paseo lists a running or starting agent in it, and each project is `busy` when the listing fails |
+| `search_roots` | List of strings, at most 16 | `[]` | The search roots of `project.dependency-directory` and of `git.linked-worktree` ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 4), for example `["Developer", "GitHub"]`. Each one is a plain path relative to the home directory, with at most 16 components and no empty, `.`, `..`, or `~` component; a path that starts with `/` is refused. Two paths that differ in the case of ASCII letters only are the same path (`duplicate_identifier`). A command adds the roots of `--root` and of mise to these roots |
 | `layouts` | Array of tables, at most 16 | None | The user-configured layouts of `project.dependency-directory` ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 12, "User-configured layouts") |
 
-A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds, and each layout in the list `cleanup.projects.layouts`, with its quiet period in nanoseconds or `null`.
+A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. A search root only names a place to look; each check of the rule applies to each unit below it. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds, `search_roots` as a list of strings, and each layout in the list `cleanup.projects.layouts`, with its quiet period in nanoseconds or `null`.
 
 Each `[[cleanup.projects.layouts]]` table (owner decision of 2026-11-22) is a parameter of the reviewed rule, not a rule. It has these keys:
 

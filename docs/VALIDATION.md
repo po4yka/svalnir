@@ -404,7 +404,7 @@ The host procedure below makes the cases of the three stages of [CLEANUP_RULES.m
 
 The build of the run (step 3) gives the layout the state `automatic_eviction_validated`, because each stage needs a state that permits its mode ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 2):
 
-- The `evict` mode of `clean plan` needs a state that permits manual eviction. This build has no command that runs the discovery of a rule in the inspection mode only, so the steps of the inspection stage also use the `evict` mode, and they apply no plan.
+- The `evict` mode of `clean plan` needs a state that permits manual eviction. `clean inspect` has no inspection of `xcode.inactive-derived-data`, so the steps of the inspection stage also use the `evict` mode, and they apply no plan.
 - The disk guard needs `automatic_eviction_validated`. With an earlier state, the activation of step 20 lists the rule as not validated for automatic eviction, and the authorization refuses its automatic use.
 
 The `lifecycle_target` of the record is the last stage whose cases passed, when the cases of each earlier stage also passed. A failed case of a stage removes that stage and each later stage from the record. When the `lifecycle_target` is earlier than the state of the build of the run, the change that merges the record sets the state of the record, not the state of the build of the run, and the `limitations` of the record say that the build of the run had a later state. No branch is merged with a state that is later than the `lifecycle_target` of its approved record.
@@ -458,6 +458,39 @@ Only the project owner starts this procedure, on a host that the owner selects. 
 **Not in this procedure**
 
 The procedure does not fill a disk, does not change the clock of the host, registers no service, and needs no administrator right. The budget stop, the backoff after a removal with no gain, a restart during an operation, a full journal volume, and a permission failure are cases of the fixture tests; the record names the tests and the revision. A producer version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and is outside the promoted support.
+
+### Host procedure for `project.dependency-directory`
+
+The rule has no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/project.dependency-directory/r3/LAYOUT/manual`, one record for each layout, and one for `user-configured` that validates the mechanism and not each layout of a configuration). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects, with disposable projects only. The procedure removes files of that account.
+
+**Preparation**
+
+1. Log in as the validation user. Record `sw_vers`, `diskutil info /System/Volumes/Data`, `git rev-parse HEAD`, the version of `/Library/Developer/CommandLineTools/usr/bin/git`, and the version of each package manager and build tool of the layouts under validation.
+2. On a branch, set the lifecycle state of the layouts under validation in `crates/svalnir-agent/src/rules/projects/mod.rs` to `manual_action_validated`, with the `record_id` as the reference. Run `scripts/check.sh`, record its exit status, and build with `cargo build --release --locked`.
+3. `export SVALNIR_STATE_DIR="$HOME/svalnir-validation-state"`, then `svalnir config apply --config ./config.toml --expected-revision none` with `schema_version = 1` and `[cleanup.projects]` `search_roots = ["Validation"]`.
+4. Below `~/Validation`, make one disposable Git repository for each layout under validation, with the ignore rule of its generated directory, and run the install or build command of the layout (for example `npm install`, `cargo build`, `uv sync`, `mix compile`) so that the tool makes the directory. Also make: a project whose generated directory Git does not ignore; a project with a committed generated directory; a Mix project with a release in `_build/ENV/rel`; a dependency cloned with Git into `node_modules`; a Swift package with checkouts in `.build`; and, for `user-configured`, a layout of the configuration and a project of it.
+5. If mise is installed, run `mise trust` and `mise install` in one project outside `~/Validation`, and record the link that mise made in `~/.local/state/mise/tracked-configs`.
+
+**Inspection**
+
+6. `svalnir clean inspect --rule project.dependency-directory --format json`. Expected: each generated directory of step 4 has a unit; the refused units have `not_ignored`, `tracked_files`, `protected_child`, and `repository_refused`; the Swift package unit is measured with the exception for its checkouts; the project of step 5 has a root with the source `mise`. Keep the output.
+7. Repeat with `--no-mise` and with `--root ~/Validation/ONE_PROJECT`. Expected: no root of mise; the named root has the source `argument`.
+
+**Activity**
+
+8. With a build or an install in progress in one project, run `svalnir clean plan --mode evict --rule project.dependency-directory --format json`. Expected: the units of that project are skipped with `active_producer`.
+9. Right after a commit in one project, make a plan. Expected: its units are blocked with `retention_not_elapsed`; with `--include-active` they stay blocked until the content is 7 days old. Record how the age was reached (a wait of 7 days, or `touch -h -t` of the disposable content, which is a fixture change).
+
+**Manual eviction**
+
+10. Make a plan. Expected: one target for each unit that each check accepts, the cleanup root `~/Validation` (and the project root of mise when step 5 ran), `discovery.complete` true, and no target for a refused unit of step 6 or for the Swift package unit (`nested_repository`).
+11. Check before a step: make a plan, then remove the project marker of one project, put an entry at a protected path of the layout of a second, and start a build in a third; `svalnir clean apply --plan PLAN_ID`. Expected: these three targets are skipped with `project_marker_missing`, `protected_child`, and `producer_active`, and their files stay; each other target is removed.
+12. `svalnir history --format json`. Expected: `permanently_removed` has the count, and the sources, lockfiles, and the refused units stay.
+13. Regeneration: run the install or build command of each project again. Expected: each succeeds with no manual step. Record the time: this is the rebuild cost of the layout.
+
+**Not in this procedure**
+
+The procedure makes no automatic operation: the rule has none. A layout, a tool version, a macOS version, or a filesystem that no step ran on is `not_run` in the record and stays `proposed`.
 
 ## 14. Host validation records
 

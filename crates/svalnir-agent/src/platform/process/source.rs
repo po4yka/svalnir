@@ -20,9 +20,14 @@ pub enum QueryFailure {
     /// The process does not exist, or it is a zombie that has no data.
     #[error("the process does not exist")]
     Gone,
-    /// The worker has no permission for the query.
+    /// The worker has no permission for the query (`EPERM`).
     #[error("the worker has no permission for the query")]
     PermissionDenied,
+    /// The system denied access for the query (`EACCES`). A caller that
+    /// does not need the difference treats it as
+    /// [`PermissionDenied`](Self::PermissionDenied).
+    #[error("the system denied access for the query")]
+    AccessDenied,
     /// The host does not supply the query.
     #[error("the host does not supply the query")]
     Unsupported,
@@ -43,7 +48,7 @@ impl QueryFailure {
     pub fn reason(self) -> UnavailableReason {
         match self {
             Self::Gone => UnavailableReason::ResourceGone,
-            Self::PermissionDenied => UnavailableReason::PermissionDenied,
+            Self::PermissionDenied | Self::AccessDenied => UnavailableReason::PermissionDenied,
             Self::Unsupported => UnavailableReason::Unsupported,
             Self::Inconsistent => UnavailableReason::InconsistentData,
             Self::Overflow => UnavailableReason::Overflow,
@@ -173,6 +178,64 @@ pub struct RawListeningSockets {
     pub descriptors_truncated: bool,
 }
 
+/// One vnode that a process uses, as the kernel reports it: its path and
+/// the identity of the vnode at the time of the query.
+///
+/// The kernel can give a path that is not complete with a success status,
+/// for example for a path longer than `MAXPATHLEN`. A caller verifies the
+/// path against `object` before it treats the path as evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VnodeObject {
+    /// `vst_dev` and `vst_ino` of the vnode.
+    pub object: FileObjectEvidence,
+    /// `vst_nlink` of the vnode. Zero for a file that was removed while it
+    /// was in use.
+    pub links: u16,
+}
+
+/// One vnode with its path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RawVnode {
+    /// The absolute path, or `None` when the kernel gave no path.
+    pub path: Option<LosslessPath>,
+    /// The identity of the vnode.
+    pub vnode: VnodeObject,
+}
+
+/// The vnodes of one kind that one process uses, from at most a bounded
+/// number of native objects (file descriptors or memory regions).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawPaths {
+    /// The vnodes, each one time, in the sequence of the kernel.
+    pub paths: Vec<RawVnode>,
+    /// The process has more objects than the bound, so the objects after
+    /// the bound were not examined.
+    pub truncated: bool,
+}
+
+/// The arguments of the command line of one process.
+///
+/// The values are sensitive. The type has no `Debug` output of the values,
+/// and no serialization. A caller compares them with paths and drops them.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct RawArguments {
+    /// Each argument, `argv[0]` first, as bytes with no NUL.
+    pub values: Vec<Vec<u8>>,
+    /// The arguments are longer than the bound, so the list is not
+    /// complete.
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for RawArguments {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RawArguments")
+            .field("count", &self.values.len())
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The native queries that the inventory uses.
 ///
 /// Each method addresses a process by its PID, because the native API does.
@@ -211,6 +274,33 @@ pub trait ProcessSource {
     /// Returns a [`QueryFailure`] when the collector cannot read the file
     /// attributes.
     fn file_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure>;
+
+    /// The file object at `path` now, with no resolution of a symbolic
+    /// link at its end (`lstat`).
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the collector cannot read the file
+    /// attributes.
+    fn link_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        let _ = path;
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The names of the entries of `/`, at most `max` of them.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the directory cannot be read or has
+    /// more entries than `max`.
+    fn root_entries(&self, max: usize) -> Result<Vec<Vec<u8>>, QueryFailure> {
+        let _ = max;
+        Err(QueryFailure::Unsupported)
+    }
 
     /// The resource use of the process that has this PID now.
     ///
@@ -305,6 +395,98 @@ pub trait ProcessSource {
         max_descriptors: usize,
     ) -> Result<RawListeningSockets, QueryFailure> {
         let _ = (pid, max_descriptors);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The effective and the real user of the process that has this PID
+    /// now, from a query that the system answers also for many processes
+    /// whose identity query it denies.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`process_info`](Self::process_info)
+    /// does.
+    fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
+        let _ = pid;
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The current working directory of the process with the identity of
+    /// its vnode.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`working_directory`](Self::working_directory)
+    /// does.
+    fn working_directory_vnode(&self, pid: Pid) -> Result<RawVnode, QueryFailure> {
+        let _ = pid;
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The vnodes that the open file descriptors of the process refer to,
+    /// from at most `max_descriptors` descriptors. A descriptor that is not
+    /// a vnode, or that closed during the query, is not in the result. A
+    /// vnode for which the kernel gives no path is in the result with no
+    /// path.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the process does not exist, the query
+    /// is denied, or the source does not supply the query.
+    fn open_file_paths(&self, pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
+        let _ = (pid, max_descriptors);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The vnodes that the memory regions of the process map, from at most
+    /// `max_regions` regions. A region that maps no vnode is not in the
+    /// result.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`open_file_paths`](Self::open_file_paths)
+    /// does.
+    fn mapped_file_paths(&self, pid: Pid, max_regions: usize) -> Result<RawPaths, QueryFailure> {
+        let _ = (pid, max_regions);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The arguments of the command line of the process, from at most
+    /// `max_bytes` bytes of the argument area. The environment of the
+    /// process is not read.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`open_file_paths`](Self::open_file_paths)
+    /// does.
+    fn arguments(&self, pid: Pid, max_bytes: usize) -> Result<RawArguments, QueryFailure> {
+        let _ = (pid, max_bytes);
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// Whether the running code of the process is an Apple platform
+    /// binary: its dynamic code signature is valid for the requirement
+    /// `anchor apple`, and its signing information has a platform
+    /// identifier (code signed as part of an operating system release).
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] when the signature cannot be examined. A
+    /// failure is not evidence either way.
+    fn apple_platform_code(&self, pid: Pid) -> Result<bool, QueryFailure> {
+        let _ = pid;
         Err(QueryFailure::Unsupported)
     }
 }

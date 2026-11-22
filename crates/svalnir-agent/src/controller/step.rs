@@ -1259,7 +1259,7 @@ impl<'a> Run<'a> {
             let permits: bool = revisions.iter().any(|rule| {
                 rule.layouts
                     .iter()
-                    .any(|layout| layout.lifecycle.permits(&RuleMode::AutomaticEviction))
+                    .any(|layout| layout.permits(&RuleMode::AutomaticEviction))
             });
             if permits {
                 return Vec::new();

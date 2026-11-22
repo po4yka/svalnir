@@ -17,6 +17,7 @@
 //! | --- | --- |
 //! | [`build_cleanup_plan`] | A plan for the `trash`, `permanent`, or `evict` mode, with its batches and the entries that were left out |
 //! | [`build_stop_plan`] | A plan for one verified application or job instance |
+//! | [`build_owner_plan`] | A plan for one owner operation of a producer on one measured scope |
 //! | [`split_batches`] | The batches of a filesystem plan under a batch ceiling |
 //! | [`check_apply`], [`check_approval`], [`check_expiry`], [`check_revisions`] | The checks before an apply |
 //! | [`explain`] | The explanation of a plan for `clean show` |
@@ -42,6 +43,7 @@ mod cleanup;
 mod context;
 mod explain;
 mod mode;
+mod owner;
 mod paths;
 mod reason;
 mod stop;
@@ -65,5 +67,6 @@ pub use explain::{
     TargetExplanation, Totals, explain,
 };
 pub use mode::{CleanupMode, PlanMode, StopKind, mode_of};
+pub use owner::{OwnerPlanRequest, build_owner_plan};
 pub use reason::{Omission, OmissionReason};
 pub use stop::{StopLimits, StopRequest, StopStepIds, StopStrategy, build_stop_plan};

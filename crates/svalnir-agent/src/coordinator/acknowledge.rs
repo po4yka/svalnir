@@ -30,6 +30,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     /// | `operation_not_unknown_outcome` | `request` | The operation is in a different state |
     /// | `principal_mismatch` | `authority` | A different user applied the operation in this lifetime |
     /// | `reconciliation_pending` | `outcome` | The reconciliation after a restart is not complete |
+    /// | `owner_process_alive` | `outcome` | A process of the command of an owner step lives |
     /// | `clock_unavailable` | `native` | The clock gave no value |
     /// | `acknowledgment_not_recorded` | `recording` | The journal did not record it |
     pub fn acknowledge(
@@ -55,6 +56,19 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             .is_some_and(|applicant| applicant.uid != principal.uid)
         {
             return Err(refusal(code::PRINCIPAL_MISMATCH, ErrorFamily::Authority));
+        }
+        // A command of an owner step that still runs keeps the leases: the
+        // records of the journal are read again, and the processes are
+        // examined now (`docs/ACTION_CONTRACTS.md` section 7).
+        let processes = self
+            .journal
+            .owner_processes(operation_id)
+            .map_err(|_| refusal(code::ACKNOWLEDGMENT_NOT_RECORDED, ErrorFamily::Recording))?;
+        if processes
+            .iter()
+            .any(|process| self.probe.owner_process_lives(process))
+        {
+            return Err(refusal(code::OWNER_PROCESS_ALIVE, ErrorFamily::Outcome));
         }
         let Some(time) = self.clock.now() else {
             return Err(refusal(code::CLOCK_UNAVAILABLE, ErrorFamily::Native));

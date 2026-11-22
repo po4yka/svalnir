@@ -379,6 +379,14 @@ impl crate::rules::DiscoveryEnvironment for TestRuleEnvironment {
         self.0.xcode_evidence(principal)
     }
 
+    fn path_uses(
+        &self,
+        principal: svalnir_core::process::Uid,
+        scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        self.0.path_uses(principal, scopes)
+    }
+
     fn producer_activity(
         &self,
         _rule: &svalnir_core::id::RuleId,
@@ -625,6 +633,7 @@ impl Bench {
             coordinator: CoordinatorConfig {
                 filesystem_adapter: AdapterId::new("svalnir.filesystem").unwrap(),
                 process_adapter: AdapterId::new("macos.process").unwrap(),
+                owner_adapter: AdapterId::new("svalnir.owner-operation").unwrap(),
                 batch_targets: 2,
                 poll_interval: Nanoseconds::new(SECOND),
                 volatile_capacity: 8,
@@ -677,6 +686,12 @@ impl Bench {
                     executor_epoch: epoch.clone(),
                 },
                 ExecutorConfig::default(),
+            )),
+            owner: Box::new(crate::executor::owner::OwnerExecutor::new(
+                crate::executor::owner::OwnerExecutorConfig::new(
+                    AdapterId::new("svalnir.owner-operation").unwrap(),
+                    LosslessPath::from_path(&self.home).unwrap(),
+                ),
             )),
             probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
             candidates: Box::new(TempCandidates {

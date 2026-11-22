@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use svalnir_core::action::Plan;
 use svalnir_core::authority::ActionGrant;
+use svalnir_core::config::UserLayout;
 use svalnir_core::grant::{
     ActionRequest, AuthorityState, Authorization, AuthorizationContext, ControlClock,
     IncidentBudget, InstanceInhibition, Refusal, authorize,
@@ -29,6 +30,7 @@ use super::model::{TriggerKey, TriggerRecord};
 use crate::coordinator::{AuthoritySource, RevisionSnapshot, TimeReading, TriggerStanding};
 use crate::executor::fs::ApprovedRoots;
 use crate::protection::ProtectedLocations;
+use crate::rules::projects::UnitRecheck;
 use crate::rules::{ProducerActivity, SharedEnvironment};
 
 /// The largest number of automatic plans whose trigger the records keep.
@@ -71,6 +73,11 @@ pub struct AuthorityRecords {
     /// eviction: the process table and the clock. `None` gives an unknown
     /// activity, which permits no eviction step.
     pub environment: Option<SharedEnvironment>,
+    /// The layouts of `[[cleanup.projects.layouts]]` of the configuration
+    /// in effect, for the check of a unit of `project.dependency-directory`
+    /// with the layout `user-configured` before its step. With none, such a
+    /// unit has an unknown layout, which permits no step.
+    pub project_layouts: Vec<UserLayout>,
 }
 
 impl fmt::Debug for AuthorityRecords {
@@ -100,6 +107,7 @@ impl AuthorityRecords {
             locations: ProtectedLocations::default(),
             automatic_roots: ApprovedRoots::default(),
             environment: None,
+            project_layouts: Vec::new(),
         }
     }
 
@@ -159,8 +167,12 @@ impl AuthoritySource for SharedAuthority {
             return RevisionSnapshot::default();
         };
         // The rule revisions that can do the mode now. Only the eviction
-        // mode binds a rule.
-        let rules = if matches!(mode, PlanMode::Cleanup(CleanupMode::Evict)) {
+        // mode and an owner operation, which uses the eviction mode of its
+        // rule, bind a rule.
+        let rules = if matches!(
+            mode,
+            PlanMode::Cleanup(CleanupMode::Evict) | PlanMode::Owner(_)
+        ) {
             records
                 .registry
                 .rules()
@@ -168,7 +180,7 @@ impl AuthoritySource for SharedAuthority {
                 .filter(|rule| {
                     rule.layouts
                         .iter()
-                        .any(|layout| layout.lifecycle.permits(&RuleMode::ManualEviction))
+                        .any(|layout| layout.permits(&RuleMode::ManualEviction))
                 })
                 .map(|rule| rule.reference.clone())
                 .collect()
@@ -251,6 +263,49 @@ impl AuthoritySource for SharedAuthority {
         };
         environment.map_or(ProducerActivity::Unknown, |environment| {
             environment.producer_activity(&rule.id, principal)
+        })
+    }
+
+    fn owner_operation(&self, rule: &RuleRef) -> Option<svalnir_core::rule::owner::OwnerOperation> {
+        self.records().registry.owner_operation(rule).cloned()
+    }
+
+    fn unit_use(&self, path: &std::path::Path) -> crate::rules::in_use::UnitUse {
+        // The reading of the process table is outside the critical
+        // section.
+        let (environment, principal) = {
+            let records = self.records();
+            (records.environment.clone(), records.principal)
+        };
+        environment.map_or(
+            crate::rules::in_use::UnitUse::Unknown {
+                reason: "no_process_evidence",
+                processes: Vec::new(),
+                omitted: 0,
+            },
+            |environment| environment.unit_use(principal, path),
+        )
+    }
+
+    fn unit_recheck(
+        &self,
+        rule: &RuleRef,
+        layout: Option<&str>,
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> UnitRecheck {
+        // The reading of the filesystem and of the process table is
+        // outside the critical section.
+        let (environment, principal, layouts) = {
+            let records = self.records();
+            (
+                records.environment.clone(),
+                records.principal,
+                records.project_layouts.clone(),
+            )
+        };
+        environment.map_or(UnitRecheck::Unknown("no_process_evidence"), |environment| {
+            environment.unit_recheck(principal, rule, layout, root, path, &layouts)
         })
     }
 }

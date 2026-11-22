@@ -8,12 +8,18 @@
 //!    mutation. A tree that does not fit the depth, entry, or descriptor
 //!    bound, that has a mount point, a dataless directory or file, an entry of
 //!    another owner than the target, or a type that is not supported, is
-//!    refused as a whole: nothing is removed.
+//!    refused as a whole: nothing is removed. A tree of an eviction with a
+//!    Git marker (`.git`) or a Git directory (`HEAD`, `objects/`, and
+//!    `refs/`) at any depth is refused in the same way.
 //! 2. The removal goes bottom-up through the measured entries only. It
 //!    compares each entry with its measurement immediately before the
 //!    call, never follows a symbolic link, and never reads a directory
-//!    again. An entry that appeared after the measurement is not removed,
-//!    so its directory stays and the result is partial.
+//!    again for its entries. An entry that appeared after the measurement
+//!    is not removed, so its directory stays and the result is partial.
+//!    For an eviction, the removal reads the names of each directory again
+//!    immediately before it removes the entries of that directory: when a
+//!    Git marker or a Git directory appeared there, it removes no further
+//!    entry of the tree.
 //!
 //! The comparison and the `unlinkat` call are not one atomic step. An actor
 //! that can write to the directory can replace an entry between them; the
@@ -49,6 +55,7 @@ use super::resolve::{
     Checkpoint, HomeGuard, Injection, Located, Refusal, identity_of, is_absent, is_not_directory,
     push_name,
 };
+use crate::rules::nested_git;
 
 /// The size in bytes of one `st_blocks` unit.
 pub(super) const BLOCK_BYTES: u64 = 512;
@@ -266,6 +273,8 @@ pub(super) struct TreeBounds {
     pub(super) charge: WorkCharge,
     /// Whether a regular file with more than one name refuses the tree.
     pub(super) refuse_hard_links: bool,
+    /// Whether a Git marker (`.git`) at any depth refuses the tree.
+    pub(super) refuse_repositories: bool,
 }
 
 /// The read-only measurement of a directory target.
@@ -279,6 +288,8 @@ struct Measure<'a> {
     /// Whether a regular file with more than one name refuses the tree:
     /// true for an eviction.
     refuse_hard_links: bool,
+    /// Whether a Git marker refuses the tree: true for an eviction.
+    refuse_repositories: bool,
     injection: &'a Injection,
     entries: u64,
     /// The allocated bytes of the measured entries below the target. A
@@ -380,6 +391,15 @@ impl Measure<'_> {
                 OpenFailure::Changed => changed(),
                 OpenFailure::Read(error) => Refusal::read_failure(&error),
             })?;
+        // A Git directory with no `.git` name, as of a bare repository.
+        if self.refuse_repositories
+            && nested_git::is_git_directory(descriptor.as_fd())
+                .map_err(|error| Refusal::read_failure(&error))?
+        {
+            return Err(Refusal::skipped(Cause::eligibility(
+                code::NESTED_REPOSITORY,
+            )));
+        }
         let mut stream: DirStream = DirStream::from_descriptor(descriptor)
             .map_err(|error| Refusal::read_failure(&error))?;
         let mut entries: Vec<Snapshot> = Vec::new();
@@ -406,6 +426,15 @@ impl Measure<'_> {
                 Err(error) => return Err(Refusal::read_failure(&error)),
             };
             self.admit_entry(&metadata)?;
+            // A Git repository in the tree of an eviction: its commits and
+            // changes can exist nowhere else. The check is in the
+            // measurement, so the whole tree is refused before the first
+            // call (`docs/CLEANUP_RULES.md` section 6).
+            if self.refuse_repositories && nested_git::is_marker(entry_name.to_bytes()) {
+                return Err(Refusal::skipped(Cause::eligibility(
+                    code::NESTED_REPOSITORY,
+                )));
+            }
             let children: Vec<Snapshot> = match metadata.kind {
                 Kind::Other => {
                     return Err(Refusal::skipped(Cause::eligibility(
@@ -533,6 +562,12 @@ struct Removal<'a> {
     work: ProcessedWork,
     first_cause: Option<Cause>,
     indeterminate: Option<Cause>,
+    /// Whether a Git repository that appears during the removal stops it:
+    /// true for an eviction.
+    refuse_repositories: bool,
+    /// The cause that stopped the removal before its end. Each later entry
+    /// gets no call.
+    halted: Option<Cause>,
 }
 
 impl Removal<'_> {
@@ -621,6 +656,26 @@ impl Removal<'_> {
         self.stopped
     }
 
+    /// For an eviction, reads the names of the open directory `directory`
+    /// again before the removal of its entries. A Git repository that a
+    /// process made there after the measurement stops the removal before
+    /// it removes an entry of the directory, so the new work tree stays.
+    /// Returns the attempt of the directory when it gets no call.
+    fn repository_appeared(&mut self, directory: BorrowedFd<'_>) -> Option<Attempt> {
+        if !self.refuse_repositories {
+            return None;
+        }
+        match nested_git::holds_repository_now(directory) {
+            Ok(false) => None,
+            Ok(true) => {
+                let cause: Cause = Cause::eligibility(code::NESTED_REPOSITORY);
+                self.halted = Some(cause.clone());
+                Some(Attempt::NotAttempted(Refusal::skipped(cause)))
+            }
+            Err(error) => Some(Attempt::NotAttempted(Refusal::read_failure(&error))),
+        }
+    }
+
     /// The result has the measurement of the comparison before the call,
     /// when the comparison was done.
     fn attempt(
@@ -633,6 +688,9 @@ impl Removal<'_> {
             // No entry of the subtree gets a call.
             self.remain(snapshot.entries());
             return (Attempt::Stopped(stop), None);
+        }
+        if let Some(cause) = &self.halted {
+            return (Attempt::NotAttempted(Refusal::skipped(cause.clone())), None);
         }
         let name: &CStr = &snapshot.name;
         let changed = || {
@@ -691,6 +749,9 @@ impl Removal<'_> {
                         return (Attempt::NotAttempted(Refusal::read_failure(&error)), None);
                     }
                 };
+            if let Some(attempt) = self.repository_appeared(descriptor.as_fd()) {
+                return (attempt, None);
+            }
             let directory_length: usize = path.len();
             for child in &snapshot.children {
                 path.truncate(directory_length);
@@ -764,6 +825,7 @@ pub(super) fn remove_tree(
         device: located.device,
         owner: located.metadata.owner,
         refuse_hard_links: tree.refuse_hard_links,
+        refuse_repositories: tree.refuse_repositories,
         injection,
         entries: 0,
         allocated: 0,
@@ -796,6 +858,8 @@ pub(super) fn remove_tree(
         work: ProcessedWork::none(),
         first_cause: None,
         indeterminate: None,
+        refuse_repositories: tree.refuse_repositories,
+        halted: None,
     };
     let mut path: Vec<u8> = located.path.clone();
     let attempt: Attempt = removal.entry(located.parent.as_fd(), &root, &mut path);

@@ -77,6 +77,8 @@ pub enum Command {
     Scan(ScanArgs),
     /// Inspect a recorded scan and the capacity of the startup data volume.
     Report(ReportArgs),
+    /// Show the free and available space of the volume of the home directory.
+    Disk(DiskArgs),
     /// Prepare, inspect, and apply a cleanup plan.
     Clean {
         #[command(subcommand)]
@@ -127,6 +129,9 @@ pub enum Command {
     Completions(CompletionsArgs),
     /// Display the license of Svalnir.
     License,
+    /// Serve the Model Context Protocol on stdin and stdout for a coding
+    /// agent. A plan is applied only through the path of `clean apply`.
+    Mcp,
 }
 
 impl Command {
@@ -136,7 +141,9 @@ impl Command {
             Self::Status => "status",
             Self::Scan(_) => "scan",
             Self::Report(_) => "report",
+            Self::Disk(_) => "disk",
             Self::Clean { command } => match command {
+                CleanCommand::Inspect(_) => "clean inspect",
                 CleanCommand::Plan(_) => "clean plan",
                 CleanCommand::Show(_) => "clean show",
                 CleanCommand::Apply(_) => "clean apply",
@@ -183,6 +190,7 @@ impl Command {
             Self::Doctor => "doctor",
             Self::Completions(_) => "completions",
             Self::License => "license",
+            Self::Mcp => "mcp",
         }
     }
 
@@ -264,8 +272,21 @@ pub struct ReportArgs {
     pub threshold: Option<Bytes>,
 }
 
+#[derive(Debug, Args)]
+pub struct DiskArgs {
+    /// Print a warning only when the available capacity is below SIZE, for
+    /// example `20GiB`, and print nothing otherwise. In this mode each
+    /// error goes to stderr and the exit status is 0, so a hook never
+    /// fails.
+    #[arg(long, value_name = "SIZE")]
+    pub warn_below: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum CleanCommand {
+    /// Report what a reviewed rule finds and why. This command changes no
+    /// file.
+    Inspect(CleanInspectArgs),
     /// Prepare a bounded cleanup plan. This command changes no file.
     Plan(CleanPlanArgs),
     /// Explain the targets, estimates, exclusions, and expiry of a plan.
@@ -277,8 +298,8 @@ pub enum CleanCommand {
 #[derive(Debug, Args)]
 pub struct CleanPlanArgs {
     /// Identifier of the scan that supplies the candidates. The `trash` and
-    /// `permanent` modes require it. The `evict` mode reads no scan: its
-    /// candidates come from the rule.
+    /// `permanent` modes require it. The `evict` and `owner` modes read no
+    /// scan: their candidates come from the rule.
     #[arg(long, value_name = "SCAN_ID")]
     pub scan: Option<String>,
     /// Selection preset that filters candidates. It grants no authority.
@@ -287,15 +308,62 @@ pub struct CleanPlanArgs {
     /// Removal mode.
     #[arg(long, value_enum, default_value_t = CleanMode::Trash)]
     pub mode: CleanMode,
-    /// Reviewed cleanup rule. Only the `evict` mode accepts it, and requires it.
-    #[arg(long, value_name = "RULE_ID", required_if_eq("mode", "evict"))]
+    /// Reviewed cleanup rule. Only the `evict` and `owner` modes accept it,
+    /// and they require it.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        required_if_eq_any([("mode", "evict"), ("mode", "owner")])
+    )]
     pub rule: Option<String>,
+    /// Consent to a clear rule: the plan removes cache data of the
+    /// producer, also data that a project uses now. The `owner` mode
+    /// accepts it for a rule whose owner command has the kind `clear`, and
+    /// the `evict` mode for a clear rule of the registry, which requires
+    /// it.
+    #[arg(long)]
+    pub include_clear: bool,
     /// An entry of the saved scan to select, by its exact path. Repeat it
     /// for each entry. With none, the `trash` and `permanent` modes list the
     /// candidates of the scan and make no plan. The `evict` mode takes no
     /// entry.
     #[arg(long = "entry", value_name = "PATH")]
     pub entries: Vec<PathBuf>,
+    #[command(flatten)]
+    pub projects: ProjectRootArgs,
+    /// Also select the units of a project whose activity state is `active`.
+    /// A `busy` project is never selected. Only `--rule
+    /// project.dependency-directory` accepts it.
+    #[arg(long)]
+    pub include_active: bool,
+    /// Leave out each candidate whose estimate of reclaimable bytes is
+    /// smaller than SIZE. Only `--rule project.dependency-directory`
+    /// accepts it.
+    #[arg(long, value_name = "SIZE", value_parser = byte_size)]
+    pub min_size: Option<Bytes>,
+}
+
+/// The roots of the rules that search the projects of the user.
+#[derive(Debug, Args)]
+pub struct ProjectRootArgs {
+    /// A search root: an absolute path, or a path relative to the
+    /// invocation directory, below the home directory. Repeat it for each
+    /// root. It adds to `[cleanup.projects].search_roots`.
+    #[arg(long = "root", value_name = "PATH")]
+    pub roots: Vec<PathBuf>,
+    /// Do not add the project roots that mise records in its
+    /// tracked-configs directory.
+    #[arg(long)]
+    pub no_mise: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CleanInspectArgs {
+    /// Reviewed cleanup rule with the inspection mode.
+    #[arg(long, value_name = "RULE_ID")]
+    pub rule: String,
+    #[command(flatten)]
+    pub projects: ProjectRootArgs,
 }
 
 /// Manual cleanup mode.
@@ -307,6 +375,9 @@ pub enum CleanMode {
     Permanent,
     /// Permanently remove the candidates of one reviewed rule.
     Evict,
+    /// Run the fixed command of the producer of one reviewed rule on its
+    /// measured scope.
+    Owner,
 }
 
 #[derive(Debug, Args)]
@@ -320,6 +391,19 @@ pub struct PlanRef {
 pub struct CleanApplyArgs {
     #[command(flatten)]
     pub plan: PlanRef,
+    /// The digest of the plan that was shown for the approval. A stored
+    /// plan with a different digest is refused, and nothing changes.
+    #[arg(long, value_name = "DIGEST")]
+    pub digest: Option<String>,
+    /// The modes that this request permits, for example `evict,trash`. A
+    /// stored plan of a different mode is refused, and nothing changes.
+    #[arg(long, value_enum, value_name = "MODE", value_delimiter = ',')]
+    pub only_modes: Vec<CleanMode>,
+    /// Permit only an agent as the executor. With no agent that holds the
+    /// coordinator lock, the request is refused, and this process does
+    /// not execute the plan.
+    #[arg(long)]
+    pub require_agent: bool,
     #[command(flatten)]
     pub apply: ApplyOptions,
 }

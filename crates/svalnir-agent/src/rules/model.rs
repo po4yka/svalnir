@@ -22,7 +22,7 @@ use svalnir_core::rule::{
 use svalnir_core::time::WallTime;
 use thiserror::Error;
 
-use crate::scan::{CancellationToken, MAX_DEPTH_LIMIT, ScanClock};
+use crate::scan::{CancellationToken, MAX_DEPTH_LIMIT, PrivateBytes, ScanClock};
 
 /// The largest permitted [`DiscoveryLimits::max_units`].
 pub const MAX_UNITS_LIMIT: u32 = 100_000;
@@ -349,6 +349,18 @@ pub enum SkipReason {
     OverCandidateCeiling,
     /// The operating system denied access to the unit or to a part of it.
     AccessDenied,
+    /// A process of the user uses the unit: it has a file open in it, maps
+    /// a file from it, has its working directory in it, runs an executable
+    /// from it, or names it in an argument (`docs/CLEANUP_RULES.md` section
+    /// 6). Serialized as `unit_in_use`.
+    UnitInUse,
+    /// The use check does not show that no process of the user uses the
+    /// unit. Serialized as `unit_use_unknown`.
+    UnitUseUnknown,
+    /// The unit holds a Git repository: an object with the name `.git`,
+    /// or a Git directory (`HEAD`, `objects`, and `refs`), at some depth
+    /// (`docs/CLEANUP_RULES.md` section 6, "Repositories in a unit").
+    NestedRepository,
 }
 
 impl SkipReason {
@@ -360,10 +372,12 @@ impl SkipReason {
             | Self::NotRegenerable
             | Self::RegenerabilityUnknown
             | Self::SourceNotLocal
-            | Self::ExclusionOverlap => SkipCategory::ProtectedData,
+            | Self::ExclusionOverlap
+            | Self::NestedRepository => SkipCategory::ProtectedData,
             Self::WrongOwner | Self::SharedOwnership => SkipCategory::UnknownOwnership,
-            Self::ActiveProducer => SkipCategory::ActiveProducer,
+            Self::ActiveProducer | Self::UnitInUse => SkipCategory::ActiveProducer,
             Self::ActivityUnknown
+            | Self::UnitUseUnknown
             | Self::NotSealed
             | Self::ModifiedAfterSeal
             | Self::RetentionNotElapsed
@@ -440,8 +454,14 @@ pub enum SizeMeasure {
     /// The sum of `st_blocks * 512` of the unit and of each object below
     /// it. This is allocated storage. It is not exclusive storage: APFS
     /// clones and snapshots can share it, and a metadata read cannot
-    /// measure that.
+    /// measure that. The estimate uses it when the private allocated bytes
+    /// are unavailable.
     AllocatedBytes,
+    /// The private allocated bytes of the unit that the APFS backend of the
+    /// scanner reported (`docs/RESOURCE_MODEL.md` section 8): the sum of
+    /// the private parts, with no block that a clone shares. A snapshot, a
+    /// name outside the unit, or an open file can still keep these blocks.
+    PrivateAllocatedBytes,
 }
 
 /// A prediction of the bytes that the removal of a unit can make
@@ -453,7 +473,8 @@ pub struct ReclaimEstimate {
     pub bytes: Bytes,
     /// The size that the estimate derives from.
     pub measure: SizeMeasure,
-    /// Always `false`: a metadata read cannot measure exclusive storage.
+    /// Always `false`: no measure of this build proves exclusive storage,
+    /// because a local snapshot can keep each block of the unit.
     pub exclusive_storage_known: bool,
     /// The number of files of the unit whose allocated size is less than
     /// their logical size: sparse, compressed, or dataless files.
@@ -484,6 +505,14 @@ pub struct UnitMeasurement {
     /// The sum of `st_blocks * 512` of the unit and of each object below
     /// it.
     pub allocated_bytes: Bytes,
+    /// The private allocated bytes of the unit, or the cause that they are
+    /// unavailable. They count no block that a clone shares. An unavailable
+    /// value is not zero.
+    pub private_allocated_bytes: PrivateBytes,
+    /// The shared parts of the clone families whose members are all in the
+    /// unit. Not a reclaim figure: a modified clone outside the unit or a
+    /// snapshot can hold them. The estimate never uses them.
+    pub complete_family_shared_bytes: PrivateBytes,
     /// The number of names below the unit that are regular files.
     pub files: EntryCount,
     /// The number of names below the unit that are directories.
@@ -530,7 +559,7 @@ pub struct DiscoveredCandidate {
 impl DiscoveredCandidate {
     /// Whether the lifecycle state of the layout permits `mode`.
     pub fn permits(&self, mode: &RuleMode) -> bool {
-        self.lifecycle.permits(mode)
+        svalnir_core::rule::layout_permits(&self.candidate.layout, &self.lifecycle, mode)
     }
 
     /// The binding of the unit for a plan target.
@@ -591,6 +620,10 @@ pub struct SkippedUnit {
     pub eligibility: CandidateEligibility,
     /// The identity evidence of the unit, when the rule got it.
     pub evidence: Option<TargetEvidence>,
+    /// The first Git marker (`.git`) or Git directory of the unit,
+    /// relative to the unit, when the list has
+    /// [`SkipReason::NestedRepository`].
+    pub repository_marker: Option<LosslessPath>,
 }
 
 /// The result of one discovery of one rule.

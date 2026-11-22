@@ -31,7 +31,7 @@ use svalnir_core::id::{OperationId, PlanId, RootId, ScanId, StepId, TargetId};
 use svalnir_core::plan::{
     CleanupEntry, CleanupLimits, CleanupRequest, ModeSelection, PlanBuildError, PlanContext,
     PlanExplanation, PlanMode, PlanOutcome, PlanPreview, SelectionPreset, SizeEstimate,
-    TargetPreview, build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
+    TargetExplanation, TargetPreview, build_cleanup_plan, explain, manual_plan_lifetime, mode_of,
 };
 use svalnir_core::policy::ProtectionFact;
 use svalnir_core::process::Uid;
@@ -58,10 +58,12 @@ const PLAN_WORK_ITEMS: u64 = 4_000_000;
 const BATCH_WORK_ITEMS: u64 = 100_000;
 
 /// The time that the execution of a manual cleanup plan can use.
-pub(crate) const EXECUTION_DEADLINE: Nanoseconds = Nanoseconds::new(30 * 60 * 1_000_000_000);
+pub(crate) const EXECUTION_DEADLINE: Nanoseconds =
+    svalnir_agent::client::cleanup::EXECUTION_DEADLINE;
 
 /// The time in which the executor verifies the effect of one step.
-pub(crate) const VERIFICATION_WINDOW: Nanoseconds = Nanoseconds::new(5 * 1_000_000_000);
+pub(crate) const VERIFICATION_WINDOW: Nanoseconds =
+    svalnir_agent::client::cleanup::VERIFICATION_WINDOW;
 
 pub(crate) const PLAN_NOTE: &str = "This command changed no file. The plan gives no authority: apply it with `svalnir clean apply --plan PLAN_ID`, which asks for the approval of this plan and checks each target again.";
 
@@ -75,6 +77,77 @@ pub(crate) struct StaleEntry {
     /// `absent`, `changed_since_scan`, `outside_scan_root`,
     /// `type_not_supported`, or `not_readable`.
     pub(crate) reason: &'static str,
+}
+
+/// A selected entry of a manual plan that holds a Git repository, or that
+/// the check for one could not examine completely. The plan does not
+/// refuse it: the user selected the entry
+/// (`docs/CLEANUP_RULES.md` section 6, "Repositories in a unit").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RepositoryWarning {
+    /// The selected entry.
+    pub(crate) entry: LosslessPath,
+    /// `nested_repository`, or the reason that the check is not complete.
+    pub(crate) code: &'static str,
+    /// The repository, or the directory that the check could not read,
+    /// relative to the entry, when the code has one.
+    pub(crate) path: Option<LosslessPath>,
+}
+
+/// The largest number of selected entries that `clean plan` examines for
+/// a repository.
+const MAX_REPOSITORY_CHECKS: usize = 256;
+
+/// The repository warnings of the directory targets of a manual plan. The
+/// check is a read-only walk of each selected directory.
+fn repository_warnings(explanation: &PlanExplanation) -> Vec<RepositoryWarning> {
+    use svalnir_agent::rules::git::GitToolProblem;
+    use svalnir_agent::rules::nested_git::{self, DetectionLimits, Verdict};
+    let limits: DetectionLimits = DetectionLimits {
+        max_duration: std::time::Duration::from_secs(10),
+        ..DetectionLimits::default()
+    };
+    let mut warnings: Vec<RepositoryWarning> = Vec::new();
+    let entries = explanation
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            TargetExplanation::File {
+                path: Some(path), ..
+            } => Some(path),
+            _ => None,
+        });
+    for entry in entries.take(MAX_REPOSITORY_CHECKS) {
+        let path: PathBuf = entry.to_path_buf();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        // The walk opens a path with no symbolic link; the warning is
+        // advice, so the resolved path of the entry is walked.
+        let verdict: Verdict = match std::fs::canonicalize(&path) {
+            Ok(resolved) => nested_git::check_unit(
+                &resolved,
+                None,
+                Err(GitToolProblem::NotInstalled),
+                &limits,
+                None,
+            ),
+            Err(_) => Verdict::Refused(nested_git::RepositoryRefusal {
+                reason: nested_git::RefusalReason::UnitUnavailable,
+                path: None,
+            }),
+        };
+        if let Verdict::Refused(refusal) = verdict {
+            warnings.push(RepositoryWarning {
+                entry: entry.clone(),
+                code: refusal.reason.as_str(),
+                path: refusal
+                    .path
+                    .and_then(|path| LosslessPath::from_path(&path).ok()),
+            });
+        }
+    }
+    warnings
 }
 
 /// The result of `clean plan` and `clean show`.
@@ -103,6 +176,14 @@ pub(crate) struct PlanView {
     /// that this invocation made. A plan of a scan has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) discovery: Option<super::evict::DiscoveryView>,
+    /// The owner command of a plan of the `owner` mode that this
+    /// invocation made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner: Option<super::owner::OwnerView>,
+    /// The selected directories of a `trash` or `permanent` plan that hold
+    /// a Git repository, for `clean plan`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) repository_warnings: Vec<RepositoryWarning>,
     pub(crate) note: &'static str,
 }
 
@@ -110,6 +191,31 @@ impl PlanView {
     pub(crate) fn render(&self) -> String {
         let mut out = String::new();
         plan_view::render(&self.explanation, &self.cleanup_roots, &mut out);
+        if !self.repository_warnings.is_empty() {
+            put_line!(
+                out,
+                "\nWarning: {} selected entries hold a Git repository, or could not be checked for one. A repository can hold commits and changes that exist nowhere else. The plan does not refuse these entries:",
+                self.repository_warnings.len()
+            );
+            for warning in self
+                .repository_warnings
+                .iter()
+                .take(plan_view::TEXT_LIST_LIMIT)
+            {
+                let at: String = warning.path.as_ref().map_or_else(String::new, |path| {
+                    format!("  (at {})", path.display_label())
+                });
+                put_line!(
+                    out,
+                    "  {}  {}{at}",
+                    warning.code,
+                    warning.entry.display_label()
+                );
+            }
+            if self.repository_warnings.len() > plan_view::TEXT_LIST_LIMIT {
+                out.push_str("  ...\n");
+            }
+        }
         if !self.stale_entries.is_empty() {
             put_line!(
                 out,
@@ -125,6 +231,9 @@ impl PlanView {
         }
         if let Some(discovery) = &self.discovery {
             discovery.render(&mut out);
+        }
+        if let Some(owner) = &self.owner {
+            owner.render(&mut out);
         }
         if let Some(operation_id) = &self.operation_id {
             put_line!(out, "\nApplied: operation {operation_id}");
@@ -237,30 +346,37 @@ fn root_record(scan: &ScanResult) -> Result<RootRecord, ErrorBody> {
     })
 }
 
+/// The root of each file target and of each owner-operation target of a
+/// sealed plan: its identity, its path, and its object.
+fn plan_roots(plan: &Plan) -> Vec<(&RootId, &LosslessPath, &FileObjectEvidence)> {
+    plan.targets
+        .iter()
+        .filter_map(|target| match &target.binding {
+            TargetBinding::File(binding) => {
+                Some((&binding.root_id, &binding.root_path, &binding.root_object))
+            }
+            TargetBinding::OwnerOperation(owner) => {
+                Some((&owner.root_id, &owner.root_path, &owner.root_object))
+            }
+            TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+        })
+        .collect()
+}
+
 /// Whether a plan document agrees with the sealed plan of the journal:
 /// the same digest, the same plan, and cleanup roots that are exactly
-/// those that the file targets of the plan bind, each with the path and
-/// the object that the sealed plan binds for it and with the identity
-/// that its values give.
+/// those that the file targets and the owner-operation targets of the
+/// plan bind, each with the path and the object that the sealed plan binds
+/// for it and with the identity that its values give.
 ///
 /// A root that no target binds is refused. The document gives the
 /// executor no root: the coordinator takes the approved roots from the
 /// sealed plan. The check keeps a changed document out of the view and out
 /// of the volumes of the capacity observations.
 fn document_agrees(document: &PlanDocument, plan: &Plan) -> bool {
-    let bindings = || {
-        plan.targets
-            .iter()
-            .filter_map(|target| match &target.binding {
-                TargetBinding::File(binding) => Some(binding),
-                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
-            })
-    };
-    let bound: BTreeSet<&RootId> = bindings().map(|binding| &binding.root_id).collect();
+    let bound_roots: Vec<(&RootId, &LosslessPath, &FileObjectEvidence)> = plan_roots(plan);
+    let bound: BTreeSet<&RootId> = bound_roots.iter().map(|(root_id, _, _)| *root_id).collect();
     let named: BTreeSet<&RootId> = document.roots.iter().map(|root| &root.root_id).collect();
-    let bound_roots: Vec<(&RootId, &LosslessPath, &FileObjectEvidence)> = bindings()
-        .map(|binding| (&binding.root_id, &binding.root_path, &binding.root_object))
-        .collect();
     named == bound
         && roots_agree(&document.roots, &bound_roots)
         && named.len() == document.roots.len()
@@ -295,7 +411,9 @@ pub(crate) fn bound_paths(plan: &Plan) -> BTreeMap<TargetId, LosslessPath> {
         .iter()
         .filter_map(|target| match &target.binding {
             TargetBinding::File(binding) => Some((target.target_id.clone(), bound_path(binding)?)),
-            TargetBinding::Application(_) | TargetBinding::Process(_) => None,
+            TargetBinding::Application(_)
+            | TargetBinding::Process(_)
+            | TargetBinding::OwnerOperation(_) => None,
         })
         .collect()
 }
@@ -578,7 +696,7 @@ fn build(
     let request = CleanupRequest {
         mode: match mode {
             CleanMode::Permanent => ModeSelection::Permanent,
-            CleanMode::Trash | CleanMode::Evict => ModeSelection::Trash,
+            CleanMode::Trash | CleanMode::Evict | CleanMode::Owner => ModeSelection::Trash,
         },
         entries,
         preset,
@@ -625,6 +743,10 @@ pub(crate) fn plan(
     arguments: &CleanPlanArgs,
     invocation: &mut Invocation<'_>,
 ) -> Result<ExitStatus, CommandFailure> {
+    super::inspect::check_plan_options(arguments)?;
+    if arguments.mode == CleanMode::Owner {
+        return super::owner::plan(arguments, invocation);
+    }
     if arguments.mode == CleanMode::Evict {
         if !arguments.entries.is_empty() {
             return Err(selection::entry_not_accepted().into());
@@ -705,9 +827,11 @@ pub(crate) fn plan(
         plan_store::save_plan(environment, &document)?;
         plan_store::prune(environment);
     }
+    let explanation: PlanExplanation = explain(&outcome, &now.clock);
+    let repository_warnings: Vec<RepositoryWarning> = repository_warnings(&explanation);
     let view = PlanView {
         scan_id: Some(scan.scan_id),
-        explanation: explain(&outcome, &now.clock),
+        explanation,
         stale_entries: chosen.stale,
         operation_id: None,
         cleanup_roots: if has_plan {
@@ -718,10 +842,40 @@ pub(crate) fn plan(
         has_plan_document: has_plan,
         plan_document: if has_plan { "used" } else { "absent" },
         discovery: None,
+        owner: None,
+        repository_warnings,
         note: if has_plan { PLAN_NOTE } else { EMPTY_PLAN_NOTE },
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
     Ok(ExitStatus::Success)
+}
+
+/// Records the sealed plan of `outcome` in the journal, then saves its
+/// plan document with the cleanup roots `roots`. An outcome with no plan
+/// records and saves nothing.
+///
+/// # Errors
+///
+/// Returns the error of the journal or of the plan store.
+pub(crate) fn store_plan(
+    journal: &mut OperationJournal,
+    environment: &Environment,
+    outcome: &PlanOutcome,
+    roots: Vec<RootRecord>,
+) -> Result<(), ErrorBody> {
+    let Some(plan) = &outcome.plan else {
+        return Ok(());
+    };
+    // The journal has the sealed plan before the document names it.
+    journal
+        .try_record_plan(plan)
+        .map_err(|error| journal_error(&error))?;
+    let mut document =
+        PlanDocument::new(plan.plan_id.clone(), plan.digest().clone(), outcome.clone());
+    document.roots = roots;
+    plan_store::save_plan(environment, &document)?;
+    plan_store::prune(environment);
+    Ok(())
 }
 
 /// What this client has as the plan document of a stored plan.
@@ -758,18 +912,13 @@ pub(crate) struct StoredPlan {
 
 impl StoredPlan {
     /// The cleanup roots of the plan: the root path that the sealed plan
-    /// binds for each file target, one time for each root identity. The
-    /// digest that the user approves covers these values, so the list
-    /// needs no plan document.
+    /// binds for each file target and the scope root of each owner
+    /// operation, one time for each root identity. The digest that the user
+    /// approves covers these values, so the list needs no plan document.
     pub(crate) fn cleanup_roots(&self) -> Vec<LosslessPath> {
-        let roots: BTreeMap<&RootId, &LosslessPath> = self
-            .plan
-            .targets
-            .iter()
-            .filter_map(|target| match &target.binding {
-                TargetBinding::File(binding) => Some((&binding.root_id, &binding.root_path)),
-                TargetBinding::Application(_) | TargetBinding::Process(_) => None,
-            })
+        let roots: BTreeMap<&RootId, &LosslessPath> = plan_roots(&self.plan)
+            .into_iter()
+            .map(|(root_id, path, _)| (root_id, path))
             .collect();
         roots.into_values().cloned().collect()
     }
@@ -830,12 +979,16 @@ pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> 
         // the sealed plan binds, not from the text of the document.
         let mut outcome: PlanOutcome = document.outcome.clone();
         for preview in &mut outcome.preview.targets {
-            if let Some(TargetBinding::File(binding)) = stored
+            match stored
                 .plan
                 .target(&preview.target_id)
                 .map(|target| &target.binding)
             {
-                preview.path = bound_path(binding);
+                Some(TargetBinding::File(binding)) => preview.path = bound_path(binding),
+                Some(TargetBinding::OwnerOperation(owner)) => {
+                    preview.path = Some(owner.root_path.clone());
+                }
+                _ => {}
             }
         }
         return Ok(outcome);
@@ -860,6 +1013,7 @@ pub(crate) fn outcome_of(stored: &StoredPlan) -> Result<PlanOutcome, ErrorBody> 
                     // The path of a file target is in the sealed plan.
                     path: match &target.binding {
                         TargetBinding::File(binding) => bound_path(binding),
+                        TargetBinding::OwnerOperation(owner) => Some(owner.root_path.clone()),
                         TargetBinding::Application(_) | TargetBinding::Process(_) => None,
                     },
                     estimate: SizeEstimate::default(),
@@ -900,10 +1054,54 @@ pub(crate) fn show(
         has_plan_document: stored.document.is_some(),
         plan_document: stored.document_state.as_str(),
         discovery: None,
+        owner: None,
+        repository_warnings: Vec::new(),
         note: "This command changed nothing.",
     };
     invocation.emit(Kind::Report, &view, PlanView::render)?;
     Ok(ExitStatus::Success)
+}
+
+/// Whether the CLI mode `mode` of `--only-modes` permits a plan of the
+/// mode `plan`. `owner` permits an owner operation of each kind; a stop
+/// plan has no CLI mode.
+fn permits_mode(mode: CleanMode, plan: PlanMode) -> bool {
+    use svalnir_core::plan::CleanupMode;
+    matches!(
+        (mode, plan),
+        (CleanMode::Trash, PlanMode::Cleanup(CleanupMode::Trash))
+            | (
+                CleanMode::Permanent,
+                PlanMode::Cleanup(CleanupMode::Permanent)
+            )
+            | (CleanMode::Evict, PlanMode::Cleanup(CleanupMode::Evict))
+            | (CleanMode::Owner, PlanMode::Owner(_))
+    )
+}
+
+/// The error for a stored plan whose mode `--only-modes` does not permit.
+fn mode_not_permitted(plan_id: &PlanId) -> ErrorBody {
+    ErrorBody::new(
+        "mode_not_permitted",
+        ErrorFamily::Authority,
+        ErrorStage::Admission,
+        "the mode of the stored plan is not one of the modes that `--only-modes` permits; the command made no change",
+    )
+    .with_fields(&["only_modes"])
+    .with_plan(plan_id.as_str())
+}
+
+/// The error for a `--digest` that is not the digest of the stored plan.
+fn digest_mismatch(plan_id: &PlanId) -> ErrorBody {
+    ErrorBody::new(
+        "plan_digest_mismatch",
+        ErrorFamily::Evidence,
+        ErrorStage::Admission,
+        "the digest is not the digest of the stored plan; show the plan again with `svalnir clean show` and approve that plan; the command made no change",
+    )
+    .with_fields(&["digest"])
+    .with_plan(plan_id.as_str())
+    .with_next_action(NextAction::PrepareNewPlan)
 }
 
 pub(crate) fn apply(
@@ -914,7 +1112,31 @@ pub(crate) fn apply(
     let environment: &Environment = invocation.environment;
     let journal: Option<OperationJournal> = session::open_existing_journal(environment)?;
     let stored: StoredPlan = load_plan(journal.as_ref(), environment, &plan_id)?;
-    let is_cleanup: bool = matches!(mode_of(&stored.plan), Some(PlanMode::Cleanup(_)));
+    // The digest that was shown for the approval must be that of the
+    // stored plan. The approval then binds the same digest.
+    if let Some(expected) = &arguments.digest
+        && expected.as_str() != stored.plan.digest().as_str()
+    {
+        return Err(digest_mismatch(&plan_id).into());
+    }
+    let plan_mode: Option<PlanMode> = mode_of(&stored.plan);
+    // An owner operation is a cleanup of its scope root.
+    let is_cleanup: bool = matches!(plan_mode, Some(PlanMode::Cleanup(_) | PlanMode::Owner(_)));
+    // The modes that the caller permits, for example `svalnir mcp`. With a
+    // list, only a plan of a listed mode is applied: an owner operation
+    // needs `owner` in the list, and a stop plan and a plan of no known
+    // mode are refused.
+    if !arguments.only_modes.is_empty() {
+        let permitted: bool = plan_mode.is_some_and(|plan| {
+            arguments
+                .only_modes
+                .iter()
+                .any(|permitted| permits_mode(*permitted, plan))
+        });
+        if !permitted {
+            return Err(mode_not_permitted(&plan_id).into());
+        }
+    }
     if !is_cleanup {
         return Err(ErrorBody::new(
             "not_a_cleanup_plan",
@@ -982,6 +1204,7 @@ pub(crate) fn apply(
             yes: arguments.apply.yes,
             summary,
             what: "the apply of the plan",
+            require_agent: arguments.require_agent,
         },
         invocation,
     )

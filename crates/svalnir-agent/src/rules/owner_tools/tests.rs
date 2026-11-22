@@ -36,6 +36,18 @@ impl ProcessEvidence for Fixed {
     fn monotonic_now(&self) -> Option<MonotonicNanos> {
         self.0.observed_at
     }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        // A complete inventory with no use, at the time of the evidence.
+        crate::platform::process::PathInventory {
+            observed_at: self.0.observed_at,
+            ..crate::platform::process::PathInventory::default()
+        }
+    }
 }
 
 fn processes(executables: &[PathBuf]) -> Fixed {
@@ -125,7 +137,13 @@ fn each_owner_tool_rule_is_proposed_with_the_inspection_mode_only() {
         ]
     );
     for rule in registry.owner_tools().rules() {
-        assert_eq!(rule.modes, [RuleMode::Inspection]);
+        // `homebrew.cleanup` has a new revision with the mode of its owner
+        // operation (`rules::producers`).
+        if rule.reference.id.as_str() == "homebrew.cleanup" {
+            assert_eq!(rule.modes, [RuleMode::Inspection, RuleMode::ManualEviction]);
+        } else {
+            assert_eq!(rule.modes, [RuleMode::Inspection]);
+        }
         assert_eq!(rule.deletion_method, DeletionMethod::ProducerOperation);
         for layout in &rule.layouts {
             assert_eq!(layout.lifecycle, LifecycleState::Proposed);
@@ -142,8 +160,12 @@ fn each_owner_tool_rule_is_proposed_with_the_inspection_mode_only() {
     for state in [manual_action_validated(), automatic_eviction_validated()] {
         let registry: ReviewedRules = ReviewedRules::with_fixture_lifecycle(&state).unwrap();
         for rule in registry.owner_tools().rules() {
+            // Only the layout of the scope root of the owner operation of
+            // `homebrew.cleanup` has the fixture state.
             for layout in &rule.layouts {
-                assert_eq!(layout.lifecycle, LifecycleState::Proposed);
+                if layout.layout != "homebrew-cache-root" {
+                    assert_eq!(layout.lifecycle, LifecycleState::Proposed);
+                }
             }
         }
     }

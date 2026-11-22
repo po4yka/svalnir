@@ -148,7 +148,7 @@ The default scan remains within the selected filesystem boundary. Crossing mount
 | Trashed size | Content moved to Trash; not a claim that disk capacity was freed |
 | Observed capacity change | Before/after change in available capacity, with timestamp and measurement source |
 
-Hard links, APFS clones, snapshots, compression, sparse files, and open file descriptors complicate reclamation estimates. Summing allocated sizes does not establish how much unique storage can be recovered. Exact exclusive allocation is allowed to be unavailable.
+Hard links, APFS clones, snapshots, compression, sparse files, and open file descriptors complicate reclamation estimates. Summing allocated sizes does not establish how much unique storage can be recovered. Exact exclusive allocation is allowed to be unavailable. On APFS, the scanner reports the private allocated bytes of a unit: the sum of the bytes that only each file uses. This is a lower figure, and the reclaim estimate uses only it. The shared blocks of clone families that are complete in the unit are a separate figure that is not a reclaim figure ([RESOURCE_MODEL.md](docs/RESOURCE_MODEL.md) section 8).
 
 The baseline filesystem sample uses the appropriate `statfs` fields, including `f_bavail * f_bsize` for available bytes under that interface's semantics. Foundation's capacity estimates for important and opportunistic usage are additional, explicitly labeled signals. They must not be silently presented as already-free physical space. See [statfs][statfs] and [Apple's capacity guidance][capacity].
 
@@ -329,6 +329,8 @@ The CLI will use **`clap` with its derive API**, plus `clap_complete` for shell 
 | `svalnir status` | Summarize disk, memory, agent, and policy state |
 | `svalnir scan PATH` | Analyze a selected storage scope |
 | `svalnir report --scan ID` | Inspect a recorded scan |
+| `svalnir disk [--warn-below SIZE]` | Show the free and available space of the volume of the home directory; with `--warn-below`, warn only when space is low |
+| `svalnir clean inspect` | Inspect the units of one cleanup rule; read-only |
 | `svalnir clean plan` | Prepare a bounded cleanup plan |
 | `svalnir clean show --plan ID` | Explain targets, estimates, exclusions, and expiry |
 | `svalnir clean apply --plan ID` | Revalidate and execute an authorized plan |
@@ -347,6 +349,7 @@ The CLI will use **`clap` with its derive API**, plus `clap_complete` for shell 
 | `svalnir doctor` | Diagnose permissions, service identity, APIs, and degraded state |
 | `svalnir completions SHELL` | Generate shell completions |
 | `svalnir license` | Display the GPLv3 license and applicable notices |
+| `svalnir mcp` | Serve the Model Context Protocol on stdin and stdout for a coding agent |
 
 Future namespaces may include `apps`, `services`, `run`, `volumes`, and `power`. They are not prerequisites for the core guards. The [interfaces](docs/INTERFACES.md) document defines the common options, output encoding, exit status, and the local protocol.
 
@@ -367,6 +370,14 @@ svalnir clean plan --scan SCAN_ID --mode trash
 svalnir clean plan --scan SCAN_ID --mode trash --entry ~/Library/Caches/com.example.app
 svalnir clean show --plan PLAN_ID
 svalnir clean apply --plan PLAN_ID
+
+# Show the owner command of a producer rule: the executable, the scope
+# root, the measured size, and the exact command. Then plan it. A rule of
+# the kind `clear` needs --include-clear. Each rule is `proposed` in this
+# build, so the plan is refused until a rule has a promotion record.
+svalnir clean inspect --rule uv.cache
+svalnir clean plan --mode owner --rule uv.cache
+svalnir clean plan --mode owner --rule go.build-cache --include-clear
 
 # Inspect memory and stream machine-readable observations.
 svalnir memory status
@@ -423,6 +434,64 @@ svalnir processes stop --target TARGET_ID --force
 ```
 
 Manual commands use the same identity validation and hard protections as automation. A process budget is a sampled enforcement policy with possible overshoot, not a kernel-enforced allocation ceiling.
+
+### Coding agents
+
+#### Disk space
+
+```sh
+# The free and available space of the volume of the home directory.
+svalnir disk
+svalnir disk --format json
+
+# A check for a script or a hook: one warning line when less than 20 GiB is
+# available, and no output otherwise.
+svalnir disk --warn-below 20GiB
+```
+
+With `--warn-below`, an error goes to stderr and the exit status is `0`, so a hook does not fail. A size has a binary unit only: `B`, `KiB`, `MiB`, `GiB`, or `TiB`. A decimal unit such as `20GB` is an error: the command then prints nothing on stdout and one `error:` line on stderr.
+
+#### MCP server
+
+`svalnir mcp` is a Model Context Protocol server on stdin and stdout. Add it to Claude Code:
+
+```sh
+claude mcp add svalnir -- svalnir mcp
+```
+
+The tools are `disk`, `scan`, `report`, `inspect`, `plan`, `show`, `apply`, and `operations`. Each tool runs the CLI command of the same name, with the same checks. `apply` is `svalnir clean apply` and needs the digest that `plan` or `show` returned. It applies only `evict` and `trash` plans, and only a running agent executes them: with no agent, `apply` is refused with `agent_not_running`, and the server never executes a step itself. The descriptions of the tools tell the agent to show each plan to the user and to ask for approval before `apply`. The server cannot verify that approval. The lifecycle gates of the rules, the protections, the digest of the plan, and the journal stay in effect ([THREAT_MODEL.md](docs/THREAT_MODEL.md) section 7). The server has no `permanent` mode, and no tool that enables a guard or stops a process. [INTERFACES.md](docs/INTERFACES.md) section 17 has the contract.
+
+#### Agent skill
+
+[`skills/svalnir/SKILL.md`](skills/svalnir/SKILL.md) tells a coding agent when to use Svalnir and how to apply a plan only after the user approves it. Copy it to the skills directory of Claude Code:
+
+```sh
+mkdir -p ~/.claude/skills/svalnir
+cp skills/svalnir/SKILL.md ~/.claude/skills/svalnir/SKILL.md
+```
+
+#### Hooks
+
+This Claude Code `SessionStart` hook gives the agent a warning when less than 20 GiB is available. Add it to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "svalnir disk --warn-below 20GiB"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook prints nothing when the space is sufficient, and it does not stop the session when Svalnir gives an error. Give the size with a binary unit (`20GiB`): with `20GB` the hook prints nothing, and the error goes to stderr.
 
 ### Output contract
 
@@ -759,7 +828,7 @@ cargo run -p svalnir-cli --bin svalnir --locked -- --help
 cargo build -p svalnir-gui --locked
 ```
 
-The `svalnir` binary parses the command surface of this README and runs the read-only commands in its own process: `status`, `memory status`, `swap status`, `monitor`, `processes top`, `processes show`, `scan`, `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, `completions`, and `license`. It also runs the commands that change state: `clean plan`, `clean show`, `clean apply`, `processes stop`, `operations show`, `operations wait`, `operations cancel`, `operations acknowledge`, `config apply`, `policy enable`, `policy disable`, `policy rearm`, `agent status`, `agent pause`, `agent resume`, `agent install`, `agent uninstall`, and `history`. A plan is applied by the agent when one holds the coordinator lock of the journal, and otherwise by the client process as a transient coordinator. `processes stop --group` stops the verified members of one application or managed-job instance, as the GPUI client does. `operations cancel` sends a cancel request to the queue of the journal when an agent holds the coordinator lock, and writes the stop fence itself when no agent holds it or the agent does not answer in the wait. The `evict` mode of `clean plan` runs the discovery of the rule that `--rule` names and makes a plan of its candidates, for a rule whose layout is validated for manual action; `--profile developer` is the one selection preset, which only filters. Each reviewed rule is in the `proposed` lifecycle state, so the `evict` mode refuses each rule with `rule_mode_not_validated`, exit status `3`, and changes nothing. `policy rearm` goes to the agent through the request queue of the journal and is refused with `agent_not_running`, exit status `5`, when no agent runs. [INTERFACES.md](docs/INTERFACES.md) section 4 gives the decisions and the limits of this build. A test or a manual run must use a temporary `SVALNIR_STATE_DIR` and must not run `agent install` or `agent uninstall` with the service host of the running system. Use `--locked`, and change `Cargo.lock` only as an intended dependency update. Keep privileged APIs behind small reviewed interfaces, document unsafe invariants, and avoid passing unchecked strings across process or privilege boundaries.
+The `svalnir` binary parses the command surface of this README and runs the read-only commands in its own process: `status`, `memory status`, `swap status`, `monitor`, `processes top`, `processes show`, `scan`, `report`, `doctor`, `config validate`, `config show`, `policy list`, `policy show`, `policy simulate`, `clean inspect`, `completions`, and `license`. It also runs the commands that change state: `clean plan`, `clean show`, `clean apply`, `processes stop`, `operations show`, `operations wait`, `operations cancel`, `operations acknowledge`, `config apply`, `policy enable`, `policy disable`, `policy rearm`, `agent status`, `agent pause`, `agent resume`, `agent install`, `agent uninstall`, and `history`. A plan is applied by the agent when one holds the coordinator lock of the journal, and otherwise by the client process as a transient coordinator. `processes stop --group` stops the verified members of one application or managed-job instance, as the GPUI client does. `operations cancel` sends a cancel request to the queue of the journal when an agent holds the coordinator lock, and writes the stop fence itself when no agent holds it or the agent does not answer in the wait. The `evict` mode of `clean plan` runs the discovery of the rule that `--rule` names and makes a plan of its candidates, for a rule whose layout is validated for manual action; `--profile developer` is the one selection preset, which only filters. Each reviewed rule is in the `proposed` lifecycle state, so the `evict` mode refuses each rule with `rule_mode_not_validated`, exit status `3`, and changes nothing. `policy rearm` goes to the agent through the request queue of the journal and is refused with `agent_not_running`, exit status `5`, when no agent runs. [INTERFACES.md](docs/INTERFACES.md) section 4 gives the decisions and the limits of this build. A test or a manual run must use a temporary `SVALNIR_STATE_DIR` and must not run `agent install` or `agent uninstall` with the service host of the running system. Use `--locked`, and change `Cargo.lock` only as an intended dependency update. Keep privileged APIs behind small reviewed interfaces, document unsafe invariants, and avoid passing unchecked strings across process or privilege boundaries.
 
 ### Validation strategy
 

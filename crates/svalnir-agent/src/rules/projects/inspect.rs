@@ -5,7 +5,7 @@
 //! [`crate::rules::git`], reads the process table, and measures each unit
 //! with the scanner. It changes nothing and gives no candidate.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -13,19 +13,35 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use svalnir_core::config::{SKIPPED_DIRECTORY_NAMES, UserLayout};
 use svalnir_core::policy::ProtectionFact;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::{LayoutSupport, RuleRef};
 use svalnir_core::time::MonotonicNanos;
 
+use super::ProjectRule;
 use super::activity::{BuildProcesses, ProcessEvidence};
-use super::{CARGO_RULE_ID, CARGO_TARGET, PROJECT_LAYOUTS, ProjectLayout, ProjectRule};
+use super::layouts::{
+    DirectoryName, MarkerKind, PROJECT_LAYOUTS, PackageCheckouts, ProjectLayout,
+    USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW,
+};
+use super::recency::{
+    AgentListing, ProjectRecency, RecencyHost, RecencyState, SourceReading, assess_with_head,
+};
+use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
 use crate::protection::ProtectedLocations;
-use crate::rules::caches::{CacheMeasurement, InspectionLimits, measure_unit};
+use crate::rules::caches::{
+    CacheMeasurement, InspectionLimits, ReclaimBasis, measure_unit_observed,
+};
 use crate::rules::git::{
-    GitFailure, GitOutput, GitTool, GitToolProblem, RepositoryLookup, find_repository,
+    GitFailure, GitOutput, GitTool, GitToolProblem, Repository, RepositoryLookup, find_repository,
+};
+use crate::rules::in_use::{UnitScope, UnitUse, uses_of};
+use crate::rules::nested_git::{
+    DetectionLimits, MarkerObserver, RefusalReason, RepositoryRefusal, SwiftPmCheckouts, Verdict,
+    check_unit,
 };
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
@@ -35,16 +51,71 @@ use crate::scan::{CancellationToken, ScanClock};
 /// The largest number of search roots of one inspection.
 pub const MAX_SEARCH_ROOTS: usize = 16;
 
+/// The largest number of project roots of one inspection, for example the
+/// project roots that mise records.
+pub const MAX_PROJECT_ROOTS: usize = 256;
+
 /// The largest output of a Git query of this rule, in bytes.
 const MAX_GIT_OUTPUT: usize = 4 * 1024;
 
-/// The directories that the user names for the rule, each relative to the
-/// home directory.
+/// How the inspection examines a root of its request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKind {
+    /// A search root: the walk reads the directories below it.
+    Search,
+    /// A project directory: the inspection examines the units of that
+    /// directory only, and the walk reads no directory below it.
+    Project,
+}
+
+/// Where a root of a request comes from. The report of each root has it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RootSource {
+    /// The caller of the library function.
+    Caller,
+    /// `[cleanup.projects].search_roots` of the configuration.
+    Configuration,
+    /// A `--root` argument of the command.
+    Argument,
+    /// A configuration file that mise records in its tracked-configs
+    /// directory. The path is the target of the link that mise made.
+    Mise {
+        /// The configuration file.
+        config: PathBuf,
+    },
+}
+
+/// One root of a request, relative to the home directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchRoots(Vec<PathBuf>);
+pub struct SearchRootEntry {
+    /// The path, relative to the home directory.
+    pub relative: PathBuf,
+    /// How the inspection examines the root.
+    pub kind: RootKind,
+    /// Where the root comes from.
+    pub source: RootSource,
+}
+
+/// The roots of one request, each relative to the home directory: the
+/// search roots, then the project roots, and the roots that the request
+/// left out, each with its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRoots {
+    entries: Vec<SearchRootEntry>,
+    dropped: Vec<(SearchRootEntry, &'static str)>,
+}
+
+/// The reason of a root that has the path of an earlier root.
+pub const REPEATED_ROOT: &str = "repeated_root";
+
+/// The reason of a root that is in a search root of the request: the walk
+/// of that search root examines it.
+pub const IN_SEARCH_ROOT: &str = "in_search_root";
 
 impl SearchRoots {
-    /// The search roots `relative`.
+    /// The search roots `relative`, from the caller.
     ///
     /// # Errors
     ///
@@ -60,13 +131,195 @@ impl SearchRoots {
                 return Err(Some(path.clone()));
             }
         }
-        Ok(Self(relative))
+        Self::with_entries(
+            relative
+                .into_iter()
+                .map(|relative| SearchRootEntry {
+                    relative,
+                    kind: RootKind::Search,
+                    source: RootSource::Caller,
+                })
+                .collect(),
+        )
     }
 
-    /// The search roots, relative to the home directory.
+    /// The roots of `entries`, in their sequence, with the search roots
+    /// before the project roots, so that no directory is walked twice.
+    ///
+    /// The comparisons ignore the case of ASCII letters. A root with the
+    /// path of an earlier root is left out ([`REPEATED_ROOT`]), and so is
+    /// a search root below another search root, and a project root that is
+    /// a search root or is below one ([`IN_SEARCH_ROOT`]).
+    /// [`SearchRoots::dropped`] has each root that is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first path that is not a plain relative path, or `None`
+    /// when the list has more than [`MAX_SEARCH_ROOTS`] search roots or
+    /// more than [`MAX_PROJECT_ROOTS`] project roots after the removals.
+    pub fn with_entries(entries: Vec<SearchRootEntry>) -> Result<Self, Option<PathBuf>> {
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| !is_plain_relative(&entry.relative))
+        {
+            return Err(Some(entry.relative.clone()));
+        }
+        let (search, projects): (Vec<SearchRootEntry>, Vec<SearchRootEntry>) = entries
+            .into_iter()
+            .partition(|entry| entry.kind == RootKind::Search);
+        let same = |left: &Path, right: &Path| is_within(left, right) && is_within(right, left);
+        let mut dropped: Vec<(SearchRootEntry, &'static str)> = Vec::new();
+        let mut unique: Vec<SearchRootEntry> = Vec::new();
+        for entry in search {
+            if unique
+                .iter()
+                .any(|known| same(&known.relative, &entry.relative))
+            {
+                dropped.push((entry, REPEATED_ROOT));
+            } else {
+                unique.push(entry);
+            }
+        }
+        let mut kept: Vec<SearchRootEntry> = Vec::new();
+        for (index, entry) in unique.iter().enumerate() {
+            let nested: bool = unique.iter().enumerate().any(|(other, known)| {
+                other != index && is_within(&entry.relative, &known.relative)
+            });
+            if nested {
+                dropped.push((entry.clone(), IN_SEARCH_ROOT));
+            } else {
+                kept.push(entry.clone());
+            }
+        }
+        let searches: usize = kept.len();
+        for entry in projects {
+            if kept.iter().any(|known| {
+                known.kind == RootKind::Search && is_within(&entry.relative, &known.relative)
+            }) {
+                dropped.push((entry, IN_SEARCH_ROOT));
+            } else if kept
+                .iter()
+                .any(|known| same(&known.relative, &entry.relative))
+            {
+                dropped.push((entry, REPEATED_ROOT));
+            } else {
+                kept.push(entry);
+            }
+        }
+        if searches > MAX_SEARCH_ROOTS || kept.len() - searches > MAX_PROJECT_ROOTS {
+            return Err(None);
+        }
+        Ok(Self {
+            entries: kept,
+            dropped,
+        })
+    }
+
+    /// The roots, in their sequence.
     #[must_use]
-    pub fn paths(&self) -> &[PathBuf] {
-        &self.0
+    pub fn entries(&self) -> &[SearchRootEntry] {
+        &self.entries
+    }
+
+    /// The roots that the request left out, each with its reason.
+    #[must_use]
+    pub fn dropped(&self) -> &[(SearchRootEntry, &'static str)] {
+        &self.dropped
+    }
+
+    /// Whether the request has no root.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Why a root that the user names on the command line is not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentRootError {
+    /// The path is not absolute.
+    NotAbsolute,
+    /// The path has a `..` component.
+    NotPlain,
+    /// The path is not below the home directory, or it is the home
+    /// directory.
+    NotBelowHome,
+    /// The path does not exist.
+    NotFound,
+    /// The object at the path is not a directory. A symbolic link is not a
+    /// directory.
+    NotDirectory,
+}
+
+impl ArgumentRootError {
+    /// The stable name of the error.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAbsolute => "search_root_not_absolute",
+            Self::NotPlain => "search_root_not_plain",
+            Self::NotBelowHome => "search_root_not_below_home",
+            Self::NotFound => "search_root_not_found",
+            Self::NotDirectory => "search_root_not_directory",
+        }
+    }
+}
+
+/// The path `path` with each `.` component removed, or `None` when it has a
+/// `..` component. A `..` is not applied to the text: after a symbolic link
+/// it names a different directory than the text shows, so the argument is
+/// refused (fail closed).
+fn without_current(path: &Path) -> Option<PathBuf> {
+    let mut result: PathBuf = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return None,
+            other => result.push(other),
+        }
+    }
+    Some(result)
+}
+
+/// The search root of a `--root PATH` argument, relative to the home
+/// directory `home` (with its symbolic links resolved).
+///
+/// `path` is absolute: the caller resolved a relative argument against the
+/// invocation directory. A `.` component is removed, and a path with a
+/// `..` component is refused. A path whose text is not below `home` is
+/// compared again in its resolved form, so that `/var` and `/private/var`
+/// name one directory. The root must be a directory below the home
+/// directory; the walk then makes each check of a search root
+/// (`docs/CLEANUP_RULES.md` section 4).
+///
+/// # Errors
+///
+/// Returns an [`ArgumentRootError`].
+pub fn argument_root(path: &Path, home: &Path) -> Result<PathBuf, ArgumentRootError> {
+    if !path.is_absolute() {
+        return Err(ArgumentRootError::NotAbsolute);
+    }
+    let mut absolute: PathBuf = without_current(path).ok_or(ArgumentRootError::NotPlain)?;
+    if !absolute.starts_with(home) {
+        absolute = match fs::canonicalize(&absolute) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ArgumentRootError::NotFound);
+            }
+            Err(_) => return Err(ArgumentRootError::NotBelowHome),
+        };
+    }
+    let relative: PathBuf = match absolute.strip_prefix(home) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        _ => return Err(ArgumentRootError::NotBelowHome),
+    };
+    match fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.is_dir() => Ok(relative),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(ArgumentRootError::NotFound),
+        // A symbolic link, another kind of object, or an object that cannot
+        // be read.
+        Ok(_) | Err(_) => Err(ArgumentRootError::NotDirectory),
     }
 }
 
@@ -88,6 +341,12 @@ pub struct ProjectHost<'a> {
     pub git: Result<&'a GitTool, GitToolProblem>,
     /// The process evidence.
     pub processes: &'a dyn ProcessEvidence,
+    /// The sources and the quiet period of the project activity.
+    pub recency: RecencyHost<'a>,
+    /// The layouts of `[[cleanup.projects.layouts]]`, which the
+    /// configuration validated. Each one has the layout name
+    /// `user-configured`.
+    pub layouts: &'a [UserLayout],
 }
 
 /// The bounds of an inspection.
@@ -148,6 +407,10 @@ pub enum SearchRootOutcome {
     Absent,
     /// The root failed a check. The reason is a stable name.
     Refused(&'static str),
+    /// The request left the root out, because another root of the request
+    /// examines it ([`REPEATED_ROOT`] or [`IN_SEARCH_ROOT`]). It was not
+    /// walked.
+    Covered(&'static str),
 }
 
 /// The report of one search root.
@@ -157,10 +420,29 @@ pub struct SearchRootReport {
     pub relative: PathBuf,
     /// The path, when the home directory is known.
     pub path: Option<PathBuf>,
+    /// How the inspection examined the root.
+    pub kind: RootKind,
+    /// Where the root comes from.
+    pub source: RootSource,
     /// The result.
     pub outcome: SearchRootOutcome,
     /// The directories below the root that could not be read.
     pub unreadable_directories: u64,
+}
+
+impl SearchRootReport {
+    /// The report of `entry` with the outcome `outcome`, before the walk.
+    #[must_use]
+    pub fn of(entry: &SearchRootEntry, home: Option<&Path>, outcome: SearchRootOutcome) -> Self {
+        Self {
+            relative: entry.relative.clone(),
+            path: home.map(|home| home.join(&entry.relative)),
+            kind: entry.kind,
+            source: entry.source.clone(),
+            outcome,
+            unreadable_directories: 0,
+        }
+    }
 }
 
 /// The evidence of Git for one unit.
@@ -215,12 +497,15 @@ pub enum ProjectUnitOutcome {
         /// The reason.
         reason: &'static str,
     },
-    /// Another rule owns the directory (`docs/CLEANUP_RULES.md` section
-    /// 8). It is not measured.
-    OwnedByOtherRule {
-        /// The identity of that rule.
-        rule: &'static str,
-    },
+    /// The unit holds a Git repository, or the walk that looks for one did
+    /// not examine each entry (`docs/CLEANUP_RULES.md` section 6,
+    /// "Repositories in a unit"). It is not measured.
+    RepositoryRefused(RepositoryRefusal),
+    /// Each check before the measurement is satisfied, and the unit was not
+    /// measured: the discovery for an eviction measures it
+    /// ([`super::ProjectRequest`]). An inspection never gives this
+    /// result.
+    Checked,
 }
 
 /// The report of one generated directory.
@@ -228,14 +513,28 @@ pub enum ProjectUnitOutcome {
 pub struct ProjectUnitReport {
     /// The path of the generated directory.
     pub path: PathBuf,
+    /// The path of the root of the request whose walk found the unit.
+    pub search_root: PathBuf,
     /// The project directory.
     pub project: PathBuf,
-    /// The layout. Empty for a directory of another rule.
+    /// The layout name: a layout of the catalog, or `user-configured`.
     pub layout: &'static str,
+    /// The entry at a protected path of the layout, relative to the unit,
+    /// when the check found one (`protected_child`).
+    pub protected_child: Option<PathBuf>,
+    /// The layout of the earlier unit of the project that this unit is,
+    /// holds, or is in (`overlaps_unit`). That unit has the checks.
+    pub overlapping_layout: Option<&'static str>,
     /// The evidence of Git, when the checks came to it.
     pub version_control: Option<VersionControl>,
     /// The process evidence, when the checks came to it.
     pub activity: Option<ProjectActivity>,
+    /// The use check of `docs/CLEANUP_RULES.md` section 6, when the checks
+    /// came to it: whether a process of the user uses the unit.
+    pub uses: Option<UnitUse>,
+    /// The project activity of `docs/CLEANUP_RULES.md` section 6, when
+    /// the checks came to it. Only a busy project refuses the unit.
+    pub recency: Option<ProjectRecency>,
     /// The result.
     pub outcome: ProjectUnitOutcome,
     /// The owner workflow, as a text for the user. Svalnir does not run
@@ -267,7 +566,8 @@ pub struct ProjectInspection {
     /// The exact rule revision.
     pub rule: RuleRef,
     /// Each layout of the declaration with its lifecycle state. Each
-    /// layout of this build is `proposed`.
+    /// layout of this build is `proposed`, and `user-configured` permits at
+    /// most a manual mode in each state.
     pub layouts: Vec<LayoutSupport>,
     /// The Git executable.
     pub git: GitAvailability,
@@ -288,23 +588,288 @@ struct Inspector<'a> {
     deadline: Instant,
     expiry: Nanoseconds,
     processes: BuildProcesses,
+    /// The path-use inventory of the current search root, and its scope.
+    uses: Option<(UnitScope, PathInventory)>,
+    /// The Paseo listing, read one time when the first unit needs it.
+    agents: Option<AgentListing>,
+    /// The reading of the Git source of each Git directory, read one time
+    /// for the inspection. The unit bound bounds it.
+    heads: BTreeMap<PathBuf, SourceReading>,
+    /// The layouts of the catalog, then the layouts of the configuration.
+    layouts: Vec<Layout<'a>>,
+    /// The path of each unit of the report. The walk does not enter it.
+    matched: BTreeSet<PathBuf>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
+    /// False for the discovery for an eviction: a unit that passes each
+    /// check before the measurement is [`ProjectUnitOutcome::Checked`], and
+    /// the discovery measures it.
+    measure: bool,
+    /// The root of the walk now.
+    current_root: PathBuf,
 }
 
-/// The names of the directories that the walk does not enter: the Git
-/// directory and the generated directories of each layout.
-fn is_not_entered(name: &OsStr, names: &BTreeSet<OsString>) -> bool {
-    name == ".git"
-        || PROJECT_LAYOUTS
-            .iter()
-            .any(|layout| name == layout.directory)
-        || (name == CARGO_TARGET.0 && names.contains(OsStr::new(CARGO_TARGET.1)))
+/// One layout as the inspection uses it: a layout of the catalog or of the
+/// configuration.
+#[derive(Debug, Clone)]
+struct Layout<'a> {
+    id: &'static str,
+    directory: &'a str,
+    markers: Vec<(&'a str, MarkerKind)>,
+    inner_marker: Option<&'a str>,
+    project_file: Option<&'a str>,
+    protected: Vec<&'a str>,
+    name: DirectoryName,
+    checkouts: PackageCheckouts,
+    reclaim: ReclaimBasis,
+    owner_workflow: &'static str,
+    rebuild_impact: &'static str,
+    /// The quiet period of the layout, in place of the period of the host.
+    quiet_period: Option<Nanoseconds>,
 }
 
-/// Whether one path is the other path or is below it, by component.
+impl<'a> Layout<'a> {
+    fn built_in(layout: &'static ProjectLayout) -> Self {
+        Self {
+            id: layout.layout,
+            directory: layout.directory,
+            markers: layout
+                .project_markers
+                .iter()
+                .map(|marker| (marker.name, marker.kind))
+                .collect(),
+            inner_marker: layout.inner_marker,
+            project_file: layout.project_file,
+            protected: layout.protected.to_vec(),
+            name: layout.name,
+            checkouts: layout.checkouts,
+            reclaim: layout.reclaim,
+            owner_workflow: layout.owner_workflow,
+            rebuild_impact: layout.rebuild_impact,
+            quiet_period: None,
+        }
+    }
+
+    /// A layout of the configuration. Its name is generic: a directory with
+    /// no marker is not listed. Its markers are regular files.
+    fn configured(layout: &'a UserLayout) -> Self {
+        Self {
+            id: svalnir_core::rule::USER_CONFIGURED_LAYOUT,
+            directory: &layout.directory,
+            markers: layout
+                .markers
+                .iter()
+                .map(|marker| (marker.as_str(), MarkerKind::File))
+                .collect(),
+            inner_marker: layout.inner_marker.as_deref(),
+            project_file: None,
+            protected: layout.protected.iter().map(String::as_str).collect(),
+            name: DirectoryName::Generic,
+            checkouts: PackageCheckouts::None,
+            reclaim: ReclaimBasis::AllocatedBytes,
+            owner_workflow: USER_LAYOUT_WORKFLOW,
+            rebuild_impact: USER_LAYOUT_IMPACT,
+            // The validation bounds the period to 90 days, so it fits.
+            quiet_period: layout
+                .quiet_period
+                .and_then(|period| Nanoseconds::try_from(period).ok()),
+        }
+    }
+
+    /// The first name of the directory, which is an entry of the project
+    /// directory.
+    fn first_name(&self) -> &'a str {
+        self.directory.split('/').next().unwrap_or(self.directory)
+    }
+}
+
+/// The layouts of the catalog, then the layouts of `configured`.
+fn catalog(configured: &[UserLayout]) -> Vec<Layout<'_>> {
+    PROJECT_LAYOUTS
+        .iter()
+        .map(Layout::built_in)
+        .chain(configured.iter().map(Layout::configured))
+        .collect()
+}
+
+/// Whether `name` matches `pattern`: `*` matches each sequence of bytes,
+/// also an empty one, `?` matches one byte, and each other byte matches
+/// itself. With `fold`, the case of ASCII letters is ignored.
+pub(super) fn glob_matches(pattern: &[u8], name: &[u8], fold: bool) -> bool {
+    let same = |left: u8, right: u8| {
+        if fold {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
+        }
+    };
+    let (mut at_pattern, mut at_name): (usize, usize) = (0, 0);
+    // The position after the last `*`, and the name position that it
+    // matched up to.
+    let mut star: Option<(usize, usize)> = None;
+    while at_name < name.len() {
+        match (pattern.get(at_pattern), name.get(at_name)) {
+            (Some(b'*'), _) => {
+                at_pattern += 1;
+                star = Some((at_pattern, at_name));
+            }
+            (Some(&byte), Some(&found)) if byte == b'?' || same(byte, found) => {
+                at_pattern += 1;
+                at_name += 1;
+            }
+            _ => match star {
+                Some((after, matched)) => {
+                    at_pattern = after;
+                    at_name = matched + 1;
+                    star = Some((after, matched + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern
+        .get(at_pattern..)
+        .is_some_and(|rest| rest.iter().all(|byte| *byte == b'*'))
+}
+
+/// Whether `marker` is a pattern: it has `*` or `?`.
+fn is_pattern(marker: &str) -> bool {
+    marker.contains(['*', '?'])
+}
+
+/// The result of the search for a protected child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ChildSearch {
+    /// No entry is at a protected path.
+    Clear,
+    /// The entry at a protected path, relative to the unit.
+    Found(PathBuf),
+    /// A directory on the way could not be read completely, or the search
+    /// passed its bound.
+    Unknown,
+}
+
+/// The largest number of directories that the search for the protected
+/// children of one unit reads.
+const MAX_PROTECTED_DIRECTORIES: usize = 4_096;
+
+/// The first entry below `unit` whose path matches one of `patterns`, by
+/// component. The comparison ignores the case of ASCII letters, so it
+/// finds more entries on a volume that ignores case, not fewer. No symbolic
+/// link is followed: only a directory is entered on the way, and the last
+/// component matches an entry of each type.
+pub(super) fn find_protected(unit: &Path, patterns: &[&str]) -> ChildSearch {
+    let mut budget: usize = MAX_PROTECTED_DIRECTORIES;
+    for pattern in patterns {
+        let components: Vec<&str> = pattern.split('/').collect();
+        match search_child(unit, Path::new(""), &components, &mut budget) {
+            ChildSearch::Clear => {}
+            other => return other,
+        }
+    }
+    ChildSearch::Clear
+}
+
+fn search_child(
+    directory: &Path,
+    relative: &Path,
+    components: &[&str],
+    budget: &mut usize,
+) -> ChildSearch {
+    let Some((first, rest)) = components.split_first() else {
+        return ChildSearch::Clear;
+    };
+    if *budget == 0 {
+        return ChildSearch::Unknown;
+    }
+    *budget -= 1;
+    let Ok(entries) = fs::read_dir(directory) else {
+        return ChildSearch::Unknown;
+    };
+    let limit: usize = crate::rules::worktrees::MAX_DIRECTORY_ENTRIES;
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in entries.take(limit + 1) {
+        let Ok(entry) = entry else {
+            return ChildSearch::Unknown;
+        };
+        names.push(entry.file_name());
+    }
+    if names.len() > limit {
+        return ChildSearch::Unknown;
+    }
+    for name in names {
+        if !glob_matches(first.as_bytes(), name.as_encoded_bytes(), true) {
+            continue;
+        }
+        let found: PathBuf = relative.join(&name);
+        if rest.is_empty() {
+            return ChildSearch::Found(found);
+        }
+        let child: PathBuf = directory.join(&name);
+        match lstat(&child) {
+            Ok(snapshot) if snapshot.kind == ObjectKind::Directory => {}
+            Ok(_) => continue,
+            Err(_) => return ChildSearch::Unknown,
+        }
+        match search_child(&child, &found, rest, budget) {
+            ChildSearch::Clear => {}
+            other => return other,
+        }
+    }
+    ChildSearch::Clear
+}
+
+/// Whether the directory `project`, whose entries are `names`, has a marker
+/// of `layout`.
+fn has_marker(layout: &Layout<'_>, project: &Path, names: &BTreeSet<OsString>) -> bool {
+    let is_kind = |name: &OsStr, kind: MarkerKind| {
+        lstat(&project.join(name)).is_ok_and(|found| match kind {
+            MarkerKind::File => found.kind == ObjectKind::RegularFile,
+            MarkerKind::Directory => found.kind == ObjectKind::Directory,
+        })
+    };
+    layout.markers.iter().any(|(marker, kind)| {
+        if is_pattern(marker) {
+            names
+                .iter()
+                .filter(|name| glob_matches(marker.as_bytes(), name.as_encoded_bytes(), false))
+                .any(|name| is_kind(name, *kind))
+        } else {
+            is_kind(OsStr::new(marker), *kind)
+        }
+    })
+}
+
+/// Whether the walk never enters a directory with the name `name`: a
+/// directory of version control or the shared cache directory
+/// ([`SKIPPED_DIRECTORY_NAMES`]). The comparison ignores the case of ASCII
+/// letters.
+fn is_skipped(name: &OsStr) -> bool {
+    SKIPPED_DIRECTORY_NAMES.iter().any(|skipped| {
+        name.as_encoded_bytes()
+            .eq_ignore_ascii_case(skipped.as_bytes())
+    })
+}
+
+/// Whether one path is the other path or is below it, by component, with
+/// the case of ASCII letters ignored: a volume that ignores case finds
+/// `~/documents` for `~/Documents`, so the exclusion check fails closed.
 fn overlaps(first: &Path, second: &Path) -> bool {
-    first.starts_with(second) || second.starts_with(first)
+    is_within(first, second) || is_within(second, first)
+}
+
+/// Whether `path` is `directory` or is below it, by component, with the
+/// case of ASCII letters ignored.
+pub(super) fn is_within(path: &Path, directory: &Path) -> bool {
+    let mut components = path.components();
+    directory.components().all(|expected| {
+        components.next().is_some_and(|found| {
+            found
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
+        })
+    })
 }
 
 /// The checks of the search root at `path`, and its path with the stored
@@ -328,10 +893,14 @@ pub(in crate::rules) fn open_search_root(
         ProtectionFact::Protected => return Err(refused("root_protected")),
         ProtectionFact::Unknown => return Err(refused("root_protection_unknown")),
     }
-    if user_exclusions
-        .iter()
-        .any(|excluded| path.starts_with(excluded))
-    {
+    // The comparison ignores the case of ASCII letters, and it is made
+    // again with the stored names below.
+    let is_excluded = |path: &Path| {
+        user_exclusions
+            .iter()
+            .any(|excluded| is_within(path, excluded))
+    };
+    if is_excluded(path) {
         return Err(refused("root_excluded"));
     }
     let snapshot: ObjectSnapshot = match walk_local(path, mounts) {
@@ -348,7 +917,14 @@ pub(in crate::rules) fn open_search_root(
     if snapshot.owner != principal {
         return Err(refused("root_owner"));
     }
-    Ok((stored_case(path), snapshot))
+    let stored: PathBuf = stored_case(path);
+    if locations.of_text(&stored) != ProtectionFact::NotProtected {
+        return Err(refused("root_protected"));
+    }
+    if is_excluded(&stored) {
+        return Err(refused("root_excluded"));
+    }
+    Ok((stored, snapshot))
 }
 
 /// The path with the names that the filesystem stores, when they differ
@@ -377,10 +953,10 @@ fn stored_case(path: &Path) -> PathBuf {
 }
 
 impl ProjectRule {
-    /// Inspects the search roots `roots` below the home directory.
+    /// Inspects the roots `roots` below the home directory.
     ///
-    /// The function never fails as a whole: each search root and each
-    /// unit has its result.
+    /// The function never fails as a whole: each root and each unit has its
+    /// result.
     pub fn inspect(
         &self,
         host: ProjectHost<'_>,
@@ -402,6 +978,26 @@ impl ProjectRule {
         clock: &dyn ScanClock,
         mounts: MountTableSource,
     ) -> ProjectInspection {
+        self.examine(host, roots, limits, cancel, clock, mounts, true)
+    }
+
+    /// The walk and the checks of the inspection. With `measure` false, a
+    /// unit that passes each check before the measurement is
+    /// [`ProjectUnitOutcome::Checked`] and is not measured.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the inspection and the discovery share one walk with these inputs"
+    )]
+    pub(super) fn examine(
+        &self,
+        host: ProjectHost<'_>,
+        roots: &SearchRoots,
+        limits: ProjectLimits,
+        cancel: &CancellationToken,
+        clock: &dyn ScanClock,
+        mounts: MountTableSource,
+        measure: bool,
+    ) -> ProjectInspection {
         let git: GitAvailability = match host.git {
             Ok(tool) => GitAvailability::Located {
                 executable: tool.executable().to_path_buf(),
@@ -412,14 +1008,9 @@ impl ProjectRule {
         let mut units: Vec<ProjectUnitReport> = Vec::new();
         let refuse_all = |reason: &'static str, home: Option<&Path>| {
             roots
-                .paths()
+                .entries()
                 .iter()
-                .map(|relative| SearchRootReport {
-                    relative: relative.clone(),
-                    path: home.map(|home| home.join(relative)),
-                    outcome: SearchRootOutcome::Refused(reason),
-                    unreadable_directories: 0,
-                })
+                .map(|entry| SearchRootReport::of(entry, home, SearchRootOutcome::Refused(reason)))
                 .collect::<Vec<SearchRootReport>>()
         };
         match (host.locations.home_directory(), mounts()) {
@@ -436,13 +1027,23 @@ impl ProjectRule {
                     deadline: Instant::now() + limits.max_duration,
                     expiry: self.rule().activity.evidence_expiry,
                     processes: host.processes.build_processes(host.principal),
+                    uses: None,
+                    agents: None,
+                    heads: BTreeMap::new(),
+                    layouts: catalog(host.layouts),
+                    matched: BTreeSet::new(),
                     directories: 0,
                     units: Vec::new(),
+                    measure,
+                    current_root: PathBuf::new(),
                 };
-                for relative in roots.paths() {
-                    reports.push(inspector.root(relative));
+                for entry in roots.entries() {
+                    reports.push(inspector.root(entry));
                 }
                 units = inspector.units;
+                reports.extend(roots.dropped().iter().map(|(entry, reason)| {
+                    SearchRootReport::of(entry, Some(home), SearchRootOutcome::Covered(reason))
+                }));
             }
         }
         ProjectInspection {
@@ -456,14 +1057,10 @@ impl ProjectRule {
 }
 
 impl Inspector<'_> {
-    fn root(&mut self, relative: &Path) -> SearchRootReport {
-        let path: PathBuf = self.home.join(relative);
-        let mut report: SearchRootReport = SearchRootReport {
-            relative: relative.to_path_buf(),
-            path: Some(path.clone()),
-            outcome: SearchRootOutcome::Absent,
-            unreadable_directories: 0,
-        };
+    fn root(&mut self, entry: &SearchRootEntry) -> SearchRootReport {
+        let path: PathBuf = self.home.join(&entry.relative);
+        let mut report: SearchRootReport =
+            SearchRootReport::of(entry, Some(self.home), SearchRootOutcome::Absent);
         let (path, snapshot): (PathBuf, ObjectSnapshot) = match open_search_root(
             &path,
             self.host.locations,
@@ -478,9 +1075,40 @@ impl Inspector<'_> {
             }
         };
         report.path = Some(path.clone());
-        let completion: SearchCompletion = self.walk(&path, snapshot, &mut report);
+        self.current_root.clone_from(&path);
+        // One inventory for each root, with the root as its scope.
+        let scope: UnitScope = UnitScope::new(&path);
+        let inventory: PathInventory = self
+            .host
+            .processes
+            .path_uses(self.host.principal, std::slice::from_ref(&scope));
+        self.uses = Some((scope, inventory));
+        let completion: SearchCompletion = match entry.kind {
+            RootKind::Search => self.walk(&path, snapshot, &mut report),
+            RootKind::Project => self.project_only(&path, &mut report),
+        };
         report.outcome = SearchRootOutcome::Examined(completion);
         report
+    }
+
+    /// The units of the project directory `project` only: a project root
+    /// is not a search root, so no directory below it is read.
+    fn project_only(&mut self, project: &Path, report: &mut SearchRootReport) -> SearchCompletion {
+        if let Some(stop) = self.stop() {
+            return stop;
+        }
+        self.directories += 1;
+        let Ok(entries) = fs::read_dir(project) else {
+            report.unreadable_directories += 1;
+            return SearchCompletion::Complete;
+        };
+        let names: BTreeSet<OsString> = entries
+            .take(crate::rules::worktrees::MAX_DIRECTORY_ENTRIES)
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        self.project(project, project, &names);
+        SearchCompletion::Complete
     }
 
     /// The stop of the walk now, when one applies.
@@ -524,10 +1152,12 @@ impl Inspector<'_> {
                 .collect();
             self.project(&directory, root, &names);
             for name in &names {
-                if is_not_entered(name, &names) {
+                let child: PathBuf = directory.join(name);
+                // A unit, a directory of version control, and the shared
+                // cache directory are not entered.
+                if is_skipped(name) || self.matched.contains(&child) {
                     continue;
                 }
-                let child: PathBuf = directory.join(name);
                 let Ok(found) = lstat(&child) else {
                     continue;
                 };
@@ -544,7 +1174,7 @@ impl Inspector<'_> {
                         .host
                         .user_exclusions
                         .iter()
-                        .any(|excluded| child.starts_with(excluded))
+                        .any(|excluded| is_within(&child, excluded))
                 {
                     continue;
                 }
@@ -563,51 +1193,176 @@ impl Inspector<'_> {
     }
 
     /// The units of the directory `project`, whose entries are `names`.
+    ///
+    /// For each directory of the layouts, the first layout whose marker is
+    /// present gives the unit. With no such layout, a distinctive name gives
+    /// a unit that the checks refuse (`project_marker_missing`), and a
+    /// generic name gives no unit.
     fn project(&mut self, project: &Path, root: &Path, names: &BTreeSet<OsString>) {
-        for layout in &PROJECT_LAYOUTS {
-            if !names.contains(OsStr::new(layout.directory)) || self.stop().is_some() {
+        let mut directories: Vec<&str> = Vec::new();
+        for layout in &self.layouts {
+            if !directories.contains(&layout.directory)
+                && names.contains(OsStr::new(layout.first_name()))
+            {
+                directories.push(layout.directory);
+            }
+        }
+        // The units of this project so far, with their layouts.
+        let mut earlier: Vec<(PathBuf, &'static str)> = Vec::new();
+        for directory in directories {
+            if self.stop().is_some() {
+                return;
+            }
+            let path: PathBuf = project.join(directory);
+            // A path of two names needs its second name.
+            if directory.contains('/') && lstat(&path).is_err() {
                 continue;
             }
-            let path: PathBuf = project.join(layout.directory);
+            let chosen: Option<Layout<'_>> = {
+                let mut of_directory = self
+                    .layouts
+                    .iter()
+                    .filter(|layout| layout.directory == directory);
+                of_directory
+                    .clone()
+                    .find(|layout| has_marker(layout, project, names))
+                    .or_else(|| {
+                        of_directory.find(|layout| layout.name == DirectoryName::Distinctive)
+                    })
+                    .cloned()
+            };
+            let Some(layout) = chosen else {
+                continue;
+            };
             let mut report: ProjectUnitReport = ProjectUnitReport {
                 path: path.clone(),
+                search_root: self.current_root.clone(),
                 project: project.to_path_buf(),
-                layout: layout.layout,
+                layout: layout.id,
+                protected_child: None,
+                overlapping_layout: None,
                 version_control: None,
                 activity: None,
+                uses: None,
+                recency: None,
                 outcome: ProjectUnitOutcome::Refused { reason: "" },
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
             };
-            report.outcome = self.unit(layout, project, root, &path, &mut report);
+            // One directory is never in two units: a unit that is, holds, or
+            // is in an earlier unit of the project is refused, and only the
+            // earlier unit is measured.
+            if let Some((_, other)) = earlier.iter().find(|(unit, _)| overlaps(unit, &path)) {
+                report.overlapping_layout = Some(other);
+                report.outcome = ProjectUnitOutcome::Refused {
+                    reason: "overlaps_unit",
+                };
+            } else {
+                report.outcome = self.unit(&layout, project, root, names, &path, &mut report);
+            }
+            earlier.push((path.clone(), layout.id));
+            self.matched.insert(path);
             self.units.push(report);
-        }
-        let (target, manifest) = CARGO_TARGET;
-        if names.contains(OsStr::new(target))
-            && names.contains(OsStr::new(manifest))
-            && self.stop().is_none()
-        {
-            self.units.push(ProjectUnitReport {
-                path: project.join(target),
-                project: project.to_path_buf(),
-                layout: "",
-                version_control: None,
-                activity: None,
-                outcome: ProjectUnitOutcome::OwnedByOtherRule {
-                    rule: CARGO_RULE_ID,
-                },
-                owner_workflow: "Run `cargo clean` in the workspace. Svalnir does not run it. The rule `cargo.build-output` owns this directory.",
-                rebuild_impact: "The next build compiles the workspace and its dependencies again.",
-            });
         }
     }
 
+    /// The checks of the objects of one unit: the directories on the way,
+    /// the unit, the project marker, the inner marker, and the protected
+    /// children. The error is the stable reason of the refusal.
+    fn shape(
+        &self,
+        layout: &Layout<'_>,
+        project: &Path,
+        names: &BTreeSet<OsString>,
+        path: &Path,
+        report: &mut ProjectUnitReport,
+    ) -> Result<(), &'static str> {
+        unit_shape(self.host.principal, layout, project, names, path).map_err(|(reason, child)| {
+            report.protected_child = child;
+            reason
+        })
+    }
+}
+
+/// The checks of the objects of one unit of `layout` at `path`, in the
+/// project directory `project` whose entries are `names`: the directories
+/// on the way, the unit, the project marker, the inner marker, and the
+/// protected children. The error is the stable reason of the refusal, with
+/// the protected child that the check found.
+fn unit_shape(
+    principal: Uid,
+    layout: &Layout<'_>,
+    project: &Path,
+    names: &BTreeSet<OsString>,
+    path: &Path,
+) -> Result<(), (&'static str, Option<PathBuf>)> {
+    let plain = |reason: &'static str| Err((reason, None));
+    let Ok(parent) = lstat(project) else {
+        return plain("project_not_readable");
+    };
+    // Each directory between the project and the unit, for a path of two
+    // names, is a directory of the user on the same device, not a symbolic
+    // link.
+    let mut between: PathBuf = project.to_path_buf();
+    let mut components = layout.directory.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        between.push(component);
+        match lstat(&between) {
+            Ok(found)
+                if found.kind == ObjectKind::Directory
+                    && found.owner == principal
+                    && found.object.device == parent.object.device => {}
+            Ok(_) => return plain("unit_path_not_plain"),
+            Err(_) => return plain("unit_not_readable"),
+        }
+    }
+    let snapshot: ObjectSnapshot = match lstat(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return plain("unit_absent"),
+        Err(_) => return plain("unit_not_readable"),
+    };
+    match snapshot.kind {
+        ObjectKind::Directory => {}
+        ObjectKind::SymbolicLink => return plain("unit_symbolic_link"),
+        _ => return plain("unit_not_directory"),
+    }
+    if snapshot.owner != principal {
+        return plain("unit_owner");
+    }
+    if snapshot.object.device != parent.object.device {
+        return plain("unit_device");
+    }
+    if !has_marker(layout, project, names) {
+        return plain("project_marker_missing");
+    }
+    if let Some(inner) = layout.inner_marker
+        && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
+    {
+        return plain("unsupported_layout");
+    }
+    if let Some(file) = layout.project_file
+        && !is_plain_file(project, file)
+    {
+        return plain("unsupported_layout");
+    }
+    match find_protected(path, &layout.protected) {
+        ChildSearch::Clear => Ok(()),
+        ChildSearch::Found(child) => Err(("protected_child", Some(child))),
+        ChildSearch::Unknown => plain("protected_child_unknown"),
+    }
+}
+
+impl Inspector<'_> {
     /// The checks of one unit, in sequence, and its measurement.
     fn unit(
         &mut self,
-        layout: &ProjectLayout,
+        layout: &Layout<'_>,
         project: &Path,
         root: &Path,
+        names: &BTreeSet<OsString>,
         path: &Path,
         report: &mut ProjectUnitReport,
     ) -> ProjectUnitOutcome {
@@ -626,37 +1381,11 @@ impl Inspector<'_> {
         {
             return refused("unit_excluded");
         }
-        let Ok(parent) = lstat(project) else {
-            return refused("project_not_readable");
-        };
-        let snapshot: ObjectSnapshot = match lstat(path) {
-            Ok(snapshot) => snapshot,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return refused("unit_absent"),
-            Err(_) => return refused("unit_not_readable"),
-        };
-        match snapshot.kind {
-            ObjectKind::Directory => {}
-            ObjectKind::SymbolicLink => return refused("unit_symbolic_link"),
-            _ => return refused("unit_not_directory"),
+        if let Err(reason) = self.shape(layout, project, names, path, report) {
+            return refused(reason);
         }
-        if snapshot.owner != self.host.principal {
-            return refused("unit_owner");
-        }
-        if snapshot.object.device != parent.object.device {
-            return refused("unit_device");
-        }
-        let has_marker: bool = layout.project_markers.iter().any(|marker| {
-            lstat(&project.join(marker)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
-        });
-        if !has_marker {
-            return refused("project_marker_missing");
-        }
-        if let Some(inner) = layout.inner_marker
-            && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
-        {
-            return refused("unsupported_layout");
-        }
-        let version_control: VersionControl = self.version_control(project, root, path);
+        let (version_control, repository): (VersionControl, Option<Repository>) =
+            self.version_control(project, root, path);
         report.version_control = Some(version_control.clone());
         match version_control {
             VersionControl::Ignored => {}
@@ -665,6 +1394,15 @@ impl Inspector<'_> {
             VersionControl::NoRepository => return refused("no_repository"),
             VersionControl::Unknown { .. } => return refused("version_control_unknown"),
         }
+        let Some(repository) = repository else {
+            return refused("version_control_unknown");
+        };
+        let recency: ProjectRecency = self.recency(&repository, layout.quiet_period);
+        let busy: bool = recency.state == RecencyState::Busy;
+        report.recency = Some(recency);
+        if busy {
+            return refused("project_busy");
+        }
         let activity: ProjectActivity = self.activity(project, root);
         report.activity = Some(activity.clone());
         match activity {
@@ -672,29 +1410,106 @@ impl Inspector<'_> {
             ProjectActivity::Active { .. } => return refused("producer_active"),
             ProjectActivity::Unknown { .. } => return refused("activity_unknown"),
         }
-        match measure_unit(
+        let uses: UnitUse = self.unit_use(path);
+        report.uses = Some(uses.clone());
+        if let Some(reason) = uses.refusal() {
+            return refused(reason);
+        }
+        if !self.measure {
+            return ProjectUnitOutcome::Checked;
+        }
+        // The measurement also looks for a clone with commits or changes
+        // that exist nowhere else. For a layout with the checkouts of Swift
+        // Package Manager, a unit with a repository is examined again with
+        // the exception of `docs/CLEANUP_RULES.md` section 6.
+        let mut repositories: MarkerObserver<'_> = MarkerObserver::new(path);
+        match measure_unit_observed(
             path,
             self.limits.measure,
             self.cancel,
             self.clock,
             layout.reclaim,
+            &mut repositories,
         ) {
-            Some(measurement) => ProjectUnitOutcome::Measured(measurement),
+            Some((measurement, result)) => match repositories.verdict(&result) {
+                Verdict::Clear => ProjectUnitOutcome::Measured(measurement),
+                Verdict::Refused(refusal) => {
+                    match self.package_checkouts(layout, project, names, path, &refusal) {
+                        Some(Verdict::Clear) => ProjectUnitOutcome::Measured(measurement),
+                        Some(Verdict::Refused(refusal)) => {
+                            ProjectUnitOutcome::RepositoryRefused(refusal)
+                        }
+                        None => ProjectUnitOutcome::RepositoryRefused(refusal),
+                    }
+                }
+            },
             None => refused("unit_not_readable"),
         }
     }
 
-    /// Whether Git ignores the unit at `path` and tracks no path in it.
-    fn version_control(&self, project: &Path, root: &Path, path: &Path) -> VersionControl {
+    /// The verdict of the exception for the checkouts of Swift Package
+    /// Manager, for a unit whose measurement found a repository, or `None`
+    /// when the exception does not apply: the layout has no checkouts, the
+    /// refusal is not a repository, or no one package, workspace, or
+    /// project gives the pins.
+    fn package_checkouts(
+        &self,
+        layout: &Layout<'_>,
+        project: &Path,
+        names: &BTreeSet<OsString>,
+        path: &Path,
+        refusal: &RepositoryRefusal,
+    ) -> Option<Verdict> {
+        if refusal.reason != RefusalReason::NestedRepository {
+            return None;
+        }
+        let checkouts: SwiftPmCheckouts = match layout.checkouts {
+            PackageCheckouts::None => return None,
+            PackageCheckouts::PackageBuild => SwiftPmCheckouts::of_package_build(path)?,
+            PackageCheckouts::XcodeDerivedData => {
+                SwiftPmCheckouts::of_xcode_project(path, &pin_container(project, names)?)?
+            }
+        };
+        let limits: DetectionLimits = DetectionLimits {
+            max_duration: self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(DetectionLimits::default().max_duration),
+            ..DetectionLimits::default()
+        };
+        Some(check_unit(
+            path,
+            Some(&checkouts),
+            self.host.git,
+            &limits,
+            Some(self.cancel),
+        ))
+    }
+
+    /// Whether Git ignores the unit at `path` and tracks no path in it,
+    /// and the repository when the lookup found one.
+    fn version_control(
+        &self,
+        project: &Path,
+        root: &Path,
+        path: &Path,
+    ) -> (VersionControl, Option<Repository>) {
         let unknown = |reason: &'static str| VersionControl::Unknown { reason };
         let Ok(git) = self.host.git else {
-            return unknown("git_not_available");
+            return (unknown("git_not_available"), None);
         };
         let repository = match find_repository(project, root, self.host.principal, &self.mounts) {
             RepositoryLookup::Found(repository) => repository,
-            RepositoryLookup::NotFound => return VersionControl::NoRepository,
-            RepositoryLookup::Unknown(reason) => return unknown(reason),
+            RepositoryLookup::NotFound => return (VersionControl::NoRepository, None),
+            RepositoryLookup::Unknown(reason) => return (unknown(reason), None),
         };
+        let evidence: VersionControl = Self::ignored(git, &repository, path);
+        (evidence, Some(repository))
+    }
+
+    /// The queries of [`Inspector::version_control`] for `repository`.
+    fn ignored(git: &GitTool, repository: &Repository, path: &Path) -> VersionControl {
+        let unknown = |reason: &'static str| VersionControl::Unknown { reason };
         let Ok(relative) = path.strip_prefix(&repository.work_tree) else {
             return unknown("unit_outside_work_tree");
         };
@@ -743,6 +1558,50 @@ impl Inspector<'_> {
         }
     }
 
+    /// The project activity of `repository`. The Paseo listing is read one
+    /// time for the inspection, and the Git source one time for each Git
+    /// directory.
+    fn recency(&mut self, repository: &Repository, quiet: Option<Nanoseconds>) -> ProjectRecency {
+        let mut host: RecencyHost<'_> = self.host.recency;
+        if let Some(quiet) = quiet {
+            host.quiet_period = quiet;
+        }
+        let git: SourceReading = *self
+            .heads
+            .entry(repository.git_dir.clone())
+            .or_insert_with(|| host.head.head_activity(repository));
+        let listing: &AgentListing = self
+            .agents
+            .get_or_insert_with(|| host.agents.agent_listing());
+        assess_with_head(&host, listing, repository, git, self.clock.now().wall)
+    }
+
+    /// The use of the unit at `path`, from the inventory of the search root.
+    /// An inventory that is older than the expiry of the rule is read again.
+    fn unit_use(&mut self, path: &Path) -> UnitUse {
+        let expiry: Nanoseconds = self.expiry;
+        let now: Option<MonotonicNanos> = self.host.processes.monotonic_now();
+        let Some((scope, inventory)) = &mut self.uses else {
+            return UnitUse::Unknown {
+                reason: "no_inventory",
+                processes: Vec::new(),
+                omitted: 0,
+            };
+        };
+        let current: bool = inventory
+            .observed_at
+            .zip(now)
+            .and_then(|(observed, now)| now.checked_duration_since(observed))
+            .is_some_and(|age| age <= expiry);
+        if !current {
+            *inventory = self
+                .host
+                .processes
+                .path_uses(self.host.principal, std::slice::from_ref(scope));
+        }
+        uses_of(inventory, &UnitScope::new(path))
+    }
+
     /// The process evidence for the project at `project`. Evidence that is
     /// older than the expiry of the rule is read again.
     fn activity(&mut self, project: &Path, root: &Path) -> ProjectActivity {
@@ -777,5 +1636,205 @@ impl Inspector<'_> {
                 reason: "evidence_expired",
             }
         }
+    }
+}
+
+/// The package, workspace, or project beside a `DerivedData` directory of
+/// a project whose pins its checkouts have: `Package.swift`, else the one
+/// `*.xcworkspace`, else the one `*.xcodeproj`. `None` when no one of them
+/// is beside it.
+fn pin_container(project: &Path, names: &BTreeSet<OsString>) -> Option<PathBuf> {
+    let is = |name: &OsStr, kind: ObjectKind| {
+        lstat(&project.join(name)).is_ok_and(|found| found.kind == kind)
+    };
+    if is(OsStr::new("Package.swift"), ObjectKind::RegularFile) {
+        return Some(project.to_path_buf());
+    }
+    for extension in ["xcworkspace", "xcodeproj"] {
+        let found: Vec<&OsString> = names
+            .iter()
+            .filter(|name| {
+                Path::new(name).extension() == Some(OsStr::new(extension))
+                    && is(name, ObjectKind::Directory)
+            })
+            .collect();
+        match found.as_slice() {
+            [one] => return Some(project.join(one)),
+            [] => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether `relative`, below `project`, is a regular file, with each
+/// directory on its way a directory and not a symbolic link.
+fn is_plain_file(project: &Path, relative: &str) -> bool {
+    let mut path: PathBuf = project.to_path_buf();
+    let mut components = relative.split('/').peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        let Ok(found) = lstat(&path) else {
+            return false;
+        };
+        let expected: ObjectKind = if components.peek().is_some() {
+            ObjectKind::Directory
+        } else {
+            ObjectKind::RegularFile
+        };
+        if found.kind != expected {
+            return false;
+        }
+    }
+    true
+}
+
+/// The result of the checks of a planned unit, made again immediately
+/// before the step of an eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnitRecheck {
+    /// Each check is satisfied.
+    Passed,
+    /// A check refuses the unit. The name is a stable code.
+    Refused(&'static str),
+    /// The evidence of a check is not known. The name is a stable code.
+    Unknown(&'static str),
+    /// The unit is gone. The coordinator records it as a target that is
+    /// already absent ([`UNIT_ABSENT`]), not as a skipped target.
+    Absent,
+}
+
+/// The stable code of a unit that is gone at the check before its step.
+pub const UNIT_ABSENT: &str = "unit_absent";
+
+/// The inputs of [`recheck_unit`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecheckInput<'a> {
+    /// The user. The unit and each directory on its way must have this
+    /// owner.
+    pub principal: Uid,
+    /// The layout that the sealed plan binds for the unit.
+    pub layout: &'a str,
+    /// The approved root of the unit: a search root or a project root.
+    pub root: &'a Path,
+    /// The unit.
+    pub unit: &'a Path,
+    /// The layouts of the configuration in effect.
+    pub user_layouts: &'a [UserLayout],
+    /// The build processes, read now.
+    pub processes: &'a BuildProcesses,
+    /// The monotonic time now, on the timeline of the processes.
+    pub now: Option<MonotonicNanos>,
+    /// The age after which the process evidence is not current.
+    pub expiry: Nanoseconds,
+}
+
+/// Makes the checks of the unit `input.unit` of `project.dependency-directory`
+/// again, immediately before the step of an eviction
+/// (`docs/CLEANUP_RULES.md` section 12, "Manual eviction"): the unit has
+/// the same layout (its project marker, with no earlier layout of the same
+/// directory whose marker is now present, and its inner marker), it has no
+/// entry at a protected path of the layout, and no build process of the
+/// user works in its project.
+///
+/// The Git evidence, the project activity, and the measurement are not
+/// examined again here: the use check of the coordinator and the walk of
+/// the executor examine the unit before and during the removal.
+#[must_use]
+pub fn recheck_unit(input: &RecheckInput<'_>) -> UnitRecheck {
+    match fs::symlink_metadata(input.unit) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return UnitRecheck::Absent,
+        _ => {}
+    }
+    let layouts: Vec<Layout<'_>> = catalog(input.user_layouts);
+    let mut first: Option<UnitRecheck> = None;
+    let mut found: bool = false;
+    for layout in layouts.iter().filter(|layout| layout.id == input.layout) {
+        let directory: &Path = Path::new(layout.directory);
+        if !input.unit.ends_with(directory) {
+            continue;
+        }
+        let Some(project) =
+            (0..directory.components().count()).try_fold(input.unit, |path, _| path.parent())
+        else {
+            continue;
+        };
+        found = true;
+        let result: UnitRecheck = recheck_layout(input, &layouts, layout, project);
+        if result == UnitRecheck::Passed {
+            return result;
+        }
+        first.get_or_insert(result);
+    }
+    match first {
+        Some(result) => result,
+        // A layout of the configuration that the configuration in effect
+        // does not have, for example after a change of the configuration.
+        None if !found && input.layout == svalnir_core::rule::USER_CONFIGURED_LAYOUT => {
+            UnitRecheck::Unknown("unit_layout_unknown")
+        }
+        None => UnitRecheck::Refused("unit_layout_changed"),
+    }
+}
+
+/// The checks of [`recheck_unit`] for one layout and one project directory.
+fn recheck_layout(
+    input: &RecheckInput<'_>,
+    layouts: &[Layout<'_>],
+    layout: &Layout<'_>,
+    project: &Path,
+) -> UnitRecheck {
+    let Ok(entries) = fs::read_dir(project) else {
+        return UnitRecheck::Unknown("project_not_readable");
+    };
+    let limit: usize = crate::rules::worktrees::MAX_DIRECTORY_ENTRIES;
+    let mut names: BTreeSet<OsString> = BTreeSet::new();
+    for entry in entries.take(limit + 1) {
+        let Ok(entry) = entry else {
+            return UnitRecheck::Unknown("project_not_readable");
+        };
+        names.insert(entry.file_name());
+    }
+    if names.len() > limit {
+        return UnitRecheck::Unknown("project_not_readable");
+    }
+    // The first layout of the directory whose marker is present gives the
+    // unit. A different one now means that the unit is a different kind of
+    // directory than at the plan.
+    let chosen: Option<&Layout<'_>> = layouts
+        .iter()
+        .filter(|other| other.directory == layout.directory)
+        .find(|other| has_marker(other, project, &names));
+    if chosen.is_some_and(|chosen| chosen.id != layout.id) {
+        return UnitRecheck::Refused("unit_layout_changed");
+    }
+    if let Err((reason, _)) = unit_shape(input.principal, layout, project, &names, input.unit) {
+        return match reason {
+            UNIT_ABSENT => UnitRecheck::Absent,
+            "project_not_readable" | "unit_not_readable" | "protected_child_unknown" => {
+                UnitRecheck::Unknown(reason)
+            }
+            _ => UnitRecheck::Refused(reason),
+        };
+    }
+    let processes: &BuildProcesses = input.processes;
+    if processes.blocking(project).is_some() {
+        return UnitRecheck::Refused("producer_active");
+    }
+    if processes.above(project, input.root).is_some() {
+        return UnitRecheck::Unknown("build_process_above_project");
+    }
+    if processes.incomplete.is_some() {
+        return UnitRecheck::Unknown("activity_unknown");
+    }
+    let current: bool = processes
+        .observed_at
+        .zip(input.now)
+        .and_then(|(observed, now)| now.checked_duration_since(observed))
+        .is_some_and(|age| age <= input.expiry);
+    if current {
+        UnitRecheck::Passed
+    } else {
+        UnitRecheck::Unknown("activity_unknown")
     }
 }

@@ -17,7 +17,7 @@ use super::error::OperationJournalError;
 ///
 /// It is independent of the configuration, CLI, IPC, and state-store
 /// versions.
-pub const JOURNAL_VERSION: u32 = 4;
+pub const JOURNAL_VERSION: u32 = 6;
 
 /// The `application_id` of a Svalnir operation journal: the ASCII text
 /// `SVLJ`. The catalog store has a different value, so that one file is
@@ -68,6 +68,16 @@ pub(super) const APPLICATION_ID: i64 = 0x5356_4C4A;
 ///   the JSON list of the `ResourceEffect` values of `svalnir-core`. One
 ///   row for each operation that has a record; a write replaces the row.
 ///   The row goes with its operation (`ON DELETE CASCADE`).
+/// - `owner_process`: the process ID, the start time in microseconds, and
+///   the process group of the command of an owner step, which the
+///   coordinator records before the command runs, and whether its set of
+///   descendants is truncated. Version 5 added it, and version 6 added the
+///   column `truncated`. The row goes with its operation (`ON DELETE
+///   CASCADE`).
+/// - `owner_descendant`: the live descendants of the command of an owner
+///   step, by their process ID and start time, as the worker finds them, at
+///   most 4096 for one step. A descendant that ended goes. Version 5 added
+///   it. The row goes with its operation (`ON DELETE CASCADE`).
 const SCHEMA: &str = "
 CREATE TABLE plan (
     plan_id TEXT NOT NULL PRIMARY KEY,
@@ -175,6 +185,22 @@ CREATE TABLE operation_effect (
     operation_seq INTEGER NOT NULL PRIMARY KEY
         REFERENCES operation (seq) ON DELETE CASCADE,
     content TEXT NOT NULL CHECK (json_valid(content))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE owner_process (
+    operation_seq INTEGER NOT NULL REFERENCES operation (seq) ON DELETE CASCADE,
+    step_id TEXT NOT NULL,
+    pid INTEGER NOT NULL CHECK (pid > 0),
+    started_us INTEGER NOT NULL CHECK (started_us >= 0),
+    process_group INTEGER NOT NULL CHECK (process_group > 0),
+    truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+    PRIMARY KEY (operation_seq, step_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE owner_descendant (
+    operation_seq INTEGER NOT NULL REFERENCES operation (seq) ON DELETE CASCADE,
+    step_id TEXT NOT NULL,
+    pid INTEGER NOT NULL CHECK (pid > 0),
+    started_us INTEGER NOT NULL CHECK (started_us >= 0),
+    PRIMARY KEY (operation_seq, step_id, pid, started_us)
 ) STRICT, WITHOUT ROWID;
 ";
 

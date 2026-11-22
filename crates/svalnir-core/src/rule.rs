@@ -8,7 +8,11 @@
 //! grant.
 //!
 //! This module has the declaration types and the interface. The registry
-//! and the rules are in `svalnir-agent` (`rules`).
+//! and the rules are in `svalnir-agent` (`rules`). [`owner`] has the
+//! owner-operation declaration of a rule with the deletion method
+//! `producer_operation`.
+
+pub mod owner;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,6 +33,15 @@ pub const MAX_RULE_TEXT_BYTES: usize = 256;
 /// The largest number of roots, layouts, and exclusions in one
 /// declaration.
 pub const MAX_RULE_ENTRIES: usize = 256;
+
+/// The layout name of the layouts that the configuration supplies
+/// (`docs/CLEANUP_RULES.md` section 12, "User-configured layouts"). Its
+/// lifecycle state is a constant of the source, as for each other layout,
+/// but it permits at most a manual mode: no lifecycle state lets it permit
+/// [`RuleMode::AutomaticEviction`] ([`LayoutSupport::permits`]), and a
+/// declaration that gives it the state "Automatic eviction validated" is
+/// not complete.
+pub const USER_CONFIGURED_LAYOUT: &str = "user-configured";
 
 /// A reference to one rule revision: the rule identity and the immutable
 /// implementation revision. Plans and grants bind this pair. A display
@@ -211,6 +224,26 @@ pub struct LayoutSupport {
     pub layout: String,
     /// The validated state of the rule revision for this layout.
     pub lifecycle: LifecycleState,
+}
+
+impl LayoutSupport {
+    /// Whether the lifecycle state of this layout permits `mode`. The
+    /// layout [`USER_CONFIGURED_LAYOUT`] never permits
+    /// [`RuleMode::AutomaticEviction`], whatever its state: a layout that
+    /// the configuration supplies is for a manual action only.
+    pub fn permits(&self, mode: &RuleMode) -> bool {
+        layout_permits(&self.layout, &self.lifecycle, mode)
+    }
+}
+
+/// Whether the state `lifecycle` of the layout `layout` permits `mode`:
+/// [`LifecycleState::permits`], with the limit of
+/// [`USER_CONFIGURED_LAYOUT`] to a manual mode.
+pub fn layout_permits(layout: &str, lifecycle: &LifecycleState, mode: &RuleMode) -> bool {
+    if layout == USER_CONFIGURED_LAYOUT && *mode == RuleMode::AutomaticEviction {
+        return false;
+    }
+    lifecycle.permits(mode)
 }
 
 wire_enum! {
@@ -456,8 +489,10 @@ impl Check for RuleDeclaration {
                 LifecycleState::ManualActionValidated { .. } => {
                     has(&RuleMode::ManualTrash) || has(&RuleMode::ManualEviction)
                 }
+                // A layout of the configuration is for a manual action
+                // only, so no evidence can promote it to this state.
                 LifecycleState::AutomaticEvictionValidated { .. } => {
-                    has(&RuleMode::AutomaticEviction)
+                    has(&RuleMode::AutomaticEviction) && support.layout != USER_CONFIGURED_LAYOUT
                 }
                 _ => true,
             };
@@ -533,7 +568,7 @@ impl RuleDeclaration {
             .iter()
             .find(|support| support.layout == layout)
             .ok_or(RuleRefusal::UnknownLayout)?;
-        if self.modes.contains(mode) && support.lifecycle.permits(mode) {
+        if self.modes.contains(mode) && support.permits(mode) {
             Ok(())
         } else {
             Err(RuleRefusal::ModeNotValidated)
@@ -555,6 +590,13 @@ pub trait RuleRegistry {
         self.rules()
             .into_iter()
             .find(|rule| &rule.reference == reference)
+    }
+
+    /// The reviewed owner-operation declaration of the exact revision
+    /// `reference` (`docs/CLEANUP_RULES.md` section 9). `None` for a rule
+    /// with no owner operation; the default has none.
+    fn owner_operation(&self, _reference: &RuleRef) -> Option<&owner::OwnerOperation> {
+        None
     }
 
     /// The exact revision `reference`, when it can do `mode` for
@@ -950,6 +992,58 @@ mod tests {
                 measurement_expiry: Nanoseconds::new(600_000_000_000),
             },
         }
+    }
+
+    #[test]
+    fn a_layout_of_the_configuration_never_permits_an_automatic_mode() {
+        let configured = |lifecycle: LifecycleState| LayoutSupport {
+            layout: super::USER_CONFIGURED_LAYOUT.to_owned(),
+            lifecycle,
+        };
+        // Also a promoted state permits at most a manual mode.
+        let manual = configured(LifecycleState::ManualActionValidated {
+            evidence: evidence(),
+        });
+        assert!(manual.permits(&RuleMode::ManualEviction));
+        assert!(manual.permits(&RuleMode::ManualTrash));
+        assert!(!manual.permits(&RuleMode::AutomaticEviction));
+        let automatic = configured(LifecycleState::AutomaticEvictionValidated {
+            evidence: evidence(),
+        });
+        assert!(!automatic.permits(&RuleMode::AutomaticEviction));
+        assert!(automatic.permits(&RuleMode::ManualEviction));
+        // A declaration cannot give that state to the layout.
+        let mut refused: RuleDeclaration = declaration(LifecycleState::Proposed);
+        refused.layouts.push(automatic);
+        assert_eq!(refused.check(), Err(RuleDeclarationError::Mode));
+        // With a manual state, the declaration is complete, and the
+        // registry path refuses the automatic mode for the layout only.
+        let mut complete: RuleDeclaration =
+            declaration(LifecycleState::AutomaticEvictionValidated {
+                evidence: evidence(),
+            });
+        complete.layouts.push(manual);
+        let rule: Rule = Checked::new(complete).unwrap();
+        assert_eq!(
+            rule.permits("temporary-v1", &RuleMode::AutomaticEviction),
+            Ok(())
+        );
+        assert_eq!(
+            rule.permits(super::USER_CONFIGURED_LAYOUT, &RuleMode::AutomaticEviction),
+            Err(RuleRefusal::ModeNotValidated)
+        );
+        assert_eq!(
+            rule.permits(super::USER_CONFIGURED_LAYOUT, &RuleMode::ManualEviction),
+            Ok(())
+        );
+        // Another layout name with the same state is not limited.
+        let other = LayoutSupport {
+            layout: "user-configured-2".to_owned(),
+            lifecycle: LifecycleState::AutomaticEvictionValidated {
+                evidence: evidence(),
+            },
+        };
+        assert!(other.permits(&RuleMode::AutomaticEviction));
     }
 
     fn states() -> Vec<LifecycleState> {

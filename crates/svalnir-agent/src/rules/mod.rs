@@ -33,6 +33,15 @@
 //! They give no candidate, and the discovery for an eviction does not
 //! examine them.
 //!
+//! # Clear rules
+//!
+//! The rules of [`clear`] remove the contents of one cache directory of a
+//! producer that has no safe cleanup command, also data that a project
+//! uses now. Each one has the inspection mode and the manual eviction
+//! only: the discovery for an eviction examines it for a manual eviction
+//! and never for an automatic one, and a client plans it only with the
+//! explicit consent of the user.
+//!
 //! # Discovery for an eviction
 //!
 //! [`ReviewedRules::discover_for_eviction`] does steps 2 to 4 for the
@@ -42,7 +51,10 @@
 //! ([`xcode_evidence`]), runs each discovery, resolves the overlaps,
 //! applies the catalog of protected file locations, and sets predicates 3,
 //! 9, and 10. [`automatic_roots`] gives the approved roots of an automatic
-//! operation.
+//! operation. `project.dependency-directory` has no root in its
+//! declaration: a manual request gives its roots
+//! ([`projects::ProjectRequest`]), and the discovery never examines it for
+//! an automatic operation.
 //!
 //! # What a discovery establishes
 //!
@@ -57,6 +69,8 @@
 #[cfg(unix)]
 pub mod caches;
 #[cfg(unix)]
+pub mod clear;
+#[cfg(unix)]
 mod eviction;
 #[cfg(unix)]
 mod expired_temporary;
@@ -65,15 +79,23 @@ pub mod fixture;
 #[cfg(unix)]
 pub mod git;
 #[cfg(unix)]
+pub mod in_use;
+#[cfg(unix)]
 mod model;
 #[cfg(unix)]
 mod native;
 #[cfg(unix)]
+pub mod nested_git;
+#[cfg(unix)]
 mod overlap;
+#[cfg(unix)]
+pub mod owner_operation;
 #[cfg(unix)]
 pub mod owner_tools;
 #[cfg(unix)]
 mod plist;
+#[cfg(unix)]
+pub mod producers;
 #[cfg(unix)]
 pub mod projects;
 #[cfg(unix)]
@@ -91,12 +113,16 @@ mod eviction_tests;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+#[cfg(test)]
+#[cfg(unix)]
+mod xcode_orphan_tests;
 
 #[cfg(unix)]
 pub use eviction::{
     BoundRoot, DiscoveryEnvironment, DiscoveryHost, EvictionCandidate, EvictionDiscovery,
     EvictionRequest, ProducerActivity, RootProblem, RootReport, RootResult, SharedEnvironment,
-    SourceEnvironment, automatic_roots, bind_root, resolve_roots, root_id_of, xcode_evidence,
+    SourceEnvironment, automatic_roots, bind_root, producer_processes, resolve_roots, root_id_of,
+    xcode_evidence,
 };
 #[cfg(unix)]
 pub use expired_temporary::{
@@ -123,6 +149,6 @@ pub use registry::{ClaimError, RegistryError, ReviewedRules, RuleStatus};
 pub use xcode::{
     BUILD_CONFIGURATIONS, INDEX_CHILDREN, INTERMEDIATES_CHILDREN, PLATFORM_SUFFIXES,
     ProducerProcesses, SHARED_ROOT_ENTRIES, UNIT_PATHS, XCODE_DERIVED_DATA_LAYOUT,
-    XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_PRODUCER_EXECUTABLES,
-    XcodeDerivedDataRule, XcodeEvidence,
+    XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_ORPHAN_LAYOUT,
+    XCODE_PRODUCER_EXECUTABLES, XcodeDerivedDataRule, XcodeEvidence,
 };

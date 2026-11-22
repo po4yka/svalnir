@@ -385,6 +385,11 @@ pub(crate) struct TestSeams {
     /// of the state of its declaration. `None`: the registry of the build,
     /// in which each layout is `proposed`.
     pub(crate) rule_lifecycle: Option<svalnir_core::rule::LifecycleState>,
+    /// A directory of test scripts: each rule with an owner operation has
+    /// the script of the name of its executable in it as its one
+    /// executable, so that no test runs a producer tool. `None`: the
+    /// executables of the declarations.
+    pub(crate) owner_executables: Option<PathBuf>,
     /// The clock and the process evidence of a rule discovery. `None`: an
     /// environment with no evidence, so that no test reads the process
     /// table of the host.
@@ -624,8 +629,19 @@ impl Seams {
     pub(crate) fn rule_registry(&self) -> Result<ReviewedRules, RegistryError> {
         #[cfg(all(test, debug_assertions))]
         {
-            if let Some(lifecycle) = &self.test.rule_lifecycle {
-                return ReviewedRules::with_fixture_lifecycle(lifecycle);
+            let registry: Option<ReviewedRules> = match &self.test.rule_lifecycle {
+                Some(lifecycle) => Some(ReviewedRules::with_fixture_lifecycle(lifecycle)?),
+                None => None,
+            };
+            if let Some(directory) = &self.test.owner_executables {
+                let registry: ReviewedRules = match registry {
+                    Some(registry) => registry,
+                    None => ReviewedRules::new()?,
+                };
+                return registry.with_owner_fixture_executables(directory);
+            }
+            if let Some(registry) = registry {
+                return Ok(registry);
             }
         }
         ReviewedRules::new()

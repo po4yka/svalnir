@@ -35,6 +35,9 @@ const TIMEOUT_NOTE: &str = "The client wait ended before a final result. Nothing
 
 const INTERRUPT_NOTE: &str = "The client was interrupted. Nothing was canceled: the operation continues. Cancel it only with `svalnir operations cancel`.";
 
+/// The note of a client wait that a stop signal ended.
+pub(crate) const STOP_WAIT_NOTE: &str = "A stop signal ended the client wait. This process executes nothing: nothing was canceled, and the operation continues. Query the result with `svalnir operations show`.";
+
 const STOP_SIGNAL_NOTE: &str = "A stop signal stopped this process, which executed the operation as a transient coordinator. It claimed no further request and stopped the operation at the next safe point; no later step was dispatched. Query the result with `svalnir operations show`.";
 
 /// Asks for the approval of a plan. `--yes` gives it with no question.
@@ -196,11 +199,12 @@ impl ApplyView {
     }
 }
 
-/// The `wait` value of a transient coordinator that a stop signal stopped.
+/// The `wait` value of a transient coordinator that a stop signal stopped,
+/// or of a client wait that a stop signal ended.
 const STOPPED_BY_SIGTERM: &str = "stopped_by_sigterm";
 const STOPPED_BY_SIGHUP: &str = "stopped_by_sighup";
 
-const fn stopped_wait(signal: StopSignal) -> &'static str {
+pub(crate) const fn stopped_wait(signal: StopSignal) -> &'static str {
     match signal {
         StopSignal::Terminate => STOPPED_BY_SIGTERM,
         StopSignal::HangUp => STOPPED_BY_SIGHUP,
@@ -240,6 +244,8 @@ pub(crate) struct ApplyFlow<'a> {
     pub(crate) summary: String,
     /// The name of the request in an error message.
     pub(crate) what: &'static str,
+    /// True for `--require-agent`: only an agent may execute the plan.
+    pub(crate) require_agent: bool,
 }
 
 fn existing_view(
@@ -344,6 +350,9 @@ fn wait_parts(
         WaitEnd::Interrupted(report) => Ok(("interrupted", report, Some(INTERRUPT_NOTE))),
         WaitEnd::Stopped(signal, report) => {
             Ok((stopped_wait(signal), report, Some(STOP_SIGNAL_NOTE)))
+        }
+        WaitEnd::SignalEnded(signal, report) => {
+            Ok((stopped_wait(signal), report, Some(STOP_WAIT_NOTE)))
         }
         WaitEnd::Rejected(error) => Err(session::action_error(&error, what)),
         WaitEnd::Failed(error) => Err(error),
@@ -525,6 +534,14 @@ pub(crate) fn run(
     if svalnir_core::plan::check_expiry(flow.plan, &now.clock).is_err() {
         return Err(plan_expired(&flow.plan.plan_id).into());
     }
+    // A request that needs an agent is refused before the question when
+    // no agent holds the coordinator lock. The execution checks again.
+    if flow.require_agent
+        && svalnir_agent::client::agent_presence(&invocation.environment.journal_path()?)
+            != svalnir_agent::client::AgentPresence::Agent
+    {
+        return Err(execution::agent_required().into());
+    }
     approve(invocation, flow.yes, &flow.summary, &flow.plan.plan_id)?;
     // From the admission on, Ctrl+C does not end this process: it can be
     // the executor of the operation.
@@ -535,6 +552,7 @@ pub(crate) fn run(
         authority: flow.authority.clone(),
         control_plane: flow.control_plane.clone(),
         request_id: invocation.request_id.clone(),
+        require_agent: flow.require_agent,
     })?;
     match applied {
         Applied::Refused(error) => Err(session::action_error(&error, flow.what).into()),
@@ -574,6 +592,7 @@ pub(crate) fn run(
         flow.yes,
         &flow.summary,
         flow.what,
+        flow.require_agent,
     );
     Err(crate::host::unsupported_platform("clean apply").into())
 }

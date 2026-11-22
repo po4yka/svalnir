@@ -23,6 +23,7 @@ use svalnir_agent::coordinator::{
     Progress, Start, SystemProbe, code,
 };
 use svalnir_agent::executor::fs::{ApprovedRoots, ExecutorLimits, FsExecutor, FsExecutorConfig};
+use svalnir_agent::executor::owner::{OwnerExecutor, OwnerExecutorConfig};
 use svalnir_agent::executor::process::{
     DarwinProcessControl, ExecutorConfig, ExecutorContext, ProcessExecutor, SourceClock,
 };
@@ -107,6 +108,11 @@ pub(crate) struct ExecutionInput<'a> {
     /// The identity of the queue request, when a different process
     /// executes the plan.
     pub(crate) request_id: RequestId,
+    /// True when only an agent may execute the plan: with no agent that
+    /// holds the coordinator lock, the request is refused with
+    /// `agent_not_running`, and this process is never a transient
+    /// coordinator.
+    pub(crate) require_agent: bool,
 }
 
 /// The result of an apply request.
@@ -138,6 +144,9 @@ pub(crate) enum WaitEnd {
     /// A stop signal stopped the transient coordinator: it claimed no
     /// further request and stopped its operations at the next safe point.
     Stopped(StopSignal, Option<OperationReport>),
+    /// A stop signal ended the wait of a client that executes nothing,
+    /// for example in `svalnir mcp`. Nothing was canceled.
+    SignalEnded(StopSignal, Option<OperationReport>),
     /// The coordinator refused the queued request.
     Rejected(ActionError),
     /// The journal gave no answer.
@@ -158,6 +167,7 @@ fn coordinator_config() -> Result<CoordinatorConfig, ErrorBody> {
     Ok(CoordinatorConfig {
         filesystem_adapter: adapter("svalnir.filesystem")?,
         process_adapter: adapter("macos.process")?,
+        owner_adapter: adapter("svalnir.owner-operation")?,
         batch_targets: 8,
         poll_interval: Nanoseconds::new(250_000_000),
         volatile_capacity: 16,
@@ -290,6 +300,16 @@ fn coordinator_dependencies(
         environment.state_directory().ok().as_deref(),
     );
     records.environment = Some(environment.seams.discovery_environment());
+    // The layouts of the configuration in effect, for the check of a unit
+    // of `project.dependency-directory` with the layout `user-configured`
+    // before its step. A configuration that cannot be read gives none, and
+    // such a unit is then skipped.
+    records.project_layouts = open_journal(environment)
+        .ok()
+        .and_then(|journal| session::active_config(&journal, authority).ok())
+        .map_or_else(Vec::new, |active| {
+            active.config.cleanup().projects.layouts.clone()
+        });
     let authority: SharedAuthority = SharedAuthority::new(records);
     Ok((
         Dependencies {
@@ -300,6 +320,10 @@ fn coordinator_dependencies(
             filesystem: Box::new(filesystem),
             roots: roots.clone(),
             application: Box::new(application),
+            owner: Box::new(OwnerExecutor::new(OwnerExecutorConfig::new(
+                AdapterId::new("svalnir.owner-operation").map_err(|_| session::identity_error())?,
+                home_directory(environment)?,
+            ))),
             probe: Box::new(SystemProbe::new(roots, DarwinProcessSource::new())),
         },
         clock,
@@ -377,8 +401,16 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
         ExecutorEpochId::new(session::new_id("client")).map_err(|_| session::identity_error())?;
     let (dependencies, clock, authority) = dependencies(input, &epoch)?;
     let database = input.environment.journal_path()?;
+    if input.require_agent && client::agent_presence(&database) != AgentPresence::Agent {
+        return Err(agent_required());
+    }
     let start = start_coordinator(input.environment, &database, &epoch, dependencies)?;
     match start {
+        // The agent stopped after the check: the lock was free.
+        Start::Coordinating(coordinator) if input.require_agent => {
+            release(coordinator);
+            Err(agent_required())
+        }
         Start::Coordinating(mut coordinator) => {
             // From now on this process is a coordinator: a stop signal
             // stops it as it stops the agent.
@@ -463,6 +495,17 @@ pub(crate) fn apply(input: &ExecutionInput<'_>) -> Result<Applied, ErrorBody> {
             }
         }
     }
+}
+
+/// The refusal of an apply that needs an agent as the executor.
+pub(crate) fn agent_required() -> ErrorBody {
+    ErrorBody::new(
+        code::AGENT_NOT_RUNNING,
+        ErrorFamily::Evidence,
+        ErrorStage::Dispatch,
+        "no agent holds the coordinator lock, and this request permits no other executor; start the agent with `svalnir agent install`, or apply the plan with `svalnir clean apply` in a terminal; the command made no change",
+    )
+    .with_next_action(NextAction::RefreshObservation)
 }
 
 /// The result of an acknowledgment request.
@@ -1093,6 +1136,11 @@ impl Queued {
             }
             if interrupt.is_requested() {
                 return WaitEnd::Interrupted(last);
+            }
+            // This process executes nothing, so a stop signal that its
+            // handler recorded ends the wait at once.
+            if let Some(signal) = interrupt.stop_signal() {
+                return WaitEnd::SignalEnded(signal, last);
             }
             if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
                 return WaitEnd::TimedOut(last);

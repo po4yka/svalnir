@@ -11,9 +11,10 @@ use super::finding::{Finding, FindingCode, Location};
 use super::path::ConfigPath;
 use super::reader::{Context, Read, TableReader, join_path};
 use super::schema::{
-    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, DiskExclusions, DiskGuard,
-    EligibleGroup, GlobalTrigger, History, MemoryGuard, Privacy, Profile, Protections,
-    RestartPolicy, SCHEMA_VERSION, ValidatedConfig, VolumeSelector,
+    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, Cleanup, DiskExclusions,
+    DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD, MIN_QUIET_PERIOD,
+    MemoryGuard, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy, SCHEMA_VERSION,
+    ValidatedConfig, VolumeSelector,
 };
 use super::template::{TEMPLATE_REVISION, Template};
 use crate::id::RuleId;
@@ -152,6 +153,8 @@ fn read_document(context: &mut Context, table: &Table) -> (Option<ValidatedConfi
     let memory_table: TableReader<'_> = root.table(context, "memory_guard");
     let (memory_guard, grace_period): (MemoryGuard, Option<Duration>) =
         read_memory_guard(context, memory_table, &template.memory_guard);
+    let cleanup_table: TableReader<'_> = root.table(context, "cleanup");
+    let cleanup: Cleanup = read_cleanup(context, cleanup_table, &template.cleanup);
     let history_table: TableReader<'_> = root.table(context, "history");
     let history: History = read_history(context, history_table, &template.history);
     let privacy_table: TableReader<'_> = root.table(context, "privacy");
@@ -173,6 +176,7 @@ fn read_document(context: &mut Context, table: &Table) -> (Option<ValidatedConfi
         protections,
         disk_guard,
         memory_guard,
+        cleanup,
         history,
         privacy,
         explicit: BTreeSet::new(),
@@ -907,6 +911,34 @@ fn read_memory_guard(
         app_budgets,
     };
     (memory_guard, grace)
+}
+
+/// Reads `[cleanup]`. A quiet period outside [`MIN_QUIET_PERIOD`] to
+/// [`MAX_QUIET_PERIOD`] has a finding. The template has no layout, so the
+/// layouts are the tables of the document only.
+fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cleanup) -> Cleanup {
+    let mut projects_table: TableReader<'_> = table.table(context, "projects");
+    let path: String = projects_table.key_path("quiet_period");
+    let quiet_period: Read<Duration> = match projects_table.duration(context, "quiet_period") {
+        Read::Valid(period) if !(MIN_QUIET_PERIOD..=MAX_QUIET_PERIOD).contains(&period) => {
+            context.report(FindingCode::OutOfRange, &path, "must be from 1h to 90d");
+            Read::Invalid
+        }
+        other => other,
+    };
+    let projects: ProjectCleanup = ProjectCleanup {
+        quiet_period: value_or(quiet_period, defaults.projects.quiet_period),
+        paseo_agents: value_or(
+            projects_table.boolean(context, "paseo_agents"),
+            defaults.projects.paseo_agents,
+        ),
+        search_roots: super::layout::read_search_roots(context, &mut projects_table)
+            .unwrap_or_else(|| defaults.projects.search_roots.clone()),
+        layouts: super::layout::read_layouts(context, &mut projects_table),
+    };
+    projects_table.finish(context);
+    table.finish(context);
+    Cleanup { projects }
 }
 
 fn read_history(context: &mut Context, mut table: TableReader<'_>, defaults: &History) -> History {

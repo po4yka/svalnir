@@ -8,7 +8,7 @@
 //! environment variable, and evaluates nothing: a value with a variable
 //! reference, a command substitution, or a relative path is a value that
 //! this build does not support. A configuration file must be a plain file
-//! with one name and the owner of the inspection ([`read_record`]), with
+//! with one name and the owner of the inspection (`read_record`), with
 //! no symbolic link in its path and on local filesystems only
 //! ([`read_source`]).
 
@@ -101,7 +101,7 @@ pub enum ConfigValue {
 
 /// Reads the key of `source` below `home`.
 ///
-/// Before the first call on the path of the file, [`walk_local`] examines
+/// Before the first call on the path of the file, `walk_local` examines
 /// each component from `/` on local filesystems only, and a directory
 /// above the file must not be a symbolic link. A file below a link (for
 /// example a `~/.config` of a dotfile manager) or on a filesystem that is

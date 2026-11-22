@@ -254,6 +254,7 @@ impl Bench {
             coordinator: CoordinatorConfig {
                 filesystem_adapter: AdapterId::new("svalnir.filesystem").unwrap(),
                 process_adapter: AdapterId::new("macos.process").unwrap(),
+                owner_adapter: AdapterId::new("svalnir.owner-operation").unwrap(),
                 batch_targets: 8,
                 poll_interval: Nanoseconds::new(SECOND),
                 volatile_capacity: 8,
@@ -300,6 +301,12 @@ impl Bench {
                     executor_epoch: epoch.clone(),
                 },
                 ExecutorConfig::default(),
+            )),
+            owner: Box::new(crate::executor::owner::OwnerExecutor::new(
+                crate::executor::owner::OwnerExecutorConfig::new(
+                    AdapterId::new("svalnir.owner-operation").unwrap(),
+                    svalnir_core::file::LosslessPath::from_path(&self.home).unwrap(),
+                ),
             )),
             probe: Box::new(SystemProbe::new(
                 ApprovedRoots::default(),
@@ -678,6 +685,60 @@ fn a_producer_that_starts_after_the_admission_inhibits_each_later_step() {
     assert_ne!(operation.state(), &OperationState::Completed);
     assert_eq!(bench.journal().unsettled_operation_count().unwrap(), 0);
     stop(&bench, driver);
+}
+
+#[test]
+fn a_use_that_starts_after_the_admission_inhibits_each_later_step() {
+    for (state, code) in [
+        (crate::rules::fixture::FixtureUse::InUse, "unit_in_use"),
+        (
+            crate::rules::fixture::FixtureUse::Unknown,
+            "unit_use_unknown",
+        ),
+    ] {
+        let mut bench = Bench::validated(&[]);
+        bench.coordinator_units = 1;
+        bench.gain.store(GIBIBYTE, Ordering::SeqCst);
+        bench.seed_authority();
+        let mut driver = bench.start();
+        bench.discover(&mut driver);
+        let mut operation_id: Option<OperationId> = None;
+        for _ in 0..40 {
+            driver.tick(Some(bench.sample(bench.measurements().available())));
+            bench.clock.advance(SAMPLE);
+            operation_id = driver
+                .controller_state()
+                .outstanding
+                .as_ref()
+                .and_then(|outstanding| outstanding.operation_id.clone());
+            if operation_id.is_some() {
+                break;
+            }
+        }
+        let operation_id: OperationId = operation_id.expect("an operation was admitted");
+        let before: usize = bench.remaining().len();
+        assert!(
+            before >= 2,
+            "the operation ended in the tick of its admission"
+        );
+        // A process starts to use the units after the plan was admitted.
+        bench.environment.set_use(state);
+        bench.run_low(&mut driver, 20);
+        assert_eq!(bench.remaining().len(), before);
+        let operation = bench.journal().operation(&operation_id).unwrap().unwrap();
+        let skipped: Vec<String> = operation
+            .steps()
+            .iter()
+            .flat_map(svalnir_core::action::Step::results)
+            .filter(|result| result.effect == TargetEffect::Skipped)
+            .filter_map(|result| result.failure.as_ref())
+            .map(|failure| failure.code.as_str().to_owned())
+            .collect();
+        assert_eq!(skipped.len(), before, "{:?}", operation.steps());
+        assert!(skipped.iter().all(|found| found == code), "{skipped:?}");
+        assert_eq!(bench.journal().unsettled_operation_count().unwrap(), 0);
+        stop(&bench, driver);
+    }
 }
 
 #[test]

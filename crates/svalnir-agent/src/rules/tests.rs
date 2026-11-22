@@ -169,20 +169,26 @@ fn reference(id: &str, revision: &str) -> RuleRef {
 }
 
 #[test]
-fn the_registry_has_thirteen_rules_and_each_layout_is_proposed() {
+fn the_registry_has_eighteen_rules_and_each_layout_is_proposed() {
     let registry = ReviewedRules::new().unwrap();
     let rules = registry.rules();
     // The two rules of Milestone 2, the six cache rules,
     // `project.dependency-directory`, and the three rules of the owner
-    // tools, and `git.linked-worktree`.
-    assert_eq!(rules.len(), 13);
+    // tools, `git.linked-worktree`, and the five rules of
+    // `rules::producers` with their own declaration.
+    // The clear rules come after them.
+    let clear: usize = super::clear::CLEAR_SPECS.len();
+    assert_eq!(rules.len(), 18 + clear);
     let statuses = registry.statuses();
     // One layout for each of the two rules, two for `pnpm.content-store`
-    // and for `yarn.cache`, one for each other cache rule, three for
-    // `project.dependency-directory`, two for `simulator.devices` and for
-    // `container.build-cache`, and one for `homebrew.cleanup` and for
-    // `git.linked-worktree`.
-    assert_eq!(statuses.len(), 19);
+    // and for `yarn.cache`, one for each other cache rule, 32 for
+    // `project.dependency-directory` (the catalog and `user-configured`),
+    // two for `simulator.devices` and for `container.build-cache`, and one
+    // for `homebrew.cleanup` and for `git.linked-worktree`, and the layout
+    // of the scope root of each of the ten rules with an owner operation.
+    // A clear rule has one layout, and `xcode.inactive-derived-data` has a
+    // second layout for an orphan project directory.
+    assert_eq!(statuses.len(), 59 + clear);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);
@@ -372,10 +378,21 @@ fn a_sealed_expired_item_is_a_candidate_with_its_evidence() {
     assert!(measurement.logical_bytes.get() >= 4_196);
     assert!(measurement.charge.work_bytes >= measurement.logical_bytes);
     assert!(measurement.charge.work_bytes >= measurement.allocated_bytes);
-    // The estimate is the allocated size, and it is marked as not
-    // exclusive.
-    assert_eq!(measurement.estimate.bytes, measurement.allocated_bytes);
-    assert_eq!(measurement.estimate.measure, SizeMeasure::AllocatedBytes);
+    // On a volume that reports the private size, the estimate is the
+    // private allocated size; otherwise it is the allocated size. Neither
+    // is marked as exclusive. The files of the fixture have no clones, so
+    // the two sizes are equal.
+    if let Some(private) = measurement.private_allocated_bytes.value() {
+        assert_eq!(measurement.estimate.bytes, private);
+        assert_eq!(
+            measurement.estimate.measure,
+            SizeMeasure::PrivateAllocatedBytes
+        );
+        assert_eq!(private, measurement.allocated_bytes);
+    } else {
+        assert_eq!(measurement.estimate.bytes, measurement.allocated_bytes);
+        assert_eq!(measurement.estimate.measure, SizeMeasure::AllocatedBytes);
+    }
     assert!(!measurement.estimate.exclusive_storage_known);
 
     // The facts. Predicates 3, 9, and 10 belong to admission.
@@ -785,6 +802,44 @@ fn an_item_with_content_that_the_rule_preserves_is_skipped() {
         let skipped = skip_of(&discovery, name);
         assert_eq!(skipped.reasons, [SkipReason::ExclusionOverlap]);
         assert_eq!(skipped.eligibility.no_exclusion_overlap, Fact::NotSatisfied);
+    }
+}
+
+#[test]
+fn an_item_that_holds_a_repository_is_skipped() {
+    let fixture = temporary_fixture();
+    let clone: PathBuf = fixture.root().join("clone");
+    add_item(&fixture, "clone", |_| {
+        fs::create_dir_all(clone.join("nested/dep/.git/objects")).unwrap();
+        fs::write(
+            clone.join("nested/dep/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+    });
+    let gitlink: PathBuf = fixture.root().join("gitlink");
+    add_item(&fixture, "gitlink", |_| {
+        fs::write(gitlink.join(".git"), b"gitdir: ../elsewhere\n").unwrap();
+    });
+    add_item(&fixture, "plain", |_| {});
+
+    let discovery = discover_temporary(&fixture);
+    candidate_of(&discovery, "plain");
+    for (name, marker) in [("clone", "nested/dep/.git"), ("gitlink", ".git")] {
+        let skipped = skip_of(&discovery, name);
+        assert!(
+            skipped.reasons.contains(&SkipReason::NestedRepository),
+            "{name}: {:?}",
+            skipped.reasons
+        );
+        assert_eq!(skipped.eligibility.regenerable, Fact::NotSatisfied);
+        assert_eq!(
+            skipped
+                .repository_marker
+                .as_ref()
+                .and_then(svalnir_core::file::LosslessPath::as_utf8),
+            Some(marker)
+        );
     }
 }
 
@@ -2167,7 +2222,14 @@ fn a_project_with_no_source_or_with_source_overlap_is_not_a_candidate() {
     let (fixture, _) = xcode_fixture();
     fs::remove_dir_all(fixture.base().join("src")).unwrap();
     let discovery = discover_xcode(&fixture);
-    assert_eq!(discovery.candidates.len(), 0);
+    // The one candidate is the whole project directory, of the layout of an
+    // orphan; the units of the other layout stay `not_regenerable`.
+    let layouts: Vec<&str> = discovery
+        .candidates
+        .iter()
+        .map(|candidate| candidate.candidate.layout.as_str())
+        .collect();
+    assert_eq!(layouts, [super::xcode::XCODE_ORPHAN_LAYOUT]);
     for name in super::xcode::UNIT_PATHS {
         let skipped = skip_of(&discovery, &unit(name));
         assert_eq!(skipped.reasons, [SkipReason::NotRegenerable]);

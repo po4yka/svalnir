@@ -76,7 +76,56 @@ For an application budget:
 
 The fast sampling interval must fit the maximum qualification gap and decision freshness limit. Ordinary graceful termination requires a positive grace period. Immediate force is a distinct authorized disposable-workload strategy, not an accidental consequence of `grace_period = "0s"`.
 
+For the project rules:
+
+```text
+1h <= quiet_period <= 90d
+```
+
 `plan_ttl` bounds a plan that the agent prepares automatically. It must allow the intended grace interval; it does not guarantee that later escalation will still be valid. `manual_plan_ttl` bounds a plan that a user prepares and reviews before approval, and it must be long enough for that review. Both values are finite and positive. Expiry, permission loss, or a cleared trigger can stop a later step, and an expired plan of either type requires a new plan.
+
+### Cleanup rule settings
+
+The `[cleanup.projects]` table holds the settings of the project activity of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 6 ("Project activity"):
+
+| Key | Type | Template value | Meaning |
+| --- | --- | --- | --- |
+| `quiet_period` | Duration, 1 hour to 90 days | `"24h"` | The time with no project activity after which a project is `quiet` |
+| `paseo_agents` | Boolean | `false` | `true` turns on the Paseo source. A project is then `busy` while Paseo lists a running or starting agent in it, and each project is `busy` when the listing fails |
+| `search_roots` | List of strings, at most 16 | `[]` | The search roots of `project.dependency-directory` and of `git.linked-worktree` ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 4), for example `["Developer", "GitHub"]`. Each one is a plain path relative to the home directory, with at most 16 components and no empty, `.`, `..`, or `~` component; a path that starts with `/` is refused. Two paths that differ in the case of ASCII letters only are the same path (`duplicate_identifier`). A command adds the roots of `--root` and of mise to these roots |
+| `layouts` | Array of tables, at most 16 | None | The user-configured layouts of `project.dependency-directory` ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 12, "User-configured layouts") |
+
+A setting of this table gives no authority. A shorter quiet period can only make more projects `quiet`; it does not make a unit a candidate without the other predicates. `paseo_agents = true` can only make more projects `busy`. A search root only names a place to look; each check of the rule applies to each unit below it. `config show` gives the table as `cleanup.projects`, with the quiet period in nanoseconds, `search_roots` as a list of strings, and each layout in the list `cleanup.projects.layouts`, with its quiet period in nanoseconds or `null`.
+
+Each `[[cleanup.projects.layouts]]` table (owner decision of 2026-11-22) is a parameter of the reviewed rule, not a rule. It has these keys:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `directory` | String, required | The generated directory, relative to the project directory: one name, or two names with `/` between them |
+| `markers` | Array of 1 to 8 strings, required | The project markers. One of them must be a regular file in the directory that holds the first name of `directory`. A marker can be a pattern with `*` and `?` |
+| `inner_marker` | String | A regular file that the unit must have |
+| `protected` | Array of at most 8 strings | Paths relative to the unit, of at most 4 components, each a name or a pattern with `*` and `?`. A unit with an entry at one of them is refused |
+| `quiet_period` | Duration, 1 hour to 90 days | The quiet period of the projects of this layout, in place of `quiet_period` of the table |
+
+The validation refuses each of these before activation, with the finding code in parentheses:
+
+- A `directory` that is absolute, that starts with `~`, that has more than two names, an empty, `.`, or `..` component, a pattern, `\`, `[`, `]`, or a control character, or a component longer than 255 bytes (`invalid_path`).
+- A `directory` with a component of the skip list of the walk (`.git`, `.hg`, `.jj`, `.svn`, and `.cache`), or with the name of a protected location of the home directory: a personal folder of the default `[protections]` list (section 12), `Library`, or `Applications` (`invalid_path`). The comparisons ignore the case of ASCII letters.
+- A `directory` whose first name is the directory, or the first name of a directory of two names, of a built-in layout of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 (for example `node_modules`, `build`, `vendor`, or `tmp`), so that its units cannot overlap a built-in unit, and a `directory` whose first name is a name that section keeps out (`zig-out` and `deps`; `vendor`, `tmp`, and `_build`, also beside `rebar.config`, are built-in first names) (`invalid_path`).
+- A second table with the same `directory`, with the case of ASCII letters ignored (`duplicate_identifier`).
+- An absent `directory` or `markers` (`missing_key`), an empty `markers` list, a marker with `/`, a pattern marker with no literal part of two or more characters that is not only `.` (for example `*`, `*.*`, `a*`, `.*`, or `*e`; `*.csproj` is accepted), and a marker of the skip list (`invalid_path`).
+- An `inner_marker` with `/` or a pattern, and a protected path that is absolute or has an empty, `.`, or `..` component (`invalid_path`).
+- More than 16 tables or more than 8 entries in a list (`too_many_entries`), a `quiet_period` outside the range (`out_of_range`), and an unknown key (`unknown_key`).
+
+A user-configured layout has the layout name `user-configured`. It is never used by an automatic operation, in each lifecycle state, and each check of the rule applies to it unchanged. For example:
+
+```toml
+[[cleanup.projects.layouts]]
+directory = "builddir"
+markers = ["meson.build"]
+protected = ["meson-private/install.dat"]
+quiet_period = "3d"
+```
 
 ## 4. Illustrative complete policy values
 
@@ -154,6 +203,10 @@ footprint_recover = "3GiB"
 over_limit_for = "30s"
 cooldown = "10m"
 restart = "never"
+
+[cleanup.projects]
+quiet_period = "24h"
+paseo_agents = false
 
 [history]
 retention = "30d"
@@ -355,7 +408,7 @@ An admission deadline stops future steps; it cannot make an already-issued nativ
 
 Manual actions have explicit, finite, immutable plan limits and one-shot authorization for the selected mode. They do not consume, reset, or refund automatic incident counters. Their observed effects can contribute to incident recovery.
 
-`MoveToTrash` is the normal manual removal mode. `DeleteSelectedFiles` is a separately authorized manual permanent-removal class. `EvictRegenerableData` is rule-based and can be admitted automatically. A failed Trash operation never silently becomes permanent deletion.
+`MoveToTrash` is the normal manual removal mode. `DeleteSelectedFiles` is a separately authorized manual permanent-removal class. `EvictRegenerableData` is rule-based and can be admitted automatically. `RunOwnerOperation` runs the fixed cleanup command of a producer for a rule; it is manual, and only a bounded `prune` operation can be admitted automatically ([CLEANUP_RULES.md](CLEANUP_RULES.md) section 9). A failed Trash operation never silently becomes permanent deletion.
 
 Distinguish:
 

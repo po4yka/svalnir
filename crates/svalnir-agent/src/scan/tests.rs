@@ -17,20 +17,22 @@ use svalnir_core::id::{
     WorkerId,
 };
 use svalnir_core::observation::{
-    Coverage, Reading, Sample, ScopeKind, Source, UnavailableReason, Unit,
+    Coverage, MetricKind, Reading, Sample, ScopeKind, Source, UnavailableReason, Unit,
 };
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount};
 use svalnir_core::time::{MonotonicNanos, WallTime};
 use svalnir_core::volume::{CapacityDomainMembership, VolumeIdentity};
 
-use super::native::RawMetadata;
+use super::native::{PrivateAttributes, RawMetadata};
+use super::private::{CloneShare, FilePart, file_part};
 use super::top::TopList;
-use super::walk::{Injection, MetadataHook, budget_from_limit, join_name, scan_with};
+use super::walk::{Injection, MetadataHook, PrivateHook, budget_from_limit, join_name, scan_with};
 use super::{
-    CancellationToken, DirectoryRecord, EntryKind, EntryRecord, LargeFile, NoObserver, RegionCause,
-    RegionKind, ScanClock, ScanCompletion, ScanError, ScanLimits, ScanObserver, ScanRequest,
-    ScanResult, ScanTimestamp, WallScanClock, run_scan,
+    CancellationToken, DirectoryRecord, EntryKind, EntryRecord, LargeFile, NoObserver,
+    PrivateBytes, PrivateSizeUnavailable, RegionCause, RegionKind, ScanClock, ScanCompletion,
+    ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, ScanTimestamp, WallScanClock,
+    run_scan,
 };
 
 static NEXT_TREE: AtomicU32 = AtomicU32::new(0);
@@ -1380,7 +1382,7 @@ fn the_result_round_trips_as_json() {
     );
 
     let value: Value = serde_json::to_value(&result).unwrap();
-    assert_eq!(value["schema_version"], json!(1));
+    assert_eq!(value["schema_version"], json!(2));
     assert_eq!(value["scan_id"], json!("scan_test"));
     assert_eq!(value["completion"], json!("finished"));
     assert_eq!(value["coverage"], json!("partial"));
@@ -1447,12 +1449,13 @@ fn the_totals_are_observations_of_the_scan_scope() {
     );
     assert_eq!(observations.entries.value(), Some(&count(2)));
     assert_eq!(observations.entries.unit, Unit::Entry);
-    // A metadata scan never states an exclusive size.
+    // The exclusive size is the private allocated bytes of the scan, with
+    // the coverage of the scan.
     assert_eq!(
-        observations.exclusive_bytes.reading,
-        Reading::Unavailable(UnavailableReason::Unsupported)
+        observations.exclusive_bytes.value(),
+        result.private_allocation.bytes.value().as_ref()
     );
-    assert_eq!(observations.exclusive_bytes.value(), None);
+    assert_eq!(observations.exclusive_bytes.coverage, Coverage::Partial);
 }
 
 #[test]
@@ -1738,4 +1741,580 @@ fn a_directory_that_is_already_open_on_the_stack_is_not_entered_again() {
     assert_eq!(result.regions[0].path, lossless(&tree.path("a/loop")));
     assert_eq!(result.regions[0].cause, RegionCause::IdentityChanged);
     assert_eq!(result.totals.files, count(1));
+}
+
+// The private allocated bytes (`docs/RESOURCE_MODEL.md` section 8). The
+// tests make clones with `cp -c`, which calls `clonefile(2)`, in their own
+// temporary directories on the volume of the temporary directory.
+
+/// Clones `source` to `target` with `clonefile(2)`.
+fn clone_file(source: &Path, target: &Path) {
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let status = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(source)
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn allocated_of(path: &Path) -> u64 {
+    fs::symlink_metadata(path).unwrap().blocks() * 512
+}
+
+fn private_bytes(result: &ScanResult) -> u64 {
+    result
+        .private_allocation
+        .bytes
+        .value()
+        .expect("the private allocated bytes are available")
+        .get()
+}
+
+/// Scans with a changed private-size result for each file whose name is
+/// `name`.
+fn scan_private_injected(
+    root: &Path,
+    name: &'static str,
+    change: impl Fn(&mut std::io::Result<PrivateAttributes>) + 'static,
+) -> ScanResult {
+    scan_private_hooked(
+        root,
+        Box::new(
+            move |path: &Path, _: bool, result: &mut std::io::Result<PrivateAttributes>| {
+                if path.file_name() == Some(OsStr::new(name)) {
+                    change(result);
+                }
+            },
+        ),
+        None,
+    )
+}
+
+fn scan_private_hooked(
+    root: &Path,
+    hook: PrivateHook,
+    metadata: Option<MetadataHook>,
+) -> ScanResult {
+    scan_with(
+        &request(root, ScanLimits::default()),
+        &CancellationToken::new(),
+        &WallScanClock,
+        &mut NoObserver,
+        Injection {
+            private: Some(hook),
+            metadata,
+            ..Injection::default()
+        },
+    )
+    .unwrap()
+}
+
+fn shared_bytes(result: &ScanResult) -> u64 {
+    result
+        .private_allocation
+        .complete_family_shared_bytes
+        .value()
+        .expect("the complete-family shared bytes are available")
+        .get()
+}
+
+#[test]
+fn a_file_without_clones_has_its_allocated_size_as_private_bytes() {
+    let tree = TempTree::new("private-plain");
+    tree.file("a.bin", 300_000);
+    tree.file("d/b.bin", 5_000);
+
+    let result: ScanResult = scan(&tree.root);
+
+    assert_complete(&result);
+    // APFS reports a private size for each file. A file that shares no
+    // block has a private size equal to its allocated size.
+    assert_eq!(private_bytes(&result), result.totals.allocated_bytes.get());
+    assert_eq!(result.private_allocation.files_by_private_size, count(2));
+    assert_eq!(result.private_allocation.clone_families, count(0));
+}
+
+#[test]
+fn a_clone_family_inside_the_unit_counts_its_shared_blocks_one_time() {
+    let tree = TempTree::new("private-clone-inside");
+    let original: PathBuf = tree.file("a.bin", 1_048_576);
+    let clone: PathBuf = tree.path("d/b.bin");
+    clone_file(&original, &clone);
+
+    let result: ScanResult = scan(&tree.root);
+
+    assert_complete(&result);
+    // The allocated total has the shared blocks two times.
+    assert_eq!(
+        result.totals.allocated_bytes.get(),
+        expected(&tree.root).allocated
+    );
+    // The private allocated bytes have no shared block. The shared blocks
+    // are in the complete-family shared bytes one time.
+    assert_eq!(
+        private_bytes(&result),
+        result.totals.allocated_bytes.get() - allocated_of(&original) - allocated_of(&clone)
+    );
+    assert_eq!(shared_bytes(&result), allocated_of(&original));
+    assert_eq!(result.private_allocation.clone_families, count(1));
+    assert_eq!(result.private_allocation.clone_families_complete, count(1));
+    assert_eq!(result.private_allocation.files_by_private_size, count(2));
+}
+
+#[test]
+fn a_clone_with_a_member_outside_the_unit_adds_only_its_private_bytes() {
+    let tree = TempTree::new("private-clone-outside");
+    let original: PathBuf = tree.file("unit/a.bin", 1_048_576);
+    clone_file(&original, &tree.path("outside/b.bin"));
+    tree.file("unit/c.bin", 4_096);
+
+    let unit: PathBuf = tree.path("unit");
+    let result: ScanResult = scan(&unit);
+
+    assert_complete(&result);
+    // `a.bin` shares each block with the clone outside, so it adds zero.
+    assert_eq!(
+        private_bytes(&result),
+        result.totals.allocated_bytes.get() - allocated_of(&original)
+    );
+    assert_eq!(shared_bytes(&result), 0);
+    assert_eq!(result.private_allocation.clone_families, count(1));
+    assert_eq!(result.private_allocation.clone_families_complete, count(0));
+}
+
+#[test]
+fn a_clone_family_above_the_tracked_number_adds_only_private_bytes() {
+    let tree = TempTree::new("private-clone-limit");
+    let original: PathBuf = tree.file("a.bin", 1_048_576);
+    let clone: PathBuf = tree.path("b.bin");
+    clone_file(&original, &clone);
+
+    let result: ScanResult = scan_with(
+        &request(&tree.root, ScanLimits::default()),
+        &CancellationToken::new(),
+        &WallScanClock,
+        &mut NoObserver,
+        Injection {
+            clone_family_limit: Some(0),
+            ..Injection::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        private_bytes(&result),
+        result.totals.allocated_bytes.get() - allocated_of(&original) - allocated_of(&clone)
+    );
+    assert_eq!(shared_bytes(&result), 0);
+    assert_eq!(result.private_allocation.clone_families, count(0));
+    assert_eq!(
+        result.private_allocation.clone_families_not_tracked,
+        count(2)
+    );
+}
+
+#[test]
+fn a_hard_linked_file_with_each_name_inside_counts_one_time() {
+    let tree = TempTree::new("private-links-inside");
+    let first: PathBuf = tree.file("a.bin", 200_000);
+    tree.dir("d");
+    fs::hard_link(&first, tree.path("d/b.bin")).unwrap();
+
+    let result: ScanResult = scan(&tree.root);
+
+    assert_complete(&result);
+    assert_eq!(private_bytes(&result), result.totals.allocated_bytes.get());
+    assert_eq!(
+        result
+            .private_allocation
+            .hard_linked_objects_with_names_outside,
+        count(0)
+    );
+    assert_eq!(result.private_allocation.files_by_private_size, count(1));
+}
+
+#[test]
+fn a_hard_linked_file_with_a_name_outside_adds_zero_and_a_note() {
+    let tree = TempTree::new("private-links-outside");
+    let inside: PathBuf = tree.file("unit/a.bin", 200_000);
+    tree.dir("outside");
+    fs::hard_link(&inside, tree.path("outside/b.bin")).unwrap();
+
+    let unit: PathBuf = tree.path("unit");
+    let result: ScanResult = scan(&unit);
+
+    assert_complete(&result);
+    assert_eq!(
+        private_bytes(&result),
+        result.totals.allocated_bytes.get() - allocated_of(&inside)
+    );
+    assert_eq!(
+        result
+            .private_allocation
+            .hard_linked_objects_with_names_outside,
+        count(1)
+    );
+}
+
+#[test]
+fn a_compressed_file_adds_its_allocated_size() {
+    let tree = TempTree::new("private-compressed");
+    tree.file("packed.bin", 64_000);
+
+    let result: ScanResult = scan_injected(&tree.root, "packed.bin", |metadata| {
+        metadata.compressed = true;
+    });
+
+    assert_eq!(private_bytes(&result), result.totals.allocated_bytes.get());
+    assert_eq!(result.private_allocation.files_by_allocated_size, count(1));
+    assert_eq!(result.private_allocation.files_by_private_size, count(0));
+}
+
+#[test]
+fn a_volume_that_does_not_report_the_private_size_makes_it_unavailable() {
+    let tree = TempTree::new("private-unsupported");
+    tree.file("a.bin", 10_000);
+    tree.file("b.bin", 10_000);
+
+    let result: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        if let Ok(attributes) = result {
+            attributes.private_size = None;
+            attributes.clone_id = None;
+            attributes.clone_count = None;
+        }
+    });
+
+    // The other totals stay; the private quantity is not a zero.
+    assert_complete(&result);
+    assert_eq!(
+        result.private_allocation.bytes,
+        PrivateBytes::Unavailable {
+            cause: PrivateSizeUnavailable::NotReported
+        }
+    );
+    let value: Value = serde_json::to_value(result.private_allocation).unwrap();
+    assert_eq!(value["bytes"]["availability"], json!("unavailable"));
+    assert_eq!(value["bytes"]["cause"], json!("not_reported"));
+}
+
+#[test]
+fn a_failed_or_replaced_private_size_query_makes_it_unavailable() {
+    let tree = TempTree::new("private-failed");
+    tree.file("a.bin", 10_000);
+
+    let denied: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        *result = Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    });
+    let replaced: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        if let Ok(attributes) = result {
+            attributes.file_id = attributes.file_id.map(|id| id ^ 1);
+        }
+    });
+    let negative: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        if let Ok(attributes) = result {
+            attributes.private_size = Some(-1);
+        }
+    });
+
+    let cause = |result: &ScanResult| {
+        if let PrivateBytes::Unavailable { cause } = result.private_allocation.bytes {
+            Some(cause)
+        } else {
+            None
+        }
+    };
+    assert_eq!(
+        cause(&denied),
+        Some(PrivateSizeUnavailable::PermissionDenied)
+    );
+    assert_eq!(
+        cause(&replaced),
+        Some(PrivateSizeUnavailable::IdentityChanged)
+    );
+    assert_eq!(
+        cause(&negative),
+        Some(PrivateSizeUnavailable::InconsistentValue)
+    );
+}
+
+#[test]
+fn a_private_size_above_the_allocated_size_adds_the_allocated_size() {
+    let part = file_part(
+        Ok(PrivateAttributes {
+            file_id: Some(7),
+            private_size: Some(9_000),
+            clone_id: Some(3),
+            clone_count: Some(2),
+        }),
+        7,
+        Bytes::new(8_192),
+        false,
+    );
+    assert_eq!(part, Ok(FilePart::Allocated(Bytes::new(8_192))));
+
+    let shared = file_part(
+        Ok(PrivateAttributes {
+            file_id: Some(7),
+            private_size: Some(4_096),
+            clone_id: Some(3),
+            clone_count: Some(2),
+        }),
+        7,
+        Bytes::new(8_192),
+        false,
+    );
+    assert_eq!(
+        shared,
+        Ok(FilePart::Private {
+            private: Bytes::new(4_096),
+            clone: Some(CloneShare {
+                family: 3,
+                members: 2,
+                shared: Bytes::new(4_096),
+            }),
+        })
+    );
+}
+
+#[test]
+fn the_exclusive_observation_is_the_private_allocated_bytes() {
+    let tree = TempTree::new("private-observation");
+    tree.file("a.bin", 10_000);
+    let source = Source {
+        adapter_id: AdapterId::new("svalnir.scan").unwrap(),
+        adapter_revision: "1".to_owned(),
+        native_api: "getattrlistat".to_owned(),
+        native_field: "ATTR_CMNEXT_PRIVATESIZE".to_owned(),
+        worker_id: WorkerId::new("worker_test").unwrap(),
+    };
+    let sample = Sample {
+        sample_id: SampleId::new("sample_test").unwrap(),
+        clock_domain: ClockDomainId::new("clock_test").unwrap(),
+        boot_id: BootId::new("boot_test").unwrap(),
+        collector_epoch: CollectorEpochId::new("collector_test").unwrap(),
+        started_monotonic_ns: MonotonicNanos::new(1),
+        finished_monotonic_ns: MonotonicNanos::new(2),
+        captured_at: WallTime::UNIX_EPOCH,
+    };
+
+    let measured: ScanResult = scan(&tree.root);
+    let unsupported: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        if let Ok(attributes) = result {
+            attributes.private_size = None;
+        }
+    });
+    let available = measured.observations(&source, &sample).unwrap();
+    let unavailable = unsupported.observations(&source, &sample).unwrap();
+
+    assert_eq!(available.exclusive_bytes.kind, MetricKind::Estimate);
+    assert_eq!(
+        available.exclusive_bytes.value(),
+        Some(&Bytes::new(private_bytes(&measured)))
+    );
+    assert_eq!(
+        unavailable.exclusive_bytes.reading,
+        Reading::Unavailable(UnavailableReason::Unsupported)
+    );
+}
+
+#[test]
+fn a_modified_clone_outside_keeps_the_shared_blocks_of_a_complete_family() {
+    let tree = TempTree::new("private-modified-clone");
+    let original: PathBuf = tree.file("unit/a.bin", 4 * 1_048_576);
+    clone_file(&original, &tree.path("unit/b.bin"));
+    clone_file(&original, &tree.path("unit/c.bin"));
+    let outside: PathBuf = tree.path("outside/d.bin");
+    clone_file(&original, &outside);
+    // A write to one block gives the clone outside a new clone identity.
+    // It still references the other blocks of the family.
+    {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut file = fs::OpenOptions::new().write(true).open(&outside).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[0xa5_u8; 4_096]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let unit: PathBuf = tree.path("unit");
+    let result: ScanResult = scan(&unit);
+
+    assert_complete(&result);
+    let members: u64 = allocated_of(&original)
+        + allocated_of(&tree.path("unit/b.bin"))
+        + allocated_of(&tree.path("unit/c.bin"));
+    // The lower figure has none of the shared blocks, which the removal of
+    // the unit does not free while `d.bin` exists.
+    assert_eq!(
+        private_bytes(&result),
+        result.totals.allocated_bytes.get() - members
+    );
+    assert!(private_bytes(&result) < 1_048_576);
+    // The family is complete in the unit, so the shared blocks are in the
+    // complete-family shared bytes, which are not a reclaim figure.
+    assert_eq!(result.private_allocation.clone_families_complete, count(1));
+    assert_eq!(shared_bytes(&result), allocated_of(&original));
+}
+
+#[test]
+fn a_kernel_that_refuses_the_clone_count_gets_a_request_without_it() {
+    let tree = TempTree::new("private-einval");
+    tree.file("a.bin", 10_000);
+    tree.file("b.bin", 10_000);
+    let calls = std::rc::Rc::new(Cell::new((0_u32, 0_u32)));
+    let seen = std::rc::Rc::clone(&calls);
+
+    let result: ScanResult = scan_private_hooked(
+        &tree.root,
+        Box::new(
+            move |_: &Path, with_count: bool, result: &mut std::io::Result<PrivateAttributes>| {
+                let (with, without) = seen.get();
+                if with_count {
+                    seen.set((with + 1, without));
+                    *result = Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                } else {
+                    seen.set((with, without + 1));
+                }
+            },
+        ),
+        None,
+    );
+
+    assert_complete(&result);
+    // One refused call, then each file without the clone count.
+    assert_eq!(calls.get(), (1, 2));
+    assert_eq!(private_bytes(&result), result.totals.allocated_bytes.get());
+    assert_eq!(result.private_allocation.files_by_private_size, count(2));
+
+    let refused: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        *result = Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    });
+    assert_eq!(
+        refused.private_allocation.bytes,
+        PrivateBytes::Unavailable {
+            cause: PrivateSizeUnavailable::NotReported
+        }
+    );
+    let unsupported: ScanResult = scan_private_injected(&tree.root, "a.bin", |result| {
+        *result = Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    });
+    assert_eq!(
+        unsupported.private_allocation.bytes.value(),
+        None,
+        "ENOTSUP is not a zero"
+    );
+}
+
+#[test]
+fn an_entry_without_an_allocated_size_is_counted() {
+    let tree = TempTree::new("private-fifo");
+    tree.file("a.bin", 10_000);
+    let status = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(tree.path("pipe"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let result: ScanResult = scan(&tree.root);
+
+    assert_complete(&result);
+    assert_eq!(
+        result.private_allocation.entries_without_allocated_size,
+        count(1)
+    );
+    assert_eq!(private_bytes(&result), result.totals.allocated_bytes.get());
+}
+
+#[test]
+fn a_family_member_with_no_shared_part_is_a_member_and_is_counted() {
+    let tree = TempTree::new("private-no-shared");
+    tree.file("a.bin", 10_000);
+    tree.file("b.bin", 10_000);
+
+    // Each file reports a family of two and a private size equal to its
+    // allocated size, so its shared part is zero.
+    let result: ScanResult = scan_private_hooked(
+        &tree.root,
+        Box::new(
+            |_: &Path, _: bool, result: &mut std::io::Result<PrivateAttributes>| {
+                if let Ok(attributes) = result {
+                    attributes.clone_id = Some(77);
+                    attributes.clone_count = Some(2);
+                }
+            },
+        ),
+        None,
+    );
+
+    assert_eq!(
+        result.private_allocation.clone_members_without_shared_part,
+        count(2)
+    );
+    assert_eq!(result.private_allocation.clone_families_complete, count(1));
+    assert_eq!(private_bytes(&result), result.totals.allocated_bytes.get());
+    assert_eq!(shared_bytes(&result), 0);
+}
+
+#[test]
+fn a_compressed_member_of_a_clone_family_adds_zero_to_the_lower_figure() {
+    let tree = TempTree::new("private-compressed-family");
+    let original: PathBuf = tree.file("a.bin", 1_048_576);
+    let clone: PathBuf = tree.path("b.bin");
+    clone_file(&original, &clone);
+    tree.file("single.bin", 64_000);
+
+    let result: ScanResult = scan_private_hooked(
+        &tree.root,
+        Box::new(|_: &Path, _: bool, _: &mut std::io::Result<PrivateAttributes>| {}),
+        Some(Box::new(|_: &Path, metadata: &mut RawMetadata| {
+            if metadata.kind == EntryKind::File {
+                metadata.compressed = true;
+            }
+        })),
+    );
+    let single: u64 = allocated_of(&tree.path("single.bin"));
+
+    assert_complete(&result);
+    // The clones add zero; the compressed file with a clone count of 1
+    // adds its allocated size.
+    assert_eq!(
+        private_bytes(&result),
+        result.totals.allocated_bytes.get() - allocated_of(&original) - allocated_of(&clone)
+    );
+    assert_eq!(shared_bytes(&result), allocated_of(&original));
+    assert_eq!(result.private_allocation.files_by_allocated_size, count(1));
+    assert!(single > 0);
+
+    // A compressed file whose clone count is not known adds zero.
+    let unknown: ScanResult = scan_private_hooked(
+        &tree.root,
+        Box::new(
+            |path: &Path, _: bool, result: &mut std::io::Result<PrivateAttributes>| {
+                if path.file_name() == Some(OsStr::new("single.bin"))
+                    && let Ok(attributes) = result
+                {
+                    attributes.clone_count = None;
+                }
+            },
+        ),
+        Some(Box::new(|path: &Path, metadata: &mut RawMetadata| {
+            if path.file_name() == Some(OsStr::new("single.bin")) {
+                metadata.compressed = true;
+            }
+        })),
+    );
+    assert_eq!(
+        unknown
+            .private_allocation
+            .compressed_files_with_unknown_sharing,
+        count(1)
+    );
+    assert_eq!(
+        private_bytes(&unknown),
+        unknown.totals.allocated_bytes.get()
+            - allocated_of(&original)
+            - allocated_of(&clone)
+            - single
+    );
 }

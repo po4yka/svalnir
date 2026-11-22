@@ -29,6 +29,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+# The unit tests give a rule a fixture lifecycle state
+# (`ReviewedRules::with_fixture_lifecycle`), which only a test build has.
+svalnir-agent = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

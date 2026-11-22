@@ -16,13 +16,13 @@ use std::time::Duration;
 
 use super::path::ConfigPath;
 use super::schema::{
-    AgentConfig, AutomaticMode, DiskExclusions, DiskGuard, GlobalTrigger, History, MemoryGuard,
-    Privacy, Profile, VolumeSelector,
+    AgentConfig, AutomaticMode, Cleanup, DiskExclusions, DiskGuard, GlobalTrigger, History,
+    MemoryGuard, Privacy, Profile, ProjectCleanup, VolumeSelector,
 };
 use crate::quantity::{Bytes, EntryCount};
 
 /// The revision of the template. Increase it when a value changes.
-pub const TEMPLATE_REVISION: u32 = 2;
+pub const TEMPLATE_REVISION: u32 = 4;
 
 /// The personal folders of the home directory: the default of
 /// `[protections].excluded_paths` (`docs/POLICY_SPEC.md` section 12). Each
@@ -57,6 +57,7 @@ pub(super) struct Template {
     pub(super) excluded_paths: Vec<ConfigPath>,
     pub(super) disk_guard: DiskGuard,
     pub(super) memory_guard: MemoryGuard,
+    pub(super) cleanup: Cleanup,
     pub(super) history: History,
     pub(super) privacy: Privacy,
 }
@@ -124,6 +125,14 @@ impl Template {
                 protected_bundle_ids: Vec::new(),
                 protected_executable_paths: Vec::new(),
                 app_budgets: Vec::new(),
+            },
+            cleanup: Cleanup {
+                projects: ProjectCleanup {
+                    quiet_period: Duration::from_hours(24),
+                    paseo_agents: false,
+                    search_roots: Vec::new(),
+                    layouts: Vec::new(),
+                },
             },
             history: History {
                 retention: Duration::from_hours(30 * 24),

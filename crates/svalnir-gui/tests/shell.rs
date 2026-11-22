@@ -159,9 +159,10 @@ fn the_wide_sidebar_has_screen_items_and_nested_items(cx: &mut TestAppContext) {
         }
     })
     .unwrap();
-    // Seven screens, six nested items of Overview; the two of Storage are closed.
+    // Seven screens, six nested items of Overview; the three of Storage are
+    // closed.
     assert_eq!(found.len(), 7 + 6, "{found:?}");
-    assert_eq!(missing, ["0-0-1-0", "0-0-1-1"]);
+    assert_eq!(missing, ["0-0-1-0", "0-0-1-1", "0-0-1-2"]);
 }
 
 #[gpui_kit::test]

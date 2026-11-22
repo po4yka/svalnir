@@ -23,7 +23,7 @@ fn changes_state(command: &Command) -> bool {
     match command {
         Command::Clean { command } => match command {
             CleanCommand::Plan { .. } | CleanCommand::Apply { .. } => true,
-            CleanCommand::Show { .. } => false,
+            CleanCommand::Show { .. } | CleanCommand::Inspect { .. } => false,
         },
         Command::Processes { command } => match command {
             ProcessesCommand::Stop { .. } => true,
@@ -61,11 +61,15 @@ fn changes_state(command: &Command) -> bool {
         Command::Status
         | Command::Scan { .. }
         | Command::Report { .. }
+        | Command::Disk { .. }
         | Command::Monitor { .. }
         | Command::History { .. }
         | Command::Doctor
         | Command::Completions { .. }
-        | Command::License => false,
+        | Command::License
+        // The server changes nothing itself. Each tool call is one
+        // invocation of a command, which has its own check.
+        | Command::Mcp => false,
     }
 }
 

@@ -113,6 +113,8 @@ pub(crate) fn environment() -> (Environment, TempDirectory) {
             state_directory_override: Some(directory.path().join("state").into_os_string()),
             home: Some(home),
             current_directory: Some(directory.path().to_path_buf()),
+            xdg_state_home: None,
+            xdg_config_home: None,
             interrupt,
             seams,
         },
@@ -602,6 +604,9 @@ pub(crate) fn scan_result(partial: bool) -> ScanResult {
             compressed_files: EntryCount::new(0),
             files_allocated_below_logical: EntryCount::new(0),
         },
+        private_allocation: svalnir_agent::scan::PrivateAllocation::unavailable(
+            svalnir_agent::scan::PrivateSizeUnavailable::NotReported,
+        ),
         largest_files,
         largest_directories: vec![LargeDirectory {
             path: path(b"/data/project/build"),
@@ -742,5 +747,16 @@ impl svalnir_agent::rules::DiscoveryEnvironment for NoEvidence {
             producer_processes: svalnir_agent::rules::ProducerProcesses::Unknown,
             observed_at: MonotonicNanos::new(0),
         }
+    }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[svalnir_agent::rules::in_use::UnitScope],
+    ) -> svalnir_agent::platform::process::PathInventory {
+        svalnir_agent::platform::process::PathInventory::incomplete(
+            svalnir_agent::platform::process::InventoryGap::ProcessListUnavailable,
+            None,
+        )
     }
 }

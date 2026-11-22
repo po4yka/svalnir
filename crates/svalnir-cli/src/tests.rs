@@ -687,10 +687,13 @@ fn scan_and_report_work_end_to_end_on_a_temporary_directory() {
         assert_eq!(observation["metric_id"], "scan.allocated_bytes");
         assert_eq!(observation["scope"]["kind"], "scan");
         assert_eq!(observation["scope"]["identity_id"], scan_id.as_str());
-        assert_eq!(
-            envelope["result"]["observations"]["exclusive_bytes"]["reason"],
-            "unsupported"
-        );
+        // The temporary directory is on APFS, which reports the private
+        // size, so the exclusive size is the private allocated size.
+        let exclusive = &envelope["result"]["observations"]["exclusive_bytes"];
+        let private = &envelope["result"]["scan"]["private_allocation"]["bytes"];
+        assert_eq!(exclusive["kind"], "estimate");
+        assert_eq!(private["availability"], "available");
+        assert_eq!(exclusive["value"], private["bytes"]);
     }
 
     let report = run_with(
@@ -896,6 +899,59 @@ fn the_default_proposal_is_the_file_in_the_state_directory() {
 }
 
 #[test]
+fn config_show_has_the_project_cleanup_table() {
+    let (environment, directory) = environment();
+    let state = directory.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let template = svalnir(&["config", "show", "--format", "json"]);
+    assert_eq!(
+        template.envelope()["result"]["cleanup"],
+        serde_json::json!({
+            "projects": {
+                "quiet_period": "86400000000000",
+                "paseo_agents": false,
+                "search_roots": [],
+                "layouts": []
+            }
+        })
+    );
+    std::fs::write(
+        state.join("config.toml"),
+        "schema_version = 1\n[cleanup.projects]\nquiet_period = \"2d\"\npaseo_agents = true\nsearch_roots = [\"Developer\", \"GitHub/work\"]\n\n[[cleanup.projects.layouts]]\ndirectory = \"out\"\nmarkers = [\"meson.build\", \"*.meson\"]\nprotected = [\"keep\"]\nquiet_period = \"2h\"\n",
+    )
+    .unwrap();
+    let shown = run_with(&environment, &["config", "show", "--format", "json"]);
+    assert_eq!(shown.status, ExitStatus::Success, "{}", shown.stdout);
+    assert_eq!(
+        shown.envelope()["result"]["cleanup"]["projects"],
+        serde_json::json!({
+            "quiet_period": "172800000000000",
+            "paseo_agents": true,
+            "search_roots": ["Developer", "GitHub/work"],
+            "layouts": [{
+                "directory": "out",
+                "markers": ["meson.build", "*.meson"],
+                "inner_marker": null,
+                "protected": ["keep"],
+                "quiet_period": "7200000000000"
+            }]
+        })
+    );
+    let text = run_with(&environment, &["config", "show"]);
+    assert_eq!(text.status, ExitStatus::Success);
+    for line in [
+        "cleanup",
+        "projects",
+        "quiet_period",
+        "paseo_agents",
+        "layouts",
+        "meson.build",
+    ] {
+        assert!(text.stdout.contains(line), "{line}: {}", text.stdout);
+    }
+}
+
+#[test]
 fn without_a_file_the_proposal_is_the_built_in_template() {
     let shown = svalnir(&["config", "show", "--format", "json"]);
     assert_eq!(shown.status, ExitStatus::Success, "{}", shown.stdout);
@@ -925,7 +981,7 @@ fn without_a_file_the_proposal_is_the_built_in_template() {
             "{policy}"
         );
     }
-    assert_eq!(envelope["result"]["template_revision"], 2);
+    assert_eq!(envelope["result"]["template_revision"], 4);
 
     let text = svalnir(&["policy", "show", "memory-guard"]);
     assert_eq!(text.status, ExitStatus::Success);

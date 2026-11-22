@@ -13,8 +13,9 @@ use serde::Serialize;
 use svalnir_agent::platform::memory::CollectionContext;
 use svalnir_agent::platform::volume;
 use svalnir_agent::scan::{
-    CancellationToken, NoObserver, ScanClock, ScanCompletion, ScanError, ScanLimits,
-    ScanObservations, ScanRequest, ScanResult, ScanTimestamp, WallScanClock, run_scan,
+    CancellationToken, NoObserver, PrivateAllocation, PrivateBytes, ScanClock, ScanCompletion,
+    ScanError, ScanLimits, ScanObservations, ScanRequest, ScanResult, ScanTimestamp, WallScanClock,
+    run_scan,
 };
 use svalnir_agent::store::{RetentionPolicy, ScanRecord, Store, StoreError, StoreOptions};
 use svalnir_core::config;
@@ -41,7 +42,7 @@ const TEXT_LIST_LIMIT: usize = 10;
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
 
 /// The statement of each scan result about authority.
-const AUTHORITY_NOTE: &str = "A scan and a saved scan record do not authorize a cleanup. The allocated size is not exclusive size and not reclaimable size.";
+const AUTHORITY_NOTE: &str = "A scan and a saved scan record do not authorize a cleanup. The allocated size is not exclusive size. The allocated size and the private size are not reclaimable size: a snapshot, a name outside the root, or an open file can keep blocks.";
 
 /// The totals of a scan as observations of the `scan` scope.
 #[derive(Debug, Clone, Serialize)]
@@ -178,7 +179,18 @@ fn render_summary(result: &ScanResult, out: &mut String) {
         14,
         &human_bytes(totals.allocated_bytes.get()),
     );
-    field(out, "Exclusive size", 14, "unavailable (unsupported)");
+    field(
+        out,
+        "Private size",
+        14,
+        &private_size_text(&result.private_allocation),
+    );
+    field(
+        out,
+        "Clone-shared",
+        14,
+        &shared_size_text(&result.private_allocation),
+    );
     let shared = &result.shared_storage;
     field(
         out,
@@ -193,6 +205,36 @@ fn render_summary(result: &ScanResult, out: &mut String) {
     );
     if result.coverage != Coverage::Complete {
         out.push_str("  The totals are a sum of the measured part only.\n");
+    }
+}
+
+/// The private allocated bytes of the root, with the evidence of the
+/// calculation, or the cause that they are unavailable.
+fn private_size_text(private: &PrivateAllocation) -> String {
+    match private.bytes {
+        PrivateBytes::Available { bytes } => format!(
+            "{} lower figure, no shared block ({} files by private size, {} by allocated size, {} compressed with unknown sharing; {} hard-linked objects with a name outside; {} entries with no size)",
+            human_bytes(bytes.get()),
+            private.files_by_private_size,
+            private.files_by_allocated_size,
+            private.compressed_files_with_unknown_sharing,
+            private.hard_linked_objects_with_names_outside,
+            private.entries_without_allocated_size
+        ),
+        PrivateBytes::Unavailable { cause } => format!("unavailable ({})", cause.as_str()),
+    }
+}
+
+/// The complete-family shared bytes, which are not a reclaim figure.
+fn shared_size_text(private: &PrivateAllocation) -> String {
+    match private.complete_family_shared_bytes {
+        PrivateBytes::Available { bytes } => format!(
+            "{} in {} of {} clone families with each member inside; not a reclaim figure, because a modified clone outside or a snapshot can hold these blocks",
+            human_bytes(bytes.get()),
+            private.clone_families_complete,
+            private.clone_families
+        ),
+        PrivateBytes::Unavailable { cause } => format!("unavailable ({})", cause.as_str()),
     }
 }
 
@@ -806,8 +848,22 @@ mod tests {
         assert!(text.contains("Logical size    3.0 MiB"), "{text}");
         assert!(text.contains("Allocated size  4.0 MiB"), "{text}");
         assert!(
-            text.contains("Exclusive size  unavailable (unsupported)"),
+            text.contains("Private size    unavailable (not_reported)"),
             "{text}"
+        );
+        assert!(
+            text.contains("Clone-shared    unavailable (not_reported)"),
+            "{text}"
+        );
+        let mut measured = result.clone();
+        measured.private_allocation.bytes = super::PrivateBytes::Available {
+            bytes: svalnir_core::quantity::Bytes::new(2 * 1024 * 1024),
+        };
+        let measured_text = render_result(&measured);
+        assert!(
+            measured_text
+                .contains("Private size    2.0 MiB lower figure, no shared block (0 files"),
+            "{measured_text}"
         );
         assert!(text.contains("/data/project/big.bin"), "{text}");
         assert!(!text.contains("Regions that the totals"), "{text}");

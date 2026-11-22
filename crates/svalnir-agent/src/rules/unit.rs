@@ -35,10 +35,11 @@ use super::model::{
     DiscoveryError, DiscoveryScope, MeasurementSource, ReclaimEstimate, RootEvidence, SizeMeasure,
     SkipReason, SkippedUnit, TargetEvidence, UnitMeasurement,
 };
+use super::nested_git;
 use crate::platform::volume::{Locality, MountTable};
 use crate::scan::{
-    CancellationToken, EntryKind, EntryRecord, RegionCause, ScanCompletion, ScanError, ScanLimits,
-    ScanObserver, ScanRequest, ScanResult, run_scan,
+    CancellationToken, EntryKind, EntryRecord, PrivateBytes, RegionCause, ScanCompletion,
+    ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, run_scan,
 };
 
 /// The number of bytes of one block of `st_blocks`.
@@ -569,6 +570,8 @@ struct UnitObserver<'a> {
     /// The newest modification or status change of an object below the
     /// unit.
     newest_change: Option<WallTime>,
+    /// The Git markers and the Git directories below the unit.
+    repositories: nested_git::MarkerTracker,
 }
 
 /// Examines the owner and the times of one measured entry below a unit.
@@ -642,12 +645,43 @@ impl ScanObserver for UnitObserver<'_> {
                 if let Some(reason) = (self.classify)(relative, entry.kind) {
                     self.reasons.insert(reason);
                 }
+                // A Git repository at any depth: its commits and changes
+                // can exist nowhere else (section 6, "Repositories in a
+                // unit"). The unit of a rule of this build has no
+                // checkouts of Swift Package Manager, so no exception
+                // applies.
+                if self.repositories.note(relative, entry.kind) {
+                    self.reasons.insert(SkipReason::NestedRepository);
+                }
             }
             // An entry that the rule cannot classify is not shown to be
             // safe.
             Err(_) => {
                 self.reasons.insert(SkipReason::MeasurementIncomplete);
             }
+        }
+    }
+}
+
+/// The result of the measurement of one unit, with what the observer
+/// found besides the measurement.
+#[derive(Debug)]
+struct MeasuredUnit {
+    measured: Measured,
+    /// The newest modification or status change of an object below the
+    /// unit.
+    newest_change: Option<WallTime>,
+    /// The first Git marker or Git directory below the unit, relative to
+    /// the unit.
+    repository_marker: Option<PathBuf>,
+}
+
+impl MeasuredUnit {
+    const fn only(measured: Measured) -> Self {
+        Self {
+            measured,
+            newest_change: None,
+            repository_marker: None,
         }
     }
 }
@@ -703,9 +737,9 @@ fn measure_unit(
     bounds: &mut Bounds<'_>,
     classify: Classifier<'_>,
     principal: Uid,
-) -> Result<(Measured, Option<WallTime>), DiscoveryError> {
+) -> Result<MeasuredUnit, DiscoveryError> {
     if let Some(completion) = bounds.stop() {
-        return Ok((Measured::Stopped(completion), None));
+        return Ok(MeasuredUnit::only(Measured::Stopped(completion)));
     }
     let ceiling: WorkCharge = rule.budget.per_candidate;
     let remaining: u64 = bounds.remaining_entries();
@@ -745,13 +779,15 @@ fn measure_unit(
         classify,
         owner: principal,
         newest_change: None,
+        repositories: nested_git::MarkerTracker::default(),
     };
     let scanned: Result<ScanResult, ScanError> =
         run_scan(&request, &scan_cancel, bounds.control.clock, &mut observer);
     let result: ScanResult = match scanned {
         Ok(result) => result,
         Err(error) => {
-            return scan_refusal(error).map(|reasons| (Measured::Rejected(reasons), None));
+            return scan_refusal(error)
+                .map(|reasons| MeasuredUnit::only(Measured::Rejected(reasons)));
         }
     };
     bounds.entries_examined = bounds
@@ -759,6 +795,7 @@ fn measure_unit(
         .saturating_add(result.entries_examined.get());
 
     let newest_change: Option<WallTime> = observer.newest_change;
+    let repository_marker: Option<PathBuf> = observer.repositories.first().map(Path::to_path_buf);
     let scan: FinishedScan<'_> = FinishedScan {
         result: &result,
         reasons: observer.reasons,
@@ -766,7 +803,11 @@ fn measure_unit(
         work_bytes: observer.work_bytes,
         scan_limit,
     };
-    Ok((scan.conclude(unit, &ceiling), newest_change))
+    Ok(MeasuredUnit {
+        measured: scan.conclude(unit, &ceiling),
+        newest_change,
+        repository_marker,
+    })
 }
 
 /// The skip reason of a scan that did not start.
@@ -850,6 +891,21 @@ impl FinishedScan<'_> {
         }
 
         let totals = result.totals;
+        let private: PrivateBytes = result.private_allocation.bytes;
+        let estimate: ReclaimEstimate = match private.value() {
+            Some(bytes) => ReclaimEstimate {
+                bytes,
+                measure: SizeMeasure::PrivateAllocatedBytes,
+                exclusive_storage_known: false,
+                files_allocated_below_logical: result.shared_storage.files_allocated_below_logical,
+            },
+            None => ReclaimEstimate {
+                bytes: totals.allocated_bytes,
+                measure: SizeMeasure::AllocatedBytes,
+                exclusive_storage_known: false,
+                files_allocated_below_logical: result.shared_storage.files_allocated_below_logical,
+            },
+        };
         let charge: Option<WorkCharge> = work_bytes
             .zip(unit.allocated)
             .and_then(|(below, own)| below.checked_add(own))
@@ -869,16 +925,13 @@ impl FinishedScan<'_> {
             source: MeasurementSource::Scanned,
             logical_bytes: totals.logical_bytes,
             allocated_bytes: totals.allocated_bytes,
+            private_allocated_bytes: private,
+            complete_family_shared_bytes: result.private_allocation.complete_family_shared_bytes,
             files: totals.files,
             directories: totals.directories,
             symlinks: totals.symlinks,
             charge,
-            estimate: ReclaimEstimate {
-                bytes: totals.allocated_bytes,
-                measure: SizeMeasure::AllocatedBytes,
-                exclusive_storage_known: false,
-                files_allocated_below_logical: result.shared_storage.files_allocated_below_logical,
-            },
+            estimate,
             measured_at: result.finished.wall,
         })
     }
@@ -904,6 +957,9 @@ pub(super) struct Assessment {
     /// unit. `None` when the unit was not measured in this discovery or
     /// has no object below it.
     pub(super) newest_content_change: Option<WallTime>,
+    /// The first Git marker or Git directory below the unit, relative to
+    /// the unit, when the measurement found one.
+    pub(super) repository_marker: Option<PathBuf>,
 }
 
 impl Assessment {
@@ -919,6 +975,7 @@ impl Assessment {
             measurement: None,
             activity: ActivityFact::Unknown,
             newest_content_change: None,
+            repository_marker: None,
         }
     }
 
@@ -964,6 +1021,7 @@ pub(super) fn conclude(
         measurement,
         activity,
         newest_content_change: _,
+        repository_marker,
     } = assessment;
     let relative_entry: LosslessPath = LosslessPath::from_path(&relative)
         .map_err(|_| DiscoveryError::Internal("the unit name"))?;
@@ -985,6 +1043,8 @@ pub(super) fn conclude(
             reasons: reasons.into_iter().collect(),
             eligibility,
             evidence,
+            repository_marker: repository_marker
+                .and_then(|path| LosslessPath::from_path(&path).ok()),
         })));
     };
     let support: &LayoutSupport = rule
@@ -1239,6 +1299,8 @@ fn apply_rejection(eligibility: &mut CandidateEligibility, reasons: &BTreeSet<Sk
     for reason in reasons {
         match reason {
             SkipReason::ProtectedData => eligibility.no_exclusion_overlap = Fact::NotSatisfied,
+            // A repository holds data that no build makes again.
+            SkipReason::NestedRepository => eligibility.regenerable = Fact::NotSatisfied,
             SkipReason::UnsupportedLayout => {
                 eligibility.rule_supports_layout = Fact::NotSatisfied;
             }
@@ -1298,12 +1360,16 @@ pub(super) fn establish_charge(
         before,
         principal,
     } = *unit;
-    let (measured, newest_change): (Measured, Option<WallTime>) = match known {
+    let MeasuredUnit {
+        measured,
+        newest_change,
+        repository_marker,
+    } = match known {
         None => measure_unit(path, before, rule, bounds, classify, principal)?,
         // A carried measurement examines no object below the unit: the
         // owners and the times of the content are those of the earlier
         // discovery, and the executor compares each owner again.
-        Some(known) => (
+        Some(known) => MeasuredUnit::only(
             carried_measurement(
                 known,
                 before,
@@ -1314,10 +1380,10 @@ pub(super) fn establish_charge(
                 |reason| Measured::Rejected(BTreeSet::from([reason])),
                 Measured::Complete,
             ),
-            None,
         ),
     };
     assessment.newest_content_change = newest_change;
+    assessment.repository_marker = repository_marker;
     match measured {
         Measured::Complete(measurement) => {
             assessment.eligibility.unit_and_charge_known = Fact::Satisfied;

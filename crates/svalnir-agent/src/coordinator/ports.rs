@@ -11,7 +11,9 @@ use svalnir_core::action::{Journal, Plan, Principal, ResourceEffect, StopFence, 
 use svalnir_core::authority::Generation;
 use svalnir_core::file::FileObjectEvidence;
 use svalnir_core::grant::{ActionRequest, Authorization, EvidenceStamp, IncidentBudget, Refusal};
-use svalnir_core::id::{ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, VolumeId};
+use svalnir_core::id::{
+    ExecutorEpochId, IncidentId, LeaseId, OperationId, RequestId, StepId, VolumeId,
+};
 use svalnir_core::observation::Observation;
 use svalnir_core::plan::PlanMode;
 use svalnir_core::policy::{EvaluationClock, ProtectionFact};
@@ -21,19 +23,24 @@ use svalnir_core::state::PressureState;
 use svalnir_core::time::WallTime;
 
 use crate::executor::fs::{AdmittedStep, ApprovedRoots, FsExecutor, StepOutcome, StopSignal};
+use crate::executor::owner::{AdmittedOwnerStep, OwnerExecutor, OwnerRun};
 use crate::executor::process::{
     ExecutorError, GenerationState, Observation as ExitObservation, ProcessControl,
     ProcessExecutor, StepClock, StepInput, StepRun, StopRequest,
 };
 use crate::journal::{
     Acknowledged, Acknowledgment, ClaimedRequest, CoordinationStart, CoordinatorLock,
-    IncidentUsage, OperationJournal, OperationJournalError, RecoveryRecord, RequestCompletion,
-    VolatilePersistReport, VolatileRecord,
+    DescendantChange, IncidentUsage, OperationJournal, OperationJournalError, OwnerProcess,
+    RecoveryRecord, RequestCompletion, VolatilePersistReport, VolatileRecord,
 };
 use crate::platform::process::ProcessSource;
 use crate::protection::ProtectedLocations;
 use crate::rules::ProducerActivity;
+use crate::rules::in_use::UnitUse;
+use crate::rules::projects::UnitRecheck;
+use std::path::Path;
 use svalnir_core::rule::RuleRef;
+use svalnir_core::rule::owner::OwnerOperation;
 
 /// One reading of the clocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +137,47 @@ pub trait AuthoritySource: Debug {
     /// before each step of an eviction. Only
     /// [`ProducerActivity::Inactive`] permits the step.
     fn producer_activity(&self, rule: &RuleRef) -> ProducerActivity;
+
+    /// Whether a process of the user uses the file target at `path` now,
+    /// from an inventory that this call reads (`docs/CLEANUP_RULES.md`
+    /// section 6). The coordinator asks immediately before each step of an
+    /// eviction, after [`producer_activity`](Self::producer_activity). Only
+    /// [`UnitUse::NotInUse`] permits the step.
+    fn unit_use(&self, path: &Path) -> UnitUse;
+
+    /// The checks of the rule for the file target at `path` below its
+    /// approved root `root`, from evidence that this call reads: for
+    /// `project.dependency-directory`, the layout `layout` of the sealed
+    /// plan with its markers, the protected children, and the build
+    /// processes of the project. The coordinator asks immediately before
+    /// each step of an eviction, after [`unit_use`](Self::unit_use). Only
+    /// [`UnitRecheck::Passed`] permits the step.
+    ///
+    /// The default has no evidence for that rule, so it refuses its steps;
+    /// a rule with no such check passes.
+    fn unit_recheck(
+        &self,
+        rule: &RuleRef,
+        layout: Option<&str>,
+        _root: &Path,
+        _path: &Path,
+    ) -> UnitRecheck {
+        if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID
+            || crate::rules::clear::is_clear_rule(rule.id.as_str())
+            || layout == Some(crate::rules::XCODE_ORPHAN_LAYOUT)
+        {
+            UnitRecheck::Unknown("unit_recheck_unavailable")
+        } else {
+            UnitRecheck::Passed
+        }
+    }
+
+    /// The reviewed owner-operation declaration of the exact rule revision
+    /// `rule`, from the registry of the records
+    /// ([`svalnir_core::rule::RuleRegistry::owner_operation`]). The
+    /// coordinator makes the command of an owner step again from it at
+    /// admission. `None` for a rule with no owner operation.
+    fn owner_operation(&self, rule: &RuleRef) -> Option<OwnerOperation>;
 }
 
 /// The measurements of outcome verification.
@@ -185,6 +233,20 @@ impl FilesystemExecutor for FsExecutor {
         signal: &dyn StopSignal,
     ) -> StepOutcome {
         self.execute_step_until(roots, step, signal)
+    }
+}
+
+/// The owner executor, as the coordinator calls it.
+pub trait OwnerOperationExecutor: Debug {
+    /// Starts one admitted owner step under `roots` on a worker thread and
+    /// returns its handle; the call does not wait for the command
+    /// (`docs/ACTION_CONTRACTS.md` section 7).
+    fn begin(&self, roots: &ApprovedRoots, step: AdmittedOwnerStep<'_>) -> OwnerRun;
+}
+
+impl OwnerOperationExecutor for OwnerExecutor {
+    fn begin(&self, roots: &ApprovedRoots, step: AdmittedOwnerStep<'_>) -> OwnerRun {
+        Self::begin(self, roots, step)
     }
 }
 
@@ -251,6 +313,23 @@ pub trait TargetProbe: Debug {
 
     /// Reads one planned process generation.
     fn process(&self, planned: &ProcessIdentity) -> GenerationState;
+
+    /// Whether a process of the recorded command of an owner step lives:
+    /// the command, a process of its group, or a process for which it is
+    /// responsible. The default reads the process table of the host
+    /// ([`crate::executor::owner::process_lives`]).
+    fn owner_process_lives(&self, process: &OwnerProcess) -> bool {
+        crate::executor::owner::process_lives(process)
+    }
+
+    /// Stops each live process of the recorded command of an owner step,
+    /// for the reconciliation after a restart. Returns whether a process
+    /// of the command lives after the stop. The default signals the
+    /// processes of the host by their identities
+    /// ([`crate::executor::owner::stop_recorded`]).
+    fn stop_owner_process(&self, process: &OwnerProcess) -> bool {
+        crate::executor::owner::stop_recorded(process, crate::executor::owner::RECORDED_STOP_GRACE)
+    }
 }
 
 /// The probe of the running system: `lstat` on the approved root, on each
@@ -489,6 +568,44 @@ pub trait CoordinatorJournal: Journal {
         operation_id: &OperationId,
     ) -> Result<Vec<ResourceEffect>, OperationJournalError>;
 
+    /// Records the process of the command of an owner step. See
+    /// [`OperationJournal::record_owner_process`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn record_owner_process(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        process: &OwnerProcess,
+    ) -> Result<(), OperationJournalError>;
+
+    /// Applies a change of the descendants to the process record of an
+    /// owner step. See
+    /// [`OperationJournal::record_owner_descendants`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn record_owner_descendants(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        change: &DescendantChange,
+    ) -> Result<(), OperationJournalError>;
+
+    /// The process records of the owner steps of an operation. See
+    /// [`OperationJournal::owner_processes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the journal.
+    fn owner_processes(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Vec<OwnerProcess>, OperationJournalError>;
+
     /// Writes the stop fence of an operation. The result says whether the
     /// fence is durable or is a stop of this instance only.
     fn stop_fence(&mut self, operation_id: &OperationId) -> StopFence {
@@ -589,5 +706,30 @@ impl CoordinatorJournal for OperationJournal {
         record: &mut VolatileRecord,
     ) -> Result<VolatilePersistReport, OperationJournalError> {
         record.persist_into(self)
+    }
+
+    fn record_owner_process(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        process: &OwnerProcess,
+    ) -> Result<(), OperationJournalError> {
+        Self::record_owner_process(self, operation_id, step_id, process)
+    }
+
+    fn owner_processes(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Vec<OwnerProcess>, OperationJournalError> {
+        Self::owner_processes(self, operation_id)
+    }
+
+    fn record_owner_descendants(
+        &mut self,
+        operation_id: &OperationId,
+        step_id: &StepId,
+        change: &DescendantChange,
+    ) -> Result<(), OperationJournalError> {
+        Self::record_owner_descendants(self, operation_id, step_id, change)
     }
 }

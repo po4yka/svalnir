@@ -13,20 +13,25 @@ use svalnir_core::time::MonotonicNanos;
 use tempfile::TempDir;
 
 use super::{
-    BuildProcesses, NativeProcessEvidence, ProcessEvidence, ProjectActivity, ProjectHost,
-    ProjectInspection, ProjectLimits, ProjectProcess, ProjectUnitOutcome, ProjectUnitReport,
-    SearchCompletion, SearchRootOutcome, SearchRoots, VersionControl, is_build_process,
+    AgentListing, AgentStatus, BuildProcesses, ClaudeTranscripts, GitHeadActivity, HeadActivity,
+    NativeProcessEvidence, ProcessEvidence, ProjectActivity, ProjectHost, ProjectInspection,
+    ProjectLimits, ProjectProcess, ProjectUnitOutcome, ProjectUnitReport, RecencyHost,
+    SearchCompletion, SearchRootOutcome, SearchRoots, SourceReading, TranscriptActivity,
+    VersionControl, is_build_process,
 };
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
 use crate::rules::caches::ReclaimFigure;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
+use crate::rules::git::Repository;
 use crate::rules::git::{GitTool, GitToolProblem};
+use crate::rules::nested_git::{RefusalReason, RepositoryRefusal};
 use crate::rules::resolve_roots;
-use crate::scan::{CancellationToken, WallScanClock};
+use crate::scan::{CancellationToken, ScanClock, WallScanClock};
+use svalnir_core::quantity::Nanoseconds;
 
 /// Process evidence that the test gives.
-struct Fixed(BuildProcesses);
+pub(super) struct Fixed(BuildProcesses);
 
 impl ProcessEvidence for Fixed {
     fn build_processes(&self, _principal: Uid) -> BuildProcesses {
@@ -35,6 +40,18 @@ impl ProcessEvidence for Fixed {
 
     fn monotonic_now(&self) -> Option<MonotonicNanos> {
         self.0.observed_at
+    }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        _scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        // A complete inventory with no use, at the time of the evidence.
+        crate::platform::process::PathInventory {
+            observed_at: self.0.observed_at,
+            ..crate::platform::process::PathInventory::default()
+        }
     }
 }
 
@@ -48,24 +65,58 @@ fn inventory(processes: Vec<ProjectProcess>) -> Fixed {
 }
 
 /// A complete inventory with one process that is not a build process.
-fn quiet() -> Fixed {
+pub(super) fn quiet() -> Fixed {
     inventory(vec![ProjectProcess {
         executable: PathBuf::from("/usr/bin/login"),
         working_directory: None,
     }])
 }
 
+/// Sources of the project activity with no evidence, and no Paseo source.
+pub(super) struct NoActivity;
+
+impl HeadActivity for NoActivity {
+    fn head_activity(&self, _repository: &Repository) -> SourceReading {
+        SourceReading::NoEvidence
+    }
+}
+
+impl TranscriptActivity for NoActivity {
+    fn transcript_activity(&self, _root: &Path) -> SourceReading {
+        SourceReading::NoEvidence
+    }
+}
+
+impl AgentStatus for NoActivity {
+    fn agent_listing(&self) -> AgentListing {
+        AgentListing::Off
+    }
+}
+
+/// The quiet period of the template, 24 hours.
+pub(super) const DAY: Nanoseconds = Nanoseconds::new(86_400_000_000_000);
+
+/// A project activity with no evidence.
+pub(super) fn no_recency() -> RecencyHost<'static> {
+    RecencyHost {
+        quiet_period: DAY,
+        head: &NoActivity,
+        transcripts: &NoActivity,
+        agents: &NoActivity,
+    }
+}
+
 /// A home directory with the search root `Code` in a temporary directory.
-struct Home {
+pub(super) struct Home {
     _directory: TempDir,
-    path: PathBuf,
-    locations: ProtectedLocations,
-    principal: Uid,
-    git: GitTool,
+    pub(super) path: PathBuf,
+    pub(super) locations: ProtectedLocations,
+    pub(super) principal: Uid,
+    pub(super) git: GitTool,
 }
 
 impl Home {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let directory: TempDir = TempDir::new().unwrap();
         let path: PathBuf = fs::canonicalize(directory.path()).unwrap();
         let state: PathBuf = path.join("Library/Application Support/Svalnir");
@@ -81,7 +132,7 @@ impl Home {
         }
     }
 
-    fn write(&self, relative: &str, content: &[u8]) -> PathBuf {
+    pub(super) fn write(&self, relative: &str, content: &[u8]) -> PathBuf {
         let path: PathBuf = self.path.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, content).unwrap();
@@ -90,7 +141,7 @@ impl Home {
 
     /// Runs the Git of the test in `directory`, with no configuration of
     /// the host.
-    fn git(&self, directory: &str, arguments: &[&str]) {
+    pub(super) fn git(&self, directory: &str, arguments: &[&str]) {
         let status = Command::new(self.git.executable())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -117,7 +168,7 @@ impl Home {
     }
 
     /// A repository at `directory` with one commit of its files.
-    fn repository(&self, directory: &str) {
+    pub(super) fn repository(&self, directory: &str) {
         fs::create_dir_all(self.path.join(directory)).unwrap();
         self.git(directory, &["init", "-q"]);
         self.git(directory, &["add", "-A"]);
@@ -126,7 +177,7 @@ impl Home {
 
     /// A Node project at `Code/NAME` with an installed package, which Git
     /// ignores.
-    fn node_project(&self, name: &str) -> PathBuf {
+    pub(super) fn node_project(&self, name: &str) -> PathBuf {
         let project: String = format!("Code/{name}");
         self.write(&format!("{project}/package.json"), b"{}");
         self.write(&format!("{project}/.gitignore"), b"node_modules/\n");
@@ -138,11 +189,59 @@ impl Home {
         self.path.join(project)
     }
 
-    fn inspect_with(
+    pub(super) fn inspect_with(
         &self,
         processes: &dyn ProcessEvidence,
         git: Result<&GitTool, GitToolProblem>,
         limits: ProjectLimits,
+    ) -> ProjectInspection {
+        self.inspect_recency(processes, git, limits, &NoActivity, DAY, &WallScanClock)
+    }
+
+    /// The inspection with the native Git and transcript sources of the
+    /// project activity, the Paseo source `agents`, the quiet period
+    /// `quiet_period`, and the clock `clock`.
+    pub(super) fn inspect_recency(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        agents: &dyn AgentStatus,
+        quiet_period: Nanoseconds,
+        clock: &dyn ScanClock,
+    ) -> ProjectInspection {
+        let head = GitHeadActivity::new(git);
+        let transcripts = ClaudeTranscripts::for_home(Some(&self.path));
+        let recency = RecencyHost {
+            quiet_period,
+            head: &head,
+            transcripts: &transcripts,
+            agents,
+        };
+        self.inspect_sources(processes, git, limits, recency, clock)
+    }
+
+    /// The inspection with the sources of the project activity `recency`.
+    pub(super) fn inspect_sources(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        recency: RecencyHost<'_>,
+        clock: &dyn ScanClock,
+    ) -> ProjectInspection {
+        self.inspect_layouts(processes, git, limits, recency, clock, &[])
+    }
+
+    /// The inspection with the layouts of the configuration `layouts`.
+    pub(super) fn inspect_layouts(
+        &self,
+        processes: &dyn ProcessEvidence,
+        git: Result<&GitTool, GitToolProblem>,
+        limits: ProjectLimits,
+        recency: RecencyHost<'_>,
+        clock: &dyn ScanClock,
+        layouts: &[svalnir_core::config::UserLayout],
     ) -> ProjectInspection {
         let registry: ReviewedRules = ReviewedRules::new().unwrap();
         let host: ProjectHost<'_> = ProjectHost {
@@ -151,23 +250,25 @@ impl Home {
             user_exclusions: &[],
             git,
             processes,
+            recency,
+            layouts,
         };
         registry.projects().inspect(
             host,
             &SearchRoots::new(vec![PathBuf::from("Code")]).unwrap(),
             limits,
             &CancellationToken::new(),
-            &WallScanClock,
+            clock,
         )
     }
 
-    fn inspect(&self, processes: &dyn ProcessEvidence) -> ProjectInspection {
+    pub(super) fn inspect(&self, processes: &dyn ProcessEvidence) -> ProjectInspection {
         self.inspect_with(processes, Ok(&self.git), ProjectLimits::default())
     }
 }
 
 /// The report of the unit at `path`.
-fn unit<'a>(inspection: &'a ProjectInspection, path: &Path) -> &'a ProjectUnitReport {
+pub(super) fn unit<'a>(inspection: &'a ProjectInspection, path: &Path) -> &'a ProjectUnitReport {
     inspection
         .units
         .iter()
@@ -175,7 +276,7 @@ fn unit<'a>(inspection: &'a ProjectInspection, path: &Path) -> &'a ProjectUnitRe
         .unwrap_or_else(|| panic!("no unit {}: {:#?}", path.display(), inspection.units))
 }
 
-fn refusal(report: &ProjectUnitReport) -> &'static str {
+pub(super) fn refusal(report: &ProjectUnitReport) -> &'static str {
     match report.outcome {
         ProjectUnitOutcome::Refused { reason } => reason,
         ref other => panic!("the unit was not refused: {other:?}"),
@@ -187,17 +288,33 @@ fn refusal(report: &ProjectUnitReport) -> &'static str {
 // ---------------------------------------------------------------------
 
 #[test]
-fn the_rule_is_registered_proposed_with_the_inspection_mode_only() {
+fn the_rule_is_registered_proposed_with_no_automatic_mode() {
     let registry: ReviewedRules = ReviewedRules::new().unwrap();
     let rule = registry.projects().rule();
     assert_eq!(rule.reference.id.as_str(), "project.dependency-directory");
-    assert_eq!(rule.modes, [RuleMode::Inspection]);
+    assert_eq!(rule.reference.revision.as_str(), "r3");
+    assert_eq!(rule.modes, [RuleMode::Inspection, RuleMode::ManualEviction]);
     let layouts: Vec<&str> = rule
         .layouts
         .iter()
         .map(|layout| layout.layout.as_str())
         .collect();
-    assert_eq!(layouts, ["node-modules", "python-venv", "cocoapods-pods"]);
+    let mut expected: Vec<&str> = super::PROJECT_LAYOUTS
+        .iter()
+        .map(|layout| layout.layout)
+        .collect();
+    expected.push("user-configured");
+    assert_eq!(layouts, expected);
+    assert_eq!(
+        &layouts[..5],
+        [
+            "node-modules",
+            "python-venv",
+            "python-venv-plain",
+            "cocoapods-pods",
+            "cargo-target"
+        ]
+    );
     for layout in &rule.layouts {
         assert_eq!(layout.lifecycle, LifecycleState::Proposed);
         for mode in RuleMode::ALL {
@@ -225,13 +342,23 @@ fn the_rule_is_registered_proposed_with_the_inspection_mode_only() {
 }
 
 #[test]
-fn a_fixture_lifecycle_does_not_change_the_rule() {
+fn a_fixture_lifecycle_gives_the_rule_a_manual_state_at_most() {
     for state in [manual_action_validated(), automatic_eviction_validated()] {
         let registry: ReviewedRules = ReviewedRules::with_fixture_lifecycle(&state).unwrap();
-        for layout in &registry.projects().rule().layouts {
-            assert_eq!(layout.lifecycle, LifecycleState::Proposed);
-            assert!(!layout.lifecycle.permits(&RuleMode::ManualEviction));
-            assert!(!layout.lifecycle.permits(&RuleMode::AutomaticEviction));
+        let rule = registry.projects().rule();
+        for layout in &rule.layouts {
+            assert_eq!(layout.lifecycle, manual_action_validated());
+            assert!(layout.permits(&RuleMode::ManualEviction));
+            assert!(!layout.permits(&RuleMode::AutomaticEviction));
+            assert!(
+                registry
+                    .resolve(
+                        &rule.reference,
+                        &layout.layout,
+                        &RuleMode::AutomaticEviction
+                    )
+                    .is_err()
+            );
         }
     }
 }
@@ -246,10 +373,7 @@ fn a_search_root_is_a_plain_path_below_the_home_directory() {
     }
     assert!(SearchRoots::new(vec![PathBuf::from("Code"), PathBuf::from("Code")]).is_err());
     assert_eq!(SearchRoots::new(vec![PathBuf::from("Code"); 17]), Err(None));
-    assert_eq!(
-        SearchRoots::new(Vec::new()).unwrap().paths(),
-        &[] as &[PathBuf]
-    );
+    assert!(SearchRoots::new(Vec::new()).unwrap().is_empty());
 }
 
 #[test]
@@ -265,6 +389,8 @@ fn no_search_root_examines_nothing() {
             user_exclusions: &[],
             git: Ok(&home.git),
             processes: &processes,
+            recency: no_recency(),
+            layouts: &[],
         },
         &SearchRoots::new(Vec::new()).unwrap(),
         ProjectLimits::default(),
@@ -287,6 +413,8 @@ fn a_search_root_with_the_state_directory_is_refused() {
             user_exclusions: &[],
             git: Ok(&home.git),
             processes: &processes,
+            recency: no_recency(),
+            layouts: &[],
         },
         &SearchRoots::new(vec![PathBuf::from("Library"), PathBuf::from("Absent")]).unwrap(),
         ProjectLimits::default(),
@@ -581,21 +709,36 @@ fn a_virtual_environment_needs_its_marker_and_cocoapods_needs_its_manifest() {
 }
 
 #[test]
-fn a_cargo_target_directory_belongs_to_the_cargo_rule() {
+fn a_cargo_target_directory_is_the_cargo_target_layout() {
     let home = Home::new();
     home.write("Code/crate/Cargo.toml", b"[package]\n");
+    home.write("Code/crate/.gitignore", b"/target\n");
+    home.repository("Code/crate");
     home.write("Code/crate/target/debug/app", b"");
+    // A target directory with no tag of Cargo is not a unit.
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let report = unit(&inspection, &home.path.join("Code/crate/target"));
+    assert_eq!(report.layout, "cargo-target");
+    assert_eq!(refusal(report), "unsupported_layout");
+    home.write(
+        "Code/crate/target/CACHEDIR.TAG",
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    assert!(matches!(
+        unit(&inspection, &home.path.join("Code/crate/target")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
     // A directory named `target` with no manifest is an ordinary
-    // directory, which the walk enters.
+    // directory, which the walk enters and the report does not list.
     home.write("Code/web/target/package.json", b"{}");
     home.write("Code/web/target/node_modules/a/index.js", b"1;\n");
     let inspection: ProjectInspection = home.inspect(&quiet());
-    let report = unit(&inspection, &home.path.join("Code/crate/target"));
-    assert_eq!(
-        report.outcome,
-        ProjectUnitOutcome::OwnedByOtherRule {
-            rule: "cargo.build-output"
-        }
+    assert!(
+        inspection
+            .units
+            .iter()
+            .all(|unit| unit.path != home.path.join("Code/web/target"))
     );
     assert_eq!(
         refusal(unit(
@@ -647,7 +790,20 @@ fn a_linked_worktree_of_the_project_has_git_evidence() {
 
 #[test]
 fn the_build_process_names() {
-    for name in ["node", "pnpm", "python3", "python3.13", "pod", "xcodebuild"] {
+    for name in [
+        "node",
+        "pnpm",
+        "python3",
+        "python3.13",
+        "pod",
+        "xcodebuild",
+        "cargo",
+        "java",
+        "beam.smp",
+        "dotnet",
+        "zig",
+        "swift-build",
+    ] {
         assert!(is_build_process(name), "{name}");
     }
     for name in ["zsh", "Finder", "nodejs-helper", "login"] {
@@ -720,6 +876,8 @@ fn a_search_root_in_another_case_has_the_stored_names() {
             user_exclusions: &[],
             git: Ok(&home.git),
             processes: &NativeProcessEvidence,
+            recency: no_recency(),
+            layouts: &[],
         },
         &SearchRoots::new(vec![PathBuf::from("code")]).unwrap(),
         ProjectLimits::default(),
@@ -731,4 +889,138 @@ fn a_search_root_in_another_case_has_the_stored_names() {
     assert_eq!(inspection.roots[0].path, Some(home.path.join("Code")));
     let report = unit(&inspection, &project.join("node_modules"));
     assert_eq!(refusal(report), "producer_active");
+}
+
+// ---------------------------------------------------------------------
+// The use check of a running process (`docs/CLEANUP_RULES.md` section 6).
+// ---------------------------------------------------------------------
+
+/// The build-process evidence of `quiet`, with the path-use inventory of
+/// `uses`.
+struct WithUses<
+    F: Fn(&[crate::rules::in_use::UnitScope]) -> crate::platform::process::PathInventory,
+>(Fixed, F);
+
+impl<F: Fn(&[crate::rules::in_use::UnitScope]) -> crate::platform::process::PathInventory>
+    ProcessEvidence for WithUses<F>
+{
+    fn build_processes(&self, principal: Uid) -> BuildProcesses {
+        self.0.build_processes(principal)
+    }
+
+    fn monotonic_now(&self) -> Option<MonotonicNanos> {
+        self.0.monotonic_now()
+    }
+
+    fn path_uses(
+        &self,
+        _principal: Uid,
+        scopes: &[crate::rules::in_use::UnitScope],
+    ) -> crate::platform::process::PathInventory {
+        let mut inventory = (self.1)(scopes);
+        inventory.observed_at = self.0.monotonic_now();
+        inventory
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_unit_that_a_child_process_names_in_an_argument_is_refused() {
+    use crate::platform::process::{DarwinProcessSource, PathUseKind};
+    use crate::rules::in_use::{UnitUse, inventory_of};
+
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    let named: PathBuf = fs::canonicalize(project.join("node_modules/left-pad/index.js")).unwrap();
+    // A disposable child that names the file as `$0` and runs `sleep`.
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("/bin/sleep 30; :")
+        .arg(&named)
+        .spawn()
+        .unwrap();
+    let evidence = WithUses(quiet(), |scopes: &[crate::rules::in_use::UnitScope]| {
+        let source: DarwinProcessSource = DarwinProcessSource::new();
+        inventory_of(
+            &source,
+            crate::platform::process::ProcessSource::effective_uid(&source),
+            scopes,
+        )
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let report = loop {
+        let inspection: ProjectInspection = home.inspect(&evidence);
+        let report = unit(&inspection, &project.join("node_modules")).clone();
+        if matches!(report.uses, Some(UnitUse::InUse { .. }))
+            || std::time::Instant::now() > deadline
+        {
+            break report;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _killed: std::io::Result<()> = child.kill();
+    let _waited: std::io::Result<std::process::ExitStatus> = child.wait();
+    assert_eq!(refusal(&report), "unit_in_use");
+    let Some(UnitUse::InUse { uses, .. }) = &report.uses else {
+        panic!("{:?}", report.uses);
+    };
+    let found = uses
+        .iter()
+        .find(|found| found.kind == PathUseKind::Argument)
+        .unwrap_or_else(|| panic!("{uses:?}"));
+    assert_eq!(found.name, "sh");
+    assert_eq!(found.relative, PathBuf::from("left-pad"));
+    // The report has no other part of the command line.
+    let text: String = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("sleep 30"), "{text}");
+}
+
+#[test]
+fn a_unit_with_an_unknown_process_is_refused_with_its_name() {
+    use crate::platform::process::{InventoryGap, PathInventory, UnknownProcess};
+    use crate::rules::in_use::UnitUse;
+    use svalnir_core::process::Pid;
+
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    let evidence = WithUses(quiet(), |_: &[crate::rules::in_use::UnitScope]| {
+        PathInventory {
+            unknown: vec![UnknownProcess {
+                pid: Pid::new(9).unwrap(),
+                name: "routined".to_owned(),
+                reason: InventoryGap::ProcessQueryDenied,
+            }],
+            ..PathInventory::default()
+        }
+    });
+    let inspection: ProjectInspection = home.inspect(&evidence);
+    let report = unit(&inspection, &project.join("node_modules"));
+    assert_eq!(refusal(report), "unit_use_unknown");
+    let Some(UnitUse::Unknown { processes, .. }) = &report.uses else {
+        panic!("{:?}", report.uses);
+    };
+    assert_eq!(processes[0].name, "routined");
+}
+
+// ---------------------------------------------------------------------
+// Repositories in a unit.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_unit_that_holds_a_repository_is_refused_and_not_measured() {
+    let home = Home::new();
+    let project: PathBuf = home.node_project("app");
+    // A dependency that a person cloned into the ignored directory.
+    home.repository("Code/app/node_modules/forked-lib");
+
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let report = unit(&inspection, &project.join("node_modules"));
+    assert_eq!(report.version_control, Some(VersionControl::Ignored));
+    assert_eq!(
+        report.outcome,
+        ProjectUnitOutcome::RepositoryRefused(RepositoryRefusal {
+            reason: RefusalReason::NestedRepository,
+            path: Some(PathBuf::from("forked-lib")),
+        })
+    );
 }

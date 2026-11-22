@@ -32,8 +32,8 @@ use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, RecordRead, RootView, WalkStop, lstat, read_record, walk_local,
 };
 use crate::scan::{
-    CancellationToken, NoObserver, ScanClock, ScanCompletion, ScanLimits, ScanRequest, ScanResult,
-    run_scan,
+    CancellationToken, NoObserver, ScanClock, ScanCompletion, ScanLimits, ScanObserver,
+    ScanRequest, ScanResult, run_scan,
 };
 
 /// The scan identity of a unit measurement. The result is not saved.
@@ -381,9 +381,11 @@ fn is_in_project(root: &Path, home: &Path) -> bool {
 }
 
 /// Whether the unit at `path` has the marker of its layout.
-fn has_marker(path: &Path, marker: Marker, principal: Uid) -> bool {
+pub(in crate::rules) fn has_marker(path: &Path, marker: Marker, principal: Uid) -> bool {
     match marker {
         Marker::Directory => true,
+        Marker::File(name) => lstat(&path.join(name))
+            .is_ok_and(|child| child.kind == ObjectKind::RegularFile && child.owner == principal),
         Marker::ChildDirectory(name) => {
             lstat(&path.join(name)).is_ok_and(|child| child.kind == ObjectKind::Directory)
         }
@@ -405,6 +407,73 @@ fn walk_refusal(stop: &WalkStop) -> &'static str {
         WalkStop::LocalityUnknown => "root_locality_unknown",
         WalkStop::Failed(_) => RootProblem::NotReadable.as_str(),
     }
+}
+
+/// The checks of the root of a cache at `path` as the scope of an owner
+/// operation, and its binding: the checks of an inspected root
+/// ([`CacheRule::inspect`]) with no unit. The root must have no protection,
+/// overlap no location of `exclusions`, be a local directory of the user
+/// with no symbolic link from `/`, overlap no user exclusion, and be in no
+/// project directory.
+///
+/// # Errors
+///
+/// Returns [`RootOutcome::Absent`] when nothing is at the path, and
+/// [`RootOutcome::Refused`] with the stable name of the first check that
+/// fails.
+pub(in crate::rules) fn check_scope_root(
+    exclusions: &[ExclusionSpec],
+    path: &Path,
+    host: &InspectionHost<'_>,
+    home: &Path,
+    mounts: &MountTable,
+) -> Result<crate::rules::eviction::BoundRoot, RootOutcome> {
+    let refused = RootOutcome::Refused;
+    match host.locations.of_text(path) {
+        ProtectionFact::NotProtected => {}
+        ProtectionFact::Protected => return Err(refused("root_protected")),
+        ProtectionFact::Unknown => return Err(refused("root_protection_unknown")),
+    }
+    if path == home || home.starts_with(path) {
+        return Err(refused("root_contains_home"));
+    }
+    for exclusion in exclusions {
+        let Some(excluded) = excluded_paths(exclusion, home, host.principal, mounts) else {
+            return Err(refused("exclusion_not_resolved"));
+        };
+        if excluded.iter().any(|entry| overlaps(path, entry)) {
+            return Err(refused("root_overlaps_excluded"));
+        }
+    }
+    match walk_local(path, mounts) {
+        Ok(_) => {}
+        Err(WalkStop::Absent) => return Err(RootOutcome::Absent),
+        Err(stop) => return Err(refused(walk_refusal(&stop))),
+    }
+    let bound = bind_root(path).map_err(|problem| match problem {
+        RootProblem::Absent => RootOutcome::Absent,
+        other => refused(other.as_str()),
+    })?;
+    let protected: Vec<PathBuf> = host
+        .locations
+        .state_directory()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    let scope: DiscoveryScope<'_> = DiscoveryScope {
+        root: &bound.binding,
+        principal: host.principal,
+        protected_paths: &protected,
+        user_exclusions: host.user_exclusions,
+    };
+    let view: RootView =
+        RootView::open(&scope, mounts).map_err(|error| refused(refusal_name(&error)))?;
+    if is_in_project(path, home) {
+        return Err(refused("root_in_project"));
+    }
+    view.verify_unchanged()
+        .map_err(|error| refused(refusal_name(&error)))?;
+    Ok(bound)
 }
 
 /// The context of the inspection of one rule.
@@ -644,6 +713,20 @@ pub(in crate::rules) fn measure_unit(
     clock: &dyn ScanClock,
     reclaim: ReclaimBasis,
 ) -> Option<CacheMeasurement> {
+    measure_unit_observed(path, limits, cancel, clock, reclaim, &mut NoObserver)
+        .map(|(measurement, _)| measurement)
+}
+
+/// [`measure_unit`] with `observer`, which sees each entry of the scan. The
+/// result has the scan result too.
+pub(in crate::rules) fn measure_unit_observed(
+    path: &Path,
+    limits: InspectionLimits,
+    cancel: &CancellationToken,
+    clock: &dyn ScanClock,
+    reclaim: ReclaimBasis,
+    observer: &mut dyn ScanObserver,
+) -> Option<(CacheMeasurement, ScanResult)> {
     let request: ScanRequest = ScanRequest {
         scan_id: ScanId::new(INSPECTION_SCAN_ID).ok()?,
         root: LosslessPath::from_path(path).ok()?,
@@ -658,9 +741,9 @@ pub(in crate::rules) fn measure_unit(
         },
         volume: None,
     };
-    let result: ScanResult = run_scan(&request, cancel, clock, &mut NoObserver).ok()?;
+    let result: ScanResult = run_scan(&request, cancel, clock, observer).ok()?;
     let totals = &result.totals;
-    Some(CacheMeasurement {
+    let measurement: CacheMeasurement = CacheMeasurement {
         logical_bytes: totals.logical_bytes,
         allocated_bytes: totals.allocated_bytes,
         files: totals.files,
@@ -675,5 +758,6 @@ pub(in crate::rules) fn measure_unit(
             ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
             ReclaimBasis::ClonedStorage => ReclaimFigure::NotKnownClonedStorage,
         },
-    })
+    };
+    Some((measurement, result))
 }

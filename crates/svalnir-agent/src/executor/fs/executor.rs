@@ -486,6 +486,7 @@ impl FsExecutor {
                 let tree = TreeBounds {
                     charge: step.file().charge,
                     refuse_hard_links: *class == ActionClass::EvictRegenerableData,
+                    refuse_repositories: *class == ActionClass::EvictRegenerableData,
                 };
                 match remove_tree(
                     &located,

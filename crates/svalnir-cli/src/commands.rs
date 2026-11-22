@@ -6,7 +6,7 @@
 //!
 //! | Module | Commands |
 //! | --- | --- |
-//! | `resources`, `monitor`, `processes`, `scan`, `doctor`, `policy` | The read-only commands, which read the host in this process |
+//! | `resources`, `disk`, `monitor`, `processes`, `scan`, `doctor`, `policy` | The read-only commands, which read the host in this process |
 //! | `config` | `config validate` and `config show`, with `--effective` |
 //! | `authority` | `config apply`, `policy enable`, `policy disable`, `policy rearm`, `agent pause`, and `agent resume` |
 //! | `clean`, `stop` | `clean plan`, `clean show`, `clean apply`, and `processes stop` |
@@ -41,15 +41,20 @@ pub(crate) mod capacity;
 #[cfg(unix)]
 pub(crate) mod clean;
 pub(crate) mod config;
+pub(crate) mod disk;
 pub(crate) mod doctor;
 pub(crate) mod evict;
 #[cfg(target_os = "macos")]
 pub(crate) mod execution;
 pub(crate) mod history;
 mod home;
+#[cfg(unix)]
+pub(crate) mod inspect;
 pub(crate) mod monitor;
 pub(crate) mod operation_view;
 pub(crate) mod operations;
+#[cfg(unix)]
+pub(crate) mod owner;
 pub(crate) mod plan_store;
 pub(crate) mod plan_view;
 pub(crate) mod policy;
@@ -251,6 +256,8 @@ fn dispatch_read_only(
         } => processes::show(arguments, invocation),
         Command::Scan(arguments) => scan::scan(arguments, invocation),
         Command::Report(arguments) => scan::report(arguments, invocation),
+        Command::Disk(arguments) => disk::run(arguments, invocation),
+        Command::Mcp => crate::mcp::serve_process(invocation),
         Command::Doctor => doctor::run(invocation),
         Command::Config {
             command: ConfigCommand::Validate(arguments),
@@ -288,6 +295,10 @@ fn dispatch(cli: &Cli, invocation: &mut Invocation<'_>) -> Result<ExitStatus, Co
             })?;
             Ok(ExitStatus::Success)
         }
+        #[cfg(unix)]
+        Command::Clean {
+            command: CleanCommand::Inspect(arguments),
+        } => inspect::inspect(arguments, invocation),
         #[cfg(unix)]
         Command::Clean {
             command: CleanCommand::Plan(arguments),
@@ -414,6 +425,9 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
         (Command::Completions(_), Format::Json | Format::Ndjson) => {
             "`svalnir completions` writes a shell script; use `--format text`".to_owned()
         }
+        (Command::Mcp, Format::Json | Format::Ndjson) => {
+            "`svalnir mcp` writes JSON-RPC messages and takes no `--format`".to_owned()
+        }
         (command, Format::Ndjson) if !command.is_streaming() => format!(
             "`svalnir {}` is not a streaming command; use `--format json`",
             command.path()
@@ -436,7 +450,10 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
     })
 }
 
-/// A rule selects the candidates of the `evict` mode only.
+/// A rule selects the candidates of the `evict` mode and the command of the
+/// `owner` mode only, and `--include-clear` is an option of the `owner`
+/// mode and of the `evict` mode with a clear rule
+/// (`docs/CLEANUP_RULES.md` section 12, "Clear rules") only.
 fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
     let Command::Clean {
         command: CleanCommand::Plan(plan),
@@ -444,14 +461,31 @@ fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
     else {
         return Ok(());
     };
-    if plan.rule.is_none() || plan.mode == CleanMode::Evict {
+    let clear_evict: bool = plan.mode == CleanMode::Evict
+        && plan
+            .rule
+            .as_deref()
+            .is_some_and(svalnir_agent::rules::clear::is_clear_rule);
+    if plan.include_clear && plan.mode != CleanMode::Owner && !clear_evict {
+        return Err(ErrorBody {
+            code: "unsupported_rule_selection".into(),
+            family: ErrorFamily::Request,
+            stage: ErrorStage::Arguments,
+            message: "`--include-clear` applies only to `--mode owner` and to `--mode evict` with a clear rule".to_owned(),
+            fields: &["include_clear", "mode"],
+            operation_id: None,
+            plan_id: None,
+            next_action: NextAction::CorrectRequest,
+        });
+    }
+    if plan.rule.is_none() || matches!(plan.mode, CleanMode::Evict | CleanMode::Owner) {
         return Ok(());
     }
     Err(ErrorBody {
         code: "unsupported_rule_selection".into(),
         family: ErrorFamily::Request,
         stage: ErrorStage::Arguments,
-        message: "`--rule` applies only to `--mode evict`".to_owned(),
+        message: "`--rule` applies only to `--mode evict` and `--mode owner`".to_owned(),
         fields: &["rule", "mode"],
         operation_id: None,
         plan_id: None,

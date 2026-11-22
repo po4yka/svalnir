@@ -155,9 +155,17 @@ impl ActionGrant {
         self.is_in_effect(now) && class.is_recognized() && self.action_classes.contains(class)
     }
 
-    /// Whether the grant covers the exact rule revision at `now`.
-    pub fn covers_rule(&self, rule: &RuleRef, now: WallTime) -> bool {
-        self.covers_class(&ActionClass::EvictRegenerableData, now) && self.rules.contains(rule)
+    /// Whether the grant covers the exact rule revision for a step of
+    /// `class` at `now`. Only a class that removes the data of a rule
+    /// (`EvictRegenerableData` and `RunOwnerOperation`) has a rule, and the
+    /// grant must cover that class: a grant of eviction does not cover the
+    /// command of a producer for the same rule.
+    pub fn covers_rule(&self, class: &ActionClass, rule: &RuleRef, now: WallTime) -> bool {
+        let has_rule: bool = matches!(
+            class,
+            ActionClass::EvictRegenerableData | ActionClass::RunOwnerOperation
+        );
+        has_rule && self.covers_class(class, now) && self.rules.contains(rule)
     }
 
     /// Whether the grant permits an application intervention with the
@@ -344,10 +352,14 @@ mod tests {
         assert!(!grant.covers_class(&evict, at(200)));
         assert!(!grant.covers_class(&ActionClass::DeleteSelectedFiles, at(150)));
         assert!(!grant.covers_class(&ActionClass::from_wire("EmptyTrash"), at(150)));
-        assert!(grant.covers_rule(&rule("r1"), at(150)));
+        assert!(grant.covers_rule(&evict, &rule("r1"), at(150)));
         // Another revision of the same rule is not covered.
-        assert!(!grant.covers_rule(&rule("r2"), at(150)));
-        assert!(!grant.covers_rule(&rule("r1"), at(200)));
+        assert!(!grant.covers_rule(&evict, &rule("r2"), at(150)));
+        assert!(!grant.covers_rule(&evict, &rule("r1"), at(200)));
+        // A grant of eviction does not cover the command of a producer
+        // for the same rule revision.
+        assert!(!grant.covers_rule(&ActionClass::RunOwnerOperation, &rule("r1"), at(150)));
+        assert!(!grant.covers_rule(&ActionClass::DeleteSelectedFiles, &rule("r1"), at(150)));
 
         let revoked = ActionGrant {
             revoked: true,

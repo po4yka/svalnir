@@ -648,7 +648,7 @@ fn trash_moves_a_file_and_does_not_report_a_removal() {
 fn a_file_replaced_by_a_directory_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("data.bin");
@@ -970,7 +970,7 @@ fn a_trash_move_of_a_replaced_entry_is_reported_as_not_established() {
 fn a_directory_replaced_by_a_symbolic_link_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let directory: PathBuf = fixture.root.join("cache");
@@ -994,7 +994,7 @@ fn a_directory_replaced_by_a_symbolic_link_is_skipped() {
 fn a_file_replaced_by_a_symbolic_link_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("data.bin");
@@ -1015,7 +1015,7 @@ fn a_file_replaced_by_a_symbolic_link_is_skipped() {
 fn a_parent_component_replaced_by_a_symbolic_link_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let parent: PathBuf = fixture.root.join("a").join("dir");
@@ -1039,7 +1039,7 @@ fn a_parent_component_replaced_by_a_symbolic_link_is_skipped() {
 fn an_entry_replaced_by_another_inode_with_the_same_name_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("data.bin");
@@ -1290,7 +1290,7 @@ fn a_hard_link_loses_one_name_and_keeps_its_content() {
 fn a_target_on_another_device_is_skipped() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let mount: PathBuf = fixture.root.join("mnt");
@@ -1999,7 +1999,7 @@ fn a_relative_entry_that_is_not_normalized_is_refused() {
     ];
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         for entry in entries {
             let binding = binding_with(&fixture, entry, FileObjectType::RegularFile, object);
@@ -2097,7 +2097,7 @@ fn a_home_directory_that_is_not_an_anchored_path_is_rejected() {
 fn the_home_directory_and_each_directory_that_contains_it_are_refused() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         // The home directory is `root/users/me`.
@@ -2148,7 +2148,7 @@ fn the_home_directory_is_refused_under_another_name() {
 
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         // A name that is not the home path, with the identity of the home
         // directory in the binding.
@@ -2290,7 +2290,7 @@ fn an_approved_root_that_is_not_the_root_of_the_plan_is_refused() {
 fn the_approved_root_itself_is_refused() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         fs::write(fixture.root.join("data.bin"), b"data").unwrap();
@@ -3429,6 +3429,112 @@ fn an_eviction_refuses_a_tree_with_a_file_with_a_second_name() {
 }
 
 #[test]
+fn an_eviction_refuses_a_tree_with_a_repository_that_appeared_after_the_plan() {
+    for marker in ["directory", "file"] {
+        let fixture = Fixture::new();
+        let tree: PathBuf = make_tree(&fixture);
+        // The plan binds the tree with no repository in it.
+        let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+        let work_tree: PathBuf = tree.join("a").join("b");
+        if marker == "directory" {
+            fs::create_dir_all(work_tree.join(".git").join("objects")).unwrap();
+            fs::write(
+                work_tree.join(".git").join("HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(work_tree.join(".git"), b"gitdir: ../../../elsewhere\n").unwrap();
+        }
+
+        let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+        assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+        // Nothing was removed: the check is in the measurement.
+        assert!(tree.join("top.bin").exists(), "{marker}");
+        assert!(work_tree.join("two.bin").exists(), "{marker}");
+        assert!(work_tree.join(".git").exists(), "{marker}");
+    }
+}
+
+/// Makes the names of a Git directory with no `.git` name in `directory`:
+/// the file `HEAD` and the directories `objects` and `refs`.
+fn make_git_directory(directory: &Path) {
+    fs::write(directory.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::create_dir_all(directory.join("objects")).unwrap();
+    fs::create_dir_all(directory.join("refs")).unwrap();
+}
+
+#[test]
+fn an_eviction_refuses_a_tree_with_a_bare_repository() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let mirror: PathBuf = tree.join("a").join("mirror");
+    fs::create_dir(&mirror).unwrap();
+    make_git_directory(&mirror);
+    let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(mirror.join("HEAD").exists());
+    assert!(tree.join("top.bin").exists());
+}
+
+#[test]
+fn a_repository_that_appears_after_the_measurement_stops_the_removal() {
+    for marker in ["git", "bare"] {
+        let fixture = Fixture::new();
+        let tree: PathBuf = make_tree(&fixture);
+        let work_tree: PathBuf = tree.join("a").join("b");
+        let target: PathBuf = work_tree.clone();
+        // The repository appears after the measurement and before the
+        // first removal call.
+        let hook = once(
+            move |_| {
+                if marker == "git" {
+                    fs::create_dir(target.join(".git")).unwrap();
+                } else {
+                    make_git_directory(&target);
+                }
+            },
+            Checkpoint::TreeEnumerated,
+        );
+        let executor = fixture.executor_with(checkpoint_injection(hook));
+        let envelope = fixture.envelope(ActionClass::EvictRegenerableData, "tree");
+
+        let outcome = run(&executor, &fixture.roots(), &envelope);
+
+        assert_eq!(
+            failure_code(&outcome.result),
+            code::NESTED_REPOSITORY,
+            "{marker}"
+        );
+        // The measured entries of the new work tree stay.
+        assert!(work_tree.join("two.bin").exists(), "{marker}");
+        assert!(work_tree.join("three.bin").exists(), "{marker}");
+        assert!(tree.exists(), "{marker}");
+        assert!(
+            outcome.work.remaining_entries > EntryCount::ZERO,
+            "{marker}"
+        );
+    }
+}
+
+#[test]
+fn a_manual_deletion_of_a_tree_with_a_repository_is_not_refused() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    fs::create_dir(tree.join("a").join(".git")).unwrap();
+    let envelope = fixture.envelope(ActionClass::DeleteSelectedFiles, "tree");
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_removed(&outcome);
+    assert!(!tree.exists());
+}
+
+#[test]
 fn a_tree_with_a_locked_entry_is_refused_before_the_first_call() {
     for flag in [libc::UF_IMMUTABLE, libc::UF_APPEND] {
         let fixture = Fixture::new();
@@ -3470,7 +3576,7 @@ fn a_tree_with_a_locked_directory_is_refused_before_the_first_call() {
 fn a_locked_target_gets_no_call_for_each_class() {
     for class in ActionClass::ALL
         .into_iter()
-        .filter(ActionClass::is_filesystem)
+        .filter(ActionClass::takes_file_target)
     {
         let fixture = Fixture::new();
         let file: PathBuf = fixture.root.join("locked.bin");

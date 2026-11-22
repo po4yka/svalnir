@@ -95,6 +95,7 @@ pub const fn class_phrase(class: &ActionClass) -> &'static str {
         ActionClass::ForceApplicationExit => "force an application to quit",
         ActionClass::MoveToTrash => "move files to the Trash",
         ActionClass::DeleteSelectedFiles => "delete files permanently",
+        ActionClass::RunOwnerOperation => "run the cleanup command of a producer",
         ActionClass::Unrecognized(_) => "act with a different action class",
     }
 }
@@ -115,7 +116,7 @@ pub fn enable_consequence(classes: &[ActionClass]) -> String {
 /// The button row of a dialog. A row that is wider than the dialog wraps,
 /// and a button that is wider than the dialog shrinks and truncates its
 /// label (the buttons use [`ActionButton::fit`]).
-fn footer(children: Vec<AnyElement>) -> AnyElement {
+pub(crate) fn footer(children: Vec<AnyElement>) -> AnyElement {
     h_flex()
         .id("confirm-footer")
         .test_support()
@@ -346,7 +347,7 @@ fn target_list(
 
 /// The focus ring of §9: a 2 px gap in the surface color, then 2 px of
 /// `brand`.
-fn focus_ring(tokens: &Tokens) -> Vec<BoxShadow> {
+pub(crate) fn focus_ring(tokens: &Tokens) -> Vec<BoxShadow> {
     vec![
         BoxShadow {
             color: to_hsla(tokens.surface),

@@ -25,7 +25,10 @@ use super::model::{
     SCAN_RESULT_SCHEMA_VERSION, ScanCompletion, ScanError, ScanLimits, ScanRegion, ScanRequest,
     ScanResult, ScanTimestamp, ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
 };
-use super::native::{self, DirStream, RawMetadata};
+use super::native::{self, DirStream, PrivateAttributes, RawMetadata};
+use super::private::{
+    FilePart, MAX_CLONE_FAMILIES, PrivateTally, file_part, is_unsupported_request,
+};
 use super::top::TopList;
 
 /// The unit of `st_blocks`, in bytes. This is not `st_blksize` and not the
@@ -37,6 +40,13 @@ const STAT_BLOCK_BYTES: u64 = 512;
 /// valid, which a temporary directory cannot make.
 #[cfg(test)]
 pub(super) type MetadataHook = Box<dyn FnMut(&Path, &mut RawMetadata)>;
+
+/// A test changes the private-size attributes of a file before the scan
+/// uses them. This injects a volume that does not report the private size,
+/// or a failed call. The flag tells whether the call asked for the clone
+/// count.
+#[cfg(test)]
+pub(super) type PrivateHook = Box<dyn FnMut(&Path, bool, &mut io::Result<PrivateAttributes>)>;
 
 /// The injection points of a scan. A build that is not a test has none.
 #[derive(Default)]
@@ -51,6 +61,12 @@ pub(super) struct Injection {
     /// show a directory that is already open on the stack.
     #[cfg(test)]
     pub(super) opened: Option<MetadataHook>,
+    /// Changes the result of the private-size call of a file.
+    #[cfg(test)]
+    pub(super) private: Option<PrivateHook>,
+    /// Replaces [`MAX_CLONE_FAMILIES`].
+    #[cfg(test)]
+    pub(super) clone_family_limit: Option<usize>,
 }
 
 fn valid_bytes(value: i64) -> Option<Bytes> {
@@ -206,6 +222,10 @@ struct Walker<'a> {
     /// The inode numbers of the hard-linked objects that are in the totals.
     /// Each is on the device of the root.
     hard_links: HashSet<u64>,
+    /// The private allocated bytes of the root.
+    private: PrivateTally,
+    /// Whether the kernel accepts `ATTR_CMNEXT_CLONE_REFCNT`.
+    clone_count_supported: bool,
     largest_files: TopList<LargeFile>,
     largest_directories: TopList<LargeDirectory>,
     boundaries: Vec<MountBoundary>,
@@ -304,6 +324,91 @@ impl Walker<'_> {
         metadata
     }
 
+    /// Reads the private-size attributes of the current name. When the
+    /// kernel refuses `ATTR_CMNEXT_CLONE_REFCNT`, the call is sent again
+    /// without it, and no later call of the scan asks for it.
+    fn query_private(&mut self) -> io::Result<PrivateAttributes> {
+        let first: io::Result<PrivateAttributes> =
+            self.query_private_once(self.clone_count_supported);
+        match first {
+            Err(error) if self.clone_count_supported && is_unsupported_request(&error) => {
+                self.clone_count_supported = false;
+                self.query_private_once(false)
+            }
+            result => result,
+        }
+    }
+
+    fn query_private_once(&mut self, with_clone_count: bool) -> io::Result<PrivateAttributes> {
+        let result: io::Result<PrivateAttributes> = match self.stack.last() {
+            Some(frame) => native::private_attributes(
+                frame.stream.descriptor(),
+                self.current_name()?,
+                with_clone_count,
+            ),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        };
+        #[cfg(test)]
+        let result: io::Result<PrivateAttributes> = {
+            let mut result: io::Result<PrivateAttributes> = result;
+            if let Some(hook) = self.injection.private.as_mut() {
+                hook(as_path(&self.path), with_clone_count, &mut result);
+            }
+            result
+        };
+        result
+    }
+
+    /// Adds a counted entry to the private allocated bytes. `allocated` is
+    /// the allocated size of the entry, which a kind without one does not
+    /// have.
+    fn tally_private(
+        &mut self,
+        metadata: &RawMetadata,
+        hard_link: HardLink,
+        allocated: Option<Bytes>,
+    ) {
+        if hard_link == HardLink::NotTracked {
+            return;
+        }
+        let Some(allocated) = allocated else {
+            // A device, a socket, or a FIFO.
+            self.private.add_without_size();
+            return;
+        };
+        match (metadata.kind, hard_link) {
+            // A later name of a link or a directory adds nothing again.
+            (_, HardLink::NotTracked)
+            | (EntryKind::Other, _)
+            | (EntryKind::Directory | EntryKind::Symlink, HardLink::LaterName) => {}
+            (EntryKind::File, HardLink::LaterName) => self.private.add_later_link(metadata.inode),
+            (EntryKind::Directory | EntryKind::Symlink, _) => self.private.add_allocated(allocated),
+            (EntryKind::File, HardLink::Single | HardLink::FirstName) => {
+                let part: FilePart = if metadata.dataless {
+                    // A dataless file has no local data to read.
+                    FilePart::Allocated(allocated)
+                } else if !self.private.is_available() {
+                    return;
+                } else {
+                    let attributes: io::Result<PrivateAttributes> = self.query_private();
+                    match file_part(attributes, metadata.inode, allocated, metadata.compressed) {
+                        Ok(part) => part,
+                        Err(cause) => {
+                            self.private.fail(cause);
+                            return;
+                        }
+                    }
+                };
+                if hard_link == HardLink::FirstName {
+                    self.private
+                        .add_first_link(metadata.inode, metadata.link_count, part);
+                } else {
+                    self.private.add_file(part);
+                }
+            }
+        }
+    }
+
     /// How the entry takes part in hard-link deduplication. The call
     /// changes nothing: `entry` updates the set and the counts only after
     /// the entry is in the totals.
@@ -384,6 +489,7 @@ impl Walker<'_> {
             HardLink::LaterName => bump(&mut self.shared.hard_link_names_not_counted_again),
             HardLink::Single | HardLink::NotTracked => {}
         }
+        self.tally_private(&metadata, hard_link, allocated);
 
         bump(match metadata.kind {
             EntryKind::File => &mut self.kinds.files,
@@ -716,6 +822,16 @@ fn descriptor_budget(max_depth: u32, _injection: &Injection) -> usize {
     budget_from_limit(max_depth, native::soft_descriptor_limit())
 }
 
+#[cfg(test)]
+fn clone_family_limit(injection: &Injection) -> usize {
+    injection.clone_family_limit.unwrap_or(MAX_CLONE_FAMILIES)
+}
+
+#[cfg(not(test))]
+fn clone_family_limit(_injection: &Injection) -> usize {
+    MAX_CLONE_FAMILIES
+}
+
 pub(super) fn scan_with(
     request: &ScanRequest,
     cancel: &CancellationToken,
@@ -734,6 +850,7 @@ pub(super) fn scan_with(
         volume,
     } = open_root(request)?;
 
+    let family_limit: usize = clone_family_limit(&injection);
     let mut walker = Walker {
         limits: request.limits,
         root_device: volume.device,
@@ -748,6 +865,8 @@ pub(super) fn scan_with(
         kinds: ScanTotals::default(),
         shared: SharedStorageEvidence::default(),
         hard_links: HashSet::new(),
+        private: PrivateTally::new(family_limit),
+        clone_count_supported: true,
         largest_files: TopList::new(request.limits.max_largest_files),
         largest_directories: TopList::new(request.limits.max_largest_directories),
         boundaries: Vec::new(),
@@ -767,6 +886,9 @@ pub(super) fn scan_with(
         subtree: Subtree::default(),
         partial: false,
     });
+    if let Some(own) = own_allocated {
+        walker.private.add_allocated(own);
+    }
     if own_allocated.is_none() {
         // The allocation of the root object is not in the totals, and the
         // region makes the coverage partial.
@@ -807,6 +929,7 @@ pub(super) fn scan_with(
             ..walker.kinds
         },
         shared_storage: walker.shared,
+        private_allocation: walker.private.finish(),
         largest_files: walker.largest_files.into_largest_first(),
         largest_directories: walker.largest_directories.into_largest_first(),
         boundaries: walker.boundaries,

@@ -16,7 +16,12 @@
 //!    flag, in the full mode or for known candidates only.
 //! 4. It gives the candidates of all rules to the overlap resolution of
 //!    the registry.
-//! 5. It applies the catalog of protected file locations to each candidate
+//! 5. It makes the use check of `docs/CLEANUP_RULES.md` section 6 for each
+//!    candidate, with one process inventory whose scope is the bound
+//!    roots ([`super::in_use`]). A unit that a process of the user uses, or
+//!    whose use is not known, is a skipped unit with the reason
+//!    `unit_in_use` or `unit_use_unknown`.
+//! 6. It applies the catalog of protected file locations to each candidate
 //!    and sets the three eligibility predicates that a rule leaves
 //!    `unknown` (3, 9, and 10).
 //!
@@ -27,7 +32,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use svalnir_core::action::WorkCharge;
-use svalnir_core::config::ValidatedConfig;
+use svalnir_core::config::{UserLayout, ValidatedConfig};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{RootId, RuleId, StepId, TargetId, VolumeId};
 use svalnir_core::plan::{CleanupEntry, RuleEvidence, SizeEstimate};
@@ -41,16 +46,27 @@ use svalnir_core::rule::{
 use svalnir_core::time::MonotonicNanos;
 use svalnir_core::volume::VolumeIdentity;
 
+use super::clear::{self, ClearDiscoveryInput, ClearRootEntry, ClearRule, ProducerEvidence};
 use super::expired_temporary::{EXPIRED_TEMPORARY_RULE_ID, TemporaryEvidence, UseLeases};
+use super::in_use::{UnitScope, UnitUse, inventory_of, uses_of};
 use super::model::{
     DiscoveredCandidate, Discovery, DiscoveryCompletion, DiscoveryControl, DiscoveryError,
-    DiscoveryLimits, DiscoveryMode, DiscoveryScope, RootBinding, SkippedUnit,
+    DiscoveryLimits, DiscoveryMode, DiscoveryScope, RootBinding, SkipReason, SkippedUnit,
 };
 use super::overlap::{OverlapConflict, OverlapResolution};
+use super::projects::{
+    BuildProcesses, PROJECT_EVIDENCE_EXPIRY, PROJECT_RULE_ID, ProjectDiscoveryInput,
+    ProjectRequest, RecheckInput, SearchRootReport, UnitRecheck, examined_for,
+    inventory as project_inventory, recheck_unit,
+};
 use super::registry::ReviewedRules;
-use super::xcode::{ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XcodeEvidence};
+use super::xcode::{
+    ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XCODE_ORPHAN_LAYOUT, XcodeEvidence,
+};
 use crate::executor::fs::{ApprovedRoot, ApprovedRoots};
-use crate::platform::process::{ProcessSource, QueryFailure};
+use crate::platform::process::{
+    PathInventory, ProcessSource, QueryFailure, refused_process_passes_platform_gate,
+};
 use crate::platform::volume::volume_at;
 use crate::protection::ProtectedLocations;
 use crate::scan::{CancellationToken, ScanClock};
@@ -316,11 +332,15 @@ pub fn automatic_roots(
 ) -> ApprovedRoots {
     let mut roots: Vec<ApprovedRoot> = Vec::new();
     for rule in registry.rules() {
-        let permits: bool = approved.contains(&rule.reference.id)
+        // The rule of the project directories and the clear rules are for
+        // a manual eviction only, whatever their lifecycle state.
+        let permits: bool = rule.reference.id.as_str() != PROJECT_RULE_ID
+            && !clear::is_clear_rule(rule.reference.id.as_str())
+            && approved.contains(&rule.reference.id)
             && rule
                 .layouts
                 .iter()
-                .any(|layout| layout.lifecycle.permits(&RuleMode::AutomaticEviction));
+                .any(|layout| layout.permits(&RuleMode::AutomaticEviction));
         if !permits {
             continue;
         }
@@ -352,17 +372,62 @@ pub fn automatic_roots(
 /// The observation time is the time before the first query, so the
 /// evidence is never newer than its time says.
 ///
-/// A denied identity query gives no owner. The inventory reads it as a
-/// process of a different user, as the process inventory of the memory
-/// guard does: the system denies the query for a process of a different
-/// user. A process of this user whose identity query is denied is thus
-/// not seen. This is a residual risk of the evidence; the lock check of
-/// the build database is the second check of the rule.
+/// For a denied identity query, the owner query decides: a process of a
+/// different user is out of the scope, and a process of the user is out
+/// of the inventory only when it passes the platform gate of
+/// `docs/CLEANUP_RULES.md` section 6. Each other such process makes the
+/// evidence [`ProducerProcesses::Unknown`].
 pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvidence {
-    let unknown = |observed_at: MonotonicNanos| XcodeEvidence {
-        producer_processes: ProducerProcesses::Unknown,
+    let (observed_at, names) = executable_names(source, principal);
+    XcodeEvidence {
+        producer_processes: names.map_or(ProducerProcesses::Unknown, |names| {
+            ProducerProcesses::from_complete_inventory(names.iter().map(String::as_str))
+        }),
         observed_at,
-    };
+    }
+}
+
+/// Whether a process of `principal` runs an executable whose file name is
+/// in `names`, from one complete inventory of the process table, as
+/// [`xcode_evidence`] reads it. A name that ends with `*` matches each
+/// file name with the text before it as a prefix. An inventory that is not
+/// complete, or that has no process, gives [`ProducerProcesses::Unknown`].
+pub fn producer_processes<S: ProcessSource>(
+    source: &S,
+    principal: Uid,
+    names: &[&str],
+) -> ProducerProcesses {
+    let (_, found) = executable_names(source, principal);
+    match found {
+        None => ProducerProcesses::Unknown,
+        Some(found) if found.is_empty() => ProducerProcesses::Unknown,
+        Some(found) => {
+            if found.iter().any(|name| matches_any(name, names)) {
+                ProducerProcesses::Running
+            } else {
+                ProducerProcesses::NotRunning
+            }
+        }
+    }
+}
+
+/// Whether the file name `name` is one of `names`, with a trailing `*` as
+/// a prefix match.
+fn matches_any(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|wanted| match wanted.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == *wanted,
+    })
+}
+
+/// The file names of the executables of the processes of `principal`, with
+/// the time before the first query. `None` when the inventory is not
+/// complete; see [`xcode_evidence`].
+fn executable_names<S: ProcessSource>(
+    source: &S,
+    principal: Uid,
+) -> (MonotonicNanos, Option<Vec<String>>) {
+    let unknown = |observed_at: MonotonicNanos| (observed_at, None);
     let Ok(observed_at) = source.monotonic_now() else {
         return unknown(MonotonicNanos::new(0));
     };
@@ -376,7 +441,21 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
             Ok(info) => info,
             // A process that exited is not a process of the inventory. A
             // denied identity query is a process of a different user.
-            Err(QueryFailure::Gone | QueryFailure::PermissionDenied) => continue,
+            Err(QueryFailure::Gone) => continue,
+            // A denied identity query: the owner query decides. A process
+            // of a different user is out of the scope; a process of the
+            // user is out of the inventory only through the platform gate
+            // (`docs/CLEANUP_RULES.md` sections 6 and 11).
+            Err(failure @ (QueryFailure::PermissionDenied | QueryFailure::AccessDenied)) => {
+                match source.process_owner(pid) {
+                    Ok((effective, real)) if effective != principal && real != principal => {}
+                    Err(QueryFailure::Gone) => {}
+                    _ if failure == QueryFailure::PermissionDenied
+                        && refused_process_passes_platform_gate(source, pid) => {}
+                    _ => return unknown(observed_at),
+                }
+                continue;
+            }
             Err(_) => return unknown(observed_at),
         };
         if info.zombie || (info.effective_uid != principal && info.real_uid != principal) {
@@ -395,12 +474,7 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
             Err(_) => return unknown(observed_at),
         }
     }
-    XcodeEvidence {
-        producer_processes: ProducerProcesses::from_complete_inventory(
-            names.iter().map(String::as_str),
-        ),
-        observed_at,
-    }
+    (observed_at, Some(names))
 }
 
 /// What a discovery needs from its environment beside the filesystem: the
@@ -408,6 +482,23 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
 pub trait DiscoveryEnvironment: ScanClock {
     /// The process evidence of `xcode.inactive-derived-data`, read now.
     fn xcode_evidence(&self, principal: Uid) -> XcodeEvidence;
+
+    /// The path-use inventory of the processes of `principal`, read now,
+    /// with the paths in `scopes` only (`docs/CLEANUP_RULES.md` section 6).
+    fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory;
+
+    /// The use of the unit at `path` by a process of `principal`, read now.
+    ///
+    /// The coordinator asks this immediately before each step of an
+    /// eviction, after the producer activity. Only
+    /// [`UnitUse::NotInUse`] permits the step.
+    fn unit_use(&self, principal: Uid, path: &Path) -> UnitUse {
+        let scope: UnitScope = UnitScope::new(path);
+        uses_of(
+            &self.path_uses(principal, std::slice::from_ref(&scope)),
+            &scope,
+        )
+    }
 
     /// The activity of the producer of `rule` for `principal`, read now.
     ///
@@ -418,10 +509,34 @@ pub trait DiscoveryEnvironment: ScanClock {
     /// caller:
     ///
     /// - `xcode.inactive-derived-data`: the process inventory.
+    /// - A clear rule ([`super::clear`]): the process inventory, for the
+    ///   executable names of the producer of the rule
+    ///   ([`DiscoveryEnvironment::producer_processes`]).
+    /// - A rule with an owner operation ([`super::producers`]): the
+    ///   process inventory, for the executable names of the producer of the
+    ///   rule ([`DiscoveryEnvironment::producer_processes`]).
     /// - `svalnir.expired-temporary`: the use leases, which this build
     ///   does not record, so the activity is not known.
     /// - A rule that this build does not know: not known.
+    ///
+    /// `project.dependency-directory` has no producer of the rule as a
+    /// whole: its producer evidence is the build processes of the project of
+    /// each unit, which [`DiscoveryEnvironment::unit_recheck`] reads for the
+    /// unit of the step. The activity of the rule is thus `Inactive`, and
+    /// the recheck decides.
     fn producer_activity(&self, rule: &RuleId, principal: Uid) -> ProducerActivity {
+        if rule.as_str() == PROJECT_RULE_ID {
+            return ProducerActivity::Inactive;
+        }
+        let names = clear::process_names(rule.as_str())
+            .or_else(|| super::producers::producer_process_names(rule.as_str()));
+        if let Some(names) = names {
+            return match self.producer_processes(principal, names) {
+                ProducerProcesses::NotRunning => ProducerActivity::Inactive,
+                ProducerProcesses::Running => ProducerActivity::Active,
+                ProducerProcesses::Unknown => ProducerActivity::Unknown,
+            };
+        }
         if rule.as_str() != XCODE_DERIVED_DATA_RULE_ID {
             return ProducerActivity::Unknown;
         }
@@ -430,6 +545,73 @@ pub trait DiscoveryEnvironment: ScanClock {
             ProducerProcesses::Running => ProducerActivity::Active,
             ProducerProcesses::Unknown => ProducerActivity::Unknown,
         }
+    }
+
+    /// Whether a process of `principal` runs an executable of `names` now
+    /// ([`producer_processes`]). An environment with no process evidence
+    /// gives [`ProducerProcesses::Unknown`], which inhibits the step.
+    fn producer_processes(&self, _principal: Uid, _names: &[&str]) -> ProducerProcesses {
+        ProducerProcesses::Unknown
+    }
+
+    /// The build processes of `principal`, read now, for
+    /// `project.dependency-directory`. An environment with no process
+    /// evidence gives an inventory that is not complete, which refuses each
+    /// unit of the rule.
+    fn build_processes(&self, _principal: Uid) -> BuildProcesses {
+        BuildProcesses {
+            processes: Vec::new(),
+            incomplete: Some("no_process_evidence"),
+            observed_at: None,
+        }
+    }
+
+    /// The checks of the unit at `path` below the approved root `root`,
+    /// made again immediately before each step of an eviction, after the
+    /// use check (`docs/ACTION_CONTRACTS.md` section 7).
+    ///
+    /// For `project.dependency-directory`, the unit must still have the
+    /// layout `layout` that the sealed plan binds, with its project marker
+    /// and its inner marker, no entry at a protected path of the layout,
+    /// and no build process of the user in its project ([`recheck_unit`]).
+    /// The layouts of the configuration in effect are `user_layouts`.
+    ///
+    /// For a clear rule, the unit must still be a child of the root that
+    /// the rule does not keep, with the form of the rule, and with no file
+    /// of a refused name below it ([`clear::recheck_unit`]). A rule
+    /// with no such check gives [`UnitRecheck::Passed`].
+    fn unit_recheck(
+        &self,
+        principal: Uid,
+        rule: &RuleRef,
+        layout: Option<&str>,
+        root: &Path,
+        path: &Path,
+        user_layouts: &[UserLayout],
+    ) -> UnitRecheck {
+        if let Some(spec) = clear::spec_of(rule.id.as_str()) {
+            return clear::recheck_unit(spec, principal, root, path);
+        }
+        if rule.id.as_str() == XCODE_DERIVED_DATA_RULE_ID && layout == Some(XCODE_ORPHAN_LAYOUT) {
+            return super::xcode::recheck_orphan(principal, root, path);
+        }
+        if rule.id.as_str() != PROJECT_RULE_ID {
+            return UnitRecheck::Passed;
+        }
+        let Some(layout) = layout else {
+            return UnitRecheck::Unknown("unit_layout_unknown");
+        };
+        let processes: BuildProcesses = self.build_processes(principal);
+        recheck_unit(&RecheckInput {
+            principal,
+            layout,
+            root,
+            unit: path,
+            user_layouts,
+            processes: &processes,
+            now: self.now().monotonic_ns,
+            expiry: PROJECT_EVIDENCE_EXPIRY,
+        })
     }
 }
 
@@ -453,6 +635,28 @@ impl<S: ProcessSource> ScanClock for SourceEnvironment<S> {
 impl<S: ProcessSource> DiscoveryEnvironment for SourceEnvironment<S> {
     fn xcode_evidence(&self, principal: Uid) -> XcodeEvidence {
         xcode_evidence(&self.0, principal)
+    }
+
+    fn path_uses(&self, principal: Uid, scopes: &[UnitScope]) -> PathInventory {
+        inventory_of(&self.0, principal, scopes)
+    }
+
+    fn producer_processes(&self, principal: Uid, names: &[&str]) -> ProducerProcesses {
+        producer_processes(&self.0, principal, names)
+    }
+
+    fn build_processes(&self, principal: Uid) -> BuildProcesses {
+        #[cfg(target_os = "macos")]
+        let (query, owner) = (
+            crate::rules::native::working_directory,
+            crate::rules::native::process_owner,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (query, owner) = (
+            |_: Pid| -> Result<PathBuf, QueryFailure> { Err(QueryFailure::Unsupported) },
+            |_: Pid| -> Result<(Uid, Uid), QueryFailure> { Err(QueryFailure::Unsupported) },
+        );
+        project_inventory(&self.0, principal, query, owner)
     }
 }
 
@@ -490,6 +694,11 @@ pub struct EvictionRequest<'a> {
     pub limits: DiscoveryLimits,
     /// The flag that stops the discovery from a different thread.
     pub cancel: &'a CancellationToken,
+    /// The roots and the sources of `project.dependency-directory`, for a
+    /// manual eviction. The rule has no root in its declaration, so with
+    /// `None` it is not examined. It is never examined for an automatic
+    /// eviction or for known candidates.
+    pub projects: Option<&'a ProjectRequest<'a>>,
 }
 
 impl std::fmt::Debug for EvictionRequest<'_> {
@@ -616,6 +825,28 @@ pub struct EvictionDiscovery {
     /// The binding of each root that a discovery examined, with its
     /// volume. A client records it with the plan of its candidates.
     pub bound_roots: Vec<BoundRoot>,
+    /// The report of each root of `project.dependency-directory`, with its
+    /// kind and its source, when the request examined the rule.
+    pub project_roots: Vec<SearchRootReport>,
+}
+
+/// The result of a bound root of the clear rule `clear` that the discovery
+/// does not examine: a root on a volume that the request does not name, or
+/// a root with no marker of its producer, which is not bound as its cache
+/// (`clear_root_unmarked`).
+fn clear_root_refusal(
+    clear: &ClearRule,
+    request: &EvictionRequest<'_>,
+    bound: &BoundRoot,
+) -> Option<RootResult> {
+    if request
+        .volumes
+        .is_some_and(|volumes| !volumes.contains(&bound.binding.volume_id))
+    {
+        return Some(RootResult::OtherVolume);
+    }
+    (!clear::has_marker(clear.spec().marker, &bound.binding.path))
+        .then_some(RootResult::Refused("clear_root_unmarked"))
 }
 
 /// A stable name of a discovery refusal, with no path.
@@ -637,6 +868,90 @@ pub(super) const fn refusal_name(error: &DiscoveryError) -> &'static str {
         DiscoveryError::Internal(_) => "rule_defect",
         DiscoveryError::Unsupported => "unsupported_platform",
     }
+}
+
+/// The use check of the candidates of one discovery: one inventory for
+/// all candidates, with the bound roots as its scope, read after the walk
+/// of the roots. A unit that is in use, or whose use is not known, is
+/// added to the report of its root and is not kept.
+fn use_check(
+    result: &mut EvictionDiscovery,
+    candidates: Vec<DiscoveredCandidate>,
+    principal: Uid,
+    environment: &dyn DiscoveryEnvironment,
+) -> Vec<DiscoveredCandidate> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let scopes: Vec<UnitScope> = result
+        .bound_roots
+        .iter()
+        .map(|bound| UnitScope::new(&bound.binding.path))
+        .collect();
+    let inventory: PathInventory = environment.path_uses(principal, &scopes);
+    let mut kept: Vec<DiscoveredCandidate> = Vec::new();
+    for discovered in candidates {
+        let scope: UnitScope = UnitScope::new(&discovered.candidate.candidate.path.to_path_buf());
+        match use_skip(&uses_of(&inventory, &scope)) {
+            None => kept.push(discovered),
+            Some(reason) => {
+                if !skip_in_report(&mut result.roots, &discovered, reason) {
+                    // A unit with no root report is not shown.
+                    result.complete = false;
+                }
+            }
+        }
+    }
+    kept
+}
+
+/// The skip reason of the result of the use check, or `None` when it
+/// permits the unit.
+const fn use_skip(found: &UnitUse) -> Option<SkipReason> {
+    match found {
+        UnitUse::NotInUse => None,
+        UnitUse::InUse { .. } => Some(SkipReason::UnitInUse),
+        UnitUse::Unknown { .. } => Some(SkipReason::UnitUseUnknown),
+    }
+}
+
+/// Adds `discovered` as a skipped unit with `reason` to the report of its
+/// root. Predicate 6 is `not_satisfied` for a use and `unknown` for an
+/// unknown use. Returns false when the root has no report that was
+/// examined.
+fn skip_in_report(
+    roots: &mut [RootReport],
+    discovered: &DiscoveredCandidate,
+    reason: SkipReason,
+) -> bool {
+    let record = &discovered.candidate;
+    let root_path: PathBuf = discovered.root.path.to_path_buf();
+    let report: Option<&mut RootReport> = roots.iter_mut().find(|report| {
+        report.rule == record.rule && report.path.as_deref() == Some(root_path.as_path())
+    });
+    let Some(RootReport {
+        result: RootResult::Examined { skipped, .. },
+        ..
+    }) = report
+    else {
+        return false;
+    };
+    skipped.push(SkippedUnit {
+        relative_entry: discovered.evidence.relative_entry.clone(),
+        layout: Some(record.layout.clone()),
+        reasons: vec![reason],
+        eligibility: CandidateEligibility {
+            protocols_valid: if reason == SkipReason::UnitInUse {
+                Fact::NotSatisfied
+            } else {
+                Fact::Unknown
+            },
+            ..record.eligibility.clone()
+        },
+        evidence: Some(discovered.evidence.clone()),
+        repository_marker: None,
+    });
+    true
 }
 
 /// The candidate with the fact of the catalog and the three predicates of
@@ -722,8 +1037,37 @@ impl ReviewedRules {
                 && rule
                     .layouts
                     .iter()
-                    .any(|layout| layout.lifecycle.permits(request.purpose));
+                    .any(|layout| layout.permits(request.purpose));
             if !selected {
+                continue;
+            }
+            if let Some(clear) = self.clear().get(rule.reference.id.as_str()) {
+                // A clear rule is examined for a manual eviction only, and
+                // never for known candidates (an automatic operation).
+                if examined_for(request.purpose) && request.known.is_none() {
+                    found.extend(Self::examine_clear(
+                        clear,
+                        request,
+                        &protected,
+                        environment,
+                        &mut result,
+                    ));
+                }
+                continue;
+            }
+            if rule.reference.id.as_str() == PROJECT_RULE_ID {
+                // The rule of the project directories is examined for a
+                // manual eviction only, with the roots of the request, and
+                // never for known candidates (an automatic operation).
+                if examined_for(request.purpose) && request.known.is_none() {
+                    found.extend(self.examine_projects(
+                        rule,
+                        request,
+                        &protected,
+                        environment,
+                        &mut result,
+                    ));
+                }
                 continue;
             }
             for (declared, bound) in rule.roots.iter().zip(resolve_roots(rule, &host.locations)) {
@@ -757,6 +1101,18 @@ impl ReviewedRules {
                 });
             }
         }
+        self.conclude_discovery(result, found, host, environment)
+    }
+
+    /// The overlap resolution, the use check, and the facts of admission of
+    /// the candidates `found` of one discovery.
+    fn conclude_discovery(
+        &self,
+        mut result: EvictionDiscovery,
+        found: Vec<DiscoveredCandidate>,
+        host: &DiscoveryHost,
+        environment: &dyn DiscoveryEnvironment,
+    ) -> EvictionDiscovery {
         let Ok(OverlapResolution {
             candidates,
             conflicts,
@@ -772,6 +1128,8 @@ impl ReviewedRules {
         if conflicts_omitted > 0 {
             result.complete = false;
         }
+        let candidates: Vec<DiscoveredCandidate> =
+            use_check(&mut result, candidates, host.principal, environment);
         for discovered in candidates {
             let candidate: Option<RuleCandidate> = self
                 .lookup(&discovered.candidate.rule)
@@ -788,6 +1146,214 @@ impl ReviewedRules {
             }
         }
         result
+    }
+
+    /// The inspection of the clear rule `id` (`docs/CLEANUP_RULES.md`
+    /// section 12, "Clear rules"): the discovery of each of its roots, with
+    /// the use check and the facts of admission, whatever the lifecycle
+    /// state of the rule. `None` when `id` is not a clear rule.
+    ///
+    /// The result is a report: it gives no authority, and a plan of a
+    /// manual eviction runs [`ReviewedRules::discover_for_eviction`] again.
+    #[must_use]
+    pub fn inspect_clear(
+        &self,
+        id: &str,
+        request: &EvictionRequest<'_>,
+        environment: &dyn DiscoveryEnvironment,
+    ) -> Option<(EvictionDiscovery, Vec<ClearRootEntry>)> {
+        let clear: &ClearRule = self.clear().get(id)?;
+        let mut result: EvictionDiscovery = EvictionDiscovery {
+            complete: true,
+            ..EvictionDiscovery::default()
+        };
+        let protected: Vec<PathBuf> = request
+            .host
+            .locations
+            .state_directory()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect();
+        let roots: Vec<ClearRootEntry> = request
+            .host
+            .locations
+            .home_directory()
+            .map_or_else(Vec::new, |home| clear::resolve(clear.spec(), home).0);
+        if protected.is_empty() {
+            result.complete = false;
+            return Some((result, roots));
+        }
+        let found: Vec<DiscoveredCandidate> =
+            Self::examine_clear(clear, request, &protected, environment, &mut result);
+        Some((
+            self.conclude_discovery(result, found, request.host, environment),
+            roots,
+        ))
+    }
+
+    /// The discovery of each root of the clear rule `clear`: the
+    /// candidates. The report of each root is added to `result`.
+    fn examine_clear(
+        clear: &ClearRule,
+        request: &EvictionRequest<'_>,
+        protected: &[PathBuf],
+        environment: &dyn DiscoveryEnvironment,
+        result: &mut EvictionDiscovery,
+    ) -> Vec<DiscoveredCandidate> {
+        let rule: &Rule = clear.rule();
+        let Some(home) = request.host.locations.home_directory() else {
+            result.complete = false;
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: None,
+                result: RootResult::NotBound(RootProblem::BaseUnknown),
+            });
+            return Vec::new();
+        };
+        let (roots, expanded) = clear::resolve(clear.spec(), home);
+        if !expanded {
+            result.complete = false;
+        }
+        let mut found: Vec<DiscoveredCandidate> = Vec::new();
+        for entry in roots {
+            let Some(path) = entry.path else {
+                result.complete = false;
+                result.roots.push(RootReport {
+                    rule: rule.reference.clone(),
+                    path: None,
+                    result: RootResult::Refused(entry.problem.unwrap_or("root_not_resolved")),
+                });
+                continue;
+            };
+            let bound: BoundRoot = match bind_root(&path) {
+                Ok(bound) => bound,
+                Err(problem) => {
+                    if problem != RootProblem::Absent {
+                        result.complete = false;
+                    }
+                    result.roots.push(RootReport {
+                        rule: rule.reference.clone(),
+                        path: Some(path),
+                        result: RootResult::NotBound(problem),
+                    });
+                    continue;
+                }
+            };
+            if let Some(refused) = clear_root_refusal(clear, request, &bound) {
+                if refused != RootResult::OtherVolume {
+                    result.complete = false;
+                }
+                result.roots.push(RootReport {
+                    rule: rule.reference.clone(),
+                    path: Some(path),
+                    result: refused,
+                });
+                continue;
+            }
+            let scope: DiscoveryScope<'_> = DiscoveryScope {
+                root: &bound.binding,
+                principal: request.host.principal,
+                protected_paths: protected,
+                user_exclusions: &request.host.user_exclusions,
+            };
+            let control: DiscoveryControl<'_> = DiscoveryControl {
+                limits: request.limits,
+                cancel: request.cancel,
+                clock: environment,
+            };
+            // The inventory is read immediately before the discovery of the
+            // root, so its age is the time of that discovery.
+            let evidence: ProducerEvidence = ProducerEvidence {
+                observed_at: environment.now().monotonic_ns,
+                processes: environment
+                    .producer_processes(request.host.principal, clear.spec().processes),
+            };
+            let discovered = clear.discover(&ClearDiscoveryInput {
+                scope: &scope,
+                control: &control,
+                evidence,
+                mounts: crate::platform::volume::MountTable::read,
+            });
+            let root_result: RootResult = match discovered {
+                Ok(discovery) => {
+                    if discovery.completion != DiscoveryCompletion::Finished {
+                        result.complete = false;
+                    }
+                    found.extend(discovery.candidates);
+                    result.bound_roots.push(bound);
+                    RootResult::Examined {
+                        completion: discovery.completion,
+                        skipped: discovery.skipped,
+                        skipped_omitted: discovery.skipped_omitted,
+                    }
+                }
+                Err(error) => {
+                    result.complete = false;
+                    RootResult::Refused(refusal_name(&error))
+                }
+            };
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: Some(path),
+                result: root_result,
+            });
+        }
+        found
+    }
+
+    /// The discovery of `project.dependency-directory` with the roots of the
+    /// request: the candidates. The report of each root is added to
+    /// `result`.
+    fn examine_projects(
+        &self,
+        rule: &Rule,
+        request: &EvictionRequest<'_>,
+        protected: &[PathBuf],
+        environment: &dyn DiscoveryEnvironment,
+        result: &mut EvictionDiscovery,
+    ) -> Vec<DiscoveredCandidate> {
+        let Some(projects) = request.projects else {
+            // With no root, the rule has no place to look.
+            result.complete = false;
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: None,
+                result: RootResult::Refused("no_search_roots"),
+            });
+            return Vec::new();
+        };
+        let (reports, roots) = self.projects().discover_roots(&ProjectDiscoveryInput {
+            host: request.host,
+            request: projects,
+            protected,
+            limits: request.limits,
+            cancel: request.cancel,
+            environment,
+            mounts: crate::platform::volume::MountTable::read,
+        });
+        result.project_roots = reports;
+        let mut found: Vec<DiscoveredCandidate> = Vec::new();
+        for root in roots {
+            match &root.result {
+                RootResult::Examined { completion, .. } => {
+                    if *completion != DiscoveryCompletion::Finished {
+                        result.complete = false;
+                    }
+                }
+                RootResult::NotBound(RootProblem::Absent)
+                | RootResult::OtherVolume
+                | RootResult::NothingKnown => {}
+                RootResult::NotBound(_) | RootResult::Refused(_) => result.complete = false,
+            }
+            result.bound_roots.extend(root.bound);
+            found.extend(root.candidates);
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: root.path,
+                result: root.result,
+            });
+        }
+        found
     }
 
     /// The discovery of one bound root of one rule: the result for the
@@ -837,14 +1403,29 @@ impl ReviewedRules {
             clock: environment,
         };
         match self.discover_one(rule, &scope, mode, &control, environment) {
-            Ok(discovery) => (
-                RootResult::Examined {
-                    completion: discovery.completion,
-                    skipped: discovery.skipped,
-                    skipped_omitted: discovery.skipped_omitted,
-                },
-                discovery.candidates,
-            ),
+            Ok(mut discovery) => {
+                // The layout of an orphan project directory is for a manual
+                // eviction only.
+                if *request.purpose != RuleMode::ManualEviction {
+                    let manual_only = |layout: &str| layout == XCODE_ORPHAN_LAYOUT;
+                    discovery
+                        .candidates
+                        .retain(|candidate| !manual_only(&candidate.candidate.layout));
+                    discovery.skipped.retain(|unit| {
+                        unit.layout
+                            .as_deref()
+                            .is_none_or(|layout| !manual_only(layout))
+                    });
+                }
+                (
+                    RootResult::Examined {
+                        completion: discovery.completion,
+                        skipped: discovery.skipped,
+                        skipped_omitted: discovery.skipped_omitted,
+                    },
+                    discovery.candidates,
+                )
+            }
             Err(error) => (RootResult::Refused(refusal_name(&error)), Vec::new()),
         }
     }

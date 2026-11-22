@@ -12,6 +12,7 @@ use super::{
     },
 };
 use crate::actions::{Action, ActionBook, ActionPort, ActionState, Proposal, Slot};
+use crate::ui::data_state::capture_age;
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
     collections::HashSet,
@@ -81,11 +82,12 @@ pub const fn next_interval(active: bool) -> Duration {
 }
 
 /// Whether a value captured at `captured_at` is older than three intervals
-/// at `now`. A capture time in the future is not stale.
+/// at `now`. A value whose age is not known ([`capture_age`]: the wall
+/// clock moved back) is also stale, so that the screens and the status line
+/// agree.
 #[must_use]
 pub fn is_stale(captured_at: SystemTime, now: SystemTime, interval: Duration) -> bool {
-    now.duration_since(captured_at)
-        .is_ok_and(|age| age > interval * STALE_INTERVALS)
+    capture_age(captured_at, now).is_none_or(|age| age > interval * STALE_INTERVALS)
 }
 
 /// The reads that run now, one flag for each kind.
@@ -881,21 +883,9 @@ impl AppModel {
     fn mark_stale(&mut self) {
         let now: SystemTime = SystemTime::now();
         let interval: Duration = next_interval(self.active);
-        if let Loadable::Ready(snapshot) = &self.host
-            && is_stale(snapshot.captured_at, now, interval)
-        {
-            self.host = Loadable::Stale(Arc::clone(snapshot));
-        }
-        if let Loadable::Ready(snapshot) = &self.agent
-            && is_stale(snapshot.captured_at, now, interval)
-        {
-            self.agent = Loadable::Stale(Arc::clone(snapshot));
-        }
-        if let Loadable::Ready(snapshot) = &self.service
-            && is_stale(snapshot.captured_at, now, interval)
-        {
-            self.service = Loadable::Stale(Arc::clone(snapshot));
-        }
+        age(&mut self.host, now, interval);
+        age(&mut self.agent, now, interval);
+        age(&mut self.service, now, interval);
         age(&mut self.memory, now, interval);
         age(&mut self.processes, now, interval);
         age(&mut self.automation, now, interval);
@@ -1003,6 +993,10 @@ mod tests {
         let interval: Duration = Duration::from_secs(2);
         assert!(!is_stale(now - Duration::from_secs(6), now, interval));
         assert!(is_stale(now - Duration::from_secs(7), now, interval));
-        assert!(!is_stale(now + Duration::from_secs(60), now, interval));
+        // A small step of the clock back is not stale; a larger one is,
+        // because the age is then not known.
+        assert!(!is_stale(now + Duration::from_secs(1), now, interval));
+        assert!(is_stale(now + Duration::from_secs(4), now, interval));
+        assert!(is_stale(now + Duration::from_secs(60), now, interval));
     }
 }

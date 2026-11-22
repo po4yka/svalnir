@@ -449,3 +449,23 @@ fn the_poll_follows_a_window_that_becomes_active(cx: &mut TestAppContext) {
         "no host reading in one active interval: {before} then {after}"
     );
 }
+
+/// With `--no-status-item` there is no item, so the last window close takes
+/// the quit branch and does not move the model to the background state of
+/// an item (see `the_model_keeps_reading_after_its_window_closes`). The test
+/// platform of GPUI does nothing on a quit, so this test does not show that
+/// the client quits; it shows only which branch runs.
+#[gpui_kit::test]
+fn with_no_item_the_last_window_close_takes_the_quit_branch(cx: &mut TestAppContext) {
+    let model = model(FixtureScenario::Healthy, ActionScript::Accept, false, cx);
+    cx.update(|cx| {
+        model.update(cx, |model, cx| model.set_topics(&[Topic::History], cx));
+        after_last_window_closed(false, &model, cx);
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let model: &AppModel = model.read(cx);
+        assert!(model.is_active(), "the quit branch changes no state");
+        assert_eq!(model.topics(), &[Topic::History]);
+    });
+}

@@ -20,8 +20,9 @@ pub enum ButtonVariant {
     Secondary,
     /// No fill; a 6% fill on hover.
     Quiet,
-    /// A `negative` fill with light text, for an action that ends
-    /// processes or removes data. It is never the default button.
+    /// A `negative` tint at 15% over the surface with `negative` text, for
+    /// an action that ends processes or removes data. It is never the
+    /// default button.
     Danger,
 }
 
@@ -181,7 +182,11 @@ struct Colors {
 fn colors(variant: ButtonVariant, tokens: &Tokens, dark: bool) -> Colors {
     let (top, bottom): (Hsla, Hsla) = match variant {
         ButtonVariant::Primary => (to_hsla(tokens.primary_bottom), to_hsla(tokens.primary_top)),
-        ButtonVariant::Danger => (to_hsla(tokens.negative), to_hsla(tokens.negative)),
+        // DESIGN.md section 2: the tone at 15% over the surface.
+        ButtonVariant::Danger => (
+            to_hsla(tokens.negative).opacity(0.15),
+            to_hsla(tokens.negative).opacity(0.15),
+        ),
         ButtonVariant::Secondary | ButtonVariant::Quiet => (
             to_hsla(tokens.secondary_bottom),
             to_hsla(tokens.secondary_top),
@@ -189,7 +194,7 @@ fn colors(variant: ButtonVariant, tokens: &Tokens, dark: bool) -> Colors {
     };
     let text: Hsla = match variant {
         ButtonVariant::Primary => to_hsla(tokens.primary_text),
-        ButtonVariant::Danger => to_hsla(hex_alpha(0xff_ffff, 1.0)),
+        ButtonVariant::Danger => to_hsla(tokens.negative),
         ButtonVariant::Secondary | ButtonVariant::Quiet => to_hsla(tokens.foreground),
     };
     let edge: Hsla = match variant {

@@ -9,7 +9,7 @@ use super::{
     },
 };
 use super::{
-    live_records,
+    live_records::{self, observed_bytes, system_time},
     records::{
         AutomationSnapshot, ControllerSnapshot, DiagnosticsSnapshot, HistorySnapshot,
         MemorySnapshot, ProcessesSnapshot,
@@ -108,17 +108,6 @@ fn default_state_directory() -> Option<PathBuf> {
         .then(|| home.join(DEFAULT_STATE_DIRECTORY))
 }
 
-fn bytes(observation: &Observation<Bytes>) -> Measured<u64> {
-    match observation.value() {
-        Some(value) => Measured::Value(value.get()),
-        None => Measured::Unavailable(
-            observation
-                .reason()
-                .map_or_else(|| "unrecognized".to_owned(), ToString::to_string),
-        ),
-    }
-}
-
 fn pressure(observation: &Observation<PressureState>) -> Measured<PressureLevel> {
     match observation.value() {
         Some(PressureState::Normal) => Measured::Value(PressureLevel::Normal),
@@ -146,9 +135,9 @@ impl DataSource for LiveSource {
                 identity, capacity, ..
             } => (
                 Some(identity.mount_point.display_label()),
-                bytes(&capacity.total),
-                bytes(&capacity.available),
-                bytes(&capacity.free),
+                observed_bytes(&capacity.total),
+                observed_bytes(&capacity.available),
+                observed_bytes(&capacity.free),
             ),
             DiskReading::CapacityUnavailable { identity, reason } => (
                 Some(identity.mount_point.display_label()),
@@ -172,9 +161,9 @@ impl DataSource for LiveSource {
             disk_available,
             disk_free,
             pressure: pressure(&reading.memory.pressure),
-            memory_total: bytes(&reading.memory.physical),
-            swap_used: bytes(&reading.memory.swap.used),
-            swap_total: bytes(&reading.memory.swap.allocated),
+            memory_total: observed_bytes(&reading.memory.physical),
+            swap_used: observed_bytes(&reading.memory.swap.used),
+            swap_total: observed_bytes(&reading.memory.swap.allocated),
             source: "in-process collection",
         })
     }
@@ -595,16 +584,6 @@ fn guard_rows(state: &AuthorityState, now: WallTime) -> Vec<GuardRow> {
         .into_iter()
         .map(|(policy, standing)| GuardRow::new(policy.as_str(), standing))
         .collect()
-}
-
-fn system_time(time: WallTime) -> SystemTime {
-    let seconds: i64 = time.unix_seconds();
-    let nanos: Duration = Duration::from_nanos(u64::from(time.subsecond_nanoseconds()));
-    if seconds >= 0 {
-        UNIX_EPOCH + Duration::from_secs(seconds.unsigned_abs()) + nanos
-    } else {
-        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs()) + nanos
-    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,18 @@ pub fn paint_rgba(paint: CellPaint, look: MenuBarLook) -> [f64; 4] {
     }
 }
 
+/// The outline of the pressure dot on the menu bar `look`, as red, green,
+/// blue, alpha: with Increase Contrast, a 1 px outline in the color of the
+/// menu bar text (`DESIGN.md` §9: surfaces get an outline), so that the dot
+/// keeps an edge on a menu bar of a similar color. `None` without it.
+#[must_use]
+pub fn dot_outline_rgba(look: MenuBarLook) -> Option<[f64; 4]> {
+    look.increase_contrast.then(|| {
+        let text: f64 = if look.dark { 1.0 } else { 0.0 };
+        [text, text, text, MUTED_ALPHA[1]]
+    })
+}
+
 /// The paint of the 20 cells for `used` of `total`, with the zones that
 /// start at the cells `warning` and `critical` (`DESIGN.md` §5: the zones of
 /// the disk policy are tinted cells at the end).
@@ -880,6 +892,12 @@ mod tests {
         let tint = CellPaint::Tint(ItemTone::Warning);
         assert!(paint_rgba(tint, contrast)[3] > paint_rgba(tint, dark)[3]);
         assert!(paint_rgba(CellPaint::Empty, contrast)[3] > paint_rgba(CellPaint::Empty, dark)[3]);
+        // Increase Contrast gives the dot an outline in the text color.
+        assert_eq!(dot_outline_rgba(dark), None);
+        assert_eq!(
+            dot_outline_rgba(contrast).map(|[r, g, b, _]| [r, g, b]),
+            Some([1.0, 1.0, 1.0])
+        );
         assert_eq!(pressure_tone(PressureLevel::Critical), ItemTone::Negative);
     }
 

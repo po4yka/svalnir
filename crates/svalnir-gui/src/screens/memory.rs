@@ -232,6 +232,8 @@ fn quantities_card(
         .subtitle("Each row is a different quantity");
     let mut body = v_flex().gap(tokens::SPACE_2);
     let mut any: bool = false;
+    // The provenance lines close the card, after the note.
+    let mut provenance: Vec<ProvenanceLine> = Vec::new();
     match host {
         Shown::Loading => body = body.child(skeleton_rows(3)),
         Shown::Failed(reason) => {
@@ -247,6 +249,16 @@ fn quantities_card(
             ] {
                 body = body.child(fact(id, label, bytes_text(measured), mono, stale, tokens));
             }
+            // The host rows have their own reading, so they have their own
+            // stale line and provenance; the lines of the memory reading do
+            // not cover them. The provenance closes the card.
+            if let Some(age) = stale_age {
+                body = body.child(stale_line("memory-host-stale", age, tokens));
+            }
+            provenance.push(
+                ProvenanceLine::new(value.source, value.captured_at, "host readings")
+                    .id("memory-host-provenance"),
+            );
         }
     }
     match memory {
@@ -276,8 +288,8 @@ fn quantities_card(
             if let Some(age) = stale_age {
                 body = body.child(stale_line("memory-detail-stale", age, tokens));
             }
-            body = body.child(
-                ProvenanceLine::new(value.source, value.captured_at, "host")
+            provenance.push(
+                ProvenanceLine::new(value.source, value.captured_at, "memory detail")
                     .id("memory-provenance"),
             );
         }
@@ -289,6 +301,7 @@ fn quantities_card(
             tokens,
         ));
     }
+    body = body.children(provenance);
     card(header, body)
 }
 

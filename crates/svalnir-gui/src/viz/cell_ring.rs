@@ -510,29 +510,32 @@ impl RenderOnce for CellRing {
         let count: usize = self.items.len();
         let focus: Option<usize> = self.focus;
         let inert: Vec<bool> = self.items.iter().map(|i| i.inert).collect();
-        let (mark, values, running): (Option<Mark>, Vec<f32>, bool) = state.update(cx, |s, _| {
-            if s.keyboard && !focused {
-                s.mark = None;
-                s.keyboard = false;
-            }
-            let highlight: Option<usize> = focus.or(s.mark.and_then(Mark::segment));
-            let mut target: Vec<f32> = vec![0.0; 2 * count];
-            for (index, is_inert) in inert.iter().enumerate() {
-                target[index] =
-                    f32::from(u8::from(*is_inert || highlight.is_some_and(|h| h != index)));
-                target[count + index] = f32::from(u8::from(highlight == Some(index)));
-            }
-            let tween: &mut Tween = s
-                .tween
-                .get_or_insert_with(|| Tween::new(target.clone(), now));
-            tween.retarget(target, now, animate);
-            (s.mark, tween.value_at(now), tween.running(now))
-        });
+        let (mark, mut values, running): (Option<Mark>, Vec<f32>, bool) =
+            state.update(cx, |s, _| {
+                if s.keyboard && !focused {
+                    s.mark = None;
+                    s.keyboard = false;
+                }
+                let highlight: Option<usize> = focus.or(s.mark.and_then(Mark::segment));
+                let mut target: Vec<f32> = vec![0.0; 2 * count];
+                for (index, is_inert) in inert.iter().enumerate() {
+                    target[index] =
+                        f32::from(u8::from(*is_inert || highlight.is_some_and(|h| h != index)));
+                    target[count + index] = f32::from(u8::from(highlight == Some(index)));
+                }
+                let tween: &mut Tween = s
+                    .tween
+                    .get_or_insert_with(|| Tween::new(target.clone(), now));
+                tween.retarget(target, now, animate);
+                (s.mark, tween.value_at(now), tween.running(now))
+            });
         if running {
             window.request_animation_frame();
         }
         let (dim, grow): (Vec<f32>, Vec<f32>) = if values.len() == 2 * count {
-            (values[..count].to_vec(), values[count..].to_vec())
+            // One split of the eased values: no copy of either half.
+            let grow: Vec<f32> = values.split_off(count);
+            (values, grow)
         } else {
             (vec![0.0; count], vec![0.0; count])
         };

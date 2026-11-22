@@ -11,7 +11,10 @@ use crate::{
         tokens::{self, Tokens, to_hsla},
     },
     ui::{
-        data_state::{UNAVAILABLE_TEXT, format_age, format_bytes},
+        data_state::{
+            UNAVAILABLE_TEXT, UNKNOWN_AGE_TEXT, capture_age, capture_age_text, format_age,
+            format_bytes,
+        },
         entry::card_entry,
         surface::{Panel, Shell, ShellHeader},
         value::DisplayValue,
@@ -29,10 +32,7 @@ use gpui_kit::{
     prelude::*,
     px,
 };
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{sync::Arc, time::SystemTime};
 
 /// The least width of a card (`DESIGN.md` section 9).
 pub const MIN_CARD_WIDTH: f32 = 320.0;
@@ -75,9 +75,7 @@ pub fn shown<T>(
         },
         Loadable::Stale(value) => Shown::Data {
             value: Arc::clone(value),
-            stale_age: Some(format_age(
-                now.duration_since(captured_at(value)).unwrap_or_default(),
-            )),
+            stale_age: Some(capture_age_text(captured_at(value), now)),
         },
     }
 }
@@ -95,11 +93,13 @@ pub fn bytes_text(measured: &Measured<u64>) -> String {
 }
 
 /// The age of `time` at `now`, with hours and days for an old time: "just
-/// now", "12 s ago", "5 min ago", "3 h ago", "2 d ago". A time after `now`
-/// is "just now".
+/// now", "12 s ago", "5 min ago", "3 h ago", "2 d ago". A time well after
+/// `now` has no known age ([`capture_age`]).
 #[must_use]
 pub fn ago(time: SystemTime, now: SystemTime) -> String {
-    let age: Duration = now.duration_since(time).unwrap_or_default();
+    let Some(age) = capture_age(time, now) else {
+        return UNKNOWN_AGE_TEXT.to_owned();
+    };
     let seconds: u64 = age.as_secs();
     if seconds < 3_600 {
         format_age(age)
@@ -406,6 +406,7 @@ pub fn motion_gate(model: &AppModel, reduce_motion: bool, window_active: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn each_loadable_state_has_its_presentation() {
@@ -441,10 +442,13 @@ mod tests {
         let now: SystemTime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let back = |seconds: u64| now - Duration::from_secs(seconds);
         assert_eq!(ago(back(1), now), "just now");
+        // A small step of the clock back still reads as now; a large one has
+        // no known age, and it is not shown as "just now".
+        assert_eq!(ago(now + Duration::from_secs(1), now), "just now");
+        assert_eq!(ago(now + Duration::from_secs(600), now), UNKNOWN_AGE_TEXT);
         assert_eq!(ago(back(300), now), "5 min ago");
         assert_eq!(ago(back(7_500), now), "2 h ago");
         assert_eq!(ago(back(180_000), now), "2 d ago");
-        assert_eq!(ago(now + Duration::from_secs(60), now), "just now");
     }
 
     #[test]

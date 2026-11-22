@@ -5,7 +5,9 @@
 //! fixture can make each of them. A failed query is never a zero: it is
 //! [`Measured::Unavailable`] with a reason, or a sentence in `problems`.
 
-use super::model::{GuardState, Measured, OperationPhase};
+use super::model::{
+    AgentSnapshot, GuardState, HostSnapshot, Measured, OperationPhase, ServiceSnapshot,
+};
 use std::{
     path::PathBuf,
     time::{Duration, SystemTime},
@@ -40,6 +42,24 @@ pub struct MemorySnapshot {
     pub free: Measured<u64>,
     /// The label of the source.
     pub source: &'static str,
+}
+
+impl Captured for HostSnapshot {
+    fn captured_at(&self) -> SystemTime {
+        self.captured_at
+    }
+}
+
+impl Captured for AgentSnapshot {
+    fn captured_at(&self) -> SystemTime {
+        self.captured_at
+    }
+}
+
+impl Captured for ServiceSnapshot {
+    fn captured_at(&self) -> SystemTime {
+        self.captured_at
+    }
 }
 
 impl Captured for MemorySnapshot {
@@ -376,8 +396,9 @@ pub enum PauseRow {
     NotPaused,
     /// The pause inhibits automatic intervention.
     Paused {
-        /// When the pause started.
-        since: SystemTime,
+        /// When the pause started. `None` when the record has no start
+        /// time: a missing time is not shown as a date.
+        since: Option<SystemTime>,
         /// The time that remained at the reading. `None` with no end time
         /// or for a retained pause.
         remaining: Option<Duration>,
@@ -390,8 +411,9 @@ pub enum PauseRow {
     /// The pause reached its end on the monotonic clock. It inhibits
     /// nothing; the record stays until the agent or a resume removes it.
     Expired {
-        /// When the pause started.
-        since: SystemTime,
+        /// When the pause started. `None` when the record has no start
+        /// time: a missing time is not shown as a date.
+        since: Option<SystemTime>,
     },
 }
 

@@ -325,7 +325,7 @@ fn fixture_pause(snapshot: &mut AutomationSnapshot, scenario: FixtureScenario) {
     match scenario {
         FixtureScenario::Pressure => {
             snapshot.pause = Some(PauseRow::Paused {
-                since: back(captured_at, 600),
+                since: Some(back(captured_at, 600)),
                 remaining: Some(Duration::from_mins(20)),
                 until: Some(captured_at + Duration::from_mins(20)),
                 kind: PauseKind::Timed,
@@ -333,7 +333,7 @@ fn fixture_pause(snapshot: &mut AutomationSnapshot, scenario: FixtureScenario) {
         }
         FixtureScenario::Stale => {
             snapshot.pause = Some(PauseRow::Paused {
-                since: back(captured_at, 7200),
+                since: Some(back(captured_at, 7200)),
                 remaining: None,
                 until: None,
                 kind: PauseKind::Indefinite,
@@ -341,7 +341,7 @@ fn fixture_pause(snapshot: &mut AutomationSnapshot, scenario: FixtureScenario) {
         }
         FixtureScenario::Drift => {
             snapshot.pause = Some(PauseRow::Expired {
-                since: back(captured_at, 3700),
+                since: Some(back(captured_at, 3700)),
             });
             snapshot.measurement = FreshMeasurement::Awaiting;
         }

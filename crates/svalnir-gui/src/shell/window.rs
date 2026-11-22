@@ -20,7 +20,7 @@ use crate::{
         glow,
         tokens::{self, Tokens, to_hsla},
     },
-    ui::data_state::format_age,
+    ui::data_state::capture_age_text,
 };
 use gpui_kit::{
     AnyElement, AnyView, AppContext as _, ClickEvent, Context, Entity, EntityId, FocusHandle,
@@ -224,11 +224,11 @@ impl MainWindow {
             Loadable::Unavailable(_) => "unavailable",
         };
         let updated: String = match &model.host {
-            Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => format_age(
-                SystemTime::now()
-                    .duration_since(snapshot.captured_at)
-                    .unwrap_or_default(),
-            ),
+            // The age rule of the screens: a capture time well in the future
+            // has no known age, and is not shown as 0 s.
+            Loadable::Ready(snapshot) | Loadable::Stale(snapshot) => {
+                capture_age_text(snapshot.captured_at, SystemTime::now())
+            }
             Loadable::Loading | Loadable::Unavailable(_) => "no data".to_owned(),
         };
         format!(

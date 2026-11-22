@@ -59,7 +59,10 @@ pub fn pause_summary(
             remaining,
             until: deadline,
         }) => {
-            let started: String = ago(*since, now);
+            let started: String = since.map_or_else(
+                || "at a time that is not recorded".to_owned(),
+                |since| ago(since, now),
+            );
             let sentence: String = match (kind, remaining) {
                 (PauseKind::Indefinite, _) => {
                     format!("Automation was paused {started}. The pause has no end time.")
@@ -94,8 +97,8 @@ pub fn pause_summary(
             "Pause ended",
             Tone::Neutral,
             format!(
-                "A pause from {} reached its end on the clock of the agent. It inhibits nothing, and the agent removes the record.",
-                ago(*since, now)
+                "A pause{} reached its end on the clock of the agent. It inhibits nothing, and the agent removes the record.",
+                since.map_or_else(String::new, |since| format!(" from {}", ago(since, now)))
             ),
         ),
     }
@@ -833,7 +836,7 @@ mod tests {
 
     fn paused(kind: PauseKind, remaining: Option<Duration>) -> PauseRow {
         PauseRow::Paused {
-            since: now() - Duration::from_mins(10),
+            since: Some(now() - Duration::from_mins(10)),
             remaining,
             until: remaining.map(|remaining| now() + remaining),
             kind,
@@ -872,7 +875,7 @@ mod tests {
     #[test]
     fn an_expired_pause_inhibits_nothing() {
         let expired = PauseRow::Expired {
-            since: now() - Duration::from_hours(2),
+            since: Some(now() - Duration::from_hours(2)),
         };
         let (text, tone, _) = pause_summary(Some(&expired), now(), now());
         assert_eq!((text, tone), ("Pause ended", Tone::Neutral));

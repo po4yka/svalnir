@@ -13,8 +13,8 @@
 //! the menu, and when the menu closes it asks for the latest view.
 
 use super::{
-    CellPaint, ItemTone, MenuBarLook, MenuCommand, MenuRow, StatusView, Surface, paint_rgba,
-    tone_rgb,
+    CellPaint, ItemTone, MenuBarLook, MenuCommand, MenuRow, StatusView, Surface, dot_outline_rgba,
+    paint_rgba, tone_rgb,
 };
 use crate::viz::capacity_grid::INLINE_CELLS;
 use block2::RcBlock;
@@ -173,7 +173,10 @@ impl StatusSurface {
                 };
                 item.setEnabled(false);
                 if let Some(detail) = detail {
-                    item.setToolTip(Some(&NSString::from_str(detail)));
+                    let detail: Retained<NSString> = NSString::from_str(detail);
+                    item.setToolTip(Some(&detail));
+                    // A tooltip is not read by VoiceOver; the help text is.
+                    item.setAccessibilityHelp(Some(&detail));
                 }
                 item
             }
@@ -305,11 +308,20 @@ fn grid_image(
         if let Some(tone) = pressure {
             let [r, g, b] = tone_rgb(tone, look.dark);
             set_color([r, g, b, 1.0]);
-            NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                NSPoint::new(x.max(0.0), (CELL_HEIGHT - DOT) / 2.0),
-                NSSize::new(DOT, DOT),
-            ))
-            .fill();
+            let origin: NSPoint = NSPoint::new(x.max(0.0), (CELL_HEIGHT - DOT) / 2.0);
+            NSBezierPath::bezierPathWithOvalInRect(NSRect::new(origin, NSSize::new(DOT, DOT)))
+                .fill();
+            if let Some(outline) = dot_outline_rgba(look) {
+                // The stroke is centered on the path, so the path is inset
+                // by half the line to keep the outline inside the image.
+                set_color(outline);
+                let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                    NSPoint::new(origin.x + 0.5, origin.y + 0.5),
+                    NSSize::new(DOT - 1.0, DOT - 1.0),
+                ));
+                ring.setLineWidth(1.0);
+                ring.stroke();
+            }
         }
         Bool::YES
     });

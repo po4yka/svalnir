@@ -1336,7 +1336,11 @@ impl RenderOnce for HeadroomDial {
             let (x, y): (f32, f32) = dot_center(index * 12, TICK_DOTS, LABEL_RADIUS);
             face.push(
                 div()
-                    .id(SharedString::from(format!("dial-scale-{text}")))
+                    // A static name and the index: no text is made per frame.
+                    .id(gpui_kit::ElementId::NamedInteger(
+                        SharedString::new_static("dial-scale"),
+                        u64::try_from(index).unwrap_or(u64::MAX),
+                    ))
                     .absolute()
                     .left(px(DIAL_SIZE / 2.0 + x - 12.0))
                     .top(px(DIAL_SIZE / 2.0 + y - LABEL_LINE / 2.0))
@@ -1369,10 +1373,10 @@ impl RenderOnce for HeadroomDial {
             };
             face.push(
                 div()
-                    .id(SharedString::from(format!(
-                        "dial-name-{}",
-                        ring.kind.short_name()
-                    )))
+                    .id(gpui_kit::ElementId::NamedInteger(
+                        SharedString::new_static("dial-name"),
+                        u64::try_from(index).unwrap_or(u64::MAX),
+                    ))
                     .absolute()
                     .right(px(DIAL_SIZE / 2.0 + 0.5 + NAME_GAP))
                     .top(px(DIAL_SIZE / 2.0 - RING_RADII[index] - LABEL_LINE / 2.0))

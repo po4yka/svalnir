@@ -16,8 +16,10 @@
 //!   client reads the completion. With no agent that holds the lock, each
 //!   of these is refused with the cause, and nothing is written.
 //!
-//! The client never takes the coordinator lock and never makes the state
-//! directory or the journal.
+//! The client never takes the coordinator lock. For a pause, a resume, or
+//! a disable with no state directory or no journal, it makes the private
+//! state directory and the journal through the shared function of the CLI
+//! (`client::create_state_directory`); no other action makes them.
 
 pub mod fixture;
 pub mod live;
@@ -536,9 +538,6 @@ pub fn reason_of(code: &str) -> &'static str {
         }
         "disable_refused" | "rearm_refused" => "The request was refused",
         "invalid_duration" => "The pause duration is not usable",
-        "coordinator_stopped" => {
-            "The agent stopped before it decided the request. The request stays in the queue"
-        }
         "journal_busy" => "A different process holds the journal. Try again",
         "journal_full" => "The operation journal has no space for new work",
         "journal_conflict" => "The journal has a different request with this identity",

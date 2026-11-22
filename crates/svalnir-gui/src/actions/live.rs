@@ -22,8 +22,8 @@ use std::{
 };
 use svalnir_agent::{
     client::{
-        self, ActiveConfig, ActiveConfigError, AgentPresence, StateDirectoryError, StopMode,
-        WaitError,
+        self, ActiveConfig, ActiveConfigError, AgentPresence, ManualStopError, ManualStopPlan,
+        StateDirectoryError, StopMode, WaitError,
     },
     journal::{
         JournalOptions, OperationJournal, OperationJournalError, QueuedRequest, RequestBody,
@@ -32,15 +32,13 @@ use svalnir_agent::{
     observe::{self, AuthorityReadError, Host, StoredAuthority},
     platform::{
         account::verify_process_home,
-        process::{
-            ProcessRecord, ProcessSnapshot, application_candidates, control_plane_of_this_process,
-        },
+        process::{ProcessRecord, ProcessSnapshot, control_plane_of_this_process},
     },
     runtime::journal_path,
 };
 use svalnir_core::{
     action::{ClientRole, Plan, PlanApproval},
-    authority::{AuthorityBinding, Generation},
+    authority::Generation,
     file::LosslessPath,
     grant::{
         Acknowledged, Change, ControlClock, ControlRefusal, DisableRequest, EnableRefusal,
@@ -48,14 +46,11 @@ use svalnir_core::{
         enable, pause, resume,
     },
     id::{
-        ActionGrantId, IncidentId, OperationId, PlanId, PolicyRevisionId, RequestId, StepId,
-        TargetId,
+        ActionGrantId, ApplicationInstanceId, IncidentId, OperationId, PolicyRevisionId, RequestId,
     },
-    plan::{
-        PlanContext, StopRequest, StopStepIds, build_stop_plan, check_expiry, manual_plan_lifetime,
-    },
+    plan::check_expiry,
     policy::{ApplicationCandidate, EvaluationClock, PolicyId, ProtectionContext, ProtectionFact},
-    process::{ProcessIdentity, VerifiedMembership},
+    process::ProcessIdentity,
     quantity::Nanoseconds,
     time::WallTime,
 };
@@ -402,10 +397,13 @@ impl ActionPort for LivePort {
             principal: observe::current_uid(),
             control_plane: control_plane.as_deref(),
         };
-        let candidate: ApplicationCandidate = application_candidates(&snapshot, &protection)
-            .into_iter()
-            .find(|candidate| instance_of(candidate) == Some(instance))
-            .ok_or_else(|| ActionState::refused("group_not_found"))?;
+        // The candidate and the plan come from the functions that the CLI
+        // uses, so both clients bind the same processes in the same way.
+        let instance_id: ApplicationInstanceId = ApplicationInstanceId::new(instance)
+            .map_err(|_| ActionState::refused("group_not_found"))?;
+        let candidate: ApplicationCandidate =
+            client::group_candidate(&snapshot, &protection, &instance_id)
+                .ok_or_else(|| ActionState::refused("group_not_found"))?;
         match candidate.hard_protection {
             ProtectionFact::NotProtected => {}
             ProtectionFact::Protected => return Err(ActionState::refused("target_protected")),
@@ -413,50 +411,35 @@ impl ActionPort for LivePort {
                 return Err(ActionState::refused("target_protection_unknown"));
             }
         }
-        let lifetime: Nanoseconds = manual_plan_lifetime(&config)
-            .ok_or_else(|| ActionState::refused("plan_not_buildable"))?;
         let home = std::env::var_os("HOME")
             .and_then(|home| std::fs::canonicalize(home).ok())
             .and_then(|home| LosslessPath::from_path(&home).ok());
+        let principal = client::principal(ClientRole::Gui);
+        let grace: Nanoseconds = Nanoseconds::try_from(client::DEFAULT_STOP_GRACE)
+            .map_err(|_| ActionState::refused("plan_not_buildable"))?;
         let build = |mode: StopMode| -> Result<Arc<Plan>, ActionState> {
             let plan_text: String = client::new_id("plan");
-            let identity = |suffix: &str| format!("{plan_text}-{suffix}");
-            let invalid = |_| ActionState::refused("identity_unavailable");
-            let context = PlanContext {
-                plan_id: PlanId::new(plan_text.clone()).map_err(invalid)?,
-                principal: client::principal(ClientRole::Gui),
-                authority: AuthorityBinding {
-                    policy_revision: active.revision.revision_id.clone(),
-                    action_grants: Vec::new(),
-                    privilege_grant: None,
-                },
+            let (strategy, limits) = client::manual_stop(mode, grace);
+            client::build_manual_stop(&ManualStopPlan {
+                plan_id: &plan_text,
+                principal: &principal,
+                active: &active,
+                config: &config,
                 clock: &clock,
                 created_wall: wall,
-                lifetime,
-                protections: config.protections(),
                 home_directory: home.as_ref(),
-            };
-            let (strategy, limits) = client::manual_stop(
-                mode,
-                Nanoseconds::try_from(client::DEFAULT_STOP_GRACE)
-                    .map_err(|_| ActionState::refused("plan_not_buildable"))?,
-            );
-            let request = StopRequest {
-                target_id: TargetId::new(identity("app")).map_err(invalid)?,
                 candidate: &candidate,
                 protection: &protection,
                 strategy,
-                steps: StopStepIds {
-                    graceful: StepId::new(identity("graceful")).map_err(invalid)?,
-                    force: StepId::new(identity("force")).map_err(invalid)?,
-                },
                 limits,
-            };
-            build_stop_plan(&context, &request)
-                .map_err(|_| ActionState::refused("plan_not_buildable"))?
-                .plan
-                .map(Arc::new)
-                .ok_or_else(|| ActionState::refused("target_not_eligible"))
+            })
+            .map_err(|error| match error {
+                ManualStopError::Identity => ActionState::refused("identity_unavailable"),
+                ManualStopError::Build(_) => ActionState::refused("plan_not_buildable"),
+            })?
+            .plan
+            .map(Arc::new)
+            .ok_or_else(|| ActionState::refused("target_not_eligible"))
         };
         let quit: Arc<Plan> = build(StopMode::Graceful)?;
         let force: Arc<Plan> = build(StopMode::ImmediateForce)?;
@@ -699,20 +682,6 @@ pub fn policy_label(policy: PolicyId) -> String {
 
 fn operation_id(text: &str) -> Result<OperationId, ActionState> {
     OperationId::new(text).map_err(|_| ActionState::refused("operation_not_found"))
-}
-
-/// The instance of the verified membership of the first process of a
-/// candidate. Each process of a candidate has the same instance.
-fn instance_of(candidate: &ApplicationCandidate) -> Option<&str> {
-    match candidate
-        .processes
-        .first()?
-        .association
-        .verified_membership()?
-    {
-        VerifiedMembership::Application { instance_id, .. }
-        | VerifiedMembership::ManagedJob { instance_id, .. } => Some(instance_id.as_str()),
-    }
 }
 
 /// The processes that `plan` binds, with the identity evidence of the plan

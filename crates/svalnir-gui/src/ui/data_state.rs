@@ -1,7 +1,7 @@
 //! Pure helpers that present snapshot values.
 
 use crate::data::model::Measured;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The text for a value that is not available: an em dash.
 pub const UNAVAILABLE_TEXT: &str = "\u{2014}";
@@ -50,6 +50,31 @@ pub fn used_capacity(total: &Measured<u64>, available: &Measured<u64>) -> Measur
             Measured::Unavailable(reason.clone())
         }
     }
+}
+
+/// How far a capture time can be after now and still have the age 0: the
+/// clocks of the readers can differ by a small step.
+pub const CLOCK_SLACK: Duration = Duration::from_secs(3);
+
+/// The text of the age of a capture time that is well after now.
+pub const UNKNOWN_AGE_TEXT: &str = "at an unknown time (the clock moved back)";
+
+/// The age of a value captured at `captured_at`, at `now`. `None` when the
+/// capture time is more than [`CLOCK_SLACK`] after `now`: the wall clock
+/// moved back, so the age is not known, and it is not 0.
+#[must_use]
+pub fn capture_age(captured_at: SystemTime, now: SystemTime) -> Option<Duration> {
+    match now.duration_since(captured_at) {
+        Ok(age) => Some(age),
+        Err(ahead) if ahead.duration() <= CLOCK_SLACK => Some(Duration::ZERO),
+        Err(_) => None,
+    }
+}
+
+/// The text of [`capture_age`]: [`format_age`], or [`UNKNOWN_AGE_TEXT`].
+#[must_use]
+pub fn capture_age_text(captured_at: SystemTime, now: SystemTime) -> String {
+    capture_age(captured_at, now).map_or_else(|| UNKNOWN_AGE_TEXT.to_owned(), format_age)
 }
 
 /// The age as "just now", "N s ago", or "N min ago" (hours as minutes).

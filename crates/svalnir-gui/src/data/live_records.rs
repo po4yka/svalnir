@@ -67,7 +67,7 @@ pub(crate) fn system_time(time: WallTime) -> SystemTime {
     }
 }
 
-fn observed_bytes(observation: &Observation<Bytes>) -> Measured<u64> {
+pub(crate) fn observed_bytes(observation: &Observation<Bytes>) -> Measured<u64> {
     match observation.value() {
         Some(value) => Measured::Value(value.get()),
         None => Measured::Unavailable(
@@ -495,7 +495,7 @@ fn duration(value: Nanoseconds) -> Duration {
 
 /// The pause row of `reading`, with the start time of the record.
 fn pause_row(reading: &PauseReading, since: Option<WallTime>) -> PauseRow {
-    let since: SystemTime = since.map_or(UNIX_EPOCH, system_time);
+    let since: Option<SystemTime> = since.map(system_time);
     match reading.status {
         PauseStatus::NotPaused => PauseRow::NotPaused,
         PauseStatus::Paused {
@@ -1450,7 +1450,7 @@ eligible_groups = ["background-user-applications", "managed-jobs"]
         assert_eq!(
             paused.pause,
             Some(PauseRow::Paused {
-                since: system_time(wall(10)),
+                since: Some(system_time(wall(10))),
                 remaining: Some(Duration::from_secs(300)),
                 until: Some(system_time(wall(400))),
                 kind: PauseKind::Timed,
@@ -1501,7 +1501,7 @@ eligible_groups = ["background-user-applications", "managed-jobs"]
         assert_eq!(
             later.pause,
             Some(PauseRow::Expired {
-                since: system_time(wall(10)),
+                since: Some(system_time(wall(10))),
             })
         );
         assert_eq!(later.measurement, FreshMeasurement::NotKnown);

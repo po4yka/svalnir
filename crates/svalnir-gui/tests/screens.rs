@@ -196,6 +196,12 @@ fn a_stale_reading_keeps_its_value_and_shows_its_age(cx: &mut TestAppContext) {
         Some("Stale: read 12 min ago")
     );
     assert!(label(handle, "memory-process-name-412", cx).is_some());
+    // The host rows of "Memory and swap" have their own stale line.
+    assert!(
+        label(handle, "memory-host-stale", cx).is_some_and(|text| text.starts_with("Stale: read")),
+        "{:?}",
+        label(handle, "memory-host-stale", cx)
+    );
     let (handle, _view) = open(FixtureScenario::Stale, Screen::Automation, cx);
     assert_eq!(
         label(handle, "automation-stale", cx).as_deref(),

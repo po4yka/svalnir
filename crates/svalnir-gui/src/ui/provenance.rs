@@ -2,7 +2,7 @@
 
 use crate::{
     theme::tokens::{Tokens, to_hsla},
-    ui::data_state::format_age,
+    ui::data_state::capture_age_text,
 };
 use gpui_kit::{
     App, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce,
@@ -13,11 +13,7 @@ use std::time::SystemTime;
 /// The text of a provenance line, in upper case.
 #[must_use]
 pub fn provenance_text(source: &str, captured_at: SystemTime, scope: &str) -> String {
-    let age: String = format_age(
-        SystemTime::now()
-            .duration_since(captured_at)
-            .unwrap_or_default(),
-    );
+    let age: String = capture_age_text(captured_at, SystemTime::now());
     format!("{source} \u{b7} {age} \u{b7} {scope}").to_uppercase()
 }
 

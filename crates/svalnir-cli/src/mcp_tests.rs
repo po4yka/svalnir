@@ -406,6 +406,32 @@ fn a_message_that_is_not_a_valid_request_gets_the_error_of_the_specification() {
 }
 
 #[test]
+fn the_plan_tool_cannot_give_the_consent_to_a_clear_rule() {
+    let (environment, _directory) = environment();
+    let session = serve(
+        &environment,
+        &[
+            initialize(),
+            initialized(),
+            call(
+                2,
+                "plan",
+                &json!({"mode": "evict", "rule": "cargo.registry-cache", "include_clear": true}),
+            ),
+        ],
+    );
+    let result = &response(&session, 2)["result"];
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("has no argument `include_clear`"),
+        "{result}"
+    );
+}
+
+#[test]
 fn the_disk_tool_has_the_result_of_the_command() {
     let (environment, _directory) = environment();
     let session = serve(

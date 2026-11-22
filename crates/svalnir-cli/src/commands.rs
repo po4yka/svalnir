@@ -452,7 +452,8 @@ fn check_format(command: &Command, format: Format) -> Result<(), ErrorBody> {
 
 /// A rule selects the candidates of the `evict` mode and the command of the
 /// `owner` mode only, and `--include-clear` is an option of the `owner`
-/// mode only.
+/// mode and of the `evict` mode with a clear rule
+/// (`docs/CLEANUP_RULES.md` section 12, "Clear rules") only.
 fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
     let Command::Clean {
         command: CleanCommand::Plan(plan),
@@ -460,12 +461,17 @@ fn check_rule_selection(command: &Command) -> Result<(), ErrorBody> {
     else {
         return Ok(());
     };
-    if plan.include_clear && plan.mode != CleanMode::Owner {
+    let clear_evict: bool = plan.mode == CleanMode::Evict
+        && plan
+            .rule
+            .as_deref()
+            .is_some_and(svalnir_agent::rules::clear::is_clear_rule);
+    if plan.include_clear && plan.mode != CleanMode::Owner && !clear_evict {
         return Err(ErrorBody {
             code: "unsupported_rule_selection".into(),
             family: ErrorFamily::Request,
             stage: ErrorStage::Arguments,
-            message: "`--include-clear` applies only to `--mode owner`".to_owned(),
+            message: "`--include-clear` applies only to `--mode owner` and to `--mode evict` with a clear rule".to_owned(),
             fields: &["include_clear", "mode"],
             operation_id: None,
             plan_id: None,

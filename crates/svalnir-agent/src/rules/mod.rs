@@ -33,6 +33,15 @@
 //! They give no candidate, and the discovery for an eviction does not
 //! examine them.
 //!
+//! # Clear rules
+//!
+//! The rules of [`clear`] remove the contents of one cache directory of a
+//! producer that has no safe cleanup command, also data that a project
+//! uses now. Each one has the inspection mode and the manual eviction
+//! only: the discovery for an eviction examines it for a manual eviction
+//! and never for an automatic one, and a client plans it only with the
+//! explicit consent of the user.
+//!
 //! # Discovery for an eviction
 //!
 //! [`ReviewedRules::discover_for_eviction`] does steps 2 to 4 for the
@@ -59,6 +68,8 @@
 
 #[cfg(unix)]
 pub mod caches;
+#[cfg(unix)]
+pub mod clear;
 #[cfg(unix)]
 mod eviction;
 #[cfg(unix)]
@@ -102,6 +113,9 @@ mod eviction_tests;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+#[cfg(test)]
+#[cfg(unix)]
+mod xcode_orphan_tests;
 
 #[cfg(unix)]
 pub use eviction::{
@@ -135,6 +149,6 @@ pub use registry::{ClaimError, RegistryError, ReviewedRules, RuleStatus};
 pub use xcode::{
     BUILD_CONFIGURATIONS, INDEX_CHILDREN, INTERMEDIATES_CHILDREN, PLATFORM_SUFFIXES,
     ProducerProcesses, SHARED_ROOT_ENTRIES, UNIT_PATHS, XCODE_DERIVED_DATA_LAYOUT,
-    XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_PRODUCER_EXECUTABLES,
-    XcodeDerivedDataRule, XcodeEvidence,
+    XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_ORPHAN_LAYOUT,
+    XCODE_PRODUCER_EXECUTABLES, XcodeDerivedDataRule, XcodeEvidence,
 };

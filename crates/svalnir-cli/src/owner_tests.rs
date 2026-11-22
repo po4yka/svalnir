@@ -259,7 +259,8 @@ fn the_owner_mode_refuses_a_rule_with_no_owner_operation() {
         "{}",
         entry.stdout
     );
-    // `--include-clear` is an option of the `owner` mode only.
+    // `--include-clear` is an option of the `owner` mode, and of the
+    // `evict` mode with a clear rule only.
     let evict = json(
         &world.environment,
         &[

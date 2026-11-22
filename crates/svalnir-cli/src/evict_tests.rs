@@ -339,6 +339,46 @@ fn an_evict_plan_has_the_units_of_the_rule_and_its_apply_removes_them() {
 }
 
 #[test]
+fn an_orphan_project_directory_is_planned_as_one_target_and_removed() {
+    let world = World::manual();
+    // The project of `WorkspacePath` is gone.
+    std::fs::remove_dir_all(world.directory.path().join("src")).unwrap();
+    let outcome = world.plan(&[]);
+    assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+    let result = outcome.result();
+    assert_eq!(
+        target_paths(&result),
+        [world.project.to_str().unwrap().to_owned()]
+    );
+    let plan: String = result["explanation"]["plan"]["plan_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let applied = world.apply(&plan);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(!world.project.exists());
+    // The root of the rule stays.
+    assert!(world.project.parent().unwrap().exists());
+}
+
+#[test]
+fn an_orphan_whose_project_is_back_is_skipped_at_its_step() {
+    let world = World::manual();
+    let sources: PathBuf = world.directory.path().join("src");
+    std::fs::remove_dir_all(&sources).unwrap();
+    let plan: String = world.planned();
+    // The project is back after the plan.
+    write_workspace(&sources, "App").unwrap();
+    let applied = world.apply(&plan);
+    assert!(
+        applied.stdout.contains("workspace_present"),
+        "{}",
+        applied.stdout
+    );
+    assert!(world.project.exists());
+}
+
+#[test]
 fn a_session_with_no_terminal_needs_the_approval_of_the_eviction() {
     let world = World::manual();
     let plan_id: String = world.planned();

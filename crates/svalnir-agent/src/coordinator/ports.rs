@@ -158,11 +158,14 @@ pub trait AuthoritySource: Debug {
     fn unit_recheck(
         &self,
         rule: &RuleRef,
-        _layout: Option<&str>,
+        layout: Option<&str>,
         _root: &Path,
         _path: &Path,
     ) -> UnitRecheck {
-        if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID {
+        if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID
+            || crate::rules::clear::is_clear_rule(rule.id.as_str())
+            || layout == Some(crate::rules::XCODE_ORPHAN_LAYOUT)
+        {
             UnitRecheck::Unknown("unit_recheck_unavailable")
         } else {
             UnitRecheck::Passed

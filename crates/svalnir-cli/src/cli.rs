@@ -316,9 +316,11 @@ pub struct CleanPlanArgs {
         required_if_eq_any([("mode", "evict"), ("mode", "owner")])
     )]
     pub rule: Option<String>,
-    /// Consent to a rule whose owner command has the kind `clear`: the
-    /// producer removes its cache, also data that a project uses now. Only
-    /// the `owner` mode accepts it.
+    /// Consent to a clear rule: the plan removes cache data of the
+    /// producer, also data that a project uses now. The `owner` mode
+    /// accepts it for a rule whose owner command has the kind `clear`, and
+    /// the `evict` mode for a clear rule of the registry, which requires
+    /// it.
     #[arg(long)]
     pub include_clear: bool,
     /// An entry of the saved scan to select, by its exact path. Repeat it

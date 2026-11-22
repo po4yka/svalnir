@@ -366,7 +366,7 @@ rule_id: xcode.inactive-derived-data
 rule_revision: r1
 layout: derived-data-project-v1
 lifecycle_target: automatic_eviction_validated
-record_id: VAL-05/xcode.inactive-derived-data/r1/derived-data-project-v1/automatic
+record_id: VAL-05/xcode.inactive-derived-data/r2/derived-data-project-v1/automatic
 producer_versions: []
 host_versions: []
 filesystems: []
@@ -390,7 +390,7 @@ owner_approval: null
 | `open_points_closed` | Each open point of the rule documentation that the record decides |
 | `owner_approval` | The name of the owner and the date. A record with no approval promotes nothing |
 
-The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names. [validation/README.md](validation/README.md) has the owner checklist of the host procedure below, and [validation/xcode.inactive-derived-data-r1.md](validation/xcode.inactive-derived-data-r1.md) is an empty record; neither is a record of a run.
+The record is a tracked file under `docs/validation/`, and its evidence files are beside it or at a retained location that the record names. [validation/README.md](validation/README.md) has the owner checklist of the host procedure below, and [validation/xcode.inactive-derived-data-r2.md](validation/xcode.inactive-derived-data-r2.md) is an empty record; neither is a record of a run.
 
 ### Stages and the build of the run
 
@@ -446,6 +446,10 @@ Only the project owner starts this procedure, on a host that the owner selects. 
 17. Producer after the plan: make a plan, start a build, then apply. Expected: each target is skipped with `producer_active`, and the build is not stopped.
 18. Apply of a plan with no change: `svalnir clean apply --plan PLAN_ID`, then `svalnir history --format json`. Expected: each unit is removed, `permanently_removed` has the count, `moved_to_trash` is 0, and `Logs`, `info.plist`, and the sources stay.
 19. Regeneration: build and test each project again with each Xcode version. Expected: each succeeds with no manual step. Record the time of the first build and of the indexing: this is the rebuild cost of the declaration.
+
+**Orphan layout (`manual_action_validated` only)**
+
+The layout `derived-data-orphan-v1` has its own record (record identity `VAL-05/xcode.inactive-derived-data/r2/derived-data-orphan-v1/manual`; the layout has no automatic stage). Build one project, then move its source folder to the Trash and empty it; build a second project from an external disk, then eject the disk; make a third orphan whose `SourcePackages/checkouts` has a checkout with an edit. Make a plan. Expected: one target, the project directory of the first project; the second project directory has no orphan unit; the third is skipped with `nested_repository`; the units of `derived-data-project-v1` of the three projects are skipped with `not_regenerable` or `regenerability_unknown`. Make a plan again, connect the disk of the second project, restore the first project from a copy, and apply. Expected: the target is skipped with `workspace_present`, and its files stay.
 
 **Automatic eviction (`automatic_eviction_validated`)**
 
@@ -506,7 +510,7 @@ The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules
 
 **Inspection**
 
-6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: `resolved_roots` has the root of step 4; each unit has a size; the units of step 5 are not eligible (`protected_data` for `bundler` and for the group of the local install, `nested_repository` for `repositories` of SwiftPM). Keep the output.
+6. `svalnir clean inspect --rule RULE --format json` for each rule. Expected: `resolved_roots` has the root of step 4; each unit has a size; the units of step 5 are not eligible (`protected_data` for `bundler` and for the artifact directory of the local install, `nested_repository` for `repositories` of SwiftPM); the other artifacts of the group of the local install are units. Keep the output.
 
 **Consent and activity**
 
@@ -516,7 +520,7 @@ The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules
 **Manual eviction**
 
 9. Make a plan with `--include-clear`. Expected: one target for each unit that each check accepts, the cleanup root of step 4, `discovery.complete` true, and no target for a unit of step 5.
-10. Check before a step: make a plan of `maven.repository`, then run `mvn install` of a project whose group is a target; `svalnir clean apply --plan PLAN_ID`. Expected: that target is skipped with `protected_child`, and its files stay; each other target is removed.
+10. Check before a step: make a plan of `maven.repository`, then run `mvn install` of a project whose artifact directory is a target; `svalnir clean apply --plan PLAN_ID`. Expected: that target is skipped with `protected_child`, and its files stay; each other target is removed.
 11. `svalnir history --format json`. Expected: `permanently_removed` has the count. The root directory of each rule, `~/.cargo/git`, `~/.cargo/bin`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `location_data`, and `deno_history.txt` stay.
 12. Regeneration: run the fetch or build command of each project of step 4 again. Expected: each succeeds with a network and no manual step. Record the time and the downloaded bytes: this is the rebuild cost of the rule. Record the result of an offline build (`cargo build --offline`, `mvn -o package`), which is expected to fail for a removed item.
 

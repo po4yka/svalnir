@@ -186,8 +186,9 @@ fn the_registry_has_eighteen_rules_and_each_layout_is_proposed() {
     // two for `simulator.devices` and for `container.build-cache`, and one
     // for `homebrew.cleanup` and for `git.linked-worktree`, and the layout
     // of the scope root of each of the ten rules with an owner operation.
-    // A clear rule has one layout.
-    assert_eq!(statuses.len(), 58 + clear);
+    // A clear rule has one layout, and `xcode.inactive-derived-data` has a
+    // second layout for an orphan project directory.
+    assert_eq!(statuses.len(), 59 + clear);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);
@@ -2221,7 +2222,14 @@ fn a_project_with_no_source_or_with_source_overlap_is_not_a_candidate() {
     let (fixture, _) = xcode_fixture();
     fs::remove_dir_all(fixture.base().join("src")).unwrap();
     let discovery = discover_xcode(&fixture);
-    assert_eq!(discovery.candidates.len(), 0);
+    // The one candidate is the whole project directory, of the layout of an
+    // orphan; the units of the other layout stay `not_regenerable`.
+    let layouts: Vec<&str> = discovery
+        .candidates
+        .iter()
+        .map(|candidate| candidate.candidate.layout.as_str())
+        .collect();
+    assert_eq!(layouts, [super::xcode::XCODE_ORPHAN_LAYOUT]);
     for name in super::xcode::UNIT_PATHS {
         let skipped = skip_of(&discovery, &unit(name));
         assert_eq!(skipped.reasons, [SkipReason::NotRegenerable]);

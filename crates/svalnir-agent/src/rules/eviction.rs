@@ -60,7 +60,9 @@ use super::projects::{
     inventory as project_inventory, recheck_unit,
 };
 use super::registry::ReviewedRules;
-use super::xcode::{ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XcodeEvidence};
+use super::xcode::{
+    ProducerProcesses, XCODE_DERIVED_DATA_RULE_ID, XCODE_ORPHAN_LAYOUT, XcodeEvidence,
+};
 use crate::executor::fs::{ApprovedRoot, ApprovedRoots};
 use crate::platform::process::{
     PathInventory, ProcessSource, QueryFailure, refused_process_passes_platform_gate,
@@ -589,6 +591,9 @@ pub trait DiscoveryEnvironment: ScanClock {
     ) -> UnitRecheck {
         if let Some(spec) = clear::spec_of(rule.id.as_str()) {
             return clear::recheck_unit(spec, principal, root, path);
+        }
+        if rule.id.as_str() == XCODE_DERIVED_DATA_RULE_ID && layout == Some(XCODE_ORPHAN_LAYOUT) {
+            return super::xcode::recheck_orphan(principal, root, path);
         }
         if rule.id.as_str() != PROJECT_RULE_ID {
             return UnitRecheck::Passed;
@@ -1379,14 +1384,29 @@ impl ReviewedRules {
             clock: environment,
         };
         match self.discover_one(rule, &scope, mode, &control, environment) {
-            Ok(discovery) => (
-                RootResult::Examined {
-                    completion: discovery.completion,
-                    skipped: discovery.skipped,
-                    skipped_omitted: discovery.skipped_omitted,
-                },
-                discovery.candidates,
-            ),
+            Ok(mut discovery) => {
+                // The layout of an orphan project directory is for a manual
+                // eviction only.
+                if *request.purpose != RuleMode::ManualEviction {
+                    let manual_only = |layout: &str| layout == XCODE_ORPHAN_LAYOUT;
+                    discovery
+                        .candidates
+                        .retain(|candidate| !manual_only(&candidate.candidate.layout));
+                    discovery.skipped.retain(|unit| {
+                        unit.layout
+                            .as_deref()
+                            .is_none_or(|layout| !manual_only(layout))
+                    });
+                }
+                (
+                    RootResult::Examined {
+                        completion: discovery.completion,
+                        skipped: discovery.skipped,
+                        skipped_omitted: discovery.skipped_omitted,
+                    },
+                    discovery.candidates,
+                )
+            }
             Err(error) => (RootResult::Refused(refusal_name(&error)), Vec::new()),
         }
     }

@@ -82,9 +82,20 @@ impl ClearRule {
         let mounts: MountTable =
             (input.mounts)().map_err(|_| DiscoveryError::RootLocalityUnknown)?;
         let root: RootView = RootView::open(input.scope, &mounts)?;
-        let names: Vec<PathBuf> =
-            list_root(&root, &collector.bounds, None).map_err(DiscoveryError::RootUnavailable)?;
         let mut completion: DiscoveryCompletion = DiscoveryCompletion::Finished;
+        let names: Vec<PathBuf> = if self.spec.units == UnitForm::MavenArtifact {
+            let limit: usize = usize::try_from(input.control.limits.max_units)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            let device: u64 = u64::try_from(root.device().get()).unwrap_or(u64::MAX);
+            let (units, complete) = super::artifact_directories(&root.path, device, limit);
+            if !complete {
+                completion = DiscoveryCompletion::UnitLimitReached;
+            }
+            units
+        } else {
+            list_root(&root, &collector.bounds, None).map_err(DiscoveryError::RootUnavailable)?
+        };
         for name in names {
             if !collector.has_candidate_room() {
                 completion = DiscoveryCompletion::CandidateLimitReached;
@@ -171,6 +182,8 @@ impl ClearRule {
         // Predicate 8: the complete unit and its charge.
         if before.kind == ObjectKind::Directory {
             let refuse: &'static [&'static str] = spec.refuse_names;
+            let records: bool = spec.units == UnitForm::MavenArtifact;
+            let unit_path: PathBuf = path.clone();
             let stopped: Option<DiscoveryCompletion> = establish_charge(
                 &mut assessment,
                 None,
@@ -182,8 +195,10 @@ impl ClearRule {
                 self.rule(),
                 &mut collector.bounds,
                 &mut |relative: &Path, kind: EntryKind| {
-                    (kind != EntryKind::Directory && has_refused_name(refuse, relative))
-                        .then_some(SkipReason::ProtectedData)
+                    let refused: bool = kind != EntryKind::Directory
+                        && (has_refused_name(refuse, relative)
+                            || (records && is_local_record(&unit_path.join(relative), relative)));
+                    refused.then_some(SkipReason::ProtectedData)
                 },
             )?;
             if stopped.is_some() {
@@ -345,6 +360,15 @@ fn has_refused_name(names: &[&str], relative: &Path) -> bool {
     })
 }
 
+/// Whether the file `relative` at `path` is a `_remote.repositories`
+/// record of a local install.
+fn is_local_record(path: &Path, relative: &Path) -> bool {
+    relative
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(super::REMOTE_RECORD))
+        && super::has_local_install_record(path)
+}
+
 /// The reason that the child `relative` with the snapshot `snapshot` is not
 /// a unit of `spec`, or `None`.
 fn form_refusal(
@@ -355,7 +379,8 @@ fn form_refusal(
     match (snapshot.kind, spec.units) {
         (ObjectKind::SymbolicLink, _) => Some(SkipReason::SymbolicLink),
         (ObjectKind::Other, _) => Some(SkipReason::UnsupportedObject),
-        (ObjectKind::Directory | ObjectKind::RegularFile, UnitForm::Any) => None,
+        (ObjectKind::Directory | ObjectKind::RegularFile, UnitForm::Any)
+        | (ObjectKind::Directory, UnitForm::MavenArtifact) => None,
         (ObjectKind::RegularFile, UnitForm::GemFile)
             if relative
                 .extension()
@@ -366,6 +391,7 @@ fn form_refusal(
         (ObjectKind::Directory | ObjectKind::RegularFile, UnitForm::GemFile) => {
             Some(SkipReason::UnsupportedLayout)
         }
+        (ObjectKind::RegularFile, UnitForm::MavenArtifact) => Some(SkipReason::UnsupportedLayout),
     }
 }
 
@@ -380,8 +406,9 @@ const MAX_RECHECK_ENTRIES: u64 = 2_000_000;
 /// - The unit is a child of the root `root` that the rule does not keep,
 ///   with the form of the rule, and the user `principal` owns it. A unit
 ///   that is gone gives [`UnitRecheck::Absent`].
-/// - For a rule with refused names (`maven.repository`), no entry below the
-///   unit has one of them. The walk follows no symbolic link and reads at
+/// - For `maven.repository`, the unit is still an artifact directory, and
+///   no entry below it is `maven-metadata-local.xml` or a
+///   `_remote.repositories` record of a local install. The walk follows no symbolic link and reads at
 ///   most 2 000 000 entries; a walk that stops or cannot read a directory
 ///   gives [`UnitRecheck::Unknown`].
 ///
@@ -392,7 +419,14 @@ pub fn recheck_unit(spec: &ClearSpec, principal: Uid, root: &Path, path: &Path) 
     let Ok(relative) = path.strip_prefix(root) else {
         return UnitRecheck::Refused("unit_layout_changed");
     };
-    if relative.components().count() != 1 || is_kept(spec, relative) {
+    let depth: usize = relative.components().count();
+    let shape: bool = if spec.units == UnitForm::MavenArtifact {
+        (1..=super::MAX_ARTIFACT_DEPTH).contains(&depth)
+            && ancestors_are_directories(root, relative)
+    } else {
+        depth == 1
+    };
+    if !shape || is_kept(spec, relative) {
         return UnitRecheck::Refused("unit_layout_changed");
     }
     let snapshot: ObjectSnapshot = match lstat(path) {
@@ -409,21 +443,44 @@ pub fn recheck_unit(spec: &ClearSpec, principal: Uid, root: &Path, path: &Path) 
     if snapshot.owner != principal {
         return UnitRecheck::Refused("unit_owner");
     }
-    if spec.refuse_names.is_empty() || snapshot.kind != ObjectKind::Directory {
+    let records: bool = spec.units == UnitForm::MavenArtifact;
+    if records && !super::is_artifact_directory(path) {
+        return UnitRecheck::Refused("unit_layout_changed");
+    }
+    if (spec.refuse_names.is_empty() && !records) || snapshot.kind != ObjectKind::Directory {
         return UnitRecheck::Passed;
     }
-    match find_refused(path, snapshot.object.device.get(), spec.refuse_names) {
+    let refuses = |file: &Path, name: &Path| -> bool {
+        has_refused_name(spec.refuse_names, name) || (records && is_local_record(file, name))
+    };
+    match find_refused(path, snapshot.object.device.get(), &refuses) {
         Ok(false) => UnitRecheck::Passed,
         Ok(true) => UnitRecheck::Refused("protected_child"),
         Err(()) => UnitRecheck::Unknown("protected_child_unknown"),
     }
 }
 
-/// Whether a file below `unit` has a name of `names`. The walk follows no
-/// symbolic link, does not enter another device, and reads at most
-/// [`MAX_RECHECK_ENTRIES`] entries. `Err` when it cannot read a directory
-/// or stops at its bound.
-fn find_refused(unit: &Path, device: i32, names: &[&str]) -> Result<bool, ()> {
+/// Whether each component of `relative` above its last one is a directory
+/// below `root`, not a symbolic link.
+fn ancestors_are_directories(root: &Path, relative: &Path) -> bool {
+    let mut path: PathBuf = root.to_path_buf();
+    let mut components: Vec<_> = relative.components().collect();
+    components.pop();
+    components.into_iter().all(|component| {
+        path.push(component);
+        std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+    })
+}
+
+/// Whether a file below `unit` is one that `refuses` refuses, from its path
+/// and its name. The walk follows no symbolic link, does not enter another
+/// device, and reads at most [`MAX_RECHECK_ENTRIES`] entries. `Err` when it
+/// cannot read a directory or stops at its bound.
+fn find_refused(
+    unit: &Path,
+    device: i32,
+    refuses: &dyn Fn(&Path, &Path) -> bool,
+) -> Result<bool, ()> {
     use std::os::unix::fs::MetadataExt as _;
 
     let mut pending: Vec<PathBuf> = vec![unit.to_path_buf()];
@@ -443,7 +500,7 @@ fn find_refused(unit: &Path, device: i32, names: &[&str]) -> Result<bool, ()> {
                     return Err(());
                 }
                 pending.push(path);
-            } else if has_refused_name(names, Path::new(&entry.file_name())) {
+            } else if refuses(&path, Path::new(&entry.file_name())) {
                 return Ok(true);
             }
         }

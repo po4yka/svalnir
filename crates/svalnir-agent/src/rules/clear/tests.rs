@@ -295,30 +295,51 @@ fn cargo_clears_the_archives_and_the_sources_and_keeps_git_bin_and_index() {
 }
 
 #[test]
-fn maven_refuses_a_group_with_a_local_install_and_reads_settings() {
+fn maven_refuses_an_artifact_with_a_local_install_and_reads_settings() {
     let home = Home::new();
     home.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
+    home.write(
+        ".m2/repository/org/lib/1.0/_remote.repositories",
+        b"#NOTE: internal\nlib-1.0.jar>central=\nlib-1.0.pom>central=\n",
+    );
+    // Two artifacts of one group: only the installed one is refused.
+    home.write(".m2/repository/com/me/app/1.0/app-1.0.pom", b"<project/>");
     home.write(
         ".m2/repository/com/me/app/maven-metadata-local.xml",
         b"<metadata/>",
     );
+    home.write(".m2/repository/com/me/tool/2.0/tool-2.0.jar", b"jar");
+    home.write(".m2/repository/com/me/cli/3.0/cli-3.0.jar", b"jar");
+    home.write(
+        ".m2/repository/com/me/cli/3.0/_remote.repositories",
+        b"cli-3.0.jar>=\n",
+    );
+    // An entry in no artifact directory is not a unit.
+    home.write(".m2/repository/org/stray.lastUpdated", b"x");
     home.write(".m2/settings.xml", b"<settings/>");
     let root: PathBuf = home.path.join(".m2/repository");
     let discovery: EvictionDiscovery = manual(&home, MAVEN_REPOSITORY.id);
-    assert_eq!(candidates(&home, &discovery), [".m2/repository/org"]);
     assert_eq!(
-        skip_reasons(&discovery, &root, "com"),
-        [SkipReason::ProtectedData]
+        candidates(&home, &discovery),
+        [".m2/repository/com/me/tool", ".m2/repository/org/lib"]
     );
+    for refused in ["com/me/app", "com/me/cli"] {
+        assert_eq!(
+            skip_reasons(&discovery, &root, refused),
+            [SkipReason::ProtectedData],
+            "{refused}"
+        );
+    }
+    assert!(discovery.complete, "{discovery:?}");
 
     // A `localRepository` of the settings replaces the default root.
     home.write(
         ".m2/settings.xml",
         b"<settings><!-- <localRepository>/nowhere</localRepository> -->\n  <localRepository>${user.home}/maven-repo</localRepository>\n</settings>",
     );
-    home.write("maven-repo/io/x/1/x.pom", b"<project/>");
+    home.write("maven-repo/io/x/1/x-1.pom", b"<project/>");
     let discovery: EvictionDiscovery = manual(&home, MAVEN_REPOSITORY.id);
-    assert_eq!(candidates(&home, &discovery), ["maven-repo/io"]);
+    assert_eq!(candidates(&home, &discovery), ["maven-repo/io/x"]);
 
     // A value outside the home directory gives no root.
     home.write(
@@ -580,18 +601,28 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
     let home = Home::new();
     let root: PathBuf = home.path.join(".m2/repository");
     home.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
-    let unit: PathBuf = root.join("org");
+    let unit: PathBuf = root.join("org/lib");
     let check = |path: &Path| recheck_unit(&MAVEN_REPOSITORY, home.principal, &root, path);
     assert_eq!(check(&unit), UnitRecheck::Passed);
-    // A local install below the unit after the plan.
+    // A local install in the unit after the plan.
     home.write(
-        ".m2/repository/org/me/maven-metadata-local.xml",
+        ".m2/repository/org/lib/2.0/_remote.repositories",
+        b"lib-2.0.jar>=\n",
+    );
+    assert_eq!(check(&unit), UnitRecheck::Refused("protected_child"));
+    home.write(
+        ".m2/repository/org/lib/2.0/_remote.repositories",
+        b"lib-2.0.jar>central=\n",
+    );
+    assert_eq!(check(&unit), UnitRecheck::Passed);
+    home.write(
+        ".m2/repository/org/lib/maven-metadata-local.xml",
         b"<metadata/>",
     );
     assert_eq!(check(&unit), UnitRecheck::Refused("protected_child"));
-    // A path that is not a child of the root.
+    // A group directory is not an artifact directory.
     assert_eq!(
-        check(&root.join("org/lib")),
+        check(&root.join("org")),
         UnitRecheck::Refused("unit_layout_changed")
     );
     assert_eq!(check(&root.join("gone")), UnitRecheck::Absent);

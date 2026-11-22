@@ -113,6 +113,9 @@ mod eviction_tests;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+#[cfg(test)]
+#[cfg(unix)]
+mod xcode_orphan_tests;
 
 #[cfg(unix)]
 pub use eviction::{
@@ -146,6 +149,6 @@ pub use registry::{ClaimError, RegistryError, ReviewedRules, RuleStatus};
 pub use xcode::{
     BUILD_CONFIGURATIONS, INDEX_CHILDREN, INTERMEDIATES_CHILDREN, PLATFORM_SUFFIXES,
     ProducerProcesses, SHARED_ROOT_ENTRIES, UNIT_PATHS, XCODE_DERIVED_DATA_LAYOUT,
-    XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_PRODUCER_EXECUTABLES,
-    XcodeDerivedDataRule, XcodeEvidence,
+    XCODE_DERIVED_DATA_REVISION, XCODE_DERIVED_DATA_RULE_ID, XCODE_ORPHAN_LAYOUT,
+    XCODE_PRODUCER_EXECUTABLES, XcodeDerivedDataRule, XcodeEvidence,
 };

@@ -218,34 +218,47 @@ fn a_clear_rule_needs_the_consent_and_the_flag_needs_a_clear_rule() {
 }
 
 #[test]
-fn a_maven_plan_removes_only_the_eligible_groups_and_keeps_the_settings() {
+fn a_maven_plan_removes_only_the_eligible_artifacts_and_keeps_the_settings() {
     let world = World::manual();
     world.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
-    world.write(".m2/repository/io/x/1/x.pom", b"<project/>");
+    world.write(".m2/repository/io/x/1/x-1.pom", b"<project/>");
+    // One artifact of the group `com.me` is a local install; the other is
+    // not.
+    world.write(".m2/repository/com/me/app/1.0/app-1.0.pom", b"<project/>");
     world.write(
-        ".m2/repository/com/me/app/1.0/maven-metadata-local.xml",
+        ".m2/repository/com/me/app/maven-metadata-local.xml",
         b"<metadata/>",
     );
+    world.write(".m2/repository/com/me/tool/2.0/tool-2.0.jar", b"jar");
     world.write(".m2/settings.xml", b"<settings/>");
     let (plan_id, result) = world.planned("maven.repository");
     assert_eq!(
         targets(&world, &result),
-        [".m2/repository/io", ".m2/repository/org"]
+        [
+            ".m2/repository/com/me/tool",
+            ".m2/repository/io/x",
+            ".m2/repository/org/lib"
+        ]
     );
     let discovery = &result["discovery"];
     assert_eq!(discovery["rule"]["id"], "maven.repository");
     assert_eq!(discovery["complete"], true, "{discovery}");
     let skipped = &discovery["roots"][0]["skipped"];
-    assert_eq!(skipped[0]["relative_entry"]["value"], "com", "{discovery}");
+    assert_eq!(
+        skipped[0]["relative_entry"]["value"], "com/me/app",
+        "{discovery}"
+    );
     assert_eq!(skipped[0]["reasons"][0], "protected_data");
 
     let applied = world.apply(&plan_id);
     assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
-    assert!(!world.exists(".m2/repository/org"));
-    assert!(!world.exists(".m2/repository/io"));
-    // The root, the local install, and the settings stay.
-    assert!(world.exists(".m2/repository"));
-    assert!(world.exists(".m2/repository/com/me/app/1.0/maven-metadata-local.xml"));
+    assert!(!world.exists(".m2/repository/org/lib"));
+    assert!(!world.exists(".m2/repository/io/x"));
+    assert!(!world.exists(".m2/repository/com/me/tool"));
+    // The root, the group directories, the local install, and the settings
+    // stay.
+    assert!(world.exists(".m2/repository/org"));
+    assert!(world.exists(".m2/repository/com/me/app/1.0/app-1.0.pom"));
     assert!(world.exists(".m2/settings.xml"));
 }
 
@@ -321,16 +334,16 @@ fn a_deno_plan_keeps_the_local_storage_and_the_history() {
 fn the_step_checks_a_local_install_and_a_repository_again() {
     let world = World::manual();
     world.write(".m2/repository/org/lib/1.0/lib-1.0.jar", b"jar");
-    world.write(".m2/repository/io/x/1/x.pom", b"<project/>");
+    world.write(".m2/repository/io/x/1/x-1.pom", b"<project/>");
     let (plan_id, result) = world.planned("maven.repository");
     assert_eq!(targets(&world, &result).len(), 2, "{result}");
     // After the plan: a local install in one unit, and a Git repository in
     // the other.
     world.write(
-        ".m2/repository/org/me/1.0/maven-metadata-local.xml",
-        b"<metadata/>",
+        ".m2/repository/org/lib/1.0/_remote.repositories",
+        b"lib-1.0.jar>=\n",
     );
-    world.write(".m2/repository/io/work/.git/HEAD", b"ref: x");
+    world.write(".m2/repository/io/x/work/.git/HEAD", b"ref: x");
     let applied = world.apply(&plan_id);
     // Each target is skipped, so the operation took no action.
     assert!(applied.stdout.contains("NoAction"), "{}", applied.stdout);
@@ -338,7 +351,7 @@ fn the_step_checks_a_local_install_and_a_repository_again() {
         assert!(applied.stdout.contains(code), "{code}: {}", applied.stdout);
     }
     assert!(world.exists(".m2/repository/org/lib/1.0/lib-1.0.jar"));
-    assert!(world.exists(".m2/repository/io/work/.git/HEAD"));
+    assert!(world.exists(".m2/repository/io/x/work/.git/HEAD"));
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use svalnir_gui::{
     actions::fixture::ActionScript,
@@ -14,7 +14,7 @@ use svalnir_gui::{
     data::{
         fixture::{FixtureScenario, FixtureSource},
         model::Loadable,
-        store::{AppModel, INACTIVE_INTERVAL, Topic},
+        store::{ACTIVE_INTERVAL, AppModel, INACTIVE_INTERVAL, Topic},
     },
     status_item::{
         CellPaint, ItemTone, MenuCommand, MenuRow, StatusView, Surface, install_surface,
@@ -423,5 +423,29 @@ fn the_request_line_names_the_last_command(cx: &mut TestAppContext) {
             .iter()
             .any(|title| title.starts_with("Pause request: ")),
         "{titles:?}"
+    );
+}
+
+/// A window that becomes active again reads at the active interval at once.
+/// The poll loop does not finish the long sleep of the inactive interval
+/// first, so the readings do not stop for up to 30 s.
+#[gpui_kit::test]
+fn the_poll_follows_a_window_that_becomes_active(cx: &mut TestAppContext) {
+    let model = model(FixtureScenario::Healthy, ActionScript::Accept, false, cx);
+    cx.run_until_parked();
+    cx.update(|cx| model.update(cx, |model, cx| model.set_active(false, cx)));
+    // The loop starts its next pass and sleeps the inactive interval.
+    cx.executor().advance_clock(ACTIVE_INTERVAL);
+    cx.run_until_parked();
+    cx.update(|cx| model.update(cx, |model, cx| model.set_active(true, cx)));
+    cx.run_until_parked();
+    let before: usize = cx.update(|cx| model.read(cx).history.len());
+    cx.executor()
+        .advance_clock(ACTIVE_INTERVAL + Duration::from_millis(100));
+    cx.run_until_parked();
+    let after: usize = cx.update(|cx| model.read(cx).history.len());
+    assert!(
+        after > before,
+        "no host reading in one active interval: {before} then {after}"
     );
 }

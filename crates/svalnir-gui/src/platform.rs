@@ -32,6 +32,20 @@ impl DisplayAccessibility {
     }
 }
 
+/// Whether the system reports Low Power Mode. On a host that is not macOS,
+/// it is off.
+#[must_use]
+pub fn low_power_mode() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        objc2_foundation::NSProcessInfo::processInfo().isLowPowerModeEnabled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// The offset of the local time zone from UTC at `time`, in seconds east.
 /// `None` when the host cannot give it; the caller then shows UTC.
 ///

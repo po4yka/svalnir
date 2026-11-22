@@ -2,8 +2,14 @@
 //! the data states of `DESIGN.md` section 8, and a fact list.
 
 use crate::{
-    data::model::{Loadable, Measured},
-    theme::tokens::{self, Tokens, to_hsla},
+    data::{
+        model::{Loadable, Measured, PressureLevel},
+        store::AppModel,
+    },
+    theme::{
+        motion,
+        tokens::{self, Tokens, to_hsla},
+    },
     ui::{
         data_state::{UNAVAILABLE_TEXT, format_age, format_bytes},
         entry::card_entry,
@@ -373,6 +379,28 @@ pub fn mono_text(
         }))
         .child(text.into())
         .into_any_element()
+}
+
+/// The motion gate of a screen with continuous effects. The pressure is
+/// Normal only when the host reading has it, the incidents come from the
+/// controller record, and the system gives Low Power Mode. A controller
+/// record that is not read shows no open incident.
+#[must_use]
+pub fn motion_gate(model: &AppModel, reduce_motion: bool, window_active: bool) -> motion::Gate {
+    motion::Gate {
+        reduce_motion,
+        window_active,
+        pressure_normal: model
+            .host
+            .value()
+            .is_some_and(|host| matches!(host.pressure, Measured::Value(PressureLevel::Normal))),
+        low_power: crate::platform::low_power_mode(),
+        incident_open: model
+            .controller
+            .value()
+            .and_then(|controller| controller.rows.value())
+            .is_some_and(|rows| !rows.incidents.is_empty()),
+    }
 }
 
 #[cfg(test)]

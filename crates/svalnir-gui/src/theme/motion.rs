@@ -88,13 +88,22 @@ pub fn ease_ui_out(t: f32) -> f32 {
 
 /// What allows motion right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is one independent condition of DESIGN.md section 6"
+)]
 pub struct Gate {
     /// The user set Reduce Motion.
     pub reduce_motion: bool,
     /// The window is the active window.
     pub window_active: bool,
-    /// The memory pressure is Normal.
+    /// The memory pressure is known and Normal. An unknown pressure is not
+    /// Normal: the collector can fail during a pressure event.
     pub pressure_normal: bool,
+    /// The system reports Low Power Mode.
+    pub low_power: bool,
+    /// The agent reports an open incident.
+    pub incident_open: bool,
 }
 
 impl Gate {
@@ -106,10 +115,15 @@ impl Gate {
     }
 
     /// Whether an effect that never ends (the twinkle) may run. It needs
-    /// motion, an active window, and Normal pressure.
+    /// motion, an active window, Normal pressure, no Low Power Mode, and no
+    /// open incident (`DESIGN.md` section 6, "Limits").
     #[must_use]
     pub const fn continuous(&self) -> bool {
-        self.transitions() && self.window_active && self.pressure_normal
+        self.transitions()
+            && self.window_active
+            && self.pressure_normal
+            && !self.low_power
+            && !self.incident_open
     }
 }
 
@@ -201,17 +215,23 @@ mod tests {
     }
 
     #[test]
-    fn gate_follows_reduce_motion_window_and_pressure() {
-        for bits in 0..8_u8 {
+    fn gate_follows_reduce_motion_window_pressure_power_and_incidents() {
+        for bits in 0..32_u8 {
             let gate = Gate {
                 reduce_motion: bits & 1 != 0,
                 window_active: bits & 2 != 0,
                 pressure_normal: bits & 4 != 0,
+                low_power: bits & 8 != 0,
+                incident_open: bits & 16 != 0,
             };
             assert_eq!(gate.transitions(), !gate.reduce_motion);
             assert_eq!(
                 gate.continuous(),
-                !gate.reduce_motion && gate.window_active && gate.pressure_normal
+                !gate.reduce_motion
+                    && gate.window_active
+                    && gate.pressure_normal
+                    && !gate.low_power
+                    && !gate.incident_open
             );
         }
     }

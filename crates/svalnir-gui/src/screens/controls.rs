@@ -59,13 +59,12 @@ pub fn slot_status(
     id: impl Into<SharedString>,
     model: &AppModel,
     slot: &Slot,
-    now: SystemTime,
     tokens: &Tokens,
 ) -> Option<AnyElement> {
     model
         .actions
         .state(slot)
-        .map(|state| action_status(id, state, now, tokens))
+        .map(|state| action_status(id, state, tokens))
 }
 
 /// A button that sends `action` through the model.
@@ -455,7 +454,7 @@ pub fn open_stop(
                 ))
                 .footer(footer(vec![cancel_button(Some(model.clone()))])),
             Some(Proposal::Failed(state)) => dialog
-                .child(action_status("confirm-failed", &state, now, tokens))
+                .child(action_status("confirm-failed", &state, tokens))
                 .footer(footer(vec![cancel_button(Some(model.clone()))])),
             Some(Proposal::Ready(proposal)) if proposal.expired(now) => {
                 let again: Entity<AppModel> = model.clone();
@@ -527,7 +526,7 @@ pub fn open_state_detail(
         let tokens: &Tokens = Tokens::for_dark(cx.theme().is_dark());
         let state: Option<ActionState> = model.read(cx).actions.state(&slot).cloned();
         let body: AnyElement = match state {
-            Some(state) => action_status("state-detail-line", &state, SystemTime::now(), tokens),
+            Some(state) => action_status("state-detail-line", &state, tokens),
             None => body_line("state-detail-none", "No request was sent.", true, tokens),
         };
         dialog.title(title.clone()).child(body).footer(footer(vec![

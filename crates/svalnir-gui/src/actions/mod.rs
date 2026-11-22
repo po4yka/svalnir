@@ -29,7 +29,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use svalnir_core::{action::ActionClass, action::Plan, policy::PolicyId};
 
@@ -344,18 +344,24 @@ pub enum ActionState {
     AwaitingAdmission {
         /// The identity of the queued request.
         request: String,
-        /// When the request was sent.
-        since: SystemTime,
+        /// When the request was sent, on the monotonic clock of this
+        /// process, so that a change of the wall clock does not end the
+        /// wait.
+        since: Instant,
         /// When the window stops to follow the request: a short time after
-        /// the plan expires, when the agent can only refuse it.
-        until: SystemTime,
+        /// the plan expires, when the agent can only refuse it. `Instant`
+        /// does not advance while the host sleeps, but the plan clock does,
+        /// so after a sleep the window follows the request longer than
+        /// needed; it never stops early.
+        until: Instant,
     },
     /// The agent admitted the stop. The exit is not confirmed.
     WaitingForExit {
         /// The operation of the stop.
         operation: String,
-        /// When the agent admitted it.
-        since: SystemTime,
+        /// When the window read the admission, on the monotonic clock of
+        /// this process.
+        since: Instant,
     },
     /// The stop operation has its final record.
     Settled {
@@ -373,12 +379,17 @@ pub enum ActionState {
         /// The operation of the stop.
         operation: String,
     },
-    /// The wait ended with no answer. The request stays in the queue, and
-    /// the agent can decide it later.
+    /// The request is in the queue and the window read no answer: the wait
+    /// ended, the coordinator stopped, or the read of the queue failed. The
+    /// agent can decide the request later.
     Queued,
     /// The window read no admission of a stop before its plan expired and
-    /// the grace after it ended. The agent refuses an expired plan.
-    NotAdmitted,
+    /// the grace after it ended. The agent refuses an expired plan. An
+    /// answer to `request` that arrives later replaces this state.
+    NotAdmitted {
+        /// The identity of the queued request.
+        request: String,
+    },
     /// The request was refused. Nothing changed.
     Refused {
         /// The error code.
@@ -432,7 +443,9 @@ impl ActionState {
                 _ => ("Unknown outcome", Tone::Warning, IconName::Info),
             },
             Self::ExitNotConfirmed { .. } => ("Exit not confirmed", Tone::Warning, IconName::Info),
-            Self::Queued | Self::NotAdmitted => ("Not answered", Tone::Warning, IconName::Info),
+            Self::Queued | Self::NotAdmitted { .. } => {
+                ("Not answered", Tone::Warning, IconName::Info)
+            }
             Self::Refused { .. } => ("Refused", Tone::Negative, IconName::CircleX),
             Self::Unavailable(_) => ("Unavailable", Tone::Neutral, IconName::Info),
         }
@@ -440,18 +453,18 @@ impl ActionState {
 
     /// One sentence for the state line at `now`.
     #[must_use]
-    pub fn sentence(&self, now: SystemTime) -> String {
+    pub fn sentence(&self, now: Instant) -> String {
         match self {
             Self::Pending => "The request is sent. The agent did not answer yet.".to_owned(),
             Self::Accepted { detail } => detail.clone(),
             Self::AwaitingAdmission { since, .. } => {
-                let seconds: u64 = now.duration_since(*since).map_or(0, |age| age.as_secs());
+                let seconds: u64 = now.saturating_duration_since(*since).as_secs();
                 format!(
                     "The plan is recorded and the request is in the queue. The agent did not admit it yet: {seconds} s. The window follows the request until 30 s after the plan expires."
                 )
             }
             Self::WaitingForExit { operation, since } => {
-                let seconds: u64 = now.duration_since(*since).map_or(0, |age| age.as_secs());
+                let seconds: u64 = now.saturating_duration_since(*since).as_secs();
                 format!("The agent admitted operation {operation}. Waiting for exit: {seconds} s.")
             }
             Self::Settled {
@@ -465,8 +478,8 @@ impl ActionState {
                 _ => format!("Operation {operation} ended in the state {state}. See History."),
             },
             Self::ExitNotConfirmed { operation } => format!("The window did not read the final record of operation {operation} in 5 min. The operation can still end; History shows its state."),
-            Self::Queued => "The agent did not answer before the end of the wait. The request stays in the queue, and the agent can decide it later. See History.".to_owned(),
-            Self::NotAdmitted => "The window read no admission before the plan expired. The agent refuses an expired plan; History shows an operation only if the agent admitted it. Prepare a new plan to stop the group.".to_owned(),
+            Self::Queued => "The request is in the queue, and the window read no answer from the agent. The agent can decide it later. See History.".to_owned(),
+            Self::NotAdmitted { .. } => "The window read no admission before the plan expired. The agent refuses an expired plan; History shows an operation only if the agent admitted it. Prepare a new plan to stop the group.".to_owned(),
             Self::Refused { code, reason } if code == UNEXPECTED_COMPLETION => {
                 format!("{reason} ({code}).")
             }
@@ -670,22 +683,25 @@ impl ActionBook {
 
     /// Ends each wait for an exit that started more than `limit` before
     /// `now` as [`ActionState::ExitNotConfirmed`], and each wait for an
-    /// admission after its `until` as [`ActionState::Queued`]. Returns
-    /// `true` when a state changed.
-    pub fn end_long_waits(&mut self, now: SystemTime, limit: Duration) -> bool {
+    /// admission after its `until` as [`ActionState::NotAdmitted`]. Both
+    /// times are on the monotonic clock. Returns `true` when a state
+    /// changed.
+    pub fn end_long_waits(&mut self, now: Instant, limit: Duration) -> bool {
         let mut changed: bool = false;
         for state in self.states.values_mut() {
             match state {
                 ActionState::WaitingForExit { operation, since }
-                    if now.duration_since(*since).is_ok_and(|age| age > limit) =>
+                    if now.saturating_duration_since(*since) > limit =>
                 {
                     *state = ActionState::ExitNotConfirmed {
                         operation: operation.clone(),
                     };
                     changed = true;
                 }
-                ActionState::AwaitingAdmission { until, .. } if now > *until => {
-                    *state = ActionState::NotAdmitted;
+                ActionState::AwaitingAdmission { request, until, .. } if now > *until => {
+                    *state = ActionState::NotAdmitted {
+                        request: request.clone(),
+                    };
                     changed = true;
                 }
                 _ => {}
@@ -711,13 +727,16 @@ impl ActionBook {
     /// Records the answer to the request `request` of a stop that waits for
     /// admission. A slot that no longer waits for this request keeps its
     /// state, and a state that is still a wait for admission changes
-    /// nothing.
+    /// nothing. A slot whose wait for this request ended as
+    /// [`ActionState::NotAdmitted`] takes the answer: the read can start
+    /// before the end of the wait and arrive after it.
     pub fn admit(&mut self, slot: &Slot, request: &str, state: ActionState) {
         if matches!(state, ActionState::AwaitingAdmission { .. }) {
             return;
         }
         if let Some(current) = self.states.get_mut(slot)
-            && matches!(current, ActionState::AwaitingAdmission { request: waiting, .. } if waiting == request)
+            && matches!(current, ActionState::AwaitingAdmission { request: waiting, .. }
+                | ActionState::NotAdmitted { request: waiting } if waiting == request)
         {
             *current = state;
         }
@@ -821,7 +840,7 @@ mod tests {
         let state = ActionState::refused("plan_expired");
         let (text, tone, _) = state.pill();
         assert_eq!((text, tone), ("Refused", Tone::Negative));
-        let sentence = state.sentence(SystemTime::UNIX_EPOCH);
+        let sentence = state.sentence(Instant::now());
         assert!(sentence.contains("(plan_expired)"), "{sentence}");
         assert!(sentence.ends_with("Nothing changed."), "{sentence}");
         assert_eq!(
@@ -836,7 +855,7 @@ mod tests {
         assert_eq!(state.pill().0, "Unavailable");
         assert!(
             state
-                .sentence(SystemTime::UNIX_EPOCH)
+                .sentence(Instant::now())
                 .contains("No agent holds the coordinator lock")
         );
         assert!(!state.is_busy());
@@ -844,7 +863,7 @@ mod tests {
 
     #[test]
     fn a_stop_is_done_only_after_the_exit() {
-        let since = SystemTime::UNIX_EPOCH;
+        let since = Instant::now();
         let mut book = ActionBook::default();
         let slot = Slot::Stop("app-1".to_owned());
         book.set(
@@ -903,7 +922,7 @@ mod tests {
 
     #[test]
     fn a_long_wait_for_the_exit_ends_and_frees_the_control() {
-        let since = SystemTime::UNIX_EPOCH;
+        let since = Instant::now();
         let mut book = ActionBook::default();
         let slot = Slot::Stop("app-1".to_owned());
         book.set(
@@ -928,8 +947,8 @@ mod tests {
 
     #[test]
     fn a_stop_that_waits_for_admission_is_followed_until_its_bound() {
-        let since: SystemTime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let until: SystemTime = since + Duration::from_secs(330);
+        let since: Instant = Instant::now();
+        let until: Instant = since + Duration::from_secs(330);
         let slot = Slot::Stop("app-1".to_owned());
         let mut book = ActionBook::default();
         let waiting = ActionState::AwaitingAdmission {
@@ -961,14 +980,51 @@ mod tests {
         // and the control takes a new request.
         book.set(slot.clone(), waiting);
         assert!(book.end_long_waits(until + Duration::from_secs(1), Duration::from_secs(300)));
-        assert_eq!(book.state(&slot), Some(&ActionState::NotAdmitted));
-        assert_eq!(ActionState::NotAdmitted.pill().0, "Not answered");
+        let not_admitted = ActionState::NotAdmitted {
+            request: "req-1".to_owned(),
+        };
+        assert_eq!(book.state(&slot), Some(&not_admitted));
+        assert_eq!(not_admitted.pill().0, "Not answered");
         assert!(!book.is_busy(&slot));
+    }
+
+    /// The last read of a request can start before the end of the wait and
+    /// arrive after it. Its answer replaces "not answered"; an answer to a
+    /// different request does not.
+    #[test]
+    fn a_late_admission_replaces_not_admitted() {
+        let since: Instant = Instant::now();
+        let until: Instant = since + Duration::from_secs(330);
+        let slot = Slot::Stop("app-1".to_owned());
+        let mut book = ActionBook::default();
+        book.set(
+            slot.clone(),
+            ActionState::AwaitingAdmission {
+                request: "req-1".to_owned(),
+                since,
+                until,
+            },
+        );
+        assert!(book.end_long_waits(until + Duration::from_secs(1), Duration::from_secs(300)));
+        book.admit(&slot, "req-0", ActionState::refused("plan_expired"));
+        assert!(matches!(
+            book.state(&slot),
+            Some(ActionState::NotAdmitted { .. })
+        ));
+        book.admit(
+            &slot,
+            "req-1",
+            ActionState::WaitingForExit {
+                operation: "op-1".to_owned(),
+                since: until,
+            },
+        );
+        assert_eq!(book.waiting(), vec![(slot.clone(), "op-1".to_owned())]);
     }
 
     #[test]
     fn an_unexpected_completion_does_not_say_that_nothing_changed() {
-        let sentence = ActionState::refused(UNEXPECTED_COMPLETION).sentence(SystemTime::UNIX_EPOCH);
+        let sentence = ActionState::refused(UNEXPECTED_COMPLETION).sentence(Instant::now());
         assert!(!sentence.contains("Nothing changed"), "{sentence}");
         assert!(sentence.ends_with("(unexpected_completion)."), "{sentence}");
     }
@@ -1002,13 +1058,13 @@ mod tests {
             slot.clone(),
             ActionState::WaitingForExit {
                 operation: "op-1".to_owned(),
-                since: SystemTime::UNIX_EPOCH,
+                since: Instant::now(),
             },
         );
         book.settle(&slot, "op-1", OperationPhase::Partial, "Incomplete");
         let state = book.state(&slot).unwrap_or_else(|| panic!("state"));
         assert_eq!(
-            state.sentence(SystemTime::UNIX_EPOCH),
+            state.sentence(Instant::now()),
             "Operation op-1 ended in the state Incomplete. See History."
         );
         assert_eq!(state.pill().0, "Incomplete");
@@ -1018,11 +1074,7 @@ mod tests {
             state: "Partial".to_owned(),
         };
         assert_eq!(partial.pill().0, "Partial");
-        assert!(
-            partial
-                .sentence(SystemTime::UNIX_EPOCH)
-                .contains("state Partial.")
-        );
+        assert!(partial.sentence(Instant::now()).contains("state Partial."));
     }
 
     #[test]
@@ -1038,11 +1090,7 @@ mod tests {
             state: "Failed".to_owned(),
         };
         assert_ne!(unknown.pill().1, failed.pill().1);
-        assert!(
-            unknown
-                .sentence(SystemTime::UNIX_EPOCH)
-                .contains("UnknownOutcome")
-        );
+        assert!(unknown.sentence(Instant::now()).contains("UnknownOutcome"));
     }
 
     #[test]

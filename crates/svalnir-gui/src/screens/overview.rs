@@ -921,12 +921,8 @@ impl Render for OverviewScreen {
         let agent: Loadable<AgentSnapshot> = model.agent.clone();
         let service: Loadable<ServiceSnapshot> = model.service.clone();
         self.last_render = Instant::now();
-        let gate: motion::Gate = motion::Gate {
-            reduce_motion: cx.reduce_motion(),
-            window_active: window.is_window_active(),
-            pressure_normal: !matches!(&view, View::Data { host, .. }
-                if matches!(host.pressure, Measured::Value(p) if p != PressureLevel::Normal)),
-        };
+        let gate: motion::Gate =
+            super::common::motion_gate(model, cx.reduce_motion(), window.is_window_active());
         let phase: Option<f32> = if gate.continuous() {
             self.start_twinkle(cx);
             Some(self.phase)

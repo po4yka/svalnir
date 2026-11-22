@@ -406,7 +406,7 @@ fn push_pause_rows(model: &AppModel, now: SystemTime, rows: &mut Vec<MenuRow>) -
         let (text, _tone, _icon) = state.pill();
         rows.push(MenuRow::Info {
             title: request_line(model.actions.verb(&Slot::Pause), text),
-            detail: Some(state.sentence(now)),
+            detail: Some(state.sentence(std::time::Instant::now())),
         });
     }
     pause_text

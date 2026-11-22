@@ -75,7 +75,9 @@ fn a_topic_is_read_only_when_its_screen_is_in_front(cx: &mut TestAppContext) {
     let (handle, view) = open(FixtureScenario::Healthy, Screen::Overview, cx);
     cx.update(|cx| {
         let model = view.read(cx).model().read(cx);
-        assert_eq!(model.topics(), []);
+        // Overview reads only the controller record, for its open
+        // incidents, from the first frame.
+        assert_eq!(model.topics(), [Topic::Controller]);
         assert!(matches!(model.processes, Loadable::Loading));
         assert!(matches!(model.diagnostics, Loadable::Loading));
     });
@@ -615,4 +617,23 @@ fn history_has_no_filter_when_nothing_was_read(cx: &mut TestAppContext) {
         assert_eq!(label(handle, "history-bound", cx), None, "{scenario:?}");
         assert_eq!(label(handle, "history-filter-trigger-all", cx), None);
     }
+}
+
+/// An open incident stops the continuous effects of Overview from the
+/// first frame: the window reads the controller record at once. With no
+/// incident and Normal pressure the effects may run.
+#[gpui_kit::test]
+fn an_open_incident_stops_the_continuous_effects(cx: &mut TestAppContext) {
+    let (_handle, quiet) = open(FixtureScenario::Healthy, Screen::Overview, cx);
+    let (_handle, incident) = open(FixtureScenario::Drift, Screen::Overview, cx);
+    cx.update(|cx| {
+        let quiet = quiet.read(cx).model().read(cx);
+        let incident = incident.read(cx).model().read(cx);
+        let gate = |model| svalnir_gui::screens::common::motion_gate(model, false, true);
+        let calm = gate(quiet);
+        assert!(!calm.incident_open && calm.pressure_normal, "{calm:?}");
+        let open_incident = gate(incident);
+        assert!(open_incident.incident_open, "{open_incident:?}");
+        assert!(!open_incident.continuous());
+    });
 }

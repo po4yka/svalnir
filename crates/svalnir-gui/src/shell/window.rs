@@ -102,7 +102,12 @@ impl MainWindow {
         })
         .detach();
         let active: bool = window.is_window_active();
-        model.update(cx, |model, cx| model.set_active(active, cx));
+        model.update(cx, |model, cx| {
+            model.set_active(active, cx);
+            // The window opens on Overview; `select` sets the topics of each
+            // later screen.
+            model.set_topics(topics_of(Screen::Overview), cx);
+        });
         cx.observe_window_activation(window, |this, window, cx| {
             let active: bool = window.is_window_active();
             this.model
@@ -511,10 +516,12 @@ impl MainWindow {
 
 /// The reads that only `screen` needs. The capability probes of Diagnostics
 /// run when the screen comes to the front and at an explicit refresh.
+/// Overview and Storage read the controller record for its open incidents,
+/// which stop their continuous effects.
 #[must_use]
 pub const fn topics_of(screen: Screen) -> &'static [Topic] {
     match screen {
-        Screen::Overview | Screen::Storage => &[],
+        Screen::Overview | Screen::Storage => &[Topic::Controller],
         Screen::Memory => &[Topic::Memory, Topic::Processes, Topic::Controller],
         Screen::Applications => &[Topic::Processes, Topic::Controller],
         Screen::Automation => &[Topic::Automation, Topic::Controller],

@@ -513,7 +513,6 @@ fn state_cell(
     pill: StatusPill,
     entity: &Entity<AppModel>,
     model: &AppModel,
-    now: SystemTime,
     tokens: &Tokens,
 ) -> AnyElement {
     let id: &str = &operation.operation_id;
@@ -548,7 +547,6 @@ fn state_cell(
         action_status_short(
             SharedString::from(format!("history-action-{id}")),
             state,
-            now,
             tokens,
         )
     });
@@ -645,7 +643,7 @@ fn operation_rows(operation: &OperationDetail, context: &TableContext<'_>) -> Ve
         if let Some(icon) = phase_icon(operation.phase) {
             pill = pill.icon(icon);
         }
-        let state_column: AnyElement = state_cell(operation, pill, entity, model, now, tokens);
+        let state_column: AnyElement = state_cell(operation, pill, entity, model, tokens);
         let origin: &str = if operation.automatic {
             "Started by a guard"
         } else {
@@ -1225,7 +1223,6 @@ fn detail_body(
         SharedString::from(format!("history-detail-action-{}", operation.operation_id)),
         model,
         &Slot::Operation(operation.operation_id.clone()),
-        now,
         tokens,
     )
     .map(|line| {

@@ -9,7 +9,7 @@ use crate::data::{
     fixture::{FixtureScenario, FixtureSource},
     model::OperationPhase,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// The answer of the fixture path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,15 +130,20 @@ impl ActionPort for FixturePort {
             ActionScript::Pending => match action {
                 Action::Stop { proposal, .. } => ActionState::AwaitingAdmission {
                     request: "gui-request-fixture".to_owned(),
-                    since: SystemTime::now(),
-                    until: proposal.expires_at + super::ADMISSION_GRACE,
+                    since: Instant::now(),
+                    until: Instant::now()
+                        + proposal
+                            .expires_at
+                            .duration_since(SystemTime::now())
+                            .unwrap_or_default()
+                        + super::ADMISSION_GRACE,
                 },
                 _ => ActionState::Pending,
             },
             ActionScript::Accept => match action {
                 Action::Stop { .. } => ActionState::WaitingForExit {
                     operation: "op-fixture-stop".to_owned(),
-                    since: SystemTime::now(),
+                    since: Instant::now(),
                 },
                 _ if is_authority(action) => AuthorityPath::Agent.annotate(accepted(action), true),
                 // The sentence of the live path, so that a fixture shows a

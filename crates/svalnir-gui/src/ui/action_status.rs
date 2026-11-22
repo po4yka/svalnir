@@ -15,7 +15,7 @@ use gpui_kit::{
     component::{h_flex, tooltip::Tooltip, v_flex},
     div, px,
 };
-use std::{cell::Cell, rc::Rc, time::SystemTime};
+use std::{cell::Cell, rc::Rc, time::Instant};
 
 /// The largest number of lines of the sentence in a short state line.
 pub const SHORT_LINES: usize = 2;
@@ -35,19 +35,18 @@ enum Fit {
     Short,
 }
 
-/// The state line of `state` at `now`. The row has the label
+/// The state line of `state` now. The row has the label
 /// "{pill}: {sentence}", so that a screen reader and a test read the same
 /// text.
 pub fn action_status(
     id: impl Into<SharedString>,
     state: &ActionState,
-    now: SystemTime,
     tokens: &Tokens,
 ) -> AnyElement {
-    state_line(&id.into(), state, now, Fit::Full, tokens)
+    state_line(&id.into(), state, Fit::Full, tokens)
 }
 
-/// The state line of `state` at `now` for a dense row: the sentence shows
+/// The state line of `state` now for a dense row: the sentence shows
 /// at most [`SHORT_LINES`] lines, and a longer sentence ends with an
 /// ellipsis. The full text is the accessible label of the line in each
 /// case, and the tooltip of the line only when the sentence is cut. The
@@ -56,21 +55,14 @@ pub fn action_status(
 pub fn action_status_short(
     id: impl Into<SharedString>,
     state: &ActionState,
-    now: SystemTime,
     tokens: &Tokens,
 ) -> AnyElement {
-    state_line(&id.into(), state, now, Fit::Short, tokens)
+    state_line(&id.into(), state, Fit::Short, tokens)
 }
 
-fn state_line(
-    id: &SharedString,
-    state: &ActionState,
-    now: SystemTime,
-    fit: Fit,
-    tokens: &Tokens,
-) -> AnyElement {
+fn state_line(id: &SharedString, state: &ActionState, fit: Fit, tokens: &Tokens) -> AnyElement {
     let (text, tone, icon) = state.pill();
-    let sentence: SharedString = SharedString::from(state.sentence(now));
+    let sentence: SharedString = SharedString::from(state.sentence(Instant::now()));
     let label: SharedString = SharedString::from(format!("{text}: {sentence}"));
     let (sentence_line, cut) = muted_text(&sentence, fit, tokens);
     let sentence_line = sentence_line

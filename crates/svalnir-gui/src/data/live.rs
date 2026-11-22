@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use svalnir_agent::{
@@ -46,7 +46,7 @@ const DEFAULT_STATE_DIRECTORY: &str = "Library/Application Support/Svalnir";
 /// the journal.
 #[derive(Debug)]
 pub struct LiveSource {
-    host: Mutex<Option<Host>>,
+    host: Mutex<Option<Arc<Host>>>,
     /// The process snapshot of the previous read of the processes, for the
     /// footprint growth. Only one snapshot is kept.
     previous_processes: Mutex<Option<ProcessSnapshot>>,
@@ -65,16 +65,23 @@ impl LiveSource {
         }
     }
 
-    /// Runs `read` with the host of this source, which it opens one time.
-    fn with_host<T>(&self, read: impl FnOnce(&Host) -> Result<T, String>) -> Result<T, String> {
+    /// The host of this source, which it opens one time. The lock is held
+    /// only to open or to share the host, not during a read, so that a slow
+    /// read does not stop the reads of other kinds.
+    fn shared_host(&self) -> Result<Arc<Host>, String> {
         let mut guard = self.host.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(Host::open().map_err(|error| error.to_string())?);
+        if let Some(host) = guard.as_ref() {
+            return Ok(Arc::clone(host));
         }
-        match guard.as_ref() {
-            Some(host) => read(host),
-            None => Err("the host is not open".to_owned()),
-        }
+        let host: Arc<Host> = Arc::new(Host::open().map_err(|error| error.to_string())?);
+        *guard = Some(Arc::clone(&host));
+        Ok(host)
+    }
+
+    /// Runs `read` with the host of this source.
+    fn with_host<T>(&self, read: impl FnOnce(&Host) -> Result<T, String>) -> Result<T, String> {
+        let host: Arc<Host> = self.shared_host()?;
+        read(&host)
     }
 
     /// The clocks of this process, read as the agent reads them.
@@ -130,14 +137,8 @@ fn pressure(observation: &Observation<PressureState>) -> Measured<PressureLevel>
 
 impl DataSource for LiveSource {
     fn host(&self) -> Result<HostSnapshot, String> {
-        let mut guard = self.host.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(Host::open().map_err(|error| error.to_string())?);
-        }
-        let Some(host) = guard.as_ref() else {
-            return Err("the host is not open".to_owned());
-        };
-        let reading = observe::collect(host).map_err(|error| error.to_string())?;
+        let host: Arc<Host> = self.shared_host()?;
+        let reading = observe::collect(&host).map_err(|error| error.to_string())?;
         let unavailable =
             |reason: &str| -> Measured<u64> { Measured::Unavailable(reason.to_owned()) };
         let (volume_name, disk_total, disk_available, disk_free) = match &reading.disk {
@@ -325,8 +326,8 @@ impl DataSource for LiveSource {
         "in-process collection"
     }
 
-    fn actions(&self) -> std::sync::Arc<dyn crate::actions::ActionPort> {
-        std::sync::Arc::new(crate::actions::live::LivePort::new(
+    fn actions(&self) -> Arc<dyn crate::actions::ActionPort> {
+        Arc::new(crate::actions::live::LivePort::new(
             self.state_directory.clone(),
         ))
     }

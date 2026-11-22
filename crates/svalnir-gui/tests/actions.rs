@@ -13,10 +13,7 @@ use gpui_kit::{
     Pixels, Point, Render, Styled as _, TestAppContext, Window, WindowOptions, div, px, size,
     test::TestWindowExt as _,
 };
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{sync::Arc, time::Duration};
 use svalnir_gui::{
     actions::{ActionState, Slot, fixture::ActionScript},
     app::open_main_window,
@@ -631,14 +628,12 @@ const CUT: &str = "The stop fence is recorded. The agent stops the operation at 
 impl Render for ShortLines {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let tokens: Tokens = *Tokens::for_dark(false);
-        let now: SystemTime = SystemTime::UNIX_EPOCH;
         let line = |id: &'static str, detail: &str| {
             div().w(px(CELL_WIDTH)).child(action_status_short(
                 id,
                 &ActionState::Accepted {
                     detail: detail.to_owned(),
                 },
-                now,
                 &tokens,
             ))
         };

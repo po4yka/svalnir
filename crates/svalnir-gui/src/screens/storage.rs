@@ -3,8 +3,8 @@
 use crate::{
     data::{
         model::{
-            HostSnapshot, Loadable, Measured, PressureLevel, ScanEnd, ScanProgress, ScanState,
-            ScanSummary, SizeMetric,
+            HostSnapshot, Loadable, Measured, ScanEnd, ScanProgress, ScanState, ScanSummary,
+            SizeMetric,
         },
         store::AppModel,
     },
@@ -110,6 +110,21 @@ type OpenFn = Rc<dyn Fn(usize, &mut gpui_kit::App)>;
 const CHROME_WIDTH: f32 = 2.0 * 24.0;
 /// The longest path text before the middle is cut.
 const MAX_PATH_CHARS: usize = 56;
+
+/// The bytes of the "Not scanned" segment: the used space of the volume
+/// less the scan total `scanned` in `metric`. The used space is allocated
+/// space, so with the logical metric there is no segment.
+fn unscanned_bytes(total: u64, available: u64, scanned: u64, metric: SizeMetric) -> u64 {
+    match metric {
+        SizeMetric::Allocated => total.saturating_sub(available).saturating_sub(scanned),
+        SizeMetric::Logical => 0,
+    }
+}
+
+/// The note of the "Not scanned" segment. The used space of an APFS volume
+/// is the used space of its container, so the segment is not only folders
+/// that the scan did not read.
+const NOT_SCANNED_NOTE: &str = "Used space of the volume container that the scan did not count: folders outside the scan, other volumes, snapshots, and purgeable data";
 
 /// Cuts the middle of a long text: `start…end`.
 #[must_use]
@@ -251,16 +266,11 @@ impl StorageScreen {
     }
 
     fn gate(&self, window: &Window, cx: &Context<Self>) -> motion::Gate {
-        let normal: bool = !matches!(
-            &self.model.read(cx).host,
-            Loadable::Ready(h) | Loadable::Stale(h)
-                if matches!(h.pressure, Measured::Value(p) if p != PressureLevel::Normal)
-        );
-        motion::Gate {
-            reduce_motion: cx.reduce_motion(),
-            window_active: window.is_window_active(),
-            pressure_normal: normal,
-        }
+        super::common::motion_gate(
+            self.model.read(cx),
+            cx.reduce_motion(),
+            window.is_window_active(),
+        )
     }
 
     /// The root of the next scan: the top of the path stack, else the default.
@@ -936,7 +946,12 @@ impl StorageScreen {
             })
             .collect();
         // Free space and "Not scanned" only for the default root, with a
-        // measured volume.
+        // measured volume. "Not scanned" is the used space of the volume
+        // less the scan total, and the used space is allocated space, so the
+        // segment shows only with the allocated metric: a logical total is a
+        // different quantity. On APFS the used space is the space of the
+        // container, so the segment also has the other volumes of the
+        // container, the snapshots, and purgeable data.
         let mut free_bytes: Option<u64> = None;
         let at_default_root: bool =
             self.model.read(cx).default_scan_root().as_deref() == Some(summary.root.as_path());
@@ -947,8 +962,8 @@ impl StorageScreen {
                     (&snapshot.disk_total, &snapshot.disk_available)
             {
                 free_bytes = Some(*available);
-                let used: u64 = total.saturating_sub(*available);
-                let unscanned: u64 = used.saturating_sub(summary.total(self.metric));
+                let unscanned: u64 =
+                    unscanned_bytes(*total, *available, summary.total(self.metric), self.metric);
                 if unscanned > 0 {
                     items.push(ChartItem {
                         label: "Not scanned".to_owned(),
@@ -1046,7 +1061,7 @@ impl StorageScreen {
                         total_items,
                         (metric_name, item.bytes),
                         None,
-                        Some("The scan did not read this part".to_owned()),
+                        Some(NOT_SCANNED_NOTE.to_owned()),
                     );
                 }
                 let mut tip: TipContent = segment_tip(
@@ -1431,5 +1446,33 @@ impl Render for StorageScreen {
                     ),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "Not scanned" subtracts an allocated total from allocated used space.
+    /// A logical total is a different quantity, so the logical metric shows
+    /// no segment, also when the logical total is larger than the used
+    /// space (sparse files, clones).
+    #[test]
+    fn not_scanned_needs_the_allocated_metric() {
+        let total: u64 = 1_000;
+        let available: u64 = 400;
+        assert_eq!(
+            unscanned_bytes(total, available, 250, SizeMetric::Allocated),
+            350
+        );
+        assert_eq!(
+            unscanned_bytes(total, available, 250, SizeMetric::Logical),
+            0
+        );
+        assert_eq!(
+            unscanned_bytes(total, available, 900, SizeMetric::Allocated),
+            0
+        );
+        assert_eq!(unscanned_bytes(total, 1_200, 0, SizeMetric::Allocated), 0);
     }
 }

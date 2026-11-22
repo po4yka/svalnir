@@ -247,7 +247,6 @@ fn state_with_details(
         .child(div().flex_1().min_w_0().child(action_status_short(
             SharedString::from(format!("applications-stop-state-{}", row.instance)),
             state,
-            SystemTime::now(),
             tokens,
         )))
         .child(

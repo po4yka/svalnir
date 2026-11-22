@@ -14,6 +14,7 @@ use super::{
 use crate::actions::{Action, ActionBook, ActionPort, ActionState, Proposal, Slot};
 use gpui_kit::{AppContext as _, AsyncApp, Context, Task};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant, SystemTime},
@@ -254,24 +255,20 @@ pub struct AppModel {
     last_refresh: Option<SystemTime>,
     active: bool,
     in_flight: InFlight,
+    /// The stop slots with a read of their request or operation in flight.
+    /// A slot has at most one read, so an older answer cannot replace a
+    /// newer one.
+    stop_reads: HashSet<Slot>,
     _poll: Task<()>,
 }
 
 impl AppModel {
-    /// Creates the model, starts the first load, and starts the poll loop.
-    pub fn new(source: Arc<dyn DataSource>, cx: &mut Context<Self>) -> Self {
-        Self::new_seeded(source, 0, cx)
-    }
-
-    /// Like [`Self::new`], but takes `readings` host readings at once, through
-    /// the same path as a refresh, so the history has that many samples
-    /// before the first paint. With 0 it is the same as `new`.
-    pub fn new_seeded(
-        source: Arc<dyn DataSource>,
-        readings: usize,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let poll: Task<()> = cx.spawn(async move |this, cx: &mut AsyncApp| {
+    /// Starts the poll loop. The loop reads the interval of the activity at
+    /// each pass; a change of the activity starts a new loop, so that a
+    /// window that becomes active does not wait for the end of the long
+    /// inactive interval.
+    fn start_poll(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
             loop {
                 let interval: Option<Duration> =
                     this.update(cx, |model, _| next_interval(model.active)).ok();
@@ -289,7 +286,23 @@ impl AppModel {
                     break;
                 }
             }
-        });
+        })
+    }
+
+    /// Creates the model, starts the first load, and starts the poll loop.
+    pub fn new(source: Arc<dyn DataSource>, cx: &mut Context<Self>) -> Self {
+        Self::new_seeded(source, 0, cx)
+    }
+
+    /// Like [`Self::new`], but takes `readings` host readings at once, through
+    /// the same path as a refresh, so the history has that many samples
+    /// before the first paint. With 0 it is the same as `new`.
+    pub fn new_seeded(
+        source: Arc<dyn DataSource>,
+        readings: usize,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let poll: Task<()> = Self::start_poll(cx);
         let mut model = Self {
             source_label: source.label(),
             fixture_name: source.fixture_name(),
@@ -320,6 +333,7 @@ impl AppModel {
             last_refresh: None,
             active: true,
             in_flight: InFlight::default(),
+            stop_reads: HashSet::new(),
             _poll: poll,
         };
         if readings == 0 {
@@ -511,10 +525,19 @@ impl AppModel {
     }
 
     /// Sets the activity of the window; it selects the poll interval.
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "the field only keeps the poll task alive; a new task replaces it"
+    )]
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active != active {
             self.active = active;
+            self._poll = Self::start_poll(cx);
             if active {
+                // The new loop reads first after one interval; the stops
+                // and the staleness are read now, as at a poll.
+                self.mark_stale();
+                self.read_waiting_stops(cx);
                 self.refresh_kinds(true, false, cx);
             }
         }
@@ -626,26 +649,27 @@ impl AppModel {
     /// its plan ends as "not answered", so that the control takes a new
     /// request.
     fn read_waiting_stops(&mut self, cx: &mut Context<Self>) {
-        if self
-            .actions
-            .end_long_waits(SystemTime::now(), STOP_WAIT_LIMIT)
-        {
-            cx.notify();
-        }
+        // The reads start before the waits end, so that a wait for
+        // admission whose time ends now has one last read of its request.
         for (slot, request) in self.actions.admissions() {
+            if !self.stop_reads.insert(slot.clone()) {
+                continue;
+            }
             let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
             cx.spawn(async move |this, cx: &mut AsyncApp| {
                 let id: String = request.clone();
                 let state = cx
                     .background_spawn(async move { port.admission_state(&id) })
                     .await;
-                if let Some(state) = state
-                    && this
-                        .update(cx, |model, cx| {
+                if this
+                    .update(cx, |model, cx| {
+                        model.stop_reads.remove(&slot);
+                        if let Some(state) = state {
                             model.actions.admit(&slot, &request, state);
                             cx.notify();
-                        })
-                        .is_err()
+                        }
+                    })
+                    .is_err()
                 {
                     tracing::debug!("the model closed before the read finished");
                 }
@@ -653,24 +677,32 @@ impl AppModel {
             .detach();
         }
         for (slot, operation) in self.actions.waiting() {
+            if !self.stop_reads.insert(slot.clone()) {
+                continue;
+            }
             let port: Arc<dyn ActionPort> = Arc::clone(&self.port);
             cx.spawn(async move |this, cx: &mut AsyncApp| {
                 let id: String = operation.clone();
                 let read = cx
                     .background_spawn(async move { port.operation_state(&id) })
                     .await;
-                if let Some((phase, state)) = read
-                    && this
-                        .update(cx, |model, cx| {
+                if this
+                    .update(cx, |model, cx| {
+                        model.stop_reads.remove(&slot);
+                        if let Some((phase, state)) = read {
                             model.actions.settle(&slot, &operation, phase, &state);
                             cx.notify();
-                        })
-                        .is_err()
+                        }
+                    })
+                    .is_err()
                 {
                     tracing::debug!("the model closed before the read finished");
                 }
             })
             .detach();
+        }
+        if self.actions.end_long_waits(Instant::now(), STOP_WAIT_LIMIT) {
+            cx.notify();
         }
     }
 

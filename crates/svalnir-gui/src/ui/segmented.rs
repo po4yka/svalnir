@@ -218,6 +218,8 @@ impl RenderOnce for SegmentedControl {
                             reduce_motion: cx.reduce_motion(),
                             window_active: true,
                             pressure_normal: true,
+                            low_power: false,
+                            incident_open: false,
                         };
                         state.update(cx, |s, _| {
                             s.from = s.to;

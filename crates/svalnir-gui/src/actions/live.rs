@@ -18,7 +18,7 @@ use crate::data::{live_records::collect_processes, model::OperationPhase};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use svalnir_agent::{
     client::{
@@ -315,6 +315,14 @@ impl LivePort {
         if check_expiry(plan, &clock).is_err() {
             return Err(ActionState::refused("plan_expired"));
         }
+        // The rest of the plan lifetime on the clock of the plan, read now,
+        // so that the bound of the wait does not depend on the wall clock.
+        let remaining: Duration = Duration::from_nanos(
+            plan.validity
+                .expires_at
+                .get()
+                .saturating_sub(clock.now.get()),
+        );
         let mut journal: OperationJournal = open_for_writes(&path)?;
         journal
             .try_record_plan(plan)
@@ -324,9 +332,9 @@ impl LivePort {
             digest: plan.digest().clone(),
         };
         let request_id: RequestId = enqueue(&mut journal, RequestBody::Apply { approval })?;
-        let since: SystemTime = SystemTime::now();
+        let since: Instant = Instant::now();
         match client::wait_for_completion(&journal, &path, &request_id, self.admission_wait) {
-            Ok(completion) => Ok(admission_of(completion, SystemTime::now())),
+            Ok(completion) => Ok(admission_of(completion, Instant::now())),
             // The agent can admit the plan later, until it expires, so the
             // window follows the request at each poll until then.
             // A read of the queue that failed after the write does not show
@@ -335,9 +343,9 @@ impl LivePort {
                 Ok(ActionState::AwaitingAdmission {
                     request: request_id.to_string(),
                     since,
-                    until: expiry_wall(plan)
-                        .checked_add(ADMISSION_GRACE)
-                        .unwrap_or_else(|| expiry_wall(plan)),
+                    until: since
+                        .checked_add(remaining.saturating_add(ADMISSION_GRACE))
+                        .unwrap_or(since),
                 })
             }
         }
@@ -477,7 +485,7 @@ impl ActionPort for LivePort {
             .ok()??
         {
             RequestStatus::Completed { completion } => {
-                Some(admission_of(completion, SystemTime::now()))
+                Some(admission_of(completion, Instant::now()))
             }
             _ => None,
         }
@@ -604,7 +612,8 @@ fn enqueue(journal: &mut OperationJournal, body: RequestBody) -> Result<RequestI
             .map_err(|_| ActionState::refused("identity_unavailable"))?,
         principal: client::principal(ClientRole::Gui),
         body,
-        enqueued_at: WallTime::try_from(SystemTime::now()).unwrap_or(WallTime::UNIX_EPOCH),
+        enqueued_at: WallTime::try_from(SystemTime::now())
+            .map_err(|_| ActionState::Unavailable(Unavailable::Clock))?,
     };
     journal
         .enqueue_request(&request)
@@ -613,7 +622,9 @@ fn enqueue(journal: &mut OperationJournal, body: RequestBody) -> Result<RequestI
 }
 
 /// Writes `body` to the queue of `journal` and waits for its completion.
-/// A rejection is a refusal with the code of the coordinator.
+/// A rejection is a refusal with the code of the coordinator. After the
+/// write, a wait with no answer is [`ActionState::Queued`] and never a
+/// refusal: the request is in the queue, and the agent can still decide it.
 fn send_on(
     journal: &mut OperationJournal,
     path: &Path,
@@ -621,17 +632,28 @@ fn send_on(
     wait: Duration,
 ) -> Result<RequestCompletion, ActionState> {
     let request_id: RequestId = enqueue(journal, body)?;
-    match client::wait_for_completion(journal, path, &request_id, wait) {
+    answer_of(client::wait_for_completion(
+        journal,
+        path,
+        &request_id,
+        wait,
+    ))
+}
+
+/// The answer to a request that is in the queue: a rejection is a refusal,
+/// and a wait that read no completion is [`ActionState::Queued`].
+fn answer_of(wait: Result<RequestCompletion, WaitError>) -> Result<RequestCompletion, ActionState> {
+    match wait {
         Ok(RequestCompletion::Rejected { error }) => Err(ActionState::refused(error.code.as_str())),
         Ok(completion) => Ok(completion),
-        Err(WaitError::Pending) => Err(ActionState::Queued),
-        Err(WaitError::CoordinatorStopped) => Err(ActionState::refused("coordinator_stopped")),
-        Err(WaitError::Journal(error)) => Err(journal_refusal(&error)),
+        Err(WaitError::Pending | WaitError::CoordinatorStopped | WaitError::Journal(_)) => {
+            Err(ActionState::Queued)
+        }
     }
 }
 
 /// The state of a stop after the completion of its apply request at `now`.
-fn admission_of(completion: RequestCompletion, now: SystemTime) -> ActionState {
+fn admission_of(completion: RequestCompletion, now: Instant) -> ActionState {
     match completion {
         RequestCompletion::Operation { operation_id } => ActionState::WaitingForExit {
             operation: operation_id.to_string(),
@@ -747,6 +769,7 @@ fn expiry_wall(plan: &Plan) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::test_support::{Child, stop_plan};
     use svalnir_agent::journal::{CoordinatorLock, CoordinatorRole};
     use svalnir_core::{
@@ -754,6 +777,21 @@ mod tests {
         id::{ExecutorEpochId, OperationId},
     };
 
+    /// A request that is in the queue is never reported as refused when
+    /// the wait reads no answer: the agent can still decide it.
+    #[test]
+    fn a_queued_request_with_no_answer_is_not_a_refusal() {
+        for wait in [
+            WaitError::Pending,
+            WaitError::CoordinatorStopped,
+            WaitError::Journal(OperationJournalError::Conflict),
+        ] {
+            let answer = answer_of(Err(wait));
+            assert!(matches!(answer, Err(ActionState::Queued)), "{answer:?}");
+        }
+        let queued: String = ActionState::Queued.sentence(Instant::now());
+        assert!(!queued.contains("Nothing changed"), "{queued}");
+    }
     /// A temporary directory that is private, as a state directory must be.
     /// The `tempfile` crate makes it with the mode of the umask.
     fn private_tempdir() -> tempfile::TempDir {
@@ -1299,6 +1337,12 @@ mod tests {
         wait_for_agent(&path);
         let port = LivePort::new(Some(directory.path().to_owned()))
             .with_admission_wait(Duration::from_millis(200));
+        let lifetime: Duration = Duration::from_nanos(
+            plan.validity
+                .expires_at
+                .get()
+                .saturating_sub(plan.validity.created_at.get()),
+        );
         let proposal = Arc::new(StopProposal {
             instance: "test".to_owned(),
             name: "sleep".to_owned(),
@@ -1315,8 +1359,17 @@ mod tests {
             panic!("the stop is not followed: {state:?}");
         };
         // The window follows the request until a short time after the plan
-        // expires.
-        assert_eq!(until, proposal.expires_at + ADMISSION_GRACE);
+        // expires, on the monotonic clock: the rest of the plan lifetime
+        // plus the grace. The plan did not expire before the submission.
+        let now: Instant = Instant::now();
+        assert!(
+            until <= now + ADMISSION_GRACE + lifetime,
+            "{until:?} {now:?} {lifetime:?}"
+        );
+        assert!(
+            until + Duration::from_secs(1) >= now + ADMISSION_GRACE,
+            "{until:?} {now:?}"
+        );
         assert_eq!(port.admission_state(&request), None);
         admit.send(()).unwrap_or_else(|error| panic!("{error}"));
         let answer: Option<ActionState> = (0..100).find_map(|_| {

@@ -248,7 +248,6 @@ fn state_card(
                     "automation-pause-state",
                     model,
                     &Slot::Pause,
-                    now,
                     tokens,
                 ));
             if let Some(revision) = &value.revision {
@@ -433,7 +432,6 @@ fn guard_controls(
             SharedString::from(format!("automation-guard-state-{name}")),
             model,
             &Slot::Guard(policy),
-            SystemTime::now(),
             tokens,
         ))
         .into_any_element()
@@ -647,7 +645,6 @@ fn incident_row(
             SharedString::from(format!("automation-incident-state-{id}")),
             model,
             &slot,
-            SystemTime::now(),
             tokens,
         ))
         .child(usage);

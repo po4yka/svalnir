@@ -350,6 +350,33 @@ pub struct MemoryGuard {
     pub app_budgets: Vec<AppBudget>,
 }
 
+/// The shortest accepted `[cleanup.projects].quiet_period`.
+pub const MIN_QUIET_PERIOD: Duration = Duration::from_hours(1);
+
+/// The longest accepted `[cleanup.projects].quiet_period`.
+pub const MAX_QUIET_PERIOD: Duration = Duration::from_hours(90 * 24);
+
+/// The `[cleanup.projects]` table: the project activity of
+/// `docs/CLEANUP_RULES.md` section 6. The validation makes sure that
+/// [`MIN_QUIET_PERIOD`] `<= quiet_period <=` [`MAX_QUIET_PERIOD`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProjectCleanup {
+    /// The time with no project activity after which a project is quiet.
+    pub quiet_period: Duration,
+    /// True when the Paseo source of the project activity is on.
+    pub paseo_agents: bool,
+}
+
+/// The `[cleanup]` table: the settings of the cleanup rules. A setting
+/// gives no authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Cleanup {
+    /// The `[cleanup.projects]` table.
+    pub projects: ProjectCleanup,
+}
+
 /// The `[history]` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -386,6 +413,7 @@ pub struct ValidatedConfig {
     pub(super) protections: Protections,
     pub(super) disk_guard: DiskGuard,
     pub(super) memory_guard: MemoryGuard,
+    pub(super) cleanup: Cleanup,
     pub(super) history: History,
     pub(super) privacy: Privacy,
     pub(super) explicit: BTreeSet<String>,
@@ -420,6 +448,11 @@ impl ValidatedConfig {
     /// The `[memory_guard]` table.
     pub const fn memory_guard(&self) -> &MemoryGuard {
         &self.memory_guard
+    }
+
+    /// The `[cleanup]` table.
+    pub const fn cleanup(&self) -> &Cleanup {
+        &self.cleanup
     }
 
     /// The `[history]` table.

@@ -928,7 +928,7 @@ fn without_a_file_the_proposal_is_the_built_in_template() {
             "{policy}"
         );
     }
-    assert_eq!(envelope["result"]["template_revision"], 2);
+    assert_eq!(envelope["result"]["template_revision"], 3);
 
     let text = svalnir(&["policy", "show", "memory-guard"]);
     assert_eq!(text.status, ExitStatus::Success);

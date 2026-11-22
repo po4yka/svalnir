@@ -1196,3 +1196,60 @@ fn a_replaced_protections_list_names_each_personal_folder_that_it_does_not_prote
         super::PERSONAL_FOLDERS
     );
 }
+
+#[test]
+fn the_project_cleanup_settings_have_template_values_and_a_bounded_quiet_period() {
+    let readme: ValidatedConfig = valid(example(README));
+    // The README example omits the table; the template supplies it.
+    assert_eq!(
+        readme.cleanup().projects.quiet_period,
+        Duration::from_hours(24)
+    );
+    assert!(!readme.cleanup().projects.paseo_agents);
+    let spec: ValidatedConfig = valid(example(POLICY_SPEC));
+    assert_eq!(spec.cleanup(), readme.cleanup());
+    assert!(spec.is_explicit("cleanup.projects.quiet_period"));
+
+    let changed: ValidatedConfig = valid(&spec_with(
+        "quiet_period = \"24h\"\npaseo_agents = false",
+        "quiet_period = \"90d\"\npaseo_agents = true",
+    ));
+    assert_eq!(
+        changed.cleanup().projects.quiet_period,
+        Duration::from_hours(90 * 24)
+    );
+    assert!(changed.cleanup().projects.paseo_agents);
+    valid(&spec_with(
+        "quiet_period = \"24h\"",
+        "quiet_period = \"1h\"",
+    ));
+
+    for out_of_range in ["59m", "91d", "3599999ms"] {
+        assert_one(
+            &spec_with(
+                "quiet_period = \"24h\"",
+                &format!("quiet_period = \"{out_of_range}\""),
+            ),
+            FindingCode::OutOfRange,
+            "cleanup.projects.quiet_period",
+        );
+    }
+    assert_one(
+        &spec_with("quiet_period = \"24h\"", "quiet_period = \"0h\""),
+        FindingCode::NotPositive,
+        "cleanup.projects.quiet_period",
+    );
+    assert_one(
+        &spec_with("paseo_agents = false", "paseo_agents = \"no\""),
+        FindingCode::WrongType,
+        "cleanup.projects.paseo_agents",
+    );
+    assert_one(
+        &spec_with(
+            "paseo_agents = false",
+            "paseo_agents = false\nquiet = \"1d\"",
+        ),
+        FindingCode::UnknownKey,
+        "cleanup.projects.quiet",
+    );
+}

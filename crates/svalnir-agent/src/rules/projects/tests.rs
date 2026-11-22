@@ -823,7 +823,7 @@ fn a_unit_that_a_child_process_names_in_an_argument_is_refused() {
         .find(|found| found.kind == PathUseKind::Argument)
         .unwrap_or_else(|| panic!("{uses:?}"));
     assert_eq!(found.name, "sh");
-    assert_eq!(found.relative, PathBuf::from("left-pad/index.js"));
+    assert_eq!(found.relative, PathBuf::from("left-pad"));
     // The report has no other part of the command line.
     let text: String = serde_json::to_string(&report).unwrap();
     assert!(!text.contains("sleep 30"), "{text}");

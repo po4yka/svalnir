@@ -20,9 +20,14 @@ pub enum QueryFailure {
     /// The process does not exist, or it is a zombie that has no data.
     #[error("the process does not exist")]
     Gone,
-    /// The worker has no permission for the query.
+    /// The worker has no permission for the query (`EPERM`).
     #[error("the worker has no permission for the query")]
     PermissionDenied,
+    /// The system denied access for the query (`EACCES`). A caller that
+    /// does not need the difference treats it as
+    /// [`PermissionDenied`](Self::PermissionDenied).
+    #[error("the system denied access for the query")]
+    AccessDenied,
     /// The host does not supply the query.
     #[error("the host does not supply the query")]
     Unsupported,
@@ -43,7 +48,7 @@ impl QueryFailure {
     pub fn reason(self) -> UnavailableReason {
         match self {
             Self::Gone => UnavailableReason::ResourceGone,
-            Self::PermissionDenied => UnavailableReason::PermissionDenied,
+            Self::PermissionDenied | Self::AccessDenied => UnavailableReason::PermissionDenied,
             Self::Unsupported => UnavailableReason::Unsupported,
             Self::Inconsistent => UnavailableReason::InconsistentData,
             Self::Overflow => UnavailableReason::Overflow,
@@ -173,12 +178,36 @@ pub struct RawListeningSockets {
     pub descriptors_truncated: bool,
 }
 
-/// The file paths of one kind that one process uses, from at most a bounded
+/// One vnode that a process uses, as the kernel reports it: its path and
+/// the identity of the vnode at the time of the query.
+///
+/// The kernel can give a path that is not complete with a success status,
+/// for example for a path longer than `MAXPATHLEN`. A caller verifies the
+/// path against `object` before it treats the path as evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VnodeObject {
+    /// `vst_dev` and `vst_ino` of the vnode.
+    pub object: FileObjectEvidence,
+    /// `vst_nlink` of the vnode. Zero for a file that was removed while it
+    /// was in use.
+    pub links: u16,
+}
+
+/// One vnode with its path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RawVnode {
+    /// The absolute path, or `None` when the kernel gave no path.
+    pub path: Option<LosslessPath>,
+    /// The identity of the vnode.
+    pub vnode: VnodeObject,
+}
+
+/// The vnodes of one kind that one process uses, from at most a bounded
 /// number of native objects (file descriptors or memory regions).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RawPaths {
-    /// The absolute paths, each one time, in the sequence of the kernel.
-    pub paths: Vec<LosslessPath>,
+    /// The vnodes, each one time, in the sequence of the kernel.
+    pub paths: Vec<RawVnode>,
     /// The process has more objects than the bound, so the objects after
     /// the bound were not examined.
     pub truncated: bool,
@@ -357,10 +386,25 @@ pub trait ProcessSource {
         Err(QueryFailure::Unsupported)
     }
 
-    /// The paths of the files that the open file descriptors of the
-    /// process refer to, from at most `max_descriptors` descriptors. A
-    /// descriptor that is not a vnode, or that closed during the query, is
-    /// not in the result.
+    /// The current working directory of the process with the identity of
+    /// its vnode.
+    ///
+    /// The default implementation is for a source with no such query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QueryFailure`] as [`working_directory`](Self::working_directory)
+    /// does.
+    fn working_directory_vnode(&self, pid: Pid) -> Result<RawVnode, QueryFailure> {
+        let _ = pid;
+        Err(QueryFailure::Unsupported)
+    }
+
+    /// The vnodes that the open file descriptors of the process refer to,
+    /// from at most `max_descriptors` descriptors. A descriptor that is not
+    /// a vnode, or that closed during the query, is not in the result. A
+    /// vnode for which the kernel gives no path is in the result with no
+    /// path.
     ///
     /// The default implementation is for a source with no such query.
     ///
@@ -373,8 +417,9 @@ pub trait ProcessSource {
         Err(QueryFailure::Unsupported)
     }
 
-    /// The paths of the files that the memory regions of the process map,
-    /// from at most `max_regions` regions.
+    /// The vnodes that the memory regions of the process map, from at most
+    /// `max_regions` regions. A region that maps no vnode is not in the
+    /// result.
     ///
     /// The default implementation is for a source with no such query.
     ///

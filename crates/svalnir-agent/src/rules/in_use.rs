@@ -143,7 +143,8 @@ pub struct UseRecord {
     pub name: String,
     /// The kind of use.
     pub kind: PathUseKind,
-    /// The path relative to the unit. Empty for the unit itself.
+    /// The path relative to the unit. Empty for the unit itself. For an
+    /// argument, only the first component of that path.
     pub relative: PathBuf,
 }
 
@@ -239,9 +240,14 @@ pub fn uses_of(inventory: &PathInventory, scope: &UnitScope) -> UnitUse {
     let mut omitted: u64 = 0;
     for process in &inventory.processes {
         for found in &process.uses {
-            let Some(relative) = scope.relative(&found.path) else {
+            let Some(mut relative) = scope.relative(&found.path) else {
                 continue;
             };
+            if found.kind == PathUseKind::Argument {
+                // An argument keeps only the first component below the
+                // unit; the rest of the argument text is not kept.
+                relative = relative.components().take(1).collect();
+            }
             if uses.len() < MAX_USE_RECORDS {
                 uses.push(UseRecord {
                     pid: process.pid.get(),
@@ -359,7 +365,7 @@ mod tests {
         assert_eq!(uses[0].pid, 42);
         assert_eq!(uses[0].name, "node");
         assert_eq!(uses[0].kind, PathUseKind::Argument);
-        assert_eq!(uses[0].relative, PathBuf::from(".bin/vite"));
+        assert_eq!(uses[0].relative, PathBuf::from(".bin"));
         assert_eq!(found.refusal(), Some("unit_in_use"));
         // A use elsewhere and a complete inventory: not in use.
         let other = inventory(PathUseKind::OpenFile, "/q/file");

@@ -382,7 +382,9 @@ pub fn xcode_evidence<S: ProcessSource>(source: &S, principal: Uid) -> XcodeEvid
             Ok(info) => info,
             // A process that exited is not a process of the inventory. A
             // denied identity query is a process of a different user.
-            Err(QueryFailure::Gone | QueryFailure::PermissionDenied) => continue,
+            Err(
+                QueryFailure::Gone | QueryFailure::PermissionDenied | QueryFailure::AccessDenied,
+            ) => continue,
             Err(_) => return unknown(observed_at),
         };
         if info.zombie || (info.effective_uid != principal && info.real_uid != principal) {

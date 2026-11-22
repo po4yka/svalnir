@@ -54,7 +54,7 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
     ProcessSource, QueryFailure, RawArguments, RawListeningSocket, RawListeningSockets, RawPaths,
-    RawProcessInfo, RawUsage, RunningApplication, SocketFamily, Timebase,
+    RawProcessInfo, RawUsage, RawVnode, RunningApplication, SocketFamily, Timebase, VnodeObject,
 };
 
 /// The largest number of process IDs that one list can have. The value is
@@ -79,7 +79,8 @@ impl DarwinProcessSource {
 fn last_failure() -> QueryFailure {
     match std::io::Error::last_os_error().raw_os_error() {
         Some(libc::ESRCH) => QueryFailure::Gone,
-        Some(libc::EPERM | libc::EACCES) => QueryFailure::PermissionDenied,
+        Some(libc::EPERM) => QueryFailure::PermissionDenied,
+        Some(libc::EACCES) => QueryFailure::AccessDenied,
         Some(libc::ENOTSUP | libc::ENOSYS) => QueryFailure::Unsupported,
         Some(code) => QueryFailure::Failed(code),
         None => QueryFailure::Failed(0),
@@ -379,6 +380,59 @@ fn working_directory(pid: Pid) -> Result<LosslessPath, QueryFailure> {
     LosslessPath::from_bytes(path).map_err(|_| QueryFailure::Inconsistent)
 }
 
+/// The working directory of `pid` with the identity of its vnode.
+fn working_directory_vnode(pid: Pid) -> Result<RawVnode, QueryFailure> {
+    let path: LosslessPath = working_directory(pid)?;
+    let mut info: MaybeUninit<libc::proc_vnodepathinfo> = MaybeUninit::zeroed();
+    let size: c_int = c_int::try_from(size_of::<libc::proc_vnodepathinfo>())
+        .map_err(|_| QueryFailure::Overflow)?;
+    // SAFETY: as in `working_directory`.
+    let written: c_int = unsafe {
+        libc::proc_pidinfo(
+            pid.get(),
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(last_failure());
+    }
+    if written != size {
+        return Err(QueryFailure::Inconsistent);
+    }
+    // SAFETY: as in `working_directory`.
+    let info: libc::proc_vnodepathinfo = unsafe { info.assume_init() };
+    let stat: libc::vinfo_stat = info.pvi_cdir.vip_vi.vi_stat;
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .map(|byte| byte.cast_unsigned())
+        .collect();
+    // The two readings must name one path; a different path is a change
+    // of the working directory between them.
+    let end: usize = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(QueryFailure::Inconsistent)?;
+    if bytes.get(..end) != Some(path.as_bytes()) {
+        return Err(QueryFailure::Inconsistent);
+    }
+    Ok(RawVnode {
+        path: Some(path),
+        vnode: VnodeObject {
+            object: FileObjectEvidence {
+                device: DeviceNumber::new(stat.vst_dev.cast_signed()),
+                inode: InodeNumber::new(stat.vst_ino),
+            },
+            links: stat.vst_nlink,
+        },
+    })
+}
+
 /// `PROC_PIDFDSOCKETINFO` in `<sys/proc_info.h>`.
 const PROC_PIDFDSOCKETINFO: c_int = 3;
 
@@ -599,6 +653,8 @@ const PROC_PIDREGIONPATHINFO2: c_int = 22;
 const VNODE_FDINFOWITHPATH_SIZE: usize = 1200;
 /// `offsetof(struct vnode_fdinfowithpath, pvip.vip_path)`.
 const VNODE_FDINFOWITHPATH_PATH: usize = 176;
+/// `offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat)`.
+const VNODE_FDINFOWITHPATH_INFO: usize = 24;
 /// `sizeof(struct proc_regionwithpathinfo)` in `<sys/proc_info.h>`.
 const REGIONWITHPATHINFO_SIZE: usize = 1272;
 /// `offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_address)`, a
@@ -609,13 +665,21 @@ const REGION_ADDRESS: usize = 80;
 const REGION_SIZE: usize = 88;
 /// `offsetof(struct proc_regionwithpathinfo, prp_vip.vip_path)`.
 const REGIONWITHPATHINFO_PATH: usize = 248;
+/// `offsetof(struct proc_regionwithpathinfo, prp_vip.vip_vi.vi_stat)`.
+const REGIONWITHPATHINFO_INFO: usize = 96;
 
 // The sizes and offsets above were measured with `sizeof` and `offsetof`
 // against `<sys/proc_info.h>` of the macOS SDK. Each path field is a
 // `vip_path` of `MAXPATHLEN` bytes, and each one ends inside its structure.
 const _: () = assert!(VNODE_FDINFOWITHPATH_PATH + VNODE_PATH_CAPACITY <= VNODE_FDINFOWITHPATH_SIZE);
 const _: () = assert!(REGIONWITHPATHINFO_PATH + VNODE_PATH_CAPACITY <= REGIONWITHPATHINFO_SIZE);
-const _: () = assert!(REGION_SIZE + 8 <= REGIONWITHPATHINFO_PATH);
+const _: () = assert!(REGION_SIZE + 8 <= REGIONWITHPATHINFO_INFO);
+const _: () = assert!(REGIONWITHPATHINFO_INFO + VST_INO + 8 <= REGIONWITHPATHINFO_PATH);
+const _: () = assert!(VNODE_FDINFOWITHPATH_INFO + VST_INO + 8 <= VNODE_FDINFOWITHPATH_PATH);
+// `libc::vinfo_stat` has the field offsets that the byte reads use.
+const _: () = assert!(std::mem::offset_of!(libc::vinfo_stat, vst_dev) == VST_DEV);
+const _: () = assert!(std::mem::offset_of!(libc::vinfo_stat, vst_nlink) == VST_NLINK);
+const _: () = assert!(std::mem::offset_of!(libc::vinfo_stat, vst_ino) == VST_INO);
 const _: () = assert!(libc::PROX_FDTYPE_VNODE == 1);
 const _: () = assert!(libc::KERN_PROCARGS2 == 49);
 const _: () = assert!(libc::MAXPATHLEN as usize == VNODE_PATH_CAPACITY);
@@ -655,6 +719,51 @@ pub(super) fn vnode_path_at(
         .map_err(|_| QueryFailure::Inconsistent)
 }
 
+/// The offsets of `vst_dev` (`uint32_t`), `vst_nlink` (`uint16_t`), and
+/// `vst_ino` (`uint64_t`) of `vip_vi.vi_stat`, relative to the start of the
+/// `struct vnode_info_path`, measured against `<sys/proc_info.h>`.
+const VST_DEV: usize = 0;
+const VST_NLINK: usize = 6;
+const VST_INO: usize = 8;
+
+/// The vnode identity of the `struct vnode_info_path` at `info` of `bytes`,
+/// with the path at `path`. `None` for an identity of zeros, which the
+/// kernel gives for a region that maps no vnode.
+pub(super) fn vnode_at(
+    bytes: &[u8],
+    info: usize,
+    path: usize,
+) -> Result<Option<RawVnode>, QueryFailure> {
+    let device: u32 = read_u32(bytes, info + VST_DEV)?;
+    let links: [u8; 2] = bytes
+        .get(info + VST_NLINK..info + VST_NLINK + 2)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    let inode: u64 = read_u64(bytes, info + VST_INO)?;
+    let path: Option<LosslessPath> = vnode_path_at(bytes, path)?;
+    if device == 0 && inode == 0 && path.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(RawVnode {
+        path,
+        vnode: VnodeObject {
+            object: FileObjectEvidence {
+                device: DeviceNumber::new(device.cast_signed()),
+                inode: InodeNumber::new(inode),
+            },
+            links: u16::from_ne_bytes(links),
+        },
+    }))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, QueryFailure> {
+    let field: [u8; 4] = bytes
+        .get(offset..offset.saturating_add(4))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(QueryFailure::Inconsistent)?;
+    Ok(u32::from_ne_bytes(field))
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, QueryFailure> {
     let field: [u8; 8] = bytes
         .get(offset..offset.saturating_add(8))
@@ -663,16 +772,16 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, QueryFailure> {
     Ok(u64::from_ne_bytes(field))
 }
 
-/// Adds `path` to `paths` when it is not there.
-fn push_unique(paths: &mut Vec<LosslessPath>, path: LosslessPath) {
-    if !paths.contains(&path) {
-        paths.push(path);
+/// Adds `vnode` to `vnodes` when it is not there.
+fn push_unique(vnodes: &mut Vec<RawVnode>, vnode: RawVnode) {
+    if !vnodes.contains(&vnode) {
+        vnodes.push(vnode);
     }
 }
 
-/// The path of the vnode of one descriptor, or `None` when the descriptor
-/// closed after the list was read or the kernel gives no path.
-fn vnode_of_descriptor(pid: Pid, descriptor: i32) -> Result<Option<LosslessPath>, QueryFailure> {
+/// The vnode of one descriptor, or `None` when the descriptor closed after
+/// the list was read.
+fn vnode_of_descriptor(pid: Pid, descriptor: i32) -> Result<Option<RawVnode>, QueryFailure> {
     let mut info: FdVnodeBytes = FdVnodeBytes([0; VNODE_FDINFOWITHPATH_SIZE]);
     let size: c_int =
         c_int::try_from(VNODE_FDINFOWITHPATH_SIZE).map_err(|_| QueryFailure::Overflow)?;
@@ -698,18 +807,22 @@ fn vnode_of_descriptor(pid: Pid, descriptor: i32) -> Result<Option<LosslessPath>
     if written != size {
         return Err(QueryFailure::Inconsistent);
     }
-    vnode_path_at(&info.0, VNODE_FDINFOWITHPATH_PATH)
+    vnode_at(
+        &info.0,
+        VNODE_FDINFOWITHPATH_INFO,
+        VNODE_FDINFOWITHPATH_PATH,
+    )
 }
 
 fn open_file_paths(pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {
     let (descriptors, truncated) = list_descriptors(pid, max_descriptors)?;
-    let mut paths: Vec<LosslessPath> = Vec::new();
+    let mut paths: Vec<RawVnode> = Vec::new();
     for descriptor in &descriptors {
         if descriptor.proc_fdtype != libc::PROX_FDTYPE_VNODE.cast_unsigned() {
             continue;
         }
-        if let Some(path) = vnode_of_descriptor(pid, descriptor.proc_fd)? {
-            push_unique(&mut paths, path);
+        if let Some(vnode) = vnode_of_descriptor(pid, descriptor.proc_fd)? {
+            push_unique(&mut paths, vnode);
         }
     }
     Ok(RawPaths { paths, truncated })
@@ -722,7 +835,7 @@ fn mapped_file_paths_flavor(
 ) -> Result<RawPaths, QueryFailure> {
     let size: c_int =
         c_int::try_from(REGIONWITHPATHINFO_SIZE).map_err(|_| QueryFailure::Overflow)?;
-    let mut paths: Vec<LosslessPath> = Vec::new();
+    let mut paths: Vec<RawVnode> = Vec::new();
     let mut address: u64 = 0;
     for _ in 0..max_regions {
         let mut info: RegionBytes = RegionBytes([0; REGIONWITHPATHINFO_SIZE]);
@@ -753,8 +866,8 @@ fn mapped_file_paths_flavor(
         if written != size {
             return Err(QueryFailure::Inconsistent);
         }
-        if let Some(path) = vnode_path_at(&info.0, REGIONWITHPATHINFO_PATH)? {
-            push_unique(&mut paths, path);
+        if let Some(vnode) = vnode_at(&info.0, REGIONWITHPATHINFO_INFO, REGIONWITHPATHINFO_PATH)? {
+            push_unique(&mut paths, vnode);
         }
         let start: u64 = read_u64(&info.0, REGION_ADDRESS)?;
         let length: u64 = read_u64(&info.0, REGION_SIZE)?;
@@ -1182,6 +1295,10 @@ impl ProcessSource for DarwinProcessSource {
 
     fn process_owner(&self, pid: Pid) -> Result<(Uid, Uid), QueryFailure> {
         process_owner(pid)
+    }
+
+    fn working_directory_vnode(&self, pid: Pid) -> Result<RawVnode, QueryFailure> {
+        working_directory_vnode(pid)
     }
 
     fn open_file_paths(&self, pid: Pid, max_descriptors: usize) -> Result<RawPaths, QueryFailure> {

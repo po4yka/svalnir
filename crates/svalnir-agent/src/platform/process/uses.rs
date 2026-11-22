@@ -23,7 +23,13 @@ use serde::Serialize;
 use svalnir_core::process::{Pid, Uid};
 use svalnir_core::time::MonotonicNanos;
 
-use super::source::{ProcessSource, QueryFailure, RawArguments, RawPaths};
+use std::collections::HashMap;
+
+use svalnir_core::file::{FileObjectEvidence, LosslessPath};
+
+use super::source::{
+    ProcessSource, QueryFailure, RawArguments, RawPaths, RawProcessInfo, RawVnode,
+};
 
 /// The kind of use of a path by a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -90,6 +96,12 @@ pub enum InventoryGap {
     ArgumentsTruncated,
     /// The inventory passed its time bound.
     DeadlineReached,
+    /// A path from the kernel is not in a scope, and the file at the path
+    /// does not have the device and the inode of the vnode, or the kernel
+    /// gave no path for a vnode with links.
+    PathNotVerified,
+    /// The PID named a different process after the queries, two times.
+    ProcessReplaced,
 }
 
 impl InventoryGap {
@@ -107,6 +119,8 @@ impl InventoryGap {
             Self::RegionsTruncated => "regions_truncated",
             Self::ArgumentsTruncated => "arguments_truncated",
             Self::DeadlineReached => "deadline_reached",
+            Self::PathNotVerified => "path_not_verified",
+            Self::ProcessReplaced => "process_replaced",
         }
     }
 }
@@ -228,37 +242,108 @@ fn lexical(path: &Path) -> PathBuf {
     result
 }
 
-/// The paths that the arguments name: an absolute argument, the part after
-/// the first `=` when it is absolute, and a relative argument joined to the
-/// working directory when it is known. The result is lexical; no symbolic
-/// link is followed.
+/// The forms of a path for the comparison: with no `..`, the path with `.`
+/// removed; with `..`, the part before the first `..` and the lexical form.
+/// The directory before a `..` can be a symbolic link, so the lexical form
+/// alone can miss a use; the part before `..` is a use of each unit that
+/// contains it.
+fn path_forms(path: &Path) -> Vec<PathBuf> {
+    if !path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return vec![lexical(path)];
+    }
+    let prefix: PathBuf = path
+        .components()
+        .take_while(|component| *component != Component::ParentDir)
+        .filter(|component| *component != Component::CurDir)
+        .collect();
+    vec![prefix, lexical(path)]
+}
+
+/// `text` with each `%XX` decoded. A `%` with no two hexadecimal digits
+/// stays as it is.
+fn percent_decoded(text: &[u8]) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::with_capacity(text.len());
+    let mut index: usize = 0;
+    while let Some(&byte) = text.get(index) {
+        let digits: Option<u8> = (byte == b'%')
+            .then(|| text.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+        if let Some(decoded) = digits {
+            result.push(decoded);
+            index += 3;
+        } else {
+            result.push(byte);
+            index += 1;
+        }
+    }
+    result
+}
+
+/// The texts of one argument that can name a path: the argument, the part
+/// after its first `=`, the part after an option prefix of one or two
+/// characters, the path of a `file://` URL, and each part of a list that
+/// `:` separates. The second value is true for a text that can be relative.
+fn argument_texts(value: &[u8]) -> Vec<(Vec<u8>, bool)> {
+    let mut texts: Vec<(Vec<u8>, bool)> = vec![(value.to_vec(), value.first() != Some(&b'-'))];
+    if let Some(after) = value
+        .iter()
+        .position(|byte| *byte == b'=')
+        .and_then(|index| value.get(index + 1..))
+    {
+        texts.push((after.to_vec(), false));
+    }
+    if value.first() == Some(&b'-')
+        && let Some(slash) = value.iter().position(|byte| *byte == b'/')
+        && (2..=3).contains(&slash)
+        && let Some(after) = value.get(slash..)
+    {
+        texts.push((after.to_vec(), false));
+    }
+    let mut expanded: Vec<(Vec<u8>, bool)> = Vec::new();
+    for (text, relative) in texts {
+        let text: Vec<u8> = match text.strip_prefix(b"file://".as_slice()) {
+            Some(rest) => {
+                percent_decoded(rest.strip_prefix(b"localhost".as_slice()).unwrap_or(rest))
+            }
+            None => text,
+        };
+        for part in text.split(|byte| *byte == b':') {
+            if part.len() != text.len() && !part.is_empty() {
+                expanded.push((part.to_vec(), relative));
+            }
+        }
+        expanded.push((text, relative));
+    }
+    expanded
+}
+
+/// The paths that the arguments name, in the forms of
+/// `docs/CLEANUP_RULES.md` section 6. A relative text is joined to the
+/// working directory when it is known. No symbolic link is followed.
 pub(super) fn argument_paths(
     arguments: &RawArguments,
     working_directory: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     for value in &arguments.values {
-        if value.is_empty() {
-            continue;
-        }
-        let candidate: Option<PathBuf> = if value.first() == Some(&b'/') {
-            Some(PathBuf::from(OsStr::from_bytes(value)))
-        } else if let Some(after) = value
-            .iter()
-            .position(|byte| *byte == b'=')
-            .and_then(|index| value.get(index + 1..))
-            .filter(|after| after.first() == Some(&b'/'))
-        {
-            Some(PathBuf::from(OsStr::from_bytes(after)))
-        } else if value.first() == Some(&b'-') {
-            None
-        } else {
-            working_directory.map(|directory| directory.join(OsStr::from_bytes(value)))
-        };
-        if let Some(path) = candidate.map(|path| lexical(&path))
-            && !paths.contains(&path)
-        {
-            paths.push(path);
+        for (text, relative) in argument_texts(value) {
+            let candidate: Option<PathBuf> = if text.first() == Some(&b'/') {
+                Some(PathBuf::from(OsStr::from_bytes(&text)))
+            } else if relative && !text.is_empty() && text.first() != Some(&b'-') {
+                working_directory.map(|directory| directory.join(OsStr::from_bytes(&text)))
+            } else {
+                None
+            };
+            for path in candidate.iter().flat_map(|path| path_forms(path)) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
         }
     }
     paths
@@ -302,6 +387,29 @@ fn short_name(path: &Path) -> String {
     name.get(..end).unwrap_or_default().to_owned()
 }
 
+/// The largest number of paths whose file identity one inventory keeps.
+const MAX_VERIFIED_PATHS: usize = 65_536;
+
+/// The file identity of each path that an inventory verified.
+struct Verifier<'a, S: ProcessSource + ?Sized> {
+    source: &'a S,
+    known: HashMap<LosslessPath, Option<FileObjectEvidence>>,
+}
+
+impl<S: ProcessSource + ?Sized> Verifier<'_, S> {
+    /// Whether the file at `path` now has the identity `object`.
+    fn matches(&mut self, path: &LosslessPath, object: FileObjectEvidence) -> bool {
+        if let Some(found) = self.known.get(path) {
+            return *found == Some(object);
+        }
+        let found: Option<FileObjectEvidence> = self.source.file_evidence(path).ok();
+        if self.known.len() < MAX_VERIFIED_PATHS {
+            self.known.insert(path.clone(), found);
+        }
+        found == Some(object)
+    }
+}
+
 /// The path uses of the processes of `principal` from `source`, with only
 /// the paths that `keep` accepts.
 ///
@@ -309,10 +417,10 @@ fn short_name(path: &Path) -> String {
 /// `principal`. The owner query comes first, so no use query is made of a
 /// process of a different user. The calling process is not examined. A
 /// process that exited during the reading is not in the inventory. A
-/// process whose identity query is denied is counted in
-/// [`PathInventory::not_visible`]. A process of the user whose use query
-/// fails, or that passes a bound of one process, is an
-/// [`UnknownProcess`].
+/// process of the user that fails a query, that passes a bound of one
+/// process, or whose path from the kernel cannot be verified is an
+/// [`UnknownProcess`], unless it passes the platform gate of
+/// `docs/CLEANUP_RULES.md` section 6.
 pub fn collect_path_uses<S: ProcessSource + ?Sized>(
     source: &S,
     principal: Uid,
@@ -335,6 +443,10 @@ pub fn collect_path_uses<S: ProcessSource + ?Sized>(
         inventory.note(InventoryGap::TooManyProcesses);
         pids.truncate(limits.max_processes);
     }
+    let mut verifier: Verifier<'_, S> = Verifier {
+        source,
+        known: HashMap::new(),
+    };
     let own: u32 = std::process::id();
     let mut seen: usize = 0;
     for pid in pids {
@@ -346,34 +458,106 @@ pub fn collect_path_uses<S: ProcessSource + ?Sized>(
             seen += 1;
             continue;
         }
-        let is_user = |(effective, real): (Uid, Uid)| effective == principal || real == principal;
         match source.process_owner(pid) {
-            Ok(owner) if !is_user(owner) => continue,
+            Ok(owner) if !is_user(owner, principal) => continue,
             Err(QueryFailure::Gone) => continue,
             // An owner of the user, or no owner: the identity query decides.
             _ => {}
         }
-        let info = match source.process_info(pid) {
-            Ok(info) => info,
-            Err(QueryFailure::Gone) => continue,
-            Err(QueryFailure::PermissionDenied) => {
-                inventory.not_visible = inventory.not_visible.saturating_add(1);
-                continue;
+        if examine_process(
+            source,
+            pid,
+            principal,
+            keep,
+            limits,
+            &mut verifier,
+            &mut inventory,
+        ) {
+            seen += 1;
+        }
+    }
+    if seen == 0 && inventory.unknown.is_empty() {
+        // A complete inventory has at least the calling process.
+        inventory.note(InventoryGap::ProcessListEmpty);
+    }
+    inventory
+}
+
+/// Whether the owner `(effective, real)` is the user.
+fn is_user((effective, real): (Uid, Uid), principal: Uid) -> bool {
+    effective == principal || real == principal
+}
+
+/// Whether the process passes the platform gate: its executable is on the
+/// sealed system volume, and its running code is an Apple platform binary.
+fn passes_platform_gate<S: ProcessSource + ?Sized>(
+    source: &S,
+    pid: Pid,
+    executable: Option<&Path>,
+) -> bool {
+    executable.is_some_and(is_on_sealed_system_volume)
+        && source.apple_platform_code(pid) == Ok(true)
+}
+
+/// Examines one process whose owner is the user or is not known, and adds
+/// the result to `inventory`. Returns whether it is a process of the user
+/// that the inventory saw.
+fn examine_process<S: ProcessSource + ?Sized>(
+    source: &S,
+    pid: Pid,
+    principal: Uid,
+    keep: &dyn Fn(&Path) -> bool,
+    limits: UseLimits,
+    verifier: &mut Verifier<'_, S>,
+    inventory: &mut PathInventory,
+) -> bool {
+    let mut info: RawProcessInfo = match source.process_info(pid) {
+        Ok(info) => info,
+        Err(QueryFailure::Gone) => return false,
+        Err(failure) => {
+            let executable: Result<LosslessPath, QueryFailure> = source.executable_path(pid);
+            if executable == Err(QueryFailure::Gone) {
+                return false;
             }
-            Err(failure) => {
-                let name: String = source
-                    .executable_path(pid)
-                    .map_or_else(|_| String::new(), |path| short_name(&path.to_path_buf()));
+            let path: Option<PathBuf> = executable.ok().map(|path| path.to_path_buf());
+            if failure == QueryFailure::PermissionDenied
+                && passes_platform_gate(source, pid, path.as_deref())
+            {
+                inventory.not_visible = inventory.not_visible.saturating_add(1);
+            } else {
+                let name: String = path.as_deref().map_or_else(String::new, short_name);
                 inventory.unknown_process(pid, name, gap_of(failure));
-                continue;
+            }
+            return true;
+        }
+    };
+    for attempt in 0..2 {
+        if info.zombie || !is_user((info.effective_uid, info.real_uid), principal) {
+            return false;
+        }
+        let examined: Examined = examine(source, pid, keep, limits, verifier);
+        // The PID must name the same process after the queries.
+        let after: RawProcessInfo = match source.process_info(pid) {
+            Ok(after) => after,
+            Err(QueryFailure::Gone) => return false,
+            Err(failure) => {
+                inventory.unknown_process(pid, String::new(), gap_of(failure));
+                return true;
             }
         };
-        if info.zombie || !is_user((info.effective_uid, info.real_uid)) {
-            continue;
+        if after.start_time != info.start_time
+            || after.effective_uid != info.effective_uid
+            || after.real_uid != info.real_uid
+        {
+            if attempt == 0 {
+                info = after;
+                continue;
+            }
+            inventory.unknown_process(pid, String::new(), InventoryGap::ProcessReplaced);
+            return true;
         }
-        seen += 1;
-        match examine(source, pid, keep, limits) {
-            Examined::Exited => {}
+        match examined {
+            Examined::Exited => return false,
             Examined::Known(uses) => inventory.processes.extend(uses),
             Examined::Unknown {
                 name,
@@ -384,30 +568,24 @@ pub fn collect_path_uses<S: ProcessSource + ?Sized>(
             } => {
                 // A use that was read before the failure is still a use.
                 inventory.processes.extend(uses);
-                let platform: bool = only_refused
-                    && executable
-                        .as_deref()
-                        .is_some_and(is_on_sealed_system_volume)
-                    && source.apple_platform_code(pid) == Ok(true);
-                if platform {
+                if only_refused && passes_platform_gate(source, pid, executable.as_deref()) {
                     inventory.platform_refused = inventory.platform_refused.saturating_add(1);
                 } else {
                     inventory.unknown_process(pid, name, reason);
                 }
             }
         }
+        return true;
     }
-    if seen == 0 && inventory.unknown.is_empty() {
-        // A complete inventory has at least the calling process.
-        inventory.note(InventoryGap::ProcessListEmpty);
-    }
-    inventory
+    true
 }
 
 /// The gap of a failed query of a process of the user that did not exit.
 const fn gap_of(failure: QueryFailure) -> InventoryGap {
     match failure {
-        QueryFailure::PermissionDenied => InventoryGap::ProcessQueryDenied,
+        QueryFailure::PermissionDenied | QueryFailure::AccessDenied => {
+            InventoryGap::ProcessQueryDenied
+        }
         _ => InventoryGap::ProcessQueryFailed,
     }
 }
@@ -416,20 +594,76 @@ const fn gap_of(failure: QueryFailure) -> InventoryGap {
 enum Examined {
     /// The process exited during the examination.
     Exited,
-    /// Each query answered; the record when the process has a use.
+    /// Each query answered and each path was verified; the record when the
+    /// process has a use.
     Known(Option<ProcessUses>),
-    /// A query failed or a bound was reached.
+    /// A query failed, a bound was reached, or a path was not verified.
     Unknown {
         name: String,
         reason: InventoryGap,
         uses: Option<ProcessUses>,
         /// The executable, when its query answered.
         executable: Option<PathBuf>,
-        /// Each failure was a refusal (`PermissionDenied`), and no bound
-        /// was reached.
+        /// Each failure was a refusal with `EPERM`, and no bound was
+        /// reached and no path failed the verification.
         only_refused: bool,
     },
 }
+
+/// The state of one examination.
+struct Findings {
+    reason: Option<InventoryGap>,
+    only_refused: bool,
+    uses: Vec<ProcessPathUse>,
+}
+
+impl Findings {
+    /// Notes a failed query.
+    fn fail(&mut self, failure: QueryFailure) {
+        if failure != QueryFailure::PermissionDenied {
+            self.only_refused = false;
+        }
+        self.reason.get_or_insert(gap_of(failure));
+    }
+
+    /// Notes a gap that is not a refusal: a bound or a path that was not
+    /// verified.
+    fn gap(&mut self, gap: InventoryGap) {
+        self.only_refused = false;
+        self.reason.get_or_insert(gap);
+    }
+
+    fn add(&mut self, keep: &dyn Fn(&Path) -> bool, kind: PathUseKind, path: PathBuf) {
+        if keep(&path) {
+            let found: ProcessPathUse = ProcessPathUse { kind, path };
+            if !self.uses.contains(&found) {
+                self.uses.push(found);
+            }
+        }
+    }
+
+    /// Adds the use of one vnode, or notes that its path cannot be
+    /// verified. A path in the scope is a use with no other check.
+    fn vnode<S: ProcessSource + ?Sized>(
+        &mut self,
+        keep: &dyn Fn(&Path) -> bool,
+        verifier: &mut Verifier<'_, S>,
+        kind: PathUseKind,
+        vnode: &RawVnode,
+    ) {
+        match &vnode.path {
+            Some(path) if keep(&path.to_path_buf()) => self.add(keep, kind, path.to_path_buf()),
+            // A vnode with no link has no name, so it is in no unit.
+            _ if vnode.vnode.links == 0 => {}
+            Some(path) if verifier.matches(path, vnode.vnode.object) => {}
+            _ => self.gap(InventoryGap::PathNotVerified),
+        }
+    }
+}
+
+/// `ENOENT`: `proc_pidpath` gives it for an executable with no current
+/// name.
+const NO_CURRENT_NAME: QueryFailure = QueryFailure::Failed(libc::ENOENT);
 
 /// The uses of one process of the user.
 fn examine<S: ProcessSource + ?Sized>(
@@ -437,48 +671,43 @@ fn examine<S: ProcessSource + ?Sized>(
     pid: Pid,
     keep: &dyn Fn(&Path) -> bool,
     limits: UseLimits,
+    verifier: &mut Verifier<'_, S>,
 ) -> Examined {
-    let mut reason: Option<InventoryGap> = None;
-    let mut only_refused: bool = true;
-    let mut fail = |reason: &mut Option<InventoryGap>, failure: QueryFailure| {
-        if failure != QueryFailure::PermissionDenied {
-            only_refused = false;
-        }
-        reason.get_or_insert(gap_of(failure));
-    };
-    let mut bounded: bool = false;
-    let mut uses: Vec<ProcessPathUse> = Vec::new();
-    let mut add = |kind: PathUseKind, path: PathBuf| {
-        if keep(&path) {
-            let found: ProcessPathUse = ProcessPathUse { kind, path };
-            if !uses.contains(&found) {
-                uses.push(found);
-            }
-        }
+    let mut found: Findings = Findings {
+        reason: None,
+        only_refused: true,
+        uses: Vec::new(),
     };
     let executable: Option<PathBuf> = match source.executable_path(pid) {
         Ok(path) => Some(path.to_path_buf()),
         Err(QueryFailure::Gone) => return Examined::Exited,
+        // The file was removed or replaced after the process started. The
+        // process is known when each other query answers and each path is
+        // verified (`docs/CLEANUP_RULES.md` section 6).
+        Err(NO_CURRENT_NAME) => {
+            found.only_refused = false;
+            None
+        }
         Err(failure) => {
-            fail(&mut reason, failure);
+            found.fail(failure);
             None
         }
     };
     let name: String = executable.as_deref().map_or_else(String::new, short_name);
     if let Some(path) = &executable {
-        add(PathUseKind::Executable, path.clone());
+        found.add(keep, PathUseKind::Executable, path.clone());
     }
-    let working_directory: Option<PathBuf> = match source.working_directory(pid) {
-        Ok(path) => Some(path.to_path_buf()),
+    let working_directory: Option<PathBuf> = match source.working_directory_vnode(pid) {
+        Ok(vnode) => {
+            found.vnode(keep, verifier, PathUseKind::WorkingDirectory, &vnode);
+            vnode.path.map(|path| path.to_path_buf())
+        }
         Err(QueryFailure::Gone) => return Examined::Exited,
         Err(failure) => {
-            fail(&mut reason, failure);
+            found.fail(failure);
             None
         }
     };
-    if let Some(path) = &working_directory {
-        add(PathUseKind::WorkingDirectory, path.clone());
-    }
     let queries: [(PathUseKind, InventoryGap, Result<RawPaths, QueryFailure>); 2] = [
         (
             PathUseKind::OpenFile,
@@ -493,50 +722,44 @@ fn examine<S: ProcessSource + ?Sized>(
     ];
     for (kind, bound, result) in queries {
         match result {
-            Ok(found) => {
-                if found.truncated {
-                    bounded = true;
-                    reason.get_or_insert(bound);
+            Ok(vnodes) => {
+                if vnodes.truncated {
+                    found.gap(bound);
                 }
-                for path in found.paths {
-                    add(kind, path.to_path_buf());
+                for vnode in &vnodes.paths {
+                    found.vnode(keep, verifier, kind, vnode);
                 }
             }
             Err(QueryFailure::Gone) => return Examined::Exited,
-            Err(failure) => {
-                fail(&mut reason, failure);
-            }
+            Err(failure) => found.fail(failure),
         }
     }
     match source.arguments(pid, limits.max_argument_bytes) {
         Ok(arguments) => {
             if arguments.truncated {
-                bounded = true;
-                reason.get_or_insert(InventoryGap::ArgumentsTruncated);
+                found.gap(InventoryGap::ArgumentsTruncated);
             }
             // The arguments are compared here and dropped with `arguments`.
             for path in argument_paths(&arguments, working_directory.as_deref()) {
-                add(PathUseKind::Argument, path);
+                found.add(keep, PathUseKind::Argument, path);
             }
         }
         Err(QueryFailure::Gone) => return Examined::Exited,
-        Err(failure) => {
-            fail(&mut reason, failure);
-        }
+        Err(failure) => found.fail(failure),
     }
-    let record: Option<ProcessUses> = (!uses.is_empty()).then(|| ProcessUses {
+    let record: Option<ProcessUses> = (!found.uses.is_empty()).then(|| ProcessUses {
         pid,
         name: name.clone(),
-        uses,
+        uses: found.uses,
     });
-    match reason {
+    match found.reason {
         None => Examined::Known(record),
         Some(reason) => Examined::Unknown {
             name,
             reason,
             uses: record,
             executable,
-            only_refused: only_refused && !bounded,
+            only_refused: found.only_refused,
         },
     }
 }

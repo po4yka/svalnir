@@ -191,7 +191,7 @@ pub(super) fn inventory<S: ProcessSource>(
             // process of a different user is out of the scope, and a
             // process of the user, or one with no owner, makes the
             // inventory not complete.
-            Err(QueryFailure::PermissionDenied) => {
+            Err(QueryFailure::PermissionDenied | QueryFailure::AccessDenied) => {
                 match owner(pid) {
                     Ok((effective, real)) if effective != principal && real != principal => {}
                     Err(QueryFailure::Gone) => {}

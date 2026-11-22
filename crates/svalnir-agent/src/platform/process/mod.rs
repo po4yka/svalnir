@@ -96,7 +96,7 @@ pub use native::DarwinProcessSource;
 pub use rank::{RankMetric, RankValue, RankedProcess, Ranking, rank_processes};
 pub use source::{
     ProcessSource, QueryFailure, RawArguments, RawListeningSocket, RawListeningSockets, RawPaths,
-    RawProcessInfo, RawUsage, RunningApplication, SocketFamily, Timebase,
+    RawProcessInfo, RawUsage, RawVnode, RunningApplication, SocketFamily, Timebase, VnodeObject,
 };
 pub use uses::{
     InventoryGap, MAX_NAME_BYTES, MAX_UNKNOWN_PROCESSES, PathInventory, PathUseKind,

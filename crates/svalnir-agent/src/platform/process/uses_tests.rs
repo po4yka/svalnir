@@ -3,7 +3,8 @@
 //! queries. No test signals or examines for an action a process that it did
 //! not start; the native inventory only reads the process table.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,16 +15,47 @@ use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::source::{
-    ProcessSource, QueryFailure, RawArguments, RawPaths, RawProcessInfo, RawUsage,
-    RunningApplication, Timebase,
+    ProcessSource, QueryFailure, RawArguments, RawPaths, RawProcessInfo, RawUsage, RawVnode,
+    RunningApplication, Timebase, VnodeObject,
 };
 use super::uses::{InventoryGap, PathUseKind, UseLimits, argument_paths, collect_path_uses};
+use svalnir_core::file::{DeviceNumber, InodeNumber};
 
 const USER: Uid = Uid::new(501);
 const OTHER: Uid = Uid::new(502);
 
 fn path(text: &str) -> LosslessPath {
     LosslessPath::from_bytes(text).unwrap()
+}
+
+/// The synthetic file identity of the file at `text`.
+fn object_of(text: &[u8]) -> FileObjectEvidence {
+    let inode: u64 = text.iter().fold(1_469_598_103_u64, |hash, byte| {
+        hash.wrapping_mul(1_099_511).wrapping_add(u64::from(*byte))
+    });
+    FileObjectEvidence {
+        device: DeviceNumber::new(7),
+        inode: InodeNumber::new(inode),
+    }
+}
+
+/// A vnode at `text` whose identity is the identity of the file there.
+fn vn(text: &str) -> RawVnode {
+    RawVnode {
+        path: Some(path(text)),
+        vnode: VnodeObject {
+            object: object_of(text.as_bytes()),
+            links: 1,
+        },
+    }
+}
+
+/// The vnodes at `texts`.
+fn vns(texts: &[&str]) -> RawPaths {
+    RawPaths {
+        paths: texts.iter().map(|text| vn(text)).collect(),
+        truncated: false,
+    }
 }
 
 /// One synthetic process.
@@ -37,7 +69,10 @@ struct Entry {
     arguments: Result<RawArguments, QueryFailure>,
     working_directory: &'static str,
     executable: &'static str,
+    executable_failure: Option<QueryFailure>,
     platform: Result<bool, QueryFailure>,
+    /// The start times of successive identity queries; the last repeats.
+    starts: Vec<u64>,
 }
 
 impl Entry {
@@ -51,7 +86,9 @@ impl Entry {
             arguments: Ok(RawArguments::default()),
             working_directory: "/Users/u",
             executable: "/usr/bin/true",
+            executable_failure: None,
             platform: Err(QueryFailure::Unsupported),
+            starts: vec![1_000],
         }
     }
 }
@@ -62,6 +99,8 @@ struct Table {
     list: Result<(), QueryFailure>,
     clock: bool,
     queries: Cell<usize>,
+    /// The number of identity queries of each PID.
+    identity_queries: RefCell<HashMap<i32, usize>>,
 }
 
 impl Table {
@@ -71,6 +110,7 @@ impl Table {
             list: Ok(()),
             clock: true,
             queries: Cell::new(0),
+            identity_queries: RefCell::new(HashMap::new()),
         }
     }
 
@@ -100,12 +140,16 @@ impl ProcessSource for Table {
     fn process_info(&self, pid: Pid) -> Result<RawProcessInfo, QueryFailure> {
         let entry: &Entry = self.entry(pid)?;
         entry.info?;
+        let mut counts = self.identity_queries.borrow_mut();
+        let count: &mut usize = counts.entry(pid.get()).or_default();
+        let start: u64 = entry.starts[(*count).min(entry.starts.len() - 1)];
+        *count += 1;
         Ok(RawProcessInfo {
             pid,
             parent_pid: None,
             effective_uid: entry.owner,
             real_uid: entry.owner,
-            start_time: ProcessStartTime::from_timeval(1_000, 0).unwrap(),
+            start_time: ProcessStartTime::from_timeval(start, 0).unwrap(),
             zombie: false,
         })
     }
@@ -116,11 +160,15 @@ impl ProcessSource for Table {
     }
 
     fn executable_path(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
-        Ok(path(self.entry(pid)?.executable))
+        let entry: &Entry = self.entry(pid)?;
+        match entry.executable_failure {
+            Some(failure) => Err(failure),
+            None => Ok(path(entry.executable)),
+        }
     }
 
-    fn working_directory(&self, pid: Pid) -> Result<LosslessPath, QueryFailure> {
-        Ok(path(self.entry(pid)?.working_directory))
+    fn working_directory_vnode(&self, pid: Pid) -> Result<RawVnode, QueryFailure> {
+        Ok(vn(self.entry(pid)?.working_directory))
     }
 
     fn open_file_paths(&self, pid: Pid, _max: usize) -> Result<RawPaths, QueryFailure> {
@@ -139,8 +187,8 @@ impl ProcessSource for Table {
         self.entry(pid)?.platform
     }
 
-    fn file_evidence(&self, _path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
-        Err(QueryFailure::Unsupported)
+    fn file_evidence(&self, path: &LosslessPath) -> Result<FileObjectEvidence, QueryFailure> {
+        Ok(object_of(path.as_bytes()))
     }
 
     fn usage(&self, _pid: Pid) -> Result<RawUsage, QueryFailure> {
@@ -191,14 +239,8 @@ fn collect(table: &Table) -> super::PathInventory {
 #[test]
 fn each_kind_of_use_is_found_and_paths_outside_the_scope_are_not_kept() {
     let mut entry: Entry = Entry::plain(10);
-    entry.open = Ok(RawPaths {
-        paths: vec![path("/Users/u/app/node_modules/a.js"), path("/etc/hosts")],
-        truncated: false,
-    });
-    entry.mapped = Ok(RawPaths {
-        paths: vec![path("/Users/u/app/node_modules/x.node")],
-        truncated: false,
-    });
+    entry.open = Ok(vns(&["/Users/u/app/node_modules/a.js", "/etc/hosts"]));
+    entry.mapped = Ok(vns(&["/Users/u/app/node_modules/x.node"]));
     entry.arguments = Ok(RawArguments {
         values: vec![
             b"node".to_vec(),
@@ -270,7 +312,7 @@ fn the_debug_output_of_arguments_has_no_value() {
 }
 
 #[test]
-fn argument_paths_are_absolute_assigned_or_relative_to_the_working_directory() {
+fn argument_paths_have_each_form_and_keep_the_part_before_dot_dot() {
     let arguments: RawArguments = RawArguments {
         values: vec![
             b"/a/b/../c".to_vec(),
@@ -278,22 +320,34 @@ fn argument_paths_are_absolute_assigned_or_relative_to_the_working_directory() {
             b"-x".to_vec(),
             b"./f/g".to_vec(),
             Vec::new(),
+            b"-I/inc/h".to_vec(),
+            b"-oo/out/o".to_vec(),
+            b"--opt=/l/1:/l/2".to_vec(),
+            b"file:///u/a%20b/c".to_vec(),
+            b"file://localhost/v/w".to_vec(),
         ],
         truncated: false,
     };
-    assert_eq!(
-        argument_paths(&arguments, Some(Path::new("/w"))),
-        vec![
-            PathBuf::from("/a/c"),
-            PathBuf::from("/d/e"),
-            PathBuf::from("/w/f/g")
-        ]
-    );
+    let paths: Vec<PathBuf> = argument_paths(&arguments, Some(Path::new("/w")));
+    for expected in [
+        // `..` is not resolved: the part before it and the lexical form.
+        "/a/b", "/a/c", "/d/e", "/w/f/g",
+        // An option prefix of one or two characters.
+        "/inc/h", "/out/o", // Each part of a `:` list.
+        "/l/1", "/l/2", // A `file://` URL, decoded.
+        "/u/a b/c", "/v/w",
+    ] {
+        assert!(
+            paths.contains(&PathBuf::from(expected)),
+            "{expected}: {paths:?}"
+        );
+    }
+    // An option is not joined to the working directory.
+    assert!(!paths.iter().any(|path| path.ends_with("-x")), "{paths:?}");
     // With no working directory, a relative argument names no path.
-    assert_eq!(
-        argument_paths(&arguments, None),
-        vec![PathBuf::from("/a/c"), PathBuf::from("/d/e")]
-    );
+    let none: Vec<PathBuf> = argument_paths(&arguments, None);
+    assert!(!none.contains(&PathBuf::from("/w/f/g")));
+    assert!(none.contains(&PathBuf::from("/d/e")));
 }
 
 #[test]
@@ -360,24 +414,152 @@ fn a_failed_use_query_makes_the_process_unknown_and_names_it() {
 }
 
 #[test]
-fn a_denied_identity_query_is_not_visible_and_another_user_is_out_of_scope() {
+fn a_denied_identity_query_is_not_visible_only_through_the_platform_gate() {
+    // A process of a different user is out of scope with no use query.
     let mut other: Entry = Entry::plain(20);
     other.info = Err(QueryFailure::PermissionDenied);
     other.owner = OTHER;
-    let inventory = collect(&Table::new(vec![Entry::plain(10), other.clone()]));
-    assert_eq!((inventory.gap, inventory.not_visible), (None, 0));
-    // A process of the user whose identity query is denied, for example a
-    // set-user-ID process, is counted as not visible.
-    other.owner = USER;
     let inventory = collect(&Table::new(vec![Entry::plain(10), other]));
-    assert_eq!((inventory.gap, inventory.not_visible), (None, 1));
+    assert_eq!((inventory.gap, inventory.not_visible), (None, 0));
     assert_eq!(inventory.unknown, Vec::new());
-    // No use query is made of a process of a different user.
-    let mut foreign: Entry = Entry::plain(30);
-    foreign.owner = OTHER;
-    foreign.open = Err(QueryFailure::Failed(5));
-    let inventory = collect(&Table::new(vec![Entry::plain(10), foreign]));
-    assert_eq!(inventory.unknown, Vec::new());
+    // A set-user-ID process of the user, such as `login`, passes only as
+    // Apple platform code on the sealed system volume.
+    let login = |platform: Result<bool, QueryFailure>, executable: &'static str, failure| {
+        let mut entry: Entry = Entry::plain(20);
+        entry.info = Err(failure);
+        entry.executable = executable;
+        entry.platform = platform;
+        entry
+    };
+    let inventory = collect(&Table::new(vec![
+        Entry::plain(10),
+        login(Ok(true), "/usr/bin/login", QueryFailure::PermissionDenied),
+    ]));
+    assert_eq!((inventory.not_visible, inventory.unknown.len()), (1, 0));
+    for entry in [
+        login(Ok(false), "/usr/bin/login", QueryFailure::PermissionDenied),
+        login(
+            Err(QueryFailure::Failed(-1)),
+            "/usr/bin/login",
+            QueryFailure::PermissionDenied,
+        ),
+        login(Ok(true), "/Users/u/bin/su", QueryFailure::PermissionDenied),
+        // Only `EPERM` qualifies.
+        login(Ok(true), "/usr/bin/login", QueryFailure::AccessDenied),
+    ] {
+        let inventory = collect(&Table::new(vec![Entry::plain(10), entry]));
+        assert_eq!(inventory.not_visible, 0);
+        assert_eq!(
+            unknown_reason(&inventory),
+            Some(InventoryGap::ProcessQueryDenied)
+        );
+    }
+}
+
+#[test]
+fn a_path_from_the_kernel_is_evidence_only_when_its_identity_matches() {
+    let unverified = |vnode: RawVnode| {
+        let mut entry: Entry = Entry::plain(10);
+        entry.open = Ok(RawPaths {
+            paths: vec![vnode],
+            truncated: false,
+        });
+        collect(&Table::new(vec![entry]))
+    };
+    // A path that is not complete: the file at the text is a different
+    // object, or there is none.
+    let mut truncated: RawVnode = vn("/Users/u/x/y");
+    truncated.vnode.object = object_of(b"the real deep file");
+    let inventory = unverified(truncated.clone());
+    assert_eq!(
+        unknown_reason(&inventory),
+        Some(InventoryGap::PathNotVerified)
+    );
+    // No path for a vnode with links.
+    let mut nameless: RawVnode = truncated.clone();
+    nameless.path = None;
+    assert_eq!(
+        unknown_reason(&unverified(nameless.clone())),
+        Some(InventoryGap::PathNotVerified)
+    );
+    // A vnode with no link is in no unit.
+    nameless.vnode.links = 0;
+    let inventory = unverified(nameless);
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
+    // A path in the scope is a use with no other check.
+    let mut inside: RawVnode = vn("/Users/u/app/node_modules/a");
+    inside.vnode.object = object_of(b"other");
+    let inventory = unverified(inside);
+    assert_eq!(inventory.processes.len(), 1);
+    // A platform process whose path is not verified is not in the blind
+    // spot.
+    let mut agent: Entry = refused("/usr/libexec/dmd", Ok(true));
+    agent.mapped = Ok(RawPaths {
+        paths: vec![truncated],
+        truncated: false,
+    });
+    let inventory = collect(&Table::new(vec![agent]));
+    assert_eq!(inventory.platform_refused, 0);
+    assert_eq!(inventory.unknown.len(), 1);
+}
+
+#[test]
+fn an_executable_with_no_current_name_is_known_only_when_the_rest_is_verified() {
+    let mut replaced: Entry = Entry::plain(10);
+    replaced.executable_failure = Some(QueryFailure::Failed(libc::ENOENT));
+    replaced.mapped = Ok(vns(&["/Applications/A.app/Contents/Frameworks/F"]));
+    let inventory = collect(&Table::new(vec![replaced.clone()]));
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
+    // Its working directory stays evidence.
+    let mut working: Entry = replaced.clone();
+    working.working_directory = "/Users/u/app/node_modules";
+    assert_eq!(collect(&Table::new(vec![working])).processes.len(), 1);
+    // Another failure of the same process keeps it unknown.
+    let mut failed: Entry = replaced.clone();
+    failed.open = Err(QueryFailure::Failed(5));
+    assert_eq!(collect(&Table::new(vec![failed])).unknown.len(), 1);
+    // A path that is not verified keeps it unknown.
+    let mut moved: Entry = replaced;
+    let mut vnode: RawVnode = vn("/Applications/A.app/Contents/MacOS/A");
+    vnode.vnode.object = object_of(b"the old executable");
+    moved.mapped = Ok(RawPaths {
+        paths: vec![vnode],
+        truncated: false,
+    });
+    assert_eq!(collect(&Table::new(vec![moved])).unknown.len(), 1);
+    // Each other failure of `proc_pidpath` keeps it unknown.
+    let mut other: Entry = Entry::plain(10);
+    other.executable_failure = Some(QueryFailure::Failed(libc::ENOSPC));
+    assert_eq!(collect(&Table::new(vec![other])).unknown.len(), 1);
+}
+
+#[test]
+fn a_pid_that_names_a_different_process_after_the_queries_is_examined_again() {
+    // One change: the new process is examined once more.
+    let mut once: Entry = Entry::plain(10);
+    once.starts = vec![1_000, 2_000];
+    let inventory = collect(&Table::new(vec![once]));
+    assert_eq!((inventory.gap, inventory.unknown.len()), (None, 0));
+    // Two changes: unknown.
+    let mut twice: Entry = Entry::plain(10);
+    twice.starts = vec![1_000, 2_000, 3_000];
+    let inventory = collect(&Table::new(vec![twice]));
+    assert_eq!(
+        unknown_reason(&inventory),
+        Some(InventoryGap::ProcessReplaced)
+    );
+}
+
+#[test]
+fn an_access_refusal_is_not_the_platform_blind_spot() {
+    let mut entry: Entry = refused("/usr/libexec/dmd", Ok(true));
+    entry.open = Err(QueryFailure::AccessDenied);
+    let inventory = collect(&Table::new(vec![entry, Entry::plain(11)]));
+    assert_eq!(inventory.platform_refused, 0);
+    assert_eq!(
+        unknown_reason(&inventory),
+        Some(InventoryGap::ProcessQueryDenied)
+    );
 }
 
 #[test]
@@ -670,6 +852,47 @@ mod native {
             has(&inventory, child.0.id(), PathUseKind::MappedFile, &copy),
             "{inventory:?}"
         );
+    }
+
+    #[test]
+    fn a_child_that_uses_a_path_longer_than_maxpathlen_is_never_not_in_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let root: PathBuf = resolved(&directory);
+        // Eight levels of 200 bytes: more than 1500 bytes below the root.
+        // The shell makes them with relative steps, holds a file there
+        // open as the standard input of `sleep`, and works there.
+        let level: String = "d".repeat(200);
+        let script: String = format!(
+            "for i in 1 2 3 4 5 6 7 8; do mkdir {level} && cd {level} || exit 1; done; \
+             echo x > held && : > \"$0/ready\" && exec /bin/sleep 30 < held"
+        );
+        let child = spawn(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .arg(&root)
+                .current_dir(&root),
+        );
+        let deadline: Instant = Instant::now() + Duration::from_secs(5);
+        while !root.join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(root.join("ready").exists(), "the child made no tree");
+        std::thread::sleep(Duration::from_millis(200));
+        let source: DarwinProcessSource = DarwinProcessSource::new();
+        let keep = |path: &Path| path.starts_with(&root);
+        let inventory =
+            collect_path_uses(&source, source.effective_uid(), &keep, UseLimits::default());
+        let pid: u32 = child.0.id();
+        let used: bool = inventory
+            .processes
+            .iter()
+            .any(|process| u32::try_from(process.pid.get()).is_ok_and(|value| value == pid));
+        let unknown: bool = inventory
+            .unknown
+            .iter()
+            .any(|process| u32::try_from(process.pid.get()).is_ok_and(|value| value == pid));
+        assert!(used || unknown, "the child is not seen: {inventory:?}");
     }
 
     #[test]

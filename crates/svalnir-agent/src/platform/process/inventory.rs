@@ -455,7 +455,9 @@ impl<S: ProcessSource> ProcessCollector<S> {
             Err(failure) => {
                 match failure {
                     QueryFailure::Gone => omissions.exited += 1,
-                    QueryFailure::PermissionDenied => omissions.permission_denied += 1,
+                    QueryFailure::PermissionDenied | QueryFailure::AccessDenied => {
+                        omissions.permission_denied += 1;
+                    }
                     _ => omissions.failed += 1,
                 }
                 return Ok(None);

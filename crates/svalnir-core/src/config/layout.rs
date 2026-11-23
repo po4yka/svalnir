@@ -3,11 +3,12 @@
 //! (`docs/POLICY_SPEC.md` section 3, `docs/CLEANUP_RULES.md` section 12).
 //!
 //! A layout is a parameter of the reviewed rule. The validation accepts only
-//! a plain relative directory of one or two names, one or more project
-//! markers, and bounded lists, so that a layout cannot name a path outside a
-//! project, a version-control directory, or a protected location of the
-//! home directory. The checks of the rule apply to each unit of a layout
-//! unchanged.
+//! a plain relative directory of one to three names, whose first name can
+//! be a pattern, one or more project markers, and bounded lists, so that a
+//! layout cannot name a path outside a project, a version-control or cache
+//! directory, a name that the rule keeps out, or a protected location of
+//! the home directory. The checks of the rule apply to each unit of a
+//! layout unchanged.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -15,16 +16,13 @@ use std::time::Duration;
 use super::finding::FindingCode;
 use super::reader::{Context, Read, TableReader};
 use super::schema::{
-    BUILT_IN_LAYOUT_NAMES, KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_ENTRIES, MAX_QUIET_PERIOD,
-    MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES,
+    KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES, MAX_MARKER_COMPONENTS,
+    MAX_QUIET_PERIOD, MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES,
     SKIPPED_DIRECTORY_NAMES, UserLayout,
 };
 
 /// The largest length of one name, in bytes: the name limit of APFS.
 const MAX_NAME_BYTES: usize = 255;
-
-/// The largest number of components of `directory`.
-const MAX_DIRECTORY_COMPONENTS: usize = 2;
 
 /// The largest number of components of a search root.
 const MAX_SEARCH_ROOT_COMPONENTS: usize = 16;
@@ -36,6 +34,57 @@ const MAX_PROTECTED_COMPONENTS: usize = 4;
 /// letters ignored: a volume that ignores case finds `.GIT` as `.git`.
 fn is_one_of(name: &str, names: &[&str]) -> bool {
     names.iter().any(|known| known.eq_ignore_ascii_case(name))
+}
+
+/// Whether `name` matches `pattern`: `*` matches each sequence of bytes,
+/// also an empty one, `?` matches one byte, and each other byte matches
+/// itself. With `fold`, the case of ASCII letters is ignored.
+///
+/// The project rule compares a marker and the first name of a layout with
+/// the case kept. The validation compares a pattern with the names that it
+/// refuses with the case ignored, so that it fails closed on a volume that
+/// ignores case.
+#[must_use]
+pub fn glob_matches(pattern: &[u8], name: &[u8], fold: bool) -> bool {
+    let same = |left: u8, right: u8| {
+        if fold {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
+        }
+    };
+    let (mut at_pattern, mut at_name): (usize, usize) = (0, 0);
+    // The position after the last `*`, and the name position that it
+    // matched up to.
+    let mut star: Option<(usize, usize)> = None;
+    while at_name < name.len() {
+        match (pattern.get(at_pattern), name.get(at_name)) {
+            (Some(b'*'), _) => {
+                at_pattern += 1;
+                star = Some((at_pattern, at_name));
+            }
+            (Some(&byte), Some(&found)) if byte == b'?' || same(byte, found) => {
+                at_pattern += 1;
+                at_name += 1;
+            }
+            _ => match star {
+                Some((after, matched)) => {
+                    at_pattern = after;
+                    at_name = matched + 1;
+                    star = Some((after, matched + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern
+        .get(at_pattern..)
+        .is_some_and(|rest| rest.iter().all(|byte| *byte == b'*'))
+}
+
+/// Whether `text` is a pattern: it has `*` or `?`.
+fn is_pattern(text: &str) -> bool {
+    text.contains(['*', '?'])
 }
 
 /// Why `name` is not a plain name of a directory entry, or `None`. With
@@ -80,15 +129,17 @@ fn read_directory(
         return None;
     }
     let components: Vec<&str> = text.split('/').collect();
-    if components.len() > MAX_DIRECTORY_COMPONENTS {
+    if components.len() > MAX_LAYOUT_DIRECTORY_NAMES {
         report(
             context,
-            "must be one name, or two names with `/` between them",
+            "must be one, two, or three names with `/` between them",
         );
         return None;
     }
-    for component in &components {
-        if let Some(problem) = name_problem(component, false) {
+    let first: &str = components.first().copied().unwrap_or(text);
+    for (index, component) in components.iter().enumerate() {
+        // Only the first name can be a pattern.
+        if let Some(problem) = name_problem(component, index == 0) {
             report(context, problem);
             return None;
         }
@@ -104,18 +155,14 @@ fn read_directory(
             return None;
         }
     }
-    // The first name decides the overlap: a layout of the configuration
-    // that starts with the directory of a built-in layout, or with the
-    // first name of a built-in directory of two names, would have units in
-    // or around the units of that layout.
-    let first: &str = components.first().copied().unwrap_or(text);
-    if is_one_of(first, &BUILT_IN_LAYOUT_NAMES) {
-        report(
-            context,
-            "starts with the directory of a built-in layout; a layout of the configuration cannot overlap it",
-        );
+    if let Some(problem) = pattern_name_problem(first) {
+        report(context, problem);
         return None;
     }
+    // A first name of a layout of the table is permitted: the layouts of
+    // the table come first, and a unit that is, holds, or is in an earlier
+    // unit of the project is refused (`overlaps_unit`). The names that the
+    // rule keeps out stay refused.
     if is_one_of(first, &KEPT_OUT_LAYOUT_NAMES) {
         report(
             context,
@@ -167,22 +214,76 @@ fn read_entries(
     complete.then_some(accepted)
 }
 
-/// Why `marker` is not a project marker, or `None`.
-fn marker_problem(marker: &str) -> Option<&'static str> {
-    if marker.contains('/') {
-        return Some("a marker is one name in the project directory, with no `/`");
+/// Why the pattern `first`, the first name of a `directory`, is not
+/// accepted, or `None` for a name that is not a pattern.
+///
+/// A pattern with no specific literal part, such as `*` or `*.*`, matches
+/// almost each name. A pattern that can match a name of the skip list, a
+/// name that the rule keeps out, or a protected name of the home directory
+/// would make such a directory a unit. The comparisons ignore the case of
+/// ASCII letters.
+fn pattern_name_problem(first: &str) -> Option<&'static str> {
+    if !is_pattern(first) {
+        return None;
     }
-    if let Some(problem) = name_problem(marker, true) {
-        return Some(problem);
+    if !has_specific_literal(first) {
+        return Some(
+            "a pattern name must have a literal part of two or more characters that is not only `.`",
+        );
+    }
+    let matches = |names: &[&str]| {
+        names
+            .iter()
+            .any(|name| glob_matches(first.as_bytes(), name.as_bytes(), true))
+    };
+    if matches(&SKIPPED_DIRECTORY_NAMES)
+        || matches(&KEPT_OUT_LAYOUT_NAMES)
+        || matches(&PROTECTED_HOME_NAMES)
+    {
+        return Some(
+            "a pattern name can match a version-control or cache directory, a name that the rule keeps out, or a protected location",
+        );
+    }
+    None
+}
+
+/// Why `marker` is not a project marker, or `None`.
+///
+/// A marker is a path relative to the directory that holds the first name
+/// of `directory`, of at most [`MAX_MARKER_COMPONENTS`] names. A marker
+/// that ends with `/` is a directory. A marker of one name can be a
+/// pattern; a marker of more names has no pattern.
+fn marker_problem(marker: &str) -> Option<&'static str> {
+    let path: &str = marker.strip_suffix('/').unwrap_or(marker);
+    if path.starts_with('/') {
+        return Some("a marker must be relative to the project directory");
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    if components.len() > MAX_MARKER_COMPONENTS {
+        return Some("a marker has more than 4 names");
+    }
+    let single: bool = components.len() == 1;
+    if let Some(problem) = components
+        .iter()
+        .find_map(|component| name_problem(component, single))
+    {
+        return Some(if !single && is_pattern(path) {
+            "a marker of more than one name has no pattern"
+        } else {
+            problem
+        });
     }
     // A pattern with no specific literal part, such as `*`, `*.*`, `a*`, or
     // `*e`, matches almost each file, so the layout would be a name alone.
-    if marker.contains(['*', '?']) && !has_specific_literal(marker) {
+    if is_pattern(path) && !has_specific_literal(path) {
         return Some(
             "a pattern marker must have a literal part of two or more characters that is not only `.`",
         );
     }
-    if is_one_of(marker, &SKIPPED_DIRECTORY_NAMES) {
+    if components
+        .iter()
+        .any(|component| is_one_of(component, &SKIPPED_DIRECTORY_NAMES))
+    {
         return Some("a version-control or cache name is not a project marker");
     }
     None

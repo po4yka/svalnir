@@ -393,48 +393,25 @@ pub const MAX_LAYOUT_ENTRIES: usize = 8;
 /// (`docs/CLEANUP_RULES.md` section 12).
 pub const SKIPPED_DIRECTORY_NAMES: [&str; 5] = [".git", ".hg", ".jj", ".svn", ".cache"];
 
-/// The first names of the directories of the built-in layouts of
-/// `project.dependency-directory` (`docs/CLEANUP_RULES.md` section 12). A
-/// layout of the configuration cannot start with one of them, so its units
-/// cannot overlap a unit of a built-in layout. The agent has a test that
-/// this list agrees with its catalog.
-pub const BUILT_IN_LAYOUT_NAMES: [&str; 28] = [
-    "node_modules",
-    ".venv",
-    "venv",
-    "Pods",
-    "target",
-    ".next",
-    ".turbo",
-    ".svelte-kit",
-    ".astro",
-    ".parcel-cache",
-    "dist",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    ".nox",
-    ".gradle",
-    "build",
-    "_build",
-    "obj",
-    "bin",
-    ".build",
-    "DerivedData",
-    ".zig-cache",
-    "zig-cache",
-    "vendor",
-    "tmp",
-];
+/// The largest number of names of the directory of a layout of
+/// `project.dependency-directory`, of the table and of the configuration
+/// (`docs/CLEANUP_RULES.md` section 12), for example
+/// `storage/framework/cache`.
+pub const MAX_LAYOUT_DIRECTORY_NAMES: usize = 3;
 
-/// The names that `docs/CLEANUP_RULES.md` section 12 keeps outside the rule
-/// and that are not a first name of a built-in layout: `zig-out` (install
-/// output) and `deps` of Mix (dependency sources). `vendor` (with
-/// `vendor/cache` and Go `vendor`), `tmp`, and `_build` (also beside
-/// `rebar.config`) are in [`BUILT_IN_LAYOUT_NAMES`].
-pub const KEPT_OUT_LAYOUT_NAMES: [&str; 2] = ["zig-out", "deps"];
+/// The largest number of names of a project marker of a layout of the
+/// configuration, for example `ProjectSettings/ProjectVersion.txt`.
+pub const MAX_MARKER_COMPONENTS: usize = 4;
+
+/// The first names that a layout of the configuration cannot have and that
+/// a pattern name of a layout of the configuration cannot match: the names
+/// that `docs/CLEANUP_RULES.md` section 12 keeps outside the rule. They are
+/// `zig-out` (install output), `deps` of Mix (dependency sources), `_build`
+/// (also beside `rebar.config`), `vendor` (with `vendor/cache` and Go
+/// `vendor`), and `tmp` (the other entries of `tmp` of Rails). The table
+/// of the rule has `_build`, `vendor/bundle`, and `tmp/cache` with their
+/// project markers; a layout of the configuration cannot name them.
+pub const KEPT_OUT_LAYOUT_NAMES: [&str; 5] = ["zig-out", "deps", "_build", "vendor", "tmp"];
 
 /// The names of the protected locations of the home directory that a
 /// layout of the configuration cannot name in a component: the names of
@@ -465,12 +442,15 @@ pub const PROTECTED_HOME_NAMES: [&str; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UserLayout {
-    /// The generated directory, relative to the project directory: one
-    /// name, or two names with `/` between them.
+    /// The generated directory, relative to the project directory: one to
+    /// [`MAX_LAYOUT_DIRECTORY_NAMES`] names with `/` between them. The first
+    /// name can be a pattern with `*` and `?`.
     pub directory: String,
-    /// The project markers. One of them must be a regular file in the
-    /// directory that holds the first name of `directory`. A marker can be
-    /// a pattern with `*` and `?`.
+    /// The project markers. One of them must be in the directory that holds
+    /// the first name of `directory`: a regular file, or a directory when
+    /// the marker ends with `/`. A marker is a name, a pattern with `*` and
+    /// `?`, or a relative path of at most [`MAX_MARKER_COMPONENTS`] names
+    /// with no pattern, for example `ProjectSettings/ProjectVersion.txt`.
     pub markers: Vec<String>,
     /// A regular file that the unit must have, when the table gives one.
     pub inner_marker: Option<String>,

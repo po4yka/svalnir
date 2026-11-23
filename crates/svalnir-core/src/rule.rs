@@ -43,6 +43,21 @@ pub const MAX_RULE_ENTRIES: usize = 256;
 /// not complete.
 pub const USER_CONFIGURED_LAYOUT: &str = "user-configured";
 
+/// The end of the layout name of the units of a layout with no project
+/// marker that the user allows for one manual plan
+/// (`docs/CLEANUP_RULES.md` section 12, "Unmarked directories"). A layout
+/// whose name ends with it permits at most a manual mode, as
+/// [`USER_CONFIGURED_LAYOUT`].
+pub const UNMARKED_LAYOUT_SUFFIX: &str = "+unmarked";
+
+/// Whether the layout `layout` permits at most a manual mode in each
+/// lifecycle state: [`USER_CONFIGURED_LAYOUT`] and each layout whose name
+/// ends with [`UNMARKED_LAYOUT_SUFFIX`].
+#[must_use]
+pub fn is_manual_only_layout(layout: &str) -> bool {
+    layout == USER_CONFIGURED_LAYOUT || layout.ends_with(UNMARKED_LAYOUT_SUFFIX)
+}
+
 /// A reference to one rule revision: the rule identity and the immutable
 /// implementation revision. Plans and grants bind this pair. A display
 /// name is not an execution identity.
@@ -237,10 +252,10 @@ impl LayoutSupport {
 }
 
 /// Whether the state `lifecycle` of the layout `layout` permits `mode`:
-/// [`LifecycleState::permits`], with the limit of
-/// [`USER_CONFIGURED_LAYOUT`] to a manual mode.
+/// [`LifecycleState::permits`], with the limit of each manual-only layout
+/// ([`is_manual_only_layout`]) to a manual mode.
 pub fn layout_permits(layout: &str, lifecycle: &LifecycleState, mode: &RuleMode) -> bool {
-    if layout == USER_CONFIGURED_LAYOUT && *mode == RuleMode::AutomaticEviction {
+    if is_manual_only_layout(layout) && *mode == RuleMode::AutomaticEviction {
         return false;
     }
     lifecycle.permits(mode)
@@ -489,10 +504,11 @@ impl Check for RuleDeclaration {
                 LifecycleState::ManualActionValidated { .. } => {
                     has(&RuleMode::ManualTrash) || has(&RuleMode::ManualEviction)
                 }
-                // A layout of the configuration is for a manual action
-                // only, so no evidence can promote it to this state.
+                // A layout of the configuration and a layout of unmarked
+                // directories are for a manual action only, so no evidence
+                // can promote them to this state.
                 LifecycleState::AutomaticEvictionValidated { .. } => {
-                    has(&RuleMode::AutomaticEviction) && support.layout != USER_CONFIGURED_LAYOUT
+                    has(&RuleMode::AutomaticEviction) && !is_manual_only_layout(&support.layout)
                 }
                 _ => true,
             };
@@ -1044,6 +1060,51 @@ mod tests {
             },
         };
         assert!(other.permits(&RuleMode::AutomaticEviction));
+    }
+
+    #[test]
+    fn a_layout_of_unmarked_directories_never_permits_an_automatic_mode() {
+        let unmarked = |lifecycle: LifecycleState| LayoutSupport {
+            layout: format!("python-venv{}", super::UNMARKED_LAYOUT_SUFFIX),
+            lifecycle,
+        };
+        assert!(super::is_manual_only_layout("python-venv+unmarked"));
+        assert!(!super::is_manual_only_layout("python-venv"));
+        // The function that each check asks refuses the automatic mode
+        // also for a promoted state.
+        let automatic = unmarked(LifecycleState::AutomaticEvictionValidated {
+            evidence: evidence(),
+        });
+        assert!(!super::layout_permits(
+            &automatic.layout,
+            &automatic.lifecycle,
+            &RuleMode::AutomaticEviction
+        ));
+        assert!(automatic.permits(&RuleMode::ManualEviction));
+        // The declaration check refuses that state for the layout.
+        let mut refused: RuleDeclaration = declaration(LifecycleState::Proposed);
+        refused.layouts.push(automatic);
+        assert_eq!(refused.check(), Err(RuleDeclarationError::Mode));
+        // With a manual state, the registry path refuses the automatic mode
+        // for the layout only.
+        let mut complete: RuleDeclaration =
+            declaration(LifecycleState::AutomaticEvictionValidated {
+                evidence: evidence(),
+            });
+        complete
+            .layouts
+            .push(unmarked(LifecycleState::ManualActionValidated {
+                evidence: evidence(),
+            }));
+        let rule: Rule = Checked::new(complete).unwrap();
+        assert_eq!(
+            rule.permits("python-venv+unmarked", &RuleMode::AutomaticEviction),
+            Err(RuleRefusal::ModeNotValidated)
+        );
+        assert_eq!(
+            rule.permits("python-venv+unmarked", &RuleMode::ManualEviction),
+            Ok(())
+        );
     }
 
     fn states() -> Vec<LifecycleState> {

@@ -154,6 +154,15 @@ fn read_directory(
             report(context, "names a protected location of the home directory");
             return None;
         }
+        // A name that the rule keeps out is refused at each position, so
+        // that `infra/.terraform` cannot take all of `.terraform`.
+        if is_one_of(component, &KEPT_OUT_LAYOUT_NAMES) {
+            report(
+                context,
+                "names a directory that the rule keeps out, because a removal can lose data that no tool makes again",
+            );
+            return None;
+        }
     }
     if let Some(problem) = pattern_name_problem(first) {
         report(context, problem);
@@ -161,15 +170,8 @@ fn read_directory(
     }
     // A first name of a layout of the table is permitted: the layouts of
     // the table come first, and a unit that is, holds, or is in an earlier
-    // unit of the project is refused (`overlaps_unit`). The names that the
-    // rule keeps out stay refused.
-    if is_one_of(first, &KEPT_OUT_LAYOUT_NAMES) {
-        report(
-            context,
-            "names a directory that the rule keeps out, because a removal can lose data that no tool makes again",
-        );
-        return None;
-    }
+    // unit is refused (`overlaps_unit`). The names that the rule keeps out
+    // stay refused above.
     if !seen.insert(text.to_ascii_lowercase()) {
         context.report(
             FindingCode::DuplicateIdentifier,
@@ -289,6 +291,16 @@ fn marker_problem(marker: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether the first name of `marker` can be the first name of
+/// `directory`, so that the marker is the unit or is in it. Either name can
+/// be a pattern; the comparison ignores the case of ASCII letters.
+fn marker_is_in_unit(directory: &str, marker: &str) -> bool {
+    let first = |text: &str| text.split('/').next().unwrap_or(text).to_owned();
+    let (unit, marker): (String, String) = (first(directory), first(marker));
+    glob_matches(unit.as_bytes(), marker.as_bytes(), true)
+        || glob_matches(marker.as_bytes(), unit.as_bytes(), true)
+}
+
 /// Whether `pattern` has a run of two or more bytes with no `*` and no
 /// `?` that is not only `.`, for example `.csproj` of `*.csproj`.
 fn has_specific_literal(pattern: &str) -> bool {
@@ -343,6 +355,23 @@ fn read_layout(
             None
         }
         other => other,
+    };
+    // A marker in the unit itself would make the name of the directory
+    // sufficient, for example `build/` for the directory `build`.
+    let markers: Option<Vec<String>> = match (&directory, markers) {
+        (Some(directory), Some(markers))
+            if markers
+                .iter()
+                .any(|marker| marker_is_in_unit(directory, marker)) =>
+        {
+            context.report(
+                FindingCode::InvalidPath,
+                &markers_path,
+                "a marker must not be in the directory of the layout; a name alone is not sufficient",
+            );
+            None
+        }
+        (_, markers) => markers,
     };
 
     let inner_marker: Option<Option<String>> = match table.text(context, "inner_marker") {

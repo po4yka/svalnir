@@ -1597,6 +1597,11 @@ fn a_user_layout_can_use_a_built_in_name_but_not_a_kept_out_name() {
         ".terragrunt-cache",
         "Saved/Logs",
         "UserSettings",
+        // A kept-out name at a later position of the directory.
+        "infra/.terraform",
+        "app/vendor",
+        "a/b/_build",
+        "x/tmp/cache",
     ] {
         assert_one(
             &layout_document(&format!(
@@ -1653,6 +1658,31 @@ fn a_user_layout_has_three_names_at_most_and_a_pattern_in_its_first_name_only() 
             directory,
         );
     }
+}
+
+#[test]
+fn a_user_marker_in_the_directory_of_its_layout_is_refused() {
+    let markers = "cleanup.projects.layouts[0].markers";
+    for (directory, marker) in [
+        ("build", "build/"),
+        ("build", "BUILD/x.txt"),
+        ("cmake-build-*", "cmake-build-*/"),
+        ("cmake-build-*", "cmake-build-debug/CMakeCache.txt"),
+        ("gen/cache", "gen/"),
+        ("output", "outp*/"),
+    ] {
+        assert_one(
+            &layout_document(&format!(
+                "directory = \"{directory}\"\nmarkers = [\"{marker}\"]"
+            )),
+            FindingCode::InvalidPath,
+            markers,
+        );
+    }
+    // A marker beside the directory is accepted.
+    valid(&layout_document(
+        "directory = \"cmake-build-*\"\nmarkers = [\"CMakeLists.txt\"]",
+    ));
 }
 
 #[test]

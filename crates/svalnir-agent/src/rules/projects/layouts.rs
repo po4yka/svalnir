@@ -118,6 +118,28 @@ const GRADLE_PROJECT: &[ProjectMarker] = &[
 ];
 const DOTNET_PROJECT: &[ProjectMarker] = &[file("*.csproj"), file("*.fsproj"), file("*.vbproj")];
 const NODE_PROJECT: &[ProjectMarker] = &[file("package.json")];
+const SBT_PROJECT: &[ProjectMarker] = &[file("build.sbt")];
+const SCALA_BUILD: &[ProjectMarker] = &[file("build.sbt"), file("build.mill"), file("build.sc")];
+const MIX_PROJECT: &[ProjectMarker] = &[file("mix.exs")];
+const NUXT_PROJECT: &[ProjectMarker] = &[file("nuxt.config.*")];
+const NX_PROJECT: &[ProjectMarker] = &[file("nx.json")];
+const YARN_PROJECT: &[ProjectMarker] = &[file(".yarnrc.yml")];
+const GODOT_PROJECT: &[ProjectMarker] = &[file("project.godot")];
+const TERRAFORM_MODULE: &[ProjectMarker] = &[file("*.tf"), file("*.tf.json")];
+const RENV_PROJECT: &[ProjectMarker] = &[file("renv.lock")];
+const SPHINX_PROJECT: &[ProjectMarker] = &[file("conf.py")];
+
+const ANDROID_NATIVE_WORKFLOW: &str = "Remove the directory. The next Gradle build or sync of the module makes it again (for example `./gradlew assembleDebug`). Svalnir does not run them.";
+const ANDROID_NATIVE_IMPACT: &str = "The next build configures CMake or ndk-build again and compiles the native code of each ABI again.";
+const SPHINX_WORKFLOW: &str =
+    "Run `make clean`, or remove the directory, then run `make html`. Svalnir does not run them.";
+const SPHINX_IMPACT: &str =
+    "The next build reads each source file again and makes the documentation again.";
+const NX_WORKFLOW: &str =
+    "Run `nx reset`, or stop the Nx daemon and remove the directory. Svalnir does not run them.";
+const STACK_WORKFLOW: &str = "Run `stack clean --full`, or remove the directory, then run `stack build`. Svalnir does not run them.";
+const STACK_IMPACT: &str = "The next `stack build` builds the packages again, which can take a long time. A program that `stack install` did not copy out of `.stack-work/install` is not available until then.";
+const OUTPUT_IMPACT: &str = "The next build makes the server files and the public files again. A deployment that uses this directory has no output until the next build.";
 
 const VENV_WORKFLOW: &str = "Remove the environment, then make it again with the tool of the project (for example `uv sync`, or `python3 -m venv` and an install). Svalnir does not run them.";
 const VENV_IMPACT: &str = "The next sync makes the environment again and downloads each package that no cache has. Packages that a person installed by hand are not in the project files and are lost.";
@@ -161,10 +183,27 @@ const fn linked(layout: ProjectLayout) -> ProjectLayout {
     }
 }
 
+const fn with_protected(
+    layout: ProjectLayout,
+    protected: &'static [&'static str],
+) -> ProjectLayout {
+    ProjectLayout {
+        protected,
+        ..layout
+    }
+}
+
+const fn with_project_file(layout: ProjectLayout, project_file: &'static str) -> ProjectLayout {
+    ProjectLayout {
+        project_file: Some(project_file),
+        ..layout
+    }
+}
+
 use DirectoryName::{Distinctive, Generic};
 
 /// The number of built-in layouts.
-pub const PROJECT_LAYOUT_COUNT: usize = 31;
+pub const PROJECT_LAYOUT_COUNT: usize = 85;
 
 /// The built-in layouts, in the sequence of the specification. For two
 /// layouts with the same directory, the first one whose marker is present
@@ -235,6 +274,23 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Run `mvn clean` in the project, or remove the directory. Svalnir does not run them.",
         "The next build compiles the project and makes its packages again, and downloads each dependency that the local Maven repository does not have.",
     ),
+    // sbt writes `target` in the build and in the meta-build `project`.
+    plain(
+        "target",
+        "sbt-target",
+        SBT_PROJECT,
+        Generic,
+        "Run `sbt clean` in the build, or remove the directory. Svalnir does not run them.",
+        "The next `sbt compile` compiles the build again. A package in `target` that a person did not copy to another location is not available until the next package task.",
+    ),
+    plain(
+        "project/target",
+        "sbt-meta-target",
+        SBT_PROJECT,
+        Generic,
+        "Remove the directory. The next start of sbt compiles the build definition again. Svalnir does not run sbt.",
+        "The next start of sbt compiles the build definition and its plugins again, which can take some minutes.",
+    ),
     plain(
         ".next",
         "next-build",
@@ -275,6 +331,124 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory. Parcel makes it again at the next build. Svalnir does not run it.",
         "The next build has no cache, so it transforms each asset again.",
     ),
+    // Nuxt writes the declarations `nuxt.d.ts` in its build directory.
+    with_inner(
+        plain(
+            ".nuxt",
+            "nuxt-build",
+            NUXT_PROJECT,
+            Distinctive,
+            "Remove the directory, then run `nuxt prepare`, the development server, or `nuxt build`. Svalnir does not run them.",
+            "The next `nuxt prepare`, development server, or build makes the generated types and the build files again.",
+        ),
+        "nuxt.d.ts",
+    ),
+    // A production build of Nitro, also for Nuxt, writes `nitro.json`.
+    with_inner(
+        plain(
+            ".output",
+            "nuxt-output",
+            NUXT_PROJECT,
+            Generic,
+            "Remove the directory, then run `nuxt build` or `nuxt generate`. Svalnir does not run them.",
+            OUTPUT_IMPACT,
+        ),
+        "nitro.json",
+    ),
+    with_inner(
+        plain(
+            ".output",
+            "nitro-output",
+            &[file("nitro.config.*")],
+            Generic,
+            "Remove the directory, then run `nitro build`. Svalnir does not run it.",
+            OUTPUT_IMPACT,
+        ),
+        "nitro.json",
+    ),
+    // Only the cache of `.angular`: its other entries are working
+    // directories of the development server.
+    plain(
+        ".angular/cache",
+        "angular-cache",
+        &[file("angular.json"), file(".angular.json")],
+        Distinctive,
+        "Run `ng cache clean`, or remove the directory. Svalnir does not run them.",
+        "The next `ng build`, `ng serve`, or `ng test` has no cache, so it compiles each file again. The other entries of `.angular` stay.",
+    ),
+    // `.nx/installation` holds the pinned installation of Nx and stays.
+    plain(
+        ".nx/cache",
+        "nx-cache",
+        NX_PROJECT,
+        Distinctive,
+        NX_WORKFLOW,
+        "The next task runs have no local cache hits, so each task runs again, unless a remote cache has the results. `.nx/installation` stays.",
+    ),
+    plain(
+        ".nx/workspace-data",
+        "nx-workspace-data",
+        NX_PROJECT,
+        Distinctive,
+        NX_WORKFLOW,
+        "The next `nx` command makes the project graph again. The history of the task runs is lost. `.nx/installation` stays.",
+    ),
+    with_inner(
+        plain(
+            ".docusaurus",
+            "docusaurus",
+            &[file("docusaurus.config.*")],
+            Distinctive,
+            "Run `docusaurus clear`, or remove the directory, then run `docusaurus start` or `docusaurus build`. Svalnir does not run them.",
+            "The next start or build makes the generated files of the site again.",
+        ),
+        "globalData.json",
+    ),
+    // Only two entries of `.yarn`: `releases`, `plugins`, `patches`,
+    // `sdks`, and `versions` are files of the project. With zero-install,
+    // the repository commits the cache, and the index check refuses it.
+    plain(
+        ".yarn/cache",
+        "yarn-cache",
+        YARN_PROJECT,
+        Distinctive,
+        "Remove the directory, then run `yarn install`. Svalnir does not run it.",
+        "The next `yarn install` downloads each package again, unless the global cache of Yarn has it. With zero-install the repository commits this directory, and a unit with a tracked file is refused. The other entries of `.yarn` stay.",
+    ),
+    plain(
+        ".yarn/unplugged",
+        "yarn-unplugged",
+        YARN_PROJECT,
+        Distinctive,
+        "Remove the directory, then run `yarn install`. Svalnir does not run it.",
+        "The next `yarn install` extracts the unplugged packages again and runs their build scripts again. With zero-install the repository can commit this directory, and a unit with a tracked file is refused. The other entries of `.yarn` stay.",
+    ),
+    // `vercel build` writes `config.json` in its output. The link files of
+    // `.vercel` stay.
+    with_inner(
+        plain(
+            ".vercel/output",
+            "vercel-output",
+            &[file("package.json"), file("vercel.json")],
+            Distinctive,
+            "Remove the directory, then run `vercel build`. Svalnir does not run it.",
+            "The next `vercel build` makes the output again; it needs the project link and the settings of `vercel pull`, a network, and a login. `vercel deploy --prebuilt` has no output until then. The other entries of `.vercel` stay.",
+        ),
+        "config.json",
+    ),
+    // `.wrangler/state` holds the local data of the bindings and stays.
+    plain(
+        ".wrangler/tmp",
+        "wrangler-tmp",
+        &[
+            file("wrangler.toml"),
+            file("wrangler.json"),
+            file("wrangler.jsonc"),
+        ],
+        Distinctive,
+        "Remove the directory. Wrangler makes it again at the next `wrangler dev` or `wrangler deploy`. Svalnir does not run them.",
+        "The next run bundles the worker again. The local data of the bindings in `.wrangler/state` stays.",
+    ),
     plain(
         "dist",
         "node-dist",
@@ -290,6 +464,19 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         Generic,
         "Remove the directory, then run the build of the package (for example `python3 -m build`). Svalnir does not run it.",
         "The next build makes the archives of the current version again. The archives of earlier versions are lost.",
+    ),
+    // The default reporters of Jest and of Vitest write
+    // `coverage-final.json`; `coverage` is a generic name.
+    with_inner(
+        plain(
+            "coverage",
+            "node-coverage",
+            NODE_PROJECT,
+            Generic,
+            "Remove the directory, then run the tests with coverage (for example `jest --coverage` or `vitest run --coverage`). Svalnir does not run them.",
+            "The next coverage run makes the reports again. A report of an earlier run is lost.",
+        ),
+        "coverage-final.json",
     ),
     // A module with source has its bytecode in `__pycache__`; Python 3 does
     // not import a file of `__pycache__` with no source file.
@@ -368,6 +555,23 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory. The next run of `nox` makes the sessions again. Svalnir does not run it.",
         "The next run of nox makes each session environment again and downloads each package that no cache has.",
     )),
+    // Pixi writes `.gitignore` in its directory, and it links the files of
+    // an environment from its package cache with hard links. A person
+    // writes `config.toml`.
+    linked(with_protected(
+        with_inner(
+            plain(
+                ".pixi",
+                "pixi",
+                &[file("pixi.toml"), file("pyproject.toml")],
+                Distinctive,
+                "Remove the directory, then run `pixi install`. Svalnir does not run it.",
+                "The next `pixi install` makes each environment again and downloads each package that the package cache does not have. A unit with the project configuration `config.toml` is refused, because a person writes that file.",
+            ),
+            ".gitignore",
+        ),
+        &["config.toml"],
+    )),
     plain(
         ".gradle",
         "gradle-project-cache",
@@ -375,6 +579,31 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         Distinctive,
         "Stop the Gradle daemons (`gradle --stop`), then remove the directory. Svalnir does not run them.",
         "The next build has no local task history and no configuration cache, so each task runs again.",
+    ),
+    // The Kotlin Gradle plugin writes `.kotlin` in the root project only.
+    plain(
+        ".kotlin",
+        "kotlin-project-data",
+        &[file("settings.gradle"), file("settings.gradle.kts")],
+        Distinctive,
+        "Stop the Gradle and Kotlin daemons (`gradle --stop`), then remove the directory. Svalnir does not run them.",
+        "The next build makes the directory again. The error reports in `errors` are lost. A running Gradle or Kotlin daemon uses the files in `sessions`; the use check sees the daemon only while it has a file of the unit open.",
+    ),
+    plain(
+        ".cxx",
+        "android-cxx",
+        GRADLE_PROJECT,
+        Distinctive,
+        ANDROID_NATIVE_WORKFLOW,
+        ANDROID_NATIVE_IMPACT,
+    ),
+    plain(
+        ".externalNativeBuild",
+        "android-external-native-build",
+        GRADLE_PROJECT,
+        Distinctive,
+        ANDROID_NATIVE_WORKFLOW,
+        ANDROID_NATIVE_IMPACT,
     ),
     plain(
         "build",
@@ -392,6 +621,49 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory. The next build of the package makes it again (for example `python3 -m build`). Svalnir does not run it.",
         "The next build compiles the extension modules of the package again.",
     ),
+    // `build` beside `pubspec.yaml` has no file of its own that Flutter
+    // writes. `flutter pub get` writes `.flutter-plugins-dependencies`
+    // beside it, which shows that Flutter, not Dart alone, builds the
+    // project.
+    with_project_file(
+        plain(
+            "build",
+            "flutter-build",
+            &[file("pubspec.yaml")],
+            Generic,
+            "Run `flutter clean`, or remove the directory, then run `flutter build` or `flutter run`. Svalnir does not run them.",
+            "The next build compiles the application for each platform again. An application package in `build` that a person did not copy to another location is not available until the next build.",
+        ),
+        ".flutter-plugins-dependencies",
+    ),
+    // CMake writes `CMakeCache.txt` in each build tree.
+    with_inner(
+        plain(
+            "build",
+            "cmake-build",
+            &[file("CMakeLists.txt")],
+            Generic,
+            "Remove the directory, then configure and build again (for example `cmake -S . -B build` and `cmake --build build`). Svalnir does not run them.",
+            "The next configure and build compile the project again. The cache options that a person gave only on a command line (`-D`) or in `ccmake` are lost; a preset or a toolchain file keeps them. The downloads of `FetchContent` in `_deps` need a network again.",
+        ),
+        "CMakeCache.txt",
+    ),
+    // `sphinx-quickstart` with separate source and build directories puts
+    // `conf.py` in `source`; `make html` writes the doctrees in `build`.
+    with_inner(
+        with_project_file(
+            plain(
+                "build",
+                "sphinx-build-separate",
+                &[file("Makefile"), file("make.bat")],
+                Generic,
+                SPHINX_WORKFLOW,
+                SPHINX_IMPACT,
+            ),
+            "source/conf.py",
+        ),
+        "doctrees/environment.pickle",
+    ),
     // A release of Mix is in `_build/ENV/rel`; the protected paths are those
     // of the reference of the layout coverage.
     ProjectLayout {
@@ -405,6 +677,65 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "The next `mix compile` compiles the project and its dependencies again. A release in `_build/ENV/rel` can hold a generated Erlang cookie and the earlier versions that an upgrade needs, so a unit with a release is refused.",
         )
     },
+    // dune writes the file `_build/log` in each build directory.
+    with_inner(
+        plain(
+            "_build",
+            "dune-build",
+            &[file("dune-project")],
+            Generic,
+            "Run `dune clean`, or remove the directory, then run `dune build`. Svalnir does not run them.",
+            "The next `dune build` compiles the project again. The development tools that dune built in `_build/.dev-tools.locks` are built again.",
+        ),
+        "log",
+    ),
+    // `make html` of `sphinx-quickstart` writes the doctrees in `_build`.
+    with_inner(
+        plain(
+            "_build",
+            "sphinx-build",
+            SPHINX_PROJECT,
+            Generic,
+            SPHINX_WORKFLOW,
+            SPHINX_IMPACT,
+        ),
+        "doctrees/environment.pickle",
+    ),
+    // The three language servers of Elixir write `.gitignore` in their
+    // directory.
+    with_inner(
+        plain(
+            ".elixir_ls",
+            "elixir-ls",
+            MIX_PROJECT,
+            Distinctive,
+            "Stop the editor, then remove the directory. ElixirLS makes it again at its next start. Svalnir does not run it.",
+            "The next start of ElixirLS compiles the project again and makes the Dialyzer PLT again, which can take some minutes.",
+        ),
+        ".gitignore",
+    ),
+    with_inner(
+        plain(
+            ".lexical",
+            "lexical",
+            MIX_PROJECT,
+            Distinctive,
+            "Stop the editor, then remove the directory. Lexical makes it again at its next start. Svalnir does not run it.",
+            "The next start of Lexical makes the index of the project again. The project log is lost.",
+        ),
+        ".gitignore",
+    ),
+    with_inner(
+        plain(
+            ".expert",
+            "expert",
+            MIX_PROJECT,
+            Distinctive,
+            "Stop the editor, then remove the directory. Expert makes it again at its next start. Svalnir does not run it.",
+            "The next start of Expert makes the index of the project again. The project log is lost.",
+        ),
+        ".gitignore",
+    ),
     // A restore of an SDK-style project writes `project.assets.json`.
     with_inner(
         plain(
@@ -430,6 +761,25 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "The next build makes the programs and the libraries again. A file that a person put in the directory is lost.",
         )
     },
+    // The artifacts output of the .NET SDK is beside `Directory.Build.props`.
+    // `artifacts/publish` and `artifacts/package` hold the deliverables and
+    // stay.
+    plain(
+        "artifacts/bin",
+        "dotnet-artifacts-bin",
+        &[file("Directory.Build.props")],
+        Generic,
+        "Run `dotnet clean`, or remove the directory. Svalnir does not run them.",
+        "The next build makes the programs and the libraries again. A file that a person put in the directory is lost. `artifacts/publish` and `artifacts/package` stay.",
+    ),
+    plain(
+        "artifacts/obj",
+        "dotnet-artifacts-obj",
+        &[file("Directory.Build.props")],
+        Generic,
+        "Run `dotnet clean`, or remove the directory, then run `dotnet restore`. Svalnir does not run them.",
+        "The next restore and build make the intermediate files again. `artifacts/publish` and `artifacts/package` stay.",
+    ),
     ProjectLayout {
         checkouts: PackageCheckouts::PackageBuild,
         ..with_inner(
@@ -459,6 +809,19 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "The next build compiles the project again, makes the index again, and resolves the package dependencies again.",
         )
     },
+    // `Carthage/Checkouts` holds the sources of the dependencies, which can
+    // be submodules of the user, and stays.
+    with_project_file(
+        plain(
+            "Carthage/Build",
+            "carthage-build",
+            &[file("Cartfile")],
+            Distinctive,
+            "Remove the directory, then run `carthage bootstrap` or `carthage build`. Svalnir does not run them.",
+            "The next bootstrap downloads or builds each dependency of `Cartfile.resolved` again. A binary whose source is not available now cannot be made again. `Carthage/Checkouts` stays.",
+        ),
+        "Cartfile.resolved",
+    ),
     plain(
         ".zig-cache",
         "zig-cache",
@@ -483,6 +846,24 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory, then run `bundle install`. Svalnir does not run it.",
         "The next install downloads and compiles each gem again. A gem from a source that is not available now cannot be installed again.",
     ),
+    // `vendor` is also the directory of Go and of other tools. Composer
+    // writes `vendor/composer/installed.json`, and without `composer.lock`
+    // an install can select other versions. `bundler-vendor` comes first,
+    // so a `vendor` that holds `vendor/bundle` overlaps its unit.
+    with_inner(
+        with_project_file(
+            plain(
+                "vendor",
+                "composer-vendor",
+                &[file("composer.json")],
+                Generic,
+                "Remove the directory, then run `composer install`. Svalnir does not run it.",
+                "The next `composer install` installs the versions of `composer.lock` again; it needs a network or the cache of Composer, and the credentials of each private repository. A change that a person made by hand in `vendor` is lost. A package of a path repository is a symbolic link: the removal removes the link and never follows it, so the source of the package stays.",
+            ),
+            "composer.lock",
+        ),
+        "composer/installed.json",
+    ),
     plain(
         "tmp/cache",
         "rails-tmp-cache",
@@ -490,6 +871,304 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         Generic,
         "Run `bin/rails tmp:cache:clear`, or remove the directory. Svalnir does not run them.",
         "The application makes its cache again, and bootsnap compiles its cache again at the next start.",
+    ),
+    // Symfony keeps the sessions, the application cache pool, and the HTTP
+    // cache in the cache directory of each environment by default. These
+    // are not made again, so a unit with one of them is refused.
+    with_protected(
+        with_project_file(
+            plain(
+                "var/cache",
+                "symfony-var-cache",
+                &[file("symfony.lock")],
+                Generic,
+                "Run `php bin/console cache:clear`, or remove the directory, then run `php bin/console cache:warmup`. Svalnir does not run them.",
+                "The next request or `cache:warmup` makes the cache again, and the first requests are slow. A unit with sessions, the application cache pool, or the HTTP cache is refused. `var/log` and the other entries of `var` stay.",
+            ),
+            "bin/console",
+        ),
+        &["*/sessions", "*/pools/app", "*/http_cache"],
+    ),
+    // Each `pub get` writes `.dart_tool/package_config.json`.
+    with_inner(
+        plain(
+            ".dart_tool",
+            "dart-tool",
+            &[file("pubspec.yaml")],
+            Distinctive,
+            "Remove the directory, then run `dart pub get` or `flutter pub get`. Svalnir does not run them.",
+            "The next `pub get` makes the package configuration again, and it needs a network or the pub cache. The next build makes the build files of Flutter and of `build_runner` again.",
+        ),
+        "package_config.json",
+    ),
+    plain(
+        ".bloop",
+        "bloop",
+        SCALA_BUILD,
+        Distinctive,
+        "Remove the directory, then import the build again (in Metals, or with `sbt bloopInstall`). Svalnir does not run them.",
+        "The next import writes the Bloop configuration of each project again, and the next compile compiles each project again.",
+    ),
+    plain(
+        ".metals",
+        "metals",
+        SCALA_BUILD,
+        Distinctive,
+        "Stop the editor, then remove the directory. Metals makes it again at its next start. Svalnir does not run it.",
+        "The next start of Metals asks to import the build again and shows again the notifications that a person dismissed. The logs and the reports of Metals are lost.",
+    ),
+    // Mill 1 writes `out/mill-out-lock`; `out` is a generic name.
+    with_inner(
+        plain(
+            "out",
+            "mill-out",
+            &[file("build.mill"), file("build.sc")],
+            Generic,
+            "Run `./mill clean`, or stop the Mill daemon and remove the directory. Svalnir does not run them.",
+            "The next `./mill` task runs each task again. The state of a running Mill daemon is in `out/mill-daemon`, so stop the daemon first.",
+        ),
+        "mill-out-lock",
+    ),
+    // The editor of Godot 4 writes `.godot/.gdignore`. The export
+    // credentials are secrets, and `editor` holds the editor state of the
+    // project.
+    with_protected(
+        with_inner(
+            plain(
+                ".godot",
+                "godot",
+                GODOT_PROJECT,
+                Distinctive,
+                "Close the project in the editor, then remove the directory. The editor imports the assets again when it opens the project. Svalnir does not run it.",
+                "The next open of the project imports each asset again and compiles the shaders again. A unit with `export_credentials.cfg` (the passwords and the keys of the export) or `editor` (the editor state of the project) is refused.",
+            ),
+            ".gdignore",
+        ),
+        &["export_credentials.cfg", "editor"],
+    ),
+    plain(
+        ".import",
+        "godot3-import",
+        GODOT_PROJECT,
+        Distinctive,
+        "Close the project in the editor of Godot 3, then remove the directory. The editor imports the assets again when it opens the project. Svalnir does not run it.",
+        "The next open of the project imports each asset again. The files `*.import` beside the assets hold the import settings, and they stay.",
+    ),
+    // Stack writes `stack.sqlite3` in the work directory of the project, and
+    // a work directory with no file at a fixed path in each package.
+    with_inner(
+        plain(
+            ".stack-work",
+            "stack-work",
+            &[file("stack.yaml")],
+            Distinctive,
+            STACK_WORKFLOW,
+            STACK_IMPACT,
+        ),
+        "stack.sqlite3",
+    ),
+    plain(
+        ".stack-work",
+        "stack-work-package",
+        &[file("package.yaml"), file("*.cabal")],
+        Distinctive,
+        STACK_WORKFLOW,
+        STACK_IMPACT,
+    ),
+    // Each planning of cabal writes `cache/plan.json`.
+    with_inner(
+        plain(
+            "dist-newstyle",
+            "cabal-dist-newstyle",
+            &[file("cabal.project"), file("*.cabal")],
+            Distinctive,
+            "Run `cabal clean`, or remove the directory, then run `cabal build`. Svalnir does not run them.",
+            "The next `cabal build` plans the project and builds its local packages again.",
+        ),
+        "cache/plan.json",
+    ),
+    // Each compile of Elm 0.19.1 takes the lock `elm-stuff/0.19.1/lock`.
+    with_inner(
+        plain(
+            "elm-stuff",
+            "elm-stuff",
+            &[file("elm.json")],
+            Distinctive,
+            "Remove the directory, then run `elm make`. Svalnir does not run it.",
+            "The next `elm make` compiles the project again from the package cache of `ELM_HOME`; it needs a network only for a package that the cache does not have.",
+        ),
+        "0.19.1/lock",
+    ),
+    // Only two entries of `.terraform`: the backend configuration in
+    // `terraform.tfstate` and the selected workspace in `environment` are
+    // not made again from the files of the module.
+    plain(
+        ".terraform/providers",
+        "terraform-providers",
+        TERRAFORM_MODULE,
+        Distinctive,
+        "Remove the directory, then run `terraform init`. Svalnir does not run it.",
+        "The next `terraform init` downloads each provider of `.terraform.lock.hcl` again, or links it from the plugin cache. With a plugin cache the directory holds symbolic links: the removal removes the links and never follows them. The other entries of `.terraform` stay.",
+    ),
+    with_inner(
+        plain(
+            ".terraform/modules",
+            "terraform-modules",
+            TERRAFORM_MODULE,
+            Distinctive,
+            "Remove the directory, then run `terraform init` or `terraform get`. Svalnir does not run them.",
+            "The next `terraform init` downloads each module again. A module from a source that is not available now cannot be installed again. The other entries of `.terraform` stay.",
+        ),
+        "modules.json",
+    ),
+    // The cloud assembly has `manifest.json`. A lock file shows a synthesis
+    // or a reader that runs now.
+    with_protected(
+        with_inner(
+            plain(
+                "cdk.out",
+                "cdk-out",
+                &[file("cdk.json")],
+                Distinctive,
+                "Remove the directory, then run `cdk synth`. Svalnir does not run it.",
+                "The next `cdk synth`, `cdk diff`, or `cdk deploy` makes the cloud assembly again. A unit with a lock file of a synthesis or of a reader is refused. `cdk.context.json` beside the directory stays.",
+            ),
+            "manifest.json",
+        ),
+        &["synth.lock", "read.*.lock"],
+    ),
+    // `sam build` writes `.aws-sam/build.toml`.
+    with_inner(
+        plain(
+            ".aws-sam",
+            "aws-sam",
+            &[
+                file("samconfig.toml"),
+                file("template.yaml"),
+                file("template.yml"),
+            ],
+            Distinctive,
+            "Remove the directory, then run `sam build`. Svalnir does not run it.",
+            "The next `sam build` builds each function and each layer again, and it can need a network and Docker.",
+        ),
+        "build.toml",
+    ),
+    // A package or a deployment writes `serverless-state.json`. `dev` holds
+    // the records and the token of a dev mode session.
+    with_protected(
+        with_inner(
+            plain(
+                ".serverless",
+                "serverless",
+                &[
+                    file("serverless.yml"),
+                    file("serverless.ts"),
+                    file("serverless.js"),
+                    file("serverless.json"),
+                ],
+                Distinctive,
+                "Remove the directory, then run `serverless package` or `serverless deploy`. Svalnir does not run them.",
+                "The next package makes the deployment artifacts and the state file again. A unit with `dev` (the records and the token of a dev mode session) is refused.",
+            ),
+            "serverless-state.json",
+        ),
+        &["dev"],
+    ),
+    // Only three entries of `renv`: `local`, `cellar`, and `python` hold
+    // packages and environments that a person supplies, and `activate.R` and
+    // `settings.json` are project files.
+    plain(
+        "renv/library",
+        "renv-library",
+        RENV_PROJECT,
+        Distinctive,
+        "Remove the directory, then run `renv::restore()` in R. Svalnir does not run it.",
+        "The next restore installs each package of `renv.lock` again from the cache of renv, or from a repository with a network. A package that no repository and no cache has cannot be installed again. The entries of the library are frequently symbolic links into the cache of renv: the removal removes the links and never follows them.",
+    ),
+    plain(
+        "renv/staging",
+        "renv-staging",
+        RENV_PROJECT,
+        Distinctive,
+        "Remove the directory when no install runs. renv makes it again at the next install. Svalnir does not run R.",
+        "The next install makes the directory again.",
+    ),
+    plain(
+        "renv/sandbox",
+        "renv-sandbox",
+        RENV_PROJECT,
+        Distinctive,
+        "Remove the directory. renv makes the sandbox again at the next start of R in the project. Svalnir does not run R.",
+        "The next start of R in the project makes the sandbox of the system library again.",
+    ),
+    // The `layout` functions of direnv write `CACHEDIR.TAG`. A profile of
+    // `use flake` is a garbage collector root of Nix.
+    with_protected(
+        with_inner(
+            plain(
+                ".direnv",
+                "direnv",
+                &[file(".envrc")],
+                Distinctive,
+                "Remove the directory, then enter the directory again or run `direnv reload`. Svalnir does not run them.",
+                "The next load of `.envrc` makes each layout again, for example the virtual environment of `layout python`, and it can need a network. A unit with a profile of `use flake` is refused, because it is a garbage collector root of Nix.",
+            ),
+            "CACHEDIR.TAG",
+        ),
+        &["flake-profile*"],
+    ),
+    // `state` holds the data of the services of devenv.
+    with_protected(
+        plain(
+            ".devenv",
+            "devenv",
+            &[file("devenv.nix")],
+            Distinctive,
+            "Stop the processes of devenv, then remove the directory and run `devenv shell`. Svalnir does not run them.",
+            "The next `devenv shell` evaluates the environment again, and it can need a network or the Nix store. A unit with `state` (the data of the services, for example a PostgreSQL database) is refused.",
+        ),
+        &["state"],
+    ),
+    plain(
+        ".jekyll-cache",
+        "jekyll-cache",
+        &[
+            file("_config.yml"),
+            file("_config.yaml"),
+            file("_config.toml"),
+        ],
+        Distinctive,
+        "Run `jekyll clean`, or remove the directory. Svalnir does not run them.",
+        "The next `jekyll build` or `jekyll serve` renders each page again with no cache.",
+    ),
+    // Only `_gen` of `resources`: Hugo documents no other entry of it as
+    // generated.
+    plain(
+        "resources/_gen",
+        "hugo-resources",
+        &[
+            file("hugo.toml"),
+            file("hugo.yaml"),
+            file("hugo.yml"),
+            file("hugo.json"),
+            file("config.toml"),
+        ],
+        Generic,
+        "Remove the directory, then run `hugo`. Svalnir does not run it.",
+        "The next build processes each image and each asset again. The other entries of `resources` stay.",
+    ),
+    // The search plugin of MkDocs, which is on by default, writes
+    // `search/search_index.json`; `site` is a generic name.
+    with_inner(
+        plain(
+            "site",
+            "mkdocs-site",
+            &[file("mkdocs.yml"), file("mkdocs.yaml")],
+            Generic,
+            "Remove the directory, then run `mkdocs build`. Svalnir does not run it.",
+            "The next `mkdocs build` makes the site again. A hidden entry that a person put in the directory, which `mkdocs build` keeps, is lost; a Git repository in it refuses the unit.",
+        ),
+        "search/search_index.json",
     ),
 ];
 

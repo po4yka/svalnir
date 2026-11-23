@@ -18,11 +18,15 @@ use crate::rules::in_use::{UnitScope, inventory_of};
 /// The executable names of the build and package-manager processes of the
 /// layouts: the JavaScript runtimes, package managers, and build tools,
 /// Python, its installers, and its tools, `CocoaPods`, Ruby, and Bundler,
-/// the build tools of Xcode and of Swift Package Manager, Cargo, Maven and
-/// Gradle (and the Java runtime that runs them), Mix and the Erlang
-/// runtime, .NET, and Zig. A name that starts with `python3.` or `pip3.` is
-/// also one.
-pub const BUILD_PROCESS_NAMES: [&str; 44] = [
+/// the build tools of Xcode and of Swift Package Manager, Cargo, Maven,
+/// Gradle, sbt, and Mill (and the Java runtime that runs them), Mix and the
+/// Erlang runtime, .NET, Zig, Dart and Flutter, `CMake` and Ninja, Carthage,
+/// Godot, Stack, Cabal, and GHC, Elm, dune, Terraform, `OpenTofu`, and
+/// Terragrunt, R, PHP and Composer, Pixi, Hugo, the command-line tools of
+/// AWS SAM, Serverless, and the local runtime of Wrangler, direnv, devenv,
+/// and Nix. A name that starts with `python3.`, `pip3.`, or `ghc-` is also
+/// one.
+pub const BUILD_PROCESS_NAMES: [&str; 77] = [
     "node",
     "npm",
     "npx",
@@ -67,13 +71,49 @@ pub const BUILD_PROCESS_NAMES: [&str; 44] = [
     "beam.smp",
     "dotnet",
     "zig",
+    "sbt",
+    "sbtn",
+    "mill",
+    "dart",
+    "flutter",
+    "flutter_tester",
+    "cmake",
+    "ctest",
+    "ninja",
+    "carthage",
+    "Godot",
+    "godot",
+    "stack",
+    "cabal",
+    "ghc",
+    "elm",
+    "dune",
+    "terraform",
+    "tofu",
+    "terragrunt",
+    "R",
+    "Rscript",
+    "rsession",
+    "php",
+    "composer",
+    "pixi",
+    "hugo",
+    "sam",
+    "serverless",
+    "workerd",
+    "direnv",
+    "devenv",
+    "nix",
 ];
 
 /// Whether `name` is the executable name of a build or package-manager
 /// process.
 #[must_use]
 pub fn is_build_process(name: &str) -> bool {
-    BUILD_PROCESS_NAMES.contains(&name) || name.starts_with("python3.") || name.starts_with("pip3.")
+    BUILD_PROCESS_NAMES.contains(&name)
+        || name.starts_with("python3.")
+        || name.starts_with("pip3.")
+        || name.starts_with("ghc-")
 }
 
 /// One process of the user that can use a generated directory.

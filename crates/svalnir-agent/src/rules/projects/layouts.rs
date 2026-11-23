@@ -930,8 +930,9 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "mill-out-lock",
     ),
     // The editor of Godot 4 writes `.godot/.gdignore`. The export
-    // credentials are secrets, and `editor` holds the editor state of the
-    // project.
+    // credentials are secrets. `editor` holds only the editor state of the
+    // project (open scenes, layout), which the editor makes again on each
+    // open, so it is not protected.
     with_protected(
         with_inner(
             plain(
@@ -940,11 +941,11 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
                 GODOT_PROJECT,
                 Distinctive,
                 "Close the project in the editor, then remove the directory. The editor imports the assets again when it opens the project. Svalnir does not run it.",
-                "The next open of the project imports each asset again and compiles the shaders again. A unit with `export_credentials.cfg` (the passwords and the keys of the export) or `editor` (the editor state of the project) is refused.",
+                "The next open of the project imports each asset again and compiles the shaders again. The editor state of the project in `editor` (the open scenes and the layout) is lost. A unit with `export_credentials.cfg` (the passwords and the keys of the export) is refused.",
             ),
             ".gdignore",
         ),
-        &["export_credentials.cfg", "editor"],
+        &["export_credentials.cfg"],
     ),
     plain(
         ".import",

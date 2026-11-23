@@ -714,7 +714,7 @@ The layout is for a manual eviction only. The discovery for an automatic evictio
 | `bloop` | `.bloop` | `build.sbt`, `build.mill`, or `build.sc` | None | None | A new import of the build (Metals, or `sbt bloopInstall`) | The allocated size |
 | `metals` | `.metals` | As `bloop` | None | None | The next start of Metals | The allocated size |
 | `mill-out` | `out` | `build.mill` or `build.sc` | `mill-out-lock` | None | `./mill clean` | The allocated size |
-| `godot` | `.godot` | `project.godot` | `.gdignore` | `export_credentials.cfg`, `editor` | The next open of the project in the editor | The allocated size |
+| `godot` | `.godot` | `project.godot` | `.gdignore` | `export_credentials.cfg` | The next open of the project in the editor | The allocated size |
 | `godot3-import` | `.import` | `project.godot` | None | None | The next open of the project in the editor of Godot 3 | The allocated size |
 | `stack-work` | `.stack-work` | `stack.yaml` | `stack.sqlite3` | None | `stack clean --full`, then `stack build` | The allocated size |
 | `stack-work-package` | `.stack-work` | `package.yaml` or a file `*.cabal` | None | None | As `stack-work` | The allocated size |

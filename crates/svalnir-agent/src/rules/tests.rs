@@ -181,14 +181,14 @@ fn the_registry_has_eighteen_rules_and_each_layout_is_proposed() {
     assert_eq!(rules.len(), 18 + clear);
     let statuses = registry.statuses();
     // One layout for each of the two rules, two for `pnpm.content-store`
-    // and for `yarn.cache`, one for each other cache rule, 32 for
+    // and for `yarn.cache`, one for each other cache rule, 86 for
     // `project.dependency-directory` (the catalog and `user-configured`),
     // two for `simulator.devices` and for `container.build-cache`, and one
     // for `homebrew.cleanup` and for `git.linked-worktree`, and the layout
     // of the scope root of each of the ten rules with an owner operation.
     // A clear rule has one layout, and `xcode.inactive-derived-data` has a
     // second layout for an orphan project directory.
-    assert_eq!(statuses.len(), 59 + clear);
+    assert_eq!(statuses.len(), 113 + clear);
     for status in &statuses {
         assert_eq!(status.lifecycle, LifecycleState::Proposed);
         assert_eq!(status.permitted_modes.len(), 0);

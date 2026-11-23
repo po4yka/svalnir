@@ -398,43 +398,95 @@ pub const SKIPPED_DIRECTORY_NAMES: [&str; 5] = [".git", ".hg", ".jj", ".svn", ".
 /// layout of the configuration cannot start with one of them, so its units
 /// cannot overlap a unit of a built-in layout. The agent has a test that
 /// this list agrees with its catalog.
-pub const BUILT_IN_LAYOUT_NAMES: [&str; 28] = [
+pub const BUILT_IN_LAYOUT_NAMES: [&str; 67] = [
     "node_modules",
     ".venv",
     "venv",
     "Pods",
     "target",
+    "project",
     ".next",
     ".turbo",
     ".svelte-kit",
     ".astro",
     ".parcel-cache",
+    ".nuxt",
+    ".output",
+    ".angular",
+    ".nx",
+    ".docusaurus",
+    ".yarn",
+    ".vercel",
+    ".wrangler",
     "dist",
+    "coverage",
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
     ".tox",
     ".nox",
+    ".pixi",
     ".gradle",
+    ".kotlin",
+    ".cxx",
+    ".externalNativeBuild",
     "build",
     "_build",
+    ".elixir_ls",
+    ".lexical",
+    ".expert",
     "obj",
     "bin",
+    "artifacts",
     ".build",
     "DerivedData",
+    "Carthage",
     ".zig-cache",
     "zig-cache",
     "vendor",
     "tmp",
+    "var",
+    ".dart_tool",
+    ".bloop",
+    ".metals",
+    "out",
+    ".godot",
+    ".import",
+    ".stack-work",
+    "dist-newstyle",
+    "elm-stuff",
+    ".terraform",
+    "cdk.out",
+    ".aws-sam",
+    ".serverless",
+    "renv",
+    ".direnv",
+    ".devenv",
+    ".jekyll-cache",
+    "resources",
+    "site",
 ];
 
 /// The names that `docs/CLEANUP_RULES.md` section 12 keeps outside the rule
-/// and that are not a first name of a built-in layout: `zig-out` (install
-/// output) and `deps` of Mix (dependency sources). `vendor` (with
-/// `vendor/cache` and Go `vendor`), `tmp`, and `_build` (also beside
-/// `rebar.config`) are in [`BUILT_IN_LAYOUT_NAMES`].
-pub const KEPT_OUT_LAYOUT_NAMES: [&str; 2] = ["zig-out", "deps"];
+/// because a removal can lose data that no tool makes again, and that are
+/// not a first name of a built-in layout: `zig-out` (install output),
+/// `deps` of Mix (dependency sources), `_opam` (the pins and the sources of
+/// a local switch), `.hypothesis` (the example database),
+/// `.terragrunt-cache` (local state at each depth), `Saved` of Unreal Engine
+/// (autosaves), and `UserSettings` of Unity (preferences). `vendor` (with
+/// `vendor/cache` and Go `vendor`), `tmp`, `_build` (also beside
+/// `rebar.config`), and the other first names of the table are in
+/// [`BUILT_IN_LAYOUT_NAMES`].
+pub const KEPT_OUT_LAYOUT_NAMES: [&str; 7] = [
+    "zig-out",
+    "deps",
+    "_opam",
+    ".hypothesis",
+    ".terragrunt-cache",
+    "Saved",
+    "UserSettings",
+];
 
 /// The names of the protected locations of the home directory that a
 /// layout of the configuration cannot name in a component: the names of

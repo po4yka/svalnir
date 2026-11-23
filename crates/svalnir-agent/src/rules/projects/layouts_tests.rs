@@ -10,11 +10,12 @@ use svalnir_core::config::{UserLayout, parse_and_validate};
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::{LifecycleState, RuleMode, RuleRefusal, RuleRegistry};
 
+use super::DirectoryName::Distinctive;
 use super::inspect::{ChildSearch, find_protected, glob_matches};
 use super::tests::{Home, no_recency, quiet, refusal, unit};
 use super::{
-    MarkerKind, PROJECT_LAYOUTS, ProjectInspection, ProjectLimits, ProjectMarker,
-    ProjectUnitOutcome,
+    MarkerKind, PROJECT_LAYOUT_COUNT, PROJECT_LAYOUTS, ProjectInspection, ProjectLimits,
+    ProjectMarker, ProjectUnitOutcome,
 };
 use crate::rules::ReviewedRules;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
@@ -462,7 +463,7 @@ fn a_build_directory_of_swift_package_manager_has_the_exception_for_its_checkout
 const USER_LAYOUTS: &str = "schema_version = 1
 
 [[cleanup.projects.layouts]]
-directory = \"out\"
+directory = \"builddir\"
 markers = [\"meson.build\"]
 protected = [\"keep\"]
 quiet_period = \"2h\"
@@ -482,23 +483,23 @@ fn a_layout_of_the_configuration_has_each_check() {
     let layouts: Vec<UserLayout> = configured(USER_LAYOUTS);
     for project in ["Code/u1", "Code/u2", "Code/u4", "Code/u5"] {
         home.write(&format!("{project}/meson.build"), b"project('a')\n");
-        home.write(&format!("{project}/.gitignore"), b"/out/\n/gen/\n");
+        home.write(&format!("{project}/.gitignore"), b"/builddir/\n/gen/\n");
     }
     for project in ["Code/u1", "Code/u2", "Code/u4", "Code/u5"] {
         home.repository(project);
     }
-    home.write("Code/u1/out/a.o", b"o\n");
-    home.write("Code/u2/out/keep/notes.txt", b"mine\n");
-    home.write("Code/u3/out/a.o", b"o\n");
+    home.write("Code/u1/builddir/a.o", b"o\n");
+    home.write("Code/u2/builddir/keep/notes.txt", b"mine\n");
+    home.write("Code/u3/builddir/a.o", b"o\n");
     home.write("Code/u4/gen/a.o", b"o\n");
     home.write("Code/u4/gen/cache/b.o", b"o\n");
     // A directory of the layout that Git does not ignore.
     home.write("Code/u6/meson.build", b"project('a')\n");
     home.repository("Code/u6");
-    home.write("Code/u6/out/a.o", b"o\n");
+    home.write("Code/u6/builddir/a.o", b"o\n");
     let inspection: ProjectInspection = inspect_configured(&home, &layouts);
 
-    let measured = unit(&inspection, &home.path.join("Code/u1/out"));
+    let measured = unit(&inspection, &home.path.join("Code/u1/builddir"));
     assert_eq!(measured.layout, "user-configured");
     assert!(matches!(measured.outcome, ProjectUnitOutcome::Measured(_)));
     // The quiet period of the layout replaces the period of the table.
@@ -509,10 +510,10 @@ fn a_layout_of_the_configuration_has_each_check() {
             .map(|recency| recency.quiet_period),
         Some(Nanoseconds::new(2 * 3_600_000_000_000))
     );
-    let protected = unit(&inspection, &home.path.join("Code/u2/out"));
+    let protected = unit(&inspection, &home.path.join("Code/u2/builddir"));
     assert_eq!(refusal(protected), "protected_child");
     assert_eq!(protected.protected_child, Some(PathBuf::from("keep")));
-    assert!(!is_listed(&inspection, &home.path.join("Code/u3/out")));
+    assert!(!is_listed(&inspection, &home.path.join("Code/u3/builddir")));
     // One directory is never in two units: the earlier layout measures it,
     // and the unit in it is refused.
     let outer = unit(&inspection, &home.path.join("Code/u4/gen"));
@@ -522,7 +523,7 @@ fn a_layout_of_the_configuration_has_each_check() {
     assert_eq!(inner.overlapping_layout, Some("user-configured"));
     assert_eq!(inner.version_control, None);
     assert_eq!(
-        refusal(unit(&inspection, &home.path.join("Code/u6/out"))),
+        refusal(unit(&inspection, &home.path.join("Code/u6/builddir"))),
         "not_ignored"
     );
     // The layout name is in the report with its lifecycle state.
@@ -531,7 +532,7 @@ fn a_layout_of_the_configuration_has_each_check() {
     }));
     // With no layout of the configuration, the directory is ordinary.
     let inspection: ProjectInspection = home.inspect(&quiet());
-    assert!(!is_listed(&inspection, &home.path.join("Code/u1/out")));
+    assert!(!is_listed(&inspection, &home.path.join("Code/u1/builddir")));
 }
 
 #[test]
@@ -576,4 +577,317 @@ fn a_layout_of_the_configuration_permits_no_automatic_mode() {
     };
     assert!(promoted.permits(&RuleMode::ManualEviction));
     assert!(!promoted.permits(&RuleMode::AutomaticEviction));
+}
+
+#[test]
+fn each_layout_name_of_the_catalog_is_unique() {
+    let mut names: Vec<&str> = PROJECT_LAYOUTS.iter().map(|layout| layout.layout).collect();
+    names.sort_unstable();
+    let count: usize = names.len();
+    names.dedup();
+    assert_eq!(names.len(), count);
+    assert_eq!(count, PROJECT_LAYOUT_COUNT);
+}
+
+/// The directories of the catalog, each one time, in the sequence of the
+/// catalog.
+fn directories() -> Vec<&'static str> {
+    let mut directories: Vec<&'static str> = Vec::new();
+    for layout in &PROJECT_LAYOUTS {
+        if !directories.contains(&layout.directory) {
+            directories.push(layout.directory);
+        }
+    }
+    directories
+}
+
+#[test]
+fn each_directory_of_the_catalog_with_no_marker_is_refused_or_ordinary() {
+    let home = Home::new();
+    let mut projects: Vec<(PathBuf, &str)> = Vec::new();
+    for (index, directory) in directories().into_iter().enumerate() {
+        let project: String = format!("Code/n{index}");
+        home.write(
+            &format!("{project}/.gitignore"),
+            format!("/{directory}/\n").as_bytes(),
+        );
+        home.repository(&project);
+        home.write(
+            &format!("{project}/{directory}/data/file.bin"),
+            b"generated\n",
+        );
+        projects.push((home.path.join(project).join(directory), directory));
+    }
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    for (path, directory) in projects {
+        // The first distinctive layout of the directory gives the refused
+        // unit; a directory of generic layouts only is not listed.
+        match PROJECT_LAYOUTS
+            .iter()
+            .find(|layout| layout.directory == directory && layout.name == Distinctive)
+        {
+            Some(layout) => {
+                let report = unit(&inspection, &path);
+                assert_eq!(report.layout, layout.layout, "{directory}");
+                assert_eq!(refusal(report), "project_marker_missing", "{directory}");
+            }
+            None => assert!(!is_listed(&inspection, &path), "{directory}"),
+        }
+    }
+}
+
+#[test]
+fn each_protected_path_of_the_catalog_refuses_the_unit() {
+    let home = Home::new();
+    let mut expected: Vec<(PathBuf, &str, String)> = Vec::new();
+    for layout in &PROJECT_LAYOUTS {
+        for (index, protected) in layout.protected.iter().enumerate() {
+            let project: PathBuf = project_with(
+                &home,
+                &format!("{}-{index}", layout.layout),
+                &layout.project_markers[0],
+                layout.directory,
+                layout.inner_marker,
+            );
+            // Each pattern component gets a name that matches it.
+            let child: String = protected.replace('*', "x");
+            fs::create_dir_all(project.join(layout.directory)).unwrap();
+            let entry: PathBuf = project.join(layout.directory).join(&child);
+            fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            fs::write(&entry, b"keep\n").unwrap();
+            expected.push((project.join(layout.directory), layout.layout, child));
+        }
+    }
+    assert!(expected.len() >= 12);
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    for (path, layout, child) in expected {
+        let report = unit(&inspection, &path);
+        assert_eq!(report.layout, layout);
+        assert_eq!(refusal(report), "protected_child", "{layout}: {child}");
+        assert_eq!(report.protected_child, Some(PathBuf::from(&child)));
+    }
+}
+
+#[test]
+fn each_layout_with_a_project_file_needs_it() {
+    let home = Home::new();
+    let mut expected: Vec<(PathBuf, &str)> = Vec::new();
+    for layout in PROJECT_LAYOUTS
+        .iter()
+        .filter(|layout| layout.project_file.is_some())
+    {
+        let project: PathBuf = project_with(
+            &home,
+            layout.layout,
+            &layout.project_markers[0],
+            layout.directory,
+            layout.inner_marker,
+        );
+        if let Some(file) = layout.project_file {
+            fs::remove_file(project.join(file)).unwrap();
+        }
+        expected.push((project.join(layout.directory), layout.layout));
+    }
+    assert!(expected.len() >= 6);
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    for (path, layout) in expected {
+        let report = unit(&inspection, &path);
+        assert_eq!(report.layout, layout);
+        assert_eq!(refusal(report), "unsupported_layout", "{layout}");
+    }
+}
+
+/// One case of layouts with the same directory: the markers in the
+/// project, and the layout that gives the unit.
+struct SharedName {
+    directory: &'static str,
+    markers: &'static [&'static str],
+    layout: &'static str,
+}
+
+const SHARED_NAMES: &[SharedName] = &[
+    SharedName {
+        directory: "target",
+        markers: &["Cargo.toml", "pom.xml", "build.sbt"],
+        layout: "cargo-target",
+    },
+    SharedName {
+        directory: "target",
+        markers: &["pom.xml", "build.sbt"],
+        layout: "maven-target",
+    },
+    SharedName {
+        directory: "target",
+        markers: &["build.sbt"],
+        layout: "sbt-target",
+    },
+    SharedName {
+        directory: "build",
+        markers: &["build.gradle", "pubspec.yaml", "CMakeLists.txt", "Makefile"],
+        layout: "gradle-build",
+    },
+    SharedName {
+        directory: "build",
+        markers: &["pyproject.toml", "CMakeLists.txt"],
+        layout: "setuptools-build",
+    },
+    SharedName {
+        directory: "build",
+        markers: &["pubspec.yaml", "CMakeLists.txt", "Makefile"],
+        layout: "flutter-build",
+    },
+    SharedName {
+        directory: "build",
+        markers: &["CMakeLists.txt", "Makefile"],
+        layout: "cmake-build",
+    },
+    SharedName {
+        directory: "build",
+        markers: &["Makefile"],
+        layout: "sphinx-build-separate",
+    },
+    SharedName {
+        directory: "_build",
+        markers: &["mix.exs", "dune-project", "conf.py"],
+        layout: "mix-build",
+    },
+    SharedName {
+        directory: "_build",
+        markers: &["dune-project", "conf.py"],
+        layout: "dune-build",
+    },
+    SharedName {
+        directory: "_build",
+        markers: &["conf.py"],
+        layout: "sphinx-build",
+    },
+    SharedName {
+        directory: ".output",
+        markers: &["nuxt.config.ts", "nitro.config.ts"],
+        layout: "nuxt-output",
+    },
+    SharedName {
+        directory: ".output",
+        markers: &["nitro.config.ts"],
+        layout: "nitro-output",
+    },
+    SharedName {
+        directory: ".stack-work",
+        markers: &["stack.yaml", "package.yaml"],
+        layout: "stack-work",
+    },
+    SharedName {
+        directory: ".stack-work",
+        markers: &["app.cabal"],
+        layout: "stack-work-package",
+    },
+];
+
+#[test]
+fn the_first_layout_of_a_shared_name_with_a_marker_gives_the_unit() {
+    let home = Home::new();
+    let mut expected: Vec<(PathBuf, &str)> = Vec::new();
+    for (index, case) in SHARED_NAMES.iter().enumerate() {
+        let project: String = format!("Code/s{index}");
+        for marker in case.markers {
+            home.write(&format!("{project}/{marker}"), b"marker\n");
+        }
+        home.write(
+            &format!("{project}/.gitignore"),
+            format!("/{}/\n", case.directory).as_bytes(),
+        );
+        home.repository(&project);
+        home.write(
+            &format!("{project}/{}/data/file.bin", case.directory),
+            b"generated\n",
+        );
+        expected.push((home.path.join(project).join(case.directory), case.layout));
+    }
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    for (path, layout) in expected {
+        assert_eq!(
+            unit(&inspection, &path).layout,
+            layout,
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn vendor_is_a_unit_of_composer_only() {
+    let home = Home::new();
+    // Composer, with a package of a path repository as a symbolic link.
+    home.write("Code/php/composer.json", b"{}");
+    home.write("Code/php/composer.lock", b"{}");
+    home.write("Code/php/.gitignore", b"/vendor/\n");
+    home.write("Code/php/packages/lib/src/A.php", b"<?php\n");
+    home.repository("Code/php");
+    home.write("Code/php/vendor/composer/installed.json", b"{}");
+    home.write("Code/php/vendor/acme/other/src/B.php", b"<?php\n");
+    symlink(
+        home.path.join("Code/php/packages/lib"),
+        home.path.join("Code/php/vendor/acme/lib"),
+    )
+    .unwrap();
+    // Go: `vendor` is an ordinary directory.
+    home.write("Code/go/go.mod", b"module a\n");
+    home.write("Code/go/.gitignore", b"/vendor/\n");
+    home.repository("Code/go");
+    home.write("Code/go/vendor/modules.txt", b"# a\n");
+    // Bundler and Composer: `vendor/bundle` comes first, and `vendor`
+    // overlaps its unit.
+    home.write("Code/both/Gemfile", b"source 'x'\n");
+    home.write("Code/both/composer.json", b"{}");
+    home.write("Code/both/composer.lock", b"{}");
+    home.write("Code/both/.gitignore", b"/vendor/\n");
+    home.repository("Code/both");
+    home.write("Code/both/vendor/bundle/ruby/a.rb", b"1\n");
+    home.write("Code/both/vendor/composer/installed.json", b"{}");
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let composer = unit(&inspection, &home.path.join("Code/php/vendor"));
+    assert_eq!(composer.layout, "composer-vendor");
+    assert!(
+        matches!(composer.outcome, ProjectUnitOutcome::Measured(_)),
+        "{:?}",
+        composer.outcome
+    );
+    assert!(!is_listed(&inspection, &home.path.join("Code/go/vendor")));
+    assert_eq!(
+        unit(&inspection, &home.path.join("Code/both/vendor/bundle")).layout,
+        "bundler-vendor"
+    );
+    let overlap = unit(&inspection, &home.path.join("Code/both/vendor"));
+    assert_eq!(overlap.layout, "composer-vendor");
+    assert_eq!(refusal(overlap), "overlaps_unit");
+    assert_eq!(overlap.overlapping_layout, Some("bundler-vendor"));
+    // The inspection changed nothing, also not the target of the link.
+    assert!(home.path.join("Code/php/packages/lib/src/A.php").exists());
+}
+
+#[test]
+fn a_committed_cache_of_yarn_zero_install_is_refused() {
+    let home = Home::new();
+    home.write("Code/zero/.yarnrc.yml", b"enableGlobalCache: false\n");
+    home.write(
+        "Code/zero/.gitignore",
+        b".yarn/*\n!.yarn/cache\n!.yarn/releases\n",
+    );
+    home.write("Code/zero/.yarn/cache/left-pad-1.0.0-abc.zip", b"zip\n");
+    home.write("Code/zero/.yarn/releases/yarn-4.19.0.cjs", b"//\n");
+    home.repository("Code/zero");
+    home.write("Code/zero/.yarn/unplugged/fsevents/index.js", b"1;\n");
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let cache = unit(&inspection, &home.path.join("Code/zero/.yarn/cache"));
+    assert_eq!(cache.layout, "yarn-cache");
+    assert_eq!(refusal(cache), "tracked_files");
+    let unplugged = unit(&inspection, &home.path.join("Code/zero/.yarn/unplugged"));
+    assert_eq!(unplugged.layout, "yarn-unplugged");
+    assert!(matches!(unplugged.outcome, ProjectUnitOutcome::Measured(_)));
+    // `.yarn` itself and its releases are never a unit.
+    assert!(!is_listed(&inspection, &home.path.join("Code/zero/.yarn")));
+    assert!(!is_listed(
+        &inspection,
+        &home.path.join("Code/zero/.yarn/releases")
+    ));
 }

@@ -803,10 +803,35 @@ fn the_build_process_names() {
         "dotnet",
         "zig",
         "swift-build",
+        "dart",
+        "flutter",
+        "cmake",
+        "ninja",
+        "carthage",
+        "Godot",
+        "stack",
+        "cabal",
+        "ghc",
+        "ghc-9.10.1",
+        "elm",
+        "dune",
+        "terraform",
+        "terragrunt",
+        "R",
+        "Rscript",
+        "php",
+        "composer",
+        "pixi",
+        "hugo",
+        "sam",
+        "direnv",
+        "devenv",
+        "mill",
+        "sbt",
     ] {
         assert!(is_build_process(name), "{name}");
     }
-    for name in ["zsh", "Finder", "nodejs-helper", "login"] {
+    for name in ["zsh", "Finder", "nodejs-helper", "login", "ghci-helper"] {
         assert!(!is_build_process(name), "{name}");
     }
 }

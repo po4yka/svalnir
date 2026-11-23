@@ -393,97 +393,42 @@ pub const MAX_LAYOUT_ENTRIES: usize = 8;
 /// (`docs/CLEANUP_RULES.md` section 12).
 pub const SKIPPED_DIRECTORY_NAMES: [&str; 5] = [".git", ".hg", ".jj", ".svn", ".cache"];
 
-/// The first names of the directories of the built-in layouts of
-/// `project.dependency-directory` (`docs/CLEANUP_RULES.md` section 12). A
-/// layout of the configuration cannot start with one of them, so its units
-/// cannot overlap a unit of a built-in layout. The agent has a test that
-/// this list agrees with its catalog.
-pub const BUILT_IN_LAYOUT_NAMES: [&str; 67] = [
-    "node_modules",
-    ".venv",
-    "venv",
-    "Pods",
-    "target",
-    "project",
-    ".next",
-    ".turbo",
-    ".svelte-kit",
-    ".astro",
-    ".parcel-cache",
-    ".nuxt",
-    ".output",
-    ".angular",
-    ".nx",
-    ".docusaurus",
-    ".yarn",
-    ".vercel",
-    ".wrangler",
-    "dist",
-    "coverage",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    ".nox",
-    ".pixi",
-    ".gradle",
-    ".kotlin",
-    ".cxx",
-    ".externalNativeBuild",
-    "build",
-    "_build",
-    ".elixir_ls",
-    ".lexical",
-    ".expert",
-    "obj",
-    "bin",
-    "artifacts",
-    ".build",
-    "DerivedData",
-    "Carthage",
-    ".zig-cache",
-    "zig-cache",
-    "vendor",
-    "tmp",
-    "var",
-    ".dart_tool",
-    ".bloop",
-    ".metals",
-    "out",
-    ".godot",
-    ".import",
-    ".stack-work",
-    "dist-newstyle",
-    "elm-stuff",
-    ".terraform",
-    "cdk.out",
-    ".aws-sam",
-    ".serverless",
-    "renv",
-    ".direnv",
-    ".devenv",
-    ".jekyll-cache",
-    "resources",
-    "site",
-];
+/// The largest number of names of the directory of a layout of
+/// `project.dependency-directory`, of the table and of the configuration
+/// (`docs/CLEANUP_RULES.md` section 12), for example
+/// `storage/framework/cache`.
+pub const MAX_LAYOUT_DIRECTORY_NAMES: usize = 3;
 
-/// The names that `docs/CLEANUP_RULES.md` section 12 keeps outside the rule
-/// because a removal can lose data that no tool makes again, and that are
-/// not a first name of a built-in layout: `zig-out` (install output),
-/// `deps` of Mix (dependency sources), `_opam` (the pins and the sources of
-/// a local switch), `.hypothesis` (the example database),
-/// `.terragrunt-cache` (local state at each depth), `Saved` of Unreal Engine
-/// (autosaves), and `UserSettings` of Unity (preferences). `vendor` (with
-/// `vendor/cache` and Go `vendor`), `tmp`, `_build` (also beside
-/// `rebar.config`), and the other first names of the table are in
-/// [`BUILT_IN_LAYOUT_NAMES`].
-pub const KEPT_OUT_LAYOUT_NAMES: [&str; 7] = [
+/// The largest number of names of a project marker of a layout of the
+/// configuration, for example `ProjectSettings/ProjectVersion.txt`.
+pub const MAX_MARKER_COMPONENTS: usize = 4;
+
+/// The first names that a layout of the configuration cannot have and that
+/// a pattern name of a layout of the configuration cannot match: the names
+/// that `docs/CLEANUP_RULES.md` section 12 keeps outside the rule because a
+/// removal can lose data that no tool makes again. They are `zig-out`
+/// (install output), `deps` of Mix (dependency sources), `_build` (also
+/// beside `rebar.config`), `vendor` (with `vendor/cache` and Go `vendor`),
+/// `tmp` (the other entries of `tmp` of Rails), `_opam` (the pins and the
+/// sources of a local switch), `.hypothesis` (the example database),
+/// `.terragrunt-cache` (local state at each depth), `.terraform` (the
+/// backend configuration and the selected workspace), `.wrangler` (local
+/// binding data), `Saved` of Unreal Engine (autosaves), and `UserSettings`
+/// of Unity (preferences). The table of the rule has `_build`,
+/// `vendor/bundle`, `vendor` of Composer, `tmp/cache`, and
+/// `.terraform/providers` with their project markers; a layout of the
+/// configuration cannot name them.
+pub const KEPT_OUT_LAYOUT_NAMES: [&str; 12] = [
     "zig-out",
     "deps",
+    "_build",
+    "vendor",
+    "tmp",
     "_opam",
     ".hypothesis",
     ".terragrunt-cache",
+    ".terraform",
+    ".wrangler",
     "Saved",
     "UserSettings",
 ];
@@ -517,12 +462,15 @@ pub const PROTECTED_HOME_NAMES: [&str; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UserLayout {
-    /// The generated directory, relative to the project directory: one
-    /// name, or two names with `/` between them.
+    /// The generated directory, relative to the project directory: one to
+    /// [`MAX_LAYOUT_DIRECTORY_NAMES`] names with `/` between them. The first
+    /// name can be a pattern with `*` and `?`.
     pub directory: String,
-    /// The project markers. One of them must be a regular file in the
-    /// directory that holds the first name of `directory`. A marker can be
-    /// a pattern with `*` and `?`.
+    /// The project markers. One of them must be in the directory that holds
+    /// the first name of `directory`: a regular file, or a directory when
+    /// the marker ends with `/`. A marker is a name, a pattern with `*` and
+    /// `?`, or a relative path of at most [`MAX_MARKER_COMPONENTS`] names
+    /// with no pattern, for example `ProjectSettings/ProjectVersion.txt`.
     pub markers: Vec<String>,
     /// A regular file that the unit must have, when the table gives one.
     pub inner_marker: Option<String>,

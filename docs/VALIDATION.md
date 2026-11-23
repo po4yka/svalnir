@@ -465,7 +465,7 @@ The procedure does not fill a disk, does not change the clock of the host, regis
 
 ### Host procedure for `project.dependency-directory`
 
-The rule has no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/project.dependency-directory/r3/LAYOUT/manual`, one record for each layout, and one for `user-configured` that validates the mechanism and not each layout of a configuration). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects, with disposable projects only. The procedure removes files of that account.
+The rule has no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/project.dependency-directory/r4/LAYOUT/manual`, one record for each layout, and one for `user-configured` that validates the mechanism and not each layout of a configuration). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects, with disposable projects only. The procedure removes files of that account.
 
 **Preparation**
 

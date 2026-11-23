@@ -45,6 +45,12 @@
 //! of the repository has no path in it, so a committed directory with the
 //! same name is never a unit. A directory with a generic name, such as
 //! `build`, and no marker is an ordinary directory, which the walk enters.
+//! The directory of a layout has one to three names, and its first name can
+//! be a pattern such as `cmake-build-*`; a marker can be a directory or a
+//! path in a subdirectory. A distinctive directory with no marker of a
+//! layout with [`Unmarked::ManualOnly`] is a unit of the unmarked layout
+//! name of the layout only when the request allows it (`--allow-unmarked`),
+//! for a manual plan only.
 //! A Cargo `target` directory is the layout `cargo-target`; the rule
 //! `cargo.build-output` is retired and its identity stays reserved.
 //!
@@ -92,14 +98,14 @@ pub use discover::{EnvironmentEvidence, ProjectRequest, examined_for};
 pub(in crate::rules) use inspect::open_search_root;
 pub use inspect::{
     ArgumentRootError, GitAvailability, IN_SEARCH_ROOT, MAX_PROJECT_ROOTS, MAX_SEARCH_ROOTS,
-    ProjectActivity, ProjectHost, ProjectInspection, ProjectLimits, ProjectUnitOutcome,
-    ProjectUnitReport, REPEATED_ROOT, RecheckInput, RootKind, RootSource, SearchCompletion,
-    SearchRootEntry, SearchRootOutcome, SearchRootReport, SearchRoots, UNIT_ABSENT, UnitRecheck,
-    VersionControl, argument_root, recheck_unit,
+    PROJECT_MARKER_ABSENT_ALLOWED, ProjectActivity, ProjectHost, ProjectInspection, ProjectLimits,
+    ProjectUnitOutcome, ProjectUnitReport, REPEATED_ROOT, RecheckInput, RootKind, RootSource,
+    SearchCompletion, SearchRootEntry, SearchRootOutcome, SearchRootReport, SearchRoots,
+    UNIT_ABSENT, UnitRecheck, VersionControl, argument_root, recheck_unit,
 };
 pub use layouts::{
     DirectoryName, MarkerKind, PROJECT_LAYOUT_COUNT, PROJECT_LAYOUTS, PackageCheckouts,
-    ProjectLayout, ProjectMarker, USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW,
+    ProjectLayout, ProjectMarker, USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW, Unmarked,
 };
 pub use mise::{
     IgnoredLink, MAX_LINK_BYTES, MAX_TRACKED_CONFIGS, MiseDiscovery, MiseLocations, MiseRoot,
@@ -120,8 +126,11 @@ pub const PROJECT_RULE_ID: &str = "project.dependency-directory";
 
 /// The revision of the rule. Revision `r3` adds the manual eviction and
 /// accepts a symbolic link below a unit, which the executor removes and
-/// does not follow.
-pub const PROJECT_RULE_REVISION: &str = "r3";
+/// does not follow. Revision `r4` adds 54 layouts, the markers in a
+/// subdirectory and of a directory, the pattern names, the units of three
+/// names and of `.cache`, the unmarked layout names, and the user layouts
+/// with a first name of the table.
+pub const PROJECT_RULE_REVISION: &str = "r4";
 
 const MINUTE: u64 = 60_000_000_000;
 const DAY: u64 = 86_400_000_000_000;
@@ -136,7 +145,7 @@ pub const PROJECT_EVIDENCE_EXPIRY: Nanoseconds = Nanoseconds::new(30_000_000_000
 ///
 /// The retention, the activity windows, and the budget are values of a
 /// proposed rule. No promotion record confirms them (section 3).
-fn declaration() -> Result<RuleDeclaration, RegistryError> {
+fn declaration(table: &[ProjectLayout]) -> Result<RuleDeclaration, RegistryError> {
     let path = |text: &str| {
         LosslessPath::from_bytes(text).map_err(|_| RegistryError::Declaration("a path"))
     };
@@ -150,7 +159,7 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
     // the discovery bound (`docs/CLEANUP_RULES.md` section 12, "Approved
     // roots"), for each layout and for `user-configured`.
     let mut roots: Vec<ApprovedRoot> = Vec::new();
-    for layout in &PROJECT_LAYOUTS {
+    for layout in table {
         let root: ApprovedRoot = ApprovedRoot {
             base: RootBase::UserSelected,
             relative: path(layout.directory)?,
@@ -170,12 +179,18 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
             producer: "project".to_owned(),
             attribution: OwnerAttribution::ProducerLayout,
         },
-        // The layouts of the catalog, then the one layout of the layouts of
-        // the configuration. Each one is `proposed`; `user-configured`
-        // permits at most a manual mode also after a promotion.
-        layouts: PROJECT_LAYOUTS
+        // The layouts of the catalog, then the layout names of their
+        // unmarked units, then the one layout of the layouts of the
+        // configuration. Each one is `proposed`; an unmarked layout name and
+        // `user-configured` permit at most a manual mode also after a
+        // promotion (`svalnir_core::rule::is_manual_only_layout`).
+        layouts: table
             .iter()
             .map(|layout| layout.layout)
+            .chain(table.iter().filter_map(|layout| match layout.unmarked {
+                Unmarked::Never => None,
+                Unmarked::ManualOnly { layout } => Some(layout),
+            }))
             .chain([USER_CONFIGURED_LAYOUT])
             .map(|layout| LayoutSupport {
                 layout: layout.to_owned(),
@@ -218,10 +233,12 @@ fn declaration() -> Result<RuleDeclaration, RegistryError> {
     })
 }
 
-/// The rule `project.dependency-directory`: its checked declaration.
+/// The rule `project.dependency-directory`: its checked declaration and
+/// the table of its layouts.
 #[derive(Debug, Clone)]
 pub struct ProjectRule {
     rule: Rule,
+    table: &'static [ProjectLayout],
 }
 
 impl ProjectRule {
@@ -231,8 +248,20 @@ impl ProjectRule {
     ///
     /// Returns a [`RegistryError`] when the declaration is not complete.
     pub(super) fn new() -> Result<Self, RegistryError> {
-        let rule: Rule = Checked::new(declaration()?).map_err(RegistryError::Incomplete)?;
-        Ok(Self { rule })
+        Self::with_table(&PROJECT_LAYOUTS)
+    }
+
+    /// Makes the rule with the layouts of the table `table`. A test gives
+    /// synthetic layouts here, so that a capability of the walk is proven
+    /// with no layout of [`PROJECT_LAYOUTS`].
+    pub(super) fn with_table(table: &'static [ProjectLayout]) -> Result<Self, RegistryError> {
+        let rule: Rule = Checked::new(declaration(table)?).map_err(RegistryError::Incomplete)?;
+        Ok(Self { rule, table })
+    }
+
+    /// The layouts of the table of the rule.
+    pub(super) fn table(&self) -> &'static [ProjectLayout] {
+        self.table
     }
 
     /// The rule with `lifecycle` for each layout, limited to a manual
@@ -252,6 +281,7 @@ impl ProjectRule {
         };
         Ok(Self {
             rule: super::registry::with_lifecycle(&self.rule, &manual)?,
+            table: self.table,
         })
     }
 

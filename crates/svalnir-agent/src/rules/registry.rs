@@ -229,6 +229,21 @@ impl ReviewedRules {
         Ok(Self { producers, ..self })
     }
 
+    /// The registry with `project.dependency-directory` of the layouts of
+    /// the table `table` in the state `lifecycle`, for a fixture test of a
+    /// capability of the walk with synthetic layouts.
+    #[cfg(test)]
+    pub(crate) fn with_project_table(
+        self,
+        table: &'static [super::projects::ProjectLayout],
+        lifecycle: &LifecycleState,
+    ) -> Result<Self, RegistryError> {
+        Ok(Self {
+            projects: ProjectRule::with_table(table)?.with_lifecycle(lifecycle)?,
+            ..self
+        })
+    }
+
     /// The rule `svalnir.expired-temporary`.
     pub fn expired_temporary(&self) -> &ExpiredTemporaryRule {
         &self.expired_temporary

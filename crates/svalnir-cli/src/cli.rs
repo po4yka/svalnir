@@ -336,6 +336,12 @@ pub struct CleanPlanArgs {
     /// project.dependency-directory` accepts it.
     #[arg(long)]
     pub include_active: bool,
+    /// Also select a distinctive directory with no project marker of a
+    /// layout that permits it, such as `.venv` with `pyvenv.cfg`, as a unit
+    /// of its unmarked layout name. Each other check applies. Only `--rule
+    /// project.dependency-directory` accepts it, for a manual plan only.
+    #[arg(long)]
+    pub allow_unmarked: bool,
     /// Leave out each candidate whose estimate of reclaimable bytes is
     /// smaller than SIZE. Only `--rule project.dependency-directory`
     /// accepts it.
@@ -364,6 +370,11 @@ pub struct CleanInspectArgs {
     pub rule: String,
     #[command(flatten)]
     pub projects: ProjectRootArgs,
+    /// Also show a distinctive directory with no project marker of a
+    /// layout that permits it as a unit of its unmarked layout name. Only
+    /// `--rule project.dependency-directory` accepts it.
+    #[arg(long)]
+    pub allow_unmarked: bool,
 }
 
 /// Manual cleanup mode.

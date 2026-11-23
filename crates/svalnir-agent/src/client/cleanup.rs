@@ -325,6 +325,10 @@ pub struct EvictDiscovery<'a> {
     /// Also select the units of a project whose activity state is
     /// `active`.
     pub include_active: bool,
+    /// Also select a distinctive directory with no project marker of a
+    /// layout that permits it, as a unit of its unmarked layout name
+    /// (`--allow-unmarked`). A manual plan only.
+    pub allow_unmarked: bool,
 }
 
 /// The discovery of `rule` for a manual eviction. `cancel` stops it; a
@@ -348,6 +352,7 @@ pub fn discover_for_manual_eviction(
         recency: sources.recency(&head),
         layouts: &options.config.cleanup().projects.layouts,
         include_active: options.include_active,
+        allow_unmarked: options.allow_unmarked,
         limits: ProjectLimits::default(),
     });
     let rules: [RuleId; 1] = [rule.reference.id.clone()];
@@ -538,13 +543,17 @@ pub fn build_owner_operation_plan(
     .map_err(ManualPlanError::Build)
 }
 
-/// The inspection of `project.dependency-directory` below `roots`.
+/// The inspection of `project.dependency-directory` below `roots`. With
+/// `allow_unmarked`, the inspection also shows the distinctive directories
+/// with no project marker of a layout that permits them, as units of their
+/// unmarked layout names (`--allow-unmarked`).
 #[must_use]
 pub fn inspect_projects(
     registry: &ReviewedRules,
     host: &DiscoveryHost,
     config: &ValidatedConfig,
     roots: &SearchRoots,
+    allow_unmarked: bool,
     environment: &dyn DiscoveryEnvironment,
     cancel: &CancellationToken,
 ) -> ProjectInspection {
@@ -559,6 +568,7 @@ pub fn inspect_projects(
         processes: &processes,
         recency: sources.recency(&head),
         layouts: &config.cleanup().projects.layouts,
+        allow_unmarked,
     };
     registry.projects().inspect(
         project_host,

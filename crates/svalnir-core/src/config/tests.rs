@@ -1353,7 +1353,7 @@ fn each_invalid_directory_of_a_user_layout_has_a_finding() {
             directory.to_owned(),
         ),
         (
-            "directory = \"a/b/c\"\nmarkers = [\"m\"]",
+            "directory = \"a/b/c/d\"\nmarkers = [\"m\"]",
             FindingCode::InvalidPath,
             directory.to_owned(),
         ),
@@ -1403,7 +1403,7 @@ fn each_invalid_directory_of_a_user_layout_has_a_finding() {
             directory.to_owned(),
         ),
         (
-            "directory = \"builddir*\"\nmarkers = [\"m\"]",
+            "directory = \"out/b*\"\nmarkers = [\"m\"]",
             FindingCode::InvalidPath,
             directory.to_owned(),
         ),
@@ -1444,7 +1444,32 @@ fn each_invalid_key_of_a_user_layout_has_a_finding() {
             markers.to_owned(),
         ),
         (
-            "directory = \"builddir\"\nmarkers = [\"sub/m\"]",
+            "directory = \"out\"\nmarkers = [\"sub/*.m\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"a/b/c/d/e\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"/abs\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"a//b\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\".git/HEAD\"]",
+            FindingCode::InvalidPath,
+            first("markers[0]"),
+        ),
+        (
+            "directory = \"out\"\nmarkers = [\"x/.cache/\"]",
             FindingCode::InvalidPath,
             first("markers[0]"),
         ),
@@ -1552,25 +1577,21 @@ fn the_user_layout_example_of_the_policy_spec_validates() {
 }
 
 #[test]
-fn a_user_layout_cannot_overlap_a_built_in_layout_or_a_kept_out_name() {
+fn a_user_layout_can_use_a_built_in_name_but_not_a_kept_out_name() {
     let directory = "cleanup.projects.layouts[0].directory";
+    // The names that the rule keeps out (owner decision of 2026-11-23).
     for name in [
-        "node_modules",
-        "node_modules/foo",
         "Vendor/x",
         "vendor",
         "tmp",
         "tmp/sessions",
-        "build/cache",
         "_build",
-        "target",
         "zig-out",
         "deps",
         "DEPS/x",
-        "out",
-        "coverage/x",
-        "var/cache",
         ".terraform",
+        ".terraform/providers",
+        ".wrangler/state",
         "_opam",
         ".hypothesis",
         ".terragrunt-cache",
@@ -1585,11 +1606,69 @@ fn a_user_layout_cannot_overlap_a_built_in_layout_or_a_kept_out_name() {
             directory,
         );
     }
-    // A built-in name as the second name does not overlap a built-in unit:
-    // the walk does not enter a unit.
-    valid(&layout_document(
-        "directory = \"builddir/build\"\nmarkers = [\"m\"]",
+    // A first name of a layout of the table: the layouts of the table come
+    // first, and `overlaps_unit` refuses a unit in or around a unit of the
+    // table.
+    for name in [
+        "build",
+        "target",
+        "node_modules/foo",
+        "build/cache",
+        "out/build",
+    ] {
+        let config: ValidatedConfig = valid(&layout_document(&format!(
+            "directory = \"{name}\"\nmarkers = [\"CMakeLists.txt\"]"
+        )));
+        assert_eq!(config.cleanup().projects.layouts[0].directory, name);
+    }
+}
+
+#[test]
+fn a_user_layout_has_three_names_at_most_and_a_pattern_in_its_first_name_only() {
+    let directory = "cleanup.projects.layouts[0].directory";
+    let config: ValidatedConfig = valid(&layout_document(
+        "directory = \"storage/framework/cache\"\nmarkers = [\"artisan\"]",
     ));
+    assert_eq!(
+        config.cleanup().projects.layouts[0].directory,
+        "storage/framework/cache"
+    );
+    for pattern in ["cmake-build-*", "*.egg-info", "out?/cache"] {
+        valid(&layout_document(&format!(
+            "directory = \"{pattern}\"\nmarkers = [\"CMakeLists.txt\"]"
+        )));
+    }
+    // A pattern that matches each name, that has no specific literal part,
+    // or that can match a name of the skip list, a kept-out name, or a
+    // protected name. The comparison ignores the case of ASCII letters.
+    for pattern in [
+        "*", "**", "*.*", "?", "a*", "*e", ".c*", "*CACHE", "de*", "*mp", "zig-*", "_bu*", "VEND*",
+        "Doc*", "*rary", "*.git",
+    ] {
+        assert_one(
+            &layout_document(&format!(
+                "directory = \"{pattern}\"\nmarkers = [\"CMakeLists.txt\"]"
+            )),
+            FindingCode::InvalidPath,
+            directory,
+        );
+    }
+}
+
+#[test]
+fn a_user_marker_can_be_a_directory_or_a_path_in_a_subdirectory() {
+    let config: ValidatedConfig = valid(&layout_document(
+        "directory = \"Library2\"\nmarkers = [\"ProjectSettings/ProjectVersion.txt\", \".storybook/\", \"Assets/Scenes/\", \"*.xcodeproj/\"]",
+    ));
+    assert_eq!(
+        config.cleanup().projects.layouts[0].markers,
+        [
+            "ProjectSettings/ProjectVersion.txt",
+            ".storybook/",
+            "Assets/Scenes/",
+            "*.xcodeproj/"
+        ]
+    );
 }
 
 #[test]

@@ -912,6 +912,9 @@ fn build_report(arguments: &Arguments<'_>) -> Result<Vec<String>, String> {
     Ok(command)
 }
 
+/// The description of the option `allow_unmarked` of `inspect` and `plan`.
+const UNMARKED_DESCRIPTION: &str = "Also select a distinctive directory with no project marker of a layout that permits it, such as `.venv` with `pyvenv.cfg`, as a unit of its unmarked layout name (layout name with `+unmarked`). Each other check applies. Rule `project.dependency-directory` only, for a manual plan only; ask the user before you use it.";
+
 fn project_roots(arguments: &Arguments<'_>, command: &mut Vec<String>) -> Result<(), String> {
     for root in arguments.texts("roots")? {
         option(command, "root", Some(root));
@@ -924,6 +927,11 @@ fn build_inspect(arguments: &Arguments<'_>) -> Result<Vec<String>, String> {
     let mut command: Vec<String> = vec!["clean".to_owned(), "inspect".to_owned()];
     option(&mut command, "rule", Some(arguments.required_text("rule")?));
     project_roots(arguments, &mut command)?;
+    switch(
+        &mut command,
+        "allow-unmarked",
+        arguments.flag("allow_unmarked")?,
+    );
     Ok(command)
 }
 
@@ -946,6 +954,11 @@ fn build_plan(arguments: &Arguments<'_>) -> Result<Vec<String>, String> {
         &mut command,
         "include-active",
         arguments.flag("include_active")?,
+    );
+    switch(
+        &mut command,
+        "allow-unmarked",
+        arguments.flag("allow_unmarked")?,
     );
     option(&mut command, "min-size", arguments.text("min_size")?);
     Ok(command)
@@ -1067,6 +1080,7 @@ static TOOLS: [Tool; 8] = [
                 "rule": text_property("The ID of a reviewed rule with the inspection mode, for example `project.dependency-directory` or `go.build-cache`."),
                 "roots": list_property(ROOT_DESCRIPTION),
                 "no_mise": flag_property("Do not add the project roots that mise records."),
+                "allow_unmarked": flag_property(UNMARKED_DESCRIPTION),
             })
         },
         required: &["rule"],
@@ -1089,6 +1103,7 @@ static TOOLS: [Tool; 8] = [
                 "roots": list_property(ROOT_DESCRIPTION),
                 "no_mise": flag_property("Do not add the project roots that mise records."),
                 "include_active": flag_property("Also select the projects whose activity state is `active` (rule `project.dependency-directory` only)."),
+                "allow_unmarked": flag_property(UNMARKED_DESCRIPTION),
                 "min_size": text_property("Leave out each candidate smaller than this size, for example `100MiB` (rule `project.dependency-directory` only)."),
             })
         },

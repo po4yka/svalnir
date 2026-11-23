@@ -421,6 +421,10 @@ fn owner_inset(rule: &RuleInspection, mono: &SharedString, tokens: &Tokens) -> O
     )
 }
 
+/// The label of the option `--allow-unmarked` of
+/// `project.dependency-directory`.
+const UNMARKED_CONSENT: &str = "Include directories with no project marker, such as a .venv with pyvenv.cfg. Each other check applies; for this manual plan only.";
+
 /// The options of the plan of a rule that the rule permits.
 fn plan_options(
     rule: &RuleInspection,
@@ -441,6 +445,14 @@ fn plan_options(
             model_entity,
             id,
             |options, value| options.include_active = value,
+        ));
+        out.push(option_checkbox(
+            &format!("cleanup-unmarked-{id}"),
+            UNMARKED_CONSENT,
+            options.allow_unmarked,
+            model_entity,
+            id,
+            |options, value| options.allow_unmarked = value,
         ));
         out.push(min_size_control(id, options, model_entity, tokens));
     }

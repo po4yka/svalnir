@@ -51,9 +51,15 @@ pub(crate) fn option_not_accepted() -> ErrorBody {
         "option_not_accepted",
         ErrorFamily::Request,
         ErrorStage::Arguments,
-        "`--root`, `--no-mise`, `--include-active`, and `--min-size` are options of `--mode evict --rule project.dependency-directory`, and `clean inspect` takes `--root` and `--no-mise` for the rules that search projects; the command made no change",
+        "`--root`, `--no-mise`, `--include-active`, `--allow-unmarked`, and `--min-size` are options of `--mode evict --rule project.dependency-directory`, and `clean inspect` takes `--root` and `--no-mise` for the rules that search projects and `--allow-unmarked` for `project.dependency-directory`; the command made no change",
     )
-    .with_fields(&["root", "no_mise", "include_active", "min_size"])
+    .with_fields(&[
+        "root",
+        "no_mise",
+        "include_active",
+        "allow_unmarked",
+        "min_size",
+    ])
 }
 
 /// Refuses the project options of `clean plan` for a mode or a rule that
@@ -68,6 +74,7 @@ pub(crate) fn check_plan_options(arguments: &crate::cli::CleanPlanArgs) -> Resul
     let project_options: bool = !arguments.projects.roots.is_empty()
         || arguments.projects.no_mise
         || arguments.include_active
+        || arguments.allow_unmarked
         || arguments.min_size.is_some();
     if project_options && !project_rule {
         return Err(option_not_accepted());
@@ -391,9 +398,13 @@ impl InspectView {
                     }
                     ProjectUnitOutcome::Checked => "checked".to_owned(),
                 };
+                // A unit of an unmarked layout name has no project marker.
+                let allowance: String = unit
+                    .marker_allowance
+                    .map_or_else(String::new, |allowance| format!("   {allowance}"));
                 put_line!(
                     out,
-                    "  Unit: {}   {}   {outcome}",
+                    "  Unit: {}   {}   {outcome}{allowance}",
                     unit.path.display(),
                     unit.layout
                 );
@@ -539,10 +550,13 @@ fn label<T: Serialize>(value: &T) -> String {
     }
 }
 
-/// Refuses `--root` and `--no-mise` for a rule that does not search
-/// projects.
+/// Refuses `--root`, `--no-mise`, and `--allow-unmarked` for a rule that
+/// does not search projects.
 fn no_project_roots(arguments: &CleanInspectArgs) -> Result<(), ErrorBody> {
-    if !arguments.projects.roots.is_empty() || arguments.projects.no_mise {
+    if !arguments.projects.roots.is_empty()
+        || arguments.projects.no_mise
+        || arguments.allow_unmarked
+    {
         return Err(option_not_accepted());
     }
     Ok(())
@@ -581,6 +595,7 @@ impl InspectContext<'_> {
     fn projects(
         &self,
         arguments: &ProjectRootArgs,
+        allow_unmarked: bool,
     ) -> Result<(ProjectInspection, MiseDiscovery), ErrorBody> {
         let roots: ProjectRoots = project_roots(
             self.environment,
@@ -597,6 +612,7 @@ impl InspectContext<'_> {
             self.host,
             self.config,
             &roots.roots,
+            allow_unmarked,
             self.evidence.as_ref(),
             self.cancel,
         );
@@ -623,12 +639,16 @@ impl InspectContext<'_> {
     }
 
     /// The inspection of `git.linked-worktree`. The rule has search roots
-    /// only: a project root of mise is not walked for it.
-    fn worktrees(&self, arguments: &ProjectRootArgs) -> Result<WorktreeInspection, ErrorBody> {
+    /// only: a project root of mise is not walked for it, and it takes no
+    /// `--allow-unmarked`.
+    fn worktrees(&self, arguments: &CleanInspectArgs) -> Result<WorktreeInspection, ErrorBody> {
+        if arguments.allow_unmarked {
+            return Err(option_not_accepted());
+        }
         let roots: ProjectRoots = project_roots(
             self.environment,
             self.config,
-            arguments,
+            &arguments.projects,
             self.locations,
             false,
         )?;
@@ -706,12 +726,12 @@ pub(crate) fn inspect(
         )
     });
     if rule == PROJECT_RULE_ID {
-        let (inspection, mise) = context.projects(&arguments.projects)?;
+        let (inspection, mise) = context.projects(&arguments.projects, arguments.allow_unmarked)?;
         view.projects = Some(inspection);
         view.mise = Some(mise);
     } else if rule == WORKTREE_RULE_ID {
         view.kind = "worktree";
-        view.worktrees = Some(context.worktrees(&arguments.projects)?);
+        view.worktrees = Some(context.worktrees(arguments)?);
     } else if let Some(cache) = registry.cache(rule) {
         no_project_roots(arguments)?;
         view.kind = "cache";

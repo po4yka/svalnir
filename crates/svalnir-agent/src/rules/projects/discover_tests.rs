@@ -12,13 +12,16 @@ use svalnir_core::id::RuleId;
 use svalnir_core::rule::{Fact, RuleMode};
 use svalnir_core::time::WallTime;
 
+use super::inspect::recheck_unit_in;
 use super::tests::{DAY, Home, NoActivity};
 use super::{
-    AgentListing, AgentStatus, ArgumentRootError, BuildProcesses, GitHeadActivity, HeadActivity,
-    MiseLocations, MiseState, PROJECT_RULE_ID, ProjectLimits, ProjectProcess, ProjectRequest,
-    RecencyHost, RecheckInput, RootKind, RootSource, SearchRootEntry, SearchRoots, SourceReading,
-    UnitRecheck, argument_root, project_root, recheck_unit, tracked_projects,
+    AgentListing, AgentStatus, ArgumentRootError, BuildProcesses, DirectoryName, GitHeadActivity,
+    HeadActivity, MarkerKind, MiseLocations, MiseState, PROJECT_RULE_ID, PackageCheckouts,
+    ProjectLayout, ProjectLimits, ProjectMarker, ProjectProcess, ProjectRequest, RecencyHost,
+    RecheckInput, RootKind, RootSource, SearchRootEntry, SearchRoots, SourceReading, UnitRecheck,
+    Unmarked, argument_root, project_root, recheck_unit, tracked_projects,
 };
+use crate::rules::caches::ReclaimBasis;
 use crate::rules::fixture::{
     FixtureEnvironment, automatic_eviction_validated, manual_action_validated,
 };
@@ -28,6 +31,7 @@ use crate::rules::{
     ReviewedRules, RootResult, SkipReason, automatic_roots,
 };
 use crate::scan::{CancellationToken, ScanClock as _};
+use svalnir_core::rule::RuleRegistry as _;
 
 // ---------------------------------------------------------------------
 // The roots of a request.
@@ -214,6 +218,7 @@ fn an_excluded_location_refuses_a_root_whose_case_differs() {
         },
         layouts: &[],
         include_active: false,
+        allow_unmarked: false,
         limits: ProjectLimits::default(),
     };
     let discovery = world.registry.discover_for_eviction(
@@ -379,6 +384,8 @@ struct World {
     home: Home,
     evidence: FixtureEnvironment,
     registry: ReviewedRules,
+    /// The option `--allow-unmarked` of each request.
+    allow_unmarked: bool,
 }
 
 impl World {
@@ -393,6 +400,7 @@ impl World {
             home: Home::new(),
             evidence: FixtureEnvironment::days_later(days),
             registry: ReviewedRules::with_fixture_lifecycle(&manual_action_validated()).unwrap(),
+            allow_unmarked: false,
         }
     }
 
@@ -438,6 +446,7 @@ impl World {
             },
             layouts: &[],
             include_active,
+            allow_unmarked: self.allow_unmarked,
             limits: ProjectLimits::default(),
         };
         let rules: [RuleId; 1] = [RuleId::new(PROJECT_RULE_ID).unwrap()];
@@ -906,4 +915,340 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
         evidence.unit_recheck(home.principal, &xcode, Some("x"), &root, &modules, &[]),
         UnitRecheck::Passed
     );
+}
+
+// ---------------------------------------------------------------------
+// Unmarked directories, and the checks before a step of the new
+// capabilities of the walk.
+// ---------------------------------------------------------------------
+
+/// A project at `Code/NAME` with an environment `.venv` that Git ignores
+/// and no project marker.
+fn unmarked_venv(home: &Home, name: &str) -> PathBuf {
+    home.project_files(
+        name,
+        &[],
+        "/.venv/\n",
+        &[".venv/pyvenv.cfg", ".venv/bin/python"],
+    )
+}
+
+#[test]
+fn an_unmarked_directory_is_a_candidate_of_a_manual_plan_only_with_the_option() {
+    let mut world = World::new();
+    let project: PathBuf = unmarked_venv(&world.home, "app");
+    let discovery = world.discover(false);
+    assert_eq!(eligible(&discovery), Vec::<PathBuf>::new());
+    assert_eq!(
+        reasons(&discovery, "app/.venv"),
+        [SkipReason::UnsupportedLayout]
+    );
+    world.allow_unmarked = true;
+    let discovery = world.discover(false);
+    assert_eq!(eligible(&discovery), [project.join(".venv")]);
+    let candidate = &discovery.candidates[0];
+    // The layout name of the plan target shows that the unit has no
+    // project marker.
+    assert_eq!(candidate.candidate.layout, "python-venv+unmarked");
+    assert_eq!(
+        candidate.discovered.file_binding().layout.as_deref(),
+        Some("python-venv+unmarked")
+    );
+    // The readiness of the candidate is never `ready`: no state of the
+    // layout permits an automatic eviction.
+    assert_eq!(
+        candidate.candidate.candidate.facts.rule_readiness,
+        svalnir_core::policy::RuleReadiness::NotReady
+    );
+}
+
+#[test]
+fn the_inner_marker_is_still_required_with_the_option() {
+    let mut world = World::new();
+    world.allow_unmarked = true;
+    world
+        .home
+        .project_files("app", &[], "/.venv/\n", &[".venv/bin/python"]);
+    let discovery = world.discover(false);
+    assert_eq!(eligible(&discovery), Vec::<PathBuf>::new());
+    assert_eq!(
+        reasons(&discovery, "app/.venv"),
+        [SkipReason::UnsupportedLayout]
+    );
+}
+
+#[test]
+fn no_automatic_path_binds_an_unmarked_unit() {
+    let mut world = World::new();
+    world.registry =
+        ReviewedRules::with_fixture_lifecycle(&automatic_eviction_validated()).unwrap();
+    world.allow_unmarked = true;
+    unmarked_venv(&world.home, "app");
+    // The discovery for an automatic eviction (the controller and the
+    // candidate source of the agent) never examines the rule.
+    let head = GitHeadActivity::new(Ok(&world.home.git));
+    let automatic = world.discover_with(
+        &World::code(),
+        true,
+        &head,
+        &NoActivity,
+        &RuleMode::AutomaticEviction,
+    );
+    assert_eq!(automatic.candidates.len(), 0);
+    assert_eq!(automatic.roots.len(), 0);
+    // The manual discovery of the same registry gives the unit; its root is
+    // never an approved root of an automatic operation.
+    let manual = world.discover(false);
+    assert_eq!(eligible(&manual).len(), 1);
+    let approved = automatic_roots(
+        &world.registry,
+        &[RuleId::new(PROJECT_RULE_ID).unwrap()],
+        &world.home.locations,
+    );
+    assert!(
+        approved
+            .root(&manual.candidates[0].discovered.root.root_id)
+            .is_none()
+    );
+    // The registry, which the readiness of a candidate, the controller, and
+    // the authority checks ask, refuses the automatic mode for the layout.
+    let rule = world.registry.projects().rule();
+    let support = rule
+        .layouts
+        .iter()
+        .find(|layout| layout.layout == "python-venv+unmarked")
+        .unwrap();
+    assert!(support.permits(&RuleMode::ManualEviction));
+    assert!(!support.permits(&RuleMode::AutomaticEviction));
+    assert_eq!(
+        world
+            .registry
+            .resolve(
+                &rule.reference,
+                "python-venv+unmarked",
+                &RuleMode::AutomaticEviction
+            )
+            .err(),
+        Some(svalnir_core::rule::RuleRefusal::ModeNotValidated)
+    );
+    assert!(
+        world
+            .registry
+            .resolve(
+                &rule.reference,
+                "python-venv+unmarked",
+                &RuleMode::ManualEviction
+            )
+            .is_ok()
+    );
+    // The declaration check refuses the state "Automatic eviction
+    // validated" for the layout, also if the rule had an automatic mode.
+    let mut declaration: svalnir_core::rule::RuleDeclaration = (**rule).clone();
+    declaration.modes.push(RuleMode::AutomaticEviction);
+    for layout in &mut declaration.layouts {
+        if layout.layout == "python-venv+unmarked" {
+            layout.lifecycle = automatic_eviction_validated();
+        }
+    }
+    assert!(
+        svalnir_core::action::Checked::<svalnir_core::rule::RuleDeclaration>::new(declaration)
+            .is_err()
+    );
+}
+
+#[test]
+fn the_check_before_a_step_of_an_unmarked_unit_keeps_each_check() {
+    let home = Home::new();
+    let evidence = FixtureEnvironment::days_later(0);
+    let none: BuildProcesses = complete(Vec::new(), &evidence);
+    let project: PathBuf = unmarked_venv(&home, "app");
+    let venv: PathBuf = project.join(".venv");
+    assert_eq!(
+        recheck(&home, "python-venv+unmarked", &venv, &none, &evidence),
+        UnitRecheck::Passed
+    );
+    // The layout with a marker refuses the unit, which has no marker.
+    assert_eq!(
+        recheck(&home, "python-venv", &venv, &none, &evidence),
+        UnitRecheck::Refused("project_marker_missing")
+    );
+    // A layout name of unmarked units that no layout has.
+    assert_eq!(
+        recheck(&home, "pycache+unmarked", &venv, &none, &evidence),
+        UnitRecheck::Refused("unit_layout_changed")
+    );
+    // The inner marker is gone.
+    fs::rename(venv.join("pyvenv.cfg"), project.join("pyvenv.cfg")).unwrap();
+    assert_eq!(
+        recheck(&home, "python-venv+unmarked", &venv, &none, &evidence),
+        UnitRecheck::Refused("unsupported_layout")
+    );
+    fs::rename(project.join("pyvenv.cfg"), venv.join("pyvenv.cfg")).unwrap();
+    // A build process in the project.
+    let building = complete(
+        vec![ProjectProcess {
+            executable: PathBuf::from("/usr/bin/python3"),
+            working_directory: Some(project.clone()),
+        }],
+        &evidence,
+    );
+    assert_eq!(
+        recheck(&home, "python-venv+unmarked", &venv, &building, &evidence),
+        UnitRecheck::Refused("producer_active")
+    );
+    // A project marker appears: the unit is a different kind of directory
+    // than at the plan.
+    home.write("Code/app/pyproject.toml", b"[project]\n");
+    assert_eq!(
+        recheck(&home, "python-venv+unmarked", &venv, &none, &evidence),
+        UnitRecheck::Refused("unit_layout_changed")
+    );
+}
+
+static RECHECK_TABLE: [ProjectLayout; 2] = [
+    ProjectLayout {
+        directory: "*-cache",
+        layout: "pattern-cache",
+        project_markers: &[ProjectMarker {
+            name: "conf/tool.cfg",
+            kind: MarkerKind::File,
+        }],
+        inner_marker: None,
+        project_file: None,
+        protected: &[],
+        name: DirectoryName::Generic,
+        unmarked: Unmarked::Never,
+        checkouts: PackageCheckouts::None,
+        reclaim: ReclaimBasis::AllocatedBytes,
+        owner_workflow: "A test layout.",
+        rebuild_impact: "A test layout.",
+    },
+    ProjectLayout {
+        directory: "a/b/c",
+        layout: "three-names",
+        project_markers: &[ProjectMarker {
+            name: ".tool",
+            kind: MarkerKind::Directory,
+        }],
+        inner_marker: None,
+        project_file: None,
+        protected: &[],
+        name: DirectoryName::Generic,
+        unmarked: Unmarked::Never,
+        checkouts: PackageCheckouts::None,
+        reclaim: ReclaimBasis::AllocatedBytes,
+        owner_workflow: "A test layout.",
+        rebuild_impact: "A test layout.",
+    },
+];
+
+#[test]
+fn the_check_before_a_step_matches_a_pattern_name_and_three_names() {
+    let home = Home::new();
+    let evidence = FixtureEnvironment::days_later(0);
+    let none: BuildProcesses = complete(Vec::new(), &evidence);
+    home.write("Code/p/conf/tool.cfg", b"x");
+    home.write("Code/p/x-cache/a", b"x");
+    home.write("Code/p/.tool/keep", b"x");
+    home.write("Code/p/a/b/c/data", b"x");
+    let check = |layout: &str, unit: &Path| {
+        recheck_unit_in(
+            &RECHECK_TABLE,
+            &RecheckInput {
+                principal: home.principal,
+                layout,
+                root: &home.path.join("Code"),
+                unit,
+                user_layouts: &[],
+                processes: &none,
+                now: evidence.now().monotonic_ns,
+                expiry: super::PROJECT_EVIDENCE_EXPIRY,
+            },
+        )
+    };
+    let pattern: PathBuf = home.path.join("Code/p/x-cache");
+    let three: PathBuf = home.path.join("Code/p/a/b/c");
+    assert_eq!(check("pattern-cache", &pattern), UnitRecheck::Passed);
+    assert_eq!(check("three-names", &three), UnitRecheck::Passed);
+    // A name that the pattern does not match.
+    home.write("Code/p/x-CACHE2/a", b"x");
+    assert_eq!(
+        check("pattern-cache", &home.path.join("Code/p/x-CACHE2")),
+        UnitRecheck::Refused("unit_layout_changed")
+    );
+    // The directory on the way of the marker is now a symbolic link.
+    fs::rename(
+        home.path.join("Code/p/conf"),
+        home.path.join("Code/p/conf2"),
+    )
+    .unwrap();
+    symlink(
+        home.path.join("Code/p/conf2"),
+        home.path.join("Code/p/conf"),
+    )
+    .unwrap();
+    assert_eq!(
+        check("pattern-cache", &pattern),
+        UnitRecheck::Refused("project_marker_missing")
+    );
+    // The middle name is now a symbolic link.
+    fs::rename(home.path.join("Code/p/a/b"), home.path.join("Code/p/a/b2")).unwrap();
+    symlink(home.path.join("Code/p/a/b2"), home.path.join("Code/p/a/b")).unwrap();
+    assert_eq!(
+        check("three-names", &three),
+        UnitRecheck::Refused("unit_path_not_plain")
+    );
+}
+
+#[test]
+fn the_check_before_a_step_refuses_a_user_unit_when_a_table_marker_appears() {
+    let home = Home::new();
+    let evidence = FixtureEnvironment::days_later(0);
+    let none: BuildProcesses = complete(Vec::new(), &evidence);
+    home.write("Code/c/CMakeLists.txt", b"project(c)\n");
+    home.write("Code/c/build/a.o", b"x");
+    let validation = svalnir_core::config::parse_and_validate(
+        "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"build\"\nmarkers = [\"CMakeLists.txt\"]\n",
+    );
+    let layouts = validation
+        .config()
+        .unwrap()
+        .cleanup()
+        .projects
+        .layouts
+        .clone();
+    let build: PathBuf = home.path.join("Code/c/build");
+    let check = || {
+        recheck_unit(&RecheckInput {
+            principal: home.principal,
+            layout: "user-configured",
+            root: &home.path.join("Code"),
+            unit: &build,
+            user_layouts: &layouts,
+            processes: &none,
+            now: evidence.now().monotonic_ns,
+            expiry: super::PROJECT_EVIDENCE_EXPIRY,
+        })
+    };
+    assert_eq!(check(), UnitRecheck::Passed);
+    home.write("Code/c/build.gradle", b"plugins {}\n");
+    assert_eq!(check(), UnitRecheck::Refused("unit_layout_changed"));
+}
+
+#[test]
+fn a_unit_of_a_pattern_name_of_a_synthetic_table_is_a_candidate() {
+    let mut world = World::new();
+    world.registry = ReviewedRules::new()
+        .unwrap()
+        .with_project_table(&RECHECK_TABLE, &manual_action_validated())
+        .unwrap();
+    let project: PathBuf = world.home.project_files(
+        "p",
+        &["conf/tool.cfg"],
+        "*-cache/\n",
+        &["build-cache/a.bin"],
+    );
+    let discovery = world.discover(false);
+    assert_eq!(eligible(&discovery), [project.join("build-cache")]);
+    assert_eq!(discovery.candidates[0].candidate.layout, "pattern-cache");
 }

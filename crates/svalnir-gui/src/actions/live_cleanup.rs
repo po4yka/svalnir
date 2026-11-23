@@ -423,6 +423,7 @@ fn inspect_projects(
         &host.inspection(),
         &host.config,
         &roots.roots,
+        false,
         host.evidence.as_ref(),
         cancel,
     );
@@ -773,6 +774,7 @@ fn build_evict(
             config: &host.config,
             roots: roots.as_ref().map(|roots| &roots.roots),
             include_active: request.options.include_active,
+            allow_unmarked: request.options.allow_unmarked,
         },
         cancel,
     );

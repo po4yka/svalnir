@@ -488,6 +488,7 @@ mod tests {
                 PlanKind::Evict,
                 CleanupOptions {
                     include_active: true,
+                    allow_unmarked: false,
                     min_size: Some(100 * MIB),
                     include_clear: false,
                 },

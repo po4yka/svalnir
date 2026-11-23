@@ -1581,7 +1581,14 @@ fn a_user_layout_can_use_a_built_in_name_but_not_a_kept_out_name() {
     let directory = "cleanup.projects.layouts[0].directory";
     // The names that the rule keeps out (owner decision of 2026-11-23).
     for name in [
-        "Vendor/x", "vendor", "tmp", "tmp/sessions", "_build", "zig-out", "deps", "DEPS/x",
+        "Vendor/x",
+        "vendor",
+        "tmp",
+        "tmp/sessions",
+        "_build",
+        "zig-out",
+        "deps",
+        "DEPS/x",
     ] {
         assert_one(
             &layout_document(&format!(
@@ -1594,7 +1601,13 @@ fn a_user_layout_can_use_a_built_in_name_but_not_a_kept_out_name() {
     // A first name of a layout of the table: the layouts of the table come
     // first, and `overlaps_unit` refuses a unit in or around a unit of the
     // table.
-    for name in ["build", "target", "node_modules/foo", "build/cache", "out/build"] {
+    for name in [
+        "build",
+        "target",
+        "node_modules/foo",
+        "build/cache",
+        "out/build",
+    ] {
         let config: ValidatedConfig = valid(&layout_document(&format!(
             "directory = \"{name}\"\nmarkers = [\"CMakeLists.txt\"]"
         )));
@@ -1621,8 +1634,8 @@ fn a_user_layout_has_three_names_at_most_and_a_pattern_in_its_first_name_only() 
     // or that can match a name of the skip list, a kept-out name, or a
     // protected name. The comparison ignores the case of ASCII letters.
     for pattern in [
-        "*", "**", "*.*", "?", "a*", "*e", ".c*", "*CACHE", "de*", "*mp", "zig-*", "_bu*",
-        "VEND*", "Doc*", "*rary", "*.git",
+        "*", "**", "*.*", "?", "a*", "*e", ".c*", "*CACHE", "de*", "*mp", "zig-*", "_bu*", "VEND*",
+        "Doc*", "*rary", "*.git",
     ] {
         assert_one(
             &layout_document(&format!(

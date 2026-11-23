@@ -618,3 +618,74 @@ fn clean_inspect_reports_the_units_of_the_rules_that_have_an_inspection() {
     // The inspection removed nothing.
     assert!(app.join("node_modules/left-pad/index.js").exists());
 }
+
+#[test]
+fn clean_inspect_shows_an_unmarked_directory_only_with_allow_unmarked() {
+    let world = World::new(None);
+    world.write("Code/scripts/.gitignore", b"/.venv/\n");
+    world.repository("Code/scripts");
+    world.write("Code/scripts/.venv/pyvenv.cfg", b"home = /usr/bin\n");
+    let venv: PathBuf = world.home.join("Code/scripts/.venv");
+    let root: String = world.root();
+    let inspect = |extra: &[&str]| {
+        let mut arguments: Vec<&str> = vec![
+            "clean",
+            "inspect",
+            "--rule",
+            RULE,
+            "--root",
+            &root,
+            "--no-mise",
+        ];
+        arguments.extend_from_slice(extra);
+        json(&world.environment, &arguments)
+    };
+    let unit_of = |result: &Value| {
+        result["projects"]["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|unit| unit["path"] == text(&venv))
+            .cloned()
+            .unwrap()
+    };
+    let plain = inspect(&[]);
+    assert_eq!(plain.status, ExitStatus::Success, "{}", plain.stdout);
+    let unit: Value = unit_of(&plain.result());
+    assert_eq!(unit["layout"], "python-venv");
+    assert_eq!(
+        unit["outcome"]["reason"], "project_marker_missing",
+        "{unit}"
+    );
+    assert_eq!(unit["marker_allowance"], Value::Null);
+    let allowed = inspect(&["--allow-unmarked"]);
+    assert_eq!(allowed.status, ExitStatus::Success, "{}", allowed.stdout);
+    let unit: Value = unit_of(&allowed.result());
+    assert_eq!(unit["layout"], "python-venv+unmarked");
+    assert_eq!(unit["marker_allowance"], "project_marker_absent_allowed");
+    assert_eq!(unit["outcome"]["kind"], "measured", "{unit}");
+    // The option with another rule or another mode.
+    for arguments in [
+        &[
+            "clean",
+            "inspect",
+            "--rule",
+            "go.build-cache",
+            "--allow-unmarked",
+        ][..],
+        &[
+            "clean",
+            "plan",
+            "--mode",
+            "evict",
+            "--rule",
+            "xcode.inactive-derived-data",
+            "--allow-unmarked",
+        ][..],
+        &["clean", "plan", "--scan", "s", "--allow-unmarked"][..],
+    ] {
+        let outcome = json(&world.environment, arguments);
+        assert_eq!(outcome.status, ExitStatus::Usage, "{}", outcome.stdout);
+        assert_eq!(outcome.error_code(), "option_not_accepted");
+    }
+}

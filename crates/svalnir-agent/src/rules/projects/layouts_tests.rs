@@ -13,10 +13,11 @@ use svalnir_core::rule::{LifecycleState, RuleMode, RuleRefusal, RuleRegistry};
 use super::inspect::{ChildSearch, find_protected, glob_matches};
 use super::tests::{Home, no_recency, quiet, refusal, unit};
 use super::{
-    MarkerKind, PROJECT_LAYOUTS, ProjectInspection, ProjectLimits, ProjectMarker,
-    ProjectUnitOutcome,
+    DirectoryName, MarkerKind, PROJECT_LAYOUTS, PackageCheckouts, ProjectInspection, ProjectLayout,
+    ProjectLimits, ProjectMarker, ProjectUnitOutcome, Unmarked,
 };
 use crate::rules::ReviewedRules;
+use crate::rules::caches::ReclaimBasis;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
 use crate::rules::nested_git::RefusalReason;
 use crate::scan::WallScanClock;
@@ -116,16 +117,97 @@ fn the_bin_directory_of_dotnet_needs_the_restore_output_beside_it() {
 }
 
 #[test]
-fn the_first_names_of_the_catalog_are_reserved_in_the_configuration() {
-    let mut names: Vec<&str> = PROJECT_LAYOUTS
+fn each_layout_of_the_catalog_keeps_the_bounds_of_the_walk() {
+    use svalnir_core::config::{
+        KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_DIRECTORY_NAMES, SKIPPED_DIRECTORY_NAMES,
+    };
+    for layout in &PROJECT_LAYOUTS {
+        let names: Vec<&str> = layout.directory.split('/').collect();
+        assert!(
+            (1..=MAX_LAYOUT_DIRECTORY_NAMES).contains(&names.len()),
+            "{}",
+            layout.layout
+        );
+        // Only the first name can be a pattern.
+        assert!(
+            names[1..].iter().all(|name| !name.contains(['*', '?'])),
+            "{}",
+            layout.layout
+        );
+        // A pattern never matches a name that the rule keeps out or a name
+        // of the skip list.
+        if names[0].contains(['*', '?']) {
+            for refused in KEPT_OUT_LAYOUT_NAMES
+                .iter()
+                .chain(SKIPPED_DIRECTORY_NAMES.iter())
+            {
+                assert!(
+                    !glob_matches(names[0].as_bytes(), refused.as_bytes(), true),
+                    "{} matches {refused}",
+                    layout.layout
+                );
+            }
+        }
+        // No first name is a name of the table "Names that stay outside the
+        // rule" with no layout, or a name of the skip list other than
+        // `.cache`.
+        for refused in ["zig-out", "deps", ".git", ".hg", ".jj", ".svn"] {
+            assert!(!names[0].eq_ignore_ascii_case(refused), "{}", layout.layout);
+        }
+        // A layout of `.cache` needs a marker; a distinctive name with no
+        // marker would make each shared cache directory listed.
+        if names[0].eq_ignore_ascii_case(".cache") {
+            assert_eq!(layout.name, DirectoryName::Generic, "{}", layout.layout);
+        }
+    }
+}
+
+#[test]
+fn the_unmarked_layouts_are_the_reviewed_distinctive_layouts() {
+    let unmarked: Vec<(&str, &str)> = PROJECT_LAYOUTS
         .iter()
-        .map(|layout| layout.directory.split('/').next().unwrap())
+        .filter_map(|layout| match layout.unmarked {
+            Unmarked::Never => None,
+            Unmarked::ManualOnly { layout: name } => Some((layout.layout, name)),
+        })
         .collect();
-    names.sort_unstable();
-    names.dedup();
-    let mut reserved: Vec<&str> = svalnir_core::config::BUILT_IN_LAYOUT_NAMES.to_vec();
-    reserved.sort_unstable();
-    assert_eq!(names, reserved);
+    let expected: [&str; 10] = [
+        "python-venv",
+        "mypy-cache",
+        "pytest-cache",
+        "ruff-cache",
+        "tox",
+        "gradle-project-cache",
+        "next-build",
+        "astro",
+        "svelte-kit",
+        "parcel-cache",
+    ];
+    let mut layouts: Vec<&str> = unmarked.iter().map(|(layout, _)| *layout).collect();
+    layouts.sort_unstable();
+    let mut sorted: Vec<&str> = expected.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(layouts, sorted);
+    for (layout, name) in unmarked {
+        assert_eq!(
+            name,
+            format!("{layout}{}", svalnir_core::rule::UNMARKED_LAYOUT_SUFFIX)
+        );
+        assert!(svalnir_core::rule::is_manual_only_layout(name));
+        let entry = PROJECT_LAYOUTS
+            .iter()
+            .find(|entry| entry.layout == layout)
+            .unwrap();
+        assert_eq!(entry.name, DirectoryName::Distinctive, "{layout}");
+    }
+    // `.build`, `DerivedData`, and each generic name have no unmarked
+    // units.
+    for layout in PROJECT_LAYOUTS.iter().filter(|layout| {
+        layout.name == DirectoryName::Generic
+            || matches!(layout.directory, ".build" | "DerivedData")
+    }) {
+        assert_eq!(layout.unmarked, Unmarked::Never, "{}", layout.layout);
+    }
 }
 
 /// The layouts of the configuration document `text`.
@@ -576,4 +658,452 @@ fn a_layout_of_the_configuration_permits_no_automatic_mode() {
     };
     assert!(promoted.permits(&RuleMode::ManualEviction));
     assert!(!promoted.permits(&RuleMode::AutomaticEviction));
+}
+
+// ---------------------------------------------------------------------
+// The capabilities of the walk, with synthetic layouts of a table that
+// the test gives (no layout of `PROJECT_LAYOUTS` is needed).
+// ---------------------------------------------------------------------
+
+/// A synthetic layout of a table for a test.
+const fn synthetic(
+    directory: &'static str,
+    layout: &'static str,
+    project_markers: &'static [ProjectMarker],
+    name: DirectoryName,
+) -> ProjectLayout {
+    ProjectLayout {
+        directory,
+        layout,
+        project_markers,
+        inner_marker: None,
+        project_file: None,
+        protected: &[],
+        name,
+        unmarked: Unmarked::Never,
+        checkouts: PackageCheckouts::None,
+        reclaim: ReclaimBasis::AllocatedBytes,
+        owner_workflow: "A test layout.",
+        rebuild_impact: "A test layout.",
+    }
+}
+
+const fn file_marker(name: &'static str) -> ProjectMarker {
+    ProjectMarker {
+        name,
+        kind: MarkerKind::File,
+    }
+}
+
+const fn directory_marker(name: &'static str) -> ProjectMarker {
+    ProjectMarker {
+        name,
+        kind: MarkerKind::Directory,
+    }
+}
+
+static SUBDIRECTORY_MARKER: [ProjectLayout; 1] = [synthetic(
+    "UnityTemp",
+    "unity-temp",
+    &[file_marker("ProjectSettings/ProjectVersion.txt")],
+    DirectoryName::Distinctive,
+)];
+
+#[test]
+fn a_marker_in_a_subdirectory_needs_plain_directories_on_its_way() {
+    let home = Home::new();
+    let ignore = "/UnityTemp/\n";
+    let generated = ["UnityTemp/a.bin"];
+    let good: PathBuf = home.project_files(
+        "good",
+        &["ProjectSettings/ProjectVersion.txt"],
+        ignore,
+        &generated,
+    );
+    // The directory on the way is a symbolic link to a directory with the
+    // file.
+    home.write("Code/elsewhere/ProjectVersion.txt", b"m_EditorVersion\n");
+    let linked: PathBuf = home.project_files("linked", &[], ignore, &generated);
+    symlink(
+        home.path.join("Code/elsewhere"),
+        linked.join("ProjectSettings"),
+    )
+    .unwrap();
+    // The last name is a directory, or a symbolic link to a file.
+    let directory: PathBuf = home.project_files(
+        "directory",
+        &["ProjectSettings/ProjectVersion.txt/x"],
+        ignore,
+        &generated,
+    );
+    let link: PathBuf = home.project_files("link", &["ProjectSettings/other"], ignore, &generated);
+    symlink(
+        link.join("ProjectSettings/other"),
+        link.join("ProjectSettings/ProjectVersion.txt"),
+    )
+    .unwrap();
+    let inspection: ProjectInspection = home.inspect_table(&SUBDIRECTORY_MARKER, &[], false);
+    let report = unit(&inspection, &good.join("UnityTemp"));
+    assert_eq!(report.layout, "unity-temp");
+    assert!(
+        matches!(report.outcome, ProjectUnitOutcome::Measured(_)),
+        "{:?}",
+        report.outcome
+    );
+    for project in [&linked, &directory, &link] {
+        assert_eq!(
+            refusal(unit(&inspection, &project.join("UnityTemp"))),
+            "project_marker_missing",
+            "{}",
+            project.display()
+        );
+    }
+    // A layout of the configuration has the same check.
+    let layouts: Vec<UserLayout> = configured(
+        "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"Obj2\"\nmarkers = [\"ProjectSettings/ProjectVersion.txt\"]\n",
+    );
+    for project in [&good, &linked] {
+        home.write(
+            &format!(
+                "{}/Obj2/a.bin",
+                project.strip_prefix(&home.path).unwrap().display()
+            ),
+            b"x",
+        );
+        fs::write(project.join(".gitignore"), "/UnityTemp/\n/Obj2/\n").unwrap();
+    }
+    let inspection: ProjectInspection = inspect_configured(&home, &layouts);
+    assert!(matches!(
+        unit(&inspection, &good.join("Obj2")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
+    // A generic name with no marker is not listed.
+    assert!(!is_listed(&inspection, &linked.join("Obj2")));
+}
+
+static PATTERN_NAMES: [ProjectLayout; 3] = [
+    synthetic(
+        "out-cache",
+        "out-cache",
+        &[file_marker("a.cfg")],
+        DirectoryName::Distinctive,
+    ),
+    synthetic(
+        "*-cache",
+        "pattern-cache",
+        &[file_marker("b.cfg")],
+        DirectoryName::Generic,
+    ),
+    synthetic(
+        "*.egg-info",
+        "egg-info",
+        &[file_marker("setup.py")],
+        DirectoryName::Generic,
+    ),
+];
+
+#[test]
+fn a_pattern_name_gives_units_and_the_first_layout_with_a_marker_wins() {
+    let home = Home::new();
+    let ignore = "*-cache/\n*-CACHE/\n*.egg-info/\n";
+    let pattern: PathBuf = home.project_files("one", &["b.cfg"], ignore, &["x-cache/a"]);
+    // A literal layout of the table and the pattern both match `out-cache`.
+    let both: PathBuf = home.project_files("both", &["a.cfg", "b.cfg"], ignore, &["out-cache/a"]);
+    let second: PathBuf = home.project_files("second", &["b.cfg"], ignore, &["out-cache/a"]);
+    let neither: PathBuf = home.project_files("neither", &[], ignore, &["out-cache/a"]);
+    // The comparison keeps the case.
+    let case: PathBuf = home.project_files("case", &["b.cfg"], ignore, &["Y-CACHE/a"]);
+    let egg: PathBuf = home.project_files("egg", &["setup.py"], ignore, &["pkg.egg-info/PKG-INFO"]);
+    // A generic pattern name with no marker is an ordinary directory: the
+    // walk enters it.
+    let entered: PathBuf = home.project_files(
+        "entered",
+        &[],
+        ignore,
+        &["z-cache/inner/b.cfg", "z-cache/inner/q-cache/a"],
+    );
+    let inspection: ProjectInspection = home.inspect_table(&PATTERN_NAMES, &[], false);
+    let measured = |path: &Path, layout: &str| {
+        let report = unit(&inspection, path);
+        assert_eq!(report.layout, layout, "{}", path.display());
+        assert!(
+            matches!(report.outcome, ProjectUnitOutcome::Measured(_)),
+            "{}: {:?}",
+            path.display(),
+            report.outcome
+        );
+    };
+    measured(&pattern.join("x-cache"), "pattern-cache");
+    measured(&both.join("out-cache"), "out-cache");
+    measured(&second.join("out-cache"), "pattern-cache");
+    measured(&egg.join("pkg.egg-info"), "egg-info");
+    measured(&entered.join("z-cache/inner/q-cache"), "pattern-cache");
+    assert_eq!(
+        refusal(unit(&inspection, &neither.join("out-cache"))),
+        "project_marker_missing"
+    );
+    assert!(!is_listed(&inspection, &case.join("Y-CACHE")));
+    assert!(!is_listed(&inspection, &entered.join("z-cache")));
+    // Each directory is one unit.
+    let units: Vec<&Path> = inspection
+        .units
+        .iter()
+        .map(|unit| unit.path.as_path())
+        .collect();
+    let mut unique: Vec<&Path> = units.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(units.len(), unique.len());
+}
+
+static SKIP_PATTERN: [ProjectLayout; 1] = [synthetic(
+    ".c*",
+    "dot-c",
+    &[file_marker("m.cfg")],
+    DirectoryName::Distinctive,
+)];
+
+#[test]
+fn a_pattern_name_never_matches_a_name_of_the_skip_list() {
+    let home = Home::new();
+    let project: PathBuf =
+        home.project_files("app", &["m.cfg"], ".c*/\n", &[".cache/a", ".cargo-home/a"]);
+    let inspection: ProjectInspection = home.inspect_table(&SKIP_PATTERN, &[], false);
+    assert!(!is_listed(&inspection, &project.join(".cache")));
+    assert!(matches!(
+        unit(&inspection, &project.join(".cargo-home")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
+}
+
+static DIRECTORY_MARKER: [ProjectLayout; 1] = [synthetic(
+    "storybook-static",
+    "storybook-static",
+    &[directory_marker(".storybook")],
+    DirectoryName::Distinctive,
+)];
+
+#[test]
+fn a_directory_marker_is_a_directory_and_not_a_link() {
+    let home = Home::new();
+    let ignore = "/storybook-static/\n/sb-out/\n";
+    let generated = ["storybook-static/index.html", "sb-out/index.html"];
+    let good: PathBuf = home.project_files("good", &[".storybook/main.js"], ignore, &generated);
+    let file: PathBuf = home.project_files("file", &[".storybook"], ignore, &generated);
+    home.write("Code/elsewhere/main.js", b"x");
+    let linked: PathBuf = home.project_files("linked", &[], ignore, &generated);
+    symlink(home.path.join("Code/elsewhere"), linked.join(".storybook")).unwrap();
+    let inspection: ProjectInspection = home.inspect_table(&DIRECTORY_MARKER, &[], false);
+    assert!(matches!(
+        unit(&inspection, &good.join("storybook-static")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
+    for project in [&file, &linked] {
+        assert_eq!(
+            refusal(unit(&inspection, &project.join("storybook-static"))),
+            "project_marker_missing",
+            "{}",
+            project.display()
+        );
+    }
+    // A marker of the configuration that ends with `/` is a directory; one
+    // with no `/` is a regular file.
+    let layouts: Vec<UserLayout> = configured(
+        "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"sb-out\"\nmarkers = [\".storybook/\"]\n",
+    );
+    let inspection: ProjectInspection = inspect_configured(&home, &layouts);
+    assert!(matches!(
+        unit(&inspection, &good.join("sb-out")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
+    assert!(!is_listed(&inspection, &file.join("sb-out")));
+    assert!(!is_listed(&inspection, &linked.join("sb-out")));
+    let as_file: Vec<UserLayout> = configured(
+        "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"sb-out\"\nmarkers = [\".storybook\"]\n",
+    );
+    let inspection: ProjectInspection = inspect_configured(&home, &as_file);
+    assert!(!is_listed(&inspection, &good.join("sb-out")));
+    assert!(is_listed(&inspection, &file.join("sb-out")));
+}
+
+static THREE_NAMES: [ProjectLayout; 1] = [synthetic(
+    "storage/framework/cache",
+    "laravel-cache",
+    &[file_marker("artisan")],
+    DirectoryName::Generic,
+)];
+
+#[test]
+fn a_directory_of_three_names_needs_plain_directories_on_the_way() {
+    let home = Home::new();
+    let ignore = "/storage/framework/cache/\n/out/a/b/\n";
+    let good: PathBuf = home.project_files(
+        "good",
+        &["artisan", "storage/logs/keep"],
+        ignore,
+        &["storage/framework/cache/data/a", "out/a/b/c"],
+    );
+    // The middle name is a symbolic link to a directory of the project.
+    let linked: PathBuf = home.project_files(
+        "linked",
+        &["artisan", "storage/real/cache/keep"],
+        ignore,
+        &[],
+    );
+    symlink(
+        linked.join("storage/real"),
+        linked.join("storage/framework"),
+    )
+    .unwrap();
+    let inspection: ProjectInspection = home.inspect_table(&THREE_NAMES, &[], false);
+    assert!(matches!(
+        unit(&inspection, &good.join("storage/framework/cache")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
+    assert_eq!(
+        refusal(unit(&inspection, &linked.join("storage/framework/cache"))),
+        "unit_path_not_plain"
+    );
+    // No leading name is a unit.
+    for leading in ["storage", "storage/framework"] {
+        assert!(!is_listed(&inspection, &good.join(leading)), "{leading}");
+    }
+    // A layout of the configuration can have three names.
+    let layouts: Vec<UserLayout> = configured(
+        "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"out/a/b\"\nmarkers = [\"artisan\"]\n",
+    );
+    let inspection: ProjectInspection = inspect_configured(&home, &layouts);
+    let report = unit(&inspection, &good.join("out/a/b"));
+    assert_eq!(report.layout, "user-configured");
+    assert!(matches!(report.outcome, ProjectUnitOutcome::Measured(_)));
+}
+
+static CACHE_UNIT: [ProjectLayout; 1] = [synthetic(
+    ".cache",
+    "tool-cache",
+    &[file_marker("tool.cfg")],
+    DirectoryName::Distinctive,
+)];
+
+#[test]
+fn a_cache_directory_is_a_unit_only_with_the_marker_of_its_layout() {
+    let home = Home::new();
+    let marked: PathBuf = home.project_files("marked", &["tool.cfg"], "/.cache/\n", &[".cache/a"]);
+    // With no marker, `.cache` is not listed and not entered, also for a
+    // distinctive layout: a project in it is not found.
+    let unmarked: PathBuf = home.project_files(
+        "unmarked",
+        &[],
+        "/.cache/\n",
+        &[".cache/inner/tool.cfg", ".cache/inner/.cache/a"],
+    );
+    let inspection: ProjectInspection = home.inspect_table(&CACHE_UNIT, &[], true);
+    let report = unit(&inspection, &marked.join(".cache"));
+    assert_eq!(report.layout, "tool-cache");
+    assert!(matches!(report.outcome, ProjectUnitOutcome::Measured(_)));
+    assert!(!is_listed(&inspection, &unmarked.join(".cache")));
+    assert!(!is_listed(
+        &inspection,
+        &unmarked.join(".cache/inner/.cache")
+    ));
+    // The catalog of this build has no layout of `.cache`, so the walk
+    // lists none.
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    assert!(!is_listed(&inspection, &marked.join(".cache")));
+}
+
+#[test]
+fn a_user_layout_with_a_table_name_loses_to_a_table_layout_with_its_marker() {
+    let home = Home::new();
+    let ignore = "/build/\n/target/\n";
+    let cmake: PathBuf = home.project_files("cmake", &["CMakeLists.txt"], ignore, &["build/a.o"]);
+    let gradle: PathBuf = home.project_files(
+        "gradle",
+        &["CMakeLists.txt", "build.gradle"],
+        ignore,
+        &["build/a.o"],
+    );
+    let cargo: PathBuf = home.project_files(
+        "cargo",
+        &["Cargo.toml", "CMakeLists.txt"],
+        ignore,
+        &["target/CACHEDIR.TAG", "target/native/a.o"],
+    );
+    let layouts: Vec<UserLayout> = configured(
+        "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"build\"\nmarkers = [\"CMakeLists.txt\"]\n\n[[cleanup.projects.layouts]]\ndirectory = \"target/native\"\nmarkers = [\"CMakeLists.txt\"]\n",
+    );
+    let inspection: ProjectInspection = inspect_configured(&home, &layouts);
+    let user = unit(&inspection, &cmake.join("build"));
+    assert_eq!(user.layout, "user-configured");
+    assert!(matches!(user.outcome, ProjectUnitOutcome::Measured(_)));
+    let table = unit(&inspection, &gradle.join("build"));
+    assert_eq!(table.layout, "gradle-build");
+    assert!(matches!(table.outcome, ProjectUnitOutcome::Measured(_)));
+    // A user unit in a unit of the table is refused, and only the unit of
+    // the table is measured.
+    assert!(matches!(
+        unit(&inspection, &cargo.join("target")).outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
+    let inner = unit(&inspection, &cargo.join("target/native"));
+    assert_eq!(refusal(inner), "overlaps_unit");
+    assert_eq!(inner.overlapping_layout, Some("cargo-target"));
+}
+
+#[test]
+fn an_unmarked_directory_is_a_unit_only_with_the_option_and_each_other_check() {
+    let home = Home::new();
+    let ignore = "/.venv/\n/.build/\n/venv/\n";
+    let venv: PathBuf = home.project_files(
+        "venv",
+        &[],
+        ignore,
+        &[".venv/pyvenv.cfg", ".venv/bin/python"],
+    );
+    // The inner marker is still required.
+    let no_inner: PathBuf = home.project_files("no-inner", &[], ignore, &[".venv/bin/python"]);
+    // Git must ignore the directory.
+    let not_ignored: PathBuf = home.project_files("not-ignored", &[], "", &[]);
+    home.write("Code/not-ignored/.venv/pyvenv.cfg", b"home = /usr\n");
+    // `.build` and a generic name have no unmarked units.
+    let swift: PathBuf = home.project_files("swift", &[], ignore, &[".build/workspace-state.json"]);
+    let plain: PathBuf = home.project_files("plain", &[], ignore, &["venv/pyvenv.cfg"]);
+    // Without the option, the behavior is unchanged.
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    for project in [&venv, &no_inner, &not_ignored] {
+        let report = unit(&inspection, &project.join(".venv"));
+        assert_eq!(report.layout, "python-venv");
+        assert_eq!(report.marker_allowance, None);
+        assert_eq!(refusal(report), "project_marker_missing");
+    }
+    let inspection: ProjectInspection = home.inspect_table(&PROJECT_LAYOUTS, &[], true);
+    let report = unit(&inspection, &venv.join(".venv"));
+    assert_eq!(report.layout, "python-venv+unmarked");
+    assert_eq!(
+        report.marker_allowance,
+        Some(super::PROJECT_MARKER_ABSENT_ALLOWED)
+    );
+    assert!(
+        matches!(report.outcome, ProjectUnitOutcome::Measured(_)),
+        "{:?}",
+        report.outcome
+    );
+    let report = unit(&inspection, &no_inner.join(".venv"));
+    assert_eq!(report.layout, "python-venv+unmarked");
+    assert_eq!(refusal(report), "unsupported_layout");
+    assert_eq!(
+        refusal(unit(&inspection, &not_ignored.join(".venv"))),
+        "not_ignored"
+    );
+    let report = unit(&inspection, &swift.join(".build"));
+    assert_eq!(report.layout, "swiftpm-build");
+    assert_eq!(refusal(report), "project_marker_missing");
+    assert!(!is_listed(&inspection, &plain.join("venv")));
+    // A directory with its marker keeps its layout with the option.
+    let marked: PathBuf =
+        home.project_files("marked", &["pyproject.toml"], ignore, &[".venv/pyvenv.cfg"]);
+    let inspection: ProjectInspection = home.inspect_table(&PROJECT_LAYOUTS, &[], true);
+    let report = unit(&inspection, &marked.join(".venv"));
+    assert_eq!(report.layout, "python-venv");
+    assert_eq!(report.marker_allowance, None);
 }

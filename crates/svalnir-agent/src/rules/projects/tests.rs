@@ -252,6 +252,7 @@ impl Home {
             processes,
             recency,
             layouts,
+            allow_unmarked: false,
         };
         registry.projects().inspect(
             host,
@@ -260,6 +261,58 @@ impl Home {
             &CancellationToken::new(),
             clock,
         )
+    }
+
+    /// The inspection of the rule with the layouts of the table `table`,
+    /// the layouts of the configuration `layouts`, and the option
+    /// `--allow-unmarked` when `allow_unmarked` is true.
+    pub(super) fn inspect_table(
+        &self,
+        table: &'static [super::ProjectLayout],
+        layouts: &[svalnir_core::config::UserLayout],
+        allow_unmarked: bool,
+    ) -> ProjectInspection {
+        let processes: Fixed = quiet();
+        let rule: super::ProjectRule = super::ProjectRule::with_table(table).unwrap();
+        let host: ProjectHost<'_> = ProjectHost {
+            principal: self.principal,
+            locations: &self.locations,
+            user_exclusions: &[],
+            git: Ok(&self.git),
+            processes: &processes,
+            recency: no_recency(),
+            layouts,
+            allow_unmarked,
+        };
+        rule.inspect(
+            host,
+            &SearchRoots::new(vec![PathBuf::from("Code")]).unwrap(),
+            ProjectLimits::default(),
+            &CancellationToken::new(),
+            &WallScanClock,
+        )
+    }
+
+    /// A project at `Code/NAME` with the files `files` (each with its
+    /// content), the ignore rules `ignore`, and one commit. The files of
+    /// `generated` are written after the commit.
+    pub(super) fn project_files(
+        &self,
+        name: &str,
+        files: &[&str],
+        ignore: &str,
+        generated: &[&str],
+    ) -> PathBuf {
+        let project: String = format!("Code/{name}");
+        for file in files {
+            self.write(&format!("{project}/{file}"), b"marker\n");
+        }
+        self.write(&format!("{project}/.gitignore"), ignore.as_bytes());
+        self.repository(&project);
+        for file in generated {
+            self.write(&format!("{project}/{file}"), b"generated\n");
+        }
+        self.path.join(project)
     }
 
     pub(super) fn inspect(&self, processes: &dyn ProcessEvidence) -> ProjectInspection {
@@ -303,6 +356,17 @@ fn the_rule_is_registered_proposed_with_no_automatic_mode() {
         .iter()
         .map(|layout| layout.layout)
         .collect();
+    // The layout names of the unmarked units follow the layouts of the
+    // table, in their sequence.
+    expected.extend(
+        super::PROJECT_LAYOUTS
+            .iter()
+            .filter_map(|layout| match layout.unmarked {
+                super::Unmarked::Never => None,
+                super::Unmarked::ManualOnly { layout } => Some(layout),
+            }),
+    );
+    assert_eq!(expected.len(), super::PROJECT_LAYOUT_COUNT + 10);
     expected.push("user-configured");
     assert_eq!(layouts, expected);
     assert_eq!(
@@ -391,6 +455,7 @@ fn no_search_root_examines_nothing() {
             processes: &processes,
             recency: no_recency(),
             layouts: &[],
+            allow_unmarked: false,
         },
         &SearchRoots::new(Vec::new()).unwrap(),
         ProjectLimits::default(),
@@ -415,6 +480,7 @@ fn a_search_root_with_the_state_directory_is_refused() {
             processes: &processes,
             recency: no_recency(),
             layouts: &[],
+            allow_unmarked: false,
         },
         &SearchRoots::new(vec![PathBuf::from("Library"), PathBuf::from("Absent")]).unwrap(),
         ProjectLimits::default(),
@@ -878,6 +944,7 @@ fn a_search_root_in_another_case_has_the_stored_names() {
             processes: &NativeProcessEvidence,
             recency: no_recency(),
             layouts: &[],
+            allow_unmarked: false,
         },
         &SearchRoots::new(vec![PathBuf::from("code")]).unwrap(),
         ProjectLimits::default(),

@@ -8,22 +8,26 @@
 
 use super::super::caches::ReclaimBasis;
 
-/// What a project marker must be.
+/// What a project marker must be. A symbolic link is never a marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkerKind {
     /// A regular file, for example `package.json`.
     File,
-    /// A directory, for example the bundle `App.xcodeproj`.
+    /// A directory, for example the bundle `App.xcodeproj` or the
+    /// configuration directory `.storybook`.
     Directory,
 }
 
-/// One project marker: a name or a pattern with `*` and `?`, in the
-/// directory that holds the first name of the generated directory.
+/// One project marker, relative to the directory that holds the first name
+/// of the generated directory: a name, a pattern with `*` and `?`, or a
+/// path of names with `/` between them and no pattern, for example
+/// `ProjectSettings/ProjectVersion.txt`. Each directory on the way of a
+/// path must be a directory of the user, not a symbolic link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectMarker {
-    /// The name or the pattern.
+    /// The name, the pattern, or the path.
     pub name: &'static str,
-    /// What the entry must be.
+    /// What the last entry must be.
     pub kind: MarkerKind,
 }
 
@@ -34,7 +38,7 @@ const fn file(name: &'static str) -> ProjectMarker {
     }
 }
 
-const fn bundle(name: &'static str) -> ProjectMarker {
+const fn directory_marker(name: &'static str) -> ProjectMarker {
     ProjectMarker {
         name,
         kind: MarkerKind::Directory,
@@ -55,6 +59,23 @@ pub enum DirectoryName {
     Generic,
 }
 
+/// Whether a distinctive directory of a layout with no project marker can
+/// be a unit of a manual plan (`docs/CLEANUP_RULES.md` section 12,
+/// "Unmarked directories", owner decision of 2026-11-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unmarked {
+    /// Never: the report lists the directory as `project_marker_missing`.
+    Never,
+    /// Only for a manual plan whose request allows it (`--allow-unmarked`).
+    /// The unit has the layout name `layout`, which ends with
+    /// [`svalnir_core::rule::UNMARKED_LAYOUT_SUFFIX`] and permits at most a
+    /// manual mode. Each other check of the layout applies unchanged.
+    ManualOnly {
+        /// The layout name of an unmarked unit.
+        layout: &'static str,
+    },
+}
+
 /// Which clones of Swift Package Manager a unit of the layout can hold
 /// (`docs/CLEANUP_RULES.md` section 6, "Repositories in a unit").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +94,11 @@ pub enum PackageCheckouts {
 /// One layout of the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectLayout {
-    /// The generated directory, relative to the project directory: one
-    /// name, or two names with `/` between them.
+    /// The generated directory, relative to the project directory: one to
+    /// [`svalnir_core::config::MAX_LAYOUT_DIRECTORY_NAMES`] names with `/`
+    /// between them. The first name can be a pattern with `*` and `?`,
+    /// compared as a marker pattern; a pattern never matches a name of the
+    /// skip list of the walk.
     pub directory: &'static str,
     /// The layout name of the declaration. It is stable.
     pub layout: &'static str,
@@ -94,6 +118,9 @@ pub struct ProjectLayout {
     pub protected: &'static [&'static str],
     /// How the walk treats the name with no marker.
     pub name: DirectoryName,
+    /// Whether a directory of a distinctive name with no marker can be a
+    /// unit of a manual plan.
+    pub unmarked: Unmarked,
     /// The clones of Swift Package Manager that the unit can hold.
     pub checkouts: PackageCheckouts,
     /// What the reclaim figure of a measured unit is.
@@ -140,6 +167,7 @@ const fn plain(
         project_file: None,
         protected: &[],
         name,
+        unmarked: Unmarked::Never,
         checkouts: PackageCheckouts::None,
         reclaim: ReclaimBasis::AllocatedBytes,
         owner_workflow,
@@ -150,6 +178,15 @@ const fn plain(
 const fn with_inner(layout: ProjectLayout, inner_marker: &'static str) -> ProjectLayout {
     ProjectLayout {
         inner_marker: Some(inner_marker),
+        ..layout
+    }
+}
+
+/// The layout `layout` with the unmarked units of the layout name
+/// `unmarked` for a manual plan.
+const fn unmarked(layout: ProjectLayout, unmarked: &'static str) -> ProjectLayout {
+    ProjectLayout {
+        unmarked: Unmarked::ManualOnly { layout: unmarked },
         ..layout
     }
 }
@@ -182,17 +219,20 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
     )),
     // uv can link files from its cache into an environment with clones or
     // hard links.
-    linked(with_inner(
-        plain(
-            ".venv",
-            "python-venv",
-            PYTHON_PROJECT,
-            Distinctive,
-            VENV_WORKFLOW,
-            VENV_IMPACT,
-        ),
-        "pyvenv.cfg",
-    )),
+    unmarked(
+        linked(with_inner(
+            plain(
+                ".venv",
+                "python-venv",
+                PYTHON_PROJECT,
+                Distinctive,
+                VENV_WORKFLOW,
+                VENV_IMPACT,
+            ),
+            "pyvenv.cfg",
+        )),
+        "python-venv+unmarked",
+    ),
     linked(with_inner(
         plain(
             "venv",
@@ -235,13 +275,16 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Run `mvn clean` in the project, or remove the directory. Svalnir does not run them.",
         "The next build compiles the project and makes its packages again, and downloads each dependency that the local Maven repository does not have.",
     ),
-    plain(
-        ".next",
-        "next-build",
-        NODE_PROJECT,
-        Distinctive,
-        "Remove the directory, then run `next build` or the development server when you need it again. Svalnir does not run them.",
-        "The next build or development server compiles the application again.",
+    unmarked(
+        plain(
+            ".next",
+            "next-build",
+            NODE_PROJECT,
+            Distinctive,
+            "Remove the directory, then run `next build` or the development server when you need it again. Svalnir does not run them.",
+            "The next build or development server compiles the application again.",
+        ),
+        "next-build+unmarked",
     ),
     plain(
         ".turbo",
@@ -251,29 +294,38 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory. Turborepo makes it again at the next `turbo run`. Svalnir does not run it.",
         "The next task runs have no local cache hits, so each task runs again, unless a remote cache has the results.",
     ),
-    plain(
-        ".svelte-kit",
-        "svelte-kit",
-        NODE_PROJECT,
-        Distinctive,
-        "Remove the directory, then run `svelte-kit sync`, a build, or the development server. Svalnir does not run them.",
-        "The next sync or build makes the generated types and the build output again.",
+    unmarked(
+        plain(
+            ".svelte-kit",
+            "svelte-kit",
+            NODE_PROJECT,
+            Distinctive,
+            "Remove the directory, then run `svelte-kit sync`, a build, or the development server. Svalnir does not run them.",
+            "The next sync or build makes the generated types and the build output again.",
+        ),
+        "svelte-kit+unmarked",
     ),
-    plain(
-        ".astro",
-        "astro",
-        NODE_PROJECT,
-        Distinctive,
-        "Remove the directory, then run `astro sync` or the development server. Svalnir does not run them.",
-        "The next sync makes the generated types and the content data again.",
+    unmarked(
+        plain(
+            ".astro",
+            "astro",
+            NODE_PROJECT,
+            Distinctive,
+            "Remove the directory, then run `astro sync` or the development server. Svalnir does not run them.",
+            "The next sync makes the generated types and the content data again.",
+        ),
+        "astro+unmarked",
     ),
-    plain(
-        ".parcel-cache",
-        "parcel-cache",
-        NODE_PROJECT,
-        Distinctive,
-        "Remove the directory. Parcel makes it again at the next build. Svalnir does not run it.",
-        "The next build has no cache, so it transforms each asset again.",
+    unmarked(
+        plain(
+            ".parcel-cache",
+            "parcel-cache",
+            NODE_PROJECT,
+            Distinctive,
+            "Remove the directory. Parcel makes it again at the next build. Svalnir does not run it.",
+            "The next build has no cache, so it transforms each asset again.",
+        ),
+        "parcel-cache+unmarked",
     ),
     plain(
         "dist",
@@ -302,64 +354,76 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "The next import of each module compiles it again.",
     ),
     // pytest, mypy, and Ruff write `CACHEDIR.TAG` in their cache.
-    with_inner(
-        plain(
-            ".pytest_cache",
-            "pytest-cache",
-            &[
-                file("pyproject.toml"),
-                file("pytest.ini"),
-                file("setup.cfg"),
-                file("tox.ini"),
-                file("setup.py"),
-                file("conftest.py"),
-            ],
-            Distinctive,
-            "Remove the directory, or run `pytest --cache-clear`. Svalnir does not run it.",
-            "The next run of pytest has no record of the tests that failed last, so `--last-failed` runs each test.",
+    unmarked(
+        with_inner(
+            plain(
+                ".pytest_cache",
+                "pytest-cache",
+                &[
+                    file("pyproject.toml"),
+                    file("pytest.ini"),
+                    file("setup.cfg"),
+                    file("tox.ini"),
+                    file("setup.py"),
+                    file("conftest.py"),
+                ],
+                Distinctive,
+                "Remove the directory, or run `pytest --cache-clear`. Svalnir does not run it.",
+                "The next run of pytest has no record of the tests that failed last, so `--last-failed` runs each test.",
+            ),
+            "CACHEDIR.TAG",
         ),
-        "CACHEDIR.TAG",
+        "pytest-cache+unmarked",
     ),
-    with_inner(
-        plain(
-            ".mypy_cache",
-            "mypy-cache",
-            &[
-                file("pyproject.toml"),
-                file("mypy.ini"),
-                file(".mypy.ini"),
-                file("setup.cfg"),
-                file("setup.py"),
-            ],
-            Distinctive,
-            "Remove the directory. mypy makes it again at the next run. Svalnir does not run it.",
-            "The next run of mypy examines each module again with no cache.",
+    unmarked(
+        with_inner(
+            plain(
+                ".mypy_cache",
+                "mypy-cache",
+                &[
+                    file("pyproject.toml"),
+                    file("mypy.ini"),
+                    file(".mypy.ini"),
+                    file("setup.cfg"),
+                    file("setup.py"),
+                ],
+                Distinctive,
+                "Remove the directory. mypy makes it again at the next run. Svalnir does not run it.",
+                "The next run of mypy examines each module again with no cache.",
+            ),
+            "CACHEDIR.TAG",
         ),
-        "CACHEDIR.TAG",
+        "mypy-cache+unmarked",
     ),
-    with_inner(
-        plain(
-            ".ruff_cache",
-            "ruff-cache",
-            &[
-                file("pyproject.toml"),
-                file("ruff.toml"),
-                file(".ruff.toml"),
-            ],
-            Distinctive,
-            "Remove the directory, or run `ruff clean`. Svalnir does not run it.",
-            "The next run of Ruff examines each file again with no cache.",
+    unmarked(
+        with_inner(
+            plain(
+                ".ruff_cache",
+                "ruff-cache",
+                &[
+                    file("pyproject.toml"),
+                    file("ruff.toml"),
+                    file(".ruff.toml"),
+                ],
+                Distinctive,
+                "Remove the directory, or run `ruff clean`. Svalnir does not run it.",
+                "The next run of Ruff examines each file again with no cache.",
+            ),
+            "CACHEDIR.TAG",
         ),
-        "CACHEDIR.TAG",
+        "ruff-cache+unmarked",
     ),
-    linked(plain(
-        ".tox",
-        "tox",
-        &[file("tox.ini"), file("pyproject.toml"), file("setup.cfg")],
-        Distinctive,
-        "Remove the directory, or run `tox --recreate` when you need the environments again. Svalnir does not run it.",
-        "The next run of tox makes each environment again and downloads each package that no cache has.",
-    )),
+    unmarked(
+        linked(plain(
+            ".tox",
+            "tox",
+            &[file("tox.ini"), file("pyproject.toml"), file("setup.cfg")],
+            Distinctive,
+            "Remove the directory, or run `tox --recreate` when you need the environments again. Svalnir does not run it.",
+            "The next run of tox makes each environment again and downloads each package that no cache has.",
+        )),
+        "tox+unmarked",
+    ),
     linked(plain(
         ".nox",
         "nox",
@@ -368,13 +432,16 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory. The next run of `nox` makes the sessions again. Svalnir does not run it.",
         "The next run of nox makes each session environment again and downloads each package that no cache has.",
     )),
-    plain(
-        ".gradle",
-        "gradle-project-cache",
-        GRADLE_PROJECT,
-        Distinctive,
-        "Stop the Gradle daemons (`gradle --stop`), then remove the directory. Svalnir does not run them.",
-        "The next build has no local task history and no configuration cache, so each task runs again.",
+    unmarked(
+        plain(
+            ".gradle",
+            "gradle-project-cache",
+            GRADLE_PROJECT,
+            Distinctive,
+            "Stop the Gradle daemons (`gradle --stop`), then remove the directory. Svalnir does not run them.",
+            "The next build has no local task history and no configuration cache, so each task runs again.",
+        ),
+        "gradle-project-cache+unmarked",
     ),
     plain(
         "build",
@@ -450,8 +517,8 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "DerivedData",
             "xcode-project-derived-data",
             &[
-                bundle("*.xcworkspace"),
-                bundle("*.xcodeproj"),
+                directory_marker("*.xcworkspace"),
+                directory_marker("*.xcodeproj"),
                 file("Package.swift"),
             ],
             Distinctive,

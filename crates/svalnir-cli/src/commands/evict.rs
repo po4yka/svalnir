@@ -517,6 +517,7 @@ pub(crate) fn plan(
             config: &config,
             roots: project_roots.as_ref().map(|roots| &roots.roots),
             include_active: arguments.include_active,
+            allow_unmarked: arguments.allow_unmarked,
         },
     );
     // An interrupted discovery has a part of the candidates. No plan is

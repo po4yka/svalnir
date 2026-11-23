@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+pub(super) use svalnir_core::config::glob_matches;
 use svalnir_core::config::{SKIPPED_DIRECTORY_NAMES, UserLayout};
 use svalnir_core::policy::ProtectionFact;
 use svalnir_core::process::Uid;
@@ -24,7 +25,7 @@ use super::ProjectRule;
 use super::activity::{BuildProcesses, ProcessEvidence};
 use super::layouts::{
     DirectoryName, MarkerKind, PROJECT_LAYOUTS, PackageCheckouts, ProjectLayout,
-    USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW,
+    USER_LAYOUT_IMPACT, USER_LAYOUT_WORKFLOW, Unmarked,
 };
 use super::recency::{
     AgentListing, ProjectRecency, RecencyHost, RecencyState, SourceReading, assess_with_head,
@@ -347,7 +348,16 @@ pub struct ProjectHost<'a> {
     /// configuration validated. Each one has the layout name
     /// `user-configured`.
     pub layouts: &'a [UserLayout],
+    /// True when a distinctive directory of a layout with
+    /// [`Unmarked::ManualOnly`] and no project marker is a unit of its
+    /// unmarked layout name (`--allow-unmarked`), for a manual plan only.
+    /// Each other check of the layout applies unchanged.
+    pub allow_unmarked: bool,
 }
+
+/// The evidence of a unit of an unmarked layout name: the directory has no
+/// project marker, and the request allowed it for a manual plan.
+pub const PROJECT_MARKER_ABSENT_ALLOWED: &str = "project_marker_absent_allowed";
 
 /// The bounds of an inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,8 +527,12 @@ pub struct ProjectUnitReport {
     pub search_root: PathBuf,
     /// The project directory.
     pub project: PathBuf,
-    /// The layout name: a layout of the catalog, or `user-configured`.
+    /// The layout name: a layout of the catalog, the unmarked layout name of
+    /// a layout of the catalog, or `user-configured`.
     pub layout: &'static str,
+    /// [`PROJECT_MARKER_ABSENT_ALLOWED`] for a unit of an unmarked layout
+    /// name, else `None`.
+    pub marker_allowance: Option<&'static str>,
     /// The entry at a protected path of the layout, relative to the unit,
     /// when the check found one (`protected_child`).
     pub protected_child: Option<PathBuf>,
@@ -597,6 +611,8 @@ struct Inspector<'a> {
     heads: BTreeMap<PathBuf, SourceReading>,
     /// The layouts of the catalog, then the layouts of the configuration.
     layouts: Vec<Layout<'a>>,
+    /// The option `--allow-unmarked` of the request.
+    allow_unmarked: bool,
     /// The path of each unit of the report. The walk does not enter it.
     matched: BTreeSet<PathBuf>,
     directories: usize,
@@ -626,10 +642,14 @@ struct Layout<'a> {
     rebuild_impact: &'static str,
     /// The quiet period of the layout, in place of the period of the host.
     quiet_period: Option<Nanoseconds>,
+    /// The layout name of an unmarked unit, when the layout permits one.
+    unmarked: Option<&'static str>,
+    /// True for a layout of the configuration.
+    configured: bool,
 }
 
 impl<'a> Layout<'a> {
-    fn built_in(layout: &'static ProjectLayout) -> Self {
+    fn built_in(layout: &'a ProjectLayout) -> Self {
         Self {
             id: layout.layout,
             directory: layout.directory,
@@ -647,11 +667,17 @@ impl<'a> Layout<'a> {
             owner_workflow: layout.owner_workflow,
             rebuild_impact: layout.rebuild_impact,
             quiet_period: None,
+            unmarked: match layout.unmarked {
+                Unmarked::Never => None,
+                Unmarked::ManualOnly { layout } => Some(layout),
+            },
+            configured: false,
         }
     }
 
     /// A layout of the configuration. Its name is generic: a directory with
-    /// no marker is not listed. Its markers are regular files.
+    /// no marker is not listed. A marker that ends with `/` is a directory;
+    /// each other marker is a regular file.
     fn configured(layout: &'a UserLayout) -> Self {
         Self {
             id: svalnir_core::rule::USER_CONFIGURED_LAYOUT,
@@ -659,7 +685,10 @@ impl<'a> Layout<'a> {
             markers: layout
                 .markers
                 .iter()
-                .map(|marker| (marker.as_str(), MarkerKind::File))
+                .map(|marker| match marker.strip_suffix('/') {
+                    Some(directory) => (directory, MarkerKind::Directory),
+                    None => (marker.as_str(), MarkerKind::File),
+                })
                 .collect(),
             inner_marker: layout.inner_marker.as_deref(),
             project_file: None,
@@ -673,63 +702,57 @@ impl<'a> Layout<'a> {
             quiet_period: layout
                 .quiet_period
                 .and_then(|period| Nanoseconds::try_from(period).ok()),
+            unmarked: None,
+            configured: true,
         }
     }
 
     /// The first name of the directory, which is an entry of the project
-    /// directory.
+    /// directory. It can be a pattern.
     fn first_name(&self) -> &'a str {
         self.directory.split('/').next().unwrap_or(self.directory)
     }
+
+    /// Whether the directory of the layout is `names`, the names of a
+    /// directory relative to the project directory: the first name matches
+    /// the first name of the layout, as a pattern or a literal, and each
+    /// other name is the same.
+    fn has_directory(&self, names: &[&OsStr]) -> bool {
+        let parts: Vec<&str> = self.directory.split('/').collect();
+        parts.len() == names.len()
+            && parts
+                .iter()
+                .zip(names)
+                .enumerate()
+                .all(|(index, (part, name))| {
+                    if index == 0 {
+                        name_matches(part, name)
+                    } else {
+                        name.as_encoded_bytes() == part.as_bytes()
+                    }
+                })
+    }
 }
 
-/// The layouts of the catalog, then the layouts of `configured`.
-fn catalog(configured: &[UserLayout]) -> Vec<Layout<'_>> {
-    PROJECT_LAYOUTS
+/// Whether the entry `name` of a project directory matches `part`, the
+/// first name of the directory of a layout: the same bytes for a literal,
+/// or a match with the case kept for a pattern. A pattern never matches a
+/// name of the skip list of the walk ([`is_skipped`]).
+fn name_matches(part: &str, name: &OsStr) -> bool {
+    if is_pattern(part) {
+        !is_skipped(name) && glob_matches(part.as_bytes(), name.as_encoded_bytes(), false)
+    } else {
+        name.as_encoded_bytes() == part.as_bytes()
+    }
+}
+
+/// The layouts of `table`, then the layouts of `configured`.
+fn catalog<'a>(table: &'a [ProjectLayout], configured: &'a [UserLayout]) -> Vec<Layout<'a>> {
+    table
         .iter()
         .map(Layout::built_in)
         .chain(configured.iter().map(Layout::configured))
         .collect()
-}
-
-/// Whether `name` matches `pattern`: `*` matches each sequence of bytes,
-/// also an empty one, `?` matches one byte, and each other byte matches
-/// itself. With `fold`, the case of ASCII letters is ignored.
-pub(super) fn glob_matches(pattern: &[u8], name: &[u8], fold: bool) -> bool {
-    let same = |left: u8, right: u8| {
-        if fold {
-            left.eq_ignore_ascii_case(&right)
-        } else {
-            left == right
-        }
-    };
-    let (mut at_pattern, mut at_name): (usize, usize) = (0, 0);
-    // The position after the last `*`, and the name position that it
-    // matched up to.
-    let mut star: Option<(usize, usize)> = None;
-    while at_name < name.len() {
-        match (pattern.get(at_pattern), name.get(at_name)) {
-            (Some(b'*'), _) => {
-                at_pattern += 1;
-                star = Some((at_pattern, at_name));
-            }
-            (Some(&byte), Some(&found)) if byte == b'?' || same(byte, found) => {
-                at_pattern += 1;
-                at_name += 1;
-            }
-            _ => match star {
-                Some((after, matched)) => {
-                    at_pattern = after;
-                    at_name = matched + 1;
-                    star = Some((after, matched + 1));
-                }
-                None => return false,
-            },
-        }
-    }
-    pattern
-        .get(at_pattern..)
-        .is_some_and(|rest| rest.iter().all(|byte| *byte == b'*'))
 }
 
 /// Whether `marker` is a pattern: it has `*` or `?`.
@@ -820,8 +843,15 @@ fn search_child(
 }
 
 /// Whether the directory `project`, whose entries are `names`, has a marker
-/// of `layout`.
-fn has_marker(layout: &Layout<'_>, project: &Path, names: &BTreeSet<OsString>) -> bool {
+/// of `layout`. A marker of more than one name is a path below `project`:
+/// each directory on its way is a directory of `principal`, not a symbolic
+/// link, and its last name has the kind of the marker.
+fn has_marker(
+    principal: Uid,
+    layout: &Layout<'_>,
+    project: &Path,
+    names: &BTreeSet<OsString>,
+) -> bool {
     let is_kind = |name: &OsStr, kind: MarkerKind| {
         lstat(&project.join(name)).is_ok_and(|found| match kind {
             MarkerKind::File => found.kind == ObjectKind::RegularFile,
@@ -829,7 +859,9 @@ fn has_marker(layout: &Layout<'_>, project: &Path, names: &BTreeSet<OsString>) -
         })
     };
     layout.markers.iter().any(|(marker, kind)| {
-        if is_pattern(marker) {
+        if marker.contains('/') {
+            is_marker_path(principal, project, marker, *kind)
+        } else if is_pattern(marker) {
             names
                 .iter()
                 .filter(|name| glob_matches(marker.as_bytes(), name.as_encoded_bytes(), false))
@@ -838,6 +870,44 @@ fn has_marker(layout: &Layout<'_>, project: &Path, names: &BTreeSet<OsString>) -
             is_kind(OsStr::new(marker), *kind)
         }
     })
+}
+
+/// The largest number of names of a project marker path.
+const MAX_MARKER_NAMES: usize = svalnir_core::config::MAX_MARKER_COMPONENTS;
+
+/// Whether `marker`, a path of names below `project`, is an entry of the
+/// kind `kind`, with each directory on its way a directory of `principal`
+/// and not a symbolic link. A path of more than [`MAX_MARKER_NAMES`] names
+/// is not a marker.
+fn is_marker_path(principal: Uid, project: &Path, marker: &str, kind: MarkerKind) -> bool {
+    let components: Vec<&str> = marker.split('/').collect();
+    if components.len() > MAX_MARKER_NAMES {
+        return false;
+    }
+    let mut path: PathBuf = project.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        if !is_plain_name(component) {
+            return false;
+        }
+        path.push(component);
+        let Ok(found) = lstat(&path) else {
+            return false;
+        };
+        let is_last: bool = index + 1 == components.len();
+        let expected: ObjectKind = match (is_last, kind) {
+            (false, _) | (true, MarkerKind::Directory) => ObjectKind::Directory,
+            (true, MarkerKind::File) => ObjectKind::RegularFile,
+        };
+        if found.kind != expected || (!is_last && found.owner != principal) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `name` is one name with no pattern: not empty, not `.` or `..`.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !is_pattern(name)
 }
 
 /// Whether the walk never enters a directory with the name `name`: a
@@ -1030,7 +1100,8 @@ impl ProjectRule {
                     uses: None,
                     agents: None,
                     heads: BTreeMap::new(),
-                    layouts: catalog(host.layouts),
+                    layouts: catalog(self.table(), host.layouts),
+                    allow_unmarked: host.allow_unmarked,
                     matched: BTreeSet::new(),
                     directories: 0,
                     units: Vec::new(),
@@ -1195,50 +1266,46 @@ impl Inspector<'_> {
     /// The units of the directory `project`, whose entries are `names`.
     ///
     /// For each directory of the layouts, the first layout whose marker is
-    /// present gives the unit. With no such layout, a distinctive name gives
-    /// a unit that the checks refuse (`project_marker_missing`), and a
-    /// generic name gives no unit.
+    /// present gives the unit ([`Inspector::choose`]). With no such layout,
+    /// a distinctive name gives a unit that the checks refuse
+    /// (`project_marker_missing`), or a unit of an unmarked layout name, and
+    /// a generic name gives no unit.
     fn project(&mut self, project: &Path, root: &Path, names: &BTreeSet<OsString>) {
-        let mut directories: Vec<&str> = Vec::new();
+        // The directories of the layouts, relative to the project, in the
+        // sequence of the layouts. A pattern name is compared with the
+        // entries that the walk read, so no directory is read again.
+        let mut directories: Vec<PathBuf> = Vec::new();
         for layout in &self.layouts {
-            if !directories.contains(&layout.directory)
-                && names.contains(OsStr::new(layout.first_name()))
-            {
-                directories.push(layout.directory);
+            let first: &str = layout.first_name();
+            for name in names.iter().filter(|name| name_matches(first, name)) {
+                let mut relative: PathBuf = PathBuf::from(name);
+                relative.extend(layout.directory.split('/').skip(1));
+                if !directories.contains(&relative) {
+                    directories.push(relative);
+                }
             }
         }
         // The units of this project so far, with their layouts.
         let mut earlier: Vec<(PathBuf, &'static str)> = Vec::new();
-        for directory in directories {
+        for relative in directories {
             if self.stop().is_some() {
                 return;
             }
-            let path: PathBuf = project.join(directory);
-            // A path of two names needs its second name.
-            if directory.contains('/') && lstat(&path).is_err() {
+            let path: PathBuf = project.join(&relative);
+            let parts: Vec<&OsStr> = relative.iter().collect();
+            // A path of two or three names needs its last name.
+            if parts.len() > 1 && lstat(&path).is_err() {
                 continue;
             }
-            let chosen: Option<Layout<'_>> = {
-                let mut of_directory = self
-                    .layouts
-                    .iter()
-                    .filter(|layout| layout.directory == directory);
-                of_directory
-                    .clone()
-                    .find(|layout| has_marker(layout, project, names))
-                    .or_else(|| {
-                        of_directory.find(|layout| layout.name == DirectoryName::Distinctive)
-                    })
-                    .cloned()
-            };
-            let Some(layout) = chosen else {
+            let Some((layout, unmarked)) = self.choose(project, names, &parts) else {
                 continue;
             };
             let mut report: ProjectUnitReport = ProjectUnitReport {
                 path: path.clone(),
                 search_root: self.current_root.clone(),
                 project: project.to_path_buf(),
-                layout: layout.id,
+                layout: unmarked.unwrap_or(layout.id),
+                marker_allowance: unmarked.map(|_| PROJECT_MARKER_ABSENT_ALLOWED),
                 protected_child: None,
                 overlapping_layout: None,
                 version_control: None,
@@ -1277,11 +1344,70 @@ impl Inspector<'_> {
         path: &Path,
         report: &mut ProjectUnitReport,
     ) -> Result<(), &'static str> {
-        unit_shape(self.host.principal, layout, project, names, path).map_err(|(reason, child)| {
-            report.protected_child = child;
-            reason
-        })
+        let marker: MarkerCheck = if report.marker_allowance.is_some() {
+            MarkerCheck::AbsenceAllowed
+        } else {
+            MarkerCheck::Required
+        };
+        unit_shape(self.host.principal, layout, project, names, path, marker).map_err(
+            |(reason, child)| {
+                report.protected_child = child;
+                reason
+            },
+        )
     }
+}
+
+impl<'a> Inspector<'a> {
+    /// The layout that gives the unit of the directory `parts` (relative to
+    /// the project), and its unmarked layout name when the unit has no
+    /// project marker and the request allows it.
+    ///
+    /// The first layout of the directory whose marker is present gives the
+    /// unit. With no such layout, the first distinctive layout gives a unit
+    /// that the checks refuse (`project_marker_missing`), or a unit of its
+    /// unmarked layout name with `--allow-unmarked`. A generic name gives
+    /// no unit. A name of the skip list of the walk, such as `.cache`, is a
+    /// unit only of a layout of the table whose marker is present: with no
+    /// marker it is not listed.
+    fn choose(
+        &self,
+        project: &Path,
+        names: &BTreeSet<OsString>,
+        parts: &[&OsStr],
+    ) -> Option<(Layout<'a>, Option<&'static str>)> {
+        let skipped: bool = parts.first().is_some_and(|first| is_skipped(first));
+        let of_directory: Vec<&Layout<'a>> = self
+            .layouts
+            .iter()
+            .filter(|layout| layout.has_directory(parts))
+            .filter(|layout| !(skipped && layout.configured))
+            .collect();
+        if let Some(layout) = of_directory
+            .iter()
+            .find(|layout| has_marker(self.host.principal, layout, project, names))
+        {
+            return Some(((*layout).clone(), None));
+        }
+        if skipped {
+            return None;
+        }
+        let distinctive: &Layout<'a> = of_directory
+            .iter()
+            .find(|layout| layout.name == DirectoryName::Distinctive)?;
+        let unmarked: Option<&'static str> = distinctive.unmarked.filter(|_| self.allow_unmarked);
+        Some((distinctive.clone(), unmarked))
+    }
+}
+
+/// Whether the checks of a unit need the project marker of its layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerCheck {
+    /// The directory that holds the unit has a marker of the layout.
+    Required,
+    /// The unit has an unmarked layout name: the request allowed a unit
+    /// with no marker. Each other check applies.
+    AbsenceAllowed,
 }
 
 /// The checks of the objects of one unit of `layout` at `path`, in the
@@ -1295,16 +1421,20 @@ fn unit_shape(
     project: &Path,
     names: &BTreeSet<OsString>,
     path: &Path,
+    marker: MarkerCheck,
 ) -> Result<(), (&'static str, Option<PathBuf>)> {
     let plain = |reason: &'static str| Err((reason, None));
     let Ok(parent) = lstat(project) else {
         return plain("project_not_readable");
     };
+    let Ok(relative) = path.strip_prefix(project) else {
+        return plain("unit_path_not_plain");
+    };
     // Each directory between the project and the unit, for a path of two
-    // names, is a directory of the user on the same device, not a symbolic
-    // link.
+    // or three names, is a directory of the user on the same device, not a
+    // symbolic link. No one of them is a unit.
     let mut between: PathBuf = project.to_path_buf();
-    let mut components = layout.directory.split('/').peekable();
+    let mut components = relative.iter().peekable();
     while let Some(component) = components.next() {
         if components.peek().is_none() {
             break;
@@ -1335,7 +1465,7 @@ fn unit_shape(
     if snapshot.object.device != parent.object.device {
         return plain("unit_device");
     }
-    if !has_marker(layout, project, names) {
+    if marker == MarkerCheck::Required && !has_marker(principal, layout, project, names) {
         return plain("project_marker_missing");
     }
     if let Some(inner) = layout.inner_marker
@@ -1737,30 +1867,57 @@ pub struct RecheckInput<'a> {
 /// entry at a protected path of the layout, and no build process of the
 /// user works in its project.
 ///
+/// For an unmarked layout name (it ends with
+/// [`svalnir_core::rule::UNMARKED_LAYOUT_SUFFIX`]), the project must still
+/// have no marker of a layout of the directory, and each other check of the
+/// layout applies.
+///
 /// The Git evidence, the project activity, and the measurement are not
 /// examined again here: the use check of the coordinator and the walk of
 /// the executor examine the unit before and during the removal.
 #[must_use]
 pub fn recheck_unit(input: &RecheckInput<'_>) -> UnitRecheck {
+    recheck_unit_in(&PROJECT_LAYOUTS, input)
+}
+
+/// [`recheck_unit`] with the layouts of the table `table`.
+pub(super) fn recheck_unit_in(table: &[ProjectLayout], input: &RecheckInput<'_>) -> UnitRecheck {
     match fs::symlink_metadata(input.unit) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return UnitRecheck::Absent,
         _ => {}
     }
-    let layouts: Vec<Layout<'_>> = catalog(input.user_layouts);
+    let layouts: Vec<Layout<'_>> = catalog(table, input.user_layouts);
+    // A layout name of unmarked units names the layout of the table that
+    // permits them.
+    let unmarked: bool = input
+        .layout
+        .ends_with(svalnir_core::rule::UNMARKED_LAYOUT_SUFFIX);
+    let names: Vec<&OsStr> = input.unit.iter().collect();
     let mut first: Option<UnitRecheck> = None;
     let mut found: bool = false;
-    for layout in layouts.iter().filter(|layout| layout.id == input.layout) {
-        let directory: &Path = Path::new(layout.directory);
-        if !input.unit.ends_with(directory) {
+    let bound = layouts.iter().filter(|layout| {
+        if unmarked {
+            layout.unmarked == Some(input.layout)
+        } else {
+            layout.id == input.layout
+        }
+    });
+    for layout in bound {
+        let count: usize = layout.directory.split('/').count();
+        let Some(start) = names.len().checked_sub(count) else {
+            continue;
+        };
+        let Some(parts) = names.get(start..) else {
+            continue;
+        };
+        if !layout.has_directory(parts) {
             continue;
         }
-        let Some(project) =
-            (0..directory.components().count()).try_fold(input.unit, |path, _| path.parent())
-        else {
+        let Some(project) = (0..count).try_fold(input.unit, |path, _| path.parent()) else {
             continue;
         };
         found = true;
-        let result: UnitRecheck = recheck_layout(input, &layouts, layout, project);
+        let result: UnitRecheck = recheck_layout(input, &layouts, layout, project, parts, unmarked);
         if result == UnitRecheck::Passed {
             return result;
         }
@@ -1778,11 +1935,17 @@ pub fn recheck_unit(input: &RecheckInput<'_>) -> UnitRecheck {
 }
 
 /// The checks of [`recheck_unit`] for one layout and one project directory.
+/// `parts` are the names of the unit relative to the project. With
+/// `unmarked`, the plan binds the unmarked layout name of `layout`: a
+/// marker of a layout of the directory that is now present makes the unit
+/// a different kind of directory than at the plan.
 fn recheck_layout(
     input: &RecheckInput<'_>,
     layouts: &[Layout<'_>],
     layout: &Layout<'_>,
     project: &Path,
+    parts: &[&OsStr],
+    unmarked: bool,
 ) -> UnitRecheck {
     let Ok(entries) = fs::read_dir(project) else {
         return UnitRecheck::Unknown("project_not_readable");
@@ -1803,12 +1966,24 @@ fn recheck_layout(
     // directory than at the plan.
     let chosen: Option<&Layout<'_>> = layouts
         .iter()
-        .filter(|other| other.directory == layout.directory)
-        .find(|other| has_marker(other, project, &names));
-    if chosen.is_some_and(|chosen| chosen.id != layout.id) {
+        .filter(|other| other.has_directory(parts))
+        .find(|other| has_marker(input.principal, other, project, &names));
+    let changed: bool = if unmarked {
+        chosen.is_some()
+    } else {
+        chosen.is_some_and(|chosen| chosen.id != layout.id)
+    };
+    if changed {
         return UnitRecheck::Refused("unit_layout_changed");
     }
-    if let Err((reason, _)) = unit_shape(input.principal, layout, project, &names, input.unit) {
+    let marker: MarkerCheck = if unmarked {
+        MarkerCheck::AbsenceAllowed
+    } else {
+        MarkerCheck::Required
+    };
+    if let Err((reason, _)) =
+        unit_shape(input.principal, layout, project, &names, input.unit, marker)
+    {
         return match reason {
             UNIT_ABSENT => UnitRecheck::Absent,
             "project_not_readable" | "unit_not_readable" | "protected_child_unknown" => {

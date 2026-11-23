@@ -66,6 +66,11 @@ pub struct ProjectRequest<'a> {
     /// True when a project with the state `active` can give a candidate.
     /// A `busy` project never gives one.
     pub include_active: bool,
+    /// True when a distinctive directory of a layout that permits it and
+    /// with no project marker is a unit of the unmarked layout name of its
+    /// layout (`--allow-unmarked`, `docs/CLEANUP_RULES.md` section 12,
+    /// "Unmarked directories"). Each other check applies unchanged.
+    pub allow_unmarked: bool,
     /// The bounds of the walk.
     pub limits: ProjectLimits,
 }
@@ -211,6 +216,7 @@ impl ProjectRule {
             processes: &evidence,
             recency: request.recency,
             layouts: request.layouts,
+            allow_unmarked: request.allow_unmarked,
         };
         let inspection = self.examine(
             host,

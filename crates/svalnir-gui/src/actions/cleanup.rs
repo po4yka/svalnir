@@ -213,6 +213,9 @@ pub struct CleanupOptions {
     /// Also select the units of a project whose activity state is
     /// `active` (`--include-active`). A busy project is never selected.
     pub include_active: bool,
+    /// Also select a distinctive directory with no project marker of a
+    /// layout that permits it (`--allow-unmarked`). A manual plan only.
+    pub allow_unmarked: bool,
     /// Leave out each candidate whose estimate is smaller (`--min-size`).
     pub min_size: Option<u64>,
     /// The consent to a `clear` command (`--include-clear`).
@@ -513,6 +516,7 @@ mod tests {
         let mut book = CleanupBook::default();
         let options = CleanupOptions {
             include_active: true,
+            allow_unmarked: true,
             min_size: Some(1),
             include_clear: false,
         };

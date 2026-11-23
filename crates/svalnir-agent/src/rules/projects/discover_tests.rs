@@ -748,6 +748,7 @@ fn recheck(
         processes,
         now: evidence.now().monotonic_ns,
         expiry: super::PROJECT_EVIDENCE_EXPIRY,
+        git: Some(&home.git),
     })
 }
 
@@ -1165,6 +1166,7 @@ fn the_check_before_a_step_matches_a_pattern_name_and_three_names() {
                 processes: &none,
                 now: evidence.now().monotonic_ns,
                 expiry: super::PROJECT_EVIDENCE_EXPIRY,
+                git: Some(&home.git),
             },
         )
     };
@@ -1230,6 +1232,7 @@ fn the_check_before_a_step_refuses_a_user_unit_when_a_table_marker_appears() {
             processes: &none,
             now: evidence.now().monotonic_ns,
             expiry: super::PROJECT_EVIDENCE_EXPIRY,
+            git: Some(&home.git),
         })
     };
     assert_eq!(check(), UnitRecheck::Passed);

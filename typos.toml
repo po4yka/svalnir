@@ -5,3 +5,5 @@ extend-exclude = ["Cargo.lock", ".claude/skills/"]
 [default.extend-words]
 # The identity of a simulator device in the tools of Apple (`simctl`).
 udid = "udid"
+# The prefix of the editor of Unreal Engine 4 (`UE4Editor`).
+UE = "UE"

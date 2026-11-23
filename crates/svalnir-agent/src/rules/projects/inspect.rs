@@ -672,10 +672,10 @@ struct Inspector<'a> {
     /// The option `--allow-unmarked` of the request.
     allow_unmarked: bool,
     /// The path of each unit of the report, of each project of the
-    /// inspection, with its layout. The walk does not enter it, and a
-    /// later unit that is, holds, or is in one of them is not a second
-    /// unit.
-    matched: BTreeMap<PathBuf, &'static str>,
+    /// inspection, with its layout name and the directory of its layout.
+    /// The walk does not enter it, and a later unit that is, holds, or is
+    /// in one of them is not a second unit.
+    matched: BTreeMap<PathBuf, (&'static str, &'a str)>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
     /// False for the discovery for an eviction: a unit that passes each
@@ -1344,12 +1344,6 @@ impl Inspector<'_> {
                 return;
             }
             let path: PathBuf = project.join(&relative);
-            // A directory that is a unit of an earlier project, for example
-            // `P/var/cache` of `P` for the project `P/var`, is not a unit
-            // again.
-            if self.matched.contains_key(&path) {
-                continue;
-            }
             let parts: Vec<&OsStr> = relative.iter().collect();
             // A path of two or three names needs its last name.
             if parts.len() > 1 && lstat(&path).is_err() {
@@ -1358,6 +1352,17 @@ impl Inspector<'_> {
             let Some((layout, unmarked)) = self.choose(project, names, &parts) else {
                 continue;
             };
+            // A directory that is a unit of an earlier project, for example
+            // `P/var/cache` of `P` for the project `P/var`. With the same
+            // layout it stays one unit; with another layout both claims are
+            // refused, so that the checks of neither layout alone permit a
+            // removal.
+            if let Some(&(earlier, directory)) = self.matched.get(&path) {
+                if (earlier, directory) != (layout.id, layout.directory) {
+                    self.refuse_claimed(&path, project, &layout, unmarked, earlier);
+                }
+                continue;
+            }
             let mut report: ProjectUnitReport = ProjectUnitReport {
                 path: path.clone(),
                 search_root: self.current_root.clone(),
@@ -1377,7 +1382,9 @@ impl Inspector<'_> {
             // One directory is never in two units: a unit that holds or is
             // in an earlier unit, of this project or of a project above it,
             // is refused, and only the earlier unit is measured.
-            if let Some((_, other)) = self.matched.iter().find(|(unit, _)| overlaps(unit, &path)) {
+            if let Some((_, (other, _))) =
+                self.matched.iter().find(|(unit, _)| overlaps(unit, &path))
+            {
                 report.overlapping_layout = Some(other);
                 report.outcome = ProjectUnitOutcome::Refused {
                     reason: "overlaps_unit",
@@ -1385,9 +1392,46 @@ impl Inspector<'_> {
             } else {
                 report.outcome = self.unit(&layout, project, root, names, &path, &mut report);
             }
-            self.matched.insert(path, layout.id);
+            self.matched.insert(path, (layout.id, layout.directory));
             self.units.push(report);
         }
+    }
+
+    /// Refuses the unit at `path` of the earlier layout `earlier` and the
+    /// later claim of `layout` for the project `project` with
+    /// `overlaps_unit`.
+    fn refuse_claimed(
+        &mut self,
+        path: &Path,
+        project: &Path,
+        layout: &Layout<'_>,
+        unmarked: Option<&'static str>,
+        earlier: &'static str,
+    ) {
+        let later: &'static str = unmarked.unwrap_or(layout.id);
+        let refused = ProjectUnitOutcome::Refused {
+            reason: "overlaps_unit",
+        };
+        if let Some(report) = self.units.iter_mut().find(|report| report.path == path) {
+            report.overlapping_layout = Some(later);
+            report.outcome = refused.clone();
+        }
+        self.units.push(ProjectUnitReport {
+            path: path.to_path_buf(),
+            search_root: self.current_root.clone(),
+            project: project.to_path_buf(),
+            layout: later,
+            marker_allowance: unmarked.map(|_| PROJECT_MARKER_ABSENT_ALLOWED),
+            protected_child: None,
+            overlapping_layout: Some(earlier),
+            version_control: None,
+            activity: None,
+            uses: None,
+            recency: None,
+            outcome: refused,
+            owner_workflow: layout.owner_workflow,
+            rebuild_impact: layout.rebuild_impact,
+        });
     }
 
     /// The checks of the objects of one unit: the directories on the way,
@@ -1999,6 +2043,10 @@ pub struct RecheckInput<'a> {
     pub now: Option<MonotonicNanos>,
     /// The age after which the process evidence is not current.
     pub expiry: Nanoseconds,
+    /// The Git executable that passed the checks, for the version-control
+    /// evidence of a layout that permits an own ignore file. `None` when
+    /// no executable passed them.
+    pub git: Option<&'a GitTool>,
 }
 
 /// Makes the checks of the unit `input.unit` of `project.dependency-directory`
@@ -2014,9 +2062,12 @@ pub struct RecheckInput<'a> {
 /// have no marker of a layout of the directory, and each other check of the
 /// layout applies.
 ///
-/// The Git evidence, the project activity, and the measurement are not
-/// examined again here: the use check of the coordinator and the walk of
-/// the executor examine the unit before and during the removal.
+/// For a layout that permits the evidence of an own ignore file, the Git
+/// queries of the inspection run again, because that evidence depends on
+/// the entries of the unit. For each other layout, the Git evidence, the
+/// project activity, and the measurement are not examined again here: the
+/// use check of the coordinator and the walk of the executor examine the
+/// unit before and during the removal.
 #[must_use]
 pub fn recheck_unit(input: &RecheckInput<'_>) -> UnitRecheck {
     recheck_unit_in(&PROJECT_LAYOUTS, input)
@@ -2076,6 +2127,32 @@ pub(super) fn recheck_unit_in(table: &[ProjectLayout], input: &RecheckInput<'_>)
     }
 }
 
+/// The refusal of the check before a step from the version-control
+/// evidence of the unit `input.unit` of the project `project`, made again
+/// with the queries of the inspection. `None` when Git ignores the unit.
+fn ignore_evidence(input: &RecheckInput<'_>, project: &Path) -> Option<UnitRecheck> {
+    let unknown = Some(UnitRecheck::Unknown("version_control_unknown"));
+    let Some(git) = input.git else {
+        return unknown;
+    };
+    let Ok(mounts) = MountTable::read() else {
+        return unknown;
+    };
+    let repository: Repository =
+        match find_repository(project, input.root, input.principal, &mounts) {
+            RepositoryLookup::Found(repository) => repository,
+            RepositoryLookup::NotFound => return Some(UnitRecheck::Refused("no_repository")),
+            RepositoryLookup::Unknown(_) => return unknown,
+        };
+    match Inspector::ignored(git, &repository, input.unit, true) {
+        VersionControl::Ignored { .. } => None,
+        VersionControl::NotIgnored => Some(UnitRecheck::Refused("not_ignored")),
+        VersionControl::Tracked => Some(UnitRecheck::Refused("tracked_files")),
+        VersionControl::NoRepository => Some(UnitRecheck::Refused("no_repository")),
+        VersionControl::Unknown { .. } => unknown,
+    }
+}
+
 /// The reading of the entries of the directory `directory`, bounded as the
 /// walk is. `None` when it cannot be read completely.
 fn directory_names(directory: &Path) -> Option<BTreeSet<OsString>> {
@@ -2129,6 +2206,26 @@ fn earlier_unit(
             if choose_in(layouts, input.principal, directory, &names, &parts).is_some() {
                 return Some(UnitRecheck::Refused("overlaps_unit"));
             }
+        }
+    }
+    // A project directory between `project` and the unit, such as `P/var`
+    // for the unit `P/var/cache` of `P`, whose layouts give the same
+    // directory a unit of another layout: the inspection refuses both
+    // claims.
+    let parent: &Path = input.unit.parent()?;
+    for directory in parent.ancestors() {
+        if directory == project || !directory.starts_with(project) {
+            break;
+        }
+        let Some(names) = directory_names(directory) else {
+            return Some(UnitRecheck::Unknown("project_not_readable"));
+        };
+        let Ok(relative) = input.unit.strip_prefix(directory) else {
+            continue;
+        };
+        let parts: Vec<&OsStr> = relative.iter().collect();
+        if choose_in(layouts, input.principal, directory, &names, &parts).is_some() {
+            return Some(UnitRecheck::Refused("overlaps_unit"));
         }
     }
     None
@@ -2198,10 +2295,15 @@ fn recheck_layout(
             _ => UnitRecheck::Refused(reason),
         };
     }
-    // The evidence of an own ignore file needs the file of the producer at
-    // the step too.
-    if layout.own_ignore_file && !has_own_ignore_file(input.unit) {
-        return UnitRecheck::Refused("ignore_file_changed");
+    // The evidence of an own ignore file depends on the entries of the
+    // unit, so the queries of the inspection run again: a unit that the
+    // rules above it ignore passes with no own file, and a unit that its
+    // own file ignores needs the file and no untracked entry that Git does
+    // not ignore.
+    if layout.own_ignore_file
+        && let Some(result) = ignore_evidence(input, project)
+    {
+        return result;
     }
     let processes: &BuildProcesses = input.processes;
     if processes.blocking(project).is_some() {

@@ -602,6 +602,8 @@ pub trait DiscoveryEnvironment: ScanClock {
             return UnitRecheck::Unknown("unit_layout_unknown");
         };
         let processes: BuildProcesses = self.build_processes(principal);
+        // The layouts with the evidence of an own ignore file ask Git again.
+        let git: Option<super::git::GitTool> = super::git::GitTool::locate().ok();
         recheck_unit(&RecheckInput {
             principal,
             layout,
@@ -611,6 +613,7 @@ pub trait DiscoveryEnvironment: ScanClock {
             processes: &processes,
             now: self.now().monotonic_ns,
             expiry: PROJECT_EVIDENCE_EXPIRY,
+            git: git.as_ref(),
         })
     }
 }

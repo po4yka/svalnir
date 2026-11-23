@@ -1670,6 +1670,9 @@ fn a_user_marker_in_the_directory_of_its_layout_is_refused() {
         ("cmake-build-*", "cmake-build-debug/CMakeCache.txt"),
         ("gen/cache", "gen/"),
         ("output", "outp*/"),
+        // Two patterns that can match one name, `gen-x-out`.
+        ("gen-*", "*-out/"),
+        ("cmake-build-*", "*.cmake"),
     ] {
         assert_one(
             &layout_document(&format!(

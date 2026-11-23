@@ -503,6 +503,7 @@ fn recheck_with(
             processes: &none,
             now: evidence.now().monotonic_ns,
             expiry: super::PROJECT_EVIDENCE_EXPIRY,
+            git: Some(&home.git),
         },
     )
 }
@@ -512,35 +513,84 @@ fn recheck(home: &Home, layout: &str, unit: &Path, user_layouts: &[UserLayout]) 
 }
 
 #[test]
-fn the_check_before_a_step_reads_the_own_ignore_file_again() {
+fn the_check_before_a_step_asks_git_again_for_an_own_ignore_file() {
     let home = Home::new();
-    home.write("Code/ex/mix.exs", b"defmodule X do end\n");
-    home.write("Code/ex/.elixir_ls/.gitignore", b"*\n");
-    home.write("Code/ex/.elixir_ls/build/a", b"x");
-    let unit: PathBuf = home.path.join("Code/ex/.elixir_ls");
-    assert_eq!(recheck(&home, "elixir-ls", &unit, &[]), UnitRecheck::Passed);
-    fs::write(unit.join(".gitignore"), b"build/\n").unwrap();
+    // Basis `own_ignore_file`.
+    let own: PathBuf = self_ignored(&home, "own", "mix.exs", ".elixir_ls", b"*\n");
+    assert_eq!(recheck(&home, "elixir-ls", &own, &[]), UnitRecheck::Passed);
+    // A negation and an entry that Git does not ignore, after the plan.
+    fs::write(own.join(".gitignore"), b"*\n!keep.txt\n").unwrap();
+    fs::write(own.join("keep.txt"), b"keep\n").unwrap();
     assert_eq!(
-        recheck(&home, "elixir-ls", &unit, &[]),
-        UnitRecheck::Refused("ignore_file_changed")
+        recheck(&home, "elixir-ls", &own, &[]),
+        UnitRecheck::Refused("not_ignored")
+    );
+    // A tracked file.
+    fs::write(own.join(".gitignore"), b"*\n").unwrap();
+    fs::remove_file(own.join("keep.txt")).unwrap();
+    home.git("Code/own", &["add", "-f", ".elixir_ls/data/file.bin"]);
+    assert_eq!(
+        recheck(&home, "elixir-ls", &own, &[]),
+        UnitRecheck::Refused("tracked_files")
+    );
+    // Basis `ignore_rules`: the rules of the project ignore the unit, so an
+    // own file that does not start with `*` does not refuse it.
+    let rules: PathBuf = home.project_files(
+        "rules",
+        &["mix.exs"],
+        "/.lexical/\n",
+        &[".lexical/.gitignore", ".lexical/project.log"],
+    );
+    let lexical: PathBuf = rules.join(".lexical");
+    fs::write(lexical.join(".gitignore"), b"project.log\n").unwrap();
+    assert_eq!(
+        recheck(&home, "lexical", &lexical, &[]),
+        UnitRecheck::Passed
+    );
+    // With no Git executable the evidence is not known.
+    let evidence = FixtureEnvironment::days_later(0);
+    let none: BuildProcesses = complete(&evidence);
+    let input = RecheckInput {
+        principal: home.principal,
+        layout: "lexical",
+        root: &home.path.join("Code"),
+        unit: &lexical,
+        user_layouts: &[],
+        processes: &none,
+        now: evidence.now().monotonic_ns,
+        expiry: super::PROJECT_EVIDENCE_EXPIRY,
+        git: None,
+    };
+    assert_eq!(
+        recheck_unit_in(&PROJECT_LAYOUTS, &input),
+        UnitRecheck::Unknown("version_control_unknown")
+    );
+    // A failed query (an index that Git cannot read) is not known.
+    fs::write(home.path.join("Code/rules/.git/index"), b"not an index").unwrap();
+    assert_eq!(
+        recheck(&home, "lexical", &lexical, &[]),
+        UnitRecheck::Unknown("version_control_unknown")
     );
     // A symbolic link is not the file of the producer; the inner marker
     // `.gitignore` of the layout refuses it first.
-    fs::remove_file(unit.join(".gitignore")).unwrap();
+    fs::remove_file(own.join(".gitignore")).unwrap();
     home.write("Code/elsewhere/ignore", b"*\n");
     symlink(
         home.path.join("Code/elsewhere/ignore"),
-        unit.join(".gitignore"),
+        own.join(".gitignore"),
     )
     .unwrap();
     assert_eq!(
-        recheck(&home, "elixir-ls", &unit, &[]),
+        recheck(&home, "elixir-ls", &own, &[]),
         UnitRecheck::Refused("unsupported_layout")
     );
-    // A layout with no inner marker refuses the link with the changed file.
-    home.write("Code/tool/tool.cfg", b"x");
-    home.write("Code/tool/.tool-state/a", b"x");
-    let state: PathBuf = home.path.join("Code/tool/.tool-state");
+    // A layout with no inner marker: the link is not an own ignore file.
+    let state: PathBuf = self_ignored(&home, "tool", "tool.cfg", ".tool-state", b"*\n");
+    assert_eq!(
+        recheck_with(&home, &OWN_FILE_TABLE, "tool-state", &state, &[]),
+        UnitRecheck::Passed
+    );
+    fs::remove_file(state.join(".gitignore")).unwrap();
     symlink(
         home.path.join("Code/elsewhere/ignore"),
         state.join(".gitignore"),
@@ -548,13 +598,30 @@ fn the_check_before_a_step_reads_the_own_ignore_file_again() {
     .unwrap();
     assert_eq!(
         recheck_with(&home, &OWN_FILE_TABLE, "tool-state", &state, &[]),
-        UnitRecheck::Refused("ignore_file_changed")
+        UnitRecheck::Refused("not_ignored")
+    );
+}
+
+#[test]
+fn a_cut_list_of_untracked_entries_is_not_an_own_ignore_file() {
+    let home = Home::new();
+    let cut: PathBuf = self_ignored(&home, "cut", "mix.exs", ".elixir_ls", b"*\n!*.txt\n");
+    // More names than the output bound of a query holds.
+    for index in 0..80 {
+        fs::write(cut.join(format!("{index:03}-{}.txt", "n".repeat(60))), b"x").unwrap();
+    }
+    let inspection: ProjectInspection = home.inspect(&quiet());
+    let report = unit(&inspection, &cut);
+    assert_eq!(refusal(report), "not_ignored");
+    assert_eq!(
+        recheck(&home, "elixir-ls", &cut, &[]),
+        UnitRecheck::Refused("not_ignored")
     );
 }
 
 // ---------------------------------------------------------------------
-// The units of nested project directories (independent review of
-// `a6274a4`).
+// The units of nested project directories (independent reviews of
+// `a6274a4` and of `2f00eee`).
 // ---------------------------------------------------------------------
 
 const VAR_CACHE_LAYOUTS: &str = "schema_version = 1\n[[cleanup.projects.layouts]]\ndirectory = \"cache\"\nmarkers = [\"log/\"]\n\n[[cleanup.projects.layouts]]\ndirectory = \"cache/dev\"\nmarkers = [\"log/\"]\n";
@@ -569,8 +636,20 @@ fn symfony(home: &Home) -> PathBuf {
     )
 }
 
+/// The reports of the directory `path`.
+fn reports_of<'a>(
+    inspection: &'a ProjectInspection,
+    path: &Path,
+) -> Vec<&'a super::ProjectUnitReport> {
+    inspection
+        .units
+        .iter()
+        .filter(|unit| unit.path == path)
+        .collect()
+}
+
 #[test]
-fn a_unit_of_a_project_above_is_not_a_unit_of_a_nested_project() {
+fn a_directory_that_two_layouts_claim_is_refused_for_both() {
     let home = Home::new();
     let project: PathBuf = symfony(&home);
     // sbt: `project/target` of the build, and `project` has a build file of
@@ -581,40 +660,51 @@ fn a_unit_of_a_project_above_is_not_a_unit_of_a_nested_project() {
         "target/\n",
         &["project/target/a.class"],
     );
+    // sbt with no build file in `project`: one unit.
+    let one: PathBuf = home.project_files(
+        "one",
+        &["build.sbt"],
+        "target/\n",
+        &["project/target/a.class"],
+    );
     let layouts: Vec<UserLayout> = configured(VAR_CACHE_LAYOUTS);
     let inspection: ProjectInspection = inspect_configured(&home, &layouts);
     let cache: PathBuf = project.join("var/cache");
-    // One report: the table layout refuses the unit, and the user layout of
-    // the project `var` does not take it.
-    let reports: Vec<_> = inspection
-        .units
-        .iter()
-        .filter(|unit| unit.path == cache)
-        .collect();
-    assert_eq!(reports.len(), 1);
+    let reports = reports_of(&inspection, &cache);
+    assert_eq!(reports.len(), 2);
     assert_eq!(reports[0].layout, "symfony-var-cache");
-    assert_eq!(refusal(reports[0]), "protected_child");
+    assert_eq!(reports[1].layout, "user-configured");
+    for report in &reports {
+        assert_eq!(refusal(report), "overlaps_unit");
+    }
+    assert_eq!(reports[0].overlapping_layout, Some("user-configured"));
+    assert_eq!(reports[1].overlapping_layout, Some("symfony-var-cache"));
     // A unit of the nested project in the earlier unit is refused.
     let inner = unit(&inspection, &project.join("var/cache/dev"));
     assert_eq!(refusal(inner), "overlaps_unit");
     assert_eq!(inner.overlapping_layout, Some("symfony-var-cache"));
-    let target: PathBuf = sbt.join("project/target");
-    let reports: Vec<_> = inspection
-        .units
-        .iter()
-        .filter(|unit| unit.path == target)
-        .collect();
-    assert_eq!(reports.len(), 1);
+    let reports = reports_of(&inspection, &sbt.join("project/target"));
+    assert_eq!(reports.len(), 2);
     assert_eq!(reports[0].layout, "sbt-meta-target");
+    assert_eq!(reports[1].layout, "sbt-target");
+    for report in &reports {
+        assert_eq!(refusal(report), "overlaps_unit");
+    }
+    let reports = reports_of(&inspection, &one.join("project/target"));
+    assert_eq!(reports.len(), 1);
+    assert!(matches!(
+        reports[0].outcome,
+        ProjectUnitOutcome::Measured(_)
+    ));
 }
 
 #[test]
-fn the_check_before_a_step_refuses_a_unit_of_a_project_above() {
+fn the_check_before_a_step_refuses_a_directory_that_two_layouts_claim() {
     let home = Home::new();
     let project: PathBuf = symfony(&home);
     let layouts: Vec<UserLayout> = configured(VAR_CACHE_LAYOUTS);
     let cache: PathBuf = project.join("var/cache");
-    // The table layout of the project above gives the unit.
+    // The table layout of the project above claims the directory.
     assert_eq!(
         recheck(&home, "user-configured", &cache, &layouts),
         UnitRecheck::Refused("overlaps_unit")
@@ -623,23 +713,43 @@ fn the_check_before_a_step_refuses_a_unit_of_a_project_above() {
         recheck(&home, "user-configured", &cache.join("dev"), &layouts),
         UnitRecheck::Refused("overlaps_unit")
     );
-    // With no marker of the table layout, the unit of the nested project
-    // passes.
-    fs::remove_file(project.join("symfony.lock")).unwrap();
+    // The user layout of the nested project claims the unit of the table
+    // layout.
     fs::remove_dir_all(cache.join("dev/sessions")).unwrap();
+    assert_eq!(
+        recheck(&home, "symfony-var-cache", &cache, &layouts),
+        UnitRecheck::Refused("overlaps_unit")
+    );
+    assert_eq!(
+        recheck(&home, "symfony-var-cache", &cache, &[]),
+        UnitRecheck::Passed
+    );
+    // With no marker of the table layout, `cache` of the nested project
+    // passes, and `cache/dev` is in the earlier unit `cache` of the same
+    // project.
+    fs::remove_file(project.join("symfony.lock")).unwrap();
     assert_eq!(
         recheck(&home, "user-configured", &cache, &layouts),
         UnitRecheck::Passed
     );
-    // sbt: `project/target` of `sbt-target` for the project `project`.
+    assert_eq!(
+        recheck(&home, "user-configured", &cache.join("dev"), &layouts),
+        UnitRecheck::Refused("overlaps_unit")
+    );
+    // sbt: both claims of `project/target` are refused; with no build file
+    // in `project`, `sbt-meta-target` passes.
     home.write("Code/sbt/build.sbt", b"x");
     home.write("Code/sbt/project/build.sbt", b"x");
     home.write("Code/sbt/project/target/a.class", b"x");
     let target: PathBuf = home.path.join("Code/sbt/project/target");
-    assert_eq!(
-        recheck(&home, "sbt-target", &target, &[]),
-        UnitRecheck::Refused("overlaps_unit")
-    );
+    for layout in ["sbt-target", "sbt-meta-target"] {
+        assert_eq!(
+            recheck(&home, layout, &target, &[]),
+            UnitRecheck::Refused("overlaps_unit"),
+            "{layout}"
+        );
+    }
+    fs::remove_file(home.path.join("Code/sbt/project/build.sbt")).unwrap();
     assert_eq!(
         recheck(&home, "sbt-meta-target", &target, &[]),
         UnitRecheck::Passed

@@ -21,13 +21,13 @@ use crate::rules::in_use::{UnitScope, inventory_of};
 /// the build tools of Xcode and of Swift Package Manager, Cargo, Maven,
 /// Gradle, sbt, and Mill (and the Java runtime that runs them), Mix and the
 /// Erlang runtime, .NET, Zig, Dart and Flutter, `CMake` and Ninja, Carthage,
-/// Godot, the editor of Unity, the editor and the build tool of Unreal
-/// Engine, Stack, Cabal, and GHC, Elm, dune, Terraform, `OpenTofu`, and
+/// Godot, the editor of Unity, the editors of Unreal Engine 5 and 4 and its
+/// build tool, Stack, Cabal, and GHC, Elm, dune, Terraform, `OpenTofu`, and
 /// Terragrunt, R, PHP and Composer, Pixi, Hugo, the command-line tools of
 /// AWS SAM, Serverless, and the local runtime of Wrangler, direnv, devenv,
 /// and Nix. A name that starts with `python3.`, `pip3.`, or `ghc-` is also
 /// one.
-pub const BUILD_PROCESS_NAMES: [&str; 80] = [
+pub const BUILD_PROCESS_NAMES: [&str; 81] = [
     "node",
     "npm",
     "npx",
@@ -86,6 +86,7 @@ pub const BUILD_PROCESS_NAMES: [&str; 80] = [
     "godot",
     "Unity",
     "UnrealEditor",
+    "UE4Editor",
     "UnrealBuildTool",
     "stack",
     "cabal",

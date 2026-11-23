@@ -293,10 +293,16 @@ fn marker_problem(marker: &str) -> Option<&'static str> {
 
 /// Whether the first name of `marker` can be the first name of
 /// `directory`, so that the marker is the unit or is in it. Either name can
-/// be a pattern; the comparison ignores the case of ASCII letters.
+/// be a pattern; the comparison ignores the case of ASCII letters. When
+/// both are patterns, the answer is always yes.
 fn marker_is_in_unit(directory: &str, marker: &str) -> bool {
     let first = |text: &str| text.split('/').next().unwrap_or(text).to_owned();
     let (unit, marker): (String, String) = (first(directory), first(marker));
+    // Two patterns can match one name although neither matches the other
+    // as text, for example `gen-*` and `*-out` for `gen-x-out`.
+    if is_pattern(&unit) && is_pattern(&marker) {
+        return true;
+    }
     glob_matches(unit.as_bytes(), marker.as_bytes(), true)
         || glob_matches(marker.as_bytes(), unit.as_bytes(), true)
 }

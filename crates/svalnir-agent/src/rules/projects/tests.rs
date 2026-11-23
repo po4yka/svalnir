@@ -510,7 +510,12 @@ fn an_ignored_dependency_directory_of_a_project_is_measured() {
     let report = unit(&inspection, &project.join("node_modules"));
     assert_eq!(report.layout, "node-modules");
     assert_eq!(report.project, project);
-    assert_eq!(report.version_control, Some(VersionControl::Ignored));
+    assert_eq!(
+        report.version_control,
+        Some(VersionControl::Ignored {
+            basis: super::IgnoreBasis::IgnoreRules
+        })
+    );
     assert_eq!(report.activity, Some(ProjectActivity::Inactive));
     let ProjectUnitOutcome::Measured(measurement) = &report.outcome else {
         panic!("not measured: {:?}", report.outcome);
@@ -851,7 +856,12 @@ fn a_linked_worktree_of_the_project_has_git_evidence() {
         &inspection,
         &home.path.join("Code/app-feature/node_modules"),
     );
-    assert_eq!(report.version_control, Some(VersionControl::Ignored));
+    assert_eq!(
+        report.version_control,
+        Some(VersionControl::Ignored {
+            basis: super::IgnoreBasis::IgnoreRules
+        })
+    );
 }
 
 #[test]
@@ -1107,7 +1117,12 @@ fn a_unit_that_holds_a_repository_is_refused_and_not_measured() {
 
     let inspection: ProjectInspection = home.inspect(&quiet());
     let report = unit(&inspection, &project.join("node_modules"));
-    assert_eq!(report.version_control, Some(VersionControl::Ignored));
+    assert_eq!(
+        report.version_control,
+        Some(VersionControl::Ignored {
+            basis: super::IgnoreBasis::IgnoreRules
+        })
+    );
     assert_eq!(
         report.outcome,
         ProjectUnitOutcome::RepositoryRefused(RepositoryRefusal {

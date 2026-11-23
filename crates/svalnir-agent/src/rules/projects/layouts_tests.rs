@@ -996,6 +996,7 @@ const fn synthetic(
         name,
         unmarked: Unmarked::Never,
         checkouts: PackageCheckouts::None,
+        own_ignore_file: false,
         reclaim: ReclaimBasis::AllocatedBytes,
         owner_workflow: "A test layout.",
         rebuild_impact: "A test layout.",
@@ -1320,8 +1321,8 @@ fn a_cache_directory_is_a_unit_only_with_the_marker_of_its_layout() {
         &inspection,
         &unmarked.join(".cache/inner/.cache")
     ));
-    // The catalog of this build has no layout of `.cache`, so the walk
-    // lists none.
+    // The one layout of `.cache` of the catalog needs a file
+    // `gatsby-config.*`, so the walk lists none here.
     let inspection: ProjectInspection = home.inspect(&quiet());
     assert!(!is_listed(&inspection, &marked.join(".cache")));
 }

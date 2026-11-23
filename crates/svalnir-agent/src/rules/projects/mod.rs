@@ -71,6 +71,8 @@ mod recency;
 #[cfg(test)]
 mod discover_tests;
 #[cfg(test)]
+mod evidence_tests;
+#[cfg(test)]
 mod layouts_tests;
 #[cfg(test)]
 mod recency_tests;
@@ -97,11 +99,12 @@ pub(in crate::rules) use discover::ProjectDiscoveryInput;
 pub use discover::{EnvironmentEvidence, ProjectRequest, examined_for};
 pub(in crate::rules) use inspect::open_search_root;
 pub use inspect::{
-    ArgumentRootError, GitAvailability, IN_SEARCH_ROOT, MAX_PROJECT_ROOTS, MAX_SEARCH_ROOTS,
-    PROJECT_MARKER_ABSENT_ALLOWED, ProjectActivity, ProjectHost, ProjectInspection, ProjectLimits,
-    ProjectUnitOutcome, ProjectUnitReport, REPEATED_ROOT, RecheckInput, RootKind, RootSource,
-    SearchCompletion, SearchRootEntry, SearchRootOutcome, SearchRootReport, SearchRoots,
-    UNIT_ABSENT, UnitRecheck, VersionControl, argument_root, recheck_unit,
+    ArgumentRootError, GitAvailability, IN_SEARCH_ROOT, IgnoreBasis, MAX_PROJECT_ROOTS,
+    MAX_SEARCH_ROOTS, PROJECT_MARKER_ABSENT_ALLOWED, ProjectActivity, ProjectHost,
+    ProjectInspection, ProjectLimits, ProjectUnitOutcome, ProjectUnitReport, REPEATED_ROOT,
+    RecheckInput, RootKind, RootSource, SearchCompletion, SearchRootEntry, SearchRootOutcome,
+    SearchRootReport, SearchRoots, UNIT_ABSENT, UnitRecheck, VersionControl, argument_root,
+    recheck_unit,
 };
 pub use layouts::{
     DirectoryName, MarkerKind, PROJECT_LAYOUT_COUNT, PROJECT_LAYOUTS, PackageCheckouts,
@@ -126,10 +129,11 @@ pub const PROJECT_RULE_ID: &str = "project.dependency-directory";
 
 /// The revision of the rule. Revision `r3` adds the manual eviction and
 /// accepts a symbolic link below a unit, which the executor removes and
-/// does not follow. Revision `r4` adds 54 layouts, the markers in a
+/// does not follow. Revision `r4` adds 64 layouts, the markers in a
 /// subdirectory and of a directory, the pattern names, the units of three
-/// names and of `.cache`, the unmarked layout names, and the user layouts
-/// with a first name of the table.
+/// names and of `.cache`, the unmarked layout names, the user layouts with
+/// a first name of the table, the evidence of an own ignore file, and the
+/// overlap of the units of nested project directories.
 pub const PROJECT_RULE_REVISION: &str = "r4";
 
 const MINUTE: u64 = 60_000_000_000;

@@ -123,6 +123,11 @@ pub struct ProjectLayout {
     pub unmarked: Unmarked,
     /// The clones of Swift Package Manager that the unit can hold.
     pub checkouts: PackageCheckouts,
+    /// Whether the producer writes a file `.gitignore` at the top of the
+    /// unit whose first rule is `*`, so that the version-control evidence
+    /// can be `ignored` with the basis of that file
+    /// (`docs/CLEANUP_RULES.md` section 12, "Own ignore file").
+    pub own_ignore_file: bool,
     /// What the reclaim figure of a measured unit is.
     pub reclaim: ReclaimBasis,
     /// The owner workflow, as a text for the user. Svalnir does not run it.
@@ -155,6 +160,10 @@ const GODOT_PROJECT: &[ProjectMarker] = &[file("project.godot")];
 const TERRAFORM_MODULE: &[ProjectMarker] = &[file("*.tf"), file("*.tf.json")];
 const RENV_PROJECT: &[ProjectMarker] = &[file("renv.lock")];
 const SPHINX_PROJECT: &[ProjectMarker] = &[file("conf.py")];
+const GATSBY_SITE: &[ProjectMarker] = &[file("gatsby-config.*")];
+const UNITY_PROJECT: &[ProjectMarker] = &[file("ProjectSettings/ProjectVersion.txt")];
+const UNITY_MANIFEST: &str = "Packages/manifest.json";
+const UNREAL_PROJECT: &[ProjectMarker] = &[file("*.uproject")];
 
 const ANDROID_NATIVE_WORKFLOW: &str = "Remove the directory. The next Gradle build or sync of the module makes it again (for example `./gradlew assembleDebug`). Svalnir does not run them.";
 const ANDROID_NATIVE_IMPACT: &str = "The next build configures CMake or ndk-build again and compiles the native code of each ABI again.";
@@ -191,9 +200,19 @@ const fn plain(
         name,
         unmarked: Unmarked::Never,
         checkouts: PackageCheckouts::None,
+        own_ignore_file: false,
         reclaim: ReclaimBasis::AllocatedBytes,
         owner_workflow,
         rebuild_impact,
+    }
+}
+
+/// The layout `layout`, whose producer writes `.gitignore` with the first
+/// rule `*` at the top of the unit.
+const fn self_ignored(layout: ProjectLayout) -> ProjectLayout {
+    ProjectLayout {
+        own_ignore_file: true,
+        ..layout
     }
 }
 
@@ -240,7 +259,7 @@ const fn with_project_file(layout: ProjectLayout, project_file: &'static str) ->
 use DirectoryName::{Distinctive, Generic};
 
 /// The number of built-in layouts.
-pub const PROJECT_LAYOUT_COUNT: usize = 85;
+pub const PROJECT_LAYOUT_COUNT: usize = 95;
 
 /// The built-in layouts, in the sequence of the specification. For two
 /// layouts with the same directory, the first one whose marker is present
@@ -456,6 +475,45 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         ),
         "globalData.json",
     ),
+    // `storybook build` writes the index `index.json` in its output. The
+    // configuration directory `.storybook` is beside it.
+    with_inner(
+        plain(
+            "storybook-static",
+            "storybook-static",
+            &[directory_marker(".storybook")],
+            Distinctive,
+            "Remove the directory, then run `storybook build`. Svalnir does not run it.",
+            "The next `storybook build` makes the static Storybook again. A deployment that uses this directory has no output until then.",
+        ),
+        "index.json",
+    ),
+    // Gatsby copies `default-html.js` into `.cache` at each start. `.cache`
+    // is a name of the skip list: it is a unit only with the marker.
+    with_inner(
+        plain(
+            ".cache",
+            "gatsby-cache",
+            GATSBY_SITE,
+            Generic,
+            "Run `gatsby clean`, or remove the directory, then run `gatsby develop` or `gatsby build`. Svalnir does not run them.",
+            "The next `gatsby develop` or `gatsby build` makes the cache again and processes each image and each page again, which can take a long time.",
+        ),
+        "default-html.js",
+    ),
+    // `gatsby build` writes `page-data/app-data.json`; `public` is a generic
+    // name.
+    with_inner(
+        plain(
+            "public",
+            "gatsby-public",
+            GATSBY_SITE,
+            Generic,
+            "Run `gatsby clean`, or remove the directory, then run `gatsby build`. Svalnir does not run them.",
+            "The next `gatsby build` makes the site again from the sources and from `static`. A deployment that uses this directory has no site until then, and a file that a person put in the directory is lost.",
+        ),
+        "page-data/app-data.json",
+    ),
     // Only two entries of `.yarn`: `releases`, `plugins`, `patches`,
     // `sdks`, and `versions` are files of the project. With zero-install,
     // the repository commits the cache, and the index check refuses it.
@@ -516,6 +574,20 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         Generic,
         "Remove the directory, then run the build of the package (for example `python3 -m build`). Svalnir does not run it.",
         "The next build makes the archives of the current version again. The archives of earlier versions are lost.",
+    ),
+    // The `egg_info` command of setuptools writes `PKG-INFO`. With the src
+    // layout the directory is in `src`, and the project files are above it,
+    // so that directory is not a unit.
+    with_inner(
+        plain(
+            "*.egg-info",
+            "python-egg-info",
+            &[file("setup.py"), file("pyproject.toml"), file("setup.cfg")],
+            Generic,
+            "Remove the directory. The next build or install of the package makes it again (for example `python3 -m build` or `pip install -e .`). Svalnir does not run them.",
+            "The next build or install writes the metadata of the package again. For a legacy install in development mode (`setup.py develop`), the directory is the metadata of the installed package: the package has no metadata and no entry points until the next install.",
+        ),
+        "PKG-INFO",
     ),
     // The default reporters of Jest and of Vitest write
     // `coverage-final.json`; `coverage` is a generic name.
@@ -619,10 +691,10 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Remove the directory. The next run of `nox` makes the sessions again. Svalnir does not run it.",
         "The next run of nox makes each session environment again and downloads each package that no cache has.",
     )),
-    // Pixi writes `.gitignore` in its directory, and it links the files of
-    // an environment from its package cache with hard links. A person
-    // writes `config.toml`.
-    linked(with_protected(
+    // Pixi writes `.gitignore` in its directory with the rules `*` and
+    // `!config.toml`, and it links the files of an environment from its
+    // package cache with hard links. A person writes `config.toml`.
+    self_ignored(linked(with_protected(
         with_inner(
             plain(
                 ".pixi",
@@ -635,7 +707,7 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             ".gitignore",
         ),
         &["config.toml"],
-    )),
+    ))),
     unmarked(
         plain(
             ".gradle",
@@ -715,6 +787,19 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         ),
         "CMakeCache.txt",
     ),
+    // CLion puts the build tree of each CMake profile in
+    // `cmake-build-TYPE`. The pattern never matches `build`.
+    with_inner(
+        plain(
+            "cmake-build-*",
+            "clion-cmake-build",
+            &[file("CMakeLists.txt")],
+            Generic,
+            "Remove the directory, then reload the CMake project in CLion and build again. Svalnir does not run them.",
+            "The next reload and build of the profile compile the project again. The cache options that a person gave only in the CMake options of the profile stay in the profile; options that a person gave only in `ccmake` are lost. The downloads of `FetchContent` in `_deps` need a network again.",
+        ),
+        "CMakeCache.txt",
+    ),
     // `sphinx-quickstart` with separate source and build directories puts
     // `conf.py` in `source`; `make html` writes the doctrees in `build`.
     with_inner(
@@ -769,8 +854,8 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "doctrees/environment.pickle",
     ),
     // The three language servers of Elixir write `.gitignore` in their
-    // directory.
-    with_inner(
+    // directory; ElixirLS writes the rule `*`.
+    self_ignored(with_inner(
         plain(
             ".elixir_ls",
             "elixir-ls",
@@ -780,8 +865,8 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "The next start of ElixirLS compiles the project again and makes the Dialyzer PLT again, which can take some minutes.",
         ),
         ".gitignore",
-    ),
-    with_inner(
+    )),
+    self_ignored(with_inner(
         plain(
             ".lexical",
             "lexical",
@@ -791,8 +876,8 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "The next start of Lexical makes the index of the project again. The project log is lost.",
         ),
         ".gitignore",
-    ),
-    with_inner(
+    )),
+    self_ignored(with_inner(
         plain(
             ".expert",
             "expert",
@@ -802,7 +887,7 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
             "The next start of Expert makes the index of the project again. The project log is lost.",
         ),
         ".gitignore",
-    ),
+    )),
     // A restore of an SDK-style project writes `project.assets.json`.
     with_inner(
         plain(
@@ -1022,6 +1107,60 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "Close the project in the editor of Godot 3, then remove the directory. The editor imports the assets again when it opens the project. Svalnir does not run it.",
         "The next open of the project imports each asset again. The files `*.import` beside the assets hold the import settings, and they stay.",
     ),
+    // Unity documents `Library`, `Temp`, and `Logs` as generated, and no
+    // file at a fixed path in them. The package manifest beside the
+    // project settings shows a Unity project. `UserSettings` stays.
+    with_project_file(
+        plain(
+            "Library",
+            "unity-library",
+            UNITY_PROJECT,
+            Generic,
+            "Close the project in the Unity editor, then remove the directory. The editor imports the assets again when it opens the project. Svalnir does not run it.",
+            "The next open of the project imports each asset again and compiles the scripts again, which can take hours for a large project. The packages of `PackageCache` are downloaded again from their registry or Git source.",
+        ),
+        UNITY_MANIFEST,
+    ),
+    with_project_file(
+        plain(
+            "Temp",
+            "unity-temp",
+            UNITY_PROJECT,
+            Generic,
+            "Close the project in the Unity editor. The editor clears the directory when it closes the project. Svalnir does not run it.",
+            "The editor makes the directory again when it opens the project. While the editor has the project open, the editor uses the directory.",
+        ),
+        UNITY_MANIFEST,
+    ),
+    with_project_file(
+        plain(
+            "Logs",
+            "unity-logs",
+            UNITY_PROJECT,
+            Generic,
+            "Close the project in the Unity editor, then remove the directory. Svalnir does not run it.",
+            "The logs of the imports and of the processes of the editor are lost. The next open of the project writes new logs.",
+        ),
+        UNITY_MANIFEST,
+    ),
+    // Unreal Engine documents no file at a fixed path in `Intermediate` or
+    // `DerivedDataCache`. `Saved` and `Binaries` stay.
+    plain(
+        "Intermediate",
+        "unreal-intermediate",
+        UNREAL_PROJECT,
+        Generic,
+        "Close the editor, then remove the directory and build the project again (for example with the generated Xcode project). Svalnir does not run them.",
+        "The next build makes the intermediate files and the project files again, and the editor compiles the shaders again.",
+    ),
+    plain(
+        "DerivedDataCache",
+        "unreal-derived-data-cache",
+        UNREAL_PROJECT,
+        Generic,
+        "Close the editor, then remove the directory. The editor makes the derived data again when it loads the content. Svalnir does not run it.",
+        "The next loads of the content make the derived data again from the `.uasset` files, so they are slow until then.",
+    ),
     // Stack writes `stack.sqlite3` in the work directory of the project, and
     // a work directory with no file at a fixed path in each package.
     with_inner(
@@ -1170,7 +1309,8 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
         "The next start of R in the project makes the sandbox of the system library again.",
     ),
     // The `layout` functions of direnv write `CACHEDIR.TAG`. A profile of
-    // `use flake` is a garbage collector root of Nix.
+    // `use flake` and a profile of `use nix` of nix-direnv are garbage
+    // collector roots of Nix.
     with_protected(
         with_inner(
             plain(
@@ -1179,11 +1319,11 @@ pub const PROJECT_LAYOUTS: [ProjectLayout; PROJECT_LAYOUT_COUNT] = [
                 &[file(".envrc")],
                 Distinctive,
                 "Remove the directory, then enter the directory again or run `direnv reload`. Svalnir does not run them.",
-                "The next load of `.envrc` makes each layout again, for example the virtual environment of `layout python`, and it can need a network. A unit with a profile of `use flake` is refused, because it is a garbage collector root of Nix.",
+                "The next load of `.envrc` makes each layout again, for example the virtual environment of `layout python`, and it can need a network. A unit with a profile of `use flake` or of `use nix` is refused, because it is a garbage collector root of Nix.",
             ),
             "CACHEDIR.TAG",
         ),
-        &["flake-profile*"],
+        &["flake-profile*", "nix-profile*"],
     ),
     // `state` holds the data of the services of devenv.
     with_protected(

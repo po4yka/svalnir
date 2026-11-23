@@ -460,7 +460,10 @@ impl SearchRootReport {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VersionControl {
     /// Git ignores the directory, and the index has no path in it.
-    Ignored,
+    Ignored {
+        /// What makes Git ignore the directory.
+        basis: IgnoreBasis,
+    },
     /// Git does not ignore the directory.
     NotIgnored,
     /// The index has a path in the directory, or the directory itself.
@@ -472,6 +475,61 @@ pub enum VersionControl {
         /// The stable name of the cause.
         reason: &'static str,
     },
+}
+
+/// What makes Git ignore a unit (`docs/CLEANUP_RULES.md` section 12,
+/// "Version-control evidence").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IgnoreBasis {
+    /// The ignore rules of a level above the unit ignore the directory.
+    IgnoreRules,
+    /// The unit has the file `.gitignore` of its producer with the first
+    /// rule `*`, Git reports no untracked entry in it that it does not
+    /// ignore, and its layout permits this evidence.
+    OwnIgnoreFile,
+}
+
+/// The name of the ignore file of a unit.
+const OWN_IGNORE_FILE: &str = ".gitignore";
+
+/// The largest size of the ignore file of a unit that the check reads.
+const MAX_OWN_IGNORE_FILE: u64 = 4 * 1024;
+
+/// Whether the unit at `unit` has a regular file `.gitignore` at its top,
+/// not a symbolic link, of at most [`MAX_OWN_IGNORE_FILE`] bytes, whose
+/// first line that is not empty and is not a comment is exactly `*`.
+pub(super) fn has_own_ignore_file(unit: &Path) -> bool {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // `O_NOFOLLOW` refuses a symbolic link at the last name; the type of
+    // the open file is read from the descriptor.
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(unit.join(OWN_IGNORE_FILE))
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_OWN_IGNORE_FILE {
+        return false;
+    }
+    let mut content: Vec<u8> = Vec::new();
+    if file
+        .take(MAX_OWN_IGNORE_FILE + 1)
+        .read_to_end(&mut content)
+        .is_err()
+        || content.len() as u64 > MAX_OWN_IGNORE_FILE
+    {
+        return false;
+    }
+    content
+        .split(|byte| *byte == b'\n')
+        .find(|line| !line.is_empty() && !line.starts_with(b"#"))
+        .is_some_and(|line| line == b"*")
 }
 
 /// The process evidence for one unit.
@@ -613,8 +671,11 @@ struct Inspector<'a> {
     layouts: Vec<Layout<'a>>,
     /// The option `--allow-unmarked` of the request.
     allow_unmarked: bool,
-    /// The path of each unit of the report. The walk does not enter it.
-    matched: BTreeSet<PathBuf>,
+    /// The path of each unit of the report, of each project of the
+    /// inspection, with its layout. The walk does not enter it, and a
+    /// later unit that is, holds, or is in one of them is not a second
+    /// unit.
+    matched: BTreeMap<PathBuf, &'static str>,
     directories: usize,
     units: Vec<ProjectUnitReport>,
     /// False for the discovery for an eviction: a unit that passes each
@@ -638,6 +699,8 @@ struct Layout<'a> {
     name: DirectoryName,
     checkouts: PackageCheckouts,
     reclaim: ReclaimBasis,
+    /// Whether the layout permits the evidence of an own ignore file.
+    own_ignore_file: bool,
     owner_workflow: &'static str,
     rebuild_impact: &'static str,
     /// The quiet period of the layout, in place of the period of the host.
@@ -664,6 +727,7 @@ impl<'a> Layout<'a> {
             name: layout.name,
             checkouts: layout.checkouts,
             reclaim: layout.reclaim,
+            own_ignore_file: layout.own_ignore_file,
             owner_workflow: layout.owner_workflow,
             rebuild_impact: layout.rebuild_impact,
             quiet_period: None,
@@ -696,6 +760,7 @@ impl<'a> Layout<'a> {
             name: DirectoryName::Generic,
             checkouts: PackageCheckouts::None,
             reclaim: ReclaimBasis::AllocatedBytes,
+            own_ignore_file: false,
             owner_workflow: USER_LAYOUT_WORKFLOW,
             rebuild_impact: USER_LAYOUT_IMPACT,
             // The validation bounds the period to 90 days, so it fits.
@@ -1102,7 +1167,7 @@ impl ProjectRule {
                     heads: BTreeMap::new(),
                     layouts: catalog(self.table(), host.layouts),
                     allow_unmarked: host.allow_unmarked,
-                    matched: BTreeSet::new(),
+                    matched: BTreeMap::new(),
                     directories: 0,
                     units: Vec::new(),
                     measure,
@@ -1226,7 +1291,7 @@ impl Inspector<'_> {
                 let child: PathBuf = directory.join(name);
                 // A unit, a directory of version control, and the shared
                 // cache directory are not entered.
-                if is_skipped(name) || self.matched.contains(&child) {
+                if is_skipped(name) || self.matched.contains_key(&child) {
                     continue;
                 }
                 let Ok(found) = lstat(&child) else {
@@ -1272,26 +1337,19 @@ impl Inspector<'_> {
     /// a generic name gives no unit.
     fn project(&mut self, project: &Path, root: &Path, names: &BTreeSet<OsString>) {
         // The directories of the layouts, relative to the project, in the
-        // sequence of the layouts. A pattern name is compared with the
-        // entries that the walk read, so no directory is read again.
-        let mut directories: Vec<PathBuf> = Vec::new();
-        for layout in &self.layouts {
-            let first: &str = layout.first_name();
-            for name in names.iter().filter(|name| name_matches(first, name)) {
-                let mut relative: PathBuf = PathBuf::from(name);
-                relative.extend(layout.directory.split('/').skip(1));
-                if !directories.contains(&relative) {
-                    directories.push(relative);
-                }
-            }
-        }
-        // The units of this project so far, with their layouts.
-        let mut earlier: Vec<(PathBuf, &'static str)> = Vec::new();
+        // sequence of the layouts.
+        let directories: Vec<PathBuf> = layout_directories(&self.layouts, names);
         for relative in directories {
             if self.stop().is_some() {
                 return;
             }
             let path: PathBuf = project.join(&relative);
+            // A directory that is a unit of an earlier project, for example
+            // `P/var/cache` of `P` for the project `P/var`, is not a unit
+            // again.
+            if self.matched.contains_key(&path) {
+                continue;
+            }
             let parts: Vec<&OsStr> = relative.iter().collect();
             // A path of two or three names needs its last name.
             if parts.len() > 1 && lstat(&path).is_err() {
@@ -1316,10 +1374,10 @@ impl Inspector<'_> {
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
             };
-            // One directory is never in two units: a unit that is, holds, or
-            // is in an earlier unit of the project is refused, and only the
-            // earlier unit is measured.
-            if let Some((_, other)) = earlier.iter().find(|(unit, _)| overlaps(unit, &path)) {
+            // One directory is never in two units: a unit that holds or is
+            // in an earlier unit, of this project or of a project above it,
+            // is refused, and only the earlier unit is measured.
+            if let Some((_, other)) = self.matched.iter().find(|(unit, _)| overlaps(unit, &path)) {
                 report.overlapping_layout = Some(other);
                 report.outcome = ProjectUnitOutcome::Refused {
                     reason: "overlaps_unit",
@@ -1327,8 +1385,7 @@ impl Inspector<'_> {
             } else {
                 report.outcome = self.unit(&layout, project, root, names, &path, &mut report);
             }
-            earlier.push((path.clone(), layout.id));
-            self.matched.insert(path);
+            self.matched.insert(path, layout.id);
             self.units.push(report);
         }
     }
@@ -1376,28 +1433,76 @@ impl<'a> Inspector<'a> {
         names: &BTreeSet<OsString>,
         parts: &[&OsStr],
     ) -> Option<(Layout<'a>, Option<&'static str>)> {
-        let skipped: bool = parts.first().is_some_and(|first| is_skipped(first));
-        let of_directory: Vec<&Layout<'a>> = self
-            .layouts
-            .iter()
-            .filter(|layout| layout.has_directory(parts))
-            .filter(|layout| !(skipped && layout.configured))
-            .collect();
-        if let Some(layout) = of_directory
-            .iter()
-            .find(|layout| has_marker(self.host.principal, layout, project, names))
-        {
-            return Some(((*layout).clone(), None));
+        match choose_in(&self.layouts, self.host.principal, project, names, parts)? {
+            Chosen::Marked(layout) => Some((layout.clone(), None)),
+            Chosen::Distinctive(layout) => {
+                let unmarked: Option<&'static str> =
+                    layout.unmarked.filter(|_| self.allow_unmarked);
+                Some((layout.clone(), unmarked))
+            }
         }
-        if skipped {
-            return None;
-        }
-        let distinctive: &Layout<'a> = of_directory
-            .iter()
-            .find(|layout| layout.name == DirectoryName::Distinctive)?;
-        let unmarked: Option<&'static str> = distinctive.unmarked.filter(|_| self.allow_unmarked);
-        Some((distinctive.clone(), unmarked))
     }
+}
+
+/// The layout of `layouts` that gives a unit of the directory `parts`
+/// (relative to the project `project`, whose entries are `names`).
+enum Chosen<'l, 'a> {
+    /// The first layout of the directory whose marker is present.
+    Marked(&'l Layout<'a>),
+    /// No layout of the directory has its marker: the first distinctive
+    /// layout of the directory.
+    Distinctive(&'l Layout<'a>),
+}
+
+/// The choice of [`Inspector::choose`]: the first layout of the directory
+/// whose marker is present, else the first distinctive layout. A name of
+/// the skip list of the walk, such as `.cache`, has only a layout of the
+/// table whose marker is present.
+fn choose_in<'l, 'a>(
+    layouts: &'l [Layout<'a>],
+    principal: Uid,
+    project: &Path,
+    names: &BTreeSet<OsString>,
+    parts: &[&OsStr],
+) -> Option<Chosen<'l, 'a>> {
+    let skipped: bool = parts.first().is_some_and(|first| is_skipped(first));
+    let of_directory: Vec<&'l Layout<'a>> = layouts
+        .iter()
+        .filter(|layout| layout.has_directory(parts))
+        .filter(|layout| !(skipped && layout.configured))
+        .collect();
+    if let Some(layout) = of_directory
+        .iter()
+        .find(|layout| has_marker(principal, layout, project, names))
+    {
+        return Some(Chosen::Marked(layout));
+    }
+    if skipped {
+        return None;
+    }
+    of_directory
+        .into_iter()
+        .find(|layout| layout.name == DirectoryName::Distinctive)
+        .map(Chosen::Distinctive)
+}
+
+/// The directories of the layouts of `layouts` in the directory whose
+/// entries are `names`, relative to it, in the sequence of the layouts and
+/// each one time. A pattern name is compared with the entries, so no
+/// directory is read again.
+fn layout_directories(layouts: &[Layout<'_>], names: &BTreeSet<OsString>) -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = Vec::new();
+    for layout in layouts {
+        let first: &str = layout.first_name();
+        for name in names.iter().filter(|name| name_matches(first, name)) {
+            let mut relative: PathBuf = PathBuf::from(name);
+            relative.extend(layout.directory.split('/').skip(1));
+            if !directories.contains(&relative) {
+                directories.push(relative);
+            }
+        }
+    }
+    directories
 }
 
 /// Whether the checks of a unit need the project marker of its layout.
@@ -1469,7 +1574,7 @@ fn unit_shape(
         return plain("project_marker_missing");
     }
     if let Some(inner) = layout.inner_marker
-        && !lstat(&path.join(inner)).is_ok_and(|found| found.kind == ObjectKind::RegularFile)
+        && !is_plain_file(path, inner)
     {
         return plain("unsupported_layout");
     }
@@ -1515,10 +1620,10 @@ impl Inspector<'_> {
             return refused(reason);
         }
         let (version_control, repository): (VersionControl, Option<Repository>) =
-            self.version_control(project, root, path);
+            self.version_control(project, root, path, layout.own_ignore_file);
         report.version_control = Some(version_control.clone());
         match version_control {
-            VersionControl::Ignored => {}
+            VersionControl::Ignored { .. } => {}
             VersionControl::NotIgnored => return refused("not_ignored"),
             VersionControl::Tracked => return refused("tracked_files"),
             VersionControl::NoRepository => return refused("no_repository"),
@@ -1617,12 +1722,15 @@ impl Inspector<'_> {
     }
 
     /// Whether Git ignores the unit at `path` and tracks no path in it,
-    /// and the repository when the lookup found one.
+    /// and the repository when the lookup found one. With
+    /// `own_ignore_file`, the layout permits the evidence of an own ignore
+    /// file.
     fn version_control(
         &self,
         project: &Path,
         root: &Path,
         path: &Path,
+        own_ignore_file: bool,
     ) -> (VersionControl, Option<Repository>) {
         let unknown = |reason: &'static str| VersionControl::Unknown { reason };
         let Ok(git) = self.host.git else {
@@ -1633,12 +1741,17 @@ impl Inspector<'_> {
             RepositoryLookup::NotFound => return (VersionControl::NoRepository, None),
             RepositoryLookup::Unknown(reason) => return (unknown(reason), None),
         };
-        let evidence: VersionControl = Self::ignored(git, &repository, path);
+        let evidence: VersionControl = Self::ignored(git, &repository, path, own_ignore_file);
         (evidence, Some(repository))
     }
 
     /// The queries of [`Inspector::version_control`] for `repository`.
-    fn ignored(git: &GitTool, repository: &Repository, path: &Path) -> VersionControl {
+    fn ignored(
+        git: &GitTool,
+        repository: &Repository,
+        path: &Path,
+        own_ignore_file: bool,
+    ) -> VersionControl {
         let unknown = |reason: &'static str| VersionControl::Unknown { reason };
         let Ok(relative) = path.strip_prefix(&repository.work_tree) else {
             return unknown("unit_outside_work_tree");
@@ -1681,8 +1794,37 @@ impl Inspector<'_> {
             relative,
         ]);
         match ignored {
-            Ok(output) if output.code == 0 => VersionControl::Ignored,
-            Ok(output) if output.code == 1 => VersionControl::NotIgnored,
+            Ok(output) if output.code == 0 => {
+                return VersionControl::Ignored {
+                    basis: IgnoreBasis::IgnoreRules,
+                };
+            }
+            Ok(output) if output.code == 1 => {}
+            Ok(_) => return unknown("git_query_failed"),
+            Err(failure) => return unknown(failure.as_str()),
+        }
+        // Git does not ignore the directory itself. A producer that writes
+        // `.gitignore` with the first rule `*` in it makes Git ignore each
+        // entry of it: the evidence needs that file and no untracked entry
+        // in the unit that Git does not ignore.
+        if !own_ignore_file || !has_own_ignore_file(path) {
+            return VersionControl::NotIgnored;
+        }
+        let untracked: Result<GitOutput, GitFailure> = run(&[
+            OsStr::new("ls-files"),
+            OsStr::new("-z"),
+            OsStr::new("--others"),
+            OsStr::new("--exclude-standard"),
+            OsStr::new("--"),
+            &literal,
+        ]);
+        match untracked {
+            Ok(output) if output.code == 0 && output.stdout.is_empty() && !output.truncated => {
+                VersionControl::Ignored {
+                    basis: IgnoreBasis::OwnIgnoreFile,
+                }
+            }
+            Ok(output) if output.code == 0 => VersionControl::NotIgnored,
             Ok(_) => unknown("git_query_failed"),
             Err(failure) => unknown(failure.as_str()),
         }
@@ -1934,6 +2076,64 @@ pub(super) fn recheck_unit_in(table: &[ProjectLayout], input: &RecheckInput<'_>)
     }
 }
 
+/// The reading of the entries of the directory `directory`, bounded as the
+/// walk is. `None` when it cannot be read completely.
+fn directory_names(directory: &Path) -> Option<BTreeSet<OsString>> {
+    let entries = fs::read_dir(directory).ok()?;
+    let limit: usize = crate::rules::worktrees::MAX_DIRECTORY_ENTRIES;
+    let mut names: BTreeSet<OsString> = BTreeSet::new();
+    for entry in entries.take(limit + 1) {
+        names.insert(entry.ok()?.file_name());
+    }
+    (names.len() <= limit).then_some(names)
+}
+
+/// The refusal of the check before a step when a unit that the walk finds
+/// before the unit `input.unit` is, holds, or is in it, as the inspection
+/// refuses it (`overlaps_unit`): a unit of a project directory between the
+/// root and `project`, or a unit of `project` of an earlier directory of the
+/// layouts. `None` when no such unit is there.
+fn earlier_unit(
+    input: &RecheckInput<'_>,
+    layouts: &[Layout<'_>],
+    project: &Path,
+) -> Option<UnitRecheck> {
+    let Ok(below) = project.strip_prefix(input.root) else {
+        return Some(UnitRecheck::Unknown("unit_layout_unknown"));
+    };
+    // The project directories of the walk, from the root to `project`.
+    let mut chain: Vec<PathBuf> = vec![input.root.to_path_buf()];
+    for component in below {
+        let next: PathBuf = chain
+            .last()
+            .map_or_else(PathBuf::new, |last| last.join(component));
+        chain.push(next);
+    }
+    for directory in &chain {
+        let Some(names) = directory_names(directory) else {
+            return Some(UnitRecheck::Unknown("project_not_readable"));
+        };
+        let is_project: bool = directory.as_path() == project;
+        for relative in layout_directories(layouts, &names) {
+            let path: PathBuf = directory.join(&relative);
+            if is_project && path == input.unit {
+                break;
+            }
+            if !overlaps(&path, input.unit) {
+                continue;
+            }
+            let parts: Vec<&OsStr> = relative.iter().collect();
+            if parts.len() > 1 && lstat(&path).is_err() {
+                continue;
+            }
+            if choose_in(layouts, input.principal, directory, &names, &parts).is_some() {
+                return Some(UnitRecheck::Refused("overlaps_unit"));
+            }
+        }
+    }
+    None
+}
+
 /// The checks of [`recheck_unit`] for one layout and one project directory.
 /// `parts` are the names of the unit relative to the project. With
 /// `unmarked`, the plan binds the unmarked layout name of `layout`: a
@@ -1963,7 +2163,10 @@ fn recheck_layout(
     }
     // The first layout of the directory whose marker is present gives the
     // unit. A different one now means that the unit is a different kind of
-    // directory than at the plan.
+    // directory than at the plan. The comparison is of the entry of the
+    // catalog, not of the layout name: each layout of the configuration has
+    // the name `user-configured`, and only the first one whose marker is
+    // present gives the unit.
     let chosen: Option<&Layout<'_>> = layouts
         .iter()
         .filter(|other| other.has_directory(parts))
@@ -1971,10 +2174,13 @@ fn recheck_layout(
     let changed: bool = if unmarked {
         chosen.is_some()
     } else {
-        chosen.is_some_and(|chosen| chosen.id != layout.id)
+        chosen.is_some_and(|chosen| !std::ptr::eq(chosen, layout))
     };
     if changed {
         return UnitRecheck::Refused("unit_layout_changed");
+    }
+    if let Some(result) = earlier_unit(input, layouts, project) {
+        return result;
     }
     let marker: MarkerCheck = if unmarked {
         MarkerCheck::AbsenceAllowed
@@ -1991,6 +2197,11 @@ fn recheck_layout(
             }
             _ => UnitRecheck::Refused(reason),
         };
+    }
+    // The evidence of an own ignore file needs the file of the producer at
+    // the step too.
+    if layout.own_ignore_file && !has_own_ignore_file(input.unit) {
+        return UnitRecheck::Refused("ignore_file_changed");
     }
     let processes: &BuildProcesses = input.processes;
     if processes.blocking(project).is_some() {

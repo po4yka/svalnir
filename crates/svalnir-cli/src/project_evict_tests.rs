@@ -344,14 +344,14 @@ fn the_step_checks_the_layout_and_the_protected_children_again() {
 fn a_unit_of_a_layout_of_the_configuration_is_planned_and_checked_with_that_layout() {
     let world = World::with_config(
         Some(manual_action_validated()),
-        "schema_version = 1\n\n[[cleanup.projects.layouts]]\ndirectory = \"out\"\nmarkers = [\"meson.build\"]\n",
+        "schema_version = 1\n\n[[cleanup.projects.layouts]]\ndirectory = \"builddir\"\nmarkers = [\"meson.build\"]\n",
     );
     world.write("Code/meson/meson.build", b"project('a')\n");
-    world.write("Code/meson/.gitignore", b"/out/\n");
+    world.write("Code/meson/.gitignore", b"/builddir/\n");
     world.repository("Code/meson");
-    world.write("Code/meson/out/build.ninja", b"rule cc\n");
+    world.write("Code/meson/builddir/build.ninja", b"rule cc\n");
     let (plan_id, result) = world.planned();
-    let out: PathBuf = world.home.join("Code/meson/out");
+    let out: PathBuf = world.home.join("Code/meson/builddir");
     assert_eq!(target_paths(&result), [text(&out)]);
     let applied = world.apply(&plan_id);
     assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);

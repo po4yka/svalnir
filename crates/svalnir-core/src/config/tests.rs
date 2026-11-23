@@ -1309,19 +1309,19 @@ fn layout_document(body: &str) -> String {
 #[test]
 fn a_user_layout_is_read_with_each_field() {
     let config: ValidatedConfig = valid(&format!(
-        "{}\n[[cleanup.projects.layouts]]\ndirectory = \"out2/cache\"\nmarkers = [\"Gemfile\"]\n",
+        "{}\n[[cleanup.projects.layouts]]\ndirectory = \"builddir2/cache\"\nmarkers = [\"Gemfile\"]\n",
         layout_document(
-            "directory = \"out\"\nmarkers = [\"meson.build\", \"*.meson\"]\ninner_marker = \"meson-info.json\"\nprotected = [\"keep\", \"*/release\"]\nquiet_period = \"2h\""
+            "directory = \"builddir\"\nmarkers = [\"meson.build\", \"*.meson\"]\ninner_marker = \"meson-info.json\"\nprotected = [\"keep\", \"*/release\"]\nquiet_period = \"2h\""
         )
     ));
     let layouts = &config.cleanup().projects.layouts;
     assert_eq!(layouts.len(), 2);
-    assert_eq!(layouts[0].directory, "out");
+    assert_eq!(layouts[0].directory, "builddir");
     assert_eq!(layouts[0].markers, ["meson.build", "*.meson"]);
     assert_eq!(layouts[0].inner_marker.as_deref(), Some("meson-info.json"));
     assert_eq!(layouts[0].protected, ["keep", "*/release"]);
     assert_eq!(layouts[0].quiet_period, Some(Duration::from_hours(2)));
-    assert_eq!(layouts[1].directory, "out2/cache");
+    assert_eq!(layouts[1].directory, "builddir2/cache");
     assert_eq!(layouts[1].inner_marker, None);
     assert_eq!(layouts[1].protected, Vec::<String>::new());
     assert_eq!(layouts[1].quiet_period, None);
@@ -1403,7 +1403,7 @@ fn each_invalid_directory_of_a_user_layout_has_a_finding() {
             directory.to_owned(),
         ),
         (
-            "directory = \"out*\"\nmarkers = [\"m\"]",
+            "directory = \"builddir*\"\nmarkers = [\"m\"]",
             FindingCode::InvalidPath,
             directory.to_owned(),
         ),
@@ -1429,72 +1429,72 @@ fn each_invalid_key_of_a_user_layout_has_a_finding() {
     let first = |key: &str| format!("cleanup.projects.layouts[0].{key}");
     let cases: Vec<(&str, FindingCode, String)> = vec![
         (
-            "directory = \"out\"",
+            "directory = \"builddir\"",
             FindingCode::MissingKey,
             markers.to_owned(),
         ),
         (
-            "directory = \"out\"\nmarkers = []",
+            "directory = \"builddir\"\nmarkers = []",
             FindingCode::InvalidPath,
             markers.to_owned(),
         ),
         (
-            "directory = \"out\"\nmarkers = \"m\"",
+            "directory = \"builddir\"\nmarkers = \"m\"",
             FindingCode::WrongType,
             markers.to_owned(),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"sub/m\"]",
+            "directory = \"builddir\"\nmarkers = [\"sub/m\"]",
             FindingCode::InvalidPath,
             first("markers[0]"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"*\"]",
+            "directory = \"builddir\"\nmarkers = [\"*\"]",
             FindingCode::InvalidPath,
             first("markers[0]"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\", \"*?\"]",
+            "directory = \"builddir\"\nmarkers = [\"m\", \"*?\"]",
             FindingCode::InvalidPath,
             first("markers[1]"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\"]",
+            "directory = \"builddir\"\nmarkers = [\"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\", \"m\"]",
             FindingCode::TooManyEntries,
             markers.to_owned(),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\ninner_marker = \"a/b\"",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\ninner_marker = \"a/b\"",
             FindingCode::InvalidPath,
             first("inner_marker"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\ninner_marker = \"*.tag\"",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\ninner_marker = \"*.tag\"",
             FindingCode::InvalidPath,
             first("inner_marker"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\nprotected = [\"a/../b\"]",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\nprotected = [\"a/../b\"]",
             FindingCode::InvalidPath,
             first("protected[0]"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\nprotected = [\"a/b/c/d/e\"]",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\nprotected = [\"a/b/c/d/e\"]",
             FindingCode::InvalidPath,
             first("protected[0]"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\nprotected = [\"/abs\"]",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\nprotected = [\"/abs\"]",
             FindingCode::InvalidPath,
             first("protected[0]"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\nquiet_period = \"30m\"",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\nquiet_period = \"30m\"",
             FindingCode::OutOfRange,
             first("quiet_period"),
         ),
         (
-            "directory = \"out\"\nmarkers = [\"m\"]\nautomatic = true",
+            "directory = \"builddir\"\nmarkers = [\"m\"]\nautomatic = true",
             FindingCode::UnknownKey,
             first("automatic"),
         ),
@@ -1509,8 +1509,8 @@ fn the_user_layouts_are_bounded_and_have_distinct_directories() {
     // A second layout with the same directory, in another case.
     assert_one(
         &format!(
-            "{}\n[[cleanup.projects.layouts]]\ndirectory = \"OUT\"\nmarkers = [\"m\"]\n",
-            layout_document("directory = \"out\"\nmarkers = [\"m\"]")
+            "{}\n[[cleanup.projects.layouts]]\ndirectory = \"BUILDDIR\"\nmarkers = [\"m\"]\n",
+            layout_document("directory = \"builddir\"\nmarkers = [\"m\"]")
         ),
         FindingCode::DuplicateIdentifier,
         "cleanup.projects.layouts[1].directory",
@@ -1520,7 +1520,7 @@ fn the_user_layouts_are_bounded_and_have_distinct_directories() {
     for index in 0..=super::MAX_USER_LAYOUTS {
         write!(
             many,
-            "\n[[cleanup.projects.layouts]]\ndirectory = \"out{index}\"\nmarkers = [\"m\"]\n"
+            "\n[[cleanup.projects.layouts]]\ndirectory = \"builddir{index}\"\nmarkers = [\"m\"]\n"
         )
         .unwrap();
     }
@@ -1567,6 +1567,15 @@ fn a_user_layout_cannot_overlap_a_built_in_layout_or_a_kept_out_name() {
         "zig-out",
         "deps",
         "DEPS/x",
+        "out",
+        "coverage/x",
+        "var/cache",
+        ".terraform",
+        "_opam",
+        ".hypothesis",
+        ".terragrunt-cache",
+        "Saved/Logs",
+        "UserSettings",
     ] {
         assert_one(
             &layout_document(&format!(
@@ -1579,7 +1588,7 @@ fn a_user_layout_cannot_overlap_a_built_in_layout_or_a_kept_out_name() {
     // A built-in name as the second name does not overlap a built-in unit:
     // the walk does not enter a unit.
     valid(&layout_document(
-        "directory = \"out/build\"\nmarkers = [\"m\"]",
+        "directory = \"builddir/build\"\nmarkers = [\"m\"]",
     ));
 }
 
@@ -1588,14 +1597,16 @@ fn a_pattern_marker_needs_a_specific_literal_part() {
     let marker = "cleanup.projects.layouts[0].markers[0]";
     for pattern in ["*.*", "a*", ".*", "*e", "?.?", "*..*", "*", "**", "*.?s"] {
         assert_one(
-            &layout_document(&format!("directory = \"out\"\nmarkers = [\"{pattern}\"]")),
+            &layout_document(&format!(
+                "directory = \"builddir\"\nmarkers = [\"{pattern}\"]"
+            )),
             FindingCode::InvalidPath,
             marker,
         );
     }
     for pattern in ["*.csproj", "*.py", "ab*", "x"] {
         valid(&layout_document(&format!(
-            "directory = \"out\"\nmarkers = [\"{pattern}\"]"
+            "directory = \"builddir\"\nmarkers = [\"{pattern}\"]"
         )));
     }
 }

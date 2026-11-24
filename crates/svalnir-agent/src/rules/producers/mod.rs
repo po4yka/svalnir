@@ -62,7 +62,7 @@ use svalnir_core::rule::{
 
 pub use guard::{
     GuardOutcome, HOMEBREW_OVERRIDING_KEYS, HOMEBREW_SYSTEM_ENV_FILES, MAX_TRACKED_CONFIG_BYTES,
-    homebrew_system_env, mise_tracked_configs,
+    homebrew_system_env, homebrew_user_env, mise_tracked_configs,
 };
 pub use specs::{
     GO_BUILD, GO_MODULES, HOMEBREW_CLEANUP, MISE_CACHE, MISE_INSTALLS, NPM_CACHE, PIP_CACHE,
@@ -875,7 +875,21 @@ fn guard_of(spec: &ProducerSpec, home: &Path, principal: Uid) -> GuardOutcome {
     match spec.guard {
         Guard::None => GuardOutcome::None,
         Guard::MiseTrackedConfigs => mise_tracked_configs(home, principal),
-        Guard::HomebrewSystemEnv => homebrew_system_env(&HOMEBREW_SYSTEM_ENV_FILES),
+        Guard::HomebrewSystemEnv => {
+            match (
+                homebrew_system_env(&HOMEBREW_SYSTEM_ENV_FILES),
+                homebrew_user_env(home),
+            ) {
+                (refused @ GuardOutcome::Refused { .. }, _)
+                | (_, refused @ GuardOutcome::Refused { .. }) => refused,
+                (GuardOutcome::Passed { files: system }, GuardOutcome::Passed { files: user }) => {
+                    GuardOutcome::Passed {
+                        files: system + user,
+                    }
+                }
+                (other, _) => other,
+            }
+        }
     }
 }
 

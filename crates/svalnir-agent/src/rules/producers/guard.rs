@@ -246,3 +246,57 @@ pub fn homebrew_system_env<P: AsRef<Path>>(files: &[P]) -> GuardOutcome {
     }
     GuardOutcome::Passed { files: read }
 }
+
+/// The user `brew.env` file of Homebrew below the home directory. The fixed
+/// environment of the command has `HOME` and no `XDG_CONFIG_HOME`, so this is
+/// the one user file that Homebrew reads for it.
+const HOMEBREW_USER_ENV_FILE: &str = ".homebrew/brew.env";
+
+/// The guard of `homebrew.cleanup` for the user file of the home directory
+/// `home`. The user file takes precedence over the system files, so a key of
+/// [`HOMEBREW_OVERRIDING_KEYS`] in it can change the effect of the command
+/// as a key of a system file can. `HOMEBREW_CACHE` is the exception: the root
+/// of the rule is read from this same file and the command names that root
+/// in its own `HOMEBREW_CACHE`, so the value cannot differ from the root.
+/// The file is read with no symbolic link followed and at most 64 KiB; a
+/// file that is a link, is not a regular file, is too large, or cannot be
+/// read refuses, because its keys are not known.
+#[must_use]
+pub fn homebrew_user_env(home: &Path) -> GuardOutcome {
+    use crate::rules::caches::ConfigFormat;
+    use crate::rules::caches::config::find_values;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path: PathBuf = home.join(HOMEBREW_USER_ENV_FILE);
+    let refused = || GuardOutcome::Refused {
+        reason: super::HOMEBREW_ENV_OVERRIDES,
+        path: path.clone(),
+    };
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return GuardOutcome::Passed { files: 0 };
+        }
+        Err(_) => return refused(),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_BREW_ENV_BYTES {
+        return refused();
+    }
+    let mut text: String = String::new();
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .and_then(|file| file.take(MAX_BREW_ENV_BYTES).read_to_string(&mut text));
+    if opened.is_err() {
+        return refused();
+    }
+    let sets_key: bool = HOMEBREW_OVERRIDING_KEYS
+        .iter()
+        .filter(|key| **key != "HOMEBREW_CACHE")
+        .any(|key| !find_values(&text, ConfigFormat::Assignment, key).is_empty());
+    if sets_key {
+        return refused();
+    }
+    GuardOutcome::Passed { files: 1 }
+}

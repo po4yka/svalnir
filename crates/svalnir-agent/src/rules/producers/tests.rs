@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use super::{
     EXTENDED_RULE_REVISION, GuardOutcome, HOMEBREW_ENV_OVERRIDES, OWN_RULE_REVISION,
     OWNER_SCOPE_UNMARKED, PRODUCER_SPECS, Part, ProducerBindError, ProducerBindRequest,
-    ProducerRule, homebrew_system_env, mise_tracked_configs, scope_evidence,
+    ProducerRule, homebrew_system_env, homebrew_user_env, mise_tracked_configs, scope_evidence,
 };
 use crate::executor::owner::{ScopeLimits, examine_program};
 use crate::protection::ProtectedLocations;
@@ -944,4 +944,57 @@ fn a_configured_location_of_an_owner_rule_has_each_check_of_a_root() {
         installs.scope(&home.host_with(&entries)).path,
         Some(home.path.join(".local/share/mise/installs"))
     );
+}
+
+#[test]
+fn a_user_brew_env_that_changes_the_effect_refuses_homebrew() {
+    let home = Home::new();
+    let file: PathBuf = home.path.join(".homebrew/brew.env");
+    assert_eq!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Passed { files: 0 }
+    );
+    home.write(".homebrew/brew.env", b"HOMEBREW_NO_EMOJI=1\n");
+    assert_eq!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Passed { files: 1 }
+    );
+    // The root of the rule is read from this file, so the cache is no
+    // difference.
+    home.write(".homebrew/brew.env", b"HOMEBREW_CACHE=/tmp/elsewhere\n");
+    assert_eq!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Passed { files: 1 }
+    );
+    for line in [
+        "HOMEBREW_NO_INSTALL_CLEANUP=",
+        "HOMEBREW_AUTOREMOVE=1",
+        "HOMEBREW_CLEANUP_MAX_AGE_DAYS=1",
+        "HOMEBREW_NO_AUTO_UPDATE=",
+    ] {
+        home.write(".homebrew/brew.env", format!("{line}\n").as_bytes());
+        assert_eq!(
+            homebrew_user_env(&home.path),
+            GuardOutcome::Refused {
+                reason: HOMEBREW_ENV_OVERRIDES,
+                path: file.clone(),
+            },
+            "{line}"
+        );
+    }
+    // A link is not followed, and the file is refused.
+    fs::remove_file(&file).unwrap();
+    let target: PathBuf = home.write("other/brew.env", b"HOMEBREW_NO_EMOJI=1\n");
+    symlink(&target, &file).unwrap();
+    assert!(matches!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Refused { .. }
+    ));
+    // A file that is too large is refused.
+    fs::remove_file(&file).unwrap();
+    home.write(".homebrew/brew.env", &vec![b'#'; 70 * 1024]);
+    assert!(matches!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Refused { .. }
+    ));
 }

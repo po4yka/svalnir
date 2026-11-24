@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use svalnir_core::action::{FileBinding, FileObjectType, WorkCharge};
+use svalnir_core::action::{AdmittedRepository, FileBinding, FileObjectType, WorkCharge};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, LosslessPath};
 use svalnir_core::id::{MountId, RootId, VolumeId};
 use svalnir_core::policy::MAX_CLEANUP_CANDIDATES;
@@ -554,6 +554,10 @@ pub struct DiscoveredCandidate {
     /// list does not make the candidate eligible: predicates 3, 9, and 10
     /// belong to admission.
     pub blockers: Vec<SkipReason>,
+    /// The Git repositories in the unit that the check admitted for a
+    /// manual eviction (`docs/CLEANUP_RULES.md` section 6). Empty for a unit
+    /// with no repository.
+    pub repositories: Vec<AdmittedRepository>,
 }
 
 impl DiscoveredCandidate {
@@ -577,6 +581,7 @@ impl DiscoveredCandidate {
             rule: Some(self.candidate.rule.clone()),
             layout: Some(self.candidate.layout.clone()),
             charge: self.measurement.charge,
+            repositories: self.repositories.clone(),
         }
     }
 

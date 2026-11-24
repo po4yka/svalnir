@@ -11,7 +11,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use svalnir_core::action::WorkCharge;
+use svalnir_core::action::{AdmittedRepository, WorkCharge};
 use svalnir_core::policy::ActivityFact;
 use svalnir_core::process::Uid;
 use svalnir_core::quantity::{Bytes, EntryCount, Nanoseconds};
@@ -20,9 +20,14 @@ use svalnir_core::time::{MonotonicNanos, WallTime};
 
 use super::{ClearRule, ClearSpec, UnitForm};
 use crate::platform::volume::{MountTable, MountTableSource};
+use crate::rules::git::{GitTool, GitToolProblem};
 use crate::rules::model::{
     Discovery, DiscoveryCompletion, DiscoveryControl, DiscoveryError, DiscoveryScope,
     MeasurementSource, ReclaimEstimate, SizeMeasure, SkipReason, UnitMeasurement,
+};
+use crate::rules::nested_git::{
+    REPOSITORY_CHANGED_CODE, RepositoryPolicy, RepositoryRecheck, SwiftPmCheckouts,
+    recheck_admitted,
 };
 use crate::rules::projects::UnitRecheck;
 use crate::rules::unit::{
@@ -190,6 +195,16 @@ impl ClearRule {
         // Predicate 8: the complete unit and its charge.
         if before.kind == ObjectKind::Directory {
             let refuse: &'static [&'static str] = spec.refuse_names;
+            // The child `repositories` of the shared cache of Swift Package
+            // Manager: its bare mirrors are admitted in the pin-less mode
+            // (`docs/CLEANUP_RULES.md` section 6). Each other repository
+            // refuses the unit.
+            let git: Result<GitTool, GitToolProblem> = GitTool::locate();
+            let policy: Option<RepositoryPolicy<'_>> =
+                super::admits_repositories(spec, &assessment.relative).then(|| RepositoryPolicy {
+                    checkouts: SwiftPmCheckouts::of_shared_cache(&root.path),
+                    git: git.as_ref().map_err(|problem| *problem),
+                });
             let stopped: Option<DiscoveryCompletion> = establish_charge(
                 &mut assessment,
                 None,
@@ -197,6 +212,7 @@ impl ClearRule {
                     path: &path,
                     before: &before,
                     principal: input.scope.principal,
+                    repositories: policy.as_ref(),
                 },
                 self.rule(),
                 &mut collector.bounds,
@@ -420,7 +436,41 @@ const MAX_RECHECK_ENTRIES: u64 = 2_000_000;
 /// The executor examines the identity of the object and each Git
 /// repository again in its removal pass.
 #[must_use]
-pub fn recheck_unit(spec: &ClearSpec, principal: Uid, root: &Path, path: &Path) -> UnitRecheck {
+pub fn recheck_unit(
+    spec: &ClearSpec,
+    principal: Uid,
+    root: &Path,
+    path: &Path,
+    admitted: &[AdmittedRepository],
+) -> UnitRecheck {
+    let result: UnitRecheck = recheck_shape(spec, principal, root, path);
+    if result != UnitRecheck::Passed {
+        return result;
+    }
+    // The repositories that the plan admits: the child `repositories` of
+    // the shared cache of Swift Package Manager gives the check again, and
+    // any other unit admits none.
+    let is_mirror_unit: bool = path
+        .strip_prefix(root)
+        .is_ok_and(|relative| super::admits_repositories(spec, relative));
+    if !is_mirror_unit {
+        return if admitted.is_empty() {
+            UnitRecheck::Passed
+        } else {
+            UnitRecheck::Refused(REPOSITORY_CHANGED_CODE)
+        };
+    }
+    let git: Result<GitTool, GitToolProblem> = GitTool::locate();
+    let checkouts: SwiftPmCheckouts = SwiftPmCheckouts::of_shared_cache(root);
+    match recheck_admitted(path, Some(&checkouts), git.as_ref().ok(), admitted) {
+        RepositoryRecheck::Same => UnitRecheck::Passed,
+        RepositoryRecheck::Refused(code) => UnitRecheck::Refused(code),
+        RepositoryRecheck::Unknown(code) => UnitRecheck::Unknown(code),
+    }
+}
+
+/// The checks of [`recheck_unit`] that are not about repositories.
+fn recheck_shape(spec: &ClearSpec, principal: Uid, root: &Path, path: &Path) -> UnitRecheck {
     let Ok(relative) = path.strip_prefix(root) else {
         return UnitRecheck::Refused("unit_layout_changed");
     };

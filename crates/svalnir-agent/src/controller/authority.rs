@@ -293,6 +293,7 @@ impl AuthoritySource for SharedAuthority {
         layout: Option<&str>,
         root: &std::path::Path,
         path: &std::path::Path,
+        admitted: &[svalnir_core::action::AdmittedRepository],
     ) -> UnitRecheck {
         // The reading of the filesystem and of the process table is
         // outside the critical section.
@@ -305,7 +306,7 @@ impl AuthoritySource for SharedAuthority {
             )
         };
         environment.map_or(UnitRecheck::Unknown("no_process_evidence"), |environment| {
-            environment.unit_recheck(principal, rule, layout, root, path, &layouts)
+            environment.unit_recheck(principal, rule, layout, root, path, &layouts, admitted)
         })
     }
 }

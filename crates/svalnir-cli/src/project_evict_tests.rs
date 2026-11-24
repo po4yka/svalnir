@@ -283,7 +283,7 @@ fn an_evict_plan_has_the_eligible_units_and_its_apply_removes_only_them() {
     );
     let discovery = &result["discovery"];
     assert_eq!(discovery["rule"]["id"], RULE);
-    assert_eq!(discovery["rule"]["revision"], "r4");
+    assert_eq!(discovery["rule"]["revision"], "r5");
     assert_eq!(discovery["complete"], true, "{discovery}");
     assert_eq!(discovery["project_roots"][0]["kind"], "search");
     assert_eq!(discovery["project_roots"][0]["source"]["kind"], "argument");
@@ -688,4 +688,184 @@ fn clean_inspect_shows_an_unmarked_directory_only_with_allow_unmarked() {
         assert_eq!(outcome.status, ExitStatus::Usage, "{}", outcome.stdout);
         assert_eq!(outcome.error_code(), "option_not_accepted");
     }
+}
+
+// ---------------------------------------------------------------------
+// The clean clones of Swift Package Manager (`docs/CLEANUP_RULES.md`
+// section 6).
+// ---------------------------------------------------------------------
+
+impl World {
+    fn git_in(&self, relative: &str, arguments: &[&str]) -> String {
+        crate::test_support::fixture_git(&self.home, &self.home.join(relative), arguments)
+    }
+
+    /// The upstream repository `Upstream/dep` and its commit.
+    fn upstream(&self) -> (PathBuf, String) {
+        self.write("Upstream/dep/Sources.swift", b"let value = 1\n");
+        self.repository("Upstream/dep");
+        let commit: String = self.git_in("Upstream/dep", &["rev-parse", "HEAD"]);
+        (self.home.join("Upstream/dep"), commit)
+    }
+
+    /// The pin file with one pin of version 2.
+    fn pin(&self, relative: &str, upstream: &Path, commit: &str) {
+        let resolved = serde_json::json!({
+            "pins": [{
+                "identity": "dep",
+                "kind": "localSourceControl",
+                "location": upstream.to_str().unwrap(),
+                "state": {"revision": commit},
+            }],
+            "version": 2,
+        });
+        self.write(relative, serde_json::to_vec(&resolved).unwrap().as_slice());
+    }
+
+    /// A package `Code/NAME` with a `.build` directory that Git ignores and
+    /// a clone of `Upstream/dep` at the pin in `.build/checkouts/dep`.
+    fn swift_package(&self, name: &str) -> PathBuf {
+        let (upstream, commit) = self.upstream();
+        let project: String = format!("Code/{name}");
+        self.write(&format!("{project}/Package.swift"), b"// tools 5.9\n");
+        self.write(&format!("{project}/.gitignore"), b"/.build/\n");
+        self.pin(&format!("{project}/Package.resolved"), &upstream, &commit);
+        self.repository(&project);
+        self.write(&format!("{project}/.build/workspace-state.json"), b"{}");
+        self.write(&format!("{project}/.build/debug/out.o"), b"object");
+        let checkouts: String = format!("{project}/.build/checkouts");
+        std::fs::create_dir_all(self.home.join(&checkouts)).unwrap();
+        self.git_in(
+            &checkouts,
+            &[
+                "clone",
+                "-q",
+                "--no-hardlinks",
+                upstream.to_str().unwrap(),
+                "dep",
+            ],
+        );
+        self.git_in(
+            &format!("{checkouts}/dep"),
+            &["checkout", "-q", "--detach", &commit],
+        );
+        self.home.join(project)
+    }
+
+    /// A project `Code/NAME` with `App.xcodeproj` and a `DerivedData`
+    /// directory with a clone of `Upstream/dep` at the pin in
+    /// `SourcePackages/checkouts/dep`.
+    fn xcode_project(&self, name: &str) -> PathBuf {
+        let (upstream, commit) = self.upstream();
+        let project: String = format!("Code/{name}");
+        self.write(&format!("{project}/App.xcodeproj/project.pbxproj"), b"{}");
+        self.write(&format!("{project}/.gitignore"), b"/DerivedData/\n");
+        self.pin(
+            &format!(
+                "{project}/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+            ),
+            &upstream,
+            &commit,
+        );
+        self.repository(&project);
+        self.write(
+            &format!("{project}/DerivedData/Build/Products/a.o"),
+            b"object",
+        );
+        let checkouts: String = format!("{project}/DerivedData/SourcePackages/checkouts");
+        std::fs::create_dir_all(self.home.join(&checkouts)).unwrap();
+        self.git_in(
+            &checkouts,
+            &[
+                "clone",
+                "-q",
+                "--no-hardlinks",
+                upstream.to_str().unwrap(),
+                "dep",
+            ],
+        );
+        self.git_in(
+            &format!("{checkouts}/dep"),
+            &["checkout", "-q", "--detach", &commit],
+        );
+        self.home.join(project)
+    }
+}
+
+#[test]
+fn a_clean_swift_checkout_is_removed_with_its_build_directory() {
+    let world = World::manual();
+    let package: PathBuf = world.swift_package("sp");
+    let (plan_id, result) = world.planned();
+    assert_eq!(target_paths(&result), [text(&package.join(".build"))]);
+    let applied = world.apply(&plan_id);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(!package.join(".build").exists());
+    assert!(package.join("Package.swift").exists());
+    assert!(world.home.join("Upstream/dep/Sources.swift").exists());
+}
+
+#[test]
+fn a_clean_swift_checkout_of_an_xcode_project_is_removed_with_its_derived_data() {
+    let world = World::manual();
+    let project: PathBuf = world.xcode_project("xp");
+    let (plan_id, result) = world.planned();
+    assert_eq!(target_paths(&result), [text(&project.join("DerivedData"))]);
+    let applied = world.apply(&plan_id);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(!project.join("DerivedData").exists());
+    assert!(project.join("App.xcodeproj/project.pbxproj").exists());
+}
+
+#[test]
+fn a_swift_checkout_with_no_pin_file_keeps_its_build_directory() {
+    let world = World::manual();
+    let package: PathBuf = world.swift_package("sp");
+    std::fs::remove_file(package.join("Package.resolved")).unwrap();
+    let root: String = world.root();
+    let outcome = world.plan(&["--root", &root, "--no-mise"]);
+    assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+    assert!(
+        target_paths(&outcome.result()).is_empty(),
+        "{}",
+        outcome.stdout
+    );
+    assert!(package.join(".build/checkouts/dep/.git").exists());
+}
+
+#[test]
+fn a_new_commit_in_an_admitted_checkout_skips_the_step() {
+    let world = World::manual();
+    let package: PathBuf = world.swift_package("sp");
+    let (plan_id, result) = world.planned();
+    assert_eq!(target_paths(&result), [text(&package.join(".build"))]);
+    world.git_in(
+        "Code/sp/.build/checkouts/dep",
+        &["commit", "-q", "--allow-empty", "-m", "mine"],
+    );
+    let applied = world.apply(&plan_id);
+    assert!(
+        applied.stdout.contains("repository_changed"),
+        "{}",
+        applied.stdout
+    );
+    assert!(package.join(".build/checkouts/dep/.git").exists());
+    assert!(package.join(".build/debug/out.o").exists());
+}
+
+#[test]
+fn a_repository_that_the_plan_does_not_list_skips_the_step() {
+    let world = World::manual();
+    let package: PathBuf = world.swift_package("sp");
+    let (plan_id, _) = world.planned();
+    world.write("Code/sp/.build/extra/a.txt", b"mine\n");
+    world.repository("Code/sp/.build/extra");
+    let applied = world.apply(&plan_id);
+    assert!(
+        applied.stdout.contains("repository_changed"),
+        "{}",
+        applied.stdout
+    );
+    assert!(package.join(".build/extra/.git").exists());
+    assert!(package.join(".build/checkouts/dep/.git").exists());
 }

@@ -252,6 +252,7 @@ fn entry(name: &str, bytes: u64) -> CleanupEntry {
             layout: LAYOUT.to_owned(),
             eligibility: satisfied(),
         }),
+        repositories: Vec::new(),
     }
 }
 

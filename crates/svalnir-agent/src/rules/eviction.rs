@@ -31,7 +31,7 @@
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use svalnir_core::action::WorkCharge;
+use svalnir_core::action::{AdmittedRepository, WorkCharge};
 use svalnir_core::config::{UserLayout, ValidatedConfig};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{RootId, RuleId, StepId, TargetId, VolumeId};
@@ -608,7 +608,12 @@ pub trait DiscoveryEnvironment: ScanClock {
     /// For a clear rule, the unit must still be a child of the root that
     /// the rule does not keep, with the form of the rule, and with no file
     /// of a refused name below it ([`clear::recheck_unit`]). A rule
-    /// with no such check gives [`UnitRecheck::Passed`].
+    /// with no such check gives [`UnitRecheck::Passed`], unless the plan
+    /// lists admitted repositories: then it gives `repository_changed`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the sealed list of admitted repositories is one more input of the same check"
+    )]
     fn unit_recheck(
         &self,
         principal: Uid,
@@ -617,15 +622,24 @@ pub trait DiscoveryEnvironment: ScanClock {
         root: &Path,
         path: &Path,
         user_layouts: &[UserLayout],
+        admitted: &[AdmittedRepository],
     ) -> UnitRecheck {
         if let Some(spec) = clear::spec_of(rule.id.as_str()) {
-            return clear::recheck_unit(spec, principal, root, path);
+            return clear::recheck_unit(spec, principal, root, path, admitted);
         }
         if rule.id.as_str() == XCODE_DERIVED_DATA_RULE_ID && layout == Some(XCODE_ORPHAN_LAYOUT) {
-            return super::xcode::recheck_orphan(principal, root, path);
+            return super::xcode::recheck_orphan(principal, root, path, admitted);
         }
         if rule.id.as_str() != PROJECT_RULE_ID {
-            return UnitRecheck::Passed;
+            // No other rule or layout runs the check of the admitted
+            // repositories, so a plan that lists one cannot be right: it
+            // would let the executor admit a Git object that no check
+            // examined.
+            return if admitted.is_empty() {
+                UnitRecheck::Passed
+            } else {
+                UnitRecheck::Refused(super::nested_git::REPOSITORY_CHANGED_CODE)
+            };
         }
         let Some(layout) = layout else {
             return UnitRecheck::Unknown("unit_layout_unknown");
@@ -643,6 +657,7 @@ pub trait DiscoveryEnvironment: ScanClock {
             now: self.now().monotonic_ns,
             expiry: PROJECT_EVIDENCE_EXPIRY,
             git: git.as_ref(),
+            admitted,
         })
     }
 }
@@ -835,6 +850,7 @@ impl EvictionCandidate {
             // rule follows none below it, so the path has no other form.
             resolved_paths: Vec::new(),
             rule: Some(RuleEvidence::of(&self.candidate)),
+            repositories: discovered.repositories.clone(),
         }
     }
 }

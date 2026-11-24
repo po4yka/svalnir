@@ -27,13 +27,19 @@
 //!   of its remote-tracking references is a fetch or a clone: a push from
 //!   the checkout leaves another entry.
 //! - Each commit of its references and reflogs is reachable from a
-//!   remote-tracking reference of `origin`, from `HEAD`, or from a tag that
-//!   the mirror has with the same object.
+//!   remote-tracking reference of `origin`, from `HEAD` (with a pin only), or
+//!   from a tag that the mirror has with the same object.
+//! - It has no `.git/modules` entry: a submodule is not admitted.
+//! - With no pin, its origin is a remote URL, or a mirror that
+//!   [`check_mirror`] accepts beside it.
 //!
 //! [`check_mirror`] accepts a mirror only when its Git directory is the
-//! object that the walk measured, it is bare, its one remote is the
-//! location of a pin, no commit is only in its reflogs, and each entry of
-//! its reflogs is a fetch or a clone. A bare repository records no reflog
+//! object that the walk measured (before and after the queries), it is
+//! bare, its one remote is the location of a pin (with no pins: a remote
+//! URL), the remote has `mirror = true`, it has no `worktrees` and no
+//! `modules` entry, no commit is only in its reflogs, and each entry of its
+//! reflogs is a fetch or a clone. The mirrors that Swift Package Manager
+//! makes have `mirror = true` and `fetch = +refs/*:refs/*`. A bare repository records no reflog
 //! by default, so a push into a mirror from another repository is not
 //! seen: that is a residual risk.
 //!
@@ -68,7 +74,10 @@ const MAX_QUERY_OUTPUT: usize = 256 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwiftPmCheckouts {
     checkouts: PathBuf,
-    resolved: PathBuf,
+    /// The pin file. `None` for the pin-less mode of a project directory
+    /// whose workspace is gone, and of the shared cache: no pin then gives
+    /// the revision or the location.
+    resolved: Option<PathBuf>,
 }
 
 impl SwiftPmCheckouts {
@@ -77,7 +86,31 @@ impl SwiftPmCheckouts {
     pub const fn new(checkouts: PathBuf, resolved: PathBuf) -> Self {
         Self {
             checkouts,
-            resolved,
+            resolved: Some(resolved),
+        }
+    }
+
+    /// The pin-less mode for the project directory `project` of
+    /// `DerivedData` whose workspace is gone: the checkouts are in
+    /// `SourcePackages/checkouts` and the mirrors in
+    /// `SourcePackages/repositories`. No pin file is read.
+    #[must_use]
+    pub fn of_orphan_project(project: &Path) -> Self {
+        Self {
+            checkouts: project.join("SourcePackages/checkouts"),
+            resolved: None,
+        }
+    }
+
+    /// The pin-less mode for the `repositories` directory of the shared
+    /// cache of Swift Package Manager, `cache` being its parent
+    /// (`org.swift.swiftpm`). Only the mirrors directly in `repositories`
+    /// are managed; the cache has no checkout.
+    #[must_use]
+    pub fn of_shared_cache(cache: &Path) -> Self {
+        Self {
+            checkouts: cache.join("checkouts"),
+            resolved: None,
         }
     }
 
@@ -124,10 +157,10 @@ impl SwiftPmCheckouts {
         &self.checkouts
     }
 
-    /// The pin file.
+    /// The pin file, or `None` in the pin-less mode.
     #[must_use]
-    pub fn resolved(&self) -> &Path {
-        &self.resolved
+    pub fn resolved(&self) -> Option<&Path> {
+        self.resolved.as_deref()
     }
 
     /// What Swift Package Manager keeps at `work_tree`: a checkout, which
@@ -444,13 +477,15 @@ fn reflogs_are_fetches(queries: &Queries<'_>, selection: &str) -> Result<(), Ref
         "log",
         "-g",
         "--no-show-signature",
-        "--format=%gs",
+        "--format=x%gs",
         selection,
     ])?;
-    let is_fetch = |line: &[u8]| line.starts_with(b"fetch") || line.starts_with(b"clone");
+    // Each entry has the fixed prefix `x`, so an entry with an empty
+    // subject, as `git update-ref` with no message writes, is not dropped.
+    let is_fetch = |line: &[u8]| line.starts_with(b"xfetch") || line.starts_with(b"xclone");
     if entries
         .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
+        .filter(|line| line != b"")
         .all(is_fetch)
     {
         Ok(())
@@ -471,7 +506,7 @@ fn reflogs_are_fetches(queries: &Queries<'_>, selection: &str) -> Result<(), Ref
 pub fn check_mirror(
     git: &GitTool,
     git_dir: &Path,
-    pins: &[Pin],
+    pins: Option<&[Pin]>,
     expected: Option<FileObjectEvidence>,
 ) -> Result<Vec<(String, String)>, RefusalReason> {
     has_identity(git_dir, expected)?;
@@ -486,8 +521,41 @@ pub fn check_mirror(
     let Some(origin) = queries.origin_url()? else {
         return Err(RefusalReason::NotMirror);
     };
-    if !pins.iter().any(|pin| same_location(&origin, &pin.location)) {
-        return Err(RefusalReason::LocationNotPinned);
+    // The pin-less mode has no pin: the origin must be a remote URL, so a
+    // mirror of a local path is not a copy that a remote restores.
+    match pins {
+        Some(pins) => {
+            if !pins.iter().any(|pin| same_location(&origin, &pin.location)) {
+                return Err(RefusalReason::LocationNotPinned);
+            }
+        }
+        None => {
+            if !is_remote_url(&origin) {
+                return Err(RefusalReason::LocationNotPinned);
+            }
+        }
+    }
+    // Swift Package Manager writes `mirror = true` in the remote of each
+    // mirror that it makes.
+    let mirror_flag: GitOutput = queries.run(&[
+        OsStr::new("config"),
+        OsStr::new("--type=bool"),
+        OsStr::new("--get"),
+        OsStr::new("remote.origin.mirror"),
+    ])?;
+    if mirror_flag.code != 0 || mirror_flag.stdout != b"true\n" {
+        return Err(RefusalReason::NotMirror);
+    }
+    // A linked worktree of a mirror has its own work tree and commits.
+    match fs::symlink_metadata(git_dir.join("worktrees")) {
+        Ok(_) => return Err(RefusalReason::LinkedWorktrees),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(RefusalReason::GitFailed),
+    }
+    // A Git directory below the mirror is not a part of it: the executor
+    // refuses it, so the check refuses it here.
+    if has_modules(git_dir)? {
+        return Err(RefusalReason::NestedRepository);
     }
     if !queries
         .output(&["rev-list", "-n", "1", "--reflog", "--not", "--all"])?
@@ -496,7 +564,21 @@ pub fn check_mirror(
         return Err(RefusalReason::LocalCommits);
     }
     reflogs_are_fetches(&queries, "--all")?;
-    queries.tags()
+    let tags: Vec<(String, String)> = queries.tags()?;
+    // The queries ran after the first identity check. The Git directory
+    // must still be the measured object.
+    has_identity(git_dir, expected)?;
+    Ok(tags)
+}
+
+/// Whether the Git directory `git_dir` has a `modules` entry, where Git
+/// keeps the Git directories of submodules. Submodules are not admitted.
+fn has_modules(git_dir: &Path) -> Result<bool, RefusalReason> {
+    match fs::symlink_metadata(git_dir.join("modules")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(RefusalReason::GitFailed),
+    }
 }
 
 /// The tags of the mirror at the remote `url` of a checkout, when `url`
@@ -506,7 +588,7 @@ pub fn check_mirror(
 fn mirror_of_origin(
     git: &GitTool,
     url: &str,
-    pin: &Pin,
+    pin: Option<&Pin>,
     checkouts: &SwiftPmCheckouts,
 ) -> Result<Option<Vec<(String, String)>>, RefusalReason> {
     if !url.starts_with('/') {
@@ -526,7 +608,7 @@ fn mirror_of_origin(
     let metadata: fs::Metadata =
         fs::symlink_metadata(&mirror).map_err(|_| RefusalReason::IdentityChanged)?;
     let expected: Option<FileObjectEvidence> = identity_of(&metadata);
-    match check_mirror(git, &mirror, std::slice::from_ref(pin), expected) {
+    match check_mirror(git, &mirror, pin.map(std::slice::from_ref), expected) {
         Ok(tags) => Ok(Some(tags)),
         Err(RefusalReason::NotMirror | RefusalReason::LocationNotPinned) => Ok(None),
         Err(reason) => Err(reason),
@@ -578,7 +660,7 @@ pub fn check_checkout(
     git: &GitTool,
     work_tree: &Path,
     name: &str,
-    pins: &[Pin],
+    pins: Option<&[Pin]>,
     checkouts: &SwiftPmCheckouts,
     expected: Option<FileObjectEvidence>,
 ) -> Result<(), RefusalReason> {
@@ -588,17 +670,28 @@ pub fn check_checkout(
     // or a replacement.
     has_identity(&git_dir, expected)?;
     let identity: String = name.to_ascii_lowercase();
-    let Some(pin) = pins.iter().find(|pin| pin.identity == identity) else {
-        return Err(RefusalReason::NotPinned);
+    // The pin-less mode has no pin: the checks against pins are not made,
+    // and the commits must be reachable from the remote instead.
+    let pin: Option<&Pin> = match pins {
+        Some(pins) => match pins.iter().find(|pin| pin.identity == identity) {
+            Some(pin) => Some(pin),
+            None => return Err(RefusalReason::NotPinned),
+        },
+        None => None,
     };
     match fs::symlink_metadata(git_dir.join("worktrees")) {
         Ok(_) => return Err(RefusalReason::LinkedWorktrees),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(RefusalReason::GitFailed),
     }
+    // Submodules are out of scope: the executor refuses a Git directory in
+    // `.git/modules`, so the check refuses it before the plan.
+    if has_modules(&git_dir)? {
+        return Err(RefusalReason::NestedRepository);
+    }
     let queries: Queries<'_> = Queries {
         git,
-        git_dir,
+        git_dir: git_dir.clone(),
         work_tree: Some(work_tree),
     };
     // A filter driver is a program of the configuration that `git status`
@@ -609,19 +702,30 @@ pub fn check_checkout(
         return Err(RefusalReason::FilterDriver);
     }
     let head: Vec<u8> = queries.output(&["rev-parse", "--verify", "HEAD^{commit}"])?;
-    if head.trim_ascii() != pin.revision.as_bytes() {
+    if pin.is_some_and(|pin| head.trim_ascii() != pin.revision.as_bytes()) {
         return Err(RefusalReason::RevisionNotPinned);
     }
     let Some(origin) = queries.origin_url()? else {
-        return Err(RefusalReason::LocationNotPinned);
+        return Err(if pin.is_some() {
+            RefusalReason::LocationNotPinned
+        } else {
+            RefusalReason::OriginMissing
+        });
     };
-    let mirror_tags: Vec<(String, String)> = if same_location(&origin, &pin.location) {
-        Vec::new()
-    } else {
-        match mirror_of_origin(git, &origin, pin, checkouts)? {
+    let mirror_tags: Vec<(String, String)> = match pin {
+        Some(pin) if same_location(&origin, &pin.location) => Vec::new(),
+        Some(_) => match mirror_of_origin(git, &origin, pin, checkouts)? {
             Some(tags) => tags,
             None => return Err(RefusalReason::LocationNotPinned),
-        }
+        },
+        // The origin is a remote URL, or a mirror that [`check_mirror`]
+        // accepts beside the checkout (whose own origin is a remote URL).
+        // The mirror, when it is the origin, gives its tags.
+        None => match mirror_of_origin(git, &origin, None, checkouts)? {
+            Some(tags) => tags,
+            None if is_remote_url(&origin) => Vec::new(),
+            None => return Err(RefusalReason::OriginMissing),
+        },
     };
     if queries.finds(&["rev-parse", "--verify", "--quiet", "refs/stash"])? {
         return Err(RefusalReason::Stash);
@@ -652,11 +756,16 @@ pub fn check_checkout(
         "--reflog",
         "--not",
         "--glob=refs/remotes/origin/*",
-        "HEAD",
     ]
     .iter()
     .map(OsString::from)
     .collect();
+    // With a pin, `HEAD` is the revision of the pin, which the pins restore.
+    // Without a pin, `HEAD` must be reachable from the remote like each
+    // other commit.
+    if pin.is_some() {
+        arguments.push(OsString::from("HEAD"));
+    }
     for (name, object) in queries.tags()? {
         if mirror_tags.contains(&(name, object.clone())) {
             arguments.push(OsString::from(object));
@@ -670,5 +779,8 @@ pub fn check_checkout(
     if !output.stdout.is_empty() {
         return Err(RefusalReason::LocalCommits);
     }
+    // The queries ran after the first identity check. The Git directory
+    // must still be the measured object.
+    has_identity(&git_dir, expected)?;
     Ok(())
 }

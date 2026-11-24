@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use svalnir_core::action::AdmittedRepository;
 pub(super) use svalnir_core::config::glob_matches;
 use svalnir_core::config::{SKIPPED_DIRECTORY_NAMES, UserLayout};
 use svalnir_core::policy::ProtectionFact;
@@ -41,8 +42,8 @@ use crate::rules::git::{
 };
 use crate::rules::in_use::{UnitScope, UnitUse, uses_of};
 use crate::rules::nested_git::{
-    DetectionLimits, MarkerObserver, RefusalReason, RepositoryRefusal, SwiftPmCheckouts, Verdict,
-    check_unit,
+    DetectionLimits, MarkerObserver, REPOSITORY_CHANGED_CODE, RefusalReason, RepositoryRecheck,
+    RepositoryRefusal, SwiftPmCheckouts, Verdict, check_unit, recheck_admitted,
 };
 use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, WalkStop, is_plain_relative, lstat, walk_local,
@@ -614,6 +615,12 @@ pub struct ProjectUnitReport {
     pub owner_workflow: &'static str,
     /// The consequence of a removal.
     pub rebuild_impact: &'static str,
+    /// The checkouts of Swift Package Manager and their pins, for a layout
+    /// that has them and a project that gives the pins. The eviction
+    /// discovery uses them for the exception of
+    /// `docs/CLEANUP_RULES.md` section 6.
+    #[serde(skip)]
+    pub checkouts: Option<SwiftPmCheckouts>,
 }
 
 /// Which Git executable the inspection used.
@@ -1378,6 +1385,7 @@ impl Inspector<'_> {
                 outcome: ProjectUnitOutcome::Refused { reason: "" },
                 owner_workflow: layout.owner_workflow,
                 rebuild_impact: layout.rebuild_impact,
+                checkouts: Self::checkouts_of(&layout, project, names, &path),
             };
             // One directory is never in two units: a unit that holds or is
             // in an earlier unit, of this project or of a project above it,
@@ -1431,6 +1439,7 @@ impl Inspector<'_> {
             outcome: refused,
             owner_workflow: layout.owner_workflow,
             rebuild_impact: layout.rebuild_impact,
+            checkouts: None,
         });
     }
 
@@ -1726,6 +1735,24 @@ impl Inspector<'_> {
         }
     }
 
+    /// The checkouts of Swift Package Manager and their pins for the unit
+    /// at `path`, or `None` when the layout has none or no one package,
+    /// workspace, or project gives the pins.
+    fn checkouts_of(
+        layout: &Layout<'_>,
+        project: &Path,
+        names: &BTreeSet<OsString>,
+        path: &Path,
+    ) -> Option<SwiftPmCheckouts> {
+        match layout.checkouts {
+            PackageCheckouts::None => None,
+            PackageCheckouts::PackageBuild => SwiftPmCheckouts::of_package_build(path),
+            PackageCheckouts::XcodeDerivedData => {
+                SwiftPmCheckouts::of_xcode_project(path, &pin_container(project, names)?)
+            }
+        }
+    }
+
     /// The verdict of the exception for the checkouts of Swift Package
     /// Manager, for a unit whose measurement found a repository, or `None`
     /// when the exception does not apply: the layout has no checkouts, the
@@ -1742,13 +1769,7 @@ impl Inspector<'_> {
         if refusal.reason != RefusalReason::NestedRepository {
             return None;
         }
-        let checkouts: SwiftPmCheckouts = match layout.checkouts {
-            PackageCheckouts::None => return None,
-            PackageCheckouts::PackageBuild => SwiftPmCheckouts::of_package_build(path)?,
-            PackageCheckouts::XcodeDerivedData => {
-                SwiftPmCheckouts::of_xcode_project(path, &pin_container(project, names)?)?
-            }
-        };
+        let checkouts: SwiftPmCheckouts = Self::checkouts_of(layout, project, names, path)?;
         let limits: DetectionLimits = DetectionLimits {
             max_duration: self
                 .deadline
@@ -2047,6 +2068,10 @@ pub struct RecheckInput<'a> {
     /// evidence of a layout that permits an own ignore file. `None` when
     /// no executable passed them.
     pub git: Option<&'a GitTool>,
+    /// The repositories that the sealed plan admits in the unit. The check
+    /// runs the exception again and needs exactly this list
+    /// (`docs/CLEANUP_RULES.md` section 6).
+    pub admitted: &'a [AdmittedRepository],
 }
 
 /// Makes the checks of the unit `input.unit` of `project.dependency-directory`
@@ -2320,9 +2345,25 @@ fn recheck_layout(
         .zip(input.now)
         .and_then(|(observed, now)| now.checked_duration_since(observed))
         .is_some_and(|age| age <= input.expiry);
-    if current {
-        UnitRecheck::Passed
-    } else {
-        UnitRecheck::Unknown("activity_unknown")
+    if !current {
+        return UnitRecheck::Unknown("activity_unknown");
+    }
+    // The clean checkouts of Swift Package Manager that the plan admits:
+    // the checks run again and give exactly the sealed list.
+    let checkouts: Option<SwiftPmCheckouts> =
+        Inspector::checkouts_of(layout, project, &names, input.unit);
+    // A layout with no checkouts admits no repository: the walk of the
+    // check is not made for it, and the executor refuses each repository.
+    let Some(checkouts) = checkouts else {
+        return if input.admitted.is_empty() {
+            UnitRecheck::Passed
+        } else {
+            UnitRecheck::Refused(REPOSITORY_CHANGED_CODE)
+        };
+    };
+    match recheck_admitted(input.unit, Some(&checkouts), input.git, input.admitted) {
+        RepositoryRecheck::Same => UnitRecheck::Passed,
+        RepositoryRecheck::Refused(code) => UnitRecheck::Refused(code),
+        RepositoryRecheck::Unknown(code) => UnitRecheck::Unknown(code),
     }
 }

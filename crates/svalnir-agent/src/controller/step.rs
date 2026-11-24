@@ -1537,6 +1537,8 @@ impl<'a> Run<'a> {
                 // own resolution; the agent gives no other form.
                 resolved_paths: Vec::new(),
                 rule: Some(RuleEvidence::of(&prepared.candidate)),
+                // An automatic plan never admits a repository.
+                repositories: Vec::new(),
             });
         }
         let rule: Result<&Rule, RuleRefusal> = self.input.registry.resolve(

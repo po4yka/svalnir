@@ -10,7 +10,11 @@
 //!    another owner than the target, or a type that is not supported, is
 //!    refused as a whole: nothing is removed. A tree of an eviction with a
 //!    Git marker (`.git`) or a Git directory (`HEAD`, `objects/`, and
-//!    `refs/`) at any depth is refused in the same way.
+//!    `refs/`) at any depth is refused in the same way, except a Git
+//!    object that the plan admits: its path relative to the target and its
+//!    identity, read from the open descriptor, are those of an
+//!    `AdmittedRepository` of the binding. The executor runs no Git
+//!    query.
 //! 2. The removal goes bottom-up through the measured entries only. It
 //!    compares each entry with its measurement immediately before the
 //!    call, never follows a symbolic link, and never reads a directory
@@ -44,7 +48,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
-use svalnir_core::action::WorkCharge;
+use svalnir_core::action::{AdmittedRepository, WorkCharge};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
 use svalnir_core::quantity::{Bytes, EntryCount};
 
@@ -268,17 +272,60 @@ impl Snapshot {
 
 /// The bounds of a directory target that the binding of the plan gives.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TreeBounds {
+pub(super) struct TreeBounds<'a> {
     /// The work charge of the binding.
     pub(super) charge: WorkCharge,
     /// Whether a regular file with more than one name refuses the tree.
     pub(super) refuse_hard_links: bool,
     /// Whether a Git marker (`.git`) at any depth refuses the tree.
     pub(super) refuse_repositories: bool,
+    /// The Git objects that the plan admits, as the binding of the target
+    /// lists them. Each other Git marker and Git directory refuses the
+    /// tree. Empty for a target with no admitted repository.
+    pub(super) admitted: &'a [AdmittedRepository],
+}
+
+/// The path of a Git object relative to the target: `path` without the
+/// first `target_len` bytes and the separator, and then `name` when the
+/// object is an entry of the directory at `path`.
+fn relative_object(path: &[u8], target_len: usize, name: Option<&[u8]>) -> Vec<u8> {
+    let mut relative: Vec<u8> = path
+        .get(target_len..)
+        .unwrap_or_default()
+        .strip_prefix(b"/")
+        .unwrap_or_default()
+        .to_vec();
+    if let Some(name) = name {
+        if !relative.is_empty() {
+            relative.push(b'/');
+        }
+        relative.extend_from_slice(name);
+    }
+    relative
+}
+
+/// Whether the plan admits the Git object at `relative` with the identity
+/// `object`. The identity is that of the open descriptor or of the `fstatat`
+/// of the entry, not a path string: a replaced object has another inode.
+fn is_admitted(
+    admitted: &[AdmittedRepository],
+    relative: &[u8],
+    object: Option<FileObjectEvidence>,
+) -> bool {
+    object.is_some_and(|object| {
+        !relative.is_empty()
+            && admitted
+                .iter()
+                .any(|entry| entry.path.as_bytes() == relative && entry.object == object)
+    })
 }
 
 /// The read-only measurement of a directory target.
 struct Measure<'a> {
+    /// The length of the path of the target.
+    target_len: usize,
+    /// The Git objects that the plan admits.
+    admitted: &'a [AdmittedRepository],
     limits: &'a ExecutorLimits,
     /// The home directory and each directory that contains it.
     home: &'a HomeGuard,
@@ -349,6 +396,49 @@ impl Measure<'_> {
 }
 
 impl Measure<'_> {
+    /// For an eviction, refuses the open directory `directory` at `path`
+    /// when it is a Git directory that the plan does not admit with the
+    /// identity of the open descriptor.
+    fn admit_git_directory(&self, directory: BorrowedFd<'_>, path: &[u8]) -> Result<(), Refusal> {
+        if !self.refuse_repositories
+            || !nested_git::is_git_directory(directory)
+                .map_err(|error| Refusal::read_failure(&error))?
+        {
+            return Ok(());
+        }
+        let opened: Metadata =
+            native::stat_descriptor(directory).map_err(|error| Refusal::read_failure(&error))?;
+        let relative: Vec<u8> = relative_object(path, self.target_len, None);
+        if is_admitted(self.admitted, &relative, identity_of(&opened)) {
+            Ok(())
+        } else {
+            Err(Refusal::skipped(Cause::eligibility(
+                code::NESTED_REPOSITORY,
+            )))
+        }
+    }
+
+    /// For an eviction, refuses the entry `name` at `path` with `metadata`
+    /// when it is a `.git` marker that the plan does not admit.
+    fn admit_marker(&self, name: &CStr, path: &[u8], metadata: &Metadata) -> Result<(), Refusal> {
+        if self.refuse_repositories
+            && nested_git::is_marker(name.to_bytes())
+            && (metadata.kind != Kind::Directory
+                || !is_admitted(
+                    self.admitted,
+                    &relative_object(path, self.target_len, None),
+                    identity_of(metadata),
+                ))
+        {
+            return Err(Refusal::skipped(Cause::eligibility(
+                code::NESTED_REPOSITORY,
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Measure<'_> {
     /// Opens the directory `name` of `parent`, compares it with
     /// `expected`, and measures its entries. `level` is 1 for the target
     /// directory. `path` is the path of the directory.
@@ -391,15 +481,11 @@ impl Measure<'_> {
                 OpenFailure::Changed => changed(),
                 OpenFailure::Read(error) => Refusal::read_failure(&error),
             })?;
-        // A Git directory with no `.git` name, as of a bare repository.
-        if self.refuse_repositories
-            && nested_git::is_git_directory(descriptor.as_fd())
-                .map_err(|error| Refusal::read_failure(&error))?
-        {
-            return Err(Refusal::skipped(Cause::eligibility(
-                code::NESTED_REPOSITORY,
-            )));
-        }
+        // A Git directory with no `.git` name, as of a bare repository,
+        // or the `.git` directory of a checkout. Only a Git directory that
+        // the plan admits, with the identity of the open descriptor, is
+        // measured.
+        self.admit_git_directory(descriptor.as_fd(), path)?;
         let mut stream: DirStream = DirStream::from_descriptor(descriptor)
             .map_err(|error| Refusal::read_failure(&error))?;
         let mut entries: Vec<Snapshot> = Vec::new();
@@ -430,11 +516,7 @@ impl Measure<'_> {
             // changes can exist nowhere else. The check is in the
             // measurement, so the whole tree is refused before the first
             // call (`docs/CLEANUP_RULES.md` section 6).
-            if self.refuse_repositories && nested_git::is_marker(entry_name.to_bytes()) {
-                return Err(Refusal::skipped(Cause::eligibility(
-                    code::NESTED_REPOSITORY,
-                )));
-            }
+            self.admit_marker(&entry_name, path, &metadata)?;
             let children: Vec<Snapshot> = match metadata.kind {
                 Kind::Other => {
                     return Err(Refusal::skipped(Cause::eligibility(
@@ -565,6 +647,10 @@ struct Removal<'a> {
     /// Whether a Git repository that appears during the removal stops it:
     /// true for an eviction.
     refuse_repositories: bool,
+    /// The length of the path of the target.
+    target_len: usize,
+    /// The Git objects that the plan admits.
+    admitted: &'a [AdmittedRepository],
     /// The cause that stopped the removal before its end. Each later entry
     /// gets no call.
     halted: Option<Cause>,
@@ -657,17 +743,29 @@ impl Removal<'_> {
     }
 
     /// For an eviction, reads the names of the open directory `directory`
-    /// again before the removal of its entries. A Git repository that a
-    /// process made there after the measurement stops the removal before
-    /// it removes an entry of the directory, so the new work tree stays.
-    /// Returns the attempt of the directory when it gets no call.
-    fn repository_appeared(&mut self, directory: BorrowedFd<'_>) -> Option<Attempt> {
+    /// at `path` again before the removal of its entries. A Git repository
+    /// that a process made there after the measurement, and each Git object
+    /// that the plan does not admit with the same identity, stops the
+    /// removal before it removes an entry of the directory, so the new work
+    /// tree stays. Returns the attempt of the directory when it gets no
+    /// call.
+    fn repository_appeared(&mut self, directory: BorrowedFd<'_>, path: &[u8]) -> Option<Attempt> {
         if !self.refuse_repositories {
             return None;
         }
-        match nested_git::holds_repository_now(directory) {
-            Ok(false) => None,
-            Ok(true) => {
+        match nested_git::git_objects_now(directory) {
+            Ok(objects) => {
+                let admitted: bool = objects.iter().all(|found| {
+                    found.is_directory
+                        && is_admitted(
+                            self.admitted,
+                            &relative_object(path, self.target_len, found.name.as_deref()),
+                            found.object,
+                        )
+                });
+                if admitted {
+                    return None;
+                }
                 let cause: Cause = Cause::eligibility(code::NESTED_REPOSITORY);
                 self.halted = Some(cause.clone());
                 Some(Attempt::NotAttempted(Refusal::skipped(cause)))
@@ -749,7 +847,7 @@ impl Removal<'_> {
                         return (Attempt::NotAttempted(Refusal::read_failure(&error)), None);
                     }
                 };
-            if let Some(attempt) = self.repository_appeared(descriptor.as_fd()) {
+            if let Some(attempt) = self.repository_appeared(descriptor.as_fd(), path) {
                 return (attempt, None);
             }
             let directory_length: usize = path.len();
@@ -812,7 +910,7 @@ impl Removal<'_> {
 /// below the target. No mutation call was issued then.
 pub(super) fn remove_tree(
     located: &Located,
-    tree: TreeBounds,
+    tree: TreeBounds<'_>,
     home: &HomeGuard,
     limits: &ExecutorLimits,
     injection: &Injection,
@@ -820,6 +918,8 @@ pub(super) fn remove_tree(
 ) -> Result<TreeRemoval, Refusal> {
     let mut path: Vec<u8> = located.path.clone();
     let mut measure = Measure {
+        target_len: located.path.len(),
+        admitted: tree.admitted,
         limits,
         home,
         device: located.device,
@@ -859,6 +959,8 @@ pub(super) fn remove_tree(
         first_cause: None,
         indeterminate: None,
         refuse_repositories: tree.refuse_repositories,
+        target_len: located.path.len(),
+        admitted: tree.admitted,
         halted: None,
     };
     let mut path: Vec<u8> = located.path.clone();

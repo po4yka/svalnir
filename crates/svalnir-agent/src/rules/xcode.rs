@@ -83,11 +83,13 @@ use svalnir_core::rule::{
 };
 use svalnir_core::time::{MonotonicNanos, WallTime};
 
+use super::git::{GitTool, GitToolProblem};
 use super::model::{
     DiscoveredCandidate, Discovery, DiscoveryCompletion, DiscoveryControl, DiscoveryError,
     DiscoveryMode, DiscoveryScope, SkipReason,
 };
 use super::native::is_locked_by_another_process;
+use super::nested_git::{RepositoryPolicy, SwiftPmCheckouts};
 use super::plist::{ProjectInfo, parse_project_info};
 use super::registry::RegistryError;
 use super::unit::{
@@ -102,8 +104,9 @@ use crate::scan::EntryKind;
 pub const XCODE_DERIVED_DATA_RULE_ID: &str = "xcode.inactive-derived-data";
 
 /// The implementation revision of the rule in this build. Revision `r2`
-/// adds the layout [`XCODE_ORPHAN_LAYOUT`].
-pub const XCODE_DERIVED_DATA_REVISION: &str = "r2";
+/// added the layout [`XCODE_ORPHAN_LAYOUT`]. Revision `r3` admits the clean
+/// clones of Swift Package Manager in the unit of that layout.
+pub const XCODE_DERIVED_DATA_REVISION: &str = "r3";
 
 /// The layout of the generated subset of a project directory whose project
 /// is present.
@@ -1181,6 +1184,7 @@ impl UnitContext<'_> {
                 path: &path,
                 before: &before,
                 principal: self.scope.principal,
+                repositories: None,
             },
             &self.rule.rule,
             &mut collector.bounds,
@@ -1225,10 +1229,10 @@ impl UnitContext<'_> {
     /// The data of a project that no longer exists has no use, so predicate
     /// 4 is satisfied by the absence of the project, which the rule
     /// examined ([`workspace_gone`]). The measurement refuses a unit with a
-    /// Git repository at any depth, also a checkout of Swift Package
-    /// Manager in `SourcePackages/checkouts`, because the filesystem
-    /// executor of an eviction refuses each repository: a checkout with an
-    /// edit or a local commit thus stays. The deny-list of the rule applies
+    /// Git repository at any depth, except a clean clone of Swift Package
+    /// Manager in `SourcePackages/checkouts` or `SourcePackages/repositories`
+    /// that the pin-less check admits: a checkout with an edit or a local
+    /// commit thus stays. The deny-list of the rule applies
     /// at each depth; the allow-list of the children of a unit does not.
     fn assess_orphan(
         &mut self,
@@ -1255,6 +1259,15 @@ impl UnitContext<'_> {
             return Ok(Outcome::Assessed(Box::new(assessment)));
         }
         assessment.eligibility.no_exclusion_overlap = Fact::Satisfied;
+        // The layout is for a manual eviction only. The clean clones of
+        // Swift Package Manager in `SourcePackages` are admitted in the
+        // pin-less mode (`docs/CLEANUP_RULES.md` section 6): the workspace
+        // is gone, so no pin file exists.
+        let git: Result<GitTool, GitToolProblem> = GitTool::locate();
+        let policy: RepositoryPolicy<'_> = RepositoryPolicy {
+            checkouts: SwiftPmCheckouts::of_orphan_project(&path),
+            git: git.as_ref().map_err(|problem| *problem),
+        };
         let stopped: Option<DiscoveryCompletion> = establish_charge(
             &mut assessment,
             None,
@@ -1262,6 +1275,7 @@ impl UnitContext<'_> {
                 path: &path,
                 before: &before,
                 principal: self.scope.principal,
+                repositories: Some(&policy),
             },
             &self.rule.rule,
             &mut collector.bounds,
@@ -1470,7 +1484,9 @@ pub(super) fn recheck_orphan(
     principal: svalnir_core::process::Uid,
     root: &Path,
     path: &Path,
+    admitted: &[svalnir_core::action::AdmittedRepository],
 ) -> super::projects::UnitRecheck {
+    use super::nested_git::{RepositoryRecheck, recheck_admitted};
     use super::projects::UnitRecheck;
 
     let Ok(relative) = path.strip_prefix(root) else {
@@ -1503,9 +1519,18 @@ pub(super) fn recheck_orphan(
         return UnitRecheck::Unknown("workspace_state_unknown");
     };
     match workspace_gone(&info.workspace_path, &mounts) {
-        WorkspaceGone::Gone => UnitRecheck::Passed,
-        WorkspaceGone::Present => UnitRecheck::Refused("workspace_present"),
-        WorkspaceGone::Unknown => UnitRecheck::Unknown("workspace_state_unknown"),
+        WorkspaceGone::Gone => {}
+        WorkspaceGone::Present => return UnitRecheck::Refused("workspace_present"),
+        WorkspaceGone::Unknown => return UnitRecheck::Unknown("workspace_state_unknown"),
+    }
+    // The pin-less check of the clean clones of Swift Package Manager runs
+    // again and must give exactly the list that the plan binds.
+    let git: Result<GitTool, GitToolProblem> = GitTool::locate();
+    let checkouts: SwiftPmCheckouts = SwiftPmCheckouts::of_orphan_project(path);
+    match recheck_admitted(path, Some(&checkouts), git.as_ref().ok(), admitted) {
+        RepositoryRecheck::Same => UnitRecheck::Passed,
+        RepositoryRecheck::Refused(code) => UnitRecheck::Refused(code),
+        RepositoryRecheck::Unknown(code) => UnitRecheck::Unknown(code),
     }
 }
 

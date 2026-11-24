@@ -15,16 +15,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use svalnir_core::action::{
-    ActionClass, Attribution, Checked, ClientRole, Correlation, DispatchConsumption,
-    DispatchReceipt, DispatchState, Durability, EnvelopeContent, ErrorCode, ErrorFamily,
-    Escalation, EvidenceBinding, ExecutorRole, FileBinding, FileObjectType, LeaseResource,
-    NativeResult, OperationState, PLAN_SCHEMA_VERSION, PlanTarget, Principal, RecordingMode,
-    RequestEnvelope, Reservation, ResourceLease, StepLimits, StopReason, TargetBinding,
-    TargetEffect, TargetResult, Trigger, WorkCharge, aggregate,
+    ActionClass, AdmittedRepository, Attribution, Checked, ClientRole, Correlation,
+    DispatchConsumption, DispatchReceipt, DispatchState, Durability, EnvelopeContent, ErrorCode,
+    ErrorFamily, Escalation, EvidenceBinding, ExecutorRole, FileBinding, FileObjectType,
+    LeaseResource, NativeResult, OperationState, PLAN_SCHEMA_VERSION, PlanTarget, Principal,
+    RecordingMode, RepositoryKind, RequestEnvelope, Reservation, ResourceLease, StepLimits,
+    StopReason, TargetBinding, TargetEffect, TargetResult, Trigger, WorkCharge, aggregate,
 };
 use svalnir_core::authority::AuthorityBinding;
 use svalnir_core::digest::ContentDigest;
-use svalnir_core::file::{DeviceNumber, FileObjectEvidence, LosslessPath};
+use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{
     AdapterId, BootId, ClockDomainId, ExecutorEpochId, LeaseId, MountId, OperationId, PlanId,
     PolicyRevisionId, RootId, RuleId, RuleRevisionId, StepId, TargetId, VolumeId,
@@ -236,6 +236,7 @@ fn binding_with(
         // A charge larger than each fixture tree: a test of the growth
         // check sets a smaller one.
         charge: WorkCharge::new(Bytes::new(1 << 30), EntryCount::new(100_000)),
+        repositories: Vec::new(),
     }
 }
 
@@ -3605,4 +3606,242 @@ fn a_directory_target_in_a_locked_parent_is_refused_before_the_first_call() {
 
     assert_skipped(&outcome, &ErrorFamily::Eligibility, code::LOCKED_OBJECT);
     assert!(tree.join("a.bin").exists());
+}
+
+// ---------------------------------------------------------------------
+// The Git objects that the plan admits.
+// ---------------------------------------------------------------------
+
+/// The envelope of an eviction of `relative` whose binding admits
+/// `repositories`.
+fn envelope_admitting(
+    fixture: &Fixture,
+    relative: &str,
+    repositories: Vec<AdmittedRepository>,
+) -> RequestEnvelope {
+    let mut binding: FileBinding = fixture.binding(relative);
+    binding.repositories = repositories;
+    envelope_of(ActionClass::EvictRegenerableData, relative, binding)
+}
+
+/// The record of the Git object at `path` of the fixture, listed as the
+/// path `relative` below the target.
+fn admitted(path: &Path, relative: &str, kind: RepositoryKind) -> AdmittedRepository {
+    AdmittedRepository {
+        path: LosslessPath::from_bytes(relative).unwrap(),
+        kind,
+        object: object_of(path),
+    }
+}
+
+/// Makes the `.git` directory of a checkout in `work_tree`, with a file
+/// below `objects`.
+fn make_checkout(work_tree: &Path) -> PathBuf {
+    let git: PathBuf = work_tree.join(".git");
+    fs::create_dir_all(git.join("objects").join("pack")).unwrap();
+    fs::create_dir_all(git.join("refs")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(git.join("objects").join("pack").join("p.pack"), [1_u8; 8]).unwrap();
+    git
+}
+
+#[test]
+fn an_eviction_removes_an_admitted_checkout_and_an_admitted_mirror() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let git: PathBuf = make_checkout(&tree.join("a").join("b"));
+    let mirror: PathBuf = tree.join("a").join("mirror");
+    fs::create_dir(&mirror).unwrap();
+    make_git_directory(&mirror);
+    let envelope = envelope_admitting(
+        &fixture,
+        "tree",
+        vec![
+            admitted(&git, "a/b/.git", RepositoryKind::Checkout),
+            admitted(&mirror, "a/mirror", RepositoryKind::BareMirror),
+        ],
+    );
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_removed(&outcome);
+    assert!(!tree.exists());
+}
+
+#[test]
+fn a_git_directory_that_the_plan_does_not_admit_halts_the_tree() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let git: PathBuf = make_checkout(&tree.join("a").join("b"));
+    let other: PathBuf = tree.join("a").join("mirror");
+    fs::create_dir(&other).unwrap();
+    make_git_directory(&other);
+    // Only the checkout is admitted.
+    let envelope = envelope_admitting(
+        &fixture,
+        "tree",
+        vec![admitted(&git, "a/b/.git", RepositoryKind::Checkout)],
+    );
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(other.join("HEAD").exists());
+    assert!(git.join("HEAD").exists());
+    assert!(tree.join("top.bin").exists());
+}
+
+#[test]
+fn an_admitted_path_with_another_identity_is_not_admitted() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let git: PathBuf = make_checkout(&tree.join("a").join("b"));
+    let mut record = admitted(&git, "a/b/.git", RepositoryKind::Checkout);
+    // The plan names another inode: the checked object was replaced.
+    record.object.inode = InodeNumber::new(record.object.inode.get() + 1);
+    let envelope = envelope_admitting(&fixture, "tree", vec![record]);
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(git.join("HEAD").exists());
+    assert!(tree.join("top.bin").exists());
+}
+
+#[test]
+fn a_replaced_git_directory_is_not_admitted() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let work_tree: PathBuf = tree.join("a").join("b");
+    let git: PathBuf = make_checkout(&work_tree);
+    let record = admitted(&git, "a/b/.git", RepositoryKind::Checkout);
+    // After the check, another directory takes the name. The old directory
+    // goes outside the tree, so the tree holds one Git directory at the
+    // admitted path, and only its inode differs from the record.
+    fs::rename(&git, fixture.base.join("moved-git")).unwrap();
+    make_checkout(&work_tree);
+    let envelope = envelope_admitting(&fixture, "tree", vec![record]);
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(work_tree.join(".git").join("HEAD").exists());
+}
+
+#[test]
+fn a_git_directory_inside_an_admitted_git_directory_is_refused() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let git: PathBuf = make_checkout(&tree.join("a").join("b"));
+    let module: PathBuf = git.join("modules").join("x");
+    fs::create_dir_all(&module).unwrap();
+    make_git_directory(&module);
+    let envelope = envelope_admitting(
+        &fixture,
+        "tree",
+        vec![admitted(&git, "a/b/.git", RepositoryKind::Checkout)],
+    );
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(module.join("HEAD").exists());
+    assert!(git.join("HEAD").exists());
+}
+
+#[test]
+fn a_symbolic_link_named_git_is_not_admitted() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let work_tree: PathBuf = tree.join("a").join("b");
+    // The real Git directory is outside the tree; the tree has a link.
+    let real: PathBuf = make_checkout(&fixture.base.join("real-work-tree"));
+    let link: PathBuf = work_tree.join(".git");
+    symlink(&real, &link).unwrap();
+    let envelope = envelope_admitting(
+        &fixture,
+        "tree",
+        vec![admitted(&link, "a/b/.git", RepositoryKind::Checkout)],
+    );
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(real.join("HEAD").exists());
+    assert!(fs::symlink_metadata(&link).is_ok());
+}
+
+#[test]
+fn a_git_file_in_the_work_tree_of_an_admitted_checkout_is_refused() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let work_tree: PathBuf = tree.join("a").join("b");
+    let git: PathBuf = make_checkout(&work_tree);
+    // A file `.git` of a submodule or of a linked worktree.
+    let nested: PathBuf = work_tree.join("sub");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join(".git"), b"gitdir: ../.git/modules/sub\n").unwrap();
+    let envelope = envelope_admitting(
+        &fixture,
+        "tree",
+        vec![admitted(&git, "a/b/.git", RepositoryKind::Checkout)],
+    );
+
+    let outcome = run(&fixture.executor(), &fixture.roots(), &envelope);
+
+    assert_skipped(&outcome, &ErrorFamily::Eligibility, code::NESTED_REPOSITORY);
+    assert!(nested.join(".git").exists());
+    assert!(git.join("HEAD").exists());
+}
+
+#[test]
+fn a_git_directory_that_appears_next_to_an_admitted_one_is_not_removed() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let work_tree: PathBuf = tree.join("a").join("b");
+    let git: PathBuf = make_checkout(&work_tree);
+    let record = admitted(&git, "a/b/.git", RepositoryKind::Checkout);
+    // The measured directory `b` becomes a Git directory after the
+    // measurement: `HEAD`, `objects`, and `refs` appear in it.
+    let target: PathBuf = work_tree.clone();
+    let hook = once(
+        move |_| {
+            make_git_directory(&target);
+        },
+        Checkpoint::TreeEnumerated,
+    );
+    let executor = fixture.executor_with(checkpoint_injection(hook));
+    let envelope = envelope_admitting(&fixture, "tree", vec![record]);
+
+    let outcome = run(&executor, &fixture.roots(), &envelope);
+
+    // The directory `b` was measured, so it is read again before its
+    // entries go, and the removal stops there.
+    assert_eq!(failure_code(&outcome.result), code::NESTED_REPOSITORY);
+    assert!(tree.exists());
+    assert!(work_tree.join("HEAD").exists());
+    assert!(outcome.work.remaining_entries > EntryCount::ZERO);
+}
+
+#[test]
+fn a_marker_that_appears_after_the_measurement_stops_the_removal_with_an_admitted_list() {
+    let fixture = Fixture::new();
+    let tree: PathBuf = make_tree(&fixture);
+    let work_tree: PathBuf = tree.join("a").join("b");
+    let git: PathBuf = make_checkout(&work_tree);
+    let record = admitted(&git, "a/b/.git", RepositoryKind::Checkout);
+    let other: PathBuf = tree.join("a");
+    let hook = once(
+        move |_| {
+            fs::create_dir(other.join(".git")).unwrap();
+        },
+        Checkpoint::TreeEnumerated,
+    );
+    let executor = fixture.executor_with(checkpoint_injection(hook));
+    let envelope = envelope_admitting(&fixture, "tree", vec![record]);
+
+    let outcome = run(&executor, &fixture.roots(), &envelope);
+
+    assert_eq!(failure_code(&outcome.result), code::NESTED_REPOSITORY);
+    assert!(tree.join("a").join(".git").exists());
 }

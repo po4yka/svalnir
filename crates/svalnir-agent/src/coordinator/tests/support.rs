@@ -1053,6 +1053,7 @@ impl Tree {
             rule: None,
             layout: None,
             charge: measured_charge(&path),
+            repositories: Vec::new(),
         }
     }
 }

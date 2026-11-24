@@ -161,6 +161,7 @@ pub trait AuthoritySource: Debug {
         layout: Option<&str>,
         _root: &Path,
         _path: &Path,
+        _admitted: &[svalnir_core::action::AdmittedRepository],
     ) -> UnitRecheck {
         if rule.id.as_str() == crate::rules::projects::PROJECT_RULE_ID
             || crate::rules::clear::is_clear_rule(rule.id.as_str())

@@ -394,3 +394,110 @@ fn clean_inspect_reports_the_units_of_a_proposed_clear_rule() {
     assert!(world.exists(".hex/packages/hexpm/jason-1.4.tar"));
     assert!(world.exists(".hex/hex.config"));
 }
+
+impl World {
+    /// A bare clone `NAME` in `repositories` of the shared cache of Swift
+    /// Package Manager, cloned from a repository with one commit.
+    fn mirror(&self, name: &str) {
+        use crate::test_support::fixture_git;
+
+        let upstream: PathBuf = self.home.join("Upstream/dep");
+        if !upstream.exists() {
+            self.write("Upstream/dep/Sources.swift", b"let value = 1\n");
+            fixture_git(&self.home, &upstream, &["init", "-q"]);
+            fixture_git(&self.home, &upstream, &["add", "-A"]);
+            fixture_git(&self.home, &upstream, &["commit", "-q", "-m", "start"]);
+        }
+        let repositories: PathBuf = self
+            .home
+            .join("Library/Caches/org.swift.swiftpm/repositories");
+        std::fs::create_dir_all(&repositories).unwrap();
+        fixture_git(
+            &self.home,
+            &repositories,
+            &[
+                "clone",
+                "-q",
+                "--mirror",
+                "--no-hardlinks",
+                upstream.to_str().unwrap(),
+                name,
+            ],
+        );
+        // A mirror of Swift Package Manager has a remote URL as its origin.
+        fixture_git(
+            &self.home,
+            &repositories.join(name),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/org/dep.git",
+            ],
+        );
+    }
+}
+
+#[test]
+fn the_shared_cache_of_swift_package_manager_removes_its_bare_clones() {
+    let world = World::manual();
+    world.mirror("dep-1");
+    world.mirror("dep-2");
+    world.write("Library/Caches/org.swift.swiftpm/manifests/a.db", b"db");
+    world.write(
+        "Library/Caches/org.swift.swiftpm/artifacts/keep.zip",
+        b"zip",
+    );
+    let (plan_id, result) = world.planned("swiftpm.cache");
+    assert_eq!(
+        targets(&world, &result),
+        [
+            "Library/Caches/org.swift.swiftpm/manifests",
+            "Library/Caches/org.swift.swiftpm/repositories"
+        ]
+    );
+    let applied = world.apply(&plan_id);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(!world.exists("Library/Caches/org.swift.swiftpm/repositories"));
+    assert!(!world.exists("Library/Caches/org.swift.swiftpm/manifests"));
+    assert!(world.exists("Library/Caches/org.swift.swiftpm/artifacts/keep.zip"));
+}
+
+#[test]
+fn a_clone_that_is_not_bare_keeps_the_repositories_directory() {
+    let world = World::manual();
+    world.mirror("dep-1");
+    world.write(
+        "Library/Caches/org.swift.swiftpm/repositories/plain/a.txt",
+        b"mine\n",
+    );
+    crate::test_support::fixture_git(
+        &world.home,
+        &world
+            .home
+            .join("Library/Caches/org.swift.swiftpm/repositories/plain"),
+        &["init", "-q"],
+    );
+    world.write("Library/Caches/org.swift.swiftpm/manifests/a.db", b"db");
+    let (_, result) = world.planned("swiftpm.cache");
+    assert_eq!(
+        targets(&world, &result),
+        ["Library/Caches/org.swift.swiftpm/manifests"]
+    );
+}
+
+#[test]
+fn a_clone_that_appears_after_the_plan_skips_the_step() {
+    let world = World::manual();
+    world.mirror("dep-1");
+    let (plan_id, _) = world.planned("swiftpm.cache");
+    world.mirror("dep-2");
+    let applied = world.apply(&plan_id);
+    assert!(
+        applied.stdout.contains("repository_changed"),
+        "{}",
+        applied.stdout
+    );
+    assert!(world.exists("Library/Caches/org.swift.swiftpm/repositories/dep-1"));
+    assert!(world.exists("Library/Caches/org.swift.swiftpm/repositories/dep-2"));
+}

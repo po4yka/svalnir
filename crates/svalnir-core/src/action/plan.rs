@@ -48,8 +48,12 @@ use crate::time::{MonotonicNanos, WallTime};
 /// makes a new plan. A plan is valid for a short time in one boot.
 ///
 /// Version 3 added the budget generation to [`Trigger`] and the target of
-/// one process. Version 4 added the target of an owner operation.
-pub const PLAN_SCHEMA_VERSION: u32 = 4;
+/// one process. Version 4 added the target of an owner operation. Version 5
+/// added the admitted repositories of a file target ([`AdmittedRepository`]).
+pub const PLAN_SCHEMA_VERSION: u32 = 5;
+
+/// The largest number of admitted repositories in one file target.
+pub const MAX_ADMITTED_REPOSITORIES: usize = 256;
 
 /// The largest number of targets and of steps in one plan.
 pub const MAX_PLAN_TARGETS: usize = 4096;
@@ -180,6 +184,38 @@ impl Validity {
     }
 }
 
+wire_enum! {
+    /// The kind of a Git repository that the plan admits in a file target.
+    RepositoryKind {
+        /// The `.git` directory of a clone of Swift Package Manager.
+        Checkout => "checkout",
+        /// A bare Git directory of a mirror of Swift Package Manager.
+        BareMirror => "bare_mirror",
+    }
+}
+
+/// One Git repository that a manual plan admits in a file target
+/// (`docs/CLEANUP_RULES.md` section 6, "Checkouts of Swift Package
+/// Manager"). The check of the rule found it clean and made again from its
+/// remote. The filesystem executor refuses each Git object of the tree
+/// except the objects of this list.
+///
+/// The record names one Git object: the `.git` entry of a work tree, or a
+/// Git directory with no `.git` name. A checkout has the record of its
+/// `.git` directory, and a mirror has the record of its Git directory. This
+/// build does not admit a submodule: it has no kind for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedRepository {
+    /// The path of the Git object, relative to the target.
+    pub path: LosslessPath,
+    /// The kind.
+    pub kind: RepositoryKind,
+    /// The device and the inode of the Git object, as the check measured
+    /// them.
+    pub object: FileObjectEvidence,
+}
+
 /// The binding of a file target.
 ///
 /// A display path of the entry is not in the binding: the entry is
@@ -227,6 +263,10 @@ pub struct FileBinding {
     pub layout: Option<String>,
     /// The known conservative charge of the entry.
     pub charge: WorkCharge,
+    /// The Git repositories in the entry that the plan admits, in the
+    /// sequence of their paths. Empty for an entry with no repository.
+    /// Only a manual plan of `EvictRegenerableData` has an entry here.
+    pub repositories: Vec<AdmittedRepository>,
 }
 
 /// True when `path` is absolute, has at least one component, and has no
@@ -576,6 +616,30 @@ pub(super) fn check_trigger_identities(trigger: &Trigger) -> Result<(), PlanErro
 }
 
 /// Checks the binding of a file target for a step of `class`.
+/// Whether the admitted repositories of a file binding are valid: none for
+/// a class other than `EvictRegenerableData`, at most
+/// [`MAX_ADMITTED_REPOSITORIES`], each path relative and canonical, no path
+/// twice.
+fn check_admitted_repositories(class: &ActionClass, repositories: &[AdmittedRepository]) -> bool {
+    if repositories.is_empty() {
+        return true;
+    }
+    if !matches!(class, ActionClass::EvictRegenerableData)
+        || repositories.len() > MAX_ADMITTED_REPOSITORIES
+    {
+        return false;
+    }
+    let mut paths: BTreeSet<&[u8]> = BTreeSet::new();
+    repositories.iter().all(|repository| {
+        let bytes: &[u8] = repository.path.as_bytes();
+        !bytes.starts_with(b"/")
+            && bytes
+                .split(|byte| *byte == b'/')
+                .all(|part| !part.is_empty() && part != b"." && part != b"..")
+            && paths.insert(bytes)
+    })
+}
+
 pub(super) fn check_file_binding(
     class: &ActionClass,
     file: &FileBinding,
@@ -602,10 +666,17 @@ pub(super) fn check_file_binding(
     // An entry is a minimum of one item. A charge of no items would use
     // no part of an item limit, and it fits in an exhausted allowance.
     let charge_agrees: bool = file.charge.items != EntryCount::ZERO;
+    let repositories_agree: bool = check_admitted_repositories(class, &file.repositories);
     // An owner operation has its own binding: a file target is not the
     // scope of a command.
     let class_agrees: bool = class.takes_file_target();
-    if class_agrees && rule_agrees && layout_agrees && root_agrees && owner_agrees && charge_agrees
+    if class_agrees
+        && rule_agrees
+        && layout_agrees
+        && root_agrees
+        && owner_agrees
+        && charge_agrees
+        && repositories_agree
     {
         Ok(())
     } else {
@@ -804,6 +875,14 @@ impl PlanContent {
             }
             if !matches!(self.principal.role, ClientRole::Agent) {
                 return Err(PlanError::Trigger);
+            }
+            // An automatic plan never admits a repository: only a manual
+            // plan has the exception for the checkouts of Swift Package
+            // Manager.
+            if self.targets.iter().any(|target| {
+                matches!(&target.binding, TargetBinding::File(file) if !file.repositories.is_empty())
+            }) {
+                return Err(PlanError::Binding);
             }
         }
         Ok(())

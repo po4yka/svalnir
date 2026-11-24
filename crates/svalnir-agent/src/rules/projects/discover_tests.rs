@@ -751,6 +751,7 @@ fn recheck(
         now: evidence.now().monotonic_ns,
         expiry: super::PROJECT_EVIDENCE_EXPIRY,
         git: Some(&home.git),
+        admitted: &[],
     })
 }
 
@@ -865,7 +866,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
     let modules: PathBuf = home.path.join("Code/app/node_modules");
     let project_rule = svalnir_core::rule::RuleRef {
         id: RuleId::new(PROJECT_RULE_ID).unwrap(),
-        revision: svalnir_core::id::RuleRevisionId::new("r4").unwrap(),
+        revision: svalnir_core::id::RuleRevisionId::new("r5").unwrap(),
     };
     let root: PathBuf = home.path.join("Code");
     assert_eq!(
@@ -875,6 +876,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             Some("node-modules"),
             &root,
             &modules,
+            &[],
             &[]
         ),
         UnitRecheck::Passed
@@ -887,12 +889,21 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             Some("node-modules"),
             &root,
             &modules,
+            &[],
             &[]
         ),
         UnitRecheck::Refused("producer_active")
     );
     assert_eq!(
-        evidence.unit_recheck(home.principal, &project_rule, None, &root, &modules, &[]),
+        evidence.unit_recheck(
+            home.principal,
+            &project_rule,
+            None,
+            &root,
+            &modules,
+            &[],
+            &[]
+        ),
         UnitRecheck::Unknown("unit_layout_unknown")
     );
     // A unit that is gone is absent, not refused.
@@ -905,6 +916,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             Some("node-modules"),
             &root,
             &modules,
+            &[],
             &[]
         ),
         UnitRecheck::Absent
@@ -915,9 +927,55 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
         revision: svalnir_core::id::RuleRevisionId::new("r1").unwrap(),
     };
     assert_eq!(
-        evidence.unit_recheck(home.principal, &xcode, Some("x"), &root, &modules, &[]),
+        evidence.unit_recheck(home.principal, &xcode, Some("x"), &root, &modules, &[], &[]),
         UnitRecheck::Passed
     );
+}
+
+#[test]
+fn a_rule_with_no_repository_check_refuses_a_plan_that_admits_a_repository() {
+    use svalnir_core::action::{AdmittedRepository, RepositoryKind};
+    use svalnir_core::file::{DeviceNumber, FileObjectEvidence, LosslessPath};
+
+    let home = Home::new();
+    let root: PathBuf = home.path.join("root");
+    let unit: PathBuf = root.join("unit");
+    fs::create_dir_all(&unit).unwrap();
+    let evidence = FixtureEnvironment::days_later(0);
+    let admitted: Vec<AdmittedRepository> = vec![AdmittedRepository {
+        path: LosslessPath::from_bytes("checkouts/dep/.git").unwrap(),
+        kind: RepositoryKind::Checkout,
+        object: FileObjectEvidence {
+            device: DeviceNumber::new(1),
+            inode: 1_u64.into(),
+        },
+    }];
+    // The project layout of the rule of Xcode has no repository check.
+    for (rule, layout) in [
+        (
+            crate::rules::XCODE_DERIVED_DATA_RULE_ID,
+            Some("derived-data-project-v1"),
+        ),
+        ("homebrew.download-cache", None),
+    ] {
+        let reference = svalnir_core::rule::RuleRef {
+            id: RuleId::new(rule).unwrap(),
+            revision: svalnir_core::id::RuleRevisionId::new("r1").unwrap(),
+        };
+        assert_eq!(
+            evidence.unit_recheck(
+                home.principal,
+                &reference,
+                layout,
+                &root,
+                &unit,
+                &[],
+                &admitted
+            ),
+            UnitRecheck::Refused("repository_changed"),
+            "{rule}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1169,6 +1227,7 @@ fn the_check_before_a_step_matches_a_pattern_name_and_three_names() {
                 now: evidence.now().monotonic_ns,
                 expiry: super::PROJECT_EVIDENCE_EXPIRY,
                 git: Some(&home.git),
+                admitted: &[],
             },
         )
     };
@@ -1235,6 +1294,7 @@ fn the_check_before_a_step_refuses_a_user_unit_when_a_table_marker_appears() {
             now: evidence.now().monotonic_ns,
             expiry: super::PROJECT_EVIDENCE_EXPIRY,
             git: Some(&home.git),
+            admitted: &[],
         })
     };
     assert_eq!(check(), UnitRecheck::Passed);

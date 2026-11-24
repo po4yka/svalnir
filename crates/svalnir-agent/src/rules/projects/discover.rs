@@ -41,6 +41,7 @@ use crate::rules::model::{
     DiscoveredCandidate, DiscoveryCompletion, DiscoveryControl, DiscoveryError, DiscoveryLimits,
     DiscoveryScope, SkipReason,
 };
+use crate::rules::nested_git::RepositoryPolicy;
 use crate::rules::unit::{
     Assessment, Collector, ObjectKind, ObjectSnapshot, RootView, UnitUnderMeasurement,
     elapsed_between, establish_charge, lstat, target_evidence,
@@ -409,9 +410,16 @@ impl ProjectRule {
         }
         assessment.eligibility.no_exclusion_overlap = Fact::Satisfied;
         // Predicate 8: the complete unit and its charge. The measurement
-        // refuses a Git repository at each depth, with no exception for
-        // the checkouts of Swift Package Manager: the filesystem executor
-        // of an eviction refuses each repository.
+        // refuses a Git repository at each depth, with the exception of
+        // the clean checkouts of Swift Package Manager of the layouts that
+        // have them, for a manual eviction (`docs/CLEANUP_RULES.md`
+        // section 6): the plan binds the admitted repositories, and the
+        // executor refuses each other one.
+        let policy: Option<RepositoryPolicy<'_>> =
+            unit.checkouts.as_ref().map(|checkouts| RepositoryPolicy {
+                checkouts: checkouts.clone(),
+                git: input.request.git,
+            });
         let stopped: Option<DiscoveryCompletion> = establish_charge(
             &mut assessment,
             None,
@@ -419,6 +427,7 @@ impl ProjectRule {
                 path: &unit.path,
                 before: &before,
                 principal: input.host.principal,
+                repositories: policy.as_ref(),
             },
             self.rule(),
             &mut collector.bounds,

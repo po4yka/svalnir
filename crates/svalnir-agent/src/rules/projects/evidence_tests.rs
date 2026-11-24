@@ -504,6 +504,7 @@ fn recheck_with(
             now: evidence.now().monotonic_ns,
             expiry: super::PROJECT_EVIDENCE_EXPIRY,
             git: Some(&home.git),
+            admitted: &[],
         },
     )
 }
@@ -560,6 +561,7 @@ fn the_check_before_a_step_asks_git_again_for_an_own_ignore_file() {
         now: evidence.now().monotonic_ns,
         expiry: super::PROJECT_EVIDENCE_EXPIRY,
         git: None,
+        admitted: &[],
     };
     assert_eq!(
         recheck_unit_in(&PROJECT_LAYOUTS, &input),

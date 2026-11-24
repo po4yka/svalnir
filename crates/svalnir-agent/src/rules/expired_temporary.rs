@@ -636,6 +636,7 @@ impl ItemContext<'_> {
                 path: &path,
                 before: &before,
                 principal: self.scope.principal,
+                repositories: None,
             },
             self.rule,
             &mut collector.bounds,

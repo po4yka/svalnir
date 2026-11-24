@@ -449,7 +449,7 @@ Only the project owner starts this procedure, on a host that the owner selects. 
 
 **Orphan layout (`manual_action_validated` only)**
 
-The layout `derived-data-orphan-v1` has its own record (record identity `VAL-05/xcode.inactive-derived-data/r2/derived-data-orphan-v1/manual`; the layout has no automatic stage). Build one project, then move its source folder to the Trash and empty it; build a second project from an external disk, then eject the disk; make a third orphan whose `SourcePackages/checkouts` has a checkout with an edit. Make a plan. Expected: one target, the project directory of the first project; the second project directory has no orphan unit; the third is skipped with `nested_repository`; the units of `derived-data-project-v1` of the three projects are skipped with `not_regenerable` or `regenerability_unknown`. Make a plan again, connect the disk of the second project, restore the first project from a copy, and apply. Expected: the target is skipped with `workspace_present`, and its files stay.
+The layout `derived-data-orphan-v1` has its own record (record identity `VAL-05/xcode.inactive-derived-data/r3/derived-data-orphan-v1/manual`; the layout has no automatic stage). Build one project, then move its source folder to the Trash and empty it; build a second project from an external disk, then eject the disk; make a third orphan whose `SourcePackages/checkouts` has a checkout with an edit, and a fourth orphan whose `SourcePackages/checkouts` has a clean checkout and whose `SourcePackages/repositories` has its mirror. Make a plan. Expected: one target for the first project directory, and one target with the list of admitted repositories for the fourth; the second project directory has no orphan unit; the third is skipped (a clone with an edit is not admitted); the units of `derived-data-project-v1` of the three projects are skipped with `not_regenerable` or `regenerability_unknown`. Make a plan again, connect the disk of the second project, restore the first project from a copy, and apply. Expected: the target is skipped with `workspace_present`, and its files stay.
 
 **Automatic eviction (`automatic_eviction_validated`)**
 
@@ -465,7 +465,7 @@ The procedure does not fill a disk, does not change the clock of the host, regis
 
 ### Host procedure for `project.dependency-directory`
 
-The rule has no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/project.dependency-directory/r4/LAYOUT/manual`, one record for each layout, and one for `user-configured` that validates the mechanism and not each layout of a configuration). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects, with disposable projects only. The procedure removes files of that account.
+The rule has no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/project.dependency-directory/r5/LAYOUT/manual`, one record for each layout, and one for `user-configured` that validates the mechanism and not each layout of a configuration). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects, with disposable projects only. The procedure removes files of that account.
 
 **Preparation**
 

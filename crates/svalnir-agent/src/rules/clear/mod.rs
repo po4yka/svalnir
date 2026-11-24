@@ -68,8 +68,31 @@ pub(in crate::rules) use discover::{ClearDiscoveryInput, ProducerEvidence};
 use super::caches::LocationForm;
 use super::registry::RegistryError;
 
-/// The revision of each rule of this module.
+/// The revision of each rule of this module, except `swiftpm.cache`.
 pub const CLEAR_RULE_REVISION: &str = "r1";
+
+/// The revision of `swiftpm.cache`. Revision `r2` admits the bare mirrors
+/// of the child `repositories` through the pin-less check of
+/// `docs/CLEANUP_RULES.md` section 6.
+pub const SWIFTPM_CACHE_REVISION: &str = "r2";
+
+/// The revision of the rule of `spec`.
+#[must_use]
+pub fn revision_of_spec(spec: &ClearSpec) -> &'static str {
+    if spec.id == SWIFTPM_CACHE_RULE_ID {
+        SWIFTPM_CACHE_REVISION
+    } else {
+        CLEAR_RULE_REVISION
+    }
+}
+
+/// Whether the unit `relative` of the rule of `spec` is the one that the
+/// exception for the bare mirrors of Swift Package Manager applies to:
+/// the child `repositories` of the shared cache.
+#[must_use]
+pub fn admits_repositories(spec: &ClearSpec, relative: &Path) -> bool {
+    spec.id == SWIFTPM_CACHE_RULE_ID && relative == Path::new("repositories")
+}
 
 /// The identity of the rule for the registry cache of Cargo.
 pub const CARGO_REGISTRY_RULE_ID: &str = "cargo.registry-cache";
@@ -588,7 +611,7 @@ pub const SWIFTPM_CACHE: ClearSpec = ClearSpec {
         "Xcode",
     ],
     rebuild_cost: RebuildCost::Medium,
-    kept: "`artifacts` and `prebuilts` stay; `repositories` holds bare Git mirrors, which the repository check refuses, so it also stays.",
+    kept: "`artifacts` and `prebuilts` stay. `repositories` is a unit only when each repository in it is a bare clone directly in it that the pin-less mirror check accepts; any other repository in it refuses the unit.",
     regeneration: "The next package resolution downloads each removed manifest and registry archive again.",
 };
 
@@ -752,7 +775,7 @@ fn declaration(spec: &ClearSpec) -> Result<RuleDeclaration, RegistryError> {
         reference: RuleRef {
             id: RuleId::new(spec.id)
                 .map_err(|_| RegistryError::Declaration("the rule identity"))?,
-            revision: RuleRevisionId::new(CLEAR_RULE_REVISION)
+            revision: RuleRevisionId::new(revision_of_spec(spec))
                 .map_err(|_| RegistryError::Declaration("the rule revision"))?,
         },
         owner: RuleOwner {

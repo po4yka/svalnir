@@ -829,10 +829,13 @@ impl<J: CoordinatorJournal> Coordinator<J> {
     ) -> Option<(&'static str, ErrorFamily)> {
         let root: PathBuf = file.root_path.to_path_buf();
         let path: PathBuf = root.join(file.relative_entry.to_path_buf());
-        match self
-            .authority
-            .unit_recheck(rule, file.layout.as_deref(), &root, &path)
-        {
+        match self.authority.unit_recheck(
+            rule,
+            file.layout.as_deref(),
+            &root,
+            &path,
+            &file.repositories,
+        ) {
             UnitRecheck::Passed => None,
             UnitRecheck::Refused(code) => Some((code, ErrorFamily::Eligibility)),
             UnitRecheck::Unknown(code) => Some((code, ErrorFamily::Evidence)),

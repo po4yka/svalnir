@@ -29,7 +29,7 @@
 //! with the scanner already reads each entry of a unit, so they give each
 //! entry to a `MarkerTracker`. The filesystem executor applies
 //! [`is_marker`] and `is_git_directory` in the measurement of a directory
-//! target, before its first removal call, and `holds_repository_now` to
+//! target, before its first removal call, and `git_objects_now` to
 //! each directory of the removal pass before it removes the entries of
 //! that directory.
 //!
@@ -53,7 +53,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use svalnir_core::file::{DeviceNumber, FileObjectEvidence};
+use svalnir_core::action::{AdmittedRepository, MAX_ADMITTED_REPOSITORIES, RepositoryKind};
+use svalnir_core::file::{DeviceNumber, FileObjectEvidence, LosslessPath};
 
 use crate::executor::fs::native::{self, DirStream, Kind, Metadata};
 use crate::rules::git::{GitTool, GitToolProblem};
@@ -109,7 +110,7 @@ impl Default for DetectionLimits {
             max_depth: 64,
             max_entries: 2_000_000,
             max_duration: Duration::from_secs(60),
-            max_repositories: 64,
+            max_repositories: MAX_ADMITTED_REPOSITORIES,
         }
     }
 }
@@ -143,6 +144,10 @@ pub struct FoundRepository {
     /// The device and the inode of the marker, or of the Git directory of
     /// a [`MarkerKind::Bare`] repository, as the walk measured them.
     pub object: Option<FileObjectEvidence>,
+    /// The name of the marker as the walk read it from the directory, for
+    /// example `.GIT` on a volume that ignores case. Empty for a
+    /// [`MarkerKind::Bare`] repository.
+    pub marker_name: Vec<u8>,
 }
 
 /// Why a walk did not examine each entry of the unit.
@@ -237,6 +242,9 @@ pub enum RefusalReason {
     /// A repository in the `repositories` directory is not a bare mirror
     /// with one remote.
     NotMirror,
+    /// A checkout of the pin-less mode has no one remote `origin` with a
+    /// URL.
+    OriginMissing,
     /// The Git directory is not the object that the walk measured.
     IdentityChanged,
     /// No trusted Git executable is available for the checks.
@@ -267,6 +275,7 @@ impl RefusalReason {
             Self::ReflogDisabled => "swiftpm_checkout_reflog_disabled",
             Self::ReflogNotFetch => "swiftpm_reflog_not_fetch",
             Self::NotMirror => "swiftpm_mirror_not_valid",
+            Self::OriginMissing => "swiftpm_origin_missing",
             Self::IdentityChanged => "repository_identity_changed",
             Self::GitUnavailable => "swiftpm_git_unavailable",
             Self::GitFailed => "swiftpm_git_failed",
@@ -343,27 +352,64 @@ pub(crate) fn is_git_directory(directory: BorrowedFd<'_>) -> io::Result<bool> {
         && kind_at(directory, c"refs")? == Some(Kind::Directory))
 }
 
-/// Whether the open directory `directory` has a Git marker
-/// ([`is_marker`]) now, or is a Git directory (`is_git_directory`). The
+/// One Git object that a directory has now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitObjectNow {
+    /// The name of the `.git` entry of the directory, or `None` when the
+    /// directory itself is a Git directory.
+    pub(crate) name: Option<Vec<u8>>,
+    /// The device and the inode of the object, from `fstat` of the open
+    /// directory or `fstatat` of the entry.
+    pub(crate) object: Option<FileObjectEvidence>,
+    /// Whether the object is a directory. A plan admits only a directory: a
+    /// symbolic link or a file with the name `.git` is not admitted.
+    pub(crate) is_directory: bool,
+}
+
+/// Each Git object of the open directory `directory`: the directory itself
+/// when it is a Git directory, and each entry with a Git marker name. The
 /// names are read again from the directory.
 ///
 /// # Errors
 ///
 /// Returns the error of a read.
-pub(crate) fn holds_repository_now(directory: BorrowedFd<'_>) -> io::Result<bool> {
+pub(crate) fn git_objects_now(directory: BorrowedFd<'_>) -> io::Result<Vec<GitObjectNow>> {
+    let mut found: Vec<GitObjectNow> = Vec::new();
     if is_git_directory(directory)? {
-        return Ok(true);
+        let object: Option<FileObjectEvidence> = native::stat_descriptor(directory)
+            .ok()
+            .as_ref()
+            .and_then(identity);
+        found.push(GitObjectNow {
+            name: None,
+            object,
+            is_directory: true,
+        });
     }
     let again: OwnedFd = native::open_directory_at(directory, c".")?;
     let mut stream: DirStream = DirStream::from_descriptor(again)?;
     let mut name: Vec<u8> = Vec::new();
     while stream.next_name(&mut name)? {
         // The name ends with its NUL terminator.
-        if is_marker(name.strip_suffix(&[0]).unwrap_or(&name)) {
-            return Ok(true);
+        let plain: &[u8] = name.strip_suffix(&[0]).unwrap_or(&name);
+        if !is_marker(plain) {
+            continue;
         }
+        let entry: CString = CString::new(plain.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "name"))?;
+        let (object, is_directory): (Option<FileObjectEvidence>, bool) =
+            match native::stat_at(stream.descriptor(), &entry) {
+                Ok(metadata) => (identity(&metadata), metadata.kind == Kind::Directory),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => (None, false),
+            };
+        found.push(GitObjectNow {
+            name: Some(plain.to_vec()),
+            object,
+            is_directory,
+        });
     }
-    Ok(false)
+    Ok(found)
 }
 
 /// Finds the repositories of a unit from the entries of a walk that
@@ -469,7 +515,7 @@ impl<'a> MarkerObserver<'a> {
             };
             return refuse(RefusalReason::NestedRepository, Some(path));
         }
-        let relative = |path: &svalnir_core::file::LosslessPath| {
+        let relative = |path: &LosslessPath| {
             path.to_path_buf()
                 .strip_prefix(self.unit)
                 .ok()
@@ -587,6 +633,7 @@ impl Walk<'_> {
                     work_tree: relative.clone(),
                     marker: MarkerKind::Bare,
                     object,
+                    marker_name: Vec::new(),
                 });
                 return Ok(());
             }
@@ -620,6 +667,7 @@ impl Walk<'_> {
                     work_tree: relative.clone(),
                     marker: marker_kind(metadata.kind),
                     object: identity(&metadata),
+                    marker_name: name_bytes.to_vec(),
                 });
                 // The Git directory is not a part of the work tree, and
                 // its content is the repository itself.
@@ -746,30 +794,35 @@ fn refusal_of(problem: &DetectionProblem) -> RepositoryRefusal {
     RepositoryRefusal { reason, path }
 }
 
-/// The verdict on the unit at `unit` from its detection.
+/// The admitted repositories of the unit at `unit` from its detection, or
+/// the first refusal.
 ///
 /// A problem of the walk refuses the unit. A repository refuses the unit,
 /// unless `checkouts` is given and the repository is a checkout that
 /// [`swiftpm::check_checkout`] accepts or a mirror that
-/// [`swiftpm::check_mirror`] accepts. The first refusal is the verdict.
-/// Without a Git executable (`git`), each checkout is refused.
-#[must_use]
-pub fn judge(
+/// [`swiftpm::check_mirror`] accepts. Each accepted repository is in the
+/// result, with the path of its Git object relative to the unit and the
+/// identity that the walk measured. Without a Git executable (`git`), each
+/// checkout is refused.
+///
+/// # Errors
+///
+/// Returns the first [`RepositoryRefusal`].
+pub fn judge_admitting(
     unit: &Path,
     detection: &Detection,
     checkouts: Option<&SwiftPmCheckouts>,
     git: Result<&GitTool, GitToolProblem>,
-) -> Verdict {
+) -> Result<Vec<AdmittedRepository>, RepositoryRefusal> {
     if let Some(problem) = &detection.problem {
-        return Verdict::Refused(refusal_of(problem));
+        return Err(refusal_of(problem));
     }
-    let mut pins: Option<Result<Vec<Pin>, PinsProblem>> = None;
+    let mut admitted: Vec<AdmittedRepository> = Vec::new();
+    let mut pins: Option<Result<Option<Vec<Pin>>, PinsProblem>> = None;
     for repository in &detection.repositories {
-        let refuse = |reason: RefusalReason| {
-            Verdict::Refused(RepositoryRefusal {
-                reason,
-                path: Some(repository.work_tree.clone()),
-            })
+        let refuse = |reason: RefusalReason| RepositoryRefusal {
+            reason,
+            path: Some(repository.work_tree.clone()),
         };
         let work_tree: PathBuf = unit.join(&repository.work_tree);
         let Some((checkouts, managed)) = checkouts.and_then(|checkouts| {
@@ -777,13 +830,32 @@ pub fn judge(
                 .managed(&work_tree, repository.marker)
                 .map(|managed| (checkouts, managed))
         }) else {
-            return refuse(RefusalReason::NestedRepository);
+            return Err(refuse(RefusalReason::NestedRepository));
         };
         let Ok(git) = git else {
-            return refuse(RefusalReason::GitUnavailable);
+            return Err(refuse(RefusalReason::GitUnavailable));
         };
-        let Ok(pins) = pins.get_or_insert_with(|| read_pins(checkouts.resolved())) else {
-            return refuse(RefusalReason::PinsUnavailable);
+        // The pins are read once. The pin-less mode has none.
+        let Ok(pins) = pins.get_or_insert_with(|| match checkouts.resolved() {
+            Some(resolved) => read_pins(resolved).map(Some),
+            None => Ok(None),
+        }) else {
+            return Err(refuse(RefusalReason::PinsUnavailable));
+        };
+        let pins: Option<&[Pin]> = pins.as_deref();
+        let Some(object) = repository.object else {
+            return Err(refuse(RefusalReason::IdentityChanged));
+        };
+        let (path, kind): (PathBuf, RepositoryKind) = match &managed {
+            // The path has the name that the walk read, because the
+            // executor compares the name byte by byte.
+            swiftpm::Managed::Checkout(_) => (
+                repository
+                    .work_tree
+                    .join(OsStr::from_bytes(&repository.marker_name)),
+                RepositoryKind::Checkout,
+            ),
+            swiftpm::Managed::Mirror => (repository.work_tree.clone(), RepositoryKind::BareMirror),
         };
         let checked: Result<(), RefusalReason> = match managed {
             swiftpm::Managed::Checkout(name) => {
@@ -794,10 +866,126 @@ pub fn judge(
             }
         };
         if let Err(reason) = checked {
-            return refuse(reason);
+            return Err(refuse(reason));
         }
+        let path: LosslessPath =
+            LosslessPath::from_path(&path).map_err(|_| refuse(RefusalReason::NestedRepository))?;
+        admitted.push(AdmittedRepository { path, kind, object });
     }
-    Verdict::Clear
+    Ok(admitted)
+}
+
+/// The verdict on the unit at `unit` from its detection. The first refusal
+/// of [`judge_admitting`] is the verdict.
+#[must_use]
+pub fn judge(
+    unit: &Path,
+    detection: &Detection,
+    checkouts: Option<&SwiftPmCheckouts>,
+    git: Result<&GitTool, GitToolProblem>,
+) -> Verdict {
+    match judge_admitting(unit, detection, checkouts, git) {
+        Ok(_) => Verdict::Clear,
+        Err(refusal) => Verdict::Refused(refusal),
+    }
+}
+
+/// The repositories that the exception admits in the unit at `unit`: the
+/// walk of [`detect`] and the checks of [`judge_admitting`]. The list is
+/// sorted by path, so two calls on an unchanged unit give equal lists.
+///
+/// # Errors
+///
+/// Returns the first [`RepositoryRefusal`].
+pub fn admit_unit(
+    unit: &Path,
+    checkouts: &SwiftPmCheckouts,
+    git: Result<&GitTool, GitToolProblem>,
+    limits: &DetectionLimits,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<AdmittedRepository>, RepositoryRefusal> {
+    let detection: Detection = detect(unit, limits, cancel);
+    let mut admitted: Vec<AdmittedRepository> =
+        judge_admitting(unit, &detection, Some(checkouts), git)?;
+    admitted.sort_by(|first, second| first.path.as_bytes().cmp(second.path.as_bytes()));
+    Ok(admitted)
+}
+
+/// The result of the check of the admitted repositories before a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryRecheck {
+    /// The check produced exactly the sealed list.
+    Same,
+    /// The unit differs from the plan: the stable code of the refusal.
+    Refused(&'static str),
+    /// The check cannot be made: the stable code.
+    Unknown(&'static str),
+}
+
+/// The code of the refusal when the unit has a repository that the sealed
+/// plan does not admit.
+pub const NESTED_REPOSITORY_CODE: &str = "nested_repository";
+
+/// The code of the refusal when the list of admitted repositories that the
+/// check gives now is not the sealed list: another path, kind, or identity,
+/// or a repository that no longer passes the check (for example after a
+/// new commit).
+pub const REPOSITORY_CHANGED_CODE: &str = "repository_changed";
+
+/// Runs the checks of the exception again for the unit at `unit`, with the
+/// directories of `checkouts` (`None` for a layout with no checkouts), and
+/// compares the result with the list `sealed` of the plan. The Git
+/// executable `git` is `None` when none passed the checks.
+///
+/// Only exactly the sealed list passes: the same paths, the same kinds, and
+/// the same identities of the Git objects. Without a Git executable, a unit
+/// with a repository gives [`RepositoryRecheck::Unknown`].
+#[must_use]
+pub fn recheck_admitted(
+    unit: &Path,
+    checkouts: Option<&SwiftPmCheckouts>,
+    git: Option<&GitTool>,
+    sealed: &[AdmittedRepository],
+) -> RepositoryRecheck {
+    let git: Result<&GitTool, GitToolProblem> = git.ok_or(GitToolProblem::NotInstalled);
+    let limits: DetectionLimits = DetectionLimits::default();
+    let detection: Detection = detect(unit, &limits, None);
+    match judge_admitting(unit, &detection, checkouts, git) {
+        Ok(mut now) => {
+            now.sort_by(|first, second| first.path.as_bytes().cmp(second.path.as_bytes()));
+            let mut expected: Vec<&AdmittedRepository> = sealed.iter().collect();
+            expected.sort_by(|first, second| first.path.as_bytes().cmp(second.path.as_bytes()));
+            if now.iter().eq(expected) {
+                RepositoryRecheck::Same
+            } else {
+                RepositoryRecheck::Refused(REPOSITORY_CHANGED_CODE)
+            }
+        }
+        Err(refusal) => match refusal.reason {
+            RefusalReason::GitUnavailable => RepositoryRecheck::Unknown("git_unavailable"),
+            RefusalReason::UnitUnavailable
+            | RefusalReason::UnreadableDirectory
+            | RefusalReason::DetectionIncomplete
+            | RefusalReason::OtherDevice => {
+                RepositoryRecheck::Unknown("repository_check_incomplete")
+            }
+            RefusalReason::NestedRepository if sealed.is_empty() => {
+                RepositoryRecheck::Refused(NESTED_REPOSITORY_CODE)
+            }
+            _ => RepositoryRecheck::Refused(REPOSITORY_CHANGED_CODE),
+        },
+    }
+}
+
+/// The exception for the clean repositories of Swift Package Manager, as a
+/// rule of a manual eviction asks for it: the directories of the checkouts
+/// and of the mirrors, with the pins or with none, and the Git executable.
+#[derive(Debug, Clone)]
+pub struct RepositoryPolicy<'a> {
+    /// The checkouts, the mirrors, and the pins of the unit.
+    pub checkouts: SwiftPmCheckouts,
+    /// The trusted Git executable.
+    pub git: Result<&'a GitTool, GitToolProblem>,
 }
 
 /// [`detect`] and [`judge`] for the unit at `unit`.

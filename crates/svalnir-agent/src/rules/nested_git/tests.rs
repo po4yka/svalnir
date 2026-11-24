@@ -387,17 +387,17 @@ fn the_pins_of_an_xcode_project_are_in_its_workspace() {
         Path::new("/D/App-abcdefghijklmnopqrstuvwxyzab/SourcePackages/checkouts")
     );
     assert_eq!(
-        workspace.resolved(),
+        workspace.resolved().unwrap(),
         Path::new("/Code/App/App.xcworkspace/xcshareddata/swiftpm/Package.resolved")
     );
     assert_eq!(
-        of("/Code/App/App.xcodeproj").unwrap().resolved(),
+        of("/Code/App/App.xcodeproj").unwrap().resolved().unwrap(),
         Path::new(
             "/Code/App/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
         )
     );
     assert_eq!(
-        of("/Code/Package").unwrap().resolved(),
+        of("/Code/Package").unwrap().resolved().unwrap(),
         Path::new("/Code/Package/Package.resolved")
     );
     assert!(of("Code/App.xcodeproj").is_none());
@@ -807,4 +807,489 @@ fn the_checks_run_no_signature_program_of_the_configuration() {
     assert_eq!(package.check(), Verdict::Clear);
     assert!(!pgp_marker.exists(), "the checks ran gpg.program");
     assert!(!ssh_marker.exists(), "the checks ran gpg.ssh.program");
+}
+
+// ---------------------------------------------------------------------
+// The admitted list and the pin-less mode.
+// ---------------------------------------------------------------------
+
+use std::os::unix::fs::MetadataExt as _;
+
+use svalnir_core::action::{AdmittedRepository, RepositoryKind};
+use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber};
+
+use super::{RepositoryRecheck, admit_unit, recheck_admitted};
+
+/// The identity of the object at `path`.
+fn object_of(path: &Path) -> FileObjectEvidence {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    FileObjectEvidence {
+        device: DeviceNumber::new(i32::try_from(metadata.dev()).unwrap()),
+        inode: InodeNumber::new(metadata.ino()),
+    }
+}
+
+fn admit(
+    place: &Place,
+    unit: &Path,
+    checkouts: &SwiftPmCheckouts,
+) -> Result<Vec<AdmittedRepository>, RepositoryRefusal> {
+    admit_unit(
+        unit,
+        checkouts,
+        Ok(&place.git),
+        &DetectionLimits::default(),
+        None,
+    )
+}
+
+fn refusal(reason: RefusalReason, path: &str) -> RepositoryRefusal {
+    RepositoryRefusal {
+        reason,
+        path: Some(PathBuf::from(path)),
+    }
+}
+
+#[test]
+fn a_clean_checkout_with_pins_gives_one_admitted_record_with_its_identity() {
+    let package = Package::new();
+    let admitted = admit(&package.place, &package.unit, &package.checkouts()).unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].path.as_bytes(), b"checkouts/dep/.git");
+    assert_eq!(admitted[0].kind, RepositoryKind::Checkout);
+    assert_eq!(
+        admitted[0].object,
+        object_of(&package.checkout.join(".git"))
+    );
+}
+
+#[test]
+fn the_recheck_needs_exactly_the_sealed_list() {
+    let package = Package::new();
+    let checkouts = package.checkouts();
+    let sealed = admit(&package.place, &package.unit, &checkouts).unwrap();
+    let recheck = |list: &[AdmittedRepository]| {
+        recheck_admitted(
+            &package.unit,
+            Some(&checkouts),
+            Some(&package.place.git),
+            list,
+        )
+    };
+    assert_eq!(recheck(&sealed), RepositoryRecheck::Same);
+    // An empty list, another path, and another identity each differ.
+    assert_eq!(
+        recheck(&[]),
+        RepositoryRecheck::Refused(super::REPOSITORY_CHANGED_CODE)
+    );
+    let mut other = sealed.clone();
+    other[0].object.inode = InodeNumber::new(other[0].object.inode.get() + 1);
+    assert_eq!(
+        recheck(&other),
+        RepositoryRecheck::Refused(super::REPOSITORY_CHANGED_CODE)
+    );
+    let mut other = sealed.clone();
+    other[0].kind = RepositoryKind::BareMirror;
+    assert_eq!(
+        recheck(&other),
+        RepositoryRecheck::Refused(super::REPOSITORY_CHANGED_CODE)
+    );
+    // Without Git, a unit with a repository is not known.
+    assert_eq!(
+        recheck_admitted(&package.unit, Some(&checkouts), None, &sealed),
+        RepositoryRecheck::Unknown("git_unavailable")
+    );
+}
+
+#[test]
+fn a_commit_after_the_plan_changes_the_recheck() {
+    let package = Package::new();
+    let checkouts = package.checkouts();
+    let sealed = admit(&package.place, &package.unit, &checkouts).unwrap();
+    fs::write(package.checkout.join("Sources.swift"), b"let value = 7\n").unwrap();
+    package.git(&["commit", "-q", "-am", "late"]);
+    assert_eq!(
+        recheck_admitted(
+            &package.unit,
+            Some(&checkouts),
+            Some(&package.place.git),
+            &sealed
+        ),
+        RepositoryRecheck::Refused(super::REPOSITORY_CHANGED_CODE)
+    );
+}
+
+#[test]
+fn a_new_repository_after_the_plan_changes_the_recheck() {
+    let package = Package::new();
+    let checkouts = package.checkouts();
+    let sealed = admit(&package.place, &package.unit, &checkouts).unwrap();
+    package.place.repository("pkg/.build/debug/vendored");
+    assert_eq!(
+        recheck_admitted(
+            &package.unit,
+            Some(&checkouts),
+            Some(&package.place.git),
+            &sealed
+        ),
+        RepositoryRecheck::Refused(super::REPOSITORY_CHANGED_CODE)
+    );
+}
+
+/// A project directory of `DerivedData` whose workspace is gone, with
+/// `SourcePackages/checkouts/dep` cloned from `upstream`.
+struct Orphan {
+    place: Place,
+    upstream: PathBuf,
+    unit: PathBuf,
+    checkout: PathBuf,
+}
+
+impl Orphan {
+    fn new() -> Self {
+        let place = Place::new();
+        let upstream: PathBuf = place.repository("upstream");
+        let unit: PathBuf = place.join("DerivedData/App-abc");
+        let checkouts: PathBuf = unit.join("SourcePackages/checkouts");
+        fs::create_dir_all(&checkouts).unwrap();
+        place.write("DerivedData/App-abc/Build/Products/out.o", b"object");
+        place.git(
+            &checkouts,
+            &["clone", "-q", upstream.to_str().unwrap(), "dep"],
+        );
+        let checkout = checkouts.join("dep");
+        // The origin of a clone of Swift Package Manager is a remote URL.
+        place.git(&checkout, &["remote", "set-url", "origin", REMOTE_URL]);
+        Self {
+            place,
+            upstream,
+            unit,
+            checkout,
+        }
+    }
+
+    fn checkouts(&self) -> SwiftPmCheckouts {
+        SwiftPmCheckouts::of_orphan_project(&self.unit)
+    }
+
+    fn admit(&self) -> Result<Vec<AdmittedRepository>, RepositoryRefusal> {
+        admit(&self.place, &self.unit, &self.checkouts())
+    }
+
+    fn git(&self, arguments: &[&str]) -> String {
+        self.place.git(&self.checkout, arguments)
+    }
+
+    /// Makes the mirror `SourcePackages/repositories/dep-1234`.
+    fn mirror(&self) -> PathBuf {
+        let repositories: PathBuf = self.unit.join("SourcePackages/repositories");
+        fs::create_dir_all(&repositories).unwrap();
+        self.place.git(
+            &repositories,
+            &[
+                "clone",
+                "-q",
+                "--mirror",
+                self.upstream.to_str().unwrap(),
+                "dep-1234",
+            ],
+        );
+        let mirror: PathBuf = repositories.join("dep-1234");
+        self.place
+            .git(&mirror, &["remote", "set-url", "origin", REMOTE_URL]);
+        mirror
+    }
+}
+
+/// A remote URL that no fixture contacts: the queries run no transport.
+const REMOTE_URL: &str = "https://example.invalid/org/dep.git";
+
+#[test]
+fn a_checkout_at_an_origin_ref_is_admitted_with_no_pin() {
+    let orphan = Orphan::new();
+    let admitted = orphan.admit().unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].kind, RepositoryKind::Checkout);
+    assert_eq!(
+        admitted[0].path.as_bytes(),
+        b"SourcePackages/checkouts/dep/.git"
+    );
+}
+
+#[test]
+fn a_bare_mirror_of_a_remote_origin_is_admitted_with_no_pin() {
+    let orphan = Orphan::new();
+    let mirror: PathBuf = orphan.mirror();
+    let admitted = orphan.admit().unwrap();
+    let mirror_record = admitted
+        .iter()
+        .find(|record| record.kind == RepositoryKind::BareMirror)
+        .unwrap();
+    assert_eq!(
+        mirror_record.path.as_bytes(),
+        b"SourcePackages/repositories/dep-1234"
+    );
+    assert_eq!(mirror_record.object, object_of(&mirror));
+    assert_eq!(admitted.len(), 2);
+}
+
+#[test]
+fn a_pin_less_checkout_with_a_change_is_refused() {
+    for (name, reason) in [
+        ("edit", RefusalReason::ChangedWorkTree),
+        ("untracked", RefusalReason::ChangedWorkTree),
+        ("stash", RefusalReason::Stash),
+        ("filter", RefusalReason::FilterDriver),
+    ] {
+        let orphan = Orphan::new();
+        match name {
+            "edit" => fs::write(orphan.checkout.join("Sources.swift"), b"let value = 2\n").unwrap(),
+            "untracked" => fs::write(orphan.checkout.join("Notes.txt"), b"mine\n").unwrap(),
+            "stash" => {
+                fs::write(orphan.checkout.join("Sources.swift"), b"let value = 6\n").unwrap();
+                orphan.git(&["stash", "-q"]);
+            }
+            _ => {
+                orphan.git(&["config", "filter.lfs.clean", "cat"]);
+            }
+        }
+        assert_eq!(
+            orphan.admit().unwrap_err(),
+            refusal(reason, "SourcePackages/checkouts/dep"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_pin_less_checkout_with_a_local_commit_or_head_off_the_origin_is_refused() {
+    let orphan = Orphan::new();
+    fs::write(orphan.checkout.join("Sources.swift"), b"let value = 9\n").unwrap();
+    orphan.git(&["commit", "-q", "-am", "local"]);
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(RefusalReason::LocalCommits, "SourcePackages/checkouts/dep")
+    );
+}
+
+#[test]
+fn a_pin_less_checkout_at_a_tag_of_the_mirror_beside_it_is_admitted() {
+    let orphan = Orphan::new();
+    // A commit that the origin ref does not hold, but a tag of the mirror
+    // that is the origin of the checkout holds with the same object.
+    fs::write(orphan.upstream.join("Sources.swift"), b"let value = 10\n").unwrap();
+    orphan
+        .place
+        .git(&orphan.upstream, &["commit", "-q", "-am", "next"]);
+    orphan.place.git(&orphan.upstream, &["tag", "v2"]);
+    let mirror: PathBuf = orphan.mirror();
+    orphan.git(&["remote", "set-url", "origin", mirror.to_str().unwrap()]);
+    orphan.git(&["fetch", "-q", "origin", "tag", "v2"]);
+    orphan.git(&["checkout", "-q", "--detach", "v2"]);
+    // `HEAD` is on the tag; the remote-tracking refs are at the old commit.
+    assert!(orphan.admit().is_ok());
+}
+
+#[test]
+fn a_non_bare_repository_in_the_repositories_directory_is_refused() {
+    let orphan = Orphan::new();
+    orphan
+        .place
+        .repository("DerivedData/App-abc/SourcePackages/repositories/plain");
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(
+            RefusalReason::NestedRepository,
+            "SourcePackages/repositories/plain"
+        )
+    );
+}
+
+#[test]
+fn another_repository_in_a_pin_less_unit_is_refused() {
+    let orphan = Orphan::new();
+    orphan
+        .place
+        .repository("DerivedData/App-abc/Build/vendored");
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(RefusalReason::NestedRepository, "Build/vendored")
+    );
+}
+
+#[test]
+fn a_pin_less_checkout_without_an_origin_is_refused() {
+    let orphan = Orphan::new();
+    orphan.git(&["remote", "remove", "origin"]);
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(RefusalReason::OriginMissing, "SourcePackages/checkouts/dep")
+    );
+}
+
+#[test]
+fn the_shared_cache_admits_each_bare_clone_in_repositories_and_no_other_repository() {
+    let place = Place::new();
+    let upstream: PathBuf = place.repository("upstream");
+    let cache: PathBuf = place.join("Caches/org.swift.swiftpm");
+    let unit: PathBuf = cache.join("repositories");
+    fs::create_dir_all(&unit).unwrap();
+    for name in ["a-1", "b-2"] {
+        place.git(
+            &unit,
+            &["clone", "-q", "--bare", upstream.to_str().unwrap(), name],
+        );
+        // Swift Package Manager writes these keys into each mirror.
+        let mirror: PathBuf = unit.join(name);
+        place.git(&mirror, &["config", "remote.origin.mirror", "true"]);
+        place.git(&mirror, &["remote", "set-url", "origin", REMOTE_URL]);
+    }
+    let checkouts = SwiftPmCheckouts::of_shared_cache(&cache);
+    let admitted = admit(&place, &unit, &checkouts).unwrap();
+    assert_eq!(admitted.len(), 2);
+    assert!(
+        admitted
+            .iter()
+            .all(|record| record.kind == RepositoryKind::BareMirror)
+    );
+    assert_eq!(admitted[0].path.as_bytes(), b"a-1");
+    assert_eq!(admitted[1].path.as_bytes(), b"b-2");
+    // A non-bare repository, and a bare clone deeper than one level.
+    place.repository("Caches/org.swift.swiftpm/repositories/plain");
+    assert_eq!(
+        admit(&place, &unit, &checkouts).unwrap_err(),
+        refusal(RefusalReason::NestedRepository, "plain")
+    );
+}
+
+// ---------------------------------------------------------------------
+// The origin, the mirror conditions, and the reflog entries.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_pin_less_checkout_with_a_local_origin_is_refused() {
+    let orphan = Orphan::new();
+    orphan.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        orphan.upstream.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(RefusalReason::OriginMissing, "SourcePackages/checkouts/dep")
+    );
+}
+
+#[test]
+fn a_pin_less_checkout_whose_origin_is_not_a_mirror_in_repositories_is_refused() {
+    let orphan = Orphan::new();
+    let mirror: PathBuf = orphan.mirror();
+    // The path is in `repositories`, but the repository has no `mirror`
+    // key, so it is not a mirror of Swift Package Manager.
+    orphan
+        .place
+        .git(&mirror, &["config", "--unset", "remote.origin.mirror"]);
+    orphan.git(&["remote", "set-url", "origin", mirror.to_str().unwrap()]);
+    let refusal = orphan.admit().unwrap_err();
+    assert!(
+        matches!(
+            refusal.reason,
+            RefusalReason::OriginMissing | RefusalReason::NotMirror
+        ),
+        "{refusal:?}"
+    );
+}
+
+#[test]
+fn a_pin_less_mirror_with_a_local_origin_is_refused() {
+    let orphan = Orphan::new();
+    let mirror: PathBuf = orphan.mirror();
+    orphan.place.git(
+        &mirror,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            orphan.upstream.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(
+            RefusalReason::LocationNotPinned,
+            "SourcePackages/repositories/dep-1234"
+        )
+    );
+}
+
+#[test]
+fn a_mirror_without_the_mirror_key_is_refused() {
+    let orphan = Orphan::new();
+    let mirror: PathBuf = orphan.mirror();
+    orphan
+        .place
+        .git(&mirror, &["config", "--unset", "remote.origin.mirror"]);
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(
+            RefusalReason::NotMirror,
+            "SourcePackages/repositories/dep-1234"
+        )
+    );
+}
+
+#[test]
+fn a_mirror_with_linked_worktrees_is_refused() {
+    let orphan = Orphan::new();
+    let mirror: PathBuf = orphan.mirror();
+    fs::create_dir(mirror.join("worktrees")).unwrap();
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(
+            RefusalReason::LinkedWorktrees,
+            "SourcePackages/repositories/dep-1234"
+        )
+    );
+}
+
+#[test]
+fn a_checkout_with_a_submodule_directory_is_refused() {
+    let orphan = Orphan::new();
+    fs::create_dir_all(orphan.checkout.join(".git/modules/sub")).unwrap();
+    assert_eq!(
+        orphan.admit().unwrap_err(),
+        refusal(
+            RefusalReason::NestedRepository,
+            "SourcePackages/checkouts/dep"
+        )
+    );
+}
+
+#[test]
+fn a_reference_update_with_an_empty_reflog_subject_is_not_a_fetch() {
+    let package = Package::new();
+    // `update-ref` with no `-m` writes an entry with an empty subject.
+    package.git(&["update-ref", "refs/remotes/origin/quiet", &package.pinned]);
+    assert_eq!(
+        package.check(),
+        checkout_refused(RefusalReason::ReflogNotFetch)
+    );
+}
+
+#[test]
+fn the_name_of_the_git_directory_is_the_name_that_the_walk_read() {
+    let orphan = Orphan::new();
+    let upper: PathBuf = orphan.checkout.join(".GIT");
+    fs::rename(orphan.checkout.join(".git"), &upper).unwrap();
+    if fs::symlink_metadata(orphan.checkout.join(".git")).is_err() {
+        // A volume that tells the cases apart: Git cannot find `.git`.
+        assert!(orphan.admit().is_err());
+        return;
+    }
+    let admitted = orphan.admit().unwrap();
+    assert_eq!(
+        admitted[0].path.as_bytes(),
+        b"SourcePackages/checkouts/dep/.GIT"
+    );
 }

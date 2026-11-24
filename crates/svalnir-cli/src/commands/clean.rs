@@ -627,6 +627,7 @@ fn select(
             hard_protection: entry_protection(&path, home.as_deref(), state_directory.as_deref()),
             resolved_paths: svalnir_agent::protection::resolved_forms(&path),
             rule: None,
+            repositories: Vec::new(),
         });
     }
     Ok(selection)

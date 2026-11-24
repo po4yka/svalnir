@@ -782,7 +782,7 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
         b"lib-1.0.jar>central=\n",
     );
     let unit: PathBuf = root.join("org/lib");
-    let check = |path: &Path| recheck_unit(&MAVEN_REPOSITORY, home.principal, &root, path);
+    let check = |path: &Path| recheck_unit(&MAVEN_REPOSITORY, home.principal, &root, path, &[]);
     assert_eq!(check(&unit), UnitRecheck::Passed);
     // A local install in the unit after the plan.
     home.write(".m2/repository/org/lib/2.0/lib-2.0.jar", b"jar");
@@ -812,7 +812,7 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
     let gems: PathBuf = home.path.join(".gem/ruby/3.3.0/cache");
     home.write(".gem/ruby/3.3.0/cache/bundler/x", b"x");
     home.write(".gem/ruby/3.3.0/cache/a.txt", b"x");
-    let check = |path: &Path| recheck_unit(&RUBYGEMS_CACHE, home.principal, &gems, path);
+    let check = |path: &Path| recheck_unit(&RUBYGEMS_CACHE, home.principal, &gems, path, &[]);
     assert_eq!(
         check(&gems.join("bundler")),
         UnitRecheck::Refused("unit_layout_changed")
@@ -830,7 +830,7 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
         .reference
         .clone();
     assert_eq!(
-        environment.unit_recheck(home.principal, &reference, None, &root, &unit, &[]),
+        environment.unit_recheck(home.principal, &reference, None, &root, &unit, &[], &[]),
         UnitRecheck::Refused("protected_child")
     );
 }

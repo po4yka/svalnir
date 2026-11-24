@@ -1548,6 +1548,7 @@ fn trash_content(bench: &Bench, name: &str) -> PlanContent {
                 rule: None,
                 layout: None,
                 charge: WorkCharge::new(Bytes::new(10), EntryCount::new(1)),
+                repositories: Vec::new(),
             }),
         }],
         steps: vec![PlannedStep {

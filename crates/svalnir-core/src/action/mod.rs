@@ -66,10 +66,11 @@ pub use owner::{
     ScopeMeasurement, executable_is_trusted, is_denied_environment, is_environment_name,
 };
 pub use plan::{
-    ApplicationBinding, CandidateBindingError, ClientRole, Escalation, ExecutorRole, FileBinding,
-    FileObjectType, MAX_APPLICATION_MEMBERS, MAX_PLAN_TARGETS, PLAN_SCHEMA_VERSION, Plan,
-    PlanApproval, PlanContent, PlanError, PlanLimits, PlanTarget, PlannedStep, Principal,
-    ProcessBinding, TargetBinding, Trigger, Validity,
+    AdmittedRepository, ApplicationBinding, CandidateBindingError, ClientRole, Escalation,
+    ExecutorRole, FileBinding, FileObjectType, MAX_ADMITTED_REPOSITORIES, MAX_APPLICATION_MEMBERS,
+    MAX_PLAN_TARGETS, PLAN_SCHEMA_VERSION, Plan, PlanApproval, PlanContent, PlanError, PlanLimits,
+    PlanTarget, PlannedStep, Principal, ProcessBinding, RepositoryKind, TargetBinding, Trigger,
+    Validity,
 };
 pub use reconciliation::StepReconciliation;
 pub use state::{

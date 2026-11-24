@@ -240,7 +240,7 @@ fn a_deny_listed_entry_refuses_an_orphan() {
 fn the_check_before_a_step_examines_the_workspace_again() {
     let tree = Tree::new();
     let project: PathBuf = tree.orphan();
-    let check = || recheck_orphan(tree.principal, &tree.root, &project);
+    let check = || recheck_orphan(tree.principal, &tree.root, &project, &[]);
     assert_eq!(check(), UnitRecheck::Passed);
     // The environment applies the check for the orphan layout.
     let registry: ReviewedRules = manual_registry();
@@ -253,6 +253,7 @@ fn the_check_before_a_step_examines_the_workspace_again() {
             &tree.root,
             &project,
             &[],
+            &[],
         ),
         UnitRecheck::Passed
     );
@@ -260,7 +261,7 @@ fn the_check_before_a_step_examines_the_workspace_again() {
     write_workspace(&tree.base.join("src"), "App").unwrap();
     assert_eq!(check(), UnitRecheck::Refused("workspace_present"));
     assert_eq!(
-        recheck_orphan(tree.principal, &tree.root, &project.join("Build")),
+        recheck_orphan(tree.principal, &tree.root, &project.join("Build"), &[]),
         UnitRecheck::Refused("unit_layout_changed")
     );
     fs::remove_dir_all(&project).unwrap();

@@ -293,6 +293,7 @@ mod tests {
             rule: None,
             layout: None,
             charge: WorkCharge::ZERO,
+            repositories: Vec::new(),
         }
     }
 

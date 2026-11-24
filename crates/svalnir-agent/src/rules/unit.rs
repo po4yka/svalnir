@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-use svalnir_core::action::{FileObjectType, WorkCharge};
+use svalnir_core::action::{AdmittedRepository, FileObjectType, WorkCharge};
 use svalnir_core::file::{DeviceNumber, FileObjectEvidence, InodeNumber, LosslessPath};
 use svalnir_core::id::{ScanId, TargetId};
 use svalnir_core::observation::Coverage;
@@ -572,6 +572,10 @@ struct UnitObserver<'a> {
     newest_change: Option<WallTime>,
     /// The Git markers and the Git directories below the unit.
     repositories: nested_git::MarkerTracker,
+    /// Whether a repository does not reject the unit in the observer: the
+    /// caller then checks the repositories with the exception of section 6
+    /// and rejects the unit itself.
+    defer_repositories: bool,
 }
 
 /// Examines the owner and the times of one measured entry below a unit.
@@ -650,7 +654,7 @@ impl ScanObserver for UnitObserver<'_> {
                 // unit"). The unit of a rule of this build has no
                 // checkouts of Swift Package Manager, so no exception
                 // applies.
-                if self.repositories.note(relative, entry.kind) {
+                if self.repositories.note(relative, entry.kind) && !self.defer_repositories {
                     self.reasons.insert(SkipReason::NestedRepository);
                 }
             }
@@ -736,7 +740,7 @@ fn measure_unit(
     rule: &Rule,
     bounds: &mut Bounds<'_>,
     classify: Classifier<'_>,
-    principal: Uid,
+    (principal, defer_repositories): (Uid, bool),
 ) -> Result<MeasuredUnit, DiscoveryError> {
     if let Some(completion) = bounds.stop() {
         return Ok(MeasuredUnit::only(Measured::Stopped(completion)));
@@ -780,6 +784,7 @@ fn measure_unit(
         owner: principal,
         newest_change: None,
         repositories: nested_git::MarkerTracker::default(),
+        defer_repositories,
     };
     let scanned: Result<ScanResult, ScanError> =
         run_scan(&request, &scan_cancel, bounds.control.clock, &mut observer);
@@ -937,6 +942,35 @@ impl FinishedScan<'_> {
     }
 }
 
+/// The repositories that the exception admits in the unit at `path`. `None`
+/// when the check refuses one. A unit whose measurement found a repository
+/// but whose check finds none is refused too: the two readings disagree.
+fn admit_repositories(
+    path: &Path,
+    policy: &nested_git::RepositoryPolicy<'_>,
+    bounds: &Bounds<'_>,
+    found_by_measurement: bool,
+) -> Option<Vec<AdmittedRepository>> {
+    let defaults: nested_git::DetectionLimits = nested_git::DetectionLimits::default();
+    let limits: nested_git::DetectionLimits = nested_git::DetectionLimits {
+        max_duration: bounds.deadline().map_or(defaults.max_duration, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(defaults.max_duration)
+        }),
+        ..defaults
+    };
+    let admitted: Vec<AdmittedRepository> = nested_git::admit_unit(
+        path,
+        &policy.checkouts,
+        policy.git,
+        &limits,
+        Some(bounds.control.cancel),
+    )
+    .ok()?;
+    (admitted.is_empty() != found_by_measurement).then_some(admitted)
+}
+
 /// What a rule found about one unit.
 #[derive(Debug)]
 pub(super) struct Assessment {
@@ -960,6 +994,8 @@ pub(super) struct Assessment {
     /// The first Git marker or Git directory below the unit, relative to
     /// the unit, when the measurement found one.
     pub(super) repository_marker: Option<PathBuf>,
+    /// The repositories that the exception admitted in the unit.
+    pub(super) repositories: Vec<AdmittedRepository>,
 }
 
 impl Assessment {
@@ -976,6 +1012,7 @@ impl Assessment {
             activity: ActivityFact::Unknown,
             newest_content_change: None,
             repository_marker: None,
+            repositories: Vec::new(),
         }
     }
 
@@ -1022,6 +1059,7 @@ pub(super) fn conclude(
         activity,
         newest_content_change: _,
         repository_marker,
+        repositories,
     } = assessment;
     let relative_entry: LosslessPath = LosslessPath::from_path(&relative)
         .map_err(|_| DiscoveryError::Internal("the unit name"))?;
@@ -1107,6 +1145,7 @@ pub(super) fn conclude(
         evidence,
         measurement,
         blockers: reasons.into_iter().collect(),
+        repositories,
     })))
 }
 
@@ -1336,6 +1375,10 @@ pub(super) struct UnitUnderMeasurement<'a> {
     /// The user of the discovery. Each object below the unit must have
     /// this owner.
     pub(super) principal: Uid,
+    /// The exception for the clean repositories of Swift Package Manager
+    /// (`docs/CLEANUP_RULES.md` section 6). `None`: each repository
+    /// rejects the unit. Only a rule with a manual eviction gives it.
+    pub(super) repositories: Option<&'a nested_git::RepositoryPolicy<'a>>,
 }
 
 /// Establishes the complete charge of a unit (predicate 8): a measurement
@@ -1359,13 +1402,21 @@ pub(super) fn establish_charge(
         path,
         before,
         principal,
+        repositories: policy,
     } = *unit;
     let MeasuredUnit {
         measured,
         newest_change,
         repository_marker,
     } = match known {
-        None => measure_unit(path, before, rule, bounds, classify, principal)?,
+        None => measure_unit(
+            path,
+            before,
+            rule,
+            bounds,
+            classify,
+            (principal, policy.is_some()),
+        )?,
         // A carried measurement examines no object below the unit: the
         // owners and the times of the content are those of the earlier
         // discovery, and the executor compares each owner again.
@@ -1384,6 +1435,24 @@ pub(super) fn establish_charge(
     };
     assessment.newest_content_change = newest_change;
     assessment.repository_marker = repository_marker;
+    // A repository in a unit that the observer let pass: the exception
+    // admits it, or the unit is rejected. A known candidate that has
+    // repositories is not carried: the executor needs the list again.
+    let measured: Measured = match (measured, policy) {
+        (Measured::Complete(_), _) if known.is_some_and(|known| !known.repositories.is_empty()) => {
+            Measured::Rejected(BTreeSet::from([SkipReason::NestedRepository]))
+        }
+        (Measured::Complete(measurement), Some(policy)) if known.is_none() => {
+            match admit_repositories(path, policy, bounds, assessment.repository_marker.is_some()) {
+                Some(admitted) => {
+                    assessment.repositories = admitted;
+                    Measured::Complete(measurement)
+                }
+                None => Measured::Rejected(BTreeSet::from([SkipReason::NestedRepository])),
+            }
+        }
+        (measured, _) => measured,
+    };
     match measured {
         Measured::Complete(measurement) => {
             assessment.eligibility.unit_and_charge_known = Fact::Satisfied;

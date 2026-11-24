@@ -20,8 +20,9 @@ use super::paths::{
 };
 use super::reason::{Omission, OmissionReason, push_reason};
 use crate::action::{
-    ErrorFamily, Escalation, ExecutorRole, FileBinding, FileObjectType, MAX_PLAN_TARGETS, Plan,
-    PlanContent, PlanLimits, PlanTarget, PlannedStep, TargetBinding, WorkCharge,
+    AdmittedRepository, ErrorFamily, Escalation, ExecutorRole, FileBinding, FileObjectType,
+    MAX_PLAN_TARGETS, Plan, PlanContent, PlanLimits, PlanTarget, PlannedStep, TargetBinding,
+    WorkCharge,
 };
 use crate::file::{FileObjectEvidence, LosslessPath};
 use crate::id::{MountId, RootId, RuleId, StepId, TargetId, VolumeId};
@@ -148,6 +149,11 @@ pub struct CleanupEntry {
     /// The rule evidence, when a rule found the entry. The `evict` mode
     /// needs it.
     pub rule: Option<RuleEvidence>,
+    /// The Git repositories in the entry that the discovery admitted
+    /// (`docs/CLEANUP_RULES.md` section 6). Empty for an entry with no
+    /// repository. The plan binds the list; the executor and the check
+    /// before each step compare with it.
+    pub repositories: Vec<AdmittedRepository>,
 }
 
 /// A selection preset, for example `--profile developer`.
@@ -637,6 +643,12 @@ fn plan_parts(
                     .and(entry.rule.as_ref())
                     .map(|evidence| evidence.layout.clone()),
                 charge: *charge,
+                // Only a rule target admits repositories.
+                repositories: if rule.is_some() {
+                    entry.repositories.clone()
+                } else {
+                    Vec::new()
+                },
             }),
         });
         steps.push(PlannedStep {

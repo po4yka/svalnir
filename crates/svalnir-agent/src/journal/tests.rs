@@ -144,6 +144,7 @@ fn file_target(id: &str) -> PlanTarget {
             }),
             layout: Some("layout-v1".to_owned()),
             charge: charge(10, 1),
+            repositories: Vec::new(),
         }),
     }
 }

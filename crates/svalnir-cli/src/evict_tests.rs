@@ -625,3 +625,89 @@ fn a_state_directory_in_the_root_gives_no_plan() {
     );
     assert!(project.join("Build/Products").exists());
 }
+
+impl World {
+    /// A repository `upstream` with one commit, and a clone of it in
+    /// `SourcePackages/checkouts/dep` of the project directory.
+    fn source_package_checkout(&self) -> PathBuf {
+        use crate::test_support::fixture_git;
+
+        let home: PathBuf = std::fs::canonicalize(self.environment.home.as_ref().unwrap()).unwrap();
+        let upstream: PathBuf = self.directory.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(upstream.join("Sources.swift"), b"let value = 1\n").unwrap();
+        fixture_git(&home, &upstream, &["init", "-q"]);
+        fixture_git(&home, &upstream, &["add", "-A"]);
+        fixture_git(&home, &upstream, &["commit", "-q", "-m", "start"]);
+        let checkouts: PathBuf = self.project.join("SourcePackages/checkouts");
+        std::fs::create_dir_all(&checkouts).unwrap();
+        fixture_git(
+            &home,
+            &checkouts,
+            &[
+                "clone",
+                "-q",
+                "--no-hardlinks",
+                upstream.to_str().unwrap(),
+                "dep",
+            ],
+        );
+        // A checkout of Swift Package Manager has a remote URL as its
+        // origin; the commit stays in the remote-tracking references.
+        fixture_git(
+            &home,
+            &checkouts.join("dep"),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/org/dep.git",
+            ],
+        );
+        checkouts.join("dep")
+    }
+}
+
+#[test]
+fn an_orphan_with_a_swift_clone_that_gets_a_commit_after_the_plan_skips_the_step() {
+    use crate::test_support::fixture_git;
+
+    let world = World::manual();
+    let checkout: PathBuf = world.source_package_checkout();
+    std::fs::remove_dir_all(world.directory.path().join("src")).unwrap();
+    let home: PathBuf = std::fs::canonicalize(world.environment.home.as_ref().unwrap()).unwrap();
+    // A commit after the plan: the step keeps the project directory.
+    let plan: String = world.planned();
+    fixture_git(
+        &home,
+        &checkout,
+        &["commit", "-q", "--allow-empty", "-m", "mine"],
+    );
+    let applied = world.apply(&plan);
+    assert!(
+        applied.stdout.contains("repository_changed"),
+        "{}",
+        applied.stdout
+    );
+    assert!(checkout.join(".git").exists());
+    // A new plan is refused for the local commit: no target.
+    let outcome = world.plan(&[]);
+    assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+    assert!(
+        target_paths(&outcome.result()).is_empty(),
+        "{}",
+        outcome.stdout
+    );
+}
+
+#[test]
+fn an_orphan_with_a_clean_swift_clone_is_planned_and_removed() {
+    let world = World::manual();
+    let checkout: PathBuf = world.source_package_checkout();
+    std::fs::remove_dir_all(world.directory.path().join("src")).unwrap();
+    let plan: String = world.planned();
+    let applied = world.apply(&plan);
+    assert_eq!(applied.status, ExitStatus::Success, "{}", applied.stdout);
+    assert!(!checkout.exists());
+    assert!(!world.project.exists());
+}

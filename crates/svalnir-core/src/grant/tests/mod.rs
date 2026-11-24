@@ -415,6 +415,7 @@ fn file_binding(rule: Option<RuleRef>) -> FileBinding {
         object: None,
         rule,
         charge: charge(60, 1),
+        repositories: Vec::new(),
     }
 }
 

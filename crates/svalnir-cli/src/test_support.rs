@@ -760,3 +760,36 @@ impl svalnir_agent::rules::DiscoveryEnvironment for NoEvidence {
         )
     }
 }
+
+/// Runs the Git of the host in `directory` with no configuration of the
+/// host, for a fixture repository below `home`, and gives its standard
+/// output without the final newline. It panics when Git fails.
+#[cfg(debug_assertions)]
+pub(crate) fn fixture_git(home: &Path, directory: &Path, arguments: &[&str]) -> String {
+    let tool = svalnir_agent::rules::git::GitTool::locate()
+        .expect("the developer tools of the host have Git");
+    let output = std::process::Command::new(tool.executable())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir(directory)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {arguments:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}

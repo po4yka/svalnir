@@ -3,14 +3,14 @@
 use serde_json::{Value, json};
 
 use super::{
-    ActionClass, ActionError, ActionStage, ApplicationBinding, Attribution, CandidateBindingError,
-    CapacityEffect, Check, Checked, ClientRole, Correlation, DispatchState, Durability,
-    EffectEvidence, EnvelopeContent, EnvelopeError, ErrorCode, ErrorFamily, Escalation,
+    ActionClass, ActionError, ActionStage, AdmittedRepository, ApplicationBinding, Attribution,
+    CandidateBindingError, CapacityEffect, Check, Checked, ClientRole, Correlation, DispatchState,
+    Durability, EffectEvidence, EnvelopeContent, EnvelopeError, ErrorCode, ErrorFamily, Escalation,
     EvidenceBinding, ExecutorRole, FileBinding, FileObjectType, LeaseResource, NativeResult,
     Operation, OperationError, OperationState, OutcomeError, PLAN_SCHEMA_VERSION, Plan,
     PlanApproval, PlanContent, PlanError, PlanLimits, PlanState, PlanTarget, PlannedStep,
-    Principal, RecordingMode, RequestEnvelope, Reservation, ResourceEffect, ResourceLease,
-    StepLimits, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
+    Principal, RecordingMode, RepositoryKind, RequestEnvelope, Reservation, ResourceEffect,
+    ResourceLease, StepLimits, StepState, StopReason, TargetBinding, TargetEffect, TargetResult,
     TargetResultRecord, TransitionError, Trigger, TriggerClass, Validity, WorkCharge, aggregate,
     aggregate_step,
 };
@@ -84,6 +84,7 @@ fn file_binding(entry: &str, bytes: u64) -> FileBinding {
         rule: Some(rule()),
         layout: Some("layout-v1".to_owned()),
         charge: charge(bytes, 1),
+        repositories: Vec::new(),
     }
 }
 
@@ -519,7 +520,7 @@ fn a_plan_round_trips_and_a_changed_plan_is_rejected() {
         let plan = seal(content);
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["digest"], json!(plan.digest().as_str()));
-        assert_eq!(value["content"]["schema_version"], json!(4));
+        assert_eq!(value["content"]["schema_version"], json!(5));
         assert_eq!(serde_json::from_value::<Plan>(value).unwrap(), plan);
     }
 
@@ -570,6 +571,72 @@ fn a_plan_round_trips_and_a_changed_plan_is_rejected() {
     assert!(serde_json::from_value::<Plan>(changed).is_err());
 }
 
+fn admitted(path: &str) -> AdmittedRepository {
+    AdmittedRepository {
+        path: LosslessPath::from_bytes(path).unwrap(),
+        kind: RepositoryKind::Checkout,
+        object: FileObjectEvidence {
+            device: DeviceNumber::new(16_777_234),
+            inode: InodeNumber::new(77),
+        },
+    }
+}
+
+fn with_repositories(class: &ActionClass, repositories: Vec<AdmittedRepository>) -> PlanContent {
+    let mut content = file_content(class);
+    content.targets[0] = PlanTarget {
+        target_id: target_id("a"),
+        binding: TargetBinding::File(FileBinding {
+            repositories,
+            ..file_binding("a", 60)
+        }),
+    };
+    content
+}
+
+#[test]
+fn a_manual_eviction_plan_may_admit_repositories_and_no_other_plan_may() {
+    let plan = seal(with_repositories(
+        &ActionClass::EvictRegenerableData,
+        vec![admitted("a/.git"), admitted("b/.git")],
+    ));
+    let value = serde_json::to_value(&plan).unwrap();
+    assert_eq!(
+        value["content"]["targets"][0]["binding"]["repositories"][0]["kind"],
+        json!("checkout")
+    );
+    assert!(serde_json::from_value::<Plan>(value).is_ok());
+    // An automatic plan never admits a repository.
+    let mut content =
+        with_repositories(&ActionClass::EvictRegenerableData, vec![admitted("a/.git")]);
+    content.trigger = automatic(TriggerClass::DiskPressure);
+    content.principal.role = ClientRole::Agent;
+    content.authority.action_grants = vec![grant_ref()];
+    assert_eq!(Plan::seal(content).unwrap_err(), PlanError::Binding);
+    // A class other than the eviction admits none.
+    for class in [ActionClass::MoveToTrash, ActionClass::DeleteSelectedFiles] {
+        let content = with_repositories(&class, vec![admitted("a/.git")]);
+        assert_eq!(Plan::seal(content).unwrap_err(), PlanError::Binding);
+    }
+    // A path that is absolute, not canonical, or twice, and a list that is
+    // too long.
+    let evict = ActionClass::EvictRegenerableData;
+    for list in [
+        vec![admitted("/a/.git")],
+        vec![admitted("a/../.git")],
+        vec![admitted("a//.git")],
+        vec![admitted("a/./.git")],
+        vec![admitted("a/.git"), admitted("a/.git")],
+        (0..257).map(|n| admitted(&format!("p{n}/.git"))).collect(),
+    ] {
+        let content = with_repositories(&evict, list);
+        assert_eq!(Plan::seal(content).unwrap_err(), PlanError::Binding);
+    }
+    // The limit itself seals.
+    let list: Vec<AdmittedRepository> = (0..256).map(|n| admitted(&format!("p{n}/.git"))).collect();
+    seal(with_repositories(&evict, list));
+}
+
 fn rejected(change: impl FnOnce(&mut PlanContent), base: PlanContent) -> PlanError {
     let mut content = base;
     change(&mut content);
@@ -585,7 +652,8 @@ fn a_filesystem_plan_that_does_not_agree_with_itself_is_rejected() {
         (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 1)),
         (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 2)),
         (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 3)),
-        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 5)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 4)),
+        (PlanError::SchemaVersion, Box::new(|c| c.schema_version = 6)),
         (PlanError::Count, Box::new(|c| c.targets.clear())),
         (PlanError::Count, Box::new(|c| c.steps.clear())),
         (

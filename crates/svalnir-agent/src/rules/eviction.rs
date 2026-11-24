@@ -91,6 +91,19 @@ pub struct DiscoveryHost {
     pub system_root: PathBuf,
 }
 
+/// The directory that the absolute default roots of a clear rule are
+/// below. A test build has a directory that does not exist, so that no
+/// test of a client discovers a root of the host outside its fixture home
+/// directory (the Ruby of Homebrew); a test that examines such a root sets
+/// [`DiscoveryHost::system_root`] to a directory of its fixture.
+fn host_system_root() -> PathBuf {
+    if cfg!(any(test, feature = "test-support")) {
+        PathBuf::from("/nonexistent-svalnir-system-root")
+    } else {
+        PathBuf::from("/")
+    }
+}
+
 impl DiscoveryHost {
     /// The host of a manual discovery: the paths of
     /// `[protections].excluded_paths` are the exclusions.
@@ -107,7 +120,7 @@ impl DiscoveryHost {
             locations,
             user_exclusions,
             cache_locations,
-            system_root: PathBuf::from("/"),
+            system_root: host_system_root(),
         }
     }
 
@@ -135,7 +148,7 @@ impl DiscoveryHost {
             locations,
             user_exclusions,
             cache_locations,
-            system_root: PathBuf::from("/"),
+            system_root: host_system_root(),
         }
     }
 }
@@ -1217,6 +1230,51 @@ impl ReviewedRules {
         ))
     }
 
+    /// The binding of the root `path` of the clear rule `clear`, after the
+    /// checks of a configured location, of the binding, and of the root.
+    /// A refusal adds the report of the root to `result` and gives `None`.
+    fn bind_clear_root(
+        clear: &ClearRule,
+        request: &EvictionRequest<'_>,
+        home: &Path,
+        source: &clear::RootSource,
+        path: &Path,
+        result: &mut EvictionDiscovery,
+    ) -> Option<BoundRoot> {
+        let rule: &Rule = clear.rule();
+        let mut refuse = |refused: RootResult, complete: bool| {
+            if !complete {
+                result.complete = false;
+            }
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: Some(path.to_path_buf()),
+                result: refused,
+            });
+            None
+        };
+        // A configured location has the checks of a location first.
+        if matches!(source, clear::RootSource::Location)
+            && let Some(code) = super::caches::location_refusal(path, home, &request.host.locations)
+        {
+            return refuse(RootResult::Refused(code), false);
+        }
+        let bound: BoundRoot = match bind_root(path) {
+            Ok(bound) => bound,
+            Err(problem) => {
+                return refuse(
+                    RootResult::NotBound(problem),
+                    problem == RootProblem::Absent,
+                );
+            }
+        };
+        if let Some(refused) = clear_root_refusal(clear, request, &bound) {
+            let complete: bool = refused == RootResult::OtherVolume;
+            return refuse(refused, complete);
+        }
+        Some(bound)
+    }
+
     /// The discovery of each root of the clear rule `clear`: the
     /// candidates. The report of each root is added to `result`.
     fn examine_clear(
@@ -1254,44 +1312,11 @@ impl ReviewedRules {
                 });
                 continue;
             };
-            // A configured location has the checks of a location first.
-            if matches!(entry.source, clear::RootSource::Location)
-                && let Some(code) =
-                    super::caches::location_refusal(&path, home, &request.host.locations)
-            {
-                result.complete = false;
-                result.roots.push(RootReport {
-                    rule: rule.reference.clone(),
-                    path: Some(path),
-                    result: RootResult::Refused(code),
-                });
+            let Some(bound) =
+                Self::bind_clear_root(clear, request, home, &entry.source, &path, result)
+            else {
                 continue;
-            }
-            let bound: BoundRoot = match bind_root(&path) {
-                Ok(bound) => bound,
-                Err(problem) => {
-                    if problem != RootProblem::Absent {
-                        result.complete = false;
-                    }
-                    result.roots.push(RootReport {
-                        rule: rule.reference.clone(),
-                        path: Some(path),
-                        result: RootResult::NotBound(problem),
-                    });
-                    continue;
-                }
             };
-            if let Some(refused) = clear_root_refusal(clear, request, &bound) {
-                if refused != RootResult::OtherVolume {
-                    result.complete = false;
-                }
-                result.roots.push(RootReport {
-                    rule: rule.reference.clone(),
-                    path: Some(path),
-                    result: refused,
-                });
-                continue;
-            }
             let scope: DiscoveryScope<'_> = DiscoveryScope {
                 root: &bound.binding,
                 principal: request.host.principal,

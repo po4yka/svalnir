@@ -740,12 +740,7 @@ pub(crate) fn inspect(
         no_project_roots(arguments)?;
         view.kind = "cache";
         view.cache = Some(cache.inspect(
-            InspectionHost {
-                principal,
-                locations: &locations,
-                user_exclusions: &host.user_exclusions,
-                cache_locations: &host.cache_locations,
-            },
+            owner_host,
             InspectionLimits::default(),
             &cancel,
             evidence.as_ref(),

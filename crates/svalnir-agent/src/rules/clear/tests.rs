@@ -896,8 +896,10 @@ fn root_result<'a>(discovery: &'a EvictionDiscovery, root: &Path) -> &'a RootRes
         .roots
         .iter()
         .find(|report| report.path.as_deref() == Some(root))
-        .map(|report| &report.result)
-        .unwrap_or_else(|| panic!("no report of {}: {discovery:?}", root.display()))
+        .map_or_else(
+            || panic!("no report of {}: {discovery:?}", root.display()),
+            |report| &report.result,
+        )
 }
 
 /// A manual discovery of `rule` with the configured locations `locations`.
@@ -978,7 +980,7 @@ fn a_configured_root_has_the_checks_of_a_default_root() {
         &RootResult::Refused("clear_root_unmarked")
     );
     assert!(!discovery.complete);
-    assert!(candidates(&home, &discovery).is_empty());
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
     // A root that is a symbolic link is not bound.
     fs::create_dir_all(home.path.join("real/packages/hexpm")).unwrap();
     fs::create_dir(home.path.join("linked")).unwrap();
@@ -1000,7 +1002,7 @@ fn a_configured_root_has_the_checks_of_a_default_root() {
         root_result(&discovery, &home.path.join("work/app/hex/packages")),
         &RootResult::Refused("configuration_in_work_tree")
     );
-    assert!(candidates(&home, &discovery).is_empty());
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
     // The home directory, a directory above it, and a protected location.
     // The catalog protects the home directory first, so its code is the
     // code of a protected location.
@@ -1122,7 +1124,7 @@ fn the_global_cache_of_yarn_berry_needs_both_folders_beside_it() {
         root_result(&discovery, &root),
         &RootResult::Refused("clear_root_unmarked")
     );
-    assert!(candidates(&home, &discovery).is_empty());
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
     // A Yarn global folder in another place, from the configuration.
     home.write("yarn-home/cache/b-npm-1.0.0-abc-10.zip", b"zip");
     fs::create_dir_all(home.path.join("yarn-home/index")).unwrap();

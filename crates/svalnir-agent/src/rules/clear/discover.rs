@@ -393,8 +393,8 @@ fn form_refusal(
         (
             ObjectKind::Directory | ObjectKind::RegularFile,
             UnitForm::GemFile | UnitForm::ZipFile,
-        ) => Some(SkipReason::UnsupportedLayout),
-        (ObjectKind::RegularFile, UnitForm::MavenArtifact) => Some(SkipReason::UnsupportedLayout),
+        )
+        | (ObjectKind::RegularFile, UnitForm::MavenArtifact) => Some(SkipReason::UnsupportedLayout),
     }
 }
 

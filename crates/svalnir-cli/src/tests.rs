@@ -912,7 +912,8 @@ fn config_show_has_the_project_cleanup_table() {
                 "paseo_agents": false,
                 "search_roots": [],
                 "layouts": []
-            }
+            },
+            "cache_locations": []
         })
     );
     std::fs::write(

@@ -1739,7 +1739,7 @@ fn location_document(tables: &[(&str, &str)]) -> String {
 #[test]
 fn a_cache_location_names_a_rule_and_an_anchored_path() {
     let template: ValidatedConfig = valid(example(README));
-    assert!(template.cleanup().caches.locations.is_empty());
+    assert_eq!(template.cleanup().caches.locations.len(), 0);
     let config: ValidatedConfig = valid(&location_document(&[
         ("cargo.registry-cache", "~/dev/cargo-home"),
         ("cargo.registry-cache", "/Volumes/Work/cargo"),

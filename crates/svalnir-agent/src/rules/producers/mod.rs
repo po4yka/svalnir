@@ -62,7 +62,7 @@ use svalnir_core::rule::{
 
 pub use guard::{
     GuardOutcome, HOMEBREW_OVERRIDING_KEYS, HOMEBREW_SYSTEM_ENV_FILES, MAX_TRACKED_CONFIG_BYTES,
-    homebrew_system_env, mise_tracked_configs,
+    homebrew_system_env, homebrew_user_env, mise_tracked_configs,
 };
 pub use specs::{
     GO_BUILD, GO_MODULES, HOMEBREW_CLEANUP, MISE_CACHE, MISE_INSTALLS, NPM_CACHE, PIP_CACHE,
@@ -71,8 +71,9 @@ pub use specs::{
 
 use super::caches::config::{ConfigValue, paths_of, read_source};
 use super::caches::{
-    ConfigSource, ExclusionSpec, InspectionHost, Location, Marker, RootOutcome, RootResolution,
-    RootSpec, check_scope_root, has_marker, resolve,
+    ConfigSource, ExclusionSpec, InspectionHost, Location, LocationForm, Marker, RootOutcome,
+    RootResolution, RootSpec, check_scope_root, has_marker, location_refusal, locations_of,
+    resolve,
 };
 use super::eviction::BoundRoot;
 use super::owner_operation::{
@@ -213,6 +214,11 @@ pub struct ProducerSpec {
     /// The lookup decision: how the root is found, and why no query of
     /// the producer runs.
     pub lookup: &'static str,
+    /// What a configured location names for the rule
+    /// ([`LocationForm`]). A rule with an owner operation takes `Itself`
+    /// when a fixed argument or variable of its command names the scope
+    /// root, and the configured location is then the scope root.
+    pub location: LocationForm,
 }
 
 fn location(location: Location) -> Result<ExecutableLocation, RegistryError> {
@@ -657,6 +663,24 @@ impl ProducerRule {
             }
             _ => (resolution, path),
         };
+        // A configured location is the scope root, in place of the root of
+        // the configuration files of the producer or the default. It has
+        // the checks below, and the checks of a location first.
+        let configured: Vec<PathBuf> = locations_of(host.cache_locations, self.spec.id);
+        let (resolution, path) = match (self.spec.location, configured.first()) {
+            (LocationForm::Itself, Some(location)) => {
+                if let Some(code) = location_refusal(location, home, host.locations, &mounts) {
+                    return ScopeReport {
+                        resolution: RootResolution::ConfiguredLocation,
+                        path: Some(location.clone()),
+                        outcome: RootOutcome::Refused(code),
+                        bound: None,
+                    };
+                }
+                (RootResolution::ConfiguredLocation, Some(location.clone()))
+            }
+            _ => (resolution, path),
+        };
         let Some(path) = path else {
             return ScopeReport {
                 resolution,
@@ -851,7 +875,21 @@ fn guard_of(spec: &ProducerSpec, home: &Path, principal: Uid) -> GuardOutcome {
     match spec.guard {
         Guard::None => GuardOutcome::None,
         Guard::MiseTrackedConfigs => mise_tracked_configs(home, principal),
-        Guard::HomebrewSystemEnv => homebrew_system_env(&HOMEBREW_SYSTEM_ENV_FILES),
+        Guard::HomebrewSystemEnv => {
+            match (
+                homebrew_system_env(&HOMEBREW_SYSTEM_ENV_FILES),
+                homebrew_user_env(home),
+            ) {
+                (refused @ GuardOutcome::Refused { .. }, _)
+                | (_, refused @ GuardOutcome::Refused { .. }) => refused,
+                (GuardOutcome::Passed { files: system }, GuardOutcome::Passed { files: user }) => {
+                    GuardOutcome::Passed {
+                        files: system + user,
+                    }
+                }
+                (other, _) => other,
+            }
+        }
     }
 }
 
@@ -866,17 +904,18 @@ fn marked(spec: &ProducerSpec, root: &Path, principal: Uid) -> bool {
 /// The checks of the scope root of an owner operation of the rule `rule`
 /// at admission and immediately before its step
 /// (`docs/CLEANUP_RULES.md` section 9): the marker of the producer and the
-/// guards. A rule that is not of this module passes.
+/// guards, after the checks of a location of the root
+/// ([`location_refusal`]). A rule that is not of this module passes.
 ///
 /// # Errors
 ///
-/// Returns the stable code of the first check that fails:
-/// [`OWNER_SCOPE_UNMARKED`], [`OWNER_GUARD_REFUSED`], or
+/// Returns the stable code of the first check that fails: a code of
+/// [`location_refusal`], [`OWNER_SCOPE_UNMARKED`], [`OWNER_GUARD_REFUSED`], or
 /// [`HOMEBREW_ENV_OVERRIDES`].
 pub fn scope_evidence(
     rule: &RuleRef,
     root: &Path,
-    home: &Path,
+    (home, locations): (&Path, &crate::protection::ProtectedLocations),
     principal: Uid,
 ) -> Result<(), &'static str> {
     let Some(spec) = PRODUCER_SPECS
@@ -885,6 +924,14 @@ pub fn scope_evidence(
     else {
         return Ok(());
     };
+    // The checks of a location, as at the plan: a `.git` entry or a project
+    // marker that a directory above the root got after the plan refuses the
+    // step. They examine the locality first, so no probe reaches a network
+    // filesystem.
+    let mounts = MountTable::read().map_err(|_| "root_locality_unknown")?;
+    if let Some(code) = location_refusal(root, home, locations, &mounts) {
+        return Err(code);
+    }
     if !marked(spec, root, principal) {
         return Err(OWNER_SCOPE_UNMARKED);
     }

@@ -52,6 +52,8 @@ pub struct InspectionHost<'a> {
     /// The paths of `[protections]` and of the disk guard exclusions. A
     /// unit that overlaps one is not measured.
     pub user_exclusions: &'a [PathBuf],
+    /// The configured cache locations of `[cleanup.caches]`, for each rule.
+    pub cache_locations: &'a [super::CacheLocationEntry],
 }
 
 /// The bounds of the measurement of one unit.
@@ -105,6 +107,8 @@ pub enum RootResolution {
         /// The reason.
         problem: ConfigProblem,
     },
+    /// The path is a location of `[[cleanup.caches.locations]]`.
+    ConfiguredLocation,
     /// The home directory of the user is not known.
     HomeUnknown,
     /// The mount table cannot be read, so no configuration file is read.
@@ -373,7 +377,7 @@ fn has_project_marker(directory: &Path) -> bool {
 /// Whether the root or a directory above it is a project directory. The
 /// search stops below the home directory, or below `/` for a root outside
 /// it: the home directory can be a repository of personal settings.
-fn is_in_project(root: &Path, home: &Path) -> bool {
+pub(super) fn is_in_project(root: &Path, home: &Path) -> bool {
     root.ancestors()
         .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
         .take_while(|ancestor| !home.starts_with(ancestor))
@@ -399,7 +403,7 @@ pub(in crate::rules) fn has_marker(path: &Path, marker: Marker, principal: Uid) 
 }
 
 /// The stable name of a stop of [`walk_local`].
-fn walk_refusal(stop: &WalkStop) -> &'static str {
+pub(super) fn walk_refusal(stop: &WalkStop) -> &'static str {
     match stop {
         WalkStop::Absent => RootProblem::Absent.as_str(),
         WalkStop::LinkInAncestor => "root_path_not_plain",
@@ -449,6 +453,9 @@ pub(in crate::rules) fn check_scope_root(
         Ok(_) => {}
         Err(WalkStop::Absent) => return Err(RootOutcome::Absent),
         Err(stop) => return Err(refused(walk_refusal(&stop))),
+    }
+    if let Some(code) = super::ancestor_refusal(path, home) {
+        return Err(refused(code));
     }
     let bound = bind_root(path).map_err(|problem| match problem {
         RootProblem::Absent => RootOutcome::Absent,

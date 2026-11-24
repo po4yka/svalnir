@@ -388,6 +388,7 @@ pub(crate) fn plan(
         principal,
         &locations,
         &discovery_host.user_exclusions,
+        &discovery_host.cache_locations,
         arguments.include_clear,
     );
     let result: Result<ProducerBinding, ProducerBindError> = bind(rule, &request, environment);

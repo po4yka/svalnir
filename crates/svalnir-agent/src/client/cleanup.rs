@@ -502,6 +502,7 @@ pub fn owner_bind_request<'a>(
     principal: Uid,
     locations: &'a ProtectedLocations,
     user_exclusions: &'a [PathBuf],
+    cache_locations: &'a [crate::rules::caches::CacheLocationEntry],
     include_clear: bool,
 ) -> ProducerBindRequest<'a> {
     ProducerBindRequest {
@@ -509,6 +510,7 @@ pub fn owner_bind_request<'a>(
             principal,
             locations,
             user_exclusions,
+            cache_locations,
         },
         include_clear,
         max_executable_bytes: MAX_PRODUCER_EXECUTABLE_BYTES,

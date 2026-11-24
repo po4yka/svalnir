@@ -36,6 +36,8 @@ mod inspect;
 #[cfg(test)]
 mod tests;
 
+use std::path::{Path, PathBuf};
+
 use svalnir_core::action::{Checked, ExecutorRole, FileObjectType, WorkCharge};
 use svalnir_core::file::LosslessPath;
 use svalnir_core::id::{RuleId, RuleRevisionId};
@@ -93,6 +95,154 @@ pub const PROJECT_MARKERS: [&str; 13] = [
     "Package.swift",
     "Gemfile",
 ];
+
+/// What a configured location (`[[cleanup.caches.locations]]`) names for a
+/// rule (`docs/CLEANUP_RULES.md` section 4, "Configured cache locations").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationForm {
+    /// The rule has no configured location: no fixed variable or argument
+    /// of its command names the root, or the producer has no variable.
+    NotAccepted,
+    /// The location is the root itself.
+    Itself,
+    /// The location is the home directory of the producer, and the roots
+    /// are these paths below it.
+    Below(&'static [&'static str]),
+}
+
+/// One configured location, with its path in the absolute form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLocationEntry {
+    /// The rule identity.
+    pub rule: String,
+    /// The absolute path of the location.
+    pub path: PathBuf,
+}
+
+/// The configured locations of `config`, with `~/` expanded below `home`. A
+/// location that needs a home directory that is not known is left out.
+#[must_use]
+pub fn cache_locations(
+    config: &svalnir_core::config::ValidatedConfig,
+    home: Option<&Path>,
+) -> Vec<CacheLocationEntry> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    config
+        .cleanup()
+        .caches
+        .locations
+        .iter()
+        .filter_map(|location| {
+            Some(CacheLocationEntry {
+                rule: location.rule.clone(),
+                path: location.path.expand(home).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The paths of the configured locations of the rule `rule`.
+#[must_use]
+pub fn locations_of(entries: &[CacheLocationEntry], rule: &str) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| entry.rule == rule)
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// The stable code of a configured location that fails a check of a
+/// location, or `None`: the catalog of protected file locations protects it
+/// (`root_protected`), it is the home directory or contains it
+/// (`root_contains_home`), it is not on a local filesystem (`root_not_local`,
+/// `root_locality_unknown`), a directory from it up to the home directory
+/// (not included; up to `/` for a location outside the home directory) has a
+/// `.git` entry (`configuration_in_work_tree`) or one that cannot be examined
+/// (`configuration_in_work_tree_unknown`), or the location is in a project
+/// directory (`root_in_project`). A repository or a project in the folder of
+/// a location can be the work of the user. The checks of a root of the rule
+/// itself (owner, filesystem, marker) run after this one.
+///
+/// The text checks and the walk of the path on local filesystems come first,
+/// so no probe of a name reaches a network filesystem or starts an automount.
+/// A location that is absent has no refusal here: the binding of the root
+/// reports it.
+#[must_use]
+pub fn location_refusal(
+    path: &Path,
+    home: &Path,
+    locations: &crate::protection::ProtectedLocations,
+    mounts: &crate::platform::volume::MountTable,
+) -> Option<&'static str> {
+    use super::unit::{WalkStop, walk_local};
+    use svalnir_core::policy::ProtectionFact;
+    match locations.of_text(path) {
+        ProtectionFact::NotProtected => {}
+        ProtectionFact::Protected => return Some("root_protected"),
+        ProtectionFact::Unknown => return Some("root_protection_unknown"),
+    }
+    if path == home || home.starts_with(path) {
+        return Some("root_contains_home");
+    }
+    match walk_local(path, mounts) {
+        Ok(_) => {}
+        Err(WalkStop::Absent) => return None,
+        Err(stop) => return Some(inspect::walk_refusal(&stop)),
+    }
+    for ancestor in path
+        .ancestors()
+        .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
+    {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Some("configuration_in_work_tree"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A name that cannot be examined can be a repository.
+            Err(_) => return Some("configuration_in_work_tree_unknown"),
+        }
+    }
+    if inspect::is_in_project(path, home) {
+        return Some("root_in_project");
+    }
+    ancestor_refusal(path, home)
+}
+
+/// The stable code of a root outside the home directory whose own directory
+/// or an ancestor directory below `/` can be changed by a user other than its
+/// owner, or `None` (`root_ancestor_writable`): a directory that is writable
+/// by its group or by others, unless it is a sticky directory of the user
+/// `root`. The root and each ancestor are examined with no link followed. A
+/// root below the home directory has no refusal here, because the checks of
+/// the home directory are the checks of the account. A directory that is absent
+/// has none (the binding reports it), and one that cannot be examined is
+/// refused with `root_not_readable`. The caller has examined the locality of
+/// the path first.
+#[must_use]
+pub(in crate::rules) fn ancestor_refusal(path: &Path, home: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    const GROUP_OR_OTHERS_WRITE: u32 = 0o022;
+    const STICKY: u32 = 0o1000;
+    if path.starts_with(home) {
+        return None;
+    }
+    for ancestor in path
+        .ancestors()
+        .take_while(|ancestor| ancestor.parent().is_some())
+    {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                let sticky_root: bool = metadata.mode() & STICKY != 0 && metadata.uid() == 0;
+                if metadata.mode() & GROUP_OR_OTHERS_WRITE != 0 && !sticky_root {
+                    return Some("root_ancestor_writable");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some("root_not_readable"),
+        }
+    }
+    None
+}
 
 /// A location of the host that a rule refuses as a root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

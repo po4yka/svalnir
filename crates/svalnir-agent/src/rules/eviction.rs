@@ -46,6 +46,7 @@ use svalnir_core::rule::{
 use svalnir_core::time::MonotonicNanos;
 use svalnir_core::volume::VolumeIdentity;
 
+use super::caches::{CacheLocationEntry, cache_locations};
 use super::clear::{self, ClearDiscoveryInput, ClearRootEntry, ClearRule, ProducerEvidence};
 use super::expired_temporary::{EXPIRED_TEMPORARY_RULE_ID, TemporaryEvidence, UseLeases};
 use super::in_use::{UnitScope, UnitUse, inventory_of, uses_of};
@@ -81,6 +82,26 @@ pub struct DiscoveryHost {
     pub locations: ProtectedLocations,
     /// The exclusions of the user configuration, as absolute paths.
     pub user_exclusions: Vec<PathBuf>,
+    /// The configured cache locations of `[cleanup.caches]`, which add a
+    /// root to a clear rule.
+    pub cache_locations: Vec<CacheLocationEntry>,
+    /// The directory that the absolute default roots of a clear rule (the
+    /// Ruby of Homebrew) are below: `/` on a host, a directory of a fixture
+    /// in a test.
+    pub system_root: PathBuf,
+}
+
+/// The directory that the absolute default roots of a clear rule are
+/// below. A test build has a directory that does not exist, so that no
+/// test of a client discovers a root of the host outside its fixture home
+/// directory (the Ruby of Homebrew); a test that examines such a root sets
+/// [`DiscoveryHost::system_root`] to a directory of its fixture.
+fn host_system_root() -> PathBuf {
+    if cfg!(any(test, feature = "test-support")) {
+        PathBuf::from("/nonexistent-svalnir-system-root")
+    } else {
+        PathBuf::from("/")
+    }
 }
 
 impl DiscoveryHost {
@@ -92,10 +113,14 @@ impl DiscoveryHost {
             locations.home_directory(),
             config.protections().excluded_paths.iter(),
         );
+        let cache_locations: Vec<CacheLocationEntry> =
+            cache_locations(config, locations.home_directory());
         Self {
             principal,
             locations,
             user_exclusions,
+            cache_locations,
+            system_root: host_system_root(),
         }
     }
 
@@ -116,10 +141,14 @@ impl DiscoveryHost {
                 .iter()
                 .chain(&config.disk_guard().exclusions.paths),
         );
+        let cache_locations: Vec<CacheLocationEntry> =
+            cache_locations(config, locations.home_directory());
         Self {
             principal,
             locations,
             user_exclusions,
+            cache_locations,
+            system_root: host_system_root(),
         }
     }
 }
@@ -1177,11 +1206,18 @@ impl ReviewedRules {
             .map(Path::to_path_buf)
             .into_iter()
             .collect();
-        let roots: Vec<ClearRootEntry> = request
-            .host
-            .locations
-            .home_directory()
-            .map_or_else(Vec::new, |home| clear::resolve(clear.spec(), home).0);
+        let roots: Vec<ClearRootEntry> =
+            request
+                .host
+                .locations
+                .home_directory()
+                .map_or_else(Vec::new, |home| {
+                    let configured: Vec<PathBuf> = super::caches::locations_of(
+                        &request.host.cache_locations,
+                        clear.rule().reference.id.as_str(),
+                    );
+                    clear::resolve(clear.spec(), home, &request.host.system_root, &configured).0
+                });
         if protected.is_empty() {
             result.complete = false;
             return Some((result, roots));
@@ -1192,6 +1228,62 @@ impl ReviewedRules {
             self.conclude_discovery(result, found, request.host, environment),
             roots,
         ))
+    }
+
+    /// The binding of the root `path` of the clear rule `clear`, after the
+    /// checks of a configured location, of the binding, and of the root.
+    /// A refusal adds the report of the root to `result` and gives `None`.
+    fn bind_clear_root(
+        clear: &ClearRule,
+        request: &EvictionRequest<'_>,
+        home: &Path,
+        source: &clear::RootSource,
+        path: &Path,
+        result: &mut EvictionDiscovery,
+    ) -> Option<BoundRoot> {
+        let rule: &Rule = clear.rule();
+        let mut refuse = |refused: RootResult, complete: bool| {
+            if !complete {
+                result.complete = false;
+            }
+            result.roots.push(RootReport {
+                rule: rule.reference.clone(),
+                path: Some(path.to_path_buf()),
+                result: refused,
+            });
+            None
+        };
+        // A configured location has the checks of a location first.
+        if matches!(source, clear::RootSource::Location) {
+            let Ok(mounts) = crate::platform::volume::MountTable::read() else {
+                return refuse(RootResult::Refused("root_locality_unknown"), false);
+            };
+            if let Some(code) =
+                super::caches::location_refusal(path, home, &request.host.locations, &mounts)
+            {
+                return refuse(RootResult::Refused(code), false);
+            }
+        }
+        let bound: BoundRoot = match bind_root(path) {
+            Ok(bound) => bound,
+            Err(problem) => {
+                return refuse(
+                    RootResult::NotBound(problem),
+                    problem == RootProblem::Absent,
+                );
+            }
+        };
+        // A root outside the home directory (the Ruby of Homebrew, a
+        // configured location) is also refused when a directory above it
+        // permits a change by a user other than its owner.
+        if let Some(code) = super::caches::ancestor_refusal(path, home) {
+            return refuse(RootResult::Refused(code), false);
+        }
+        if let Some(refused) = clear_root_refusal(clear, request, &bound) {
+            let complete: bool = refused == RootResult::OtherVolume;
+            return refuse(refused, complete);
+        }
+        Some(bound)
     }
 
     /// The discovery of each root of the clear rule `clear`: the
@@ -1213,7 +1305,10 @@ impl ReviewedRules {
             });
             return Vec::new();
         };
-        let (roots, expanded) = clear::resolve(clear.spec(), home);
+        let configured: Vec<PathBuf> =
+            super::caches::locations_of(&request.host.cache_locations, rule.reference.id.as_str());
+        let (roots, expanded) =
+            clear::resolve(clear.spec(), home, &request.host.system_root, &configured);
         if !expanded {
             result.complete = false;
         }
@@ -1228,31 +1323,11 @@ impl ReviewedRules {
                 });
                 continue;
             };
-            let bound: BoundRoot = match bind_root(&path) {
-                Ok(bound) => bound,
-                Err(problem) => {
-                    if problem != RootProblem::Absent {
-                        result.complete = false;
-                    }
-                    result.roots.push(RootReport {
-                        rule: rule.reference.clone(),
-                        path: Some(path),
-                        result: RootResult::NotBound(problem),
-                    });
-                    continue;
-                }
-            };
-            if let Some(refused) = clear_root_refusal(clear, request, &bound) {
-                if refused != RootResult::OtherVolume {
-                    result.complete = false;
-                }
-                result.roots.push(RootReport {
-                    rule: rule.reference.clone(),
-                    path: Some(path),
-                    result: refused,
-                });
+            let Some(bound) =
+                Self::bind_clear_root(clear, request, home, &entry.source, &path, result)
+            else {
                 continue;
-            }
+            };
             let scope: DiscoveryScope<'_> = DiscoveryScope {
                 root: &bound.binding,
                 principal: request.host.principal,

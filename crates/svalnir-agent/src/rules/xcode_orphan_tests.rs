@@ -77,6 +77,8 @@ impl Tree {
             principal: self.principal,
             locations: ProtectedLocations::resolve(Some(&self.home), Some(&self.state)),
             user_exclusions: Vec::new(),
+            cache_locations: Vec::new(),
+            system_root: PathBuf::from("/nonexistent-svalnir-system-root"),
         }
     }
 

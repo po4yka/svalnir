@@ -16,14 +16,15 @@ use tempfile::TempDir;
 use super::{
     EXTENDED_RULE_REVISION, GuardOutcome, HOMEBREW_ENV_OVERRIDES, OWN_RULE_REVISION,
     OWNER_SCOPE_UNMARKED, PRODUCER_SPECS, Part, ProducerBindError, ProducerBindRequest,
-    ProducerRule, homebrew_system_env, mise_tracked_configs, scope_evidence,
+    ProducerRule, homebrew_system_env, homebrew_user_env, mise_tracked_configs, scope_evidence,
 };
-use crate::executor::owner::ScopeLimits;
+use crate::executor::owner::{ScopeLimits, examine_program};
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
-use crate::rules::caches::{InspectionHost, RootOutcome, RootResolution};
+use crate::rules::caches::{CacheLocationEntry, InspectionHost, RootOutcome, RootResolution};
 use crate::rules::fixture::{manual_action_validated, write_owner_script};
 use crate::rules::owner_operation::{OwnerBindError, binding_agrees};
+use crate::rules::owner_operation::{canonical_interpreters, canonical_locations};
 use crate::scan::{CancellationToken, WallScanClock};
 
 /// A home directory in a temporary directory, with a directory of test
@@ -67,6 +68,15 @@ impl Home {
             principal: self.principal,
             locations: &self.locations,
             user_exclusions: &[],
+            cache_locations: &[],
+        }
+    }
+
+    /// The host with the configured location `path` of the rule `rule`.
+    fn host_with<'a>(&'a self, entries: &'a [CacheLocationEntry]) -> InspectionHost<'a> {
+        InspectionHost {
+            cache_locations: entries,
+            ..self.host()
         }
     }
 
@@ -576,16 +586,132 @@ fn a_root_with_a_typing_error_is_never_a_scope() {
             if report.outcome == RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
     ));
     assert!(work.exists());
-    // The rule `mise.cache` has no marker, so it binds no scope.
+    // The rule `mise.cache` needs the `.auto_prune` of mise in its root.
     fs::create_dir_all(home.path.join("Library/Caches/mise/node")).unwrap();
+    let mise = registry.producer("mise.cache").unwrap();
     assert_eq!(
-        registry
-            .producer("mise.cache")
-            .unwrap()
-            .scope(&home.host())
-            .outcome,
+        mise.scope(&home.host()).outcome,
         RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
     );
+    // The directory form, as one host has it.
+    fs::create_dir(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    assert_eq!(mise.scope(&home.host()).outcome, RootOutcome::Examined);
+    // The file form.
+    fs::remove_dir(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    home.write("Library/Caches/mise/.auto_prune", b"");
+    assert_eq!(mise.scope(&home.host()).outcome, RootOutcome::Examined);
+    // A symbolic link of that name is no marker.
+    fs::remove_file(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    symlink(
+        &home.path,
+        home.path.join("Library/Caches/mise/.auto_prune"),
+    )
+    .unwrap();
+    assert_eq!(
+        mise.scope(&home.host()).outcome,
+        RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
+    );
+}
+
+/// A Mach-O executable that the checks of the owner executor accept.
+fn native_program(home: &Home, relative: &str) -> PathBuf {
+    let path: PathBuf = home.path.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::copy("/bin/sh", &path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn the_latest_installs_of_mise_are_executable_locations() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let installs: PathBuf = home.path.join(".local/share/mise/installs");
+    let link = |tool: &str| {
+        symlink("1.0.0", installs.join(tool).join("latest")).unwrap();
+    };
+    // `npm` of the `latest` node: the script `npm-cli.js` with the `node`
+    // of the same install as its interpreter.
+    let node: PathBuf = native_program(&home, ".local/share/mise/installs/node/1.0.0/bin/node");
+    let npm: PathBuf = home.write(
+        ".local/share/mise/installs/node/1.0.0/lib/node_modules/npm/bin/npm-cli.js",
+        b"#!/usr/bin/env node\nrequire('../lib/cli.js')\n",
+    );
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    link("node");
+    let operation = registry.producer("npm.content-cache").unwrap().operation();
+    // The host can have its own Node.js, which comes first in the sequence,
+    // so the test reads the declared locations and binds the files directly.
+    let located = canonical_locations(&operation.executables, &home.path);
+    assert!(located.contains(&fs::canonicalize(&npm).unwrap()));
+    let interpreters = canonical_interpreters(&operation.interpreters, &home.path);
+    assert!(interpreters.contains(&(fs::canonicalize(&node).unwrap(), Vec::new())));
+    // Another `node` comes first in the declared sequence, as the `node` of
+    // Homebrew does: the script runs with the `node` of its own install.
+    let other: PathBuf = native_program(&home, "other/bin/node");
+    let mut declared = vec![(fs::canonicalize(&other).unwrap(), Vec::new())];
+    declared.extend(interpreters.iter().cloned());
+    let (executable, interpreter) = examine_program(
+        &fs::canonicalize(&npm).unwrap(),
+        &declared,
+        home.principal,
+        1 << 28,
+    )
+    .unwrap();
+    assert_eq!(
+        executable.path.to_path_buf(),
+        fs::canonicalize(&npm).unwrap()
+    );
+    assert_eq!(
+        interpreter.unwrap().executable.path.to_path_buf(),
+        fs::canonicalize(&node).unwrap()
+    );
+    // With the real declared sequence, the binding is the same.
+    let (_, interpreter) = examine_program(
+        &fs::canonicalize(&npm).unwrap(),
+        &interpreters,
+        home.principal,
+        1 << 28,
+    )
+    .unwrap();
+    assert_eq!(
+        interpreter.unwrap().executable.path.to_path_buf(),
+        fs::canonicalize(&node).unwrap()
+    );
+    // The Bash wrapper `bin/npm` of that install is not a location.
+    let wrapper: PathBuf = home.write(
+        ".local/share/mise/installs/node/1.0.0/bin/npm",
+        b"#!/usr/bin/env bash\nexit 0\n",
+    );
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    for spec in PRODUCER_SPECS {
+        for location in spec.executables {
+            assert!(
+                !matches!(location, crate::rules::caches::Location::Home(path) if path.ends_with("latest/bin/npm")
+                    || path.ends_with("latest/bin/pip3")),
+                "{}",
+                spec.id
+            );
+        }
+    }
+    // `uv` of the `latest` install of mise is in the directory of its
+    // archive.
+    let uv: PathBuf = native_program(
+        &home,
+        ".local/share/mise/installs/uv/1.0.0/uv-aarch64-apple-darwin/uv",
+    );
+    link("uv");
+    let operation = registry.producer("uv.cache").unwrap().operation();
+    let located = canonical_locations(&operation.executables, &home.path);
+    assert!(located.contains(&fs::canonicalize(&uv).unwrap()));
+    let (_, interpreter) = examine_program(
+        &fs::canonicalize(&uv).unwrap(),
+        &[],
+        home.principal,
+        1 << 28,
+    )
+    .unwrap();
+    assert!(interpreter.is_none());
 }
 
 #[test]
@@ -606,12 +732,12 @@ fn the_checks_at_admission_read_the_marker_and_the_guards_again() {
         .reference
         .clone();
     assert_eq!(
-        scope_evidence(&rule, &root, &home.path, home.principal),
+        scope_evidence(&rule, &root, (&home.path, &home.locations), home.principal),
         Ok(())
     );
     fs::remove_file(root.join("CACHEDIR.TAG")).unwrap();
     assert_eq!(
-        scope_evidence(&rule, &root, &home.path, home.principal),
+        scope_evidence(&rule, &root, (&home.path, &home.locations), home.principal),
         Err(OWNER_SCOPE_UNMARKED)
     );
     // A rule that is not of this module, as the fixture rule, passes.
@@ -622,7 +748,7 @@ fn the_checks_at_admission_read_the_marker_and_the_guards_again() {
         .reference
         .clone();
     assert_eq!(
-        scope_evidence(&other, &root, &home.path, home.principal),
+        scope_evidence(&other, &root, (&home.path, &home.locations), home.principal),
         Ok(())
     );
 }
@@ -695,4 +821,204 @@ fn a_system_brew_env_that_changes_the_effect_refuses_homebrew() {
             .iter()
             .any(|entry| entry.name == "HOMEBREW_NO_AUTOREMOVE")
     );
+}
+
+fn entry(rule: &str, path: PathBuf) -> CacheLocationEntry {
+    CacheLocationEntry {
+        rule: rule.to_owned(),
+        path,
+    }
+}
+
+#[test]
+fn a_configured_location_is_the_scope_root_of_an_owner_rule() {
+    let home = Home::new();
+    let registry: ReviewedRules = home.registry();
+    write_owner_script(&home.tools, "uv", "exit 0").unwrap();
+    let uv = registry.producer("uv.cache").unwrap();
+    // The default root exists and has its marker, and a configured location
+    // takes its place as the scope root.
+    let default: PathBuf = home.path.join(".cache/uv");
+    fs::create_dir_all(&default).unwrap();
+    let tag: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+    fs::write(default.join("CACHEDIR.TAG"), tag).unwrap();
+    let configured: PathBuf = home.path.join("caches/uv");
+    let entries = [entry("uv.cache", configured.clone())];
+    // No marker: the existing code.
+    fs::create_dir_all(&configured).unwrap();
+    let report = uv.scope(&home.host_with(&entries));
+    assert_eq!(report.resolution, RootResolution::ConfiguredLocation);
+    assert_eq!(report.path, Some(configured.clone()));
+    assert_eq!(report.outcome, RootOutcome::Refused(OWNER_SCOPE_UNMARKED));
+    // With the marker, and the command names the configured root.
+    fs::write(configured.join("CACHEDIR.TAG"), tag).unwrap();
+    let request = ProducerBindRequest {
+        host: home.host_with(&entries),
+        include_clear: false,
+        max_executable_bytes: 1 << 20,
+        scope_limits: ScopeLimits::default(),
+    };
+    let bound = uv
+        .bind(&request, &CancellationToken::new(), &WallScanClock)
+        .unwrap();
+    assert_eq!(bound.scope.outcome, RootOutcome::Examined);
+    assert_eq!(
+        bound.binding.arguments.last().unwrap(),
+        configured.to_str().unwrap()
+    );
+    // The inspection shows the source.
+    let inspection = uv.inspect(
+        &home.host_with(&entries),
+        1 << 20,
+        &CancellationToken::new(),
+        &WallScanClock,
+    );
+    assert_eq!(
+        inspection.scope.resolution,
+        RootResolution::ConfiguredLocation
+    );
+    // Without the entry the root is the default again.
+    assert_eq!(uv.scope(&home.host()).path, Some(default));
+}
+
+#[test]
+fn a_configured_location_of_an_owner_rule_has_each_check_of_a_root() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let mise = registry.producer("mise.cache").unwrap();
+    let scope = |path: &Path| {
+        let entries = [entry("mise.cache", path.to_path_buf())];
+        mise.scope(&home.host_with(&entries))
+    };
+    // A symbolic link.
+    fs::create_dir_all(home.path.join("real/.auto_prune")).unwrap();
+    symlink(home.path.join("real"), home.path.join("linked")).unwrap();
+    assert_eq!(
+        scope(&home.path.join("linked")).outcome,
+        RootOutcome::Refused("root_not_directory")
+    );
+    // A Git work tree.
+    fs::create_dir_all(home.path.join("work/app/cache/.auto_prune")).unwrap();
+    fs::create_dir(home.path.join("work/app/.git")).unwrap();
+    assert_eq!(
+        scope(&home.path.join("work/app/cache")).outcome,
+        RootOutcome::Refused("configuration_in_work_tree")
+    );
+    // A project folder with no Git.
+    fs::create_dir_all(home.path.join("proj/cache/.auto_prune")).unwrap();
+    fs::write(home.path.join("proj/package.json"), b"{}").unwrap();
+    assert_eq!(
+        scope(&home.path.join("proj/cache")).outcome,
+        RootOutcome::Refused("root_in_project")
+    );
+    // A location outside the home directory under a directory that the
+    // group can write.
+    let outside: TempDir = TempDir::new().unwrap();
+    let base: PathBuf = fs::canonicalize(outside.path()).unwrap();
+    fs::create_dir_all(base.join("shared/cache/.auto_prune")).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(base.join("shared"), fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        scope(&base.join("shared/cache")).outcome,
+        RootOutcome::Refused("root_ancestor_writable")
+    );
+    fs::set_permissions(base.join("shared"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        scope(&base.join("shared/cache")).outcome,
+        RootOutcome::Examined
+    );
+    // The home directory.
+    assert!(matches!(
+        scope(&home.path).outcome,
+        RootOutcome::Refused("root_protected" | "root_contains_home")
+    ));
+    // A root that is absent is no error.
+    assert_eq!(
+        scope(&home.path.join("absent")).outcome,
+        RootOutcome::Absent
+    );
+    // A rule whose command names no root takes no location.
+    let installs = registry.producer("mise.installs").unwrap();
+    let entries = [entry("mise.installs", home.path.join("real"))];
+    assert_eq!(
+        installs.scope(&home.host_with(&entries)).path,
+        Some(home.path.join(".local/share/mise/installs"))
+    );
+}
+
+#[test]
+fn a_user_brew_env_that_changes_the_effect_refuses_homebrew() {
+    let home = Home::new();
+    let file: PathBuf = home.path.join(".homebrew/brew.env");
+    assert_eq!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Passed { files: 0 }
+    );
+    home.write(".homebrew/brew.env", b"HOMEBREW_NO_EMOJI=1\n");
+    assert_eq!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Passed { files: 1 }
+    );
+    // The root of the rule is read from this file, so the cache is no
+    // difference.
+    home.write(".homebrew/brew.env", b"HOMEBREW_CACHE=/tmp/elsewhere\n");
+    assert_eq!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Passed { files: 1 }
+    );
+    for line in [
+        "HOMEBREW_NO_INSTALL_CLEANUP=",
+        "HOMEBREW_AUTOREMOVE=1",
+        "HOMEBREW_CLEANUP_MAX_AGE_DAYS=1",
+        "HOMEBREW_NO_AUTO_UPDATE=",
+    ] {
+        home.write(".homebrew/brew.env", format!("{line}\n").as_bytes());
+        assert_eq!(
+            homebrew_user_env(&home.path),
+            GuardOutcome::Refused {
+                reason: HOMEBREW_ENV_OVERRIDES,
+                path: file.clone(),
+            },
+            "{line}"
+        );
+    }
+    // A link is not followed, and the file is refused.
+    fs::remove_file(&file).unwrap();
+    let target: PathBuf = home.write("other/brew.env", b"HOMEBREW_NO_EMOJI=1\n");
+    symlink(&target, &file).unwrap();
+    assert!(matches!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Refused { .. }
+    ));
+    // A file that is too large is refused.
+    fs::remove_file(&file).unwrap();
+    home.write(".homebrew/brew.env", &vec![b'#'; 70 * 1024]);
+    assert!(matches!(
+        homebrew_user_env(&home.path),
+        GuardOutcome::Refused { .. }
+    ));
+}
+
+#[test]
+fn the_checks_at_admission_read_the_location_again() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let rule = registry
+        .producer("mise.cache")
+        .unwrap()
+        .rule()
+        .reference
+        .clone();
+    let root: PathBuf = home.path.join("work/cache");
+    fs::create_dir_all(root.join(".auto_prune")).unwrap();
+    let check = || scope_evidence(&rule, &root, (&home.path, &home.locations), home.principal);
+    assert_eq!(check(), Ok(()));
+    // A project marker that appears between the plan and the step.
+    fs::write(home.path.join("work/Package.swift"), b"").unwrap();
+    assert_eq!(check(), Err("root_in_project"));
+    fs::remove_file(home.path.join("work/Package.swift")).unwrap();
+    assert_eq!(check(), Ok(()));
+    // A Git directory that appears between the plan and the step.
+    fs::create_dir(home.path.join("work/.git")).unwrap();
+    assert_eq!(check(), Err("configuration_in_work_tree"));
 }

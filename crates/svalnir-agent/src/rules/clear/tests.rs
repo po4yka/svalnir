@@ -6,6 +6,7 @@
 //! fixture.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use svalnir_core::id::RuleId;
@@ -70,6 +71,8 @@ impl Home {
             principal: self.principal,
             locations: ProtectedLocations::resolve(Some(&self.path), Some(&self.state)),
             user_exclusions: Vec::new(),
+            cache_locations: Vec::new(),
+            system_root: self.path.join("system"),
         }
     }
 }
@@ -404,7 +407,12 @@ fn maven_reads_the_settings_and_refuses_a_root_in_a_work_tree() {
         b"<settings><localRepository>${user.home}/sdk-repo</localRepository></settings>",
     );
     downloaded("sdk-repo/io");
-    let (roots, _) = resolve(&MAVEN_REPOSITORY, &home.path);
+    let (roots, _) = resolve(
+        &MAVEN_REPOSITORY,
+        &home.path,
+        &home.path.join("system"),
+        &[],
+    );
     assert_eq!(roots.len(), 1);
     assert_eq!(
         roots[0].path.as_deref(),
@@ -640,7 +648,7 @@ fn the_expansion_of_a_root_pattern_is_bounded_and_skips_links() {
         home.path.join(".gem/ruby/linked"),
     )
     .unwrap();
-    let (roots, complete) = resolve(&RUBYGEMS_CACHE, &home.path);
+    let (roots, complete) = resolve(&RUBYGEMS_CACHE, &home.path, &home.path.join("system"), &[]);
     assert!(!complete);
     assert_eq!(roots.len(), super::MAX_EXPANDED_ROOTS);
     // The cut keeps the first versions in name order.
@@ -659,10 +667,20 @@ fn the_expansion_of_a_root_pattern_is_bounded_and_skips_links() {
 #[test]
 fn each_default_root_of_each_rule_is_below_the_home_directory() {
     for spec in &CLEAR_SPECS {
-        let (roots, _) = resolve(spec, Path::new("/Users/test"));
+        let (roots, _) = resolve(
+            spec,
+            Path::new("/Users/test"),
+            Path::new("/nonexistent-svalnir-system-root"),
+            &[],
+        );
         for root in roots {
             let path: PathBuf = root.path.unwrap();
-            assert!(path.starts_with("/Users/test/"), "{}", spec.id);
+            // The Ruby of Homebrew is the one default outside the home
+            // directory.
+            let homebrew: bool = spec.id == "rubygems.cache"
+                && (path.starts_with("/opt/homebrew/lib/ruby/gems")
+                    || path.starts_with("/usr/local/lib/ruby/gems"));
+            assert!(homebrew || path.starts_with("/Users/test/"), "{}", spec.id);
             assert!(!path.to_str().unwrap().contains('*'), "{}", spec.id);
         }
     }
@@ -866,5 +884,334 @@ fn the_inspection_reports_the_roots_and_the_units_of_a_proposed_rule() {
                 &month_later(),
             )
             .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------
+// Configured cache locations and the global cache of Yarn 2 and later
+// ---------------------------------------------------------------------
+
+/// The result of the root `root` in `discovery`.
+fn root_result<'a>(discovery: &'a EvictionDiscovery, root: &Path) -> &'a RootResult {
+    discovery
+        .roots
+        .iter()
+        .find(|report| report.path.as_deref() == Some(root))
+        .map_or_else(
+            || panic!("no report of {}: {discovery:?}", root.display()),
+            |report| &report.result,
+        )
+}
+
+/// A manual discovery of `rule` with the configured locations `locations`.
+fn manual_with(home: &Home, rule: &str, locations: &[PathBuf]) -> EvictionDiscovery {
+    let mut host: DiscoveryHost = home.host();
+    host.cache_locations = locations
+        .iter()
+        .map(|path| crate::rules::caches::CacheLocationEntry {
+            rule: rule.to_owned(),
+            path: path.clone(),
+        })
+        .collect();
+    let cancel = CancellationToken::new();
+    manual_registry().discover_for_eviction(
+        &EvictionRequest {
+            host: &host,
+            purpose: &RuleMode::ManualEviction,
+            rules: Some(&[RuleId::new(rule).unwrap()]),
+            volumes: None,
+            known: None,
+            limits: DiscoveryLimits::default(),
+            cancel: &cancel,
+            projects: None,
+        },
+        &month_later(),
+    )
+}
+
+#[test]
+fn a_configured_location_adds_its_roots_beside_the_default() {
+    let home = Home::new();
+    home.write(".hex/packages/hexpm/jason-1.4.tar", b"tar");
+    home.write("dev/hex/packages/hexpm/plug-1.0.tar", b"tar");
+    let discovery: EvictionDiscovery =
+        manual_with(&home, "hex.packages", &[home.path.join("dev/hex")]);
+    // The path names the Hex home: the root is `packages` below it.
+    assert_eq!(
+        candidates(&home, &discovery),
+        [".hex/packages/hexpm", "dev/hex/packages/hexpm"]
+    );
+    // Each root is reported, the default one too.
+    for root in [".hex/packages", "dev/hex/packages"] {
+        assert!(matches!(
+            root_result(&discovery, &home.path.join(root)),
+            RootResult::Examined { .. }
+        ));
+    }
+    // Without the location only the default root has a candidate.
+    assert_eq!(
+        candidates(&home, &manual(&home, "hex.packages")),
+        [".hex/packages/hexpm"]
+    );
+    // A rule with a list of roots below the location: Cargo home.
+    home.write("cargo-home/registry/index/x/f", b"i");
+    home.write("cargo-home/registry/cache/x/a.crate", b"c");
+    home.write("cargo-home/registry/src/x/a-1/lib.rs", b"s");
+    let discovery: EvictionDiscovery = manual_with(
+        &home,
+        "cargo.registry-cache",
+        &[home.path.join("cargo-home")],
+    );
+    assert_eq!(
+        candidates(&home, &discovery),
+        ["cargo-home/registry/cache/x", "cargo-home/registry/src/x"]
+    );
+}
+
+#[test]
+fn a_configured_root_has_the_checks_of_a_default_root() {
+    let home = Home::new();
+    let location = |relative: &str| vec![home.path.join(relative)];
+    // No marker of the producer.
+    home.write("dev/hex/packages/other/file", b"x");
+    let root: PathBuf = home.path.join("dev/hex/packages");
+    let discovery = manual_with(&home, "hex.packages", &location("dev/hex"));
+    assert_eq!(
+        root_result(&discovery, &root),
+        &RootResult::Refused("clear_root_unmarked")
+    );
+    assert!(!discovery.complete);
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // A root that is a symbolic link is not bound.
+    fs::create_dir_all(home.path.join("real/packages/hexpm")).unwrap();
+    fs::create_dir(home.path.join("linked")).unwrap();
+    std::os::unix::fs::symlink(
+        home.path.join("real/packages"),
+        home.path.join("linked/packages"),
+    )
+    .unwrap();
+    let discovery = manual_with(&home, "hex.packages", &location("linked"));
+    assert!(matches!(
+        root_result(&discovery, &home.path.join("linked/packages")),
+        RootResult::NotBound(_)
+    ));
+    // A location in a Git work tree gives no root.
+    home.write("work/app/hex/packages/hexpm/a.tar", b"tar");
+    fs::create_dir(home.path.join("work/app/.git")).unwrap();
+    let discovery = manual_with(&home, "hex.packages", &location("work/app/hex"));
+    assert_eq!(
+        root_result(&discovery, &home.path.join("work/app/hex/packages")),
+        &RootResult::Refused("configuration_in_work_tree")
+    );
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // A location outside the home directory under a directory that the
+    // group can write.
+    let outside: TempDir = TempDir::new().unwrap();
+    let base: PathBuf = fs::canonicalize(outside.path()).unwrap();
+    fs::create_dir_all(base.join("shared/hex/packages/hexpm")).unwrap();
+    fs::write(base.join("shared/hex/packages/hexpm/a.tar"), b"tar").unwrap();
+    let set_mode = |relative: &str, bits: u32| {
+        fs::set_permissions(base.join(relative), fs::Permissions::from_mode(bits)).unwrap();
+    };
+    set_mode("", 0o755);
+    set_mode("shared", 0o775);
+    let discovery = manual_with(&home, "hex.packages", &[base.join("shared/hex")]);
+    assert_eq!(
+        root_result(&discovery, &base.join("shared/hex/packages")),
+        &RootResult::Refused("root_ancestor_writable")
+    );
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // With the mode 0755 the root is examined.
+    set_mode("shared", 0o755);
+    let discovery = manual_with(&home, "hex.packages", &[base.join("shared/hex")]);
+    assert!(matches!(
+        root_result(&discovery, &base.join("shared/hex/packages")),
+        RootResult::Examined { .. }
+    ));
+    // A location in the folder of a project with no Git.
+    home.write("proj/hex/packages/hexpm/a.tar", b"tar");
+    home.write("proj/Package.swift", b"");
+    let discovery = manual_with(&home, "hex.packages", &location("proj/hex"));
+    assert_eq!(
+        root_result(&discovery, &home.path.join("proj/hex/packages")),
+        &RootResult::Refused("root_in_project")
+    );
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // The home directory, a directory above it, and a protected location.
+    // The catalog protects the home directory first, so its code is the
+    // code of a protected location.
+    for refused in [home.path.clone(), home.path.parent().unwrap().to_path_buf()] {
+        let discovery = manual_with(&home, "bun.cache", std::slice::from_ref(&refused));
+        assert!(matches!(
+            root_result(&discovery, &refused),
+            RootResult::Refused("root_protected" | "root_contains_home")
+        ));
+    }
+    // The state directory of Svalnir is protected.
+    let discovery = manual_with(&home, "bun.cache", std::slice::from_ref(&home.state));
+    assert_eq!(
+        root_result(&discovery, &home.state),
+        &RootResult::Refused("root_protected")
+    );
+}
+
+#[test]
+fn a_rule_with_no_location_form_ignores_a_configured_location() {
+    let home = Home::new();
+    home.write("elsewhere/repositories/x/f", b"x");
+    let discovery = manual_with(&home, "swiftpm.cache", &[home.path.join("elsewhere")]);
+    assert!(
+        discovery.roots.iter().all(|report| {
+            report.path.as_deref() != Some(home.path.join("elsewhere").as_path())
+        })
+    );
+}
+
+#[test]
+fn the_location_table_of_the_configuration_agrees_with_the_rules() {
+    use svalnir_core::config::CACHE_LOCATION_RULES;
+
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    for (id, limit) in CACHE_LOCATION_RULES {
+        let accepted: bool = match super::spec_of(id) {
+            Some(spec) => spec.location != super::LocationForm::NotAccepted,
+            None => registry
+                .producer(id)
+                .is_some_and(|rule| rule.spec().location != super::LocationForm::NotAccepted),
+        };
+        assert!(accepted, "{id}");
+        // A rule with an owner operation acts on one scope root.
+        assert_eq!(limit == 1, super::spec_of(id).is_none(), "{id}");
+    }
+    for spec in &CLEAR_SPECS {
+        let listed: bool = CACHE_LOCATION_RULES.iter().any(|(id, _)| *id == spec.id);
+        assert_eq!(
+            listed,
+            spec.location != super::LocationForm::NotAccepted,
+            "{}",
+            spec.id
+        );
+    }
+    for producer in registry.producers() {
+        let listed: bool = CACHE_LOCATION_RULES
+            .iter()
+            .any(|(id, _)| *id == producer.spec().id);
+        assert_eq!(
+            listed,
+            producer.spec().location != super::LocationForm::NotAccepted,
+            "{}",
+            producer.spec().id
+        );
+    }
+}
+
+/// The root of the global cache of Yarn 2 and later, with the folders that
+/// mark it.
+fn berry_home() -> Home {
+    let home = Home::new();
+    fs::create_dir_all(home.path.join(".yarn/berry/index")).unwrap();
+    fs::create_dir_all(home.path.join(".yarn/berry/metadata")).unwrap();
+    home
+}
+
+#[test]
+fn the_global_cache_of_yarn_berry_has_the_zip_files_as_units() {
+    let home = berry_home();
+    let root: PathBuf = home.path.join(".yarn/berry/cache");
+    home.write(".yarn/berry/cache/left-pad-npm-1.3.0-abc-10.zip", b"zip");
+    home.write(".yarn/berry/cache/@scope-pkg-npm-2.0.0-def-10.zip", b"zip");
+    home.write(".yarn/berry/cache/notes.txt", b"text");
+    fs::create_dir(root.join("folder.zip")).unwrap();
+    std::os::unix::fs::symlink(home.path.join("outside.zip"), root.join("link.zip")).unwrap();
+    let discovery: EvictionDiscovery = manual(&home, "yarn.berry-cache");
+    assert_eq!(
+        candidates(&home, &discovery),
+        [
+            ".yarn/berry/cache/@scope-pkg-npm-2.0.0-def-10.zip",
+            ".yarn/berry/cache/left-pad-npm-1.3.0-abc-10.zip"
+        ]
+    );
+    assert_eq!(
+        skip_reasons(&discovery, &root, "link.zip"),
+        [SkipReason::SymbolicLink]
+    );
+    assert_eq!(
+        skip_reasons(&discovery, &root, "folder.zip"),
+        [SkipReason::UnsupportedLayout]
+    );
+    assert_eq!(
+        skip_reasons(&discovery, &root, "notes.txt"),
+        [SkipReason::UnsupportedLayout]
+    );
+    // The folders beside the root stay: they are not in the root.
+    assert!(home.path.join(".yarn/berry/index").is_dir());
+}
+
+#[test]
+fn the_global_cache_of_yarn_berry_needs_both_folders_beside_it() {
+    let home = berry_home();
+    home.write(".yarn/berry/cache/a-npm-1.0.0-abc-10.zip", b"zip");
+    fs::remove_dir(home.path.join(".yarn/berry/metadata")).unwrap();
+    let root: PathBuf = home.path.join(".yarn/berry/cache");
+    let discovery: EvictionDiscovery = manual(&home, "yarn.berry-cache");
+    assert_eq!(
+        root_result(&discovery, &root),
+        &RootResult::Refused("clear_root_unmarked")
+    );
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // A Yarn global folder in another place, from the configuration.
+    home.write("yarn-home/cache/b-npm-1.0.0-abc-10.zip", b"zip");
+    fs::create_dir_all(home.path.join("yarn-home/index")).unwrap();
+    fs::create_dir_all(home.path.join("yarn-home/metadata")).unwrap();
+    let discovery = manual_with(&home, "yarn.berry-cache", &[home.path.join("yarn-home")]);
+    assert_eq!(
+        candidates(&home, &discovery),
+        ["yarn-home/cache/b-npm-1.0.0-abc-10.zip"]
+    );
+}
+
+#[test]
+fn a_component_star_of_an_absolute_pattern_expands_below_the_root() {
+    let home = Home::new();
+    let base: PathBuf = home.path.join("prefix/lib/ruby/gems");
+    fs::create_dir_all(base.join("4.0.0/cache")).unwrap();
+    fs::create_dir_all(base.join("3.4.0")).unwrap();
+    let pattern: String = format!("{}/*/cache", base.display());
+    let (paths, complete) =
+        super::expand(Path::new("/nonexistent-home"), Path::new("/"), &pattern, 8);
+    assert!(complete);
+    assert_eq!(paths, [base.join("4.0.0/cache")]);
+}
+
+#[test]
+fn a_homebrew_gem_cache_has_regular_gem_files_only_as_units() {
+    // The default root of the Ruby of Homebrew is below the system root,
+    // which is a directory of the fixture here. Its cache has `.gem` files,
+    // and symbolic links into the Cellar for the default gems.
+    let home = Home::new();
+    let gems: PathBuf = home.path.join("system/opt/homebrew/lib/ruby/gems/4.0.0");
+    fs::create_dir_all(gems.join("specifications")).unwrap();
+    fs::create_dir_all(gems.join("cache")).unwrap();
+    fs::write(gems.join("cache/ffi-1.17.2.gem"), b"gem").unwrap();
+    std::os::unix::fs::symlink(
+        home.path.join("Cellar/ruby/cache/abbrev-0.1.2.gem"),
+        gems.join("cache/abbrev-0.1.2.gem"),
+    )
+    .unwrap();
+    let discovery = manual(&home, "rubygems.cache");
+    assert_eq!(
+        candidates(&home, &discovery),
+        ["system/opt/homebrew/lib/ruby/gems/4.0.0/cache/ffi-1.17.2.gem"]
+    );
+    assert_eq!(
+        skip_reasons(&discovery, &gems.join("cache"), "abbrev-0.1.2.gem"),
+        [SkipReason::SymbolicLink]
+    );
+    // The same root with no `specifications` beside it is not a gem cache.
+    fs::remove_dir(gems.join("specifications")).unwrap();
+    let discovery = manual(&home, "rubygems.cache");
+    assert_eq!(
+        root_result(&discovery, &gems.join("cache")),
+        &RootResult::Refused("clear_root_unmarked")
     );
 }

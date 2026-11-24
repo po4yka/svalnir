@@ -500,6 +500,8 @@ The procedure makes no automatic operation: the rule has none. A layout, a tool 
 
 The clear rules of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 12 ("Clear rules") have no automatic mode, so the last stage of a record is `manual_action_validated` (record identity `VAL-05/RULE/r1/LAYOUT/manual`, one record for each rule). The owner rules of the procedure for `xcode.inactive-derived-data` apply: only the project owner starts it, on a host and a dedicated standard user account that the owner selects. The procedure removes the caches of that account, so the account must have no work that needs them offline. A rule whose producer is not installed on the host is `not_run`.
 
+The Homebrew roots of `rubygems.cache` (`/opt/homebrew/lib/ruby/gems/*/cache` and `/usr/local/lib/ruby/gems/*/cache`) need a build without the feature `test-support`: a build with it, such as the debug builds of section 14, sets the system root of the discovery to a directory that does not exist, and never finds them. A root outside the home directory is also refused with `root_ancestor_writable` when the group or others can write the root or a directory above it (an Intel `/usr/local` that the group `admin` can write), so the record of such a host names the refusal and not a removal.
+
 **Preparation**
 
 1. Log in as the validation user. Record `sw_vers`, `diskutil info /System/Volumes/Data`, `git rev-parse HEAD`, and the version of each producer under test (`cargo --version`, `gradle --version`, `mvn --version`, `ruby --version` and `gem --version`, `deno --version`, `dotnet --version`, `swift --version`, `zig version`, `mix hex.info`, `rebar3 version`, `bun --version`).

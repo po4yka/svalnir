@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use super::path::ConfigPath;
 use super::schema::{
-    AgentConfig, AutomaticMode, Cleanup, DiskExclusions, DiskGuard, GlobalTrigger, History,
-    MemoryGuard, Privacy, Profile, ProjectCleanup, VolumeSelector,
+    AgentConfig, AutomaticMode, CacheCleanup, Cleanup, DiskExclusions, DiskGuard, GlobalTrigger,
+    History, MemoryGuard, Privacy, Profile, ProjectCleanup, VolumeSelector,
 };
 use crate::quantity::{Bytes, EntryCount};
 
@@ -133,6 +133,7 @@ impl Template {
                     search_roots: Vec::new(),
                     layouts: Vec::new(),
                 },
+                caches: CacheCleanup::default(),
             },
             history: History {
                 retention: Duration::from_hours(30 * 24),

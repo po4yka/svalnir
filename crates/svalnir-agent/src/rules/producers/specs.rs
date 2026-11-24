@@ -13,8 +13,8 @@ use svalnir_core::policy::RebuildCost;
 
 use super::{Guard, Part, ProducerBase, ProducerSpec};
 use crate::rules::caches::{
-    ConfigFormat, ConfigSource, ExclusionSpec, GO, HOMEBREW, Location, Marker, PNPM, RootSpec, UV,
-    YARN,
+    ConfigFormat, ConfigSource, ExclusionSpec, GO, HOMEBREW, Location, LocationForm, Marker, PNPM,
+    RootSpec, UV, YARN,
 };
 
 /// The search path of each command: the system directories only.
@@ -160,8 +160,15 @@ pub const MISE_CACHE: ProducerSpec = ProducerSpec {
     default_below: None,
     guard: Guard::None,
     processes: &["mise"],
-    markers: &[],
+    // The file or directory `.auto_prune` that mise writes in its cache root
+    // for its pruning interval. One host has an empty
+    // directory of this name; the file form is accepted too.
+    markers: &[
+        Marker::ChildDirectory(".auto_prune"),
+        Marker::File(".auto_prune"),
+    ],
     lookup: "The root is the default of macOS. Plonge runs `mise cache path`; Svalnir runs no query and gives the root to mise in `MISE_CACHE_DIR`.",
+    location: LocationForm::Itself,
 };
 
 /// The rule `mise.installs`.
@@ -194,6 +201,7 @@ pub const MISE_INSTALLS: ProducerSpec = ProducerSpec {
     processes: &["mise"],
     markers: &[Marker::File(".mise-installs.toml")],
     lookup: "The root is the default of the data directory of mise, which mise uses with the fixed environment of the command. Plonge reads `mise doctor --json`; Svalnir runs no query.",
+    location: LocationForm::NotAccepted,
 };
 
 /// The rule `uv.cache`, revision 2.
@@ -212,6 +220,10 @@ pub const UV_CACHE: ProducerSpec = ProducerSpec {
         Location::Absolute("/opt/homebrew/bin/uv"),
         Location::Absolute("/usr/local/bin/uv"),
         Location::Home(".cargo/bin/uv"),
+        // The `latest` install of mise unpacks the archive of uv into a
+        // directory named for the platform.
+        Location::Home(".local/share/mise/installs/uv/latest/uv-aarch64-apple-darwin/uv"),
+        Location::Home(".local/share/mise/installs/uv/latest/uv-x86_64-apple-darwin/uv"),
     ],
     interpreters: &[],
     arguments: &[
@@ -234,6 +246,7 @@ pub const UV_CACHE: ProducerSpec = ProducerSpec {
         prefix: b"Signature: 8a477f597d28d172789f06886806bc55",
     }],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `pnpm.content-store`, revision 2.
@@ -278,6 +291,7 @@ pub const PNPM_STORE: ProducerSpec = ProducerSpec {
         Marker::ChildDirectory("v3/files"),
     ],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `go.build-cache`, revision 2.
@@ -313,6 +327,7 @@ pub const GO_BUILD: ProducerSpec = ProducerSpec {
         prefix: b"This directory holds cached build artifacts from the Go build system.",
     }],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `go.module-cache`.
@@ -347,6 +362,7 @@ pub const GO_MODULES: ProducerSpec = ProducerSpec {
     processes: &["go"],
     markers: &[Marker::ChildDirectory("cache/download")],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `homebrew.cleanup`, revision 2.
@@ -385,6 +401,7 @@ pub const HOMEBREW_CLEANUP: ProducerSpec = ProducerSpec {
     processes: &["brew", "ruby"],
     markers: &[Marker::ChildDirectory("downloads")],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `npm.content-cache`.
@@ -403,6 +420,12 @@ pub const NPM_CACHE: ProducerSpec = ProducerSpec {
     executables: &[
         Location::Absolute("/opt/homebrew/bin/npm"),
         Location::Absolute("/usr/local/bin/npm"),
+        // The real npm of the `latest` install of mise. The `bin/npm` of
+        // that install is a Bash wrapper that finds `mise` and `npm` through
+        // `PATH`, so it is not a location.
+        Location::Home(
+            ".local/share/mise/installs/node/latest/lib/node_modules/npm/bin/npm-cli.js",
+        ),
     ],
     interpreters: &NODE,
     arguments: &[
@@ -427,6 +450,7 @@ pub const NPM_CACHE: ProducerSpec = ProducerSpec {
     processes: &["npm", "npx", "node"],
     markers: &[Marker::ChildDirectory("_cacache")],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `yarn.cache`, revision 2: the global cache of Yarn 1.
@@ -467,6 +491,7 @@ pub const YARN_CACHE: ProducerSpec = ProducerSpec {
     processes: &["yarn", "node"],
     markers: &[Marker::ChildDirectory("v6")],
     lookup: FROM_FILES,
+    location: LocationForm::Itself,
 };
 
 /// The rule `pip.cache`.
@@ -513,6 +538,7 @@ pub const PIP_CACHE: ProducerSpec = ProducerSpec {
         Marker::ChildDirectory("wheels"),
     ],
     lookup: "The root is the default of macOS: the keys of `pip.conf` are in sections, which Svalnir does not read, and the command gives `--isolated`. Plonge runs `pip cache dir`; Svalnir runs no query.",
+    location: LocationForm::Itself,
 };
 
 /// The rules of this module, in the sequence of the report.

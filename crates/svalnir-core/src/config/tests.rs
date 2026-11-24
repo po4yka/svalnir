@@ -1722,3 +1722,109 @@ fn a_pattern_marker_needs_a_specific_literal_part() {
         )));
     }
 }
+
+/// A document with the `[[cleanup.caches.locations]]` tables `tables`.
+fn location_document(tables: &[(&str, &str)]) -> String {
+    let mut text: String = "schema_version = 1\n".to_owned();
+    for (rule, path) in tables {
+        write!(
+            text,
+            "\n[[cleanup.caches.locations]]\nrule = \"{rule}\"\npath = \"{path}\"\n"
+        )
+        .unwrap();
+    }
+    text
+}
+
+#[test]
+fn a_cache_location_names_a_rule_and_an_anchored_path() {
+    let template: ValidatedConfig = valid(example(README));
+    assert_eq!(template.cleanup().caches.locations.len(), 0);
+    let config: ValidatedConfig = valid(&location_document(&[
+        ("cargo.registry-cache", "~/dev/cargo-home"),
+        ("cargo.registry-cache", "/Volumes/Work/cargo"),
+        ("uv.cache", "~/caches/uv"),
+    ]));
+    let locations = &config.cleanup().caches.locations;
+    assert_eq!(locations.len(), 3);
+    assert_eq!(locations[0].rule, "cargo.registry-cache");
+    assert_eq!(locations[0].path.to_string(), "~/dev/cargo-home");
+    assert_eq!(locations[1].path.base(), PathBase::Root);
+    assert!(config.is_explicit("cleanup.caches.locations[0].rule"));
+}
+
+#[test]
+fn a_cache_location_with_a_problem_has_a_finding() {
+    let at = |index: usize, key: &str| format!("cleanup.caches.locations[{index}].{key}");
+    // A rule that does not support a location: an unknown rule, a rule
+    // whose command names no root, and a rule with no location.
+    for rule in [
+        "no.such-rule",
+        "mise.installs",
+        "swiftpm.cache",
+        "nuget.http-cache",
+    ] {
+        assert_one(
+            &location_document(&[(rule, "~/x")]),
+            FindingCode::UnknownValue,
+            &at(0, "rule"),
+        );
+    }
+    // The path: not anchored, `.` or `..`, evaluation syntax, `/`, and the
+    // home directory itself.
+    for (bad, code) in [
+        ("cache", FindingCode::InvalidPath),
+        ("~user/x", FindingCode::InvalidPath),
+        ("~/a/../b", FindingCode::InvalidPath),
+        ("/a/./b", FindingCode::InvalidPath),
+        ("~/$X/cache", FindingCode::InvalidPath),
+        ("/", FindingCode::InvalidPath),
+        ("~/", FindingCode::InvalidPath),
+        ("//", FindingCode::InvalidPath),
+    ] {
+        assert_one(
+            &location_document(&[("uv.cache", bad)]),
+            code,
+            &at(0, "path"),
+        );
+    }
+    // The same location twice, with the case of ASCII letters ignored.
+    assert_one(
+        &location_document(&[("bun.cache", "~/Bun"), ("bun.cache", "~/bun")]),
+        FindingCode::DuplicateIdentifier,
+        &at(1, "path"),
+    );
+    // A rule with an owner operation acts on one scope root.
+    assert_one(
+        &location_document(&[("uv.cache", "~/a"), ("uv.cache", "~/b")]),
+        FindingCode::TooManyEntries,
+        &at(1, "rule"),
+    );
+    // A clear rule has at most 16 locations.
+    let names: Vec<String> = (0..17).map(|index| format!("~/c{index}")).collect();
+    let tables: Vec<(&str, &str)> = names
+        .iter()
+        .map(|name| ("bun.cache", name.as_str()))
+        .collect();
+    assert_one(
+        &location_document(&tables),
+        FindingCode::TooManyEntries,
+        &at(16, "rule"),
+    );
+    // Required keys, and an unknown key.
+    assert_one(
+        "schema_version = 1\n[[cleanup.caches.locations]]\nrule = \"uv.cache\"\n",
+        FindingCode::MissingKey,
+        &at(0, "path"),
+    );
+    assert_one(
+        "schema_version = 1\n[[cleanup.caches.locations]]\npath = \"~/x\"\n",
+        FindingCode::MissingKey,
+        &at(0, "rule"),
+    );
+    assert_one(
+        "schema_version = 1\n[[cleanup.caches.locations]]\nrule = \"uv.cache\"\npath = \"~/x\"\nextra = 1\n",
+        FindingCode::UnknownKey,
+        &at(0, "extra"),
+    );
+}

@@ -62,6 +62,7 @@ impl Home {
             principal: self.principal,
             locations: &self.locations,
             user_exclusions: exclusions,
+            cache_locations: &[],
         };
         registry.cache(id).unwrap().inspect(
             host,
@@ -687,6 +688,7 @@ fn an_unknown_home_directory_gives_no_root() {
         principal: Uid::new(0),
         locations: &locations,
         user_exclusions: &[],
+        cache_locations: &[],
     };
     for cache in registry.caches() {
         let inspection = cache.inspect(
@@ -731,4 +733,167 @@ fn listing(root: &Path) -> Vec<(PathBuf, u64, i64)> {
     }
     entries.sort();
     entries
+}
+
+// ---------------------------------------------------------------------
+// The checks of a configured location
+// ---------------------------------------------------------------------
+
+/// A raw mount with the given type, flags, and point.
+fn raw_mount(point: &str, filesystem_type: &str, flags: u32) -> crate::platform::volume::RawMount {
+    crate::platform::volume::RawMount {
+        mount_point: point.as_bytes().to_vec(),
+        mounted_from: b"//host/share".to_vec(),
+        filesystem_type: filesystem_type.as_bytes().to_vec(),
+        fsid: [i32::MIN, 0],
+        flags,
+        block_size: 4_096,
+        blocks: 1,
+        blocks_free: 1,
+        blocks_available: 1,
+    }
+}
+
+#[test]
+fn a_location_is_tested_for_locality_before_any_probe_of_a_name() {
+    use crate::platform::volume::MountTable;
+    use crate::platform::volume::raw::MOUNT_FLAG_LOCAL;
+
+    let home = Home::new();
+    // A work tree above the location: a probe of `.git` would find it.
+    let location: PathBuf = home.path.join("work/app/cache");
+    fs::create_dir_all(&location).unwrap();
+    fs::create_dir(home.path.join("work/app/.git")).unwrap();
+    let local = MountTable::read().unwrap();
+    assert_eq!(
+        super::location_refusal(&location, &home.path, &home.locations, &local),
+        Some("configuration_in_work_tree")
+    );
+    // The table reports the location as a network filesystem: the refusal
+    // is the locality, and no name below it is probed.
+    let remote = MountTable::from_mounts(vec![
+        raw_mount("/", "apfs", MOUNT_FLAG_LOCAL),
+        raw_mount(location.to_str().unwrap(), "smbfs", 0),
+    ]);
+    assert_eq!(
+        super::location_refusal(&location, &home.path, &home.locations, &remote),
+        Some("root_not_local")
+    );
+    // The table has no mount for the location.
+    let empty = MountTable::from_mounts(Vec::new());
+    assert_eq!(
+        super::location_refusal(&location, &home.path, &home.locations, &empty),
+        Some("root_locality_unknown")
+    );
+}
+
+#[test]
+fn a_location_in_a_project_with_no_git_is_refused() {
+    use crate::platform::volume::MountTable;
+
+    let home = Home::new();
+    let local = MountTable::read().unwrap();
+    for marker in ["Package.swift", "package.json", "Cargo.toml"] {
+        let project: PathBuf = home.path.join(format!("proj-{marker}"));
+        let location: PathBuf = project.join("cache");
+        fs::create_dir_all(&location).unwrap();
+        fs::write(project.join(marker), b"").unwrap();
+        assert_eq!(
+            super::location_refusal(&location, &home.path, &home.locations, &local),
+            Some("root_in_project"),
+            "{marker}"
+        );
+    }
+    // A folder with no marker has no refusal, and an absent one has none
+    // here: the binding of the root reports it.
+    let plain: PathBuf = home.path.join("plain/cache");
+    fs::create_dir_all(&plain).unwrap();
+    assert_eq!(
+        super::location_refusal(&plain, &home.path, &home.locations, &local),
+        None
+    );
+    assert_eq!(
+        super::location_refusal(
+            &home.path.join("absent"),
+            &home.path,
+            &home.locations,
+            &local
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_git_entry_that_cannot_be_examined_refuses_the_location() {
+    use crate::platform::volume::MountTable;
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = Home::new();
+    let local = MountTable::read().unwrap();
+    // The directory `app` cannot be searched, so its `.git` cannot be
+    // examined. The walk of the location needs `app` too, so the test
+    // closes the directory above the location: its `.git` is the entry.
+    let outer: PathBuf = home.path.join("outer");
+    let location: PathBuf = outer.join("inner/cache");
+    fs::create_dir_all(&location).unwrap();
+    // The directory `inner` has no search permission: the probe of
+    // `inner/.git` is a probe in `outer`, which stays open, and the probe of
+    // `cache/.git` is the one that fails.
+    fs::set_permissions(&location, fs::Permissions::from_mode(0o600)).unwrap();
+    let refusal = super::location_refusal(&location, &home.path, &home.locations, &local);
+    fs::set_permissions(&location, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(refusal, Some("configuration_in_work_tree_unknown"));
+}
+
+#[test]
+fn a_root_outside_the_home_directory_with_a_writable_ancestor_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = Home::new();
+    let outside: TempDir = TempDir::new().unwrap();
+    let base: PathBuf = fs::canonicalize(outside.path()).unwrap();
+    let root: PathBuf = base.join("a/cache");
+    fs::create_dir_all(&root).unwrap();
+    let mode = |path: &Path, bits: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(bits)).unwrap();
+    };
+    mode(&base, 0o755);
+    mode(&base.join("a"), 0o755);
+    mode(&root, 0o755);
+    assert_eq!(super::ancestor_refusal(&root, &home.path), None);
+    // A directory above the root that the group or others can write.
+    mode(&base.join("a"), 0o775);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    mode(&base.join("a"), 0o757);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    // The root itself.
+    mode(&base.join("a"), 0o755);
+    mode(&root, 0o770);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    // A sticky directory of a user other than root is no exception.
+    mode(&root, 0o755);
+    mode(&base.join("a"), 0o1777);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    // A root below the home directory has no refusal here.
+    let inside: PathBuf = home.path.join("x/cache");
+    fs::create_dir_all(&inside).unwrap();
+    mode(&home.path.join("x"), 0o777);
+    assert_eq!(super::ancestor_refusal(&inside, &home.path), None);
+    // An absent root is reported by its binding.
+    assert_eq!(
+        super::ancestor_refusal(&base.join("absent/cache"), &home.path),
+        None
+    );
 }

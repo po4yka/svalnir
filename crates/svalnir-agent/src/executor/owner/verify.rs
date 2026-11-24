@@ -308,7 +308,10 @@ const ENV_PATH: &str = "/usr/bin/env";
 /// links resolved, and the argument of the line must be the permitted
 /// argument of that location; for `#!/usr/bin/env NAME`, it is the
 /// location with no argument whose file name is `NAME`, so `env` never
-/// searches `PATH`. The interpreter must be a Mach-O file.
+/// searches `PATH`. When more than one location has that name, the one in
+/// the install of the executable comes first (the `bin/NAME` of the directory
+/// that holds `bin`), so a script of an install runs with the interpreter of
+/// the same install. The interpreter must be a Mach-O file.
 ///
 /// # Errors
 ///
@@ -321,7 +324,10 @@ pub fn examine_program(
 ) -> Result<(ExecutableBinding, Option<InterpreterBinding>), ExecutableProblem> {
     let cancel = CancellationToken::new();
     let examined: Examined = examine_file(path, principal, limit, &cancel)?;
-    let Some((interpreter, arguments)) = script_interpreter(examined.kind?, interpreters)? else {
+    let canonical: PathBuf = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Some((interpreter, arguments)) =
+        script_interpreter(examined.kind?, interpreters, Some(&canonical))?
+    else {
         return Ok((examined.binding, None));
     };
     let interpreter: Examined = examine_file(&interpreter, principal, limit, &cancel)?;
@@ -339,10 +345,13 @@ pub fn examine_program(
 
 /// The interpreter and the interpreter arguments of a script of `kind`,
 /// from its `#!` line and the declared `interpreters`. `None` for a Mach-O
-/// file.
+/// file. `executable` is the canonical path of the script, if it is known:
+/// it selects the interpreter of its own install among interpreters of one
+/// name.
 fn script_interpreter(
     kind: ExecutableKind,
     interpreters: &[(PathBuf, Vec<String>)],
+    executable: Option<&Path>,
 ) -> Result<Option<(PathBuf, Vec<String>)>, ExecutableProblem> {
     match kind {
         ExecutableKind::MachO => Ok(None),
@@ -354,14 +363,19 @@ fn script_interpreter(
             if name.starts_with('-') || name.contains('=') {
                 return Err(ExecutableProblem::NotExecutable);
             }
-            interpreters
-                .iter()
-                .find(|(candidate, arguments)| {
+            let named = || {
+                interpreters.iter().filter(|(candidate, arguments)| {
                     arguments.is_empty()
                         && candidate
                             .file_name()
                             .is_some_and(|file| file == name.as_str())
                 })
+            };
+            named()
+                .find(|(candidate, _)| {
+                    executable.is_some_and(|executable| in_install_of(candidate, executable))
+                })
+                .or_else(|| named().next())
                 .map(|(candidate, _)| Some((candidate.clone(), Vec::new())))
                 .ok_or(ExecutableProblem::InterpreterNotDeclared)
         }
@@ -378,6 +392,16 @@ fn script_interpreter(
             Ok(Some((resolved, arguments)))
         }
     }
+}
+
+/// Whether `executable` is in the install of `interpreter`: the directory
+/// that holds the `bin` directory of the interpreter. The root and a
+/// top-level directory are no install.
+fn in_install_of(interpreter: &Path, executable: &Path) -> bool {
+    interpreter
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|install| install.components().count() > 2 && executable.starts_with(install))
 }
 
 /// Whether the `#!` line of the executable of a binding gives the
@@ -399,7 +423,10 @@ pub(super) fn script_agrees(
             interpreter.arguments.clone(),
         )]
     });
-    match (script_interpreter(kind.clone(), &declared), interpreter) {
+    match (
+        script_interpreter(kind.clone(), &declared, None),
+        interpreter,
+    ) {
         (Ok(None), None) => true,
         (Ok(Some((found, arguments))), Some(interpreter)) => {
             found == interpreter.executable.path.to_path_buf() && arguments == interpreter.arguments

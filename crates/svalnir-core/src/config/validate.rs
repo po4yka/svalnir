@@ -11,10 +11,10 @@ use super::finding::{Finding, FindingCode, Location};
 use super::path::ConfigPath;
 use super::reader::{Context, Read, TableReader, join_path};
 use super::schema::{
-    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, Cleanup, DiskExclusions,
-    DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD, MIN_QUIET_PERIOD,
-    MemoryGuard, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy, SCHEMA_VERSION,
-    ValidatedConfig, VolumeSelector,
+    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, CacheCleanup, Cleanup,
+    DiskExclusions, DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD,
+    MIN_QUIET_PERIOD, MemoryGuard, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy,
+    SCHEMA_VERSION, ValidatedConfig, VolumeSelector,
 };
 use super::template::{TEMPLATE_REVISION, Template};
 use crate::id::RuleId;
@@ -937,8 +937,13 @@ fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cl
         layouts: super::layout::read_layouts(context, &mut projects_table),
     };
     projects_table.finish(context);
+    let mut caches_table: TableReader<'_> = table.table(context, "caches");
+    let caches: CacheCleanup = CacheCleanup {
+        locations: super::locations::read_locations(context, &mut caches_table),
+    };
+    caches_table.finish(context);
     table.finish(context);
-    Cleanup { projects }
+    Cleanup { projects, caches }
 }
 
 fn read_history(context: &mut Context, mut table: TableReader<'_>, defaults: &History) -> History {

@@ -38,6 +38,7 @@
 mod check;
 mod finding;
 mod layout;
+mod locations;
 mod path;
 mod reader;
 mod schema;
@@ -49,15 +50,16 @@ mod validate;
 pub use check::{CheckId, CheckOutcome, CheckReport, CheckStatus};
 pub use finding::{Finding, FindingCode, Location};
 pub use layout::glob_matches;
+pub use locations::{CACHE_LOCATION_RULES, MAX_CACHE_LOCATIONS};
 pub use path::{ConfigPath, ConfigPathError, ExpandPathError, MAX_PATH_BYTES, PathBase};
 pub use reader::{MAX_FINDINGS, MAX_LIST_ENTRIES};
 pub use schema::{
-    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, Cleanup, DiskExclusions,
-    DiskGuard, EligibleGroup, GlobalTrigger, History, KEPT_OUT_LAYOUT_NAMES,
-    MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES, MAX_MARKER_COMPONENTS, MAX_QUIET_PERIOD,
-    MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, MemoryGuard, PROTECTED_HOME_NAMES,
-    Privacy, Profile, ProjectCleanup, Protections, RestartPolicy, SCHEMA_VERSION,
-    SKIPPED_DIRECTORY_NAMES, UserLayout, ValidatedConfig, VolumeSelector,
+    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, CacheCleanup, CacheLocation,
+    Cleanup, DiskExclusions, DiskGuard, EligibleGroup, GlobalTrigger, History,
+    KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES, MAX_MARKER_COMPONENTS,
+    MAX_QUIET_PERIOD, MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, MemoryGuard,
+    PROTECTED_HOME_NAMES, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy,
+    SCHEMA_VERSION, SKIPPED_DIRECTORY_NAMES, UserLayout, ValidatedConfig, VolumeSelector,
 };
 pub use template::{PERSONAL_FOLDERS, TEMPLATE_REVISION};
 pub use validate::{MAX_APP_BUDGETS, MAX_DOCUMENT_BYTES, Validation, parse_and_validate};

@@ -13,9 +13,9 @@ use svalnir_core::config::{UserLayout, parse_and_validate};
 use super::inspect::{has_own_ignore_file, paseo_root, recheck_unit_in};
 use super::tests::{Home, no_recency, quiet, refusal, unit};
 use super::{
-    AgentListing, BuildProcesses, DirectoryName, IgnoreBasis, MarkerKind, PROJECT_LAYOUTS,
-    PackageCheckouts, ProjectInspection, ProjectLayout, ProjectLimits, ProjectMarker,
-    ProjectUnitOutcome, RecheckInput, UnitRecheck, Unmarked, VersionControl,
+    AgentListing, AgentsRead, BuildProcesses, DirectoryName, IgnoreBasis, LazyAgents, MarkerKind,
+    PROJECT_LAYOUTS, PackageCheckouts, ProjectInspection, ProjectLayout, ProjectLimits,
+    ProjectMarker, ProjectUnitOutcome, RecheckInput, UnitRecheck, Unmarked, VersionControl,
 };
 use crate::rules::caches::ReclaimBasis;
 use crate::rules::fixture::FixtureEnvironment;
@@ -607,7 +607,7 @@ fn the_check_before_a_step_asks_git_again_for_an_own_ignore_file() {
 }
 
 /// The check before a step of `unit` with the Paseo listing `agents`.
-fn recheck_agents(home: &Home, unit: &Path, agents: &AgentListing) -> UnitRecheck {
+fn recheck_agents(home: &Home, unit: &Path, agents: &dyn AgentsRead) -> UnitRecheck {
     let evidence = FixtureEnvironment::days_later(0);
     let none: BuildProcesses = complete(&evidence);
     recheck_unit_in(
@@ -685,16 +685,56 @@ fn the_paseo_root_is_the_nearest_directory_with_a_git_entry_below_the_search_roo
     home.repository("Code/mono");
     home.write("Code/mono/pkg/app/mix.exs", b"marker\n");
     let app: PathBuf = code.join("mono/pkg/app");
-    assert_eq!(paseo_root(&app, &code), code.join("mono"));
+    assert_eq!(paseo_root(&app, &code).unwrap(), code.join("mono"));
     // A `.git` file, as of a linked work tree, also counts.
     home.write("Code/mono/pkg/.git", b"gitdir: ../../elsewhere\n");
-    assert_eq!(paseo_root(&app, &code), code.join("mono/pkg"));
+    assert_eq!(paseo_root(&app, &code).unwrap(), code.join("mono/pkg"));
     // With no `.git` entry, the project directory is the root; the search
     // root itself is not searched above.
     home.write("Code/plain/mix.exs", b"marker\n");
     let plain: PathBuf = code.join("plain");
-    assert_eq!(paseo_root(&plain, &code), plain);
-    assert_eq!(paseo_root(&code, &code), code);
+    assert_eq!(paseo_root(&plain, &code).unwrap(), plain);
+    assert_eq!(paseo_root(&code, &code).unwrap(), code);
+}
+
+#[test]
+fn a_failed_lookup_of_the_git_entry_is_not_a_missing_entry() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = Home::new();
+    let code: PathBuf = home.path.join("Code");
+    home.write("Code/locked/mix.exs", b"marker\n");
+    let locked: PathBuf = code.join("locked");
+    // A directory that can be read but not searched: the stat of `.git`
+    // in it fails with a permission error.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = paseo_root(&locked, &code);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+}
+
+#[test]
+fn the_paseo_listing_is_read_once_and_only_for_a_unit_that_is_there() {
+    use std::cell::Cell;
+    let home = Home::new();
+    let unit: PathBuf = self_ignored(&home, "own", "mix.exs", ".elixir_ls", b"*\n");
+    let calls: Cell<usize> = Cell::new(0);
+    let lazy = LazyAgents::new(|| {
+        calls.set(calls.get() + 1);
+        AgentListing::Off
+    });
+    // An absent unit ends the check before the listing.
+    let absent: PathBuf = home.path.join("Code/own/.missing");
+    assert_eq!(recheck_agents(&home, &absent, &lazy), UnitRecheck::Absent);
+    assert_eq!(calls.get(), 0);
+    // A refusal by a cheaper check does not ask for it either.
+    let other = home.path.join("Code/own/src");
+    fs::create_dir_all(&other).unwrap();
+    assert_ne!(recheck_agents(&home, &other, &lazy), UnitRecheck::Passed);
+    assert_eq!(calls.get(), 0);
+    // A unit that passes asks once, however often the evidence is read.
+    assert_eq!(recheck_agents(&home, &unit, &lazy), UnitRecheck::Passed);
+    assert_eq!(recheck_agents(&home, &unit, &lazy), UnitRecheck::Passed);
+    assert_eq!(calls.get(), 1);
 }
 
 #[test]

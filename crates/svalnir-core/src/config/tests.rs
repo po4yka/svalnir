@@ -1358,7 +1358,16 @@ fn the_claude_config_dirs_are_absolute_paths_with_no_duplicate() {
         .collect();
     assert_eq!(shown, ["/Volumes/Work/claude", "/opt/cc"]);
     assert!(config.is_explicit("cleanup.projects.claude_config_dirs"));
-    for bad in ["", "relative/dir", "~/claude", "/a/../b", "/a/./b", "/a/*"] {
+    for bad in [
+        "",
+        "relative/dir",
+        "~/claude",
+        "/a/../b",
+        "/a/./b",
+        "/a/*",
+        "/",
+        "//",
+    ] {
         assert_one(
             &document(&format!("[\"{bad}\"]")),
             FindingCode::InvalidPath,

@@ -30,7 +30,9 @@ use super::model::{TriggerKey, TriggerRecord};
 use crate::coordinator::{AuthoritySource, RevisionSnapshot, TimeReading, TriggerStanding};
 use crate::executor::fs::ApprovedRoots;
 use crate::protection::ProtectedLocations;
-use crate::rules::projects::UnitRecheck;
+use crate::rules::projects::{
+    AgentListing, AgentStatus as _, PROJECT_RULE_ID, PaseoAgents, UnitRecheck,
+};
 use crate::rules::{ProducerActivity, SharedEnvironment};
 
 /// The largest number of automatic plans whose trigger the records keep.
@@ -78,6 +80,10 @@ pub struct AuthorityRecords {
     /// with the layout `user-configured` before its step. With none, such a
     /// unit has an unknown layout, which permits no step.
     pub project_layouts: Vec<UserLayout>,
+    /// The Paseo source of the configuration in effect, which the check of a
+    /// unit of `project.dependency-directory` asks again before its step.
+    /// The default source is off.
+    pub project_agents: PaseoAgents,
 }
 
 impl fmt::Debug for AuthorityRecords {
@@ -108,6 +114,7 @@ impl AuthorityRecords {
             automatic_roots: ApprovedRoots::default(),
             environment: None,
             project_layouts: Vec::new(),
+            project_agents: PaseoAgents::new(false, None),
         }
     }
 
@@ -297,16 +304,26 @@ impl AuthoritySource for SharedAuthority {
     ) -> UnitRecheck {
         // The reading of the filesystem and of the process table is
         // outside the critical section.
-        let (environment, principal, layouts) = {
+        let (environment, principal, layouts, source) = {
             let records = self.records();
             (
                 records.environment.clone(),
                 records.principal,
                 records.project_layouts.clone(),
+                records.project_agents.clone(),
             )
         };
+        // One Paseo call for each check, only for the rule that has the
+        // source.
+        let agents: AgentListing = if rule.id.as_str() == PROJECT_RULE_ID {
+            source.agent_listing()
+        } else {
+            AgentListing::Off
+        };
         environment.map_or(UnitRecheck::Unknown("no_process_evidence"), |environment| {
-            environment.unit_recheck(principal, rule, layout, root, path, &layouts, admitted)
+            environment.unit_recheck(
+                principal, rule, layout, root, path, &layouts, &agents, admitted,
+            )
         })
     }
 }

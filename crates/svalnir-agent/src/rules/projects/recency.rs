@@ -20,8 +20,9 @@
 //!   `claude_config_dirs` folder; it never opens a transcript.
 //! - [`AgentStatus`]: the Paseo agents that run. The native source
 //!   ([`PaseoAgents`]) is off unless the configuration turns it on. When it
-//!   is on, it runs `paseo` only from a fixed path that passes the checks of
-//!   the Git executable, with fixed arguments, a constrained environment, a
+//!   is on, it runs `paseo` only from the path of the configuration or from
+//!   a fixed path, after the checks of the owner-operation executables (see
+//!   [`PaseoAgents`]), with fixed arguments, a constrained environment, a
 //!   deadline, and an output bound.
 //!
 //! # States
@@ -43,13 +44,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 use svalnir_core::config::{ConfigPath, ProjectCleanup};
+use svalnir_core::process::Uid;
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::Fact;
 use svalnir_core::time::WallTime;
 
-use crate::rules::git::{
-    GitFailure, GitOutput, GitTool, GitToolProblem, Repository, run_bounded, verified,
+use crate::executor::owner::{
+    ExecutableKind, ExecutableProblem, examine_executable, executable_kind,
 };
+use crate::rules::git::{GitFailure, GitOutput, GitTool, GitToolProblem, Repository, run_bounded};
 
 /// The largest output of the Git query, in bytes.
 const MAX_GIT_OUTPUT: usize = 4 * 1024;
@@ -65,10 +68,9 @@ pub const MAX_TRANSCRIPT_ENTRIES: usize = 20_000;
 /// The deepest subfolder of a transcript folder that the source reads.
 const TRANSCRIPT_DEPTH: u32 = 2;
 
-/// The paths of the executables that [`PaseoAgents`] examines. Each one
-/// must pass the checks of the Git executable: the resolved file and each
-/// directory above it have the superuser as owner and permit no write by
-/// the group or by others.
+/// The paths of the executables that [`PaseoAgents`] examines when the
+/// configuration names none. Each one must pass the trust rule of
+/// [`PaseoAgents`].
 pub const PASEO_CANDIDATES: [&str; 2] = ["/usr/local/bin/paseo", "/opt/homebrew/bin/paseo"];
 
 /// The fixed arguments of the Paseo listing.
@@ -254,12 +256,7 @@ fn agent_reading(listing: &AgentListing, root: &Path) -> AgentReading {
         AgentListing::Off => AgentReading::Off,
         AgentListing::Failed { reason } => AgentReading::Failed { reason },
         AgentListing::Listed { busy } => {
-            let resolved: Option<PathBuf> = fs::canonicalize(root).ok();
-            let roots: Vec<&Path> = std::iter::once(root).chain(resolved.as_deref()).collect();
-            let inside: bool = busy
-                .iter()
-                .any(|directory| roots.iter().any(|root| is_at_or_below(directory, root)));
-            if inside {
+            if has_busy_agent_in(busy, root) {
                 AgentReading::Busy
             } else {
                 AgentReading::NotBusy
@@ -268,10 +265,19 @@ fn agent_reading(listing: &AgentListing, root: &Path) -> AgentReading {
     }
 }
 
+/// Whether a working directory of `busy` is `root` or below it. `root` is
+/// also compared in its resolved form.
+pub(super) fn has_busy_agent_in(busy: &[PathBuf], root: &Path) -> bool {
+    let resolved: Option<PathBuf> = fs::canonicalize(root).ok();
+    let roots: Vec<&Path> = std::iter::once(root).chain(resolved.as_deref()).collect();
+    busy.iter()
+        .any(|directory| roots.iter().any(|root| is_at_or_below(directory, root)))
+}
+
 /// Whether `path` is `root` or below it, by component, with the case of
 /// ASCII letters ignored, as on the default volume. A difference of case
 /// thus gives a busy project and not a miss.
-fn is_at_or_below(path: &Path, root: &Path) -> bool {
+pub(super) fn is_at_or_below(path: &Path, root: &Path) -> bool {
     let mut path = path.components();
     root.components().all(|component| {
         path.next().is_some_and(|other| {
@@ -722,12 +728,44 @@ pub(super) fn newest_transcript(
     Ok(newest)
 }
 
+/// The largest executable that the trust check reads for its digest: the
+/// Node.js binary is about 100 MiB.
+const MAX_PASEO_FILE: u64 = 512 * 1024 * 1024;
+
+/// The command of the Paseo listing: the program, and the script that the
+/// program reads when `paseo` is a `#!` script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaseoLaunch {
+    /// The resolved program: `paseo`, or its interpreter.
+    program: PathBuf,
+    /// The resolved script, for the interpreter.
+    script: Option<PathBuf>,
+    /// The directory of the interpreter, which starts `PATH`.
+    interpreter_directory: Option<PathBuf>,
+}
+
 /// The Paseo source.
+///
+/// The executable is the path `paseo_executable` of the configuration, or
+/// else the first of [`PASEO_CANDIDATES`] that passes the checks. The
+/// symbolic link of the path is resolved first, and the resolved file must
+/// pass the trust rule of the owner-operation executables
+/// ([`examine_executable`]): a regular file with an execute bit, owned by
+/// root or by the user, with no write bit for the group or for others, with
+/// each directory above it a directory of the same rule. A Mach-O file runs
+/// directly. A `#!` script runs through its interpreter: for
+/// `#!/usr/bin/env NAME` the file `NAME` in the directory of the unresolved
+/// path (where `npm` puts `node` beside `paseo`), and for an absolute
+/// interpreter path that path. The interpreter must be a Mach-O file that
+/// passes the same rule.
 #[derive(Debug, Clone)]
 pub struct PaseoAgents {
     enabled: bool,
     home: Option<PathBuf>,
     candidates: Vec<PathBuf>,
+    /// The executable of the configuration, which is the only candidate.
+    configured: Option<ConfigPath>,
+    principal: Uid,
     deadline: Duration,
     /// An executable that a test gives, with no check.
     #[cfg(test)]
@@ -743,16 +781,33 @@ impl PaseoAgents {
             enabled,
             home: home.map(Path::to_path_buf),
             candidates: PASEO_CANDIDATES.iter().map(PathBuf::from).collect(),
+            configured: None,
+            principal: crate::observe::current_uid(),
             deadline: PASEO_DEADLINE,
             #[cfg(test)]
             unchecked: None,
         }
     }
 
+    /// The source of the settings `settings` for the home directory `home`.
+    #[must_use]
+    pub fn from_settings(settings: &ProjectCleanup, home: Option<&Path>) -> Self {
+        let mut source: Self = Self::new(settings.paseo_agents, home);
+        source.configured.clone_from(&settings.paseo_executable);
+        source
+    }
+
     /// The source with other paths of the executable.
     #[cfg(test)]
     pub(crate) fn with_candidates(mut self, candidates: Vec<PathBuf>) -> Self {
         self.candidates = candidates;
+        self
+    }
+
+    /// The source with the executable `configured` of the configuration.
+    #[cfg(test)]
+    pub(crate) fn with_configured(mut self, configured: ConfigPath) -> Self {
+        self.configured = Some(configured);
         self
     }
 
@@ -765,21 +820,95 @@ impl PaseoAgents {
         self
     }
 
-    /// The executable that passes the checks.
-    fn executable(&self) -> Result<PathBuf, &'static str> {
+    /// The command that passes the checks.
+    fn launch(&self, home: &Path) -> Result<PaseoLaunch, &'static str> {
         #[cfg(test)]
         if let Some(executable) = &self.unchecked {
-            return Ok(executable.clone());
+            return Ok(PaseoLaunch {
+                program: executable.clone(),
+                script: None,
+                interpreter_directory: None,
+            });
         }
+        let candidates: Vec<PathBuf> = match &self.configured {
+            Some(configured) => vec![configured.expand(home).map_err(|_| "paseo_not_installed")?],
+            None => self.candidates.clone(),
+        };
         let mut problem: &'static str = "paseo_not_installed";
-        for candidate in &self.candidates {
-            match verified(candidate) {
-                Ok(executable) => return Ok(executable),
-                Err(GitToolProblem::NotTrusted) => problem = "paseo_not_trusted",
-                Err(GitToolProblem::NotInstalled) => {}
+        for candidate in &candidates {
+            match self.check_candidate(candidate) {
+                Ok(launch) => return Ok(launch),
+                Err("paseo_not_installed") => {}
+                Err(reason) => {
+                    if problem == "paseo_not_installed" {
+                        problem = reason;
+                    }
+                }
             }
         }
         Err(problem)
+    }
+
+    /// Resolves and checks the executable at `candidate`.
+    fn check_candidate(&self, candidate: &Path) -> Result<PaseoLaunch, &'static str> {
+        let resolved: PathBuf = fs::canonicalize(candidate).map_err(|_| "paseo_not_installed")?;
+        self.trusted_file(&resolved)
+            .map_err(|problem| match problem {
+                ExecutableProblem::NotFound => "paseo_not_installed",
+                _ => "paseo_not_trusted",
+            })?;
+        let kind: ExecutableKind = executable_kind(&resolved).map_err(|_| "paseo_not_trusted")?;
+        let (interpreter, argument): (PathBuf, Option<String>) = match kind {
+            ExecutableKind::MachO => {
+                return Ok(PaseoLaunch {
+                    program: resolved,
+                    script: None,
+                    interpreter_directory: None,
+                });
+            }
+            ExecutableKind::Script {
+                interpreter,
+                argument,
+            } => (interpreter, argument),
+        };
+        let located: PathBuf = if interpreter == Path::new("/usr/bin/env") {
+            let name: String = argument.ok_or("paseo_interpreter_not_found")?;
+            let plain: bool = !name.is_empty()
+                && !name.starts_with('-')
+                && !name.contains(['/', '='])
+                && name != "."
+                && name != "..";
+            let beside: Option<&Path> = candidate.parent();
+            match beside {
+                Some(directory) if plain => directory.join(name),
+                _ => return Err("paseo_interpreter_not_found"),
+            }
+        } else if argument.is_none() {
+            interpreter
+        } else {
+            return Err("paseo_interpreter_not_found");
+        };
+        let interpreter: PathBuf =
+            fs::canonicalize(&located).map_err(|_| "paseo_interpreter_not_found")?;
+        self.trusted_file(&interpreter)
+            .map_err(|problem| match problem {
+                ExecutableProblem::NotFound => "paseo_interpreter_not_found",
+                _ => "paseo_interpreter_not_trusted",
+            })?;
+        if executable_kind(&interpreter) != Ok(ExecutableKind::MachO) {
+            return Err("paseo_interpreter_not_trusted");
+        }
+        let directory: Option<PathBuf> = interpreter.parent().map(Path::to_path_buf);
+        Ok(PaseoLaunch {
+            program: interpreter,
+            script: Some(resolved),
+            interpreter_directory: directory,
+        })
+    }
+
+    /// Whether the resolved file `path` passes the trust rule.
+    fn trusted_file(&self, path: &Path) -> Result<(), ExecutableProblem> {
+        examine_executable(path, self.principal, MAX_PASEO_FILE).map(|_| ())
     }
 }
 
@@ -792,15 +921,24 @@ impl AgentStatus for PaseoAgents {
         let Some(home) = &self.home else {
             return failed("home_unknown");
         };
-        let executable: PathBuf = match self.executable() {
-            Ok(executable) => executable,
+        let launch: PaseoLaunch = match self.launch(home) {
+            Ok(launch) => launch,
             Err(reason) => return failed(reason),
         };
-        let mut command: Command = Command::new(executable);
+        let mut path: OsString = OsString::new();
+        if let Some(directory) = &launch.interpreter_directory {
+            path.push(directory);
+            path.push(":");
+        }
+        path.push("/usr/bin:/bin");
+        let mut command: Command = Command::new(&launch.program);
+        if let Some(script) = &launch.script {
+            command.arg(script);
+        }
         command
             .env_clear()
             .env("HOME", home)
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", path)
             .env("LC_ALL", "C")
             .env("NO_COLOR", "1")
             .current_dir("/")

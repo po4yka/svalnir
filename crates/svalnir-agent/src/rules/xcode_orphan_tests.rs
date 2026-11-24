@@ -253,6 +253,7 @@ fn the_check_before_a_step_examines_the_workspace_again() {
             &tree.root,
             &project,
             &[],
+            &crate::rules::projects::AgentListing::Off,
             &[],
         ),
         UnitRecheck::Passed

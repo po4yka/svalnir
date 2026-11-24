@@ -56,7 +56,7 @@ use super::model::{
 };
 use super::overlap::{OverlapConflict, OverlapResolution};
 use super::projects::{
-    BuildProcesses, PROJECT_EVIDENCE_EXPIRY, PROJECT_RULE_ID, ProjectDiscoveryInput,
+    AgentListing, BuildProcesses, PROJECT_EVIDENCE_EXPIRY, PROJECT_RULE_ID, ProjectDiscoveryInput,
     ProjectRequest, RecheckInput, SearchRootReport, UnitRecheck, examined_for,
     inventory as project_inventory, recheck_unit,
 };
@@ -603,7 +603,9 @@ pub trait DiscoveryEnvironment: ScanClock {
     /// layout `layout` that the sealed plan binds, with its project marker
     /// and its inner marker, no entry at a protected path of the layout,
     /// and no build process of the user in its project ([`recheck_unit`]).
-    /// The layouts of the configuration in effect are `user_layouts`.
+    /// The layouts of the configuration in effect are `user_layouts`. The
+    /// Paseo listing `agents`, read now from the configuration in effect,
+    /// refuses a unit whose project root has a running agent.
     ///
     /// For a clear rule, the unit must still be a child of the root that
     /// the rule does not keep, with the form of the rule, and with no file
@@ -622,6 +624,7 @@ pub trait DiscoveryEnvironment: ScanClock {
         root: &Path,
         path: &Path,
         user_layouts: &[UserLayout],
+        agents: &AgentListing,
         admitted: &[AdmittedRepository],
     ) -> UnitRecheck {
         if let Some(spec) = clear::spec_of(rule.id.as_str()) {
@@ -658,6 +661,7 @@ pub trait DiscoveryEnvironment: ScanClock {
             expiry: PROJECT_EVIDENCE_EXPIRY,
             git: git.as_ref(),
             admitted,
+            agents,
         })
     }
 }

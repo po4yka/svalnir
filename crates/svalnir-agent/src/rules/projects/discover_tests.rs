@@ -752,6 +752,7 @@ fn recheck(
         expiry: super::PROJECT_EVIDENCE_EXPIRY,
         git: Some(&home.git),
         admitted: &[],
+        agents: &AgentListing::Off,
     })
 }
 
@@ -866,7 +867,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
     let modules: PathBuf = home.path.join("Code/app/node_modules");
     let project_rule = svalnir_core::rule::RuleRef {
         id: RuleId::new(PROJECT_RULE_ID).unwrap(),
-        revision: svalnir_core::id::RuleRevisionId::new("r5").unwrap(),
+        revision: svalnir_core::id::RuleRevisionId::new("r6").unwrap(),
     };
     let root: PathBuf = home.path.join("Code");
     assert_eq!(
@@ -877,6 +878,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             &root,
             &modules,
             &[],
+            &AgentListing::Off,
             &[]
         ),
         UnitRecheck::Passed
@@ -890,6 +892,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             &root,
             &modules,
             &[],
+            &AgentListing::Off,
             &[]
         ),
         UnitRecheck::Refused("producer_active")
@@ -902,6 +905,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             &root,
             &modules,
             &[],
+            &AgentListing::Off,
             &[]
         ),
         UnitRecheck::Unknown("unit_layout_unknown")
@@ -917,6 +921,7 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
             &root,
             &modules,
             &[],
+            &AgentListing::Off,
             &[]
         ),
         UnitRecheck::Absent
@@ -927,7 +932,16 @@ fn the_environment_checks_a_unit_of_the_rule_only() {
         revision: svalnir_core::id::RuleRevisionId::new("r1").unwrap(),
     };
     assert_eq!(
-        evidence.unit_recheck(home.principal, &xcode, Some("x"), &root, &modules, &[], &[]),
+        evidence.unit_recheck(
+            home.principal,
+            &xcode,
+            Some("x"),
+            &root,
+            &modules,
+            &[],
+            &AgentListing::Off,
+            &[]
+        ),
         UnitRecheck::Passed
     );
 }
@@ -970,6 +984,7 @@ fn a_rule_with_no_repository_check_refuses_a_plan_that_admits_a_repository() {
                 &root,
                 &unit,
                 &[],
+                &AgentListing::Off,
                 &admitted
             ),
             UnitRecheck::Refused("repository_changed"),
@@ -1228,6 +1243,7 @@ fn the_check_before_a_step_matches_a_pattern_name_and_three_names() {
                 expiry: super::PROJECT_EVIDENCE_EXPIRY,
                 git: Some(&home.git),
                 admitted: &[],
+                agents: &AgentListing::Off,
             },
         )
     };
@@ -1295,6 +1311,7 @@ fn the_check_before_a_step_refuses_a_user_unit_when_a_table_marker_appears() {
             expiry: super::PROJECT_EVIDENCE_EXPIRY,
             git: Some(&home.git),
             admitted: &[],
+            agents: &AgentListing::Off,
         })
     };
     assert_eq!(check(), UnitRecheck::Passed);

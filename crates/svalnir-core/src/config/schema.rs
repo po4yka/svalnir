@@ -366,6 +366,11 @@ pub struct ProjectCleanup {
     pub quiet_period: Duration,
     /// True when the Paseo source of the project activity is on.
     pub paseo_agents: bool,
+    /// The executable of the Paseo command, or `None` for the fixed
+    /// candidates. The validation makes sure that the path starts with `/` or
+    /// `~/`, has no `.` or `..` component, and names a file below its base.
+    /// The source reads it only when `paseo_agents` is true.
+    pub paseo_executable: Option<ConfigPath>,
     /// The search roots of the rule, each a plain relative path below the
     /// home directory, in the sequence of the document. The template has
     /// none. The validation makes sure that each one has no empty, `.`,

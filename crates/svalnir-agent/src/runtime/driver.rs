@@ -48,6 +48,7 @@ use crate::journal::{
     RequestCompletion,
 };
 use crate::protection::ProtectedLocations;
+use crate::rules::projects::PaseoAgents;
 use crate::rules::{SharedEnvironment, automatic_roots};
 use crate::store::{EncodedSample, RetentionPolicy, Store};
 
@@ -696,10 +697,20 @@ impl Driver {
         let layouts: Vec<svalnir_core::config::UserLayout> = effective
             .as_ref()
             .map_or_else(Vec::new, |config| config.cleanup().projects.layouts.clone());
+        let home: Option<PathBuf> = self
+            .settings
+            .home_directory
+            .as_ref()
+            .map(LosslessPath::to_path_buf);
+        let agents: PaseoAgents = effective.as_ref().map_or_else(
+            || PaseoAgents::new(false, None),
+            |config| PaseoAgents::from_settings(&config.cleanup().projects, home.as_deref()),
+        );
         self.effective = effective;
         let mut records = self.authority.records();
         records.state = state;
         records.project_layouts = layouts;
+        records.project_agents = agents;
         true
     }
 

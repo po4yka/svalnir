@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 use svalnir_core::config::{UserLayout, parse_and_validate};
 
-use super::inspect::{has_own_ignore_file, recheck_unit_in};
+use super::inspect::{has_own_ignore_file, paseo_root, recheck_unit_in};
 use super::tests::{Home, no_recency, quiet, refusal, unit};
 use super::{
-    BuildProcesses, DirectoryName, IgnoreBasis, MarkerKind, PROJECT_LAYOUTS, PackageCheckouts,
-    ProjectInspection, ProjectLayout, ProjectLimits, ProjectMarker, ProjectUnitOutcome,
-    RecheckInput, UnitRecheck, Unmarked, VersionControl,
+    AgentListing, BuildProcesses, DirectoryName, IgnoreBasis, MarkerKind, PROJECT_LAYOUTS,
+    PackageCheckouts, ProjectInspection, ProjectLayout, ProjectLimits, ProjectMarker,
+    ProjectUnitOutcome, RecheckInput, UnitRecheck, Unmarked, VersionControl,
 };
 use crate::rules::caches::ReclaimBasis;
 use crate::rules::fixture::FixtureEnvironment;
@@ -505,6 +505,7 @@ fn recheck_with(
             expiry: super::PROJECT_EVIDENCE_EXPIRY,
             git: Some(&home.git),
             admitted: &[],
+            agents: &AgentListing::Off,
         },
     )
 }
@@ -562,6 +563,7 @@ fn the_check_before_a_step_asks_git_again_for_an_own_ignore_file() {
         expiry: super::PROJECT_EVIDENCE_EXPIRY,
         git: None,
         admitted: &[],
+        agents: &AgentListing::Off,
     };
     assert_eq!(
         recheck_unit_in(&PROJECT_LAYOUTS, &input),
@@ -602,6 +604,97 @@ fn the_check_before_a_step_asks_git_again_for_an_own_ignore_file() {
         recheck_with(&home, &OWN_FILE_TABLE, "tool-state", &state, &[]),
         UnitRecheck::Refused("not_ignored")
     );
+}
+
+/// The check before a step of `unit` with the Paseo listing `agents`.
+fn recheck_agents(home: &Home, unit: &Path, agents: &AgentListing) -> UnitRecheck {
+    let evidence = FixtureEnvironment::days_later(0);
+    let none: BuildProcesses = complete(&evidence);
+    recheck_unit_in(
+        &PROJECT_LAYOUTS,
+        &RecheckInput {
+            principal: home.principal,
+            layout: "elixir-ls",
+            root: &home.path.join("Code"),
+            unit,
+            user_layouts: &[],
+            processes: &none,
+            now: evidence.now().monotonic_ns,
+            expiry: super::PROJECT_EVIDENCE_EXPIRY,
+            git: Some(&home.git),
+            admitted: &[],
+            agents,
+        },
+    )
+}
+
+fn busy(paths: &[&Path]) -> AgentListing {
+    AgentListing::Listed {
+        busy: paths.iter().map(|path| path.to_path_buf()).collect(),
+    }
+}
+
+#[test]
+fn the_check_before_a_step_asks_paseo_again() {
+    let home = Home::new();
+    let unit: PathBuf = self_ignored(&home, "own", "mix.exs", ".elixir_ls", b"*\n");
+    let project: PathBuf = home.path.join("Code/own");
+    let code: PathBuf = home.path.join("Code");
+    // The source is off, or no agent runs.
+    assert_eq!(
+        recheck_agents(&home, &unit, &AgentListing::Off),
+        UnitRecheck::Passed
+    );
+    assert_eq!(
+        recheck_agents(&home, &unit, &busy(&[])),
+        UnitRecheck::Passed
+    );
+    // An agent in the project root or below it refuses the unit.
+    for directory in [project.clone(), project.join("src"), unit.clone()] {
+        assert_eq!(
+            recheck_agents(&home, &unit, &busy(&[&directory])),
+            UnitRecheck::Refused("agent_running"),
+            "{}",
+            directory.display()
+        );
+    }
+    // An agent in a sibling project or above the project root does not.
+    let sibling: PathBuf = code.join("own-two");
+    assert_eq!(
+        recheck_agents(&home, &unit, &busy(&[&sibling, &code, &home.path])),
+        UnitRecheck::Passed
+    );
+    // A failed listing is not known.
+    assert_eq!(
+        recheck_agents(
+            &home,
+            &unit,
+            &AgentListing::Failed {
+                reason: "paseo_timeout"
+            }
+        ),
+        UnitRecheck::Unknown("paseo_timeout")
+    );
+}
+
+#[test]
+fn the_paseo_root_is_the_nearest_directory_with_a_git_entry_below_the_search_root() {
+    let home = Home::new();
+    let code: PathBuf = home.path.join("Code");
+    // A repository with a project directory below it.
+    home.repository("Code/mono");
+    home.write("Code/mono/pkg/app/mix.exs", b"marker\n");
+    let app: PathBuf = code.join("mono/pkg/app");
+    assert_eq!(paseo_root(&app, &code), code.join("mono"));
+    // A `.git` file, as of a linked work tree, also counts.
+    home.write("Code/mono/pkg/.git", b"gitdir: ../../elsewhere\n");
+    assert_eq!(paseo_root(&app, &code), code.join("mono/pkg"));
+    // With no `.git` entry, the project directory is the root; the search
+    // root itself is not searched above.
+    home.write("Code/plain/mix.exs", b"marker\n");
+    let plain: PathBuf = code.join("plain");
+    assert_eq!(paseo_root(&plain, &code), plain);
+    assert_eq!(paseo_root(&code, &code), code);
 }
 
 #[test]

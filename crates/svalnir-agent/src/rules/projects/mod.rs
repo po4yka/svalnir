@@ -133,8 +133,9 @@ pub const PROJECT_RULE_ID: &str = "project.dependency-directory";
 /// subdirectory and of a directory, the pattern names, the units of three
 /// names and of `.cache`, the unmarked layout names, the user layouts with
 /// a first name of the table, the evidence of an own ignore file, and the
-/// overlap of the units of nested project directories.
-pub const PROJECT_RULE_REVISION: &str = "r5";
+/// overlap of the units of nested project directories. Revision `r6` asks
+/// Paseo again immediately before each step of an eviction.
+pub const PROJECT_RULE_REVISION: &str = "r6";
 
 const MINUTE: u64 = 60_000_000_000;
 const DAY: u64 = 86_400_000_000_000;

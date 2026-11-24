@@ -1256,6 +1256,46 @@ fn the_project_cleanup_settings_have_template_values_and_a_bounded_quiet_period(
 }
 
 #[test]
+fn the_paseo_executable_is_an_anchored_path_with_no_relative_component() {
+    let base: &str = "paseo_agents = false";
+    let with = |line: &str| spec_with(base, &format!("{base}\n{line}"));
+    assert_eq!(
+        valid(example(README)).cleanup().projects.paseo_executable,
+        None
+    );
+    for accepted in [
+        "/opt/homebrew/bin/paseo",
+        "~/.local/share/mise/shims/paseo",
+        "/usr/local/bin/paseo/",
+    ] {
+        let config: ValidatedConfig = valid(&with(&format!("paseo_executable = \"{accepted}\"")));
+        assert!(config.cleanup().projects.paseo_executable.is_some());
+    }
+    // The key has no effect while the source is off, and is no finding.
+    valid(&with("paseo_executable = \"/usr/local/bin/paseo\""));
+    for refused in [
+        "paseo",
+        "bin/paseo",
+        "",
+        "/usr/../bin/paseo",
+        "/usr/./bin/paseo",
+        "/",
+        "~/",
+    ] {
+        assert_one(
+            &with(&format!("paseo_executable = \"{refused}\"")),
+            FindingCode::InvalidPath,
+            "cleanup.projects.paseo_executable",
+        );
+    }
+    assert_one(
+        &with("paseo_executable = 3"),
+        FindingCode::WrongType,
+        "cleanup.projects.paseo_executable",
+    );
+}
+
+#[test]
 fn the_search_roots_are_plain_relative_paths_below_the_home_directory() {
     let document =
         |value: &str| format!("schema_version = 1\n[cleanup.projects]\nsearch_roots = {value}\n");

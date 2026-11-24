@@ -289,7 +289,7 @@ impl ProjectSources {
             git: GitTool::locate(),
             transcripts: ClaudeTranscripts::for_home(home)
                 .with_config_dirs(&projects.claude_config_dirs),
-            agents: PaseoAgents::new(projects.paseo_agents, home),
+            agents: PaseoAgents::from_settings(projects, home),
             quiet_period: quiet_period(projects),
         }
     }

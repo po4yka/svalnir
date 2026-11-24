@@ -130,6 +130,7 @@ impl Template {
                 projects: ProjectCleanup {
                     quiet_period: Duration::from_hours(24),
                     paseo_agents: false,
+                    paseo_executable: None,
                     search_roots: Vec::new(),
                     claude_config_dirs: Vec::new(),
                     layouts: Vec::new(),

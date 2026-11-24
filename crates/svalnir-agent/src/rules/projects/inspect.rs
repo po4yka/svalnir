@@ -30,6 +30,7 @@ use super::layouts::{
 };
 use super::recency::{
     AgentListing, ProjectRecency, RecencyHost, RecencyState, SourceReading, assess_with_head,
+    has_busy_agent_in,
 };
 use crate::platform::process::PathInventory;
 use crate::platform::volume::{MountTable, MountTableSource};
@@ -2072,6 +2073,37 @@ pub struct RecheckInput<'a> {
     /// runs the exception again and needs exactly this list
     /// (`docs/CLEANUP_RULES.md` section 6).
     pub admitted: &'a [AdmittedRepository],
+    /// The Paseo listing, read now. [`AgentListing::Off`] when the source is
+    /// off in the configuration in effect.
+    pub agents: &'a AgentListing,
+}
+
+/// The project root of the project directory `project` for the Paseo check:
+/// the nearest directory from `project` upward, not above `root`, that has a
+/// `.git` entry (a file or a directory, with no link followed). With none,
+/// `project` itself.
+pub(super) fn paseo_root(project: &Path, root: &Path) -> PathBuf {
+    project
+        .ancestors()
+        .take_while(|directory| directory.starts_with(root))
+        .find(|directory| fs::symlink_metadata(directory.join(".git")).is_ok())
+        .unwrap_or(project)
+        .to_path_buf()
+}
+
+/// The refusal of the check before a step from the Paseo listing
+/// `input.agents`: a failed listing is not known, and a running or starting
+/// agent in the project root refuses the unit. `None` when the source is off
+/// or no agent works in the project.
+fn agent_evidence(input: &RecheckInput<'_>, project: &Path) -> Option<UnitRecheck> {
+    match input.agents {
+        AgentListing::Off => None,
+        AgentListing::Failed { reason } => Some(UnitRecheck::Unknown(reason)),
+        AgentListing::Listed { busy } => {
+            let root: PathBuf = paseo_root(project, input.root);
+            has_busy_agent_in(busy, &root).then_some(UnitRecheck::Refused("agent_running"))
+        }
+    }
 }
 
 /// Makes the checks of the unit `input.unit` of `project.dependency-directory`
@@ -2080,7 +2112,7 @@ pub struct RecheckInput<'a> {
 /// the same layout (its project marker, with no earlier layout of the same
 /// directory whose marker is now present, and its inner marker), it has no
 /// entry at a protected path of the layout, and no build process of the
-/// user works in its project.
+/// user works in its project, and no Paseo agent runs in its project root.
 ///
 /// For an unmarked layout name (it ends with
 /// [`svalnir_core::rule::UNMARKED_LAYOUT_SUFFIX`]), the project must still
@@ -2328,6 +2360,9 @@ fn recheck_layout(
     if layout.own_ignore_file
         && let Some(result) = ignore_evidence(input, project)
     {
+        return result;
+    }
+    if let Some(result) = agent_evidence(input, project) {
         return result;
     }
     let processes: &BuildProcesses = input.processes;

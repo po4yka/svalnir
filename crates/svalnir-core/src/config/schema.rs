@@ -373,6 +373,14 @@ pub struct ProjectCleanup {
     /// ASCII letters ignored, and that the list has at most
     /// [`MAX_SEARCH_ROOTS`] paths.
     pub search_roots: Vec<String>,
+    /// The configuration folders of Claude Code that the transcript source
+    /// reads in addition to `~/.claude`, each an absolute path in the
+    /// sequence of the document; the source reads `projects` below each one.
+    /// The template has none. The validation makes sure that each one starts
+    /// with `/`, has no `.` or `..` component, that no two are the same with
+    /// the case of ASCII letters ignored, and that the list has at most
+    /// [`MAX_CLAUDE_CONFIG_DIRS`] paths.
+    pub claude_config_dirs: Vec<ConfigPath>,
     /// The `[[cleanup.projects.layouts]]` tables, in the sequence of the
     /// document. The template has none.
     pub layouts: Vec<UserLayout>,
@@ -380,6 +388,9 @@ pub struct ProjectCleanup {
 
 /// The largest number of `[cleanup.projects].search_roots`.
 pub const MAX_SEARCH_ROOTS: usize = 16;
+
+/// The largest number of `[cleanup.projects].claude_config_dirs`.
+pub const MAX_CLAUDE_CONFIG_DIRS: usize = 8;
 
 /// The largest number of `[[cleanup.projects.layouts]]` tables.
 pub const MAX_USER_LAYOUTS: usize = 16;

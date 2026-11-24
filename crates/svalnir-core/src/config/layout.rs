@@ -14,11 +14,12 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::finding::FindingCode;
+use super::path::{ConfigPath, PathBase};
 use super::reader::{Context, Read, TableReader};
 use super::schema::{
-    KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES, MAX_MARKER_COMPONENTS,
-    MAX_QUIET_PERIOD, MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, PROTECTED_HOME_NAMES,
-    SKIPPED_DIRECTORY_NAMES, UserLayout,
+    KEPT_OUT_LAYOUT_NAMES, MAX_CLAUDE_CONFIG_DIRS, MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES,
+    MAX_MARKER_COMPONENTS, MAX_QUIET_PERIOD, MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD,
+    PROTECTED_HOME_NAMES, SKIPPED_DIRECTORY_NAMES, UserLayout,
 };
 
 /// The largest length of one name, in bytes: the name limit of APFS.
@@ -475,6 +476,55 @@ pub(super) fn read_search_roots(
         roots.push(text.to_owned());
     }
     complete.then_some(roots)
+}
+
+/// Reads `claude_config_dirs` of `[cleanup.projects]`: absolute paths, at
+/// most [`MAX_CLAUDE_CONFIG_DIRS`]. `None` when the key is absent or has a
+/// finding.
+pub(super) fn read_claude_config_dirs(
+    context: &mut Context,
+    table: &mut TableReader<'_>,
+) -> Option<Vec<ConfigPath>> {
+    let Read::Valid(items) = table.text_list(context, "claude_config_dirs") else {
+        return None;
+    };
+    if items.len() > MAX_CLAUDE_CONFIG_DIRS {
+        context.report(
+            FindingCode::TooManyEntries,
+            &table.key_path("claude_config_dirs"),
+            format!("must have no more than {MAX_CLAUDE_CONFIG_DIRS} entries"),
+        );
+        return None;
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut dirs: Vec<ConfigPath> = Vec::with_capacity(items.len());
+    let mut complete: bool = true;
+    for (item_path, text) in items {
+        let parsed: ConfigPath = match ConfigPath::parse(text) {
+            Ok(parsed) if parsed.base() == PathBase::Root => parsed,
+            Ok(_) => {
+                context.report(FindingCode::InvalidPath, &item_path, "must start with `/`");
+                complete = false;
+                continue;
+            }
+            Err(error) => {
+                context.report(FindingCode::InvalidPath, &item_path, error.to_string());
+                complete = false;
+                continue;
+            }
+        };
+        if !seen.insert(parsed.to_string().to_ascii_lowercase()) {
+            context.report(
+                FindingCode::DuplicateIdentifier,
+                &item_path,
+                "an earlier entry has the same path",
+            );
+            complete = false;
+            continue;
+        }
+        dirs.push(parsed);
+    }
+    complete.then_some(dirs)
 }
 
 /// Reads the `layouts` array of tables of `[cleanup.projects]`, at most

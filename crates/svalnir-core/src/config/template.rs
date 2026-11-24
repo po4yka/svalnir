@@ -131,6 +131,7 @@ impl Template {
                     quiet_period: Duration::from_hours(24),
                     paseo_agents: false,
                     search_roots: Vec::new(),
+                    claude_config_dirs: Vec::new(),
                     layouts: Vec::new(),
                 },
                 caches: CacheCleanup::default(),

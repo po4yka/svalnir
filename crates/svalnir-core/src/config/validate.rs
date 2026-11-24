@@ -934,6 +934,8 @@ fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cl
         ),
         search_roots: super::layout::read_search_roots(context, &mut projects_table)
             .unwrap_or_else(|| defaults.projects.search_roots.clone()),
+        claude_config_dirs: super::layout::read_claude_config_dirs(context, &mut projects_table)
+            .unwrap_or_else(|| defaults.projects.claude_config_dirs.clone()),
         layouts: super::layout::read_layouts(context, &mut projects_table),
     };
     projects_table.finish(context);

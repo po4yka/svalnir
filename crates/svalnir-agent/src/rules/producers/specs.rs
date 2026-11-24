@@ -160,7 +160,10 @@ pub const MISE_CACHE: ProducerSpec = ProducerSpec {
     default_below: None,
     guard: Guard::None,
     processes: &["mise"],
-    markers: &[],
+    // The file or directory `.auto_prune` that mise writes in its cache root
+    // for its pruning interval. One host has an empty
+    // directory of this name; the file form is accepted too.
+    markers: &[Marker::ChildDirectory(".auto_prune"), Marker::File(".auto_prune")],
     lookup: "The root is the default of macOS. Plonge runs `mise cache path`; Svalnir runs no query and gives the root to mise in `MISE_CACHE_DIR`.",
 };
 
@@ -212,6 +215,10 @@ pub const UV_CACHE: ProducerSpec = ProducerSpec {
         Location::Absolute("/opt/homebrew/bin/uv"),
         Location::Absolute("/usr/local/bin/uv"),
         Location::Home(".cargo/bin/uv"),
+        // The `latest` install of mise unpacks the archive of uv into a
+        // directory named for the platform.
+        Location::Home(".local/share/mise/installs/uv/latest/uv-aarch64-apple-darwin/uv"),
+        Location::Home(".local/share/mise/installs/uv/latest/uv-x86_64-apple-darwin/uv"),
     ],
     interpreters: &[],
     arguments: &[
@@ -403,6 +410,10 @@ pub const NPM_CACHE: ProducerSpec = ProducerSpec {
     executables: &[
         Location::Absolute("/opt/homebrew/bin/npm"),
         Location::Absolute("/usr/local/bin/npm"),
+        // The real npm of the `latest` install of mise. The `bin/npm` of
+        // that install is a Bash wrapper that finds `mise` and `npm` through
+        // `PATH`, so it is not a location.
+        Location::Home(".local/share/mise/installs/node/latest/lib/node_modules/npm/bin/npm-cli.js"),
     ],
     interpreters: &NODE,
     arguments: &[

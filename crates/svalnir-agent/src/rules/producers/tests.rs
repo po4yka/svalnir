@@ -18,7 +18,8 @@ use super::{
     OWNER_SCOPE_UNMARKED, PRODUCER_SPECS, Part, ProducerBindError, ProducerBindRequest,
     ProducerRule, homebrew_system_env, mise_tracked_configs, scope_evidence,
 };
-use crate::executor::owner::ScopeLimits;
+use crate::executor::owner::{ScopeLimits, examine_program};
+use crate::rules::owner_operation::{canonical_interpreters, canonical_locations};
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
 use crate::rules::caches::{InspectionHost, RootOutcome, RootResolution};
@@ -576,16 +577,108 @@ fn a_root_with_a_typing_error_is_never_a_scope() {
             if report.outcome == RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
     ));
     assert!(work.exists());
-    // The rule `mise.cache` has no marker, so it binds no scope.
+    // The rule `mise.cache` needs the `.auto_prune` of mise in its root.
     fs::create_dir_all(home.path.join("Library/Caches/mise/node")).unwrap();
+    let mise = registry.producer("mise.cache").unwrap();
     assert_eq!(
-        registry
-            .producer("mise.cache")
-            .unwrap()
-            .scope(&home.host())
-            .outcome,
+        mise.scope(&home.host()).outcome,
         RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
     );
+    // The directory form, as one host has it.
+    fs::create_dir(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    assert_eq!(mise.scope(&home.host()).outcome, RootOutcome::Examined);
+    // The file form.
+    fs::remove_dir(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    home.write("Library/Caches/mise/.auto_prune", b"");
+    assert_eq!(mise.scope(&home.host()).outcome, RootOutcome::Examined);
+    // A symbolic link of that name is no marker.
+    fs::remove_file(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    symlink(&home.path, home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    assert_eq!(
+        mise.scope(&home.host()).outcome,
+        RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
+    );
+}
+
+/// A Mach-O executable that the checks of the owner executor accept.
+fn native_program(home: &Home, relative: &str) -> PathBuf {
+    let path: PathBuf = home.path.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::copy("/bin/sh", &path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn the_latest_installs_of_mise_are_executable_locations() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let installs: PathBuf = home.path.join(".local/share/mise/installs");
+    let link = |tool: &str| {
+        symlink("1.0.0", installs.join(tool).join("latest")).unwrap();
+    };
+    // `npm` of the `latest` node: the script `npm-cli.js` with the `node`
+    // of the same install as its interpreter.
+    let node: PathBuf = native_program(&home, ".local/share/mise/installs/node/1.0.0/bin/node");
+    let npm: PathBuf = home.write(
+        ".local/share/mise/installs/node/1.0.0/lib/node_modules/npm/bin/npm-cli.js",
+        b"#!/usr/bin/env node\nrequire('../lib/cli.js')\n",
+    );
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    link("node");
+    let operation = registry.producer("npm.content-cache").unwrap().operation();
+    // The host can have its own Node.js, which comes first in the sequence,
+    // so the test reads the declared locations and binds the files directly.
+    let located = canonical_locations(&operation.executables, &home.path);
+    assert!(located.contains(&fs::canonicalize(&npm).unwrap()));
+    let interpreters = canonical_interpreters(&operation.interpreters, &home.path);
+    assert!(interpreters.contains(&(fs::canonicalize(&node).unwrap(), Vec::new())));
+    let (executable, interpreter) = examine_program(
+        &fs::canonicalize(&npm).unwrap(),
+        &[(fs::canonicalize(&node).unwrap(), Vec::new())],
+        home.principal,
+        1 << 28,
+    )
+    .unwrap();
+    assert_eq!(executable.path.to_path_buf(), fs::canonicalize(&npm).unwrap());
+    assert_eq!(
+        interpreter.unwrap().executable.path.to_path_buf(),
+        fs::canonicalize(&node).unwrap()
+    );
+    // The Bash wrapper `bin/npm` of that install is not a location.
+    let wrapper: PathBuf = home.write(
+        ".local/share/mise/installs/node/1.0.0/bin/npm",
+        b"#!/usr/bin/env bash\nexit 0\n",
+    );
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    for spec in PRODUCER_SPECS {
+        for location in spec.executables {
+            assert!(
+                !matches!(location, crate::rules::caches::Location::Home(path) if path.ends_with("latest/bin/npm")
+                    || path.ends_with("latest/bin/pip3")),
+                "{}",
+                spec.id
+            );
+        }
+    }
+    // `uv` of the `latest` install of mise is in the directory of its
+    // archive.
+    let uv: PathBuf = native_program(
+        &home,
+        ".local/share/mise/installs/uv/1.0.0/uv-aarch64-apple-darwin/uv",
+    );
+    link("uv");
+    let operation = registry.producer("uv.cache").unwrap().operation();
+    let located = canonical_locations(&operation.executables, &home.path);
+    assert!(located.contains(&fs::canonicalize(&uv).unwrap()));
+    let (_, interpreter) = examine_program(
+        &fs::canonicalize(&uv).unwrap(),
+        &[],
+        home.principal,
+        1 << 28,
+    )
+    .unwrap();
+    assert!(interpreter.is_none());
 }
 
 #[test]

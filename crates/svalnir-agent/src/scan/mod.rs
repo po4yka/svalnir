@@ -75,7 +75,18 @@ pub use model::{
     ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use walk::run_scan;
+pub use walk::{file_private_allocation, run_scan};
+
+/// The private allocated bytes of one regular file. This build has no
+/// scanner for the host operating system, so they are unavailable.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn file_private_allocation(
+    _path: &std::path::Path,
+    _device: svalnir_core::file::DeviceNumber,
+    _inode: u64,
+) -> PrivateAllocation {
+    PrivateAllocation::unavailable(PrivateSizeUnavailable::NotReported)
+}
 
 /// Scans one root directory. This build has no scanner for the host
 /// operating system.

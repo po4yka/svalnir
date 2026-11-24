@@ -11,14 +11,17 @@ use svalnir_core::rule::{LifecycleState, RuleMode, RuleRefusal, RuleRegistry};
 use tempfile::TempDir;
 
 use super::config::{ConfigFormat, ConfigProblem, find_values};
+use super::inspect::reclaim_figure;
 use super::{
-    CACHE_SPECS, CacheInspection, InspectionHost, InspectionLimits, ReclaimFigure, RootOutcome,
-    RootResolution, UnitOutcome,
+    CACHE_SPECS, CacheInspection, InspectionHost, InspectionLimits, ReclaimBasis, ReclaimFigure,
+    RootOutcome, RootResolution, UnitOutcome,
 };
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
-use crate::scan::{CancellationToken, ScanCompletion, WallScanClock};
+use crate::scan::{
+    CancellationToken, PrivateBytes, PrivateSizeUnavailable, ScanCompletion, WallScanClock,
+};
 
 /// A home directory in a temporary directory.
 struct Home {
@@ -273,7 +276,7 @@ fn a_tool_that_is_not_installed_has_its_default_root_absent() {
 }
 
 #[test]
-fn a_configured_pnpm_store_is_measured_with_no_reclaim_figure() {
+fn a_configured_pnpm_store_is_measured_with_its_private_figure() {
     let home = Home::new();
     home.write(
         ".npmrc",
@@ -301,8 +304,12 @@ fn a_configured_pnpm_store_is_measured_with_no_reclaim_figure() {
     assert_eq!(v10.logical_bytes, Bytes::new(4096));
     assert_eq!(v10.completion, ScanCompletion::Finished);
     // Hard links and clones into projects: the logical size and the
-    // allocated size are not a reclaim figure.
-    assert_eq!(v10.reclaim, ReclaimFigure::NotKnownLinkedIntoProjects);
+    // allocated size are not a reclaim figure. The private allocated bytes
+    // are, when the volume reports them.
+    assert_eq!(
+        v10.reclaim,
+        private_or(v10, ReclaimFigure::NotKnownLinkedIntoProjects)
+    );
     // The store of version 3 is not there.
     assert_eq!(root.units[1].outcome, UnitOutcome::Absent);
 }
@@ -419,10 +426,15 @@ fn the_go_build_cache_is_measured_and_the_cache_off_has_no_root() {
     assert_eq!(root.resolution, RootResolution::Default);
     let unit = measured(&root.units[0].outcome);
     assert_eq!(unit.files.get(), 2);
-    assert!(matches!(
+    assert_eq!(
         unit.reclaim,
-        ReclaimFigure::AllocatedUpperBound { .. }
-    ));
+        private_or(
+            unit,
+            ReclaimFigure::AllocatedUpperBound {
+                bytes: unit.allocated_bytes
+            }
+        )
+    );
 
     home.write("Library/Application Support/go/env", b"GOCACHE=off\n");
     let root = &home.inspect("go.build-cache").roots[0];
@@ -620,7 +632,7 @@ fn a_cocoapods_cache_in_the_cocoapods_home_is_refused() {
 }
 
 #[test]
-fn the_uv_cache_is_measured_with_no_reclaim_figure() {
+fn the_uv_cache_figure_leaves_out_a_file_with_a_hard_link_in_a_project() {
     let home = Home::new();
     home.write(".cache/uv/CACHEDIR.TAG", UV_TAG);
     let wheel: PathBuf = home.write(".cache/uv/archive-v0/abc/pkg/__init__.py", &[4_u8; 1000]);
@@ -629,8 +641,105 @@ fn the_uv_cache_is_measured_with_no_reclaim_figure() {
     fs::hard_link(&wheel, environment.join("__init__.py")).unwrap();
     let root = &home.inspect("uv.cache").roots[0];
     let unit = measured(&root.units[0].outcome);
-    assert_eq!(unit.reclaim, ReclaimFigure::NotKnownLinkedIntoProjects);
     assert!(unit.logical_bytes.get() >= 1000);
+    let Some(private) = unit.private_allocated_bytes.value() else {
+        // A volume with no private size: no reclaim figure.
+        assert_eq!(unit.reclaim, ReclaimFigure::NotKnownLinkedIntoProjects);
+        return;
+    };
+    // The file with a name in the project adds nothing: its removal from
+    // the cache frees none of its blocks.
+    let linked: u64 = fs::metadata(&wheel).unwrap().blocks() * 512;
+    assert!(linked > 0);
+    assert_eq!(private.get(), unit.allocated_bytes.get() - linked);
+    assert_eq!(
+        unit.reclaim,
+        ReclaimFigure::PrivateAllocated { bytes: private }
+    );
+}
+
+#[test]
+fn the_uv_cache_figure_leaves_out_the_blocks_of_a_clone_in_a_project() {
+    let home = Home::new();
+    home.write(".cache/uv/CACHEDIR.TAG", UV_TAG);
+    let wheel: PathBuf = home.write(
+        ".cache/uv/archive-v0/abc/pkg/data.bin",
+        &vec![5_u8; 256 * 1024],
+    );
+    // uv clones the files of its cache into an environment on APFS.
+    let environment: PathBuf = home.directory("project/.venv/lib");
+    let cloned: bool = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(&wheel)
+        .arg(environment.join("data.bin"))
+        .status()
+        .is_ok_and(|status| status.success());
+    if !cloned {
+        // The volume of the temporary directory has no clones.
+        return;
+    }
+    let root = &home.inspect("uv.cache").roots[0];
+    let unit = measured(&root.units[0].outcome);
+    let private: Bytes = unit
+        .private_allocated_bytes
+        .value()
+        .expect("a volume with clones reports the private size");
+    // The blocks of the file are shared with the clone, so they are not in
+    // the figure, and the family is not complete in the unit.
+    let shared: u64 = fs::metadata(&wheel).unwrap().blocks() * 512;
+    assert!(shared >= 256 * 1024);
+    assert_eq!(private.get(), unit.allocated_bytes.get() - shared);
+    assert_eq!(unit.complete_family_shared_bytes.value(), Some(Bytes::ZERO));
+    assert_eq!(
+        unit.reclaim,
+        ReclaimFigure::PrivateAllocated { bytes: private }
+    );
+}
+
+#[test]
+fn the_figure_of_a_unit_with_no_private_size_is_the_figure_of_its_basis() {
+    let unavailable: PrivateBytes = PrivateBytes::Unavailable {
+        cause: PrivateSizeUnavailable::NotReported,
+    };
+    let allocated: Bytes = Bytes::new(8192);
+    assert_eq!(
+        reclaim_figure(ReclaimBasis::AllocatedBytes, allocated, unavailable),
+        ReclaimFigure::AllocatedUpperBound { bytes: allocated }
+    );
+    assert_eq!(
+        reclaim_figure(ReclaimBasis::LinkedIntoProjects, allocated, unavailable),
+        ReclaimFigure::NotKnownLinkedIntoProjects
+    );
+    assert_eq!(
+        reclaim_figure(ReclaimBasis::ClonedStorage, allocated, unavailable),
+        ReclaimFigure::NotKnownClonedStorage
+    );
+    let private: PrivateBytes = PrivateBytes::Available {
+        bytes: Bytes::new(4096),
+    };
+    for basis in [
+        ReclaimBasis::AllocatedBytes,
+        ReclaimBasis::LinkedIntoProjects,
+        ReclaimBasis::ClonedStorage,
+    ] {
+        assert_eq!(
+            reclaim_figure(basis, allocated, private),
+            ReclaimFigure::PrivateAllocated {
+                bytes: Bytes::new(4096)
+            }
+        );
+    }
+}
+
+/// The figure that a unit has: the private allocated bytes when the volume
+/// reports them, and otherwise `fallback`.
+pub(in crate::rules) fn private_or(
+    unit: &super::CacheMeasurement,
+    fallback: ReclaimFigure,
+) -> ReclaimFigure {
+    unit.private_allocated_bytes
+        .value()
+        .map_or(fallback, |bytes| ReclaimFigure::PrivateAllocated { bytes })
 }
 
 #[test]

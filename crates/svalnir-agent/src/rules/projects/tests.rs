@@ -22,6 +22,7 @@ use super::{
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
 use crate::rules::caches::ReclaimFigure;
+use crate::rules::caches::tests::private_or;
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
 use crate::rules::git::Repository;
 use crate::rules::git::{GitTool, GitToolProblem};
@@ -521,10 +522,11 @@ fn an_ignored_dependency_directory_of_a_project_is_measured() {
         panic!("not measured: {:?}", report.outcome);
     };
     assert_eq!(measurement.files.get(), 1);
-    // Package managers can link the files from a store.
+    // Package managers can link the files from a store: the figure is the
+    // private allocated bytes, when the volume reports them.
     assert_eq!(
         measurement.reclaim,
-        ReclaimFigure::NotKnownLinkedIntoProjects
+        private_or(measurement, ReclaimFigure::NotKnownLinkedIntoProjects)
     );
     // The walk does not enter the unit, and the inspection changed
     // nothing.
@@ -766,10 +768,15 @@ fn a_virtual_environment_needs_its_marker_and_cocoapods_needs_its_manifest() {
     let ProjectUnitOutcome::Measured(measurement) = &pods.outcome else {
         panic!("not measured: {:?}", pods.outcome);
     };
-    assert!(matches!(
+    assert_eq!(
         measurement.reclaim,
-        ReclaimFigure::AllocatedUpperBound { .. }
-    ));
+        private_or(
+            measurement,
+            ReclaimFigure::AllocatedUpperBound {
+                bytes: measurement.allocated_bytes
+            }
+        )
+    );
     // With its marker, the environment is measured.
     home.write("Code/py/.venv/pyvenv.cfg", b"home = /usr/bin\n");
     let inspection: ProjectInspection = home.inspect(&quiet());

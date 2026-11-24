@@ -32,8 +32,8 @@ use crate::rules::unit::{
     ObjectKind, ObjectSnapshot, RecordRead, RootView, WalkStop, lstat, read_record, walk_local,
 };
 use crate::scan::{
-    CancellationToken, NoObserver, ScanClock, ScanCompletion, ScanLimits, ScanObserver,
-    ScanRequest, ScanResult, run_scan,
+    CancellationToken, NoObserver, PrivateBytes, ScanClock, ScanCompletion, ScanLimits,
+    ScanObserver, ScanRequest, ScanResult, run_scan,
 };
 
 /// The scan identity of a unit measurement. The result is not saved.
@@ -136,6 +136,17 @@ pub enum RootOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReclaimFigure {
+    /// The private allocated bytes of the unit (`docs/RESOURCE_MODEL.md`
+    /// section 8): the lower figure. They count no block that the unit
+    /// shares with a clone outside it, and no hard-linked file with a name
+    /// outside it. A local snapshot can keep each block, so the figure does
+    /// not prove reclamation. The inspection gives this figure for each
+    /// reclaim basis when the volume reports the private size of each
+    /// counted file.
+    PrivateAllocated {
+        /// The private allocated bytes.
+        bytes: Bytes,
+    },
     /// The allocated size of the unit. It is an upper estimate, not
     /// exclusive storage: APFS clones and snapshots can share it.
     AllocatedUpperBound {
@@ -172,8 +183,33 @@ pub struct CacheMeasurement {
     pub completion: ScanCompletion,
     /// Whether a region below the unit could not be measured.
     pub partial: bool,
+    /// The private allocated bytes of the unit, or the cause that they are
+    /// unavailable.
+    pub private_allocated_bytes: PrivateBytes,
+    /// The shared parts of the clone families whose members are each in
+    /// the unit, or the cause that they are unavailable. They are not a
+    /// reclaim figure: a modified clone outside the unit, or a local
+    /// snapshot, can keep each of those blocks.
+    pub complete_family_shared_bytes: PrivateBytes,
     /// The reclaim figure.
     pub reclaim: ReclaimFigure,
+}
+
+/// The reclaim figure of a unit: the private allocated bytes when they are
+/// available, and otherwise the figure of the reclaim basis of the rule.
+pub(in crate::rules) fn reclaim_figure(
+    basis: ReclaimBasis,
+    allocated: Bytes,
+    private: PrivateBytes,
+) -> ReclaimFigure {
+    if let Some(bytes) = private.value() {
+        return ReclaimFigure::PrivateAllocated { bytes };
+    }
+    match basis {
+        ReclaimBasis::AllocatedBytes => ReclaimFigure::AllocatedUpperBound { bytes: allocated },
+        ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
+        ReclaimBasis::ClonedStorage => ReclaimFigure::NotKnownClonedStorage,
+    }
 }
 
 /// The result of one unit.
@@ -758,13 +794,13 @@ pub(in crate::rules) fn measure_unit_observed(
         symlinks: totals.symlinks,
         completion: result.completion,
         partial: result.coverage != Coverage::Complete,
-        reclaim: match reclaim {
-            ReclaimBasis::AllocatedBytes => ReclaimFigure::AllocatedUpperBound {
-                bytes: totals.allocated_bytes,
-            },
-            ReclaimBasis::LinkedIntoProjects => ReclaimFigure::NotKnownLinkedIntoProjects,
-            ReclaimBasis::ClonedStorage => ReclaimFigure::NotKnownClonedStorage,
-        },
+        private_allocated_bytes: result.private_allocation.bytes,
+        complete_family_shared_bytes: result.private_allocation.complete_family_shared_bytes,
+        reclaim: reclaim_figure(
+            reclaim,
+            totals.allocated_bytes,
+            result.private_allocation.bytes,
+        ),
     };
     Some((measurement, result))
 }

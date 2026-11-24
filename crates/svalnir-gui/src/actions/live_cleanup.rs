@@ -32,7 +32,7 @@ use svalnir_agent::{
     protection::ProtectedLocations,
     rules::{
         DiscoveryHost, EvictionCandidate, EvictionDiscovery, ReviewedRules, RootResult,
-        SharedEnvironment, SourceEnvironment, XCODE_ORPHAN_LAYOUT,
+        SharedEnvironment, SizeMeasure, SourceEnvironment, UnitMeasurement, XCODE_ORPHAN_LAYOUT,
         caches::{
             CacheInspection, CacheMeasurement, InspectionLimits, ReclaimFigure, RootOutcome,
             UnitOutcome,
@@ -211,17 +211,37 @@ fn path_text(path: Option<&Path>) -> String {
 }
 
 fn cache_unit(path: &Path, measurement: &CacheMeasurement) -> UnitRow {
+    let (size, size_kind): (u64, SizeKind) = match measurement.reclaim {
+        ReclaimFigure::PrivateAllocated { bytes } => (bytes.get(), SizeKind::PrivateAllocated),
+        ReclaimFigure::AllocatedUpperBound { .. } => (
+            measurement.allocated_bytes.get(),
+            SizeKind::AllocatedUpperBound,
+        ),
+        ReclaimFigure::NotKnownLinkedIntoProjects | ReclaimFigure::NotKnownClonedStorage => (
+            measurement.allocated_bytes.get(),
+            SizeKind::AllocatedNotReclaim,
+        ),
+    };
     UnitRow {
         path: path.display().to_string(),
-        size: Some(measurement.allocated_bytes.get()),
-        size_kind: match measurement.reclaim {
-            ReclaimFigure::AllocatedUpperBound { .. } => SizeKind::AllocatedUpperBound,
-            ReclaimFigure::NotKnownLinkedIntoProjects | ReclaimFigure::NotKnownClonedStorage => {
-                SizeKind::AllocatedNotReclaim
-            }
-        },
+        size: Some(size),
+        size_kind,
         partial: measurement.partial,
         reason: None,
+    }
+}
+
+/// The size of a clear unit: its estimate when it is the private allocated
+/// bytes, and otherwise its allocated bytes as an upper estimate.
+fn clear_size(measurement: &UnitMeasurement) -> (u64, SizeKind) {
+    match measurement.estimate.measure {
+        SizeMeasure::PrivateAllocatedBytes => {
+            (measurement.estimate.bytes.get(), SizeKind::PrivateAllocated)
+        }
+        SizeMeasure::AllocatedBytes => (
+            measurement.allocated_bytes.get(),
+            SizeKind::AllocatedUpperBound,
+        ),
     }
 }
 
@@ -521,12 +541,13 @@ fn inspect_clear(
     };
     inspection.roots = roots.iter().map(clear_root_row).collect();
     for candidate in &discovery.candidates {
+        let (size, size_kind): (u64, SizeKind) = clear_size(&candidate.discovered.measurement);
         push_unit(
             &mut inspection,
             UnitRow {
                 path: candidate.candidate.candidate.path.display_label(),
-                size: Some(candidate.discovered.measurement.allocated_bytes.get()),
-                size_kind: SizeKind::AllocatedUpperBound,
+                size: Some(size),
+                size_kind,
                 partial: false,
                 reason: blocker_names(candidate),
             },

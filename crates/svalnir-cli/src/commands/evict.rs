@@ -32,6 +32,7 @@ use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::id::RuleId;
 use svalnir_core::plan::{CleanupEntry, PlanOutcome, SelectionPreset, explain};
+use svalnir_core::quantity::Bytes;
 use svalnir_core::rule::{Rule, RuleRef};
 
 use super::clean::{self, PlanView};
@@ -44,7 +45,7 @@ use crate::environment::Environment;
 use crate::host::Host;
 use crate::interrupt::Interrupt;
 use crate::output::{ErrorBody, ErrorFamily, ErrorStage, ExitStatus, Kind};
-use crate::text::put_line;
+use crate::text::{human_bytes, put_line};
 
 /// The name of the selection preset of this build.
 pub(crate) const DEVELOPER_PRESET: &str = "developer";
@@ -157,6 +158,32 @@ pub(crate) struct DiscoveryView {
     /// The candidates that `--min-size` leaves out, to a bound.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) below_minimum_size: Vec<LosslessPath>,
+    /// The sum of the shared parts of the complete clone families of the
+    /// candidates with no blocker (`docs/RESOURCE_MODEL.md` section 8). It
+    /// is not in the estimate and is not a reclaim figure: a modified clone
+    /// outside a unit, or a local snapshot, can keep each of those blocks.
+    pub(crate) complete_family_shared_bytes: Bytes,
+    /// The number of candidates with no blocker whose complete-family
+    /// shared bytes are unavailable. They add nothing to the sum.
+    pub(crate) complete_family_shared_unavailable: usize,
+}
+
+/// The sum of the complete-family shared bytes of `candidates`, and the
+/// number of candidates whose value is unavailable.
+fn family_shared<'a>(candidates: impl Iterator<Item = &'a EvictionCandidate>) -> (Bytes, usize) {
+    let (sum, unavailable): (u64, usize) = candidates.fold(
+        (0_u64, 0_usize),
+        |(sum, unavailable), candidate| match candidate
+            .discovered
+            .measurement
+            .complete_family_shared_bytes
+            .value()
+        {
+            Some(bytes) => (sum.saturating_add(bytes.get()), unavailable),
+            None => (sum, unavailable.saturating_add(1)),
+        },
+    );
+    (Bytes::new(sum), unavailable)
 }
 
 impl DiscoveryView {
@@ -168,6 +195,13 @@ impl DiscoveryView {
                 .iter()
                 .filter(|candidate| !candidate.discovered.blockers.is_empty())
         };
+        let (complete_family_shared_bytes, complete_family_shared_unavailable): (Bytes, usize) =
+            family_shared(
+                discovery
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.discovered.blockers.is_empty()),
+            );
         Self {
             rule,
             complete: discovery.complete,
@@ -232,6 +266,8 @@ impl DiscoveryView {
             project_roots: None,
             mise: None,
             below_minimum_size: Vec::new(),
+            complete_family_shared_bytes,
+            complete_family_shared_unavailable,
         }
     }
 
@@ -252,6 +288,19 @@ impl DiscoveryView {
             .take(SKIPPED_LIMIT)
             .map(|candidate| candidate.candidate.candidate.path.clone())
             .collect();
+        // A candidate that `--min-size` leaves out is not in the plan.
+        let left_out = |candidate: &EvictionCandidate| {
+            below
+                .iter()
+                .any(|other| other.candidate.candidate.path == candidate.candidate.candidate.path)
+        };
+        (
+            self.complete_family_shared_bytes,
+            self.complete_family_shared_unavailable,
+        ) =
+            family_shared(discovery.candidates.iter().filter(|candidate| {
+                candidate.discovered.blockers.is_empty() && !left_out(candidate)
+            }));
         self
     }
 
@@ -294,6 +343,13 @@ impl DiscoveryView {
         }
         if self.blocked_omitted > 0 {
             put_line!(out, "  ... and {} more", self.blocked_omitted);
+        }
+        if self.complete_family_shared_bytes > Bytes::ZERO {
+            put_line!(
+                out,
+                "  Shared in complete clone families: {}   not in the estimate; a modified clone outside a unit or a local snapshot can keep these blocks",
+                human_bytes(self.complete_family_shared_bytes.get())
+            );
         }
         for root in &self.roots {
             let path: String = root

@@ -30,9 +30,9 @@ use super::top::TopList;
 use super::walk::{Injection, MetadataHook, PrivateHook, budget_from_limit, join_name, scan_with};
 use super::{
     CancellationToken, DirectoryRecord, EntryKind, EntryRecord, LargeFile, NoObserver,
-    PrivateBytes, PrivateSizeUnavailable, RegionCause, RegionKind, ScanClock, ScanCompletion,
-    ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, ScanTimestamp, WallScanClock,
-    run_scan,
+    PrivateAllocation, PrivateBytes, PrivateSizeUnavailable, RegionCause, RegionKind, ScanClock,
+    ScanCompletion, ScanError, ScanLimits, ScanObserver, ScanRequest, ScanResult, ScanTimestamp,
+    WallScanClock, run_scan,
 };
 
 static NEXT_TREE: AtomicU32 = AtomicU32::new(0);
@@ -2316,5 +2316,104 @@ fn a_compressed_member_of_a_clone_family_adds_zero_to_the_lower_figure() {
             - allocated_of(&original)
             - allocated_of(&clone)
             - single
+    );
+}
+
+// The private allocated bytes of one file (`file_private_allocation`), for a
+// rule unit that is one file.
+
+fn inode_of(path: &Path) -> u64 {
+    fs::symlink_metadata(path).unwrap().ino()
+}
+
+fn device_of(path: &Path) -> DeviceNumber {
+    DeviceNumber::new(i32::try_from(fs::symlink_metadata(path).unwrap().dev()).unwrap())
+}
+
+fn private_of(path: &Path, inode: u64) -> PrivateAllocation {
+    crate::scan::file_private_allocation(path, device_of(path.parent().unwrap()), inode)
+}
+
+#[test]
+fn one_file_without_clones_has_its_allocated_size_as_private_bytes() {
+    let tree = TempTree::new("file-private-plain");
+    let file: PathBuf = tree.file("a.bin", 300_000);
+
+    let result: PrivateAllocation = private_of(&file, inode_of(&file));
+
+    assert_eq!(
+        result.bytes.value().map(Bytes::get),
+        Some(allocated_of(&file))
+    );
+    assert_eq!(
+        result.complete_family_shared_bytes.value(),
+        Some(Bytes::ZERO)
+    );
+    assert_eq!(result.files_by_private_size, count(1));
+}
+
+#[test]
+fn one_file_with_a_clone_outside_has_only_its_private_bytes() {
+    let tree = TempTree::new("file-private-clone");
+    let file: PathBuf = tree.file("a.bin", 1_048_576);
+    clone_file(&file, &tree.path("other/b.bin"));
+
+    let result: PrivateAllocation = private_of(&file, inode_of(&file));
+
+    // Each block is shared with the clone, and the family is not complete.
+    assert_eq!(result.bytes.value(), Some(Bytes::ZERO));
+    assert_eq!(
+        result.complete_family_shared_bytes.value(),
+        Some(Bytes::ZERO)
+    );
+    assert_eq!(result.clone_families, count(1));
+    assert_eq!(result.clone_families_complete, count(0));
+}
+
+#[test]
+fn one_file_with_a_second_name_adds_zero() {
+    let tree = TempTree::new("file-private-link");
+    let file: PathBuf = tree.file("a.bin", 64_000);
+    fs::hard_link(&file, tree.path("b.bin")).unwrap();
+
+    let result: PrivateAllocation = private_of(&file, inode_of(&file));
+
+    assert_eq!(result.bytes.value(), Some(Bytes::ZERO));
+    assert_eq!(result.hard_linked_objects_with_names_outside, count(1));
+}
+
+#[test]
+fn one_file_with_another_inode_or_kind_is_an_identity_change() {
+    let tree = TempTree::new("file-private-identity");
+    let file: PathBuf = tree.file("a.bin", 4_096);
+    let directory: PathBuf = tree.path("d");
+    fs::create_dir(&directory).unwrap();
+    let gone: PathBuf = tree.path("gone.bin");
+
+    let cause = |result: PrivateAllocation| match result.bytes {
+        PrivateBytes::Unavailable { cause } => Some(cause),
+        PrivateBytes::Available { .. } => None,
+    };
+    assert_eq!(
+        cause(private_of(&file, inode_of(&file) + 1)),
+        Some(PrivateSizeUnavailable::IdentityChanged)
+    );
+    assert_eq!(
+        cause(private_of(&directory, inode_of(&directory))),
+        Some(PrivateSizeUnavailable::IdentityChanged)
+    );
+    assert_eq!(
+        cause(private_of(&gone, 1)),
+        Some(PrivateSizeUnavailable::IdentityChanged)
+    );
+    // The same inode on another device.
+    let other: DeviceNumber = DeviceNumber::new(device_of(&file).get().wrapping_add(1));
+    assert_eq!(
+        cause(crate::scan::file_private_allocation(
+            &file,
+            other,
+            inode_of(&file)
+        )),
+        Some(PrivateSizeUnavailable::IdentityChanged)
     );
 }

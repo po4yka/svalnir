@@ -21,6 +21,7 @@ use super::{
 };
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
+use crate::rules::caches::tests::private_or;
 use crate::rules::caches::{InspectionLimits, ReclaimFigure};
 use crate::rules::fixture::{automatic_eviction_validated, manual_action_validated};
 use crate::rules::projects::{BuildProcesses, ProcessEvidence, ProjectProcess};
@@ -230,7 +231,7 @@ fn simulator_locations(home: &Home) -> SimulatorLocations {
 }
 
 #[test]
-fn a_device_is_attributed_from_its_device_plist_with_no_reclaim_figure() {
+fn a_device_is_attributed_from_its_device_plist_with_its_private_figure() {
     let home = Home::new();
     let devices: &str = "Library/Developer/CoreSimulator/Devices";
     home.write(
@@ -296,7 +297,12 @@ fn a_device_is_attributed_from_its_device_plist_with_no_reclaim_figure() {
     let DeviceOutcome::Measured(measurement) = &booted.outcome else {
         panic!("not measured: {:?}", booted.outcome);
     };
-    assert_eq!(measurement.reclaim, ReclaimFigure::NotKnownClonedStorage);
+    // The device data can share blocks with a runtime through clones: the
+    // figure is the private allocated bytes, when the volume reports them.
+    assert_eq!(
+        measurement.reclaim,
+        private_or(measurement, ReclaimFigure::NotKnownClonedStorage)
+    );
     assert!(
         booted
             .owner_workflow
@@ -469,10 +475,15 @@ fn the_old_kegs_of_a_formula_are_attributed_and_the_current_keg_is_not() {
     let KegOutcome::OldVersion(measurement) = outcome("wget", "1.21") else {
         panic!("not an old version: {:?}", outcome("wget", "1.21"));
     };
-    assert!(matches!(
+    assert_eq!(
         measurement.reclaim,
-        ReclaimFigure::AllocatedUpperBound { .. }
-    ));
+        private_or(
+            measurement,
+            ReclaimFigure::AllocatedUpperBound {
+                bytes: measurement.allocated_bytes
+            }
+        )
+    );
     assert_eq!(*outcome("wget", "1.24"), KegOutcome::Current);
     // Each keg of a pinned formula is pinned, the current one too.
     assert_eq!(*outcome("node", "20.1"), KegOutcome::Pinned);

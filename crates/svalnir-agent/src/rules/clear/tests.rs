@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use svalnir_core::id::RuleId;
 use svalnir_core::process::Uid;
+use svalnir_core::quantity::Bytes;
 use svalnir_core::rule::{LifecycleState, RuleMode, RuleRegistry as _};
 use tempfile::TempDir;
 
@@ -26,7 +27,7 @@ use crate::rules::eviction::{
 use crate::rules::fixture::{
     FixtureEnvironment, FixtureUse, automatic_eviction_validated, manual_action_validated,
 };
-use crate::rules::model::{DiscoveryLimits, SkipReason};
+use crate::rules::model::{DiscoveryLimits, SizeMeasure, SkipReason};
 use crate::rules::projects::{AgentListing, UnitRecheck};
 use crate::rules::registry::ReviewedRules;
 use crate::rules::xcode::ProducerProcesses;
@@ -1223,4 +1224,53 @@ fn a_homebrew_gem_cache_has_regular_gem_files_only_as_units() {
         root_result(&discovery, &gems.join("cache")),
         &RootResult::Refused("clear_root_unmarked")
     );
+}
+
+#[test]
+fn the_estimate_of_a_file_unit_is_its_private_allocated_bytes() {
+    let home = Home::new();
+    home.write(".gradle/caches/modules-2/files-2.1/g/a/1/a.jar", b"jar");
+    let file: PathBuf = home.write(".gradle/caches/journal.bin", &vec![3_u8; 256 * 1024]);
+    let unit = |discovery: &EvictionDiscovery| {
+        discovery
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate.candidate.path.to_path_buf() == file)
+            .expect("the file is a candidate")
+            .discovered
+            .measurement
+            .clone()
+    };
+    let measurement = unit(&manual(&home, GRADLE_CACHES.id));
+    let Some(private) = measurement.private_allocated_bytes.value() else {
+        // A volume with no private size: the estimate is the allocated size.
+        assert_eq!(measurement.estimate.measure, SizeMeasure::AllocatedBytes);
+        return;
+    };
+    // A file with no clone: the private size is the allocated size.
+    assert_eq!(private, measurement.allocated_bytes);
+    assert_eq!(
+        measurement.estimate.measure,
+        SizeMeasure::PrivateAllocatedBytes
+    );
+    assert_eq!(measurement.estimate.bytes, private);
+
+    // A clone outside the unit shares each block of the file: the removal
+    // of the unit frees none of them.
+    let cloned: bool = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(&file)
+        .arg(home.path.join("clone.bin"))
+        .status()
+        .is_ok_and(|status| status.success());
+    if !cloned {
+        return;
+    }
+    let measurement = unit(&manual(&home, GRADLE_CACHES.id));
+    assert_eq!(measurement.estimate.bytes, Bytes::ZERO);
+    assert_eq!(
+        measurement.estimate.measure,
+        SizeMeasure::PrivateAllocatedBytes
+    );
+    assert!(measurement.allocated_bytes.get() >= 256 * 1024);
 }

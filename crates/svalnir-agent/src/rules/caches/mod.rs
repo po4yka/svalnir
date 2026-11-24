@@ -34,7 +34,7 @@ pub mod config;
 mod inspect;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::rules) mod tests;
 
 use std::path::{Path, PathBuf};
 

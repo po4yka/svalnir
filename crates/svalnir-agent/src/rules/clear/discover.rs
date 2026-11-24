@@ -35,7 +35,7 @@ use crate::rules::unit::{
     elapsed_between, establish_charge, list_root, lstat, reason_of, target_evidence,
 };
 use crate::rules::xcode::ProducerProcesses;
-use crate::scan::{EntryKind, PrivateBytes, PrivateSizeUnavailable};
+use crate::scan::{EntryKind, PrivateAllocation, file_private_allocation};
 
 /// The process evidence of a clear rule: whether a process of its
 /// producer runs, and the monotonic time of the inventory.
@@ -225,7 +225,7 @@ impl ClearRule {
                 return Ok((assessment, stopped));
             }
         } else {
-            self.measure_file(&mut assessment, &before, collector.bounds.wall_now());
+            self.measure_file(&mut assessment, &path, &before, collector.bounds.wall_now());
         }
         if !assessment.reasons.is_empty() {
             return Ok((assessment, None));
@@ -241,10 +241,13 @@ impl ClearRule {
 
     /// The measurement of a regular file unit from its snapshot: one item,
     /// with the larger of its logical size and its allocated size as the
-    /// charge. A file with more than one link is refused.
+    /// charge. A file with more than one link is refused. The private
+    /// allocated bytes come from [`file_private_allocation`], and the
+    /// estimate uses them when they are available.
     fn measure_file(
         &self,
         assessment: &mut Assessment,
+        path: &Path,
         before: &ObjectSnapshot,
         measured_at: Option<WallTime>,
     ) {
@@ -266,22 +269,25 @@ impl ClearRule {
             assessment.reasons.insert(SkipReason::OverCandidateCeiling);
             return;
         }
-        let unavailable = || PrivateBytes::Unavailable {
-            cause: PrivateSizeUnavailable::NotReported,
+        let private: PrivateAllocation =
+            file_private_allocation(path, before.object.device, before.object.inode.get());
+        let (estimate_bytes, measure): (Bytes, SizeMeasure) = match private.bytes.value() {
+            Some(bytes) => (bytes, SizeMeasure::PrivateAllocatedBytes),
+            None => (Bytes::new(allocated), SizeMeasure::AllocatedBytes),
         };
         assessment.measurement = Some(UnitMeasurement {
             source: MeasurementSource::Scanned,
             logical_bytes: Bytes::new(before.size),
             allocated_bytes: Bytes::new(allocated),
-            private_allocated_bytes: unavailable(),
-            complete_family_shared_bytes: unavailable(),
+            private_allocated_bytes: private.bytes,
+            complete_family_shared_bytes: private.complete_family_shared_bytes,
             files: EntryCount::new(1),
             directories: EntryCount::new(0),
             symlinks: EntryCount::new(0),
             charge,
             estimate: ReclaimEstimate {
-                bytes: Bytes::new(allocated),
-                measure: SizeMeasure::AllocatedBytes,
+                bytes: estimate_bytes,
+                measure,
                 exclusive_storage_known: false,
                 files_allocated_below_logical: EntryCount::new(u64::from(allocated < before.size)),
             },

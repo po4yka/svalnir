@@ -633,6 +633,75 @@ fn clean_inspect_reports_the_units_of_the_rules_that_have_an_inspection() {
 }
 
 #[test]
+fn clean_inspect_and_an_evict_plan_show_the_shared_blocks_of_a_complete_clone_family() {
+    let world = World::manual();
+    let app: PathBuf = world.node_project("app");
+    world.write("Code/app/node_modules/big/a.bin", &vec![9_u8; 512 * 1024]);
+    let original: PathBuf = app.join("node_modules/big/a.bin");
+    // A clone in the same unit: the family is complete in the unit.
+    let cloned: bool = Command::new("/bin/cp")
+        .arg("-c")
+        .arg(&original)
+        .arg(app.join("node_modules/big/b.bin"))
+        .status()
+        .is_ok_and(|status| status.success());
+    if !cloned {
+        // The volume of the temporary directory has no clones.
+        return;
+    }
+    let root: String = world.root();
+    let arguments: [&str; 7] = [
+        "clean",
+        "inspect",
+        "--rule",
+        RULE,
+        "--root",
+        &root,
+        "--no-mise",
+    ];
+    let outcome = json(&world.environment, &arguments);
+    assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+    let measured: Value = outcome.result()["projects"]["units"][0]["outcome"].clone();
+    assert_eq!(measured["kind"], "measured", "{measured}");
+    assert_eq!(
+        measured["private_allocated_bytes"]["availability"], "available",
+        "{measured}"
+    );
+    // The private figure has no shared block; the shared blocks are a
+    // separate value, one time.
+    // Bytes are base-10 strings in JSON.
+    let number = |value: &Value| -> u64 { value.as_str().unwrap().parse().unwrap() };
+    let shared: u64 = number(&measured["complete_family_shared_bytes"]["bytes"]);
+    assert!(shared >= 512 * 1024, "{measured}");
+    assert_eq!(
+        measured["reclaim"]["kind"], "private_allocated",
+        "{measured}"
+    );
+    assert!(
+        number(&measured["reclaim"]["bytes"]) < number(&measured["allocated_bytes"]) - shared,
+        "{measured}"
+    );
+    let shown = run(&world.environment, &arguments);
+    assert!(
+        shown.stdout.contains("private allocated")
+            && shown
+                .stdout
+                .contains("more shared in complete clone families"),
+        "{}",
+        shown.stdout
+    );
+    // The plan reports the shared blocks apart from its estimate.
+    let (_, result) = world.planned();
+    let discovery = &result["discovery"];
+    assert_eq!(
+        number(&discovery["complete_family_shared_bytes"]),
+        shared,
+        "{discovery}"
+    );
+    assert_eq!(discovery["complete_family_shared_unavailable"], 0);
+}
+
+#[test]
 fn clean_inspect_shows_an_unmarked_directory_only_with_allow_unmarked() {
     let world = World::new(None);
     world.write("Code/scripts/.gitignore", b"/.venv/\n");

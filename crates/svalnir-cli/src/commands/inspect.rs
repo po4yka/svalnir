@@ -13,7 +13,7 @@ use serde::Serialize;
 use svalnir_agent::client::cleanup::{self, MiseRequest, ProjectRoots};
 use svalnir_agent::protection::ProtectedLocations;
 use svalnir_agent::rules::caches::{
-    CacheInspection, InspectionHost, InspectionLimits, RootOutcome, UnitOutcome,
+    CacheInspection, CacheMeasurement, InspectionHost, InspectionLimits, RootOutcome, UnitOutcome,
 };
 use svalnir_agent::rules::clear::{ClearRootEntry, RootSource as ClearRootSource};
 use svalnir_agent::rules::producers::{MAX_PRODUCER_EXECUTABLE_BYTES, OwnerInspection};
@@ -26,10 +26,11 @@ use svalnir_agent::rules::worktrees::WorktreeInspection;
 use svalnir_agent::rules::{
     DiscoveryHost, EvictionDiscovery, ReviewedRules, SharedEnvironment, SkipReason,
 };
-use svalnir_agent::scan::CancellationToken;
+use svalnir_agent::scan::{CancellationToken, PrivateBytes};
 use svalnir_core::config::ValidatedConfig;
 use svalnir_core::file::LosslessPath;
 use svalnir_core::process::Uid;
+use svalnir_core::quantity::Bytes;
 use svalnir_core::rule::RuleRegistry as _;
 
 use super::config::{self, Proposal};
@@ -200,6 +201,13 @@ const CLEAR_UNIT_LIMIT: usize = 64;
 struct ClearUnitView {
     path: LosslessPath,
     allocated_bytes: u64,
+    /// The private allocated bytes of the unit, or the cause that they are
+    /// unavailable. The reclaim estimate of the unit uses them when they
+    /// are available.
+    private_allocated_bytes: PrivateBytes,
+    /// The shared parts of the clone families whose members are each in
+    /// the unit. Not a reclaim figure.
+    complete_family_shared_bytes: PrivateBytes,
     /// The reasons that the unit is not eligible now. Empty for a unit
     /// that each check accepts.
     blockers: Vec<SkipReason>,
@@ -218,6 +226,10 @@ struct ClearInspectView {
     /// The sum of the allocated bytes of the units with no blocker. It is
     /// not exclusive storage.
     eligible_allocated_bytes: u64,
+    /// The sum of the reclaim estimates of the units with no blocker: the
+    /// private allocated bytes of a unit when they are available, and
+    /// otherwise its allocated bytes.
+    eligible_estimated_bytes: Bytes,
     /// The discovery of the roots, as `clean plan --mode evict` reports it.
     discovery: DiscoveryView,
     /// The data that the rule keeps.
@@ -238,9 +250,23 @@ impl ClearInspectView {
             .map(|candidate| ClearUnitView {
                 path: candidate.candidate.candidate.path.clone(),
                 allocated_bytes: candidate.discovered.measurement.allocated_bytes.get(),
+                private_allocated_bytes: candidate.discovered.measurement.private_allocated_bytes,
+                complete_family_shared_bytes: candidate
+                    .discovered
+                    .measurement
+                    .complete_family_shared_bytes,
                 blockers: candidate.discovered.blockers.clone(),
             })
             .collect();
+        let eligible_estimated_bytes: Bytes = Bytes::new(
+            discovery
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.discovered.blockers.is_empty())
+                .fold(0_u64, |sum, candidate| {
+                    sum.saturating_add(candidate.discovered.measurement.estimate.bytes.get())
+                }),
+        );
         let eligible_allocated_bytes: u64 = units
             .iter()
             .filter(|unit| unit.blockers.is_empty())
@@ -251,6 +277,7 @@ impl ClearInspectView {
             units: units.into_iter().take(CLEAR_UNIT_LIMIT).collect(),
             units_omitted,
             eligible_allocated_bytes,
+            eligible_estimated_bytes,
             discovery: DiscoveryView::new(rule.rule().reference.clone(), discovery),
             kept: rule.spec().kept,
             regeneration: rule.spec().regeneration,
@@ -281,9 +308,13 @@ impl ClearInspectView {
             if unit.blockers.is_empty() {
                 put_line!(
                     out,
-                    "  Unit: {}   {} allocated",
+                    "  Unit: {}   {} allocated, {}",
                     unit.path.display_label(),
-                    human_bytes(unit.allocated_bytes)
+                    human_bytes(unit.allocated_bytes),
+                    private_label(
+                        unit.private_allocated_bytes,
+                        unit.complete_family_shared_bytes
+                    )
                 );
             } else {
                 let reasons: Vec<String> = unit
@@ -308,8 +339,9 @@ impl ClearInspectView {
         }
         put_line!(
             out,
-            "  Eligible now: {} allocated (not exclusive storage)",
-            human_bytes(self.eligible_allocated_bytes)
+            "  Eligible now: {} allocated (not exclusive storage), estimate {}",
+            human_bytes(self.eligible_allocated_bytes),
+            human_bytes(self.eligible_estimated_bytes.get())
         );
         put_line!(out, "  Kept: {}", self.kept);
         put_line!(out, "  After a removal: {}", self.regeneration);
@@ -389,12 +421,7 @@ impl InspectView {
             render_roots(&mut out, &inspection.roots);
             for unit in &inspection.units {
                 let outcome: String = match &unit.outcome {
-                    ProjectUnitOutcome::Measured(measurement) => {
-                        format!(
-                            "measured, {} allocated",
-                            human_bytes(measurement.allocated_bytes.get())
-                        )
-                    }
+                    ProjectUnitOutcome::Measured(measurement) => measured_label(measurement),
                     ProjectUnitOutcome::Refused { reason } => format!("refused: {reason}"),
                     ProjectUnitOutcome::RepositoryRefused(refusal) => {
                         format!("refused: {}", refusal.reason.as_str())
@@ -429,10 +456,7 @@ impl InspectView {
                 put_line!(out, "  Root: {path}   {outcome}");
                 for unit in &root.units {
                     let outcome: String = match &unit.outcome {
-                        UnitOutcome::Measured(measurement) => format!(
-                            "measured, {} allocated",
-                            human_bytes(measurement.allocated_bytes.get())
-                        ),
+                        UnitOutcome::Measured(measurement) => measured_label(measurement),
                         UnitOutcome::Absent => "absent".to_owned(),
                         UnitOutcome::UnsupportedLayout => "unsupported_layout".to_owned(),
                         UnitOutcome::Refused { reason } => format!("refused: {reason}"),
@@ -462,6 +486,40 @@ impl InspectView {
         put_line!(out, "{}", self.note);
         out
     }
+}
+
+/// The private-size text of a unit: the private allocated bytes, or the
+/// cause that they are unavailable, and the shared bytes of the complete
+/// clone families when there are some.
+pub(crate) fn private_label(private: PrivateBytes, family_shared: PrivateBytes) -> String {
+    let text: String = match private {
+        PrivateBytes::Available { bytes } => {
+            format!("{} private allocated", human_bytes(bytes.get()))
+        }
+        PrivateBytes::Unavailable { cause } => {
+            format!("private size unavailable: {}", cause.as_str())
+        }
+    };
+    match family_shared.value().filter(|shared| shared.get() > 0) {
+        Some(shared) => format!(
+            "{text}, {} more shared in complete clone families (not a reclaim figure)",
+            human_bytes(shared.get())
+        ),
+        None => text,
+    }
+}
+
+/// The text of a measured unit of an inspection.
+fn measured_label(measurement: &CacheMeasurement) -> String {
+    format!(
+        "measured, {} allocated, {}{}",
+        human_bytes(measurement.allocated_bytes.get()),
+        private_label(
+            measurement.private_allocated_bytes,
+            measurement.complete_family_shared_bytes
+        ),
+        if measurement.partial { ", partial" } else { "" }
+    )
 }
 
 /// The text lines of the owner operation of a rule.

@@ -21,13 +21,14 @@ use svalnir_core::time::WallTime;
 
 use super::control::{CancellationToken, ScanClock, ScanObserver};
 use super::model::{
-    DirectoryRecord, EntryKind, EntryRecord, LargeDirectory, LargeFile, MountBoundary, RegionCause,
-    SCAN_RESULT_SCHEMA_VERSION, ScanCompletion, ScanError, ScanLimits, ScanRegion, ScanRequest,
-    ScanResult, ScanTimestamp, ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
+    DirectoryRecord, EntryKind, EntryRecord, LargeDirectory, LargeFile, MountBoundary,
+    PrivateAllocation, PrivateSizeUnavailable, RegionCause, SCAN_RESULT_SCHEMA_VERSION,
+    ScanCompletion, ScanError, ScanLimits, ScanRegion, ScanRequest, ScanResult, ScanTimestamp,
+    ScanTotals, ScanVolumeEvidence, SharedStorageEvidence,
 };
 use super::native::{self, DirStream, PrivateAttributes, RawMetadata};
 use super::private::{
-    FilePart, MAX_CLONE_FAMILIES, PrivateTally, file_part, is_unsupported_request,
+    FilePart, MAX_CLONE_FAMILIES, PrivateTally, cause_of_error, file_part, is_unsupported_request,
 };
 use super::top::TopList;
 
@@ -937,4 +938,66 @@ pub(super) fn scan_with(
         regions: walker.regions,
         regions_omitted: walker.regions_omitted,
     })
+}
+
+/// The private allocated bytes of the regular file at `path`, with the
+/// rules of a scan (`docs/RESOURCE_MODEL.md` section 8), for a rule unit that
+/// is one file.
+///
+/// The function opens the parent directory, reads the metadata of the name
+/// relative to it with no symbolic link followed, and reads the
+/// private-size attributes of the same name. `device` and `inode` are the
+/// identity of the earlier measurement of the caller: a name with another
+/// identity, or a name that is not a regular file, makes the quantities
+/// unavailable with `identity_changed`. A file with more than one link has a name outside
+/// the unit, so its private part is 0. A file with clones is a member of a
+/// family that is not complete, so the complete-family shared bytes are 0.
+/// The function does not materialize a dataless file.
+pub fn file_private_allocation(path: &Path, device: DeviceNumber, inode: u64) -> PrivateAllocation {
+    let _no_materialization = native::MaterializationOff::for_this_thread();
+    let mut tally: PrivateTally = PrivateTally::new(MAX_CLONE_FAMILIES);
+    match file_private_part(path, device, inode) {
+        Ok((part, links)) if links > 1 => tally.add_first_link(inode, links, part),
+        Ok((part, _)) => tally.add_file(part),
+        Err(cause) => tally.fail(cause),
+    }
+    tally.finish()
+}
+
+/// The part of the file at `path` and its link count.
+fn file_private_part(
+    path: &Path,
+    device: DeviceNumber,
+    inode: u64,
+) -> Result<(FilePart, u64), PrivateSizeUnavailable> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(PrivateSizeUnavailable::IdentityChanged);
+    };
+    let to_c = |text: &OsStr| CString::new(text.as_bytes()).ok();
+    let (Some(parent_text), Some(name_text)) = (to_c(parent.as_os_str()), to_c(name)) else {
+        return Err(PrivateSizeUnavailable::IdentityChanged);
+    };
+    let directory = native::open_root(&parent_text).map_err(|error| cause_of_error(&error))?;
+    let metadata: RawMetadata = native::stat_child(directory.as_fd(), &name_text)
+        .map_err(|error| cause_of_error(&error))?;
+    if metadata.kind != EntryKind::File
+        || metadata.device != Some(device)
+        || metadata.inode != inode
+    {
+        return Err(PrivateSizeUnavailable::IdentityChanged);
+    }
+    let allocated: Bytes =
+        allocated_from_blocks(metadata.blocks).ok_or(PrivateSizeUnavailable::InconsistentValue)?;
+    if metadata.dataless {
+        return Ok((FilePart::Allocated(allocated), metadata.link_count));
+    }
+    let attributes: io::Result<PrivateAttributes> =
+        match native::private_attributes(directory.as_fd(), &name_text, true) {
+            Err(error) if is_unsupported_request(&error) => {
+                native::private_attributes(directory.as_fd(), &name_text, false)
+            }
+            result => result,
+        };
+    let part: FilePart = file_part(attributes, metadata.inode, allocated, metadata.compressed)?;
+    Ok((part, metadata.link_count))
 }

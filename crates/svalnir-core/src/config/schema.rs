@@ -483,6 +483,28 @@ pub struct UserLayout {
     pub quiet_period: Option<Duration>,
 }
 
+/// One `[[cleanup.caches.locations]]` table: a cache location of a rule that
+/// the user supplies (`docs/CLEANUP_RULES.md` section 4, "Configured cache
+/// locations"). It adds a root to a reviewed rule and gives no authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheLocation {
+    /// The identity of a rule of [`super::CACHE_LOCATION_RULES`].
+    pub rule: String,
+    /// The location: an absolute path or a path that starts with `~/`. What
+    /// it names depends on the rule, as the table of the document says.
+    pub path: ConfigPath,
+}
+
+/// The `[cleanup.caches]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct CacheCleanup {
+    /// The `[[cleanup.caches.locations]]` tables, in the sequence of the
+    /// document. The template has none.
+    pub locations: Vec<CacheLocation>,
+}
+
 /// The `[cleanup]` table: the settings of the cleanup rules. A setting
 /// gives no authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +512,8 @@ pub struct UserLayout {
 pub struct Cleanup {
     /// The `[cleanup.projects]` table.
     pub projects: ProjectCleanup,
+    /// The `[cleanup.caches]` table.
+    pub caches: CacheCleanup,
 }
 
 /// The `[history]` table.

@@ -56,10 +56,11 @@ pub use reader::{MAX_FINDINGS, MAX_LIST_ENTRIES};
 pub use schema::{
     AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, CacheCleanup, CacheLocation,
     Cleanup, DiskExclusions, DiskGuard, EligibleGroup, GlobalTrigger, History,
-    KEPT_OUT_LAYOUT_NAMES, MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES, MAX_MARKER_COMPONENTS,
-    MAX_QUIET_PERIOD, MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD, MemoryGuard,
-    PROTECTED_HOME_NAMES, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy,
-    SCHEMA_VERSION, SKIPPED_DIRECTORY_NAMES, UserLayout, ValidatedConfig, VolumeSelector,
+    KEPT_OUT_LAYOUT_NAMES, MAX_CLAUDE_CONFIG_DIRS, MAX_LAYOUT_DIRECTORY_NAMES, MAX_LAYOUT_ENTRIES,
+    MAX_MARKER_COMPONENTS, MAX_QUIET_PERIOD, MAX_SEARCH_ROOTS, MAX_USER_LAYOUTS, MIN_QUIET_PERIOD,
+    MemoryGuard, PROTECTED_HOME_NAMES, Privacy, Profile, ProjectCleanup, Protections,
+    RestartPolicy, SCHEMA_VERSION, SKIPPED_DIRECTORY_NAMES, UserLayout, ValidatedConfig,
+    VolumeSelector,
 };
 pub use template::{PERSONAL_FOLDERS, TEMPLATE_REVISION};
 pub use validate::{MAX_APP_BUDGETS, MAX_DOCUMENT_BYTES, Validation, parse_and_validate};

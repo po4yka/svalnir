@@ -287,7 +287,8 @@ impl ProjectSources {
         let projects = &config.cleanup().projects;
         Self {
             git: GitTool::locate(),
-            transcripts: ClaudeTranscripts::for_home(home),
+            transcripts: ClaudeTranscripts::for_home(home)
+                .with_config_dirs(&projects.claude_config_dirs),
             agents: PaseoAgents::new(projects.paseo_agents, home),
             quiet_period: quiet_period(projects),
         }

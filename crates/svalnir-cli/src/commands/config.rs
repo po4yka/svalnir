@@ -320,6 +320,9 @@ struct ProjectCleanupView {
     /// The search roots of `project.dependency-directory`, relative to the
     /// home directory.
     search_roots: Vec<String>,
+    /// The Claude Code configuration folders that the transcript source reads
+    /// in addition to `~/.claude`, each an absolute path.
+    claude_config_dirs: Vec<String>,
     /// The `[[cleanup.projects.layouts]]` tables. Each one has the layout
     /// name `user-configured`, which never permits an automatic action.
     layouts: Vec<UserLayoutView>,
@@ -408,6 +411,11 @@ impl ShowView {
                         .unwrap_or(Nanoseconds::MAX),
                     paseo_agents: projects.paseo_agents,
                     search_roots: projects.search_roots.clone(),
+                    claude_config_dirs: projects
+                        .claude_config_dirs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
                     layouts: projects
                         .layouts
                         .iter()

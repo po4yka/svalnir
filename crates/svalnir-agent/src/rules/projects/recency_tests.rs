@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use svalnir_core::config::ConfigPath;
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::Fact;
 use svalnir_core::time::WallTime;
@@ -682,6 +683,98 @@ fn an_unreadable_transcript_folder_or_a_spent_bound_fails() {
             reason: "home_unknown"
         }
     );
+}
+
+/// The configuration path of the directory `path`.
+fn config_dir(path: &Path) -> ConfigPath {
+    ConfigPath::parse(path.to_str().unwrap()).unwrap()
+}
+
+#[test]
+fn a_configured_folder_with_a_newer_transcript_wins() {
+    let home = Home::new();
+    let other = Home::new();
+    let root: PathBuf = home.path.join("Code/app");
+    let key: String = encode_folder(&root);
+    set_modified(
+        &home.write(&format!(".claude/projects/{key}/a.jsonl"), b""),
+        at(BASE),
+    );
+    let source =
+        ClaudeTranscripts::for_home(Some(&home.path)).with_config_dirs(&[config_dir(&other.path)]);
+    // A configured folder with no `projects` directory gives no evidence.
+    assert_eq!(source.transcript_activity(&root), observed(at(BASE)));
+
+    set_modified(
+        &other.write(&format!("projects/{key}/s/b.jsonl"), b""),
+        at(BASE + 50),
+    );
+    let source =
+        ClaudeTranscripts::for_home(Some(&home.path)).with_config_dirs(&[config_dir(&other.path)]);
+    assert_eq!(source.transcript_activity(&root), observed(at(BASE + 50)));
+    // Only the configured folder has the transcript.
+    let lone = Home::new();
+    let source =
+        ClaudeTranscripts::for_home(Some(&lone.path)).with_config_dirs(&[config_dir(&other.path)]);
+    assert_eq!(source.transcript_activity(&root), observed(at(BASE + 50)));
+    // The source with no configured folder does not see it.
+    assert_eq!(
+        ClaudeTranscripts::for_home(Some(&lone.path)).transcript_activity(&root),
+        SourceReading::NoEvidence
+    );
+}
+
+#[test]
+fn an_unreadable_configured_projects_directory_fails() {
+    let home = Home::new();
+    let other = Home::new();
+    let root: PathBuf = home.path.join("Code/app");
+    other.write("projects/-x/a.jsonl", b"");
+    let projects: PathBuf = other.path.join("projects");
+    fs::set_permissions(&projects, fs::Permissions::from_mode(0o000)).unwrap();
+    let source =
+        ClaudeTranscripts::for_home(Some(&home.path)).with_config_dirs(&[config_dir(&other.path)]);
+    let result = source.transcript_activity(&root);
+    fs::set_permissions(&projects, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        result,
+        SourceReading::Failed {
+            reason: "transcripts_not_readable"
+        }
+    );
+    // A `projects` entry that is not a directory is also a failure.
+    let file = Home::new();
+    file.write("projects", b"");
+    let source =
+        ClaudeTranscripts::for_home(Some(&home.path)).with_config_dirs(&[config_dir(&file.path)]);
+    assert_eq!(
+        source.transcript_activity(&root),
+        SourceReading::Failed {
+            reason: "transcripts_not_readable"
+        }
+    );
+}
+
+#[test]
+fn the_default_folder_is_read_once_when_it_is_also_configured() {
+    let home = Home::new();
+    let root: PathBuf = home.path.join("Code/app");
+    let key: String = encode_folder(&root);
+    for index in 0..3 {
+        home.write(&format!(".claude/projects/{key}/{index}.jsonl"), b"");
+    }
+    let default_dir: ConfigPath = config_dir(&home.path.join(".claude"));
+    let source = ClaudeTranscripts::for_home(Some(&home.path))
+        .with_config_dirs(&[default_dir.clone(), default_dir]);
+    assert_eq!(source.directory_count(), 1);
+    // A second read of the same entries would double the use of the bound.
+    let twice = ClaudeTranscripts::for_home(Some(&home.path))
+        .with_config_dirs(&[config_dir(&home.path.join(".claude/"))]);
+    assert_eq!(twice.directory_count(), 1);
+    assert!(matches!(
+        twice.transcript_activity(&root),
+        SourceReading::Observed { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------

@@ -16,7 +16,8 @@
 //! - [`TranscriptActivity`]: the newest modification time of a Claude Code
 //!   transcript of the project. The native source ([`ClaudeTranscripts`])
 //!   reads only the names and the metadata of directory entries below
-//!   `~/.claude/projects`; it never opens a transcript.
+//!   `~/.claude/projects` and below `projects` of each configured
+//!   `claude_config_dirs` folder; it never opens a transcript.
 //! - [`AgentStatus`]: the Paseo agents that run. The native source
 //!   ([`PaseoAgents`]) is off unless the configuration turns it on. When it
 //!   is on, it runs `paseo` only from a fixed path that passes the checks of
@@ -41,7 +42,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::Serialize;
-use svalnir_core::config::ProjectCleanup;
+use svalnir_core::config::{ConfigPath, ProjectCleanup};
 use svalnir_core::quantity::Nanoseconds;
 use svalnir_core::rule::Fact;
 use svalnir_core::time::WallTime;
@@ -539,12 +540,18 @@ pub(super) fn matches_folder(name: &[u8], key: &[u8]) -> bool {
         && (name.len() == key.len() || name[key.len()] == b'-')
 }
 
-/// The transcript source: `~/.claude/projects` of the home directory.
+/// The transcript source: `~/.claude/projects` of the home directory and the
+/// `projects` directory of each configured Claude Code configuration folder
+/// (`[cleanup.projects].claude_config_dirs`). The source reads no environment
+/// variable.
 #[derive(Debug)]
 pub struct ClaudeTranscripts {
-    projects: Option<PathBuf>,
-    /// The names of the folders, read on the first use.
-    folders: OnceCell<Result<Vec<OsString>, &'static str>>,
+    /// The `projects` directories, with no one twice. `None` with no home
+    /// directory.
+    projects: Option<Vec<PathBuf>>,
+    /// The folders, each with the index of its `projects` directory, read on
+    /// the first use.
+    folders: OnceCell<Result<Vec<(usize, OsString)>, &'static str>>,
 }
 
 impl ClaudeTranscripts {
@@ -553,34 +560,67 @@ impl ClaudeTranscripts {
     #[must_use]
     pub fn for_home(home: Option<&Path>) -> Self {
         Self {
-            projects: home.map(|home| home.join(".claude/projects")),
+            projects: home.map(|home| vec![home.join(".claude/projects")]),
             folders: OnceCell::new(),
         }
     }
 
-    /// The names of the folders, or an empty list when the directory does
-    /// not exist.
-    fn folders(&self) -> &Result<Vec<OsString>, &'static str> {
+    /// The source that also reads the configuration folders `dirs`. A folder
+    /// that gives a `projects` directory that the source has already is
+    /// left out, so that no directory is read twice.
+    #[must_use]
+    pub fn with_config_dirs(mut self, dirs: &[ConfigPath]) -> Self {
+        if let Some(projects) = &mut self.projects {
+            for dir in dirs {
+                let Ok(expanded) = dir.expand(Path::new("/")) else {
+                    continue;
+                };
+                let candidate: PathBuf = expanded.join("projects");
+                let known: bool = projects.iter().any(|known| {
+                    known
+                        .as_os_str()
+                        .as_bytes()
+                        .eq_ignore_ascii_case(candidate.as_os_str().as_bytes())
+                });
+                if !known {
+                    projects.push(candidate);
+                }
+            }
+        }
+        self
+    }
+
+    /// The number of `projects` directories.
+    #[cfg(test)]
+    pub(crate) fn directory_count(&self) -> usize {
+        self.projects.as_ref().map_or(0, Vec::len)
+    }
+
+    /// The folders of each `projects` directory. A directory that does not
+    /// exist has none.
+    fn folders(&self) -> &Result<Vec<(usize, OsString)>, &'static str> {
         self.folders.get_or_init(|| {
-            let Some(projects) = &self.projects else {
+            let Some(directories) = &self.projects else {
                 return Err("home_unknown");
             };
-            match fs::symlink_metadata(projects) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(_) => return Err("transcripts_not_readable"),
-                Ok(metadata) if !metadata.file_type().is_dir() => {
-                    return Err("transcripts_not_readable");
+            let mut names: Vec<(usize, OsString)> = Vec::new();
+            for (index, projects) in directories.iter().enumerate() {
+                match fs::symlink_metadata(projects) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err("transcripts_not_readable"),
+                    Ok(metadata) if !metadata.file_type().is_dir() => {
+                        return Err("transcripts_not_readable");
+                    }
+                    Ok(_) => {}
                 }
-                Ok(_) => {}
-            }
-            let entries = fs::read_dir(projects).map_err(|_| "transcripts_not_readable")?;
-            let mut names: Vec<OsString> = Vec::new();
-            for entry in entries {
-                if names.len() >= MAX_TRANSCRIPT_FOLDERS {
-                    return Err("transcripts_bound_reached");
+                let entries = fs::read_dir(projects).map_err(|_| "transcripts_not_readable")?;
+                for (count, entry) in entries.enumerate() {
+                    if count >= MAX_TRANSCRIPT_FOLDERS {
+                        return Err("transcripts_bound_reached");
+                    }
+                    let entry = entry.map_err(|_| "transcripts_not_readable")?;
+                    names.push((index, entry.file_name()));
                 }
-                let entry = entry.map_err(|_| "transcripts_not_readable")?;
-                names.push(entry.file_name());
             }
             Ok(names)
         })
@@ -590,24 +630,24 @@ impl ClaudeTranscripts {
 impl TranscriptActivity for ClaudeTranscripts {
     fn transcript_activity(&self, root: &Path) -> SourceReading {
         let failed = |reason: &'static str| SourceReading::Failed { reason };
-        let folders: &[OsString] = match self.folders() {
+        let folders: &[(usize, OsString)] = match self.folders() {
             Ok(folders) => folders,
             Err(reason) => return failed(reason),
         };
-        let Some(projects) = &self.projects else {
+        let Some(directories) = &self.projects else {
             return failed("home_unknown");
         };
         let keys: Vec<String> = folder_keys(root);
         let mut newest: Option<WallTime> = None;
         let mut budget: usize = MAX_TRANSCRIPT_ENTRIES;
-        for name in folders {
+        for (index, name) in folders {
             if !keys
                 .iter()
                 .any(|key| matches_folder(name.as_bytes(), key.as_bytes()))
             {
                 continue;
             }
-            match newest_transcript(&projects.join(name), &mut budget) {
+            match newest_transcript(&directories[*index].join(name), &mut budget) {
                 Ok(Some(at)) => newest = newest.max(Some(at)),
                 Ok(None) => {}
                 Err(reason) => return failed(reason),

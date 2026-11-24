@@ -1301,6 +1301,46 @@ fn the_search_roots_are_plain_relative_paths_below_the_home_directory() {
     );
 }
 
+#[test]
+fn the_claude_config_dirs_are_absolute_paths_with_no_duplicate() {
+    let document = |value: &str| {
+        format!("schema_version = 1\n[cleanup.projects]\nclaude_config_dirs = {value}\n")
+    };
+    let template: ValidatedConfig = valid(example(README));
+    assert_eq!(template.cleanup().projects.claude_config_dirs.len(), 0);
+    let config: ValidatedConfig = valid(&document("[\"/Volumes/Work/claude\", \"/opt//cc/\"]"));
+    let shown: Vec<String> = config
+        .cleanup()
+        .projects
+        .claude_config_dirs
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(shown, ["/Volumes/Work/claude", "/opt/cc"]);
+    assert!(config.is_explicit("cleanup.projects.claude_config_dirs"));
+    for bad in ["", "relative/dir", "~/claude", "/a/../b", "/a/./b", "/a/*"] {
+        assert_one(
+            &document(&format!("[\"{bad}\"]")),
+            FindingCode::InvalidPath,
+            "cleanup.projects.claude_config_dirs[0]",
+        );
+    }
+    assert_one(
+        &document("[\"/a/b\", \"/A/B/\"]"),
+        FindingCode::DuplicateIdentifier,
+        "cleanup.projects.claude_config_dirs[1]",
+    );
+    let many: String = (0..=super::MAX_CLAUDE_CONFIG_DIRS)
+        .map(|index| format!("\"/d{index}\""))
+        .collect::<Vec<String>>()
+        .join(", ");
+    assert_one(
+        &document(&format!("[{many}]")),
+        FindingCode::TooManyEntries,
+        "cleanup.projects.claude_config_dirs",
+    );
+}
+
 /// A document with one `[[cleanup.projects.layouts]]` table with `body`.
 fn layout_document(body: &str) -> String {
     format!("schema_version = 1\n\n[[cleanup.projects.layouts]]\n{body}\n")

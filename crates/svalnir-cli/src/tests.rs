@@ -911,6 +911,7 @@ fn config_show_has_the_project_cleanup_table() {
                 "quiet_period": "86400000000000",
                 "paseo_agents": false,
                 "search_roots": [],
+                "claude_config_dirs": [],
                 "layouts": []
             },
             "cache_locations": []
@@ -918,7 +919,7 @@ fn config_show_has_the_project_cleanup_table() {
     );
     std::fs::write(
         state.join("config.toml"),
-        "schema_version = 1\n[cleanup.projects]\nquiet_period = \"2d\"\npaseo_agents = true\nsearch_roots = [\"Developer\", \"GitHub/work\"]\n\n[[cleanup.projects.layouts]]\ndirectory = \"builddir\"\nmarkers = [\"meson.build\", \"*.meson\"]\nprotected = [\"keep\"]\nquiet_period = \"2h\"\n",
+        "schema_version = 1\n[cleanup.projects]\nquiet_period = \"2d\"\npaseo_agents = true\nsearch_roots = [\"Developer\", \"GitHub/work\"]\nclaude_config_dirs = [\"/Volumes/Work/claude\"]\n\n[[cleanup.projects.layouts]]\ndirectory = \"builddir\"\nmarkers = [\"meson.build\", \"*.meson\"]\nprotected = [\"keep\"]\nquiet_period = \"2h\"\n",
     )
     .unwrap();
     let shown = run_with(&environment, &["config", "show", "--format", "json"]);
@@ -929,6 +930,7 @@ fn config_show_has_the_project_cleanup_table() {
             "quiet_period": "172800000000000",
             "paseo_agents": true,
             "search_roots": ["Developer", "GitHub/work"],
+            "claude_config_dirs": ["/Volumes/Work/claude"],
             "layouts": [{
                 "directory": "builddir",
                 "markers": ["meson.build", "*.meson"],

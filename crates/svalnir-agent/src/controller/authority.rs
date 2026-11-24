@@ -409,4 +409,69 @@ mod tests {
         // No list is not "not protected".
         assert_ne!(authority.protection(&[]), ProtectionFact::NotProtected);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_check_before_a_step_asks_paseo_only_for_the_project_rule_and_a_unit_that_is_there() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use svalnir_core::id::{RuleId, RuleRevisionId};
+
+        use crate::rules::fixture::FixtureEnvironment;
+        use crate::rules::projects::PaseoAgents;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let home: std::path::PathBuf = std::fs::canonicalize(directory.path()).unwrap();
+        let uid = Uid::new(std::fs::metadata(&home).unwrap().uid());
+        // A program that records each call.
+        let marker: std::path::PathBuf = home.join("asked");
+        let program: std::path::PathBuf = home.join("paseo");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho x >> '{}'\necho '[]'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let calls = || std::fs::read_to_string(&marker).map_or(0, |text| text.lines().count());
+        let root: std::path::PathBuf = home.join("Code");
+        std::fs::create_dir_all(root.join("app/node_modules/pkg")).unwrap();
+        std::fs::write(root.join("app/package.json"), b"{}").unwrap();
+        let unit: std::path::PathBuf = root.join("app/node_modules");
+        let records = {
+            let mut records = AuthorityRecords::new(uid, Box::new(NoRules));
+            records.environment = Some(Arc::new(FixtureEnvironment::days_later(0)));
+            records.project_agents = PaseoAgents::new(true, Some(&home))
+                .with_unchecked(program, Duration::from_secs(10));
+            records
+        };
+        let authority = SharedAuthority::new(records);
+        let rule = |id: &str| svalnir_core::rule::RuleRef {
+            id: RuleId::new(id).unwrap(),
+            revision: RuleRevisionId::new("r6").unwrap(),
+        };
+        // A unit that is gone ends the check before the listing.
+        let gone: std::path::PathBuf = root.join("app/missing/node_modules");
+        let _ = authority.unit_recheck(
+            &rule("project.dependency-directory"),
+            Some("node-modules"),
+            &root,
+            &gone,
+            &[],
+        );
+        assert_eq!(calls(), 0);
+        // Another rule never asks.
+        let _ = authority.unit_recheck(&rule("yarn.cache"), None, &root, &unit, &[]);
+        assert_eq!(calls(), 0);
+        // The project rule asks once for a unit that is there.
+        let _ = authority.unit_recheck(
+            &rule("project.dependency-directory"),
+            Some("node-modules"),
+            &root,
+            &unit,
+            &[],
+        );
+        assert_eq!(calls(), 1);
+    }
 }

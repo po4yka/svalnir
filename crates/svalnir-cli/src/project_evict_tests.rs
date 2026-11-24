@@ -87,6 +87,8 @@ struct World {
     evidence: FixtureEnvironment,
     home: PathBuf,
     git: GitTool,
+    /// The revision of the configuration in effect.
+    revision: std::cell::RefCell<String>,
 }
 
 impl World {
@@ -110,6 +112,7 @@ impl World {
             evidence,
             home,
             git: GitTool::locate().expect("the developer tools of the host have Git"),
+            revision: std::cell::RefCell::new(String::new()),
         };
         world.activate(document);
         world
@@ -120,6 +123,12 @@ impl World {
     }
 
     fn activate(&self, document: &str) {
+        self.activate_over(document, "none");
+    }
+
+    /// Applies `document` over the revision `expected` and keeps the
+    /// revision that the apply makes.
+    fn activate_over(&self, document: &str, expected: &str) {
         let config: PathBuf = self.directory.path().join("config.toml");
         std::fs::write(&config, document).unwrap();
         let outcome = json(
@@ -130,10 +139,14 @@ impl World {
                 "--config",
                 config.to_str().unwrap(),
                 "--expected-revision",
-                "none",
+                expected,
             ],
         );
         assert_eq!(outcome.status, ExitStatus::Success, "{}", outcome.stdout);
+        *self.revision.borrow_mut() = outcome.result()["report"]["revision"]["revision_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
     }
 
     fn write(&self, relative: &str, content: &[u8]) {
@@ -868,4 +881,32 @@ fn a_repository_that_the_plan_does_not_list_skips_the_step() {
     );
     assert!(package.join(".build/extra/.git").exists());
     assert!(package.join(".build/checkouts/dep/.git").exists());
+}
+
+#[test]
+fn a_transient_coordinator_asks_paseo_again_before_the_step() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = World::manual();
+    let app: PathBuf = world.node_project("app");
+    // A Paseo program that lists no agent while the plan is made.
+    let paseo: PathBuf = world.home.join("paseo");
+    std::fs::write(&paseo, "#!/bin/sh\necho '[]'\n").unwrap();
+    std::fs::set_permissions(&paseo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let document: String = format!(
+        "schema_version = 1\n[cleanup.projects]\npaseo_agents = true\npaseo_executable = \"{}\"\n",
+        paseo.display()
+    );
+    let revision: String = world.revision.borrow().clone();
+    world.activate_over(&document, &revision);
+    let (plan_id, _) = world.planned();
+    // The program is gone at the apply. The apply runs in the process of
+    // the client with no agent, and its check before the step asks again.
+    std::fs::remove_file(&paseo).unwrap();
+    let applied = world.apply(&plan_id);
+    assert!(
+        applied.stdout.contains("paseo_not_installed"),
+        "{}",
+        applied.stdout
+    );
+    assert!(app.join("node_modules/left-pad/index.js").exists());
 }

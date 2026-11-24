@@ -478,7 +478,8 @@ pub(super) fn read_search_roots(
     complete.then_some(roots)
 }
 
-/// Reads `claude_config_dirs` of `[cleanup.projects]`: absolute paths, at
+/// Reads `claude_config_dirs` of `[cleanup.projects]`: absolute paths below
+/// the root, at
 /// most [`MAX_CLAUDE_CONFIG_DIRS`]. `None` when the key is absent or has a
 /// finding.
 pub(super) fn read_claude_config_dirs(
@@ -501,7 +502,20 @@ pub(super) fn read_claude_config_dirs(
     let mut complete: bool = true;
     for (item_path, text) in items {
         let parsed: ConfigPath = match ConfigPath::parse(text) {
-            Ok(parsed) if parsed.base() == PathBase::Root => parsed,
+            Ok(parsed)
+                if parsed.base() == PathBase::Root && parsed.components().next().is_some() =>
+            {
+                parsed
+            }
+            Ok(parsed) if parsed.base() == PathBase::Root => {
+                context.report(
+                    FindingCode::InvalidPath,
+                    &item_path,
+                    "must name a directory, not the root",
+                );
+                complete = false;
+                continue;
+            }
             Ok(_) => {
                 context.report(FindingCode::InvalidPath, &item_path, "must start with `/`");
                 complete = false;

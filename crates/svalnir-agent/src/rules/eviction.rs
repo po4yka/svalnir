@@ -56,7 +56,7 @@ use super::model::{
 };
 use super::overlap::{OverlapConflict, OverlapResolution};
 use super::projects::{
-    AgentListing, BuildProcesses, PROJECT_EVIDENCE_EXPIRY, PROJECT_RULE_ID, ProjectDiscoveryInput,
+    AgentsRead, BuildProcesses, PROJECT_EVIDENCE_EXPIRY, PROJECT_RULE_ID, ProjectDiscoveryInput,
     ProjectRequest, RecheckInput, SearchRootReport, UnitRecheck, examined_for,
     inventory as project_inventory, recheck_unit,
 };
@@ -624,7 +624,7 @@ pub trait DiscoveryEnvironment: ScanClock {
         root: &Path,
         path: &Path,
         user_layouts: &[UserLayout],
-        agents: &AgentListing,
+        agents: &dyn AgentsRead,
         admitted: &[AdmittedRepository],
     ) -> UnitRecheck {
         if let Some(spec) = clear::spec_of(rule.id.as_str()) {

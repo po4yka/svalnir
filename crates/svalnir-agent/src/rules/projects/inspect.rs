@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -2073,22 +2074,79 @@ pub struct RecheckInput<'a> {
     /// runs the exception again and needs exactly this list
     /// (`docs/CLEANUP_RULES.md` section 6).
     pub admitted: &'a [AdmittedRepository],
-    /// The Paseo listing, read now. [`AgentListing::Off`] when the source is
-    /// off in the configuration in effect.
-    pub agents: &'a AgentListing,
+    /// The Paseo listing, read now and only when a check needs it.
+    /// [`AgentListing::Off`] when the source is off in the configuration in
+    /// effect.
+    pub agents: &'a dyn AgentsRead,
+}
+
+/// The source of the Paseo listing of a check before a step. The listing
+/// starts a process, so a check asks for it only when the cheaper checks
+/// pass.
+pub trait AgentsRead: fmt::Debug {
+    /// The listing. The same value for each call of one source.
+    fn listing(&self) -> &AgentListing;
+}
+
+impl AgentsRead for AgentListing {
+    fn listing(&self) -> &AgentListing {
+        self
+    }
+}
+
+/// A listing that `read` makes at the first call of
+/// [`AgentsRead::listing`] and keeps, so one check makes at most one call.
+pub struct LazyAgents<F: Fn() -> AgentListing> {
+    read: F,
+    cell: std::cell::OnceCell<AgentListing>,
+}
+
+impl<F: Fn() -> AgentListing> LazyAgents<F> {
+    /// A source that calls `read` on the first use.
+    pub const fn new(read: F) -> Self {
+        Self {
+            read,
+            cell: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl<F: Fn() -> AgentListing> fmt::Debug for LazyAgents<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LazyAgents")
+            .field("read", &self.cell.get().is_some())
+            .finish()
+    }
+}
+
+impl<F: Fn() -> AgentListing> AgentsRead for LazyAgents<F> {
+    fn listing(&self) -> &AgentListing {
+        self.cell.get_or_init(&self.read)
+    }
 }
 
 /// The project root of the project directory `project` for the Paseo check:
 /// the nearest directory from `project` upward, not above `root`, that has a
 /// `.git` entry (a file or a directory, with no link followed). With none,
 /// `project` itself.
-pub(super) fn paseo_root(project: &Path, root: &Path) -> PathBuf {
-    project
+///
+/// # Errors
+///
+/// A failure of the lookup of a `.git` entry other than a missing entry:
+/// the project root is not known.
+pub(super) fn paseo_root(project: &Path, root: &Path) -> io::Result<PathBuf> {
+    for directory in project
         .ancestors()
         .take_while(|directory| directory.starts_with(root))
-        .find(|directory| fs::symlink_metadata(directory.join(".git")).is_ok())
-        .unwrap_or(project)
-        .to_path_buf()
+    {
+        match fs::symlink_metadata(directory.join(".git")) {
+            Ok(_) => return Ok(directory.to_path_buf()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(project.to_path_buf())
 }
 
 /// The refusal of the check before a step from the Paseo listing
@@ -2096,11 +2154,13 @@ pub(super) fn paseo_root(project: &Path, root: &Path) -> PathBuf {
 /// agent in the project root refuses the unit. `None` when the source is off
 /// or no agent works in the project.
 fn agent_evidence(input: &RecheckInput<'_>, project: &Path) -> Option<UnitRecheck> {
-    match input.agents {
+    match input.agents.listing() {
         AgentListing::Off => None,
         AgentListing::Failed { reason } => Some(UnitRecheck::Unknown(reason)),
         AgentListing::Listed { busy } => {
-            let root: PathBuf = paseo_root(project, input.root);
+            let Ok(root) = paseo_root(project, input.root) else {
+                return Some(UnitRecheck::Unknown("project_root_unknown"));
+            };
             has_busy_agent_in(busy, &root).then_some(UnitRecheck::Refused("agent_running"))
         }
     }

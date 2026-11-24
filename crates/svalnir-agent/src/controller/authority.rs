@@ -31,7 +31,7 @@ use crate::coordinator::{AuthoritySource, RevisionSnapshot, TimeReading, Trigger
 use crate::executor::fs::ApprovedRoots;
 use crate::protection::ProtectedLocations;
 use crate::rules::projects::{
-    AgentListing, AgentStatus as _, PROJECT_RULE_ID, PaseoAgents, UnitRecheck,
+    AgentListing, AgentStatus as _, LazyAgents, PROJECT_RULE_ID, PaseoAgents, UnitRecheck,
 };
 use crate::rules::{ProducerActivity, SharedEnvironment};
 
@@ -314,12 +314,16 @@ impl AuthoritySource for SharedAuthority {
             )
         };
         // One Paseo call for each check, only for the rule that has the
-        // source.
-        let agents: AgentListing = if rule.id.as_str() == PROJECT_RULE_ID {
-            source.agent_listing()
-        } else {
-            AgentListing::Off
-        };
+        // source, and only when the unit is there and the cheaper checks
+        // pass.
+        let project_rule: bool = rule.id.as_str() == PROJECT_RULE_ID;
+        let agents = LazyAgents::new(|| {
+            if project_rule {
+                source.agent_listing()
+            } else {
+                AgentListing::Off
+            }
+        });
         environment.map_or(UnitRecheck::Unknown("no_process_evidence"), |environment| {
             environment.unit_recheck(
                 principal, rule, layout, root, path, &layouts, &agents, admitted,

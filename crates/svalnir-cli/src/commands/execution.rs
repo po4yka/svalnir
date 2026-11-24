@@ -36,6 +36,7 @@ use svalnir_agent::platform::process::DarwinProcessSource;
 use svalnir_agent::platform::volume;
 use svalnir_agent::protection::ProtectedLocations;
 use svalnir_agent::rules::ReviewedRules;
+use svalnir_agent::rules::projects::PaseoAgents;
 use svalnir_agent::runtime::host::{EpochIds, SystemAgentClock, SystemMeasurements};
 use svalnir_agent::runtime::{AgentClock, ClockHandle, ThreadIdle};
 use svalnir_core::action::{
@@ -304,12 +305,23 @@ fn coordinator_dependencies(
     // of `project.dependency-directory` with the layout `user-configured`
     // before its step. A configuration that cannot be read gives none, and
     // such a unit is then skipped.
-    records.project_layouts = open_journal(environment)
+    // The same configuration gives the Paseo source of that check. With no
+    // configuration, the source is off, as at the agent.
+    let active = open_journal(environment)
         .ok()
-        .and_then(|journal| session::active_config(&journal, authority).ok())
-        .map_or_else(Vec::new, |active| {
-            active.config.cleanup().projects.layouts.clone()
-        });
+        .and_then(|journal| session::active_config(&journal, authority).ok());
+    records.project_layouts = active.as_ref().map_or_else(Vec::new, |active| {
+        active.config.cleanup().projects.layouts.clone()
+    });
+    records.project_agents = active.as_ref().map_or_else(
+        || PaseoAgents::new(false, None),
+        |active| {
+            PaseoAgents::from_settings(
+                &active.config.cleanup().projects,
+                environment.home.as_deref(),
+            )
+        },
+    );
     let authority: SharedAuthority = SharedAuthority::new(records);
     Ok((
         Dependencies {

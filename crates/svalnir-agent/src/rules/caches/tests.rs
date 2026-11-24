@@ -844,3 +844,56 @@ fn a_git_entry_that_cannot_be_examined_refuses_the_location() {
     fs::set_permissions(&location, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(refusal, Some("configuration_in_work_tree_unknown"));
 }
+
+#[test]
+fn a_root_outside_the_home_directory_with_a_writable_ancestor_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = Home::new();
+    let outside: TempDir = TempDir::new().unwrap();
+    let base: PathBuf = fs::canonicalize(outside.path()).unwrap();
+    let root: PathBuf = base.join("a/cache");
+    fs::create_dir_all(&root).unwrap();
+    let mode = |path: &Path, bits: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(bits)).unwrap();
+    };
+    mode(&base, 0o755);
+    mode(&base.join("a"), 0o755);
+    mode(&root, 0o755);
+    assert_eq!(super::ancestor_refusal(&root, &home.path), None);
+    // A directory above the root that the group or others can write.
+    mode(&base.join("a"), 0o775);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    mode(&base.join("a"), 0o757);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    // The root itself.
+    mode(&base.join("a"), 0o755);
+    mode(&root, 0o770);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    // A sticky directory of a user other than root is no exception.
+    mode(&root, 0o755);
+    mode(&base.join("a"), 0o1777);
+    assert_eq!(
+        super::ancestor_refusal(&root, &home.path),
+        Some("root_ancestor_writable")
+    );
+    // A root below the home directory has no refusal here.
+    let inside: PathBuf = home.path.join("x/cache");
+    fs::create_dir_all(&inside).unwrap();
+    mode(&home.path.join("x"), 0o777);
+    assert_eq!(super::ancestor_refusal(&inside, &home.path), None);
+    // An absent root is reported by its binding.
+    assert_eq!(
+        super::ancestor_refusal(&base.join("absent/cache"), &home.path),
+        None
+    );
+}

@@ -1273,6 +1273,12 @@ impl ReviewedRules {
                 );
             }
         };
+        // A root outside the home directory (the Ruby of Homebrew, a
+        // configured location) is also refused when a directory above it
+        // permits a change by a user other than its owner.
+        if let Some(code) = super::caches::ancestor_refusal(path, home) {
+            return refuse(RootResult::Refused(code), false);
+        }
         if let Some(refused) = clear_root_refusal(clear, request, &bound) {
             let complete: bool = refused == RootResult::OtherVolume;
             return refuse(refused, complete);

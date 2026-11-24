@@ -454,6 +454,9 @@ pub(in crate::rules) fn check_scope_root(
         Err(WalkStop::Absent) => return Err(RootOutcome::Absent),
         Err(stop) => return Err(refused(walk_refusal(&stop))),
     }
+    if let Some(code) = super::ancestor_refusal(path, home) {
+        return Err(refused(code));
+    }
     let bound = bind_root(path).map_err(|problem| match problem {
         RootProblem::Absent => RootOutcome::Absent,
         other => refused(other.as_str()),

@@ -6,6 +6,7 @@
 //! fixture.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use svalnir_core::id::RuleId;
@@ -1003,6 +1004,30 @@ fn a_configured_root_has_the_checks_of_a_default_root() {
         &RootResult::Refused("configuration_in_work_tree")
     );
     assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // A location outside the home directory under a directory that the
+    // group can write.
+    let outside: TempDir = TempDir::new().unwrap();
+    let base: PathBuf = fs::canonicalize(outside.path()).unwrap();
+    fs::create_dir_all(base.join("shared/hex/packages/hexpm")).unwrap();
+    fs::write(base.join("shared/hex/packages/hexpm/a.tar"), b"tar").unwrap();
+    let set_mode = |relative: &str, bits: u32| {
+        fs::set_permissions(base.join(relative), fs::Permissions::from_mode(bits)).unwrap();
+    };
+    set_mode("", 0o755);
+    set_mode("shared", 0o775);
+    let discovery = manual_with(&home, "hex.packages", &[base.join("shared/hex")]);
+    assert_eq!(
+        root_result(&discovery, &base.join("shared/hex/packages")),
+        &RootResult::Refused("root_ancestor_writable")
+    );
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // With the mode 0755 the root is examined.
+    set_mode("shared", 0o755);
+    let discovery = manual_with(&home, "hex.packages", &[base.join("shared/hex")]);
+    assert!(matches!(
+        root_result(&discovery, &base.join("shared/hex/packages")),
+        RootResult::Examined { .. }
+    ));
     // A location in the folder of a project with no Git.
     home.write("proj/hex/packages/hexpm/a.tar", b"tar");
     home.write("proj/Package.swift", b"");

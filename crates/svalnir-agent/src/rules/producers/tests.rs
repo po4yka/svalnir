@@ -911,6 +911,22 @@ fn a_configured_location_of_an_owner_rule_has_each_check_of_a_root() {
         scope(&home.path.join("proj/cache")).outcome,
         RootOutcome::Refused("root_in_project")
     );
+    // A location outside the home directory under a directory that the
+    // group can write.
+    let outside: TempDir = TempDir::new().unwrap();
+    let base: PathBuf = fs::canonicalize(outside.path()).unwrap();
+    fs::create_dir_all(base.join("shared/cache/.auto_prune")).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(base.join("shared"), fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        scope(&base.join("shared/cache")).outcome,
+        RootOutcome::Refused("root_ancestor_writable")
+    );
+    fs::set_permissions(base.join("shared"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        scope(&base.join("shared/cache")).outcome,
+        RootOutcome::Examined
+    );
     // The home directory.
     assert!(matches!(
         scope(&home.path).outcome,

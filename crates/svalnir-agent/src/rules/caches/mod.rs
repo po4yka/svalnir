@@ -202,7 +202,46 @@ pub fn location_refusal(
             Err(_) => return Some("configuration_in_work_tree_unknown"),
         }
     }
-    inspect::is_in_project(path, home).then_some("root_in_project")
+    if inspect::is_in_project(path, home) {
+        return Some("root_in_project");
+    }
+    ancestor_refusal(path, home)
+}
+
+/// The stable code of a root outside the home directory whose own directory
+/// or an ancestor directory below `/` can be changed by a user other than its
+/// owner, or `None` (`root_ancestor_writable`): a directory that is writable
+/// by its group or by others, unless it is a sticky directory of the user
+/// `root`. The root and each ancestor are examined with no link followed. A
+/// root below the home directory has no refusal here, because the checks of
+/// the home directory are the checks of the account. A directory that is absent
+/// has none (the binding reports it), and one that cannot be examined is
+/// refused with `root_not_readable`. The caller has examined the locality of
+/// the path first.
+#[must_use]
+pub(in crate::rules) fn ancestor_refusal(path: &Path, home: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    const GROUP_OR_OTHERS_WRITE: u32 = 0o022;
+    const STICKY: u32 = 0o1000;
+    if path.starts_with(home) {
+        return None;
+    }
+    for ancestor in path
+        .ancestors()
+        .take_while(|ancestor| ancestor.parent().is_some())
+    {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                let sticky_root: bool = metadata.mode() & STICKY != 0 && metadata.uid() == 0;
+                if metadata.mode() & GROUP_OR_OTHERS_WRITE != 0 && !sticky_root {
+                    return Some("root_ancestor_writable");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some("root_not_readable"),
+        }
+    }
+    None
 }
 
 /// A location of the host that a rule refuses as a root.

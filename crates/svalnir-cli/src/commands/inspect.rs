@@ -262,6 +262,9 @@ impl ClearInspectView {
             let source: String = match &root.source {
                 ClearRootSource::Default { pattern } => format!("default {pattern}"),
                 ClearRootSource::Configuration { file } => format!("configuration {file}"),
+                ClearRootSource::Location => {
+                    "[[cleanup.caches.locations]] of the configuration".to_owned()
+                }
             };
             match (&root.path, root.problem) {
                 (Some(path), _) => {
@@ -716,6 +719,7 @@ pub(crate) fn inspect(
         principal,
         locations: &locations,
         user_exclusions: &host.user_exclusions,
+        cache_locations: &host.cache_locations,
     };
     let owner: Option<OwnerInspection> = registry.producer(rule).map(|producer| {
         producer.inspect(
@@ -740,6 +744,7 @@ pub(crate) fn inspect(
                 principal,
                 locations: &locations,
                 user_exclusions: &host.user_exclusions,
+                cache_locations: &host.cache_locations,
             },
             InspectionLimits::default(),
             &cancel,

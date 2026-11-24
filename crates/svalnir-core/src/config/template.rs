@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use super::path::ConfigPath;
 use super::schema::{
-    AgentConfig, AutomaticMode, Cleanup, DiskExclusions, DiskGuard, GlobalTrigger, History,
-    MemoryGuard, Privacy, Profile, ProjectCleanup, CacheCleanup, VolumeSelector,
+    AgentConfig, AutomaticMode, CacheCleanup, Cleanup, DiskExclusions, DiskGuard, GlobalTrigger,
+    History, MemoryGuard, Privacy, Profile, ProjectCleanup, VolumeSelector,
 };
 use crate::quantity::{Bytes, EntryCount};
 

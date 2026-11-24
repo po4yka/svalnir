@@ -36,6 +36,8 @@ mod inspect;
 #[cfg(test)]
 mod tests;
 
+use std::path::{Path, PathBuf};
+
 use svalnir_core::action::{Checked, ExecutorRole, FileObjectType, WorkCharge};
 use svalnir_core::file::LosslessPath;
 use svalnir_core::id::{RuleId, RuleRevisionId};
@@ -93,6 +95,93 @@ pub const PROJECT_MARKERS: [&str; 13] = [
     "Package.swift",
     "Gemfile",
 ];
+
+/// What a configured location (`[[cleanup.caches.locations]]`) names for a
+/// rule (`docs/CLEANUP_RULES.md` section 4, "Configured cache locations").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationForm {
+    /// The rule has no configured location: no fixed variable or argument
+    /// of its command names the root, or the producer has no variable.
+    NotAccepted,
+    /// The location is the root itself.
+    Itself,
+    /// The location is the home directory of the producer, and the roots
+    /// are these paths below it.
+    Below(&'static [&'static str]),
+}
+
+/// One configured location, with its path in the absolute form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLocationEntry {
+    /// The rule identity.
+    pub rule: String,
+    /// The absolute path of the location.
+    pub path: PathBuf,
+}
+
+/// The configured locations of `config`, with `~/` expanded below `home`. A
+/// location that needs a home directory that is not known is left out.
+#[must_use]
+pub fn cache_locations(
+    config: &svalnir_core::config::ValidatedConfig,
+    home: Option<&Path>,
+) -> Vec<CacheLocationEntry> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    config
+        .cleanup()
+        .caches
+        .locations
+        .iter()
+        .filter_map(|location| {
+            Some(CacheLocationEntry {
+                rule: location.rule.clone(),
+                path: location.path.expand(home).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The paths of the configured locations of the rule `rule`.
+#[must_use]
+pub fn locations_of(entries: &[CacheLocationEntry], rule: &str) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| entry.rule == rule)
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// The stable code of a configured location that fails a check of a
+/// location, or `None`: the catalog of protected file locations protects it
+/// (`root_protected`), it is the home directory or contains it
+/// (`root_contains_home`), or a directory from it up to the home directory
+/// (not included; up to `/` for a location outside the home directory) has a
+/// `.git` entry (`configuration_in_work_tree`). A repository in the folder of
+/// a project can be the work of the user. The checks of a root of the rule
+/// itself (owner, filesystem, marker) run after this one.
+#[must_use]
+pub fn location_refusal(
+    path: &Path,
+    home: &Path,
+    locations: &crate::protection::ProtectedLocations,
+) -> Option<&'static str> {
+    use svalnir_core::policy::ProtectionFact;
+    match locations.of_text(path) {
+        ProtectionFact::NotProtected => {}
+        ProtectionFact::Protected => return Some("root_protected"),
+        ProtectionFact::Unknown => return Some("root_protection_unknown"),
+    }
+    if path == home || home.starts_with(path) {
+        return Some("root_contains_home");
+    }
+    let in_tree: bool = path
+        .ancestors()
+        .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
+        .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
+    in_tree.then_some("configuration_in_work_tree")
+}
 
 /// A location of the host that a rule refuses as a root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -95,6 +95,8 @@ impl UserTree {
             principal: self.principal,
             locations: self.locations(),
             user_exclusions: Vec::new(),
+            cache_locations: Vec::new(),
+            system_root: PathBuf::from("/nonexistent-svalnir-system-root"),
         }
     }
 }
@@ -436,6 +438,8 @@ fn with_no_home_directory_or_no_state_directory_nothing_is_examined() {
         principal: home.principal,
         locations: ProtectedLocations::resolve(Some(&home.home), None),
         user_exclusions: Vec::new(),
+        cache_locations: Vec::new(),
+        system_root: PathBuf::from("/nonexistent-svalnir-system-root"),
     };
     let discovery = discover(
         &registry,
@@ -459,6 +463,8 @@ fn a_state_directory_in_the_root_refuses_the_root() {
         principal: home.principal,
         locations: ProtectedLocations::resolve(Some(&home.home), Some(&state)),
         user_exclusions: Vec::new(),
+        cache_locations: Vec::new(),
+        system_root: PathBuf::from("/nonexistent-svalnir-system-root"),
     };
     let discovery = discover(
         &automatic_registry(),

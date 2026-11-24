@@ -1758,7 +1758,12 @@ fn a_cache_location_with_a_problem_has_a_finding() {
     let at = |index: usize, key: &str| format!("cleanup.caches.locations[{index}].{key}");
     // A rule that does not support a location: an unknown rule, a rule
     // whose command names no root, and a rule with no location.
-    for rule in ["no.such-rule", "mise.installs", "swiftpm.cache", "nuget.http-cache"] {
+    for rule in [
+        "no.such-rule",
+        "mise.installs",
+        "swiftpm.cache",
+        "nuget.http-cache",
+    ] {
         assert_one(
             &location_document(&[(rule, "~/x")]),
             FindingCode::UnknownValue,

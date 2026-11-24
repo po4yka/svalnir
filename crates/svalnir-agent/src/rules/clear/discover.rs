@@ -383,9 +383,17 @@ fn form_refusal(
         {
             None
         }
-        (ObjectKind::Directory | ObjectKind::RegularFile, UnitForm::GemFile) => {
-            Some(SkipReason::UnsupportedLayout)
+        (ObjectKind::RegularFile, UnitForm::ZipFile)
+            if relative
+                .extension()
+                .is_some_and(|extension| extension == "zip") =>
+        {
+            None
         }
+        (
+            ObjectKind::Directory | ObjectKind::RegularFile,
+            UnitForm::GemFile | UnitForm::ZipFile,
+        ) => Some(SkipReason::UnsupportedLayout),
         (ObjectKind::RegularFile, UnitForm::MavenArtifact) => Some(SkipReason::UnsupportedLayout),
     }
 }

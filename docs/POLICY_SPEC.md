@@ -128,6 +128,33 @@ protected = ["meson-private/install.dat"]
 quiet_period = "3d"
 ```
 
+Each `[[cleanup.caches.locations]]` table (owner decision of 2026-11-24) gives a reviewed cache rule a location that Svalnir cannot find, because Svalnir reads no environment variable and runs no tool of a producer: a cache that `CARGO_HOME`, `GRADLE_USER_HOME`, `DENO_DIR`, `NUGET_PACKAGES`, `ZIG_GLOBAL_CACHE_DIR`, `HEX_HOME`, `MIX_XDG`, `REBAR_CACHE_DIR`, `BUN_INSTALL_CACHE_DIR`, `UV_CACHE_DIR`, `GOCACHE`, `GOMODCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`, `HOMEBREW_CACHE`, `MISE_CACHE_DIR`, or the Yarn setting `globalFolder` moves. The table is a parameter of a reviewed rule, not a rule, and it gives no authority: each check of a root of [CLEANUP_RULES.md](CLEANUP_RULES.md) section 4 applies to its roots, it never permits an automatic mode, and the layouts of the rule stay `proposed`.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `rule` | String, required | The identity of a rule that supports a location. [CLEANUP_RULES.md](CLEANUP_RULES.md) section 4, "Configured cache locations", has the list and says what the path names for each rule |
+| `path` | String, required | An absolute path, or a path that starts with `~/`. It has the grammar of the other paths of the document: no `.` or `..` component and none of the characters `*`, `?`, `[`, `]`, `{`, `}`, `$`, or a backquote |
+
+The validation refuses each of these before activation, with the finding code in parentheses:
+
+- A `rule` that is not in the list (`unknown_value`). `mise.installs`, `nuget.http-cache`, and `swiftpm.cache` are not in it.
+- A `path` that is not anchored, or that has a `.` or `..` component or an evaluation character, the path `/`, and the path `~/` (the home directory itself) (`invalid_path`).
+- A second table with the same `rule` and the same `path`, with the case of ASCII letters ignored (`duplicate_identifier`).
+- More than 64 tables, more than 16 tables for a clear rule, and more than one table for a rule with an owner operation, which acts on one scope root (`too_many_entries`).
+- An absent `rule` or `path` (`missing_key`) and an unknown key (`unknown_key`).
+
+The validation does not read the file system. Each discovery checks the root: a path that the catalog of protected file locations protects (`root_protected`), the home directory or a directory above it (`root_contains_home`), a path in a Git work tree (`configuration_in_work_tree`), a root that is a symbolic link or is not a directory of the user on a local filesystem, and a root with no marker of its producer (`clear_root_unmarked` or `owner_scope_unmarked`) give no root.
+
+```toml
+[[cleanup.caches.locations]]
+rule = "cargo.registry-cache"
+path = "~/dev/cargo-home"
+
+[[cleanup.caches.locations]]
+rule = "uv.cache"
+path = "/Volumes/Work/uv-cache"
+```
+
 ## 4. Illustrative complete policy values
 
 The following expands the README example with proposed explicit bounds and timing fields. Numbers demonstrate relationships, not suitable settings for every Mac. Application identity, rule readiness, grants, and actual release defaults still need implementation and validation.

@@ -46,6 +46,7 @@ use svalnir_core::rule::{
 use svalnir_core::time::MonotonicNanos;
 use svalnir_core::volume::VolumeIdentity;
 
+use super::caches::{CacheLocationEntry, cache_locations};
 use super::clear::{self, ClearDiscoveryInput, ClearRootEntry, ClearRule, ProducerEvidence};
 use super::expired_temporary::{EXPIRED_TEMPORARY_RULE_ID, TemporaryEvidence, UseLeases};
 use super::in_use::{UnitScope, UnitUse, inventory_of, uses_of};
@@ -81,6 +82,13 @@ pub struct DiscoveryHost {
     pub locations: ProtectedLocations,
     /// The exclusions of the user configuration, as absolute paths.
     pub user_exclusions: Vec<PathBuf>,
+    /// The configured cache locations of `[cleanup.caches]`, which add a
+    /// root to a clear rule.
+    pub cache_locations: Vec<CacheLocationEntry>,
+    /// The directory that the absolute default roots of a clear rule (the
+    /// Ruby of Homebrew) are below: `/` on a host, a directory of a fixture
+    /// in a test.
+    pub system_root: PathBuf,
 }
 
 impl DiscoveryHost {
@@ -92,10 +100,14 @@ impl DiscoveryHost {
             locations.home_directory(),
             config.protections().excluded_paths.iter(),
         );
+        let cache_locations: Vec<CacheLocationEntry> =
+            cache_locations(config, locations.home_directory());
         Self {
             principal,
             locations,
             user_exclusions,
+            cache_locations,
+            system_root: PathBuf::from("/"),
         }
     }
 
@@ -116,10 +128,14 @@ impl DiscoveryHost {
                 .iter()
                 .chain(&config.disk_guard().exclusions.paths),
         );
+        let cache_locations: Vec<CacheLocationEntry> =
+            cache_locations(config, locations.home_directory());
         Self {
             principal,
             locations,
             user_exclusions,
+            cache_locations,
+            system_root: PathBuf::from("/"),
         }
     }
 }
@@ -1177,11 +1193,18 @@ impl ReviewedRules {
             .map(Path::to_path_buf)
             .into_iter()
             .collect();
-        let roots: Vec<ClearRootEntry> = request
-            .host
-            .locations
-            .home_directory()
-            .map_or_else(Vec::new, |home| clear::resolve(clear.spec(), home).0);
+        let roots: Vec<ClearRootEntry> =
+            request
+                .host
+                .locations
+                .home_directory()
+                .map_or_else(Vec::new, |home| {
+                    let configured: Vec<PathBuf> = super::caches::locations_of(
+                        &request.host.cache_locations,
+                        clear.rule().reference.id.as_str(),
+                    );
+                    clear::resolve(clear.spec(), home, &request.host.system_root, &configured).0
+                });
         if protected.is_empty() {
             result.complete = false;
             return Some((result, roots));
@@ -1213,7 +1236,10 @@ impl ReviewedRules {
             });
             return Vec::new();
         };
-        let (roots, expanded) = clear::resolve(clear.spec(), home);
+        let configured: Vec<PathBuf> =
+            super::caches::locations_of(&request.host.cache_locations, rule.reference.id.as_str());
+        let (roots, expanded) =
+            clear::resolve(clear.spec(), home, &request.host.system_root, &configured);
         if !expanded {
             result.complete = false;
         }
@@ -1228,6 +1254,19 @@ impl ReviewedRules {
                 });
                 continue;
             };
+            // A configured location has the checks of a location first.
+            if matches!(entry.source, clear::RootSource::Location)
+                && let Some(code) =
+                    super::caches::location_refusal(&path, home, &request.host.locations)
+            {
+                result.complete = false;
+                result.roots.push(RootReport {
+                    rule: rule.reference.clone(),
+                    path: Some(path),
+                    result: RootResult::Refused(code),
+                });
+                continue;
+            }
             let bound: BoundRoot = match bind_root(&path) {
                 Ok(bound) => bound,
                 Err(problem) => {

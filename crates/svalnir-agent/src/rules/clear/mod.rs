@@ -65,6 +65,7 @@ use svalnir_core::rule::{
 pub use discover::recheck_unit;
 pub(in crate::rules) use discover::{ClearDiscoveryInput, ProducerEvidence};
 
+use super::caches::LocationForm;
 use super::registry::RegistryError;
 
 /// The revision of each rule of this module.
@@ -98,6 +99,8 @@ pub const HEX_PACKAGES_RULE_ID: &str = "hex.packages";
 pub const REBAR3_HEX_RULE_ID: &str = "rebar3.hex";
 /// The identity of the rule for the install cache of Bun.
 pub const BUN_CACHE_RULE_ID: &str = "bun.cache";
+/// The identity of the rule for the global cache of Yarn 2 and later.
+pub const YARN_BERRY_CACHE_RULE_ID: &str = "yarn.berry-cache";
 
 /// The largest number of roots of one rule after the expansion of the
 /// components `*`. The expansion stops at this bound, and the report says
@@ -119,6 +122,9 @@ pub enum UnitForm {
     /// A regular file whose name ends with `.gem`. Each other child is
     /// skipped with `unsupported_layout`.
     GemFile,
+    /// A regular file whose name ends with `.zip`. Each other child is
+    /// skipped with `unsupported_layout`.
+    ZipFile,
     /// An artifact directory of a Maven repository, at some depth below the
     /// root: a directory `GROUP/.../ARTIFACT` with a version directory
     /// `VERSION` that holds a file `ARTIFACT-*.pom` or `ARTIFACT-*.jar`
@@ -152,6 +158,8 @@ pub enum RootMarker {
     None,
     /// A directory of this name beside the root.
     Sibling(&'static str),
+    /// Each directory of these names beside the root.
+    SiblingsAll(&'static [&'static str]),
     /// A child directory of the root with one of these names.
     AnyChild(&'static [&'static str]),
     /// A child of the root whose name has this text.
@@ -184,6 +192,9 @@ pub fn has_marker(marker: RootMarker, root: &Path) -> bool {
         RootMarker::Sibling(name) => root
             .parent()
             .is_some_and(|parent| is_directory(&parent.join(name))),
+        RootMarker::SiblingsAll(names) => root
+            .parent()
+            .is_some_and(|parent| names.iter().all(|name| is_directory(&parent.join(name)))),
         RootMarker::AnyChild(names) => names.iter().any(|name| is_directory(&root.join(name))),
         RootMarker::ChildNameContains(text) => children(root).iter().any(|entry| {
             entry
@@ -334,6 +345,8 @@ pub struct ClearSpec {
     pub id: &'static str,
     /// The producer.
     pub producer: &'static str,
+    /// What a configured location (`[[cleanup.caches.locations]]`) names.
+    pub location: LocationForm,
     /// The one layout of the rule.
     pub layout: &'static str,
     /// The default roots, relative to the home directory. A component `*`
@@ -376,6 +389,7 @@ const BEAM: &[&str] = &["beam.smp", "beam"];
 pub const CARGO_REGISTRY: ClearSpec = ClearSpec {
     id: CARGO_REGISTRY_RULE_ID,
     producer: "cargo",
+    location: LocationForm::Below(&["registry/cache", "registry/src"]),
     layout: "cargo-registry-v1",
     roots: &[".cargo/registry/cache", ".cargo/registry/src"],
     configuration: None,
@@ -394,6 +408,7 @@ pub const CARGO_REGISTRY: ClearSpec = ClearSpec {
 pub const GRADLE_CACHES: ClearSpec = ClearSpec {
     id: GRADLE_CACHES_RULE_ID,
     producer: "gradle",
+    location: LocationForm::Below(&["caches"]),
     layout: "gradle-user-caches-v1",
     roots: &[".gradle/caches"],
     configuration: None,
@@ -412,6 +427,7 @@ pub const GRADLE_CACHES: ClearSpec = ClearSpec {
 pub const MAVEN_REPOSITORY: ClearSpec = ClearSpec {
     id: MAVEN_REPOSITORY_RULE_ID,
     producer: "maven",
+    location: LocationForm::Itself,
     layout: "maven-local-repository-v1",
     roots: &[".m2/repository"],
     configuration: Some(RootConfiguration::MavenSettings),
@@ -430,6 +446,7 @@ pub const MAVEN_REPOSITORY: ClearSpec = ClearSpec {
 pub const RUBYGEMS_CACHE: ClearSpec = ClearSpec {
     id: RUBYGEMS_CACHE_RULE_ID,
     producer: "rubygems",
+    location: LocationForm::Below(&["cache"]),
     layout: "rubygems-gem-cache-v1",
     roots: &[
         ".gem/ruby/*/cache",
@@ -437,6 +454,8 @@ pub const RUBYGEMS_CACHE: ClearSpec = ClearSpec {
         ".rbenv/versions/*/lib/ruby/gems/*/cache",
         ".asdf/installs/ruby/*/lib/ruby/gems/*/cache",
         ".local/share/mise/installs/ruby/*/lib/ruby/gems/*/cache",
+        "/opt/homebrew/lib/ruby/gems/*/cache",
+        "/usr/local/lib/ruby/gems/*/cache",
     ],
     configuration: None,
     keep: &["bundler"],
@@ -454,6 +473,7 @@ pub const RUBYGEMS_CACHE: ClearSpec = ClearSpec {
 pub const DENO_REMOTE: ClearSpec = ClearSpec {
     id: DENO_REMOTE_RULE_ID,
     producer: "deno",
+    location: LocationForm::Below(&["remote", "deps"]),
     layout: "deno-remote-v1",
     roots: &["Library/Caches/deno/remote", "Library/Caches/deno/deps"],
     configuration: None,
@@ -472,6 +492,7 @@ pub const DENO_REMOTE: ClearSpec = ClearSpec {
 pub const DENO_NPM: ClearSpec = ClearSpec {
     id: DENO_NPM_RULE_ID,
     producer: "deno",
+    location: LocationForm::Below(&["npm"]),
     layout: "deno-npm-v1",
     roots: &["Library/Caches/deno/npm"],
     configuration: None,
@@ -490,6 +511,7 @@ pub const DENO_NPM: ClearSpec = ClearSpec {
 pub const DENO_GEN: ClearSpec = ClearSpec {
     id: DENO_GEN_RULE_ID,
     producer: "deno",
+    location: LocationForm::Below(&["gen"]),
     layout: "deno-gen-v1",
     roots: &["Library/Caches/deno/gen"],
     configuration: None,
@@ -508,6 +530,7 @@ pub const DENO_GEN: ClearSpec = ClearSpec {
 pub const NUGET_PACKAGES: ClearSpec = ClearSpec {
     id: NUGET_PACKAGES_RULE_ID,
     producer: "nuget",
+    location: LocationForm::Itself,
     layout: "nuget-global-packages-v1",
     roots: &[".nuget/packages"],
     configuration: None,
@@ -526,6 +549,7 @@ pub const NUGET_PACKAGES: ClearSpec = ClearSpec {
 pub const NUGET_HTTP_CACHE: ClearSpec = ClearSpec {
     id: NUGET_HTTP_CACHE_RULE_ID,
     producer: "nuget",
+    location: LocationForm::NotAccepted,
     layout: "nuget-http-cache-v1",
     roots: &[
         ".local/share/NuGet/http-cache",
@@ -547,6 +571,7 @@ pub const NUGET_HTTP_CACHE: ClearSpec = ClearSpec {
 pub const SWIFTPM_CACHE: ClearSpec = ClearSpec {
     id: SWIFTPM_CACHE_RULE_ID,
     producer: "swiftpm",
+    location: LocationForm::NotAccepted,
     layout: "swiftpm-shared-cache-v1",
     roots: &["Library/Caches/org.swift.swiftpm"],
     configuration: None,
@@ -571,6 +596,7 @@ pub const SWIFTPM_CACHE: ClearSpec = ClearSpec {
 pub const ZIG_GLOBAL_CACHE: ClearSpec = ClearSpec {
     id: ZIG_GLOBAL_CACHE_RULE_ID,
     producer: "zig",
+    location: LocationForm::Itself,
     layout: "zig-global-cache-v1",
     roots: &[".cache/zig"],
     configuration: None,
@@ -589,6 +615,7 @@ pub const ZIG_GLOBAL_CACHE: ClearSpec = ClearSpec {
 pub const HEX_PACKAGES: ClearSpec = ClearSpec {
     id: HEX_PACKAGES_RULE_ID,
     producer: "hex",
+    location: LocationForm::Below(&["packages"]),
     layout: "hex-packages-v1",
     roots: &[".hex/packages"],
     configuration: None,
@@ -607,6 +634,7 @@ pub const HEX_PACKAGES: ClearSpec = ClearSpec {
 pub const REBAR3_HEX: ClearSpec = ClearSpec {
     id: REBAR3_HEX_RULE_ID,
     producer: "rebar3",
+    location: LocationForm::Below(&["hex"]),
     layout: "rebar3-hex-v1",
     roots: &[".cache/rebar3/hex"],
     configuration: None,
@@ -625,6 +653,7 @@ pub const REBAR3_HEX: ClearSpec = ClearSpec {
 pub const BUN_CACHE: ClearSpec = ClearSpec {
     id: BUN_CACHE_RULE_ID,
     producer: "bun",
+    location: LocationForm::Itself,
     layout: "bun-install-cache-v1",
     roots: &[".bun/install/cache"],
     configuration: None,
@@ -639,9 +668,30 @@ pub const BUN_CACHE: ClearSpec = ClearSpec {
     regeneration: "The next `bun install` downloads each removed package again and needs a registry that is still available.",
 };
 
+/// The rule `yarn.berry-cache`: the `cache` folder of the global folder of
+/// Yarn 2 and later. A project that uses `enableGlobalCache: false` has its
+/// own `.yarn/cache`, which this root does not hold.
+pub const YARN_BERRY_CACHE: ClearSpec = ClearSpec {
+    id: YARN_BERRY_CACHE_RULE_ID,
+    producer: "yarn",
+    location: LocationForm::Below(&["cache"]),
+    layout: "yarn-berry-global-cache-v1",
+    roots: &[".yarn/berry/cache"],
+    configuration: None,
+    keep: &[],
+    refuse_names: &[],
+    units: UnitForm::ZipFile,
+    guard: UnitGuard::None,
+    marker: RootMarker::SiblingsAll(&["index", "metadata"]),
+    processes: &["yarn", "node"],
+    rebuild_cost: RebuildCost::Low,
+    kept: "The folders `index` and `metadata` of the global folder, the `cache` folder of each project (`.yarn/cache`), the Plug'n'Play files of a project, and each entry of the cache that is not a regular `.zip` file stay.",
+    regeneration: "The next `yarn install` downloads each removed archive again and needs a registry that is still available. A project with Plug'n'Play reads these archives at run time, so it fails until `yarn install` has run.",
+};
+
 /// The specifications of this module, in the sequence of the registry
 /// table of section 10.
-pub const CLEAR_SPECS: [ClearSpec; 14] = [
+pub const CLEAR_SPECS: [ClearSpec; 15] = [
     CARGO_REGISTRY,
     GRADLE_CACHES,
     MAVEN_REPOSITORY,
@@ -656,6 +706,7 @@ pub const CLEAR_SPECS: [ClearSpec; 14] = [
     HEX_PACKAGES,
     REBAR3_HEX,
     BUN_CACHE,
+    YARN_BERRY_CACHE,
 ];
 
 const MINUTE: u64 = 60_000_000_000;
@@ -718,6 +769,7 @@ fn declaration(spec: &ClearSpec) -> Result<RuleDeclaration, RegistryError> {
         roots: spec
             .roots
             .iter()
+            .filter(|root| !root.starts_with('/'))
             .map(|root| {
                 Ok(ApprovedRoot {
                     base: RootBase::ProducerConfiguration,
@@ -863,6 +915,8 @@ pub enum RootSource {
         /// directory.
         pattern: &'static str,
     },
+    /// A location of `[[cleanup.caches.locations]]`.
+    Location,
     /// A configuration file of the producer.
     Configuration {
         /// The file, relative to the home directory.
@@ -893,7 +947,46 @@ pub struct ClearRootEntry {
 ///
 /// The second value is false when the expansion stopped at its bound.
 #[must_use]
-pub fn resolve(spec: &ClearSpec, home: &Path) -> (Vec<ClearRootEntry>, bool) {
+pub fn resolve(
+    spec: &ClearSpec,
+    home: &Path,
+    system_root: &Path,
+    locations: &[PathBuf],
+) -> (Vec<ClearRootEntry>, bool) {
+    let (mut entries, complete) = default_roots(spec, home, system_root);
+    // A configured location adds its roots beside the others and hides none
+    // of them. A root that an earlier entry already has is not added twice.
+    let children: &[&str] = match spec.location {
+        LocationForm::NotAccepted => &[],
+        LocationForm::Itself => &[""],
+        LocationForm::Below(children) => children,
+    };
+    for location in locations {
+        for child in children {
+            let path: PathBuf = if child.is_empty() {
+                location.clone()
+            } else {
+                location.join(child)
+            };
+            if entries
+                .iter()
+                .any(|entry| entry.path.as_deref() == Some(path.as_path()))
+            {
+                continue;
+            }
+            entries.push(ClearRootEntry {
+                source: RootSource::Location,
+                path: Some(path),
+                problem: None,
+            });
+        }
+    }
+    (entries, complete)
+}
+
+/// The roots of the documented default locations of `spec` and, for
+/// `maven.repository`, of the settings of Maven.
+fn default_roots(spec: &ClearSpec, home: &Path, system_root: &Path) -> (Vec<ClearRootEntry>, bool) {
     if spec.configuration == Some(RootConfiguration::MavenSettings) {
         let (configured, file) = maven_local_repository(home);
         match configured {
@@ -927,13 +1020,16 @@ pub fn resolve(spec: &ClearSpec, home: &Path) -> (Vec<ClearRootEntry>, bool) {
         if !pattern.split('/').any(|component| component == "*") {
             entries.push(ClearRootEntry {
                 source,
-                path: Some(home.join(pattern)),
+                path: Some(match pattern.strip_prefix('/') {
+                    Some(rest) => system_root.join(rest),
+                    None => home.join(pattern),
+                }),
                 problem: None,
             });
             continue;
         }
         let room: usize = MAX_EXPANDED_ROOTS.saturating_sub(entries.len());
-        let (paths, finished) = expand(home, pattern, room);
+        let (paths, finished) = expand(home, system_root, pattern, room);
         complete = complete && finished;
         entries.extend(paths.into_iter().map(|path| ClearRootEntry {
             source: source.clone(),
@@ -946,10 +1042,16 @@ pub fn resolve(spec: &ClearSpec, home: &Path) -> (Vec<ClearRootEntry>, bool) {
 
 /// The paths of `pattern` below `home`, at most `room`. The second value
 /// is false when more paths exist.
-fn expand(home: &Path, pattern: &str, room: usize) -> (Vec<PathBuf>, bool) {
-    let mut current: Vec<PathBuf> = vec![home.to_path_buf()];
+fn expand(home: &Path, system_root: &Path, pattern: &str, room: usize) -> (Vec<PathBuf>, bool) {
+    // A pattern that starts with `/` is an absolute path, for example the
+    // Ruby of Homebrew.
+    let (start, relative): (PathBuf, &str) = match pattern.strip_prefix('/') {
+        Some(rest) => (system_root.to_path_buf(), rest),
+        None => (home.to_path_buf(), pattern),
+    };
+    let mut current: Vec<PathBuf> = vec![start];
     let mut complete: bool = true;
-    for component in pattern.split('/') {
+    for component in relative.split('/') {
         let mut next: Vec<PathBuf> = Vec::new();
         for base in current {
             if component != "*" {

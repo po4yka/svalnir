@@ -52,6 +52,8 @@ pub struct InspectionHost<'a> {
     /// The paths of `[protections]` and of the disk guard exclusions. A
     /// unit that overlaps one is not measured.
     pub user_exclusions: &'a [PathBuf],
+    /// The configured cache locations of `[cleanup.caches]`, for each rule.
+    pub cache_locations: &'a [super::CacheLocationEntry],
 }
 
 /// The bounds of the measurement of one unit.
@@ -105,6 +107,8 @@ pub enum RootResolution {
         /// The reason.
         problem: ConfigProblem,
     },
+    /// The path is a location of `[[cleanup.caches.locations]]`.
+    ConfiguredLocation,
     /// The home directory of the user is not known.
     HomeUnknown,
     /// The mount table cannot be read, so no configuration file is read.

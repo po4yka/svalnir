@@ -337,10 +337,20 @@ struct UserLayoutView {
     quiet_period: Option<Nanoseconds>,
 }
 
+/// One `[[cleanup.caches.locations]]` table.
+#[derive(Debug, Clone, Serialize)]
+struct CacheLocationView {
+    rule: String,
+    path: String,
+}
+
 /// The `[cleanup]` table.
 #[derive(Debug, Clone, Serialize)]
 struct CleanupView {
     projects: ProjectCleanupView,
+    /// The `[[cleanup.caches.locations]]` tables, in the sequence of the
+    /// document.
+    cache_locations: Vec<CacheLocationView>,
 }
 
 /// The `[privacy]` table.
@@ -413,6 +423,16 @@ impl ShowView {
                         })
                         .collect(),
                 },
+                cache_locations: config
+                    .cleanup()
+                    .caches
+                    .locations
+                    .iter()
+                    .map(|location| CacheLocationView {
+                        rule: location.rule.clone(),
+                        path: location.path.to_string(),
+                    })
+                    .collect(),
             },
             history: HistoryView {
                 // A validated duration fits; a value that does not fit shows

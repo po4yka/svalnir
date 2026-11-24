@@ -71,8 +71,9 @@ pub use specs::{
 
 use super::caches::config::{ConfigValue, paths_of, read_source};
 use super::caches::{
-    ConfigSource, ExclusionSpec, InspectionHost, Location, Marker, RootOutcome, RootResolution,
-    RootSpec, check_scope_root, has_marker, resolve,
+    ConfigSource, ExclusionSpec, InspectionHost, Location, LocationForm, Marker, RootOutcome,
+    RootResolution, RootSpec, check_scope_root, has_marker, location_refusal, locations_of,
+    resolve,
 };
 use super::eviction::BoundRoot;
 use super::owner_operation::{
@@ -213,6 +214,11 @@ pub struct ProducerSpec {
     /// The lookup decision: how the root is found, and why no query of
     /// the producer runs.
     pub lookup: &'static str,
+    /// What a configured location names for the rule
+    /// ([`LocationForm`]). A rule with an owner operation takes `Itself`
+    /// when a fixed argument or variable of its command names the scope
+    /// root, and the configured location is then the scope root.
+    pub location: LocationForm,
 }
 
 fn location(location: Location) -> Result<ExecutableLocation, RegistryError> {
@@ -654,6 +660,24 @@ impl ProducerRule {
                         ),
                     },
                 }
+            }
+            _ => (resolution, path),
+        };
+        // A configured location is the scope root, in place of the root of
+        // the configuration files of the producer or the default. It has
+        // the checks below, and the checks of a location first.
+        let configured: Vec<PathBuf> = locations_of(host.cache_locations, self.spec.id);
+        let (resolution, path) = match (self.spec.location, configured.first()) {
+            (LocationForm::Itself, Some(location)) => {
+                if let Some(code) = location_refusal(location, home, host.locations) {
+                    return ScopeReport {
+                        resolution: RootResolution::ConfiguredLocation,
+                        path: Some(location.clone()),
+                        outcome: RootOutcome::Refused(code),
+                        bound: None,
+                    };
+                }
+                (RootResolution::ConfiguredLocation, Some(location.clone()))
             }
             _ => (resolution, path),
         };

@@ -409,6 +409,8 @@ impl World {
             principal: self.home.principal,
             locations: self.home.locations.clone(),
             user_exclusions: Vec::new(),
+            cache_locations: Vec::new(),
+            system_root: PathBuf::from("/nonexistent-svalnir-system-root"),
         }
     }
 

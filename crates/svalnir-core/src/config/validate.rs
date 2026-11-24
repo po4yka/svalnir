@@ -11,10 +11,10 @@ use super::finding::{Finding, FindingCode, Location};
 use super::path::ConfigPath;
 use super::reader::{Context, Read, TableReader, join_path};
 use super::schema::{
-    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, Cleanup, DiskExclusions,
-    DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD, MIN_QUIET_PERIOD,
-    MemoryGuard, Privacy, Profile, ProjectCleanup, CacheCleanup, Protections, RestartPolicy, SCHEMA_VERSION,
-    ValidatedConfig, VolumeSelector,
+    AgentConfig, AppBudget, AppBudgetId, AutomaticMode, BundleId, CacheCleanup, Cleanup,
+    DiskExclusions, DiskGuard, EligibleGroup, GlobalTrigger, History, MAX_QUIET_PERIOD,
+    MIN_QUIET_PERIOD, MemoryGuard, Privacy, Profile, ProjectCleanup, Protections, RestartPolicy,
+    SCHEMA_VERSION, ValidatedConfig, VolumeSelector,
 };
 use super::template::{TEMPLATE_REVISION, Template};
 use crate::id::RuleId;

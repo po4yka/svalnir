@@ -62,6 +62,7 @@ impl Home {
             principal: self.principal,
             locations: &self.locations,
             user_exclusions: exclusions,
+            cache_locations: &[],
         };
         registry.cache(id).unwrap().inspect(
             host,
@@ -687,6 +688,7 @@ fn an_unknown_home_directory_gives_no_root() {
         principal: Uid::new(0),
         locations: &locations,
         user_exclusions: &[],
+        cache_locations: &[],
     };
     for cache in registry.caches() {
         let inspection = cache.inspect(

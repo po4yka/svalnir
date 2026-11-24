@@ -476,6 +476,7 @@ fn clear_root_row(root: &ClearRootEntry) -> RootRow {
     let source: String = match &root.source {
         ClearRootSource::Default { pattern } => format!("default {pattern}"),
         ClearRootSource::Configuration { file } => format!("configuration {file}"),
+        ClearRootSource::Location => "[[cleanup.caches.locations]] of the configuration".to_owned(),
     };
     match (&root.path, root.problem) {
         (Some(path), _) => RootRow {
@@ -585,6 +586,7 @@ pub(super) fn inspect_rules(
                     principal: host.principal,
                     locations: &host.locations,
                     user_exclusions: &inspection_host.user_exclusions,
+                    cache_locations: &inspection_host.cache_locations,
                 },
                 InspectionLimits::default(),
                 &cancel,
@@ -657,6 +659,7 @@ fn owner_inspection(
             principal: host.principal,
             locations: &host.locations,
             user_exclusions: &inspection_host.user_exclusions,
+            cache_locations: &inspection_host.cache_locations,
         },
         MAX_PRODUCER_EXECUTABLE_BYTES,
         cancel,
@@ -885,6 +888,7 @@ fn build_owner(
         host.principal,
         &host.locations,
         &manual.user_exclusions,
+        &manual.cache_locations,
         request.options.include_clear,
     );
     let bound: ProducerBinding = producer

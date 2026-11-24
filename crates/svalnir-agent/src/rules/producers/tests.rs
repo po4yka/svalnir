@@ -19,12 +19,12 @@ use super::{
     ProducerRule, homebrew_system_env, mise_tracked_configs, scope_evidence,
 };
 use crate::executor::owner::{ScopeLimits, examine_program};
-use crate::rules::owner_operation::{canonical_interpreters, canonical_locations};
 use crate::protection::ProtectedLocations;
 use crate::rules::ReviewedRules;
-use crate::rules::caches::{InspectionHost, RootOutcome, RootResolution};
+use crate::rules::caches::{CacheLocationEntry, InspectionHost, RootOutcome, RootResolution};
 use crate::rules::fixture::{manual_action_validated, write_owner_script};
 use crate::rules::owner_operation::{OwnerBindError, binding_agrees};
+use crate::rules::owner_operation::{canonical_interpreters, canonical_locations};
 use crate::scan::{CancellationToken, WallScanClock};
 
 /// A home directory in a temporary directory, with a directory of test
@@ -68,6 +68,15 @@ impl Home {
             principal: self.principal,
             locations: &self.locations,
             user_exclusions: &[],
+            cache_locations: &[],
+        }
+    }
+
+    /// The host with the configured location `path` of the rule `rule`.
+    fn host_with<'a>(&'a self, entries: &'a [CacheLocationEntry]) -> InspectionHost<'a> {
+        InspectionHost {
+            cache_locations: entries,
+            ..self.host()
         }
     }
 
@@ -593,7 +602,11 @@ fn a_root_with_a_typing_error_is_never_a_scope() {
     assert_eq!(mise.scope(&home.host()).outcome, RootOutcome::Examined);
     // A symbolic link of that name is no marker.
     fs::remove_file(home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
-    symlink(&home.path, home.path.join("Library/Caches/mise/.auto_prune")).unwrap();
+    symlink(
+        &home.path,
+        home.path.join("Library/Caches/mise/.auto_prune"),
+    )
+    .unwrap();
     assert_eq!(
         mise.scope(&home.host()).outcome,
         RootOutcome::Refused(OWNER_SCOPE_UNMARKED)
@@ -640,7 +653,10 @@ fn the_latest_installs_of_mise_are_executable_locations() {
         1 << 28,
     )
     .unwrap();
-    assert_eq!(executable.path.to_path_buf(), fs::canonicalize(&npm).unwrap());
+    assert_eq!(
+        executable.path.to_path_buf(),
+        fs::canonicalize(&npm).unwrap()
+    );
     assert_eq!(
         interpreter.unwrap().executable.path.to_path_buf(),
         fs::canonicalize(&node).unwrap()
@@ -787,5 +803,105 @@ fn a_system_brew_env_that_changes_the_effect_refuses_homebrew() {
         brew.environment
             .iter()
             .any(|entry| entry.name == "HOMEBREW_NO_AUTOREMOVE")
+    );
+}
+
+fn entry(rule: &str, path: PathBuf) -> CacheLocationEntry {
+    CacheLocationEntry {
+        rule: rule.to_owned(),
+        path,
+    }
+}
+
+#[test]
+fn a_configured_location_is_the_scope_root_of_an_owner_rule() {
+    let home = Home::new();
+    let registry: ReviewedRules = home.registry();
+    write_owner_script(&home.tools, "uv", "exit 0").unwrap();
+    let uv = registry.producer("uv.cache").unwrap();
+    // The default root exists and has its marker, and a configured location
+    // takes its place as the scope root.
+    let default: PathBuf = home.path.join(".cache/uv");
+    fs::create_dir_all(&default).unwrap();
+    let tag: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+    fs::write(default.join("CACHEDIR.TAG"), tag).unwrap();
+    let configured: PathBuf = home.path.join("caches/uv");
+    let entries = [entry("uv.cache", configured.clone())];
+    // No marker: the existing code.
+    fs::create_dir_all(&configured).unwrap();
+    let report = uv.scope(&home.host_with(&entries));
+    assert_eq!(report.resolution, RootResolution::ConfiguredLocation);
+    assert_eq!(report.path, Some(configured.clone()));
+    assert_eq!(report.outcome, RootOutcome::Refused(OWNER_SCOPE_UNMARKED));
+    // With the marker, and the command names the configured root.
+    fs::write(configured.join("CACHEDIR.TAG"), tag).unwrap();
+    let request = ProducerBindRequest {
+        host: home.host_with(&entries),
+        include_clear: false,
+        max_executable_bytes: 1 << 20,
+        scope_limits: ScopeLimits::default(),
+    };
+    let bound = uv
+        .bind(&request, &CancellationToken::new(), &WallScanClock)
+        .unwrap();
+    assert_eq!(bound.scope.outcome, RootOutcome::Examined);
+    assert_eq!(
+        bound.binding.arguments.last().unwrap(),
+        configured.to_str().unwrap()
+    );
+    // The inspection shows the source.
+    let inspection = uv.inspect(
+        &home.host_with(&entries),
+        1 << 20,
+        &CancellationToken::new(),
+        &WallScanClock,
+    );
+    assert_eq!(
+        inspection.scope.resolution,
+        RootResolution::ConfiguredLocation
+    );
+    // Without the entry the root is the default again.
+    assert_eq!(uv.scope(&home.host()).path, Some(default));
+}
+
+#[test]
+fn a_configured_location_of_an_owner_rule_has_each_check_of_a_root() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let mise = registry.producer("mise.cache").unwrap();
+    let scope = |path: &Path| {
+        let entries = [entry("mise.cache", path.to_path_buf())];
+        mise.scope(&home.host_with(&entries))
+    };
+    // A symbolic link.
+    fs::create_dir_all(home.path.join("real/.auto_prune")).unwrap();
+    symlink(home.path.join("real"), home.path.join("linked")).unwrap();
+    assert!(matches!(
+        scope(&home.path.join("linked")).outcome,
+        RootOutcome::Refused(_)
+    ));
+    // A Git work tree.
+    fs::create_dir_all(home.path.join("work/app/cache/.auto_prune")).unwrap();
+    fs::create_dir(home.path.join("work/app/.git")).unwrap();
+    assert_eq!(
+        scope(&home.path.join("work/app/cache")).outcome,
+        RootOutcome::Refused("configuration_in_work_tree")
+    );
+    // The home directory.
+    assert!(matches!(
+        scope(&home.path).outcome,
+        RootOutcome::Refused("root_protected" | "root_contains_home")
+    ));
+    // A root that is absent is no error.
+    assert_eq!(
+        scope(&home.path.join("absent")).outcome,
+        RootOutcome::Absent
+    );
+    // A rule whose command names no root takes no location.
+    let installs = registry.producer("mise.installs").unwrap();
+    let entries = [entry("mise.installs", home.path.join("real"))];
+    assert_eq!(
+        installs.scope(&home.host_with(&entries)).path,
+        Some(home.path.join(".local/share/mise/installs"))
     );
 }

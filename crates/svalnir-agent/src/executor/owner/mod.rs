@@ -44,3 +44,4 @@ pub use native::ResponsibilitySymbols;
 pub use verify::{
     ExecutableKind, ExecutableProblem, examine_executable, examine_program, executable_kind,
 };
+pub(crate) use verify::{ensure_trusted_directories, trusted_kind};

@@ -669,7 +669,7 @@ impl ProducerRule {
         let configured: Vec<PathBuf> = locations_of(host.cache_locations, self.spec.id);
         let (resolution, path) = match (self.spec.location, configured.first()) {
             (LocationForm::Itself, Some(location)) => {
-                if let Some(code) = location_refusal(location, home, host.locations) {
+                if let Some(code) = location_refusal(location, home, host.locations, &mounts) {
                     return ScopeReport {
                         resolution: RootResolution::ConfiguredLocation,
                         path: Some(location.clone()),

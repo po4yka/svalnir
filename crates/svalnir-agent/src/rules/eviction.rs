@@ -1254,10 +1254,15 @@ impl ReviewedRules {
             None
         };
         // A configured location has the checks of a location first.
-        if matches!(source, clear::RootSource::Location)
-            && let Some(code) = super::caches::location_refusal(path, home, &request.host.locations)
-        {
-            return refuse(RootResult::Refused(code), false);
+        if matches!(source, clear::RootSource::Location) {
+            let Ok(mounts) = crate::platform::volume::MountTable::read() else {
+                return refuse(RootResult::Refused("root_locality_unknown"), false);
+            };
+            if let Some(code) =
+                super::caches::location_refusal(path, home, &request.host.locations, &mounts)
+            {
+                return refuse(RootResult::Refused(code), false);
+            }
         }
         let bound: BoundRoot = match bind_root(path) {
             Ok(bound) => bound,

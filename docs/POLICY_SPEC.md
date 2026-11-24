@@ -143,7 +143,7 @@ The validation refuses each of these before activation, with the finding code in
 - More than 64 tables, more than 16 tables for a clear rule, and more than one table for a rule with an owner operation, which acts on one scope root (`too_many_entries`).
 - An absent `rule` or `path` (`missing_key`) and an unknown key (`unknown_key`).
 
-The validation does not read the file system. Each discovery checks the root: a path that the catalog of protected file locations protects (`root_protected`), the home directory or a directory above it (`root_contains_home`), a path in a Git work tree (`configuration_in_work_tree`), a root that is a symbolic link or is not a directory of the user on a local filesystem, and a root with no marker of its producer (`clear_root_unmarked` or `owner_scope_unmarked`) give no root.
+The validation does not read the file system. Each discovery checks the root: a path that the catalog of protected file locations protects (`root_protected`), the home directory or a directory above it (`root_contains_home`), a path in a Git work tree (`configuration_in_work_tree`, or `configuration_in_work_tree_unknown` when a `.git` name cannot be examined), a path in a project directory (`root_in_project`), a root that is a symbolic link or is not a directory of the user on a local filesystem, and a root with no marker of its producer (`clear_root_unmarked` or `owner_scope_unmarked`) give no root.
 
 ```toml
 [[cleanup.caches.locations]]

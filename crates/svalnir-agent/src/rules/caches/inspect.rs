@@ -377,7 +377,7 @@ fn has_project_marker(directory: &Path) -> bool {
 /// Whether the root or a directory above it is a project directory. The
 /// search stops below the home directory, or below `/` for a root outside
 /// it: the home directory can be a repository of personal settings.
-fn is_in_project(root: &Path, home: &Path) -> bool {
+pub(super) fn is_in_project(root: &Path, home: &Path) -> bool {
     root.ancestors()
         .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
         .take_while(|ancestor| !home.starts_with(ancestor))
@@ -403,7 +403,7 @@ pub(in crate::rules) fn has_marker(path: &Path, marker: Marker, principal: Uid) 
 }
 
 /// The stable name of a stop of [`walk_local`].
-fn walk_refusal(stop: &WalkStop) -> &'static str {
+pub(super) fn walk_refusal(stop: &WalkStop) -> &'static str {
     match stop {
         WalkStop::Absent => RootProblem::Absent.as_str(),
         WalkStop::LinkInAncestor => "root_path_not_plain",

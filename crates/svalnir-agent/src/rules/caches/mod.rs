@@ -156,17 +156,27 @@ pub fn locations_of(entries: &[CacheLocationEntry], rule: &str) -> Vec<PathBuf> 
 /// The stable code of a configured location that fails a check of a
 /// location, or `None`: the catalog of protected file locations protects it
 /// (`root_protected`), it is the home directory or contains it
-/// (`root_contains_home`), or a directory from it up to the home directory
+/// (`root_contains_home`), it is not on a local filesystem (`root_not_local`,
+/// `root_locality_unknown`), a directory from it up to the home directory
 /// (not included; up to `/` for a location outside the home directory) has a
-/// `.git` entry (`configuration_in_work_tree`). A repository in the folder of
-/// a project can be the work of the user. The checks of a root of the rule
+/// `.git` entry (`configuration_in_work_tree`) or one that cannot be examined
+/// (`configuration_in_work_tree_unknown`), or the location is in a project
+/// directory (`root_in_project`). A repository or a project in the folder of
+/// a location can be the work of the user. The checks of a root of the rule
 /// itself (owner, filesystem, marker) run after this one.
+///
+/// The text checks and the walk of the path on local filesystems come first,
+/// so no probe of a name reaches a network filesystem or starts an automount.
+/// A location that is absent has no refusal here: the binding of the root
+/// reports it.
 #[must_use]
 pub fn location_refusal(
     path: &Path,
     home: &Path,
     locations: &crate::protection::ProtectedLocations,
+    mounts: &crate::platform::volume::MountTable,
 ) -> Option<&'static str> {
+    use super::unit::{WalkStop, walk_local};
     use svalnir_core::policy::ProtectionFact;
     match locations.of_text(path) {
         ProtectionFact::NotProtected => {}
@@ -176,11 +186,23 @@ pub fn location_refusal(
     if path == home || home.starts_with(path) {
         return Some("root_contains_home");
     }
-    let in_tree: bool = path
+    match walk_local(path, mounts) {
+        Ok(_) => {}
+        Err(WalkStop::Absent) => return None,
+        Err(stop) => return Some(inspect::walk_refusal(&stop)),
+    }
+    for ancestor in path
         .ancestors()
         .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
-        .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
-    in_tree.then_some("configuration_in_work_tree")
+    {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Some("configuration_in_work_tree"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A name that cannot be examined can be a repository.
+            Err(_) => return Some("configuration_in_work_tree_unknown"),
+        }
+    }
+    inspect::is_in_project(path, home).then_some("root_in_project")
 }
 
 /// A location of the host that a rule refuses as a root.

@@ -646,9 +646,14 @@ fn the_latest_installs_of_mise_are_executable_locations() {
     assert!(located.contains(&fs::canonicalize(&npm).unwrap()));
     let interpreters = canonical_interpreters(&operation.interpreters, &home.path);
     assert!(interpreters.contains(&(fs::canonicalize(&node).unwrap(), Vec::new())));
+    // Another `node` comes first in the declared sequence, as the `node` of
+    // Homebrew does: the script runs with the `node` of its own install.
+    let other: PathBuf = native_program(&home, "other/bin/node");
+    let mut declared = vec![(fs::canonicalize(&other).unwrap(), Vec::new())];
+    declared.extend(interpreters.iter().cloned());
     let (executable, interpreter) = examine_program(
         &fs::canonicalize(&npm).unwrap(),
-        &[(fs::canonicalize(&node).unwrap(), Vec::new())],
+        &declared,
         home.principal,
         1 << 28,
     )
@@ -657,6 +662,18 @@ fn the_latest_installs_of_mise_are_executable_locations() {
         executable.path.to_path_buf(),
         fs::canonicalize(&npm).unwrap()
     );
+    assert_eq!(
+        interpreter.unwrap().executable.path.to_path_buf(),
+        fs::canonicalize(&node).unwrap()
+    );
+    // With the real declared sequence, the binding is the same.
+    let (_, interpreter) = examine_program(
+        &fs::canonicalize(&npm).unwrap(),
+        &interpreters,
+        home.principal,
+        1 << 28,
+    )
+    .unwrap();
     assert_eq!(
         interpreter.unwrap().executable.path.to_path_buf(),
         fs::canonicalize(&node).unwrap()
@@ -876,16 +893,23 @@ fn a_configured_location_of_an_owner_rule_has_each_check_of_a_root() {
     // A symbolic link.
     fs::create_dir_all(home.path.join("real/.auto_prune")).unwrap();
     symlink(home.path.join("real"), home.path.join("linked")).unwrap();
-    assert!(matches!(
+    assert_eq!(
         scope(&home.path.join("linked")).outcome,
-        RootOutcome::Refused(_)
-    ));
+        RootOutcome::Refused("root_not_directory")
+    );
     // A Git work tree.
     fs::create_dir_all(home.path.join("work/app/cache/.auto_prune")).unwrap();
     fs::create_dir(home.path.join("work/app/.git")).unwrap();
     assert_eq!(
         scope(&home.path.join("work/app/cache")).outcome,
         RootOutcome::Refused("configuration_in_work_tree")
+    );
+    // A project folder with no Git.
+    fs::create_dir_all(home.path.join("proj/cache/.auto_prune")).unwrap();
+    fs::write(home.path.join("proj/package.json"), b"{}").unwrap();
+    assert_eq!(
+        scope(&home.path.join("proj/cache")).outcome,
+        RootOutcome::Refused("root_in_project")
     );
     // The home directory.
     assert!(matches!(

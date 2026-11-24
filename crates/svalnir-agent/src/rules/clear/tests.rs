@@ -1003,6 +1003,15 @@ fn a_configured_root_has_the_checks_of_a_default_root() {
         &RootResult::Refused("configuration_in_work_tree")
     );
     assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
+    // A location in the folder of a project with no Git.
+    home.write("proj/hex/packages/hexpm/a.tar", b"tar");
+    home.write("proj/Package.swift", b"");
+    let discovery = manual_with(&home, "hex.packages", &location("proj/hex"));
+    assert_eq!(
+        root_result(&discovery, &home.path.join("proj/hex/packages")),
+        &RootResult::Refused("root_in_project")
+    );
+    assert_eq!(candidates(&home, &discovery), Vec::<String>::new());
     // The home directory, a directory above it, and a protected location.
     // The catalog protects the home directory first, so its code is the
     // code of a protected location.

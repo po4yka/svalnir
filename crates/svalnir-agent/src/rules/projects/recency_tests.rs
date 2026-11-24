@@ -383,7 +383,8 @@ fn the_paseo_source_is_off_unless_the_configuration_turns_it_on() {
 #[test]
 fn the_paseo_source_accepts_only_a_protected_executable_of_a_fixed_path() {
     let directory: TempDir = TempDir::new().unwrap();
-    let home: &Path = directory.path();
+    let canonical: PathBuf = directory.path().canonicalize().unwrap();
+    let home: &Path = &canonical;
     let source =
         PaseoAgents::new(true, Some(home)).with_candidates(vec![home.join("absent/paseo")]);
     assert_eq!(failure(&source.agent_listing()), "paseo_not_installed");
@@ -429,7 +430,8 @@ fn only_candidate(home: &Path, executable: PathBuf) -> PaseoAgents {
 #[test]
 fn a_paseo_script_runs_through_the_interpreter_beside_its_link() {
     let directory: TempDir = TempDir::new().unwrap();
-    let home: &Path = directory.path();
+    let canonical: PathBuf = directory.path().canonicalize().unwrap();
+    let home: &Path = &canonical;
     let link: PathBuf = linked_script(home, "#!/usr/bin/env node", PATH_SCRIPT);
     // `node` is a link to a Mach-O file that the user does not own but root
     // does: the shell stands in for the Node.js binary.
@@ -454,7 +456,8 @@ fn a_paseo_script_runs_through_the_interpreter_beside_its_link() {
 #[test]
 fn a_paseo_interpreter_must_pass_the_trust_rule_and_be_a_mach_o_file() {
     let directory: TempDir = TempDir::new().unwrap();
-    let home: &Path = directory.path();
+    let canonical: PathBuf = directory.path().canonicalize().unwrap();
+    let home: &Path = &canonical;
     let marker: PathBuf = home.join("ran");
     let body: String = format!("touch '{}'", marker.display());
     let link: PathBuf = linked_script(home, "#!/usr/bin/env node", &body);
@@ -477,7 +480,7 @@ fn a_paseo_interpreter_must_pass_the_trust_rule_and_be_a_mach_o_file() {
     // A `#!` line with more than one argument is no accepted script, and an
     // interpreter path with an argument has no accepted interpreter.
     fs::write(home.join("lib/paseo.js"), "#!/usr/bin/env -S node\ntrue\n").unwrap();
-    check("paseo_not_trusted");
+    check("paseo_not_executable");
     fs::write(home.join("lib/paseo.js"), "#!/bin/sh -e\ntrue\n").unwrap();
     check("paseo_interpreter_not_found");
 }
@@ -486,7 +489,8 @@ fn a_paseo_interpreter_must_pass_the_trust_rule_and_be_a_mach_o_file() {
 #[test]
 fn a_paseo_script_that_the_group_can_change_does_not_run() {
     let directory: TempDir = TempDir::new().unwrap();
-    let home: &Path = directory.path();
+    let canonical: PathBuf = directory.path().canonicalize().unwrap();
+    let home: &Path = &canonical;
     let marker: PathBuf = home.join("ran");
     let link: PathBuf = linked_script(
         home,
@@ -504,9 +508,40 @@ fn a_paseo_script_that_the_group_can_change_does_not_run() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn a_paseo_link_folder_that_the_group_can_change_is_not_trusted() {
+    let directory: TempDir = TempDir::new().unwrap();
+    let canonical: PathBuf = directory.path().canonicalize().unwrap();
+    let home: &Path = &canonical;
+    let marker: PathBuf = home.join("ran");
+    let link: PathBuf = linked_script(
+        home,
+        "#!/usr/bin/env node",
+        &format!("touch '{}'", marker.display()),
+    );
+    std::os::unix::fs::symlink("/bin/sh", home.join("bin/node")).unwrap();
+    // The resolved script and its folders pass; the folder of the link does
+    // not, so neither the link nor a `node` beside it is used.
+    fs::set_permissions(home.join("bin"), fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        failure(&only_candidate(home, link.clone()).agent_listing()),
+        "paseo_not_trusted"
+    );
+    // A folder above the folder of the link is checked as well.
+    fs::set_permissions(home.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(home, fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(
+        failure(&only_candidate(home, link).agent_listing()),
+        "paseo_not_trusted"
+    );
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn a_mach_o_paseo_runs_directly_and_the_configured_path_wins() {
     let directory: TempDir = TempDir::new().unwrap();
-    let home: &Path = directory.path();
+    let canonical: PathBuf = directory.path().canonicalize().unwrap();
+    let home: &Path = &canonical;
     // The shell stands in for a Mach-O `paseo`. It fails with the fixed
     // arguments, which shows that the file passed the checks and ran.
     fs::create_dir_all(home.join("bin")).unwrap();
@@ -518,8 +553,9 @@ fn a_mach_o_paseo_runs_directly_and_the_configured_path_wins() {
     // The configured path is the only candidate: a fixed candidate that
     // works is not used, and the home directory expands `~/`.
     let other: TempDir = TempDir::new().unwrap();
-    let link: PathBuf = linked_script(other.path(), "#!/usr/bin/env node", PATH_SCRIPT);
-    std::os::unix::fs::symlink("/bin/sh", other.path().join("bin/node")).unwrap();
+    let other_path: PathBuf = other.path().canonicalize().unwrap();
+    let link: PathBuf = linked_script(&other_path, "#!/usr/bin/env node", PATH_SCRIPT);
+    std::os::unix::fs::symlink("/bin/sh", other_path.join("bin/node")).unwrap();
     let configured = |path: &str| {
         PaseoAgents::new(true, Some(home))
             .with_candidates(vec![link.clone()])

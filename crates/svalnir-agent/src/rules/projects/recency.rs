@@ -50,7 +50,7 @@ use svalnir_core::rule::Fact;
 use svalnir_core::time::WallTime;
 
 use crate::executor::owner::{
-    ExecutableKind, ExecutableProblem, examine_executable, executable_kind,
+    ExecutableKind, ExecutableProblem, ensure_trusted_directories, trusted_kind,
 };
 use crate::rules::git::{GitFailure, GitOutput, GitTool, GitToolProblem, Repository, run_bounded};
 
@@ -728,10 +728,6 @@ pub(super) fn newest_transcript(
     Ok(newest)
 }
 
-/// The largest executable that the trust check reads for its digest: the
-/// Node.js binary is about 100 MiB.
-const MAX_PASEO_FILE: u64 = 512 * 1024 * 1024;
-
 /// The command of the Paseo listing: the program, and the script that the
 /// program reads when `paseo` is a `#!` script.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,17 +743,26 @@ struct PaseoLaunch {
 /// The Paseo source.
 ///
 /// The executable is the path `paseo_executable` of the configuration, or
-/// else the first of [`PASEO_CANDIDATES`] that passes the checks. The
-/// symbolic link of the path is resolved first, and the resolved file must
-/// pass the trust rule of the owner-operation executables
-/// ([`examine_executable`]): a regular file with an execute bit, owned by
+/// else the first of [`PASEO_CANDIDATES`] that passes the checks. The folder
+/// of the unresolved path and each folder above it must be a folder, not a
+/// link, with root or the user as its owner and no write bit for the group
+/// or for others; this check comes before the link is resolved and before the
+/// interpreter is looked up. The symbolic link of the path is then resolved,
+/// and the resolved file must be a regular file with an execute bit, owned by
 /// root or by the user, with no write bit for the group or for others, with
-/// each directory above it a directory of the same rule. A Mach-O file runs
+/// each folder above it of the same rule. The check reads only metadata and
+/// the first bytes of the file; no digest is computed. A Mach-O file runs
 /// directly. A `#!` script runs through its interpreter: for
-/// `#!/usr/bin/env NAME` the file `NAME` in the directory of the unresolved
+/// `#!/usr/bin/env NAME` the file `NAME` in the folder of the unresolved
 /// path (where `npm` puts `node` beside `paseo`), and for an absolute
 /// interpreter path that path. The interpreter must be a Mach-O file that
 /// passes the same rule.
+///
+/// The binding at the start is by path only: the check does not hold the
+/// file, so the owner rule of the folders above the file and of the link
+/// folder is the protection against a replacement between the check and the
+/// start. The modules that the interpreter loads (the `node_modules` of
+/// Paseo) are not checked.
 #[derive(Debug, Clone)]
 pub struct PaseoAgents {
     enabled: bool,
@@ -851,13 +856,24 @@ impl PaseoAgents {
 
     /// Resolves and checks the executable at `candidate`.
     fn check_candidate(&self, candidate: &Path) -> Result<PaseoLaunch, &'static str> {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err("paseo_not_installed");
+            }
+            Err(_) => return Err("paseo_not_trusted"),
+        }
+        ensure_trusted_directories(candidate, self.principal).map_err(|problem| match problem {
+            ExecutableProblem::NotFound => "paseo_not_installed",
+            _ => "paseo_not_trusted",
+        })?;
         let resolved: PathBuf = fs::canonicalize(candidate).map_err(|_| "paseo_not_installed")?;
-        self.trusted_file(&resolved)
-            .map_err(|problem| match problem {
+        let kind: ExecutableKind =
+            trusted_kind(&resolved, self.principal).map_err(|problem| match problem {
                 ExecutableProblem::NotFound => "paseo_not_installed",
+                ExecutableProblem::NotExecutable => "paseo_not_executable",
                 _ => "paseo_not_trusted",
             })?;
-        let kind: ExecutableKind = executable_kind(&resolved).map_err(|_| "paseo_not_trusted")?;
         let (interpreter, argument): (PathBuf, Option<String>) = match kind {
             ExecutableKind::MachO => {
                 return Ok(PaseoLaunch {
@@ -890,13 +906,10 @@ impl PaseoAgents {
         };
         let interpreter: PathBuf =
             fs::canonicalize(&located).map_err(|_| "paseo_interpreter_not_found")?;
-        self.trusted_file(&interpreter)
-            .map_err(|problem| match problem {
-                ExecutableProblem::NotFound => "paseo_interpreter_not_found",
-                _ => "paseo_interpreter_not_trusted",
-            })?;
-        if executable_kind(&interpreter) != Ok(ExecutableKind::MachO) {
-            return Err("paseo_interpreter_not_trusted");
+        match trusted_kind(&interpreter, self.principal) {
+            Ok(ExecutableKind::MachO) => {}
+            Err(ExecutableProblem::NotFound) => return Err("paseo_interpreter_not_found"),
+            Ok(_) | Err(_) => return Err("paseo_interpreter_not_trusted"),
         }
         let directory: Option<PathBuf> = interpreter.parent().map(Path::to_path_buf);
         Ok(PaseoLaunch {
@@ -904,11 +917,6 @@ impl PaseoAgents {
             script: Some(resolved),
             interpreter_directory: directory,
         })
-    }
-
-    /// Whether the resolved file `path` passes the trust rule.
-    fn trusted_file(&self, path: &Path) -> Result<(), ExecutableProblem> {
-        examine_executable(path, self.principal, MAX_PASEO_FILE).map(|_| ())
     }
 }
 

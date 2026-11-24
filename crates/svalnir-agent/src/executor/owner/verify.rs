@@ -64,6 +64,88 @@ pub(super) fn object_of(metadata: &Metadata) -> Option<FileObjectEvidence> {
     })
 }
 
+/// The metadata of the file at `path`, when it passes the trust rule with
+/// no read of its content: the path is absolute, the object is a regular file
+/// with an execute bit and is not a symbolic link, the owner and the mode
+/// pass [`is_trusted`], and each directory above it passes
+/// [`ensure_trusted_directories`].
+fn trusted_metadata(path: &Path, principal: Uid) -> Result<Metadata, ExecutableProblem> {
+    if !path.is_absolute() {
+        return Err(ExecutableProblem::NotFound);
+    }
+    let metadata: Metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ExecutableProblem::NotFound);
+        }
+        Err(_) => return Err(ExecutableProblem::NotReadable),
+    };
+    if !metadata.file_type().is_file() || metadata.mode() & EXECUTE_BITS == 0 {
+        return Err(ExecutableProblem::NotExecutable);
+    }
+    if !is_trusted(&metadata, principal) {
+        return Err(ExecutableProblem::NotTrusted);
+    }
+    ensure_trusted_directories(path, principal)?;
+    Ok(metadata)
+}
+
+/// Requires that each directory above `path` is a directory, not a symbolic
+/// link, with root or `principal` as its owner and no write bit for the group
+/// or for others. `path` itself is not examined, so it can name a link.
+///
+/// # Errors
+///
+/// Returns [`ExecutableProblem::NotFound`] for a path that is not absolute
+/// and [`ExecutableProblem::NotTrusted`] for the first directory that fails.
+pub(crate) fn ensure_trusted_directories(
+    path: &Path,
+    principal: Uid,
+) -> Result<(), ExecutableProblem> {
+    if !path.is_absolute() {
+        return Err(ExecutableProblem::NotFound);
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let directory: Metadata =
+            fs::symlink_metadata(ancestor).map_err(|_| ExecutableProblem::NotTrusted)?;
+        if !directory.file_type().is_dir() || !is_trusted(&directory, principal) {
+            return Err(ExecutableProblem::NotTrusted);
+        }
+    }
+    Ok(())
+}
+
+/// The kind of the file at `path` with no digest: the metadata check of the
+/// trust rule, then one read of the first bytes from a descriptor that is
+/// opened with no symbolic link and whose device and inode equal those of the
+/// metadata check.
+///
+/// # Errors
+///
+/// Returns the [`ExecutableProblem`] of the first check that fails, and
+/// [`ExecutableProblem::NotExecutable`] for a file of no known kind.
+pub(crate) fn trusted_kind(
+    path: &Path,
+    principal: Uid,
+) -> Result<ExecutableKind, ExecutableProblem> {
+    let metadata: Metadata = trusted_metadata(path, principal)?;
+    let file: File = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| ExecutableProblem::NotReadable)?;
+    let opened: Metadata = file
+        .metadata()
+        .map_err(|_| ExecutableProblem::NotReadable)?;
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || !is_trusted(&opened, principal)
+    {
+        return Err(ExecutableProblem::Changed);
+    }
+    kind_of(&head_of(&file)?)
+}
+
 /// Examines the executable at `path` for a binding of `principal`.
 ///
 /// The path must be absolute, and each directory above it must be a
@@ -129,29 +211,7 @@ fn examine_file(
     limit: u64,
     cancel: &CancellationToken,
 ) -> Result<Examined, ExecutableProblem> {
-    if !path.is_absolute() {
-        return Err(ExecutableProblem::NotFound);
-    }
-    let metadata: Metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ExecutableProblem::NotFound);
-        }
-        Err(_) => return Err(ExecutableProblem::NotReadable),
-    };
-    if !metadata.file_type().is_file() || metadata.mode() & EXECUTE_BITS == 0 {
-        return Err(ExecutableProblem::NotExecutable);
-    }
-    if !is_trusted(&metadata, principal) {
-        return Err(ExecutableProblem::NotTrusted);
-    }
-    for ancestor in path.ancestors().skip(1) {
-        let directory: Metadata =
-            fs::symlink_metadata(ancestor).map_err(|_| ExecutableProblem::NotTrusted)?;
-        if !directory.file_type().is_dir() || !is_trusted(&directory, principal) {
-            return Err(ExecutableProblem::NotTrusted);
-        }
-    }
+    let metadata: Metadata = trusted_metadata(path, principal)?;
     let file: File = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)

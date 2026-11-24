@@ -904,17 +904,18 @@ fn marked(spec: &ProducerSpec, root: &Path, principal: Uid) -> bool {
 /// The checks of the scope root of an owner operation of the rule `rule`
 /// at admission and immediately before its step
 /// (`docs/CLEANUP_RULES.md` section 9): the marker of the producer and the
-/// guards. A rule that is not of this module passes.
+/// guards, after the checks of a location of the root
+/// ([`location_refusal`]). A rule that is not of this module passes.
 ///
 /// # Errors
 ///
-/// Returns the stable code of the first check that fails:
-/// [`OWNER_SCOPE_UNMARKED`], [`OWNER_GUARD_REFUSED`], or
+/// Returns the stable code of the first check that fails: a code of
+/// [`location_refusal`], [`OWNER_SCOPE_UNMARKED`], [`OWNER_GUARD_REFUSED`], or
 /// [`HOMEBREW_ENV_OVERRIDES`].
 pub fn scope_evidence(
     rule: &RuleRef,
     root: &Path,
-    home: &Path,
+    (home, locations): (&Path, &crate::protection::ProtectedLocations),
     principal: Uid,
 ) -> Result<(), &'static str> {
     let Some(spec) = PRODUCER_SPECS
@@ -923,6 +924,14 @@ pub fn scope_evidence(
     else {
         return Ok(());
     };
+    // The checks of a location, as at the plan: a `.git` entry or a project
+    // marker that a directory above the root got after the plan refuses the
+    // step. They examine the locality first, so no probe reaches a network
+    // filesystem.
+    let mounts = MountTable::read().map_err(|_| "root_locality_unknown")?;
+    if let Some(code) = location_refusal(root, home, locations, &mounts) {
+        return Err(code);
+    }
     if !marked(spec, root, principal) {
         return Err(OWNER_SCOPE_UNMARKED);
     }

@@ -855,7 +855,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
         crate::rules::producers::scope_evidence(
             &owner.rule,
             &owner.root_path.to_path_buf(),
-            home,
+            (home, &locations),
             owner.owner,
         )
         .err()

@@ -732,12 +732,12 @@ fn the_checks_at_admission_read_the_marker_and_the_guards_again() {
         .reference
         .clone();
     assert_eq!(
-        scope_evidence(&rule, &root, &home.path, home.principal),
+        scope_evidence(&rule, &root, (&home.path, &home.locations), home.principal),
         Ok(())
     );
     fs::remove_file(root.join("CACHEDIR.TAG")).unwrap();
     assert_eq!(
-        scope_evidence(&rule, &root, &home.path, home.principal),
+        scope_evidence(&rule, &root, (&home.path, &home.locations), home.principal),
         Err(OWNER_SCOPE_UNMARKED)
     );
     // A rule that is not of this module, as the fixture rule, passes.
@@ -748,7 +748,7 @@ fn the_checks_at_admission_read_the_marker_and_the_guards_again() {
         .reference
         .clone();
     assert_eq!(
-        scope_evidence(&other, &root, &home.path, home.principal),
+        scope_evidence(&other, &root, (&home.path, &home.locations), home.principal),
         Ok(())
     );
 }
@@ -997,4 +997,28 @@ fn a_user_brew_env_that_changes_the_effect_refuses_homebrew() {
         homebrew_user_env(&home.path),
         GuardOutcome::Refused { .. }
     ));
+}
+
+#[test]
+fn the_checks_at_admission_read_the_location_again() {
+    let home = Home::new();
+    let registry: ReviewedRules = ReviewedRules::new().unwrap();
+    let rule = registry
+        .producer("mise.cache")
+        .unwrap()
+        .rule()
+        .reference
+        .clone();
+    let root: PathBuf = home.path.join("work/cache");
+    fs::create_dir_all(root.join(".auto_prune")).unwrap();
+    let check = || scope_evidence(&rule, &root, (&home.path, &home.locations), home.principal);
+    assert_eq!(check(), Ok(()));
+    // A project marker that appears between the plan and the step.
+    fs::write(home.path.join("work/Package.swift"), b"").unwrap();
+    assert_eq!(check(), Err("root_in_project"));
+    fs::remove_file(home.path.join("work/Package.swift")).unwrap();
+    assert_eq!(check(), Ok(()));
+    // A Git directory that appears between the plan and the step.
+    fs::create_dir(home.path.join("work/.git")).unwrap();
+    assert_eq!(check(), Err("configuration_in_work_tree"));
 }

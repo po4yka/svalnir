@@ -939,7 +939,7 @@ impl<J: CoordinatorJournal> Coordinator<J> {
             if let Err(code) = crate::rules::producers::scope_evidence(
                 &owner.rule,
                 &owner.root_path.to_path_buf(),
-                home,
+                (home, &locations),
                 owner.owner,
             ) {
                 return Err(Box::new(admission_error(

@@ -27,7 +27,7 @@ use crate::rules::fixture::{
     FixtureEnvironment, FixtureUse, automatic_eviction_validated, manual_action_validated,
 };
 use crate::rules::model::{DiscoveryLimits, SkipReason};
-use crate::rules::projects::UnitRecheck;
+use crate::rules::projects::{AgentListing, UnitRecheck};
 use crate::rules::registry::ReviewedRules;
 use crate::rules::xcode::ProducerProcesses;
 use crate::scan::CancellationToken;
@@ -830,7 +830,16 @@ fn the_check_before_a_step_examines_the_form_and_the_refused_names_again() {
         .reference
         .clone();
     assert_eq!(
-        environment.unit_recheck(home.principal, &reference, None, &root, &unit, &[], &[]),
+        environment.unit_recheck(
+            home.principal,
+            &reference,
+            None,
+            &root,
+            &unit,
+            &[],
+            &AgentListing::Off,
+            &[]
+        ),
         UnitRecheck::Refused("protected_child")
     );
 }

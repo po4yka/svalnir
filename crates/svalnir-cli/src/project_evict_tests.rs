@@ -283,7 +283,7 @@ fn an_evict_plan_has_the_eligible_units_and_its_apply_removes_only_them() {
     );
     let discovery = &result["discovery"];
     assert_eq!(discovery["rule"]["id"], RULE);
-    assert_eq!(discovery["rule"]["revision"], "r5");
+    assert_eq!(discovery["rule"]["revision"], "r6");
     assert_eq!(discovery["complete"], true, "{discovery}");
     assert_eq!(discovery["project_roots"][0]["kind"], "search");
     assert_eq!(discovery["project_roots"][0]["source"]["kind"], "argument");

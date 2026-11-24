@@ -932,6 +932,7 @@ fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cl
             projects_table.boolean(context, "paseo_agents"),
             defaults.projects.paseo_agents,
         ),
+        paseo_executable: read_paseo_executable(context, &mut projects_table),
         search_roots: super::layout::read_search_roots(context, &mut projects_table)
             .unwrap_or_else(|| defaults.projects.search_roots.clone()),
         layouts: super::layout::read_layouts(context, &mut projects_table),
@@ -944,6 +945,32 @@ fn read_cleanup(context: &mut Context, mut table: TableReader<'_>, defaults: &Cl
     caches_table.finish(context);
     table.finish(context);
     Cleanup { projects, caches }
+}
+
+/// Reads `paseo_executable` of `[cleanup.projects]`: a path that starts with
+/// `/` or `~/`, with no `.` or `..` component, that names a file below its
+/// base. The key has no effect while `paseo_agents` is false, so it is not a
+/// finding then.
+fn read_paseo_executable(context: &mut Context, table: &mut TableReader<'_>) -> Option<ConfigPath> {
+    let key: String = table.key_path("paseo_executable");
+    let Read::Valid((_, text)) = table.text(context, "paseo_executable") else {
+        return None;
+    };
+    match ConfigPath::parse(text) {
+        Ok(path) if path.components().next().is_some() => Some(path),
+        Ok(_) => {
+            context.report(
+                FindingCode::InvalidPath,
+                &key,
+                "must name a file, not a base directory",
+            );
+            None
+        }
+        Err(error) => {
+            context.report(FindingCode::InvalidPath, &key, error.to_string());
+            None
+        }
+    }
 }
 
 fn read_history(context: &mut Context, mut table: TableReader<'_>, defaults: &History) -> History {

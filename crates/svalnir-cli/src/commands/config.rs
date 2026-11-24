@@ -317,6 +317,8 @@ struct HistoryView {
 struct ProjectCleanupView {
     quiet_period: Nanoseconds,
     paseo_agents: bool,
+    /// The configured Paseo executable, or `null` for the fixed candidates.
+    paseo_executable: Option<String>,
     /// The search roots of `project.dependency-directory`, relative to the
     /// home directory.
     search_roots: Vec<String>,
@@ -407,6 +409,7 @@ impl ShowView {
                     quiet_period: Nanoseconds::try_from(projects.quiet_period)
                         .unwrap_or(Nanoseconds::MAX),
                     paseo_agents: projects.paseo_agents,
+                    paseo_executable: projects.paseo_executable.as_ref().map(ToString::to_string),
                     search_roots: projects.search_roots.clone(),
                     layouts: projects
                         .layouts

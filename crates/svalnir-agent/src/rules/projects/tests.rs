@@ -345,7 +345,7 @@ fn the_rule_is_registered_proposed_with_no_automatic_mode() {
     let registry: ReviewedRules = ReviewedRules::new().unwrap();
     let rule = registry.projects().rule();
     assert_eq!(rule.reference.id.as_str(), "project.dependency-directory");
-    assert_eq!(rule.reference.revision.as_str(), "r5");
+    assert_eq!(rule.reference.revision.as_str(), "r6");
     assert_eq!(rule.modes, [RuleMode::Inspection, RuleMode::ManualEviction]);
     let layouts: Vec<&str> = rule
         .layouts

@@ -288,7 +288,7 @@ impl ProjectSources {
         Self {
             git: GitTool::locate(),
             transcripts: ClaudeTranscripts::for_home(home),
-            agents: PaseoAgents::new(projects.paseo_agents, home),
+            agents: PaseoAgents::from_settings(projects, home),
             quiet_period: quiet_period(projects),
         }
     }
